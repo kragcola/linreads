@@ -2,6 +2,7 @@ package dev.readflow.extensions.api
 
 import android.content.Context
 import android.net.Uri
+import android.provider.OpenableColumns
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.DownloadStatus
@@ -51,7 +52,13 @@ class LocalFileBookSource(
     suspend fun import(uri: Uri): ReadflowResult<Pair<BookMeta, DownloadedAsset>> =
         withContext(Dispatchers.IO) {
             try {
-                val fileName = uri.lastPathSegment ?: uri.path?.substringAfterLast('/')
+                // SAF URIs (content://) encode an opaque ID in lastPathSegment, not
+                // the real filename. Query OpenableColumns.DISPLAY_NAME to get the
+                // actual name, then fall back to the URI path only as a last resort.
+                val fileName = context.contentResolver
+                    .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                    ?: uri.lastPathSegment?.substringAfterLast('/')
                     ?: "unknown.txt"
                 val ext = fileName.substringAfterLast('.', "")
                 val format = BookFormat.fromExtension(ext)
