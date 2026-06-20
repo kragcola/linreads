@@ -36,7 +36,7 @@ object AppUpdateManager {
     private fun postNotification(ctx: Context, info: UpdateInfo) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "应用更新", NotificationManager.IMPORTANCE_DEFAULT),
+            NotificationChannel(CHANNEL_ID, "应用更新", NotificationManager.IMPORTANCE_HIGH),
         )
 
         // Tapping the notification triggers download + install via a BroadcastReceiver

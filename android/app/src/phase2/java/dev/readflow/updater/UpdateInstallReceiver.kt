@@ -14,6 +14,9 @@ class UpdateInstallReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val apkUrl = intent.getStringExtra("apk_url") ?: return
         val tagName = intent.getStringExtra("tag_name") ?: "dev-latest"
+        // goAsync() keeps the receiver "active" so the Android 10+ activity-start
+        // exemption (granted on notification tap) remains valid through the download.
+        val pendingResult = goAsync()
         val checker = GitHubUpdateChecker(
             repoSlug = dev.readflow.BuildConfig.GITHUB_REPO,
             currentTag = dev.readflow.BuildConfig.BUILD_TAG,
@@ -23,6 +26,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                 val file = checker.download(UpdateInfo(tagName, apkUrl, ""), context)
                 checker.install(context, file)
             }
+            pendingResult.finish()
         }
     }
 }
