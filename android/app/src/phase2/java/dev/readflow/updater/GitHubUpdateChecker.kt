@@ -22,6 +22,8 @@ class GitHubUpdateChecker(
         val conn = (URL("https://api.github.com/repos/$repoSlug/releases/tags/dev-latest")
             .openConnection() as HttpURLConnection).apply {
             setRequestProperty("Accept", "application/vnd.github+json")
+            val token = dev.readflow.BuildConfig.GITHUB_OTA_TOKEN
+            if (token.isNotEmpty()) setRequestProperty("Authorization", "Bearer $token")
             connectTimeout = 8_000; readTimeout = 8_000
         }
         try {

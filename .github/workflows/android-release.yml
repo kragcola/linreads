@@ -15,6 +15,7 @@ jobs:
       STORE_PASSWORD: android
       KEY_ALIAS: androiddebugkey
       KEY_PASSWORD: android
+      GITHUB_OTA_TOKEN: ${{ secrets.GITHUB_OTA_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4

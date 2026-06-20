@@ -22,6 +22,7 @@ android {
         versionName = "0.1.0"
         buildConfigField("String", "GITHUB_REPO", "\"kragcola/linreads\"")
         buildConfigField("String", "BUILD_TAG", "\"$buildTag\"")
+        buildConfigField("String", "GITHUB_OTA_TOKEN", "\"${System.getenv("GITHUB_OTA_TOKEN") ?: ""}\"" )
     }
 
     // Explicit signing so the key never silently changes between machines/CI runs.
