@@ -29,6 +29,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import dev.readflow.core.model.BookBundle
 import dev.readflow.core.ui.BookGrid
 import dev.readflow.core.ui.EmptyState
 import dev.readflow.core.ui.PaperSurface
@@ -45,11 +46,16 @@ fun LibraryScreen(
     viewModel: LibraryViewModel = koinViewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
-    val scanResults by viewModel.scanResults.collectAsState()
+    val scanProgress by viewModel.scanProgress.collectAsState()
     val context = LocalContext.current
+
+    var openedBundle by remember { mutableStateOf<BookBundle?>(null) }
 
     LaunchedEffect(Unit) {
         viewModel.openBook.collect { bookId -> onOpenBook(bookId) }
+    }
+    LaunchedEffect(Unit) {
+        viewModel.openBundle.collect { bundle -> openedBundle = bundle }
     }
 
     val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -119,11 +125,29 @@ fun LibraryScreen(
             }
         }
 
-        scanResults?.let { books ->
+        // 扫描进度 dialog（不可外部关闭）
+        if (scanProgress?.scanning == true) {
+            ImportProgressDialog(
+                found = scanProgress!!.found,
+                onCancel = viewModel::cancelScan,
+            )
+        }
+
+        // 扫描完成 → 展示预览 sheet
+        if (scanProgress?.scanning == false && scanProgress!!.books.isNotEmpty()) {
             ImportPreviewSheet(
-                books = books,
+                books = scanProgress!!.books,
                 onImport = { viewModel.importFromFolder(it) },
-                onDismiss = { viewModel.clearScan() },
+                onDismiss = viewModel::clearScan,
+            )
+        }
+
+        // 分组详情 sheet
+        openedBundle?.let { bundle ->
+            BundleDetailSheet(
+                bundle = bundle,
+                onOpenBook = onOpenBook,
+                onDismiss = { openedBundle = null },
             )
         }
     }

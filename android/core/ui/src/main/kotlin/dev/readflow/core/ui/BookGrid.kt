@@ -1,6 +1,7 @@
 package dev.readflow.core.ui
 
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -19,8 +20,11 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import dev.readflow.core.model.LibraryItem
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun BookGrid(
     items: List<LibraryItem>,
@@ -32,24 +36,23 @@ fun BookGrid(
     modifier: Modifier = Modifier,
 ) {
     val palette = readflowPalette
-    // Mutable list that gets reordered during drag; synced when items changes.
     val mutableItems = remember { mutableStateListOf(*items.toTypedArray()) }
     LaunchedEffect(items) {
         if (items != mutableItems.toList()) { mutableItems.clear(); mutableItems.addAll(items) }
     }
 
     val gridState = rememberLazyGridState()
+    val scope = rememberCoroutineScope()
 
-    // Drag state
     var draggedIndex by remember { mutableStateOf(-1) }
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
+    var dragStartAbsPos by remember { mutableStateOf(Offset.Zero) }
     var dropIndex by remember { mutableStateOf(-1) }
 
-    // Menus / dialogs
     var contextItem by remember { mutableStateOf<LibraryItem?>(null) }
     var renameItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var renameText by remember { mutableStateOf("") }
-    var groupTargetItem by remember { mutableStateOf<LibraryItem.Single?>(null) }  // item being grouped with
+    var groupTargetItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var groupSourceId by remember { mutableStateOf("") }
     var groupName by remember { mutableStateOf("") }
 
@@ -76,55 +79,67 @@ fun BookGrid(
                             scaleY = if (isDragging) 1.06f else if (isDropTarget) 0.94f else 1f
                             alpha = if (isDragging) 0.85f else 1f
                         }
-                        .clickable { onItemClick(item) }
+                        // 长按→菜单；点击→打开。与下方拖动手势互斥：拖动一旦开始 draggedIndex==index，
+                        // onLongClick 里延迟 80ms 后检测到此状态则不弹菜单。
+                        .combinedClickable(
+                            onClick = { onItemClick(item) },
+                            onLongClick = {
+                                scope.launch {
+                                    delay(80)
+                                    if (draggedIndex != index) contextItem = item
+                                }
+                            },
+                        )
                         .pointerInput(item.key) {
                             var totalDrag = Offset.Zero
                             detectDragGesturesAfterLongPress(
-                                onDragStart = {
+                                onDragStart = { localPos ->
                                     totalDrag = Offset.Zero
                                     draggedIndex = index
                                     dragOffset = Offset.Zero
+                                    // 记录拖动起始点在 grid 坐标系内的绝对位置
+                                    val itemInfo = gridState.layoutInfo.visibleItemsInfo
+                                        .firstOrNull { it.index == index }
+                                    dragStartAbsPos = Offset(
+                                        (itemInfo?.offset?.x ?: 0).toFloat() + localPos.x,
+                                        (itemInfo?.offset?.y ?: 0).toFloat() + localPos.y,
+                                    )
                                 },
                                 onDrag = { change, delta ->
                                     totalDrag += delta
                                     dragOffset += delta
                                     change.consume()
-                                    // Compute drop target from grid item positions
-                                    val absX = (change.position.x + dragOffset.x)
-                                    val absY = (change.position.y + dragOffset.y)
+                                    // 用 grid 坐标系绝对位置命中目标
+                                    val absPos = dragStartAbsPos + dragOffset
                                     val visInfo = gridState.layoutInfo.visibleItemsInfo
                                     dropIndex = visInfo
                                         .firstOrNull { info ->
-                                            val r = info.offset
-                                            val s = info.size
-                                            absX in r.x.toFloat()..(r.x + s.width).toFloat() &&
-                                                absY in r.y.toFloat()..(r.y + s.height).toFloat()
+                                            val rx = info.offset.x.toFloat()
+                                            val ry = info.offset.y.toFloat()
+                                            absPos.x in rx..(rx + info.size.width) &&
+                                                absPos.y in ry..(ry + info.size.height)
                                         }
                                         ?.index?.coerceIn(0, mutableItems.lastIndex)
                                         ?: dropIndex
                                 },
                                 onDragEnd = {
-                                    val movedFar = totalDrag.getDistance() > 20.dp.toPx()
                                     val target = dropIndex
                                     draggedIndex = -1
                                     dragOffset = Offset.Zero
                                     dropIndex = -1
-                                    if (!movedFar) {
-                                        contextItem = item
-                                    } else if (target >= 0 && target != index) {
+                                    if (totalDrag.getDistance() > 20.dp.toPx() && target >= 0 && target != index) {
                                         val targetItem = mutableItems.getOrNull(target)
                                         if (item is LibraryItem.Single && targetItem is LibraryItem.Single) {
-                                            // Drag onto another single book → create group
                                             groupSourceId = item.book.id
                                             groupTargetItem = targetItem
                                             groupName = ""
                                         } else {
-                                            // Reorder
                                             val moved = mutableItems.removeAt(index)
                                             mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
                                             onReorder(mutableItems.toList())
                                         }
                                     }
+                                    // 注意：不在此处触发菜单，菜单由 combinedClickable.onLongClick 负责
                                 },
                                 onDragCancel = {
                                     draggedIndex = -1
@@ -139,7 +154,6 @@ fun BookGrid(
                     ) {
                         when (item) {
                             is LibraryItem.Single -> {
-                                // Show group-merge preview when this item is a drop target
                                 if (isDropTarget && draggedIndex >= 0) {
                                     val dragged = mutableItems.getOrNull(draggedIndex)
                                     if (dragged is LibraryItem.Single) {
@@ -177,7 +191,7 @@ fun BookGrid(
         }
     }
 
-    // ── Context menu ─────────────────────────────────────────────────────────
+    // ── Context menu ──────────────────────────────────────────────────────────
     contextItem?.let { ci ->
         val id = when (ci) {
             is LibraryItem.Single -> ci.book.id
@@ -201,7 +215,7 @@ fun BookGrid(
         }
     }
 
-    // ── Rename dialog ─────────────────────────────────────────────────────────
+    // ── Rename dialog ──────────────────────────────────────────────────────────
     renameItem?.let { ri ->
         AlertDialog(
             onDismissRequest = { renameItem = null },
@@ -211,15 +225,13 @@ fun BookGrid(
                     singleLine = true, label = { Text("书名") })
             },
             confirmButton = {
-                TextButton(onClick = { onRename(ri.book.id, renameText); renameItem = null }) {
-                    Text("确定")
-                }
+                TextButton(onClick = { onRename(ri.book.id, renameText); renameItem = null }) { Text("确定") }
             },
             dismissButton = { TextButton(onClick = { renameItem = null }) { Text("取消") } },
         )
     }
 
-    // ── Create-group dialog (drag or menu) ────────────────────────────────────
+    // ── Create-group dialog ────────────────────────────────────────────────────
     if (groupSourceId.isNotEmpty()) {
         AlertDialog(
             onDismissRequest = { groupSourceId = ""; groupTargetItem = null },

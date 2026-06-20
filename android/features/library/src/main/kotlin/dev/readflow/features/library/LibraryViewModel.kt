@@ -7,12 +7,14 @@ import androidx.lifecycle.viewModelScope
 import dev.readflow.core.calibre.CalibreClient
 import dev.readflow.core.calibre.CalibreRepositoryImpl
 import dev.readflow.core.database.LibraryRepository
+import dev.readflow.core.model.BookBundle
 import dev.readflow.core.model.LibraryItem
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.extensions.api.FolderScanner
 import dev.readflow.extensions.api.LocalFileBookSource
 import dev.readflow.extensions.api.ScannedBook
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -28,6 +30,12 @@ data class LibraryUiState(
     val error: String? = null,
 )
 
+data class ScanProgress(
+    val found: Int = 0,
+    val scanning: Boolean = true,
+    val books: List<ScannedBook> = emptyList(),
+)
+
 class LibraryViewModel(
     private val repository: LibraryRepository,
     private val localSource: LocalFileBookSource,
@@ -40,8 +48,13 @@ class LibraryViewModel(
     private val _openBook = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val openBook: SharedFlow<String> = _openBook.asSharedFlow()
 
-    private val _scanResults = MutableStateFlow<List<ScannedBook>?>(null)
-    val scanResults: StateFlow<List<ScannedBook>?> = _scanResults.asStateFlow()
+    private val _openBundle = MutableSharedFlow<BookBundle>(extraBufferCapacity = 1)
+    val openBundle: SharedFlow<BookBundle> = _openBundle.asSharedFlow()
+
+    private val _scanProgress = MutableStateFlow<ScanProgress?>(null)
+    val scanProgress: StateFlow<ScanProgress?> = _scanProgress.asStateFlow()
+
+    private var scanJob: Job? = null
 
     init {
         viewModelScope.launch {
@@ -57,11 +70,10 @@ class LibraryViewModel(
     }
 
     fun onItemClick(item: LibraryItem) {
-        val bookId = when (item) {
-            is LibraryItem.Single -> item.book.id
-            is LibraryItem.Bundle -> item.bundle.books.first().id
+        when (item) {
+            is LibraryItem.Single -> _openBook.tryEmit(item.book.id)
+            is LibraryItem.Bundle -> _openBundle.tryEmit(item.bundle)
         }
-        _openBook.tryEmit(bookId)
     }
 
     fun importBook(uri: Uri) {
@@ -75,12 +87,24 @@ class LibraryViewModel(
     }
 
     fun scanFolder(context: Context, treeUri: Uri) {
-        viewModelScope.launch {
-            _scanResults.value = FolderScanner.scan(context, treeUri)
+        scanJob?.cancel()
+        val accumulated = mutableListOf<ScannedBook>()
+        _scanProgress.value = ScanProgress()
+        scanJob = viewModelScope.launch {
+            FolderScanner.scan(context, treeUri) { book ->
+                accumulated.add(book)
+                _scanProgress.value = ScanProgress(found = accumulated.size, scanning = true, books = accumulated.toList())
+            }
+            _scanProgress.value = _scanProgress.value?.copy(scanning = false)
         }
     }
 
-    fun clearScan() { _scanResults.value = null }
+    fun cancelScan() {
+        scanJob?.cancel()
+        _scanProgress.value = null
+    }
+
+    fun clearScan() { _scanProgress.value = null }
 
     fun importFromFolder(uris: List<Uri>) {
         viewModelScope.launch {
@@ -99,7 +123,6 @@ class LibraryViewModel(
         viewModelScope.launch { repository.renameBook(id, title) }
     }
 
-    /** After drag reorder, persist new sort positions for the visible flat list. */
     fun reorder(items: List<LibraryItem>) {
         viewModelScope.launch {
             items.forEachIndexed { idx, item ->
