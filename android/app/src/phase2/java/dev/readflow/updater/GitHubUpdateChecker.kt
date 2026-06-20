@@ -27,17 +27,20 @@ class GitHubUpdateChecker(
             if (token.isNotEmpty()) setRequestProperty("Authorization", "Bearer $token")
             connectTimeout = 8_000; readTimeout = 8_000
         }
+        // HTTP status check is OUTSIDE the try block so IOException propagates to the caller.
+        val code = conn.responseCode
+        if (code != 200) {
+            conn.disconnect()
+            throw IOException("HTTP $code — check GITHUB_OTA_TOKEN / repo visibility")
+        }
         try {
-            if (conn.responseCode != 200) throw IOException("HTTP ${conn.responseCode}")
             val root = JSONObject(conn.inputStream.bufferedReader().readText())
             val body = root.optString("body", "")
 
-            // Parse BUILD_TAG line written by CI: "BUILD_TAG: dev-42-abc1234"
             val releaseBuildTag = body.lineSequence()
                 .firstOrNull { it.startsWith("BUILD_TAG:") }
                 ?.substringAfter("BUILD_TAG:")?.trim()
 
-            // Same build already installed — nothing to do.
             if (releaseBuildTag != null && releaseBuildTag == currentTag) return@withContext null
 
             val assets = root.getJSONArray("assets")
@@ -49,8 +52,11 @@ class GitHubUpdateChecker(
                 }
             }
             apkUrl?.let { UpdateInfo(root.getString("tag_name"), it, body) }
+                ?: throw IOException("release has no APK asset")
+        } catch (e: IOException) {
+            throw e   // propagate — caller's runCatching will surface it
         } catch (_: Exception) {
-            null
+            null      // JSON/parse error: treat as no update (don't crash)
         } finally {
             conn.disconnect()
         }
