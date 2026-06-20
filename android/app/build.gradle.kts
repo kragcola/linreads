@@ -1,3 +1,5 @@
+import java.util.Base64
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -20,6 +22,34 @@ android {
         versionName = "0.1.0"
         buildConfigField("String", "GITHUB_REPO", "\"kragcola/linreads\"")
         buildConfigField("String", "BUILD_TAG", "\"$buildTag\"")
+    }
+
+    // Explicit signing so the key never silently changes between machines/CI runs.
+    // CI: set KEYSTORE_BASE64 env var (base64-encoded JKS/PKCS12).
+    // Local dev: falls back to the standard debug keystore.
+    signingConfigs {
+        create("linreads") {
+            val ksB64 = System.getenv("KEYSTORE_BASE64")
+            if (ksB64 != null) {
+                val ksFile = rootProject.layout.buildDirectory.get().asFile.resolve("linreads-signing.jks")
+                ksFile.parentFile.mkdirs()
+                ksFile.writeBytes(Base64.getDecoder().decode(ksB64))
+                storeFile = ksFile
+                storePassword = System.getenv("STORE_PASSWORD") ?: "android"
+                keyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
+                keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
+            } else {
+                storeFile = File(System.getProperty("user.home"), ".android/debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
+    }
+
+    buildTypes {
+        debug { signingConfig = signingConfigs.getByName("linreads") }
+        release { signingConfig = signingConfigs.getByName("linreads") }
     }
 
     buildFeatures { compose = true; buildConfig = true }

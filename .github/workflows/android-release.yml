@@ -11,6 +11,10 @@ jobs:
       contents: write
     env:
       BUILD_TAG: dev-${{ github.run_number }}-${{ github.sha }}
+      KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+      STORE_PASSWORD: android
+      KEY_ALIAS: androiddebugkey
+      KEY_PASSWORD: android
 
     steps:
       - uses: actions/checkout@v4
@@ -20,11 +24,6 @@ jobs:
           distribution: temurin
           java-version: 21
           cache: gradle
-
-      - name: Restore debug keystore
-        run: |
-          mkdir -p ~/.android
-          echo "${{ secrets.DEBUG_KEYSTORE_BASE64 }}" | base64 -d > ~/.android/debug.keystore
 
       - name: Build debug APK
         working-directory: android
