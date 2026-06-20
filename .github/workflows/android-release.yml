@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      BUILD_TAG: dev-${{ github.run_number }}-${{ github.sha }}
 
     steps:
       - uses: actions/checkout@v4
@@ -22,8 +24,6 @@ jobs:
       - name: Build debug APK
         working-directory: android
         run: ./gradlew -Preadflow.phase=2 :app:assembleDebug
-        env:
-          BUILD_TAG: dev-${{ github.run_number }}-${{ github.sha }}
 
       - name: Publish dev-latest release
         uses: softprops/action-gh-release@v2
@@ -31,6 +31,7 @@ jobs:
           tag_name: dev-latest
           name: "Dev build #${{ github.run_number }}"
           body: |
+            BUILD_TAG: ${{ env.BUILD_TAG }}
             Commit: ${{ github.sha }}
             Branch: ${{ github.ref_name }}
             Time: ${{ github.event.head_commit.timestamp }}

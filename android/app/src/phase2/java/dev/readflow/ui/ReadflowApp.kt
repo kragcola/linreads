@@ -1,6 +1,10 @@
 package dev.readflow.ui
 
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LifecycleResumeEffect
@@ -21,6 +25,16 @@ fun ReadflowApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    // Android 13+ requires POST_NOTIFICATIONS at runtime.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val permLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { /* granted or denied — either way continue */ }
+        LaunchedEffect(Unit) {
+            permLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     // Check for updates every time the app comes to foreground.
     LifecycleResumeEffect(Unit) {
         AppUpdateManager.checkOnForeground(context, scope)
@@ -39,7 +53,7 @@ fun ReadflowApp() {
             composable("reader/{bookId}") { backStackEntry ->
                 val bookId = backStackEntry.arguments?.getString("bookId") ?: return@composable
                 val vm = koinViewModel<ReaderViewModel>()
-                androidx.compose.runtime.LaunchedEffect(bookId) {
+                LaunchedEffect(bookId) {
                     vm.onIntent(ReaderIntent.OpenById(bookId))
                 }
                 ReaderScreen(

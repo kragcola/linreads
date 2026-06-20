@@ -14,7 +14,9 @@ data class UpdateInfo(val tagName: String, val apkUrl: String, val notes: String
 
 /**
  * Checks the `dev-latest` GitHub release for a newer build.
- * Uses HttpURLConnection + org.json (Android built-in — no extra deps).
+ * Version identity: CI embeds `BUILD_TAG: <tag>` in the release body; we compare
+ * that against BuildConfig.BUILD_TAG.  If absent (old release) we always show the
+ * notification so the user is never stuck on a stale install.
  */
 class GitHubUpdateChecker(
     private val repoSlug: String,
@@ -29,8 +31,16 @@ class GitHubUpdateChecker(
         try {
             if (conn.responseCode != 200) return@withContext null
             val root = JSONObject(conn.inputStream.bufferedReader().readText())
-            val tagName = root.getString("tag_name")
-            if (tagName == currentTag) return@withContext null
+            val body = root.optString("body", "")
+
+            // Parse BUILD_TAG line written by CI: "BUILD_TAG: dev-42-abc1234"
+            val releaseBuildTag = body.lineSequence()
+                .firstOrNull { it.startsWith("BUILD_TAG:") }
+                ?.substringAfter("BUILD_TAG:")?.trim()
+
+            // Same build already installed — nothing to do.
+            if (releaseBuildTag != null && releaseBuildTag == currentTag) return@withContext null
+
             val assets = root.getJSONArray("assets")
             var apkUrl: String? = null
             for (i in 0 until assets.length()) {
@@ -39,7 +49,7 @@ class GitHubUpdateChecker(
                     apkUrl = a.getString("browser_download_url"); break
                 }
             }
-            apkUrl?.let { UpdateInfo(tagName, it, root.optString("body")) }
+            apkUrl?.let { UpdateInfo(root.getString("tag_name"), it, body) }
         } catch (_: Exception) {
             null
         } finally {
