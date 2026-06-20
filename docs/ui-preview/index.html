@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LinReads UI v3 · 纸张质感</title>
+<style>
+:root {
+  --paper:#EDE6D6; --paper-deep:#E2D9C4; --paper-shadow:#C9BFA6;
+  --ink:#2A2620; --ink-soft:#6E665A;
+  --cloth-red:#8A4A3C; --cloth-blue:#3E4A52; --cloth-green:#4A5240;
+  --serif:"Noto Serif SC","Songti SC",serif;
+  --sans:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#8B8169; font-family:var(--sans); color:var(--ink); padding:32px 16px; line-height:1.5; }
+h1.page-title { text-align:center; font-family:var(--serif); font-weight:500; color:#F2ECDD; font-size:25px; margin-bottom:6px; }
+p.sub { text-align:center; color:#D8CFB8; margin-bottom:30px; font-size:13px; }
+.section-divider { text-align:center; color:#EDE6D6; font-size:13px; margin:42px 0 12px; letter-spacing:2px; opacity:0.85; }
+.swatches { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; margin:0 auto 8px; max-width:760px; }
+.sw { display:flex; flex-direction:column; align-items:center; gap:5px; font-size:11px; color:#EDE6D6; }
+.sw .chip { width:50px; height:50px; border-radius:6px; box-shadow:0 2px 6px rgba(0,0,0,0.3); }
+.gallery { display:flex; flex-wrap:wrap; gap:40px; justify-content:center; align-items:flex-start; }
+.frame-wrap { display:flex; flex-direction:column; align-items:center; gap:12px; }
+.frame-label { font-size:13px; color:#EDE6D6; font-weight:500; max-width:300px; text-align:center; }
+
+/* paper texture: subtle fiber noise via layered radial-gradients + a turbulence SVG */
+.paper-tex {
+  background-color:var(--paper);
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E"),
+    radial-gradient(140% 120% at 30% 12%, rgba(255,252,242,0.55), transparent 60%);
+}
+.phone { width:300px; height:630px; border-radius:30px; overflow:hidden; position:relative; display:flex; flex-direction:column;
+  box-shadow:0 16px 44px rgba(40,34,24,0.45); border:1px solid #B6AC90; }
+.statusbar { height:24px; flex:none; }
+
+/* ===== Library ===== */
+.lib-top { padding:8px 18px 4px; display:flex; justify-content:space-between; align-items:flex-end; }
+.lib-top .title { font-family:var(--serif); font-size:22px; font-weight:500; color:var(--ink); }
+.lib-top .icons { display:flex; gap:15px; font-size:16px; color:var(--ink-soft); padding-bottom:3px; }
+.body-scroll { overflow-y:auto; flex:1; padding:0 18px; }
+
+/* hand-drawn divider: a wobbly underline via SVG path */
+.hd { display:flex; align-items:center; gap:8px; margin:16px 0 10px; }
+.hd .lbl { font-family:var(--serif); font-size:15px; color:var(--ink); white-space:nowrap; }
+.hd .ln { flex:1; height:6px; }
+.hd .ln svg { width:100%; height:6px; display:block; }
+.hd .ln path { stroke:var(--ink-soft); stroke-width:1; fill:none; opacity:0.5; }
+
+/* reading book row with crooked paper bookmark = signature */
+.reading { display:flex; gap:16px; align-items:flex-start; padding:4px 2px 8px; }
+.rd-cover-wrap { position:relative; flex:none; padding-top:6px; }
+.rd-cover { width:74px; height:104px; border-radius:2px; box-shadow:2px 4px 12px rgba(40,34,24,0.32); display:flex; align-items:center; justify-content:center;
+  font-family:var(--serif); font-size:13px; text-align:center; padding:6px; position:relative; overflow:hidden; }
+/* cloth cover with worn dark corners */
+.cloth-red { background:var(--cloth-red); color:#E8D8C2; box-shadow:2px 4px 12px rgba(40,34,24,0.32), inset -14px -16px 22px rgba(0,0,0,0.28), inset 10px 10px 18px rgba(255,255,255,0.05); }
+.cloth-blue { background:var(--cloth-blue); color:#D6DEE2; box-shadow:2px 4px 12px rgba(40,34,24,0.32), inset -14px -16px 22px rgba(0,0,0,0.3); }
+.cloth-green { background:var(--cloth-green); color:#D8DEC8; box-shadow:2px 4px 12px rgba(40,34,24,0.32), inset -14px -16px 22px rgba(0,0,0,0.3); }
+/* the crooked paper bookmark sticking out */
+.bookmark { position:absolute; top:-6px; right:12px; width:15px; height:54px; background:#F6F0E2;
+  transform:rotate(2.5deg); box-shadow:0 2px 4px rgba(40,34,24,0.25); border-top:2px solid #DAD0B8; }
+.rd-meta { flex:1; padding-top:8px; }
+.rd-meta .bk { font-family:var(--serif); font-size:18px; color:var(--ink); }
+.rd-meta .au { font-size:13px; color:var(--ink-soft); margin-top:3px; }
+.rd-meta .pr { font-size:13px; color:var(--ink-soft); margin-top:12px; font-family:var(--serif); }
+.rd-meta .pr b { color:var(--ink); font-weight:500; }
+
+/* shelf: restrained — books are the hero, the board only hints "a surface".
+   A thin warm shelf-lip + soft book-bottom shadow. No heavy wood, no bright edge. */
+.shelf-wrap { padding:4px 0 4px; }
+.shelf-row2 { position:relative; }
+.shelf-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:22px 18px; padding:8px 18px 0; position:relative; z-index:1; align-items:end; }
+/* the shelf is just a slim lip the books rest on: subtle, recedes */
+.board-wood { height:4px; margin:0 4px; border-radius:1px;
+  background:linear-gradient(180deg, rgba(140,112,74,0.30), rgba(110,84,54,0.42));
+  position:relative; }
+/* soft shadow the books cast down onto the surface — this sells "resting on a shelf" more than the board itself */
+.board-wood::before { content:""; position:absolute; top:-6px; left:8px; right:8px; height:6px;
+  background:linear-gradient(180deg, rgba(40,28,16,0.16), transparent); }
+.bk-cover { width:100%; aspect-ratio:2/3; border-radius:2px; display:flex; align-items:center; justify-content:center; text-align:center;
+  font-family:var(--serif); font-size:10px; padding:4px; box-shadow:1px 2px 7px rgba(40,34,24,0.3); position:relative; overflow:hidden; }
+/* progress = thin ink bar at cover bottom */
+.pgbar { position:absolute; left:0; right:0; bottom:0; height:3px; background:rgba(0,0,0,0.22); }
+.pgbar i { display:block; height:100%; background:rgba(20,16,10,0.92); }
+/* no-cover book = plain cover */
+.nocover { background:var(--paper-shadow); color:#5C5440; box-shadow:inset 0 0 0 1px rgba(40,34,24,0.14), inset -10px -12px 18px rgba(0,0,0,0.16), 1px 2px 7px rgba(40,34,24,0.3); font-weight:600; flex-direction:column; gap:3px; }
+.nocover small { font-size:8px; font-weight:400; opacity:0.75; }
+
+/* bundle = stack of books, layers = min(count,4). aligned, no tilt */
+.bundle-cell { position:relative; width:100%; aspect-ratio:2/3; }
+.bundle { position:absolute; inset:0; }
+.bundle .layer { position:absolute; top:0; bottom:0; border-radius:2px; box-shadow:1px 2px 7px rgba(40,34,24,0.3); }
+.bundle .L4 { left:9px; right:-9px; background:var(--cloth-blue); filter:brightness(0.5); }
+.bundle .L3 { left:6px; right:-6px; background:var(--cloth-green); filter:brightness(0.62); }
+.bundle .L2 { left:3px; right:-3px; background:var(--cloth-red); filter:brightness(0.78); }
+.bundle .top { left:0; right:0; background:var(--cloth-blue); color:#D6DEE2; display:flex; align-items:center; justify-content:center; text-align:center; font-family:var(--serif); font-size:10px; padding:4px; box-shadow:inset -10px -12px 18px rgba(0,0,0,0.2), 1px 2px 7px rgba(40,34,24,0.32); }
+.bk-label { font-family:var(--serif); font-size:10px; color:var(--ink); text-align:center; margin-top:5px; line-height:1.3; width:100%; }
+
+/* text bottom nav with ink dot on selected */
+.bottomnav { margin-top:auto; height:54px; flex:none; display:flex; border-top:1px solid rgba(110,102,90,0.3); }
+.bottomnav .item { flex:1; display:flex; align-items:center; justify-content:center; gap:5px; font-size:14px; color:var(--ink-soft); font-family:var(--serif); }
+.bottomnav .item.active { color:var(--ink); }
+.bottomnav .item.active::before { content:"·"; font-size:22px; line-height:0; }
+
+/* ===== Empty ===== */
+.empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; padding:0 34px; text-align:center; }
+.empty .board { width:180px; height:60px; border-radius:6px; background:linear-gradient(180deg,var(--paper-deep),#DBD1B8); box-shadow:inset 0 6px 14px rgba(40,34,24,0.08); position:relative; }
+.empty .board::after { content:""; position:absolute; left:6px; right:6px; bottom:3px; height:8px; border-radius:50%; background:radial-gradient(60% 100% at 50% 0%,rgba(40,34,24,0.2),transparent 75%); }
+.empty .msg b { font-family:var(--serif); font-size:18px; color:var(--ink); display:block; margin-bottom:5px; }
+.empty .msg { color:var(--ink-soft); font-size:14px; }
+.empty .btns { display:flex; gap:12px; margin-top:6px; }
+.empty .btn { padding:10px 18px; border-radius:4px; font-size:14px; border:1px solid var(--ink-soft); color:var(--ink); background:transparent; }
+
+/* ===== Reader ===== */
+.r-day { --rbg:#EDE6D6; --rfg:#2A2620; }
+.r-night { --rbg:#2A2620; --rfg:#D8CFBC; }
+.r-warm { --rbg:#E8D6B8; --rfg:#36301F; }
+.reader { background-color:var(--rbg); }
+.reader.r-day, .reader.r-warm { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)' opacity='0.05'/%3E%3C/svg%3E"); }
+.reader .rbody { padding:30px 26px; overflow-y:auto; flex:1; }
+.reader .rbody h2 { font-family:var(--serif); font-size:19px; font-weight:500; color:var(--rfg); margin-bottom:18px; }
+.reader .rbody p { font-family:var(--serif); font-size:17px; line-height:1.8; color:var(--rfg); margin-bottom:16px; text-align:justify; }
+.r-top { position:absolute; top:24px; left:0; right:0; height:44px; display:flex; align-items:center; gap:14px; padding:0 18px; font-size:14px; color:var(--rfg);
+  background:color-mix(in srgb,var(--rbg) 90%, #000 5%); border-bottom:1px solid rgba(110,102,90,0.25); }
+.r-top .t { flex:1; font-family:var(--serif); }
+.r-bottom { position:absolute; bottom:0; left:0; right:0; padding:14px 22px 18px; background:color-mix(in srgb,var(--rbg) 90%, #000 5%); border-top:1px solid rgba(110,102,90,0.25); }
+.r-tools { display:flex; gap:34px; justify-content:center; margin-bottom:16px; font-size:13px; color:var(--rfg); font-family:var(--serif); }
+.r-tools .t { display:flex; flex-direction:column; align-items:center; gap:4px; }
+/* progress = ink line, handle = ink dot */
+.r-pbar { display:flex; align-items:center; gap:10px; }
+.r-pbar .track { flex:1; height:1px; background:rgba(110,102,90,0.4); position:relative; }
+.r-pbar .track i { position:absolute; left:0; top:50%; transform:translateY(-50%); width:47%; height:1.5px; background:var(--rfg); }
+.r-pbar .track b { position:absolute; left:47%; top:50%; transform:translate(-50%,-50%); width:7px; height:7px; border-radius:50%; background:var(--rfg); }
+.r-pbar .pct { font-size:12px; color:var(--rfg); font-family:var(--serif); }
+
+/* ===== Settings ===== */
+.set-top { padding:14px 18px; display:flex; align-items:center; gap:14px; font-size:18px; font-family:var(--serif); }
+.set-top .ic { color:var(--ink-soft); }
+.set-hd { margin:14px 18px 4px; }
+.set-hd svg { display:block; }
+.set-row { padding:13px 18px; display:flex; justify-content:space-between; align-items:center; font-size:15px; color:var(--ink); }
+.set-row .val { color:var(--ink-soft); font-size:14px; }
+
+/* ===== Responsive demo ===== */
+.resp-row { display:flex; flex-wrap:wrap; gap:28px; justify-content:center; align-items:flex-start; }
+.slab { border-radius:14px; overflow:hidden; box-shadow:0 12px 32px rgba(40,34,24,0.4); border:1px solid #B6AC90; display:flex; flex-direction:column; }
+.slab .bar { height:18px; flex:none; }
+.slab .rt { padding:6px 14px 2px; display:flex; justify-content:space-between; align-items:center; }
+.slab .rt .ti { font-family:var(--serif); font-size:16px; color:var(--ink); }
+.slab .rt .ic { font-size:13px; color:var(--ink-soft); }
+.slab .inner { display:flex; flex:1; }
+.slab .rail { width:54px; flex:none; border-right:1px solid rgba(110,102,90,0.25); display:flex; flex-direction:column; align-items:center; gap:18px; padding-top:16px; font-family:var(--serif); font-size:12px; color:var(--ink-soft); }
+.slab .rail .on { color:var(--ink); }
+.slab .agrid { flex:1; display:grid; gap:18px; padding:14px 16px; align-content:start; }
+.slab .ac { aspect-ratio:2/3; border-radius:2px; box-shadow:1px 2px 6px rgba(40,34,24,0.25); display:flex; align-items:center; justify-content:center; font-family:var(--serif); font-size:8px; color:#E8D8C2; text-align:center; padding:2px; }
+.w-phone { width:200px; }
+.w-phone .agrid { grid-template-columns:repeat(3,1fr); }
+.w-tab { width:340px; }
+.w-tab .agrid { grid-template-columns:repeat(4,1fr); }
+.w-big { width:460px; }
+.w-big .agrid { grid-template-columns:repeat(5,1fr); }
+</style>
+</head>
+<body>
+<h1 class="page-title">LinReads · UI v3.5</h1>
+<p class="sub">书架更透气(3列+大间距) · 适配密度同步放松(3/4/5列) · 隔板克制 · 合订叠放 · 记忆点=歪纸书签</p>
+
+<div class="swatches">
+  <div class="sw"><div class="chip" style="background:#EDE6D6"></div>paper</div>
+  <div class="sw"><div class="chip" style="background:#E2D9C4"></div>paper.deep</div>
+  <div class="sw"><div class="chip" style="background:#C9BFA6"></div>paper.shadow</div>
+  <div class="sw"><div class="chip" style="background:#2A2620"></div>ink</div>
+  <div class="sw"><div class="chip" style="background:#6E665A"></div>ink.soft</div>
+  <div class="sw"><div class="chip" style="background:#8A4A3C"></div>cloth.red</div>
+  <div class="sw"><div class="chip" style="background:#3E4A52"></div>cloth.blue</div>
+  <div class="sw"><div class="chip" style="background:#4A5240"></div>cloth.green</div>
+</div>
+
+<div class="section-divider">初始屏 · 书架（旧木隔板 · 记忆点=歪纸书签）</div>
+<div class="gallery">
+  <div class="frame-wrap">
+    <div class="phone paper-tex">
+      <div class="statusbar"></div>
+      <div class="lib-top"><div class="title">我的书</div><div class="icons">⌕&nbsp;&nbsp;⚙</div></div>
+      <div class="body-scroll">
+        <div class="hd"><span class="lbl">在读</span><span class="ln"><svg viewBox="0 0 200 6" preserveAspectRatio="none"><path d="M0,3 Q40,1 80,3.5 T160,2.8 T200,3.2"/></svg></span></div>
+        <div class="reading">
+          <div class="rd-cover-wrap">
+            <div class="rd-cover cloth-red">活着</div>
+            <div class="bookmark"></div>
+          </div>
+          <div class="rd-meta">
+            <div class="bk">活着</div>
+            <div class="au">余华</div>
+            <div class="pr">读到 <b>67%</b> · 第三章</div>
+          </div>
+        </div>
+        <div class="hd"><span class="lbl">书架</span><span class="ln"><svg viewBox="0 0 200 6" preserveAspectRatio="none"><path d="M0,3 Q50,4.5 90,2.5 T170,3.5 T200,2.8"/></svg></span></div>
+        <div class="shelf-wrap">
+          <div class="shelf-row2">
+            <div class="shelf-grid">
+              <div class="bk-cover cloth-blue">百年孤独<span class="pgbar"><i style="width:23%"></i></span></div>
+              <div class="bk-cover cloth-green">人类简史<span class="pgbar"><i style="width:41%"></i></span></div>
+              <div class="bk-cover cloth-red">围城</div>
+            </div>
+            <div class="board-wood"></div>
+          </div>
+          <div class="shelf-row2">
+            <div class="shelf-grid">
+              <div class="bk-cover nocover">乡土中国<small>费孝通</small></div>
+              <!-- bundle 3 books -->
+              <div class="bundle-cell"><div class="bundle"><div class="layer L3"></div><div class="layer L2"></div><div class="layer top">鲁迅全集</div></div></div>
+              <!-- bundle 4+ books -->
+              <div class="bundle-cell"><div class="bundle"><div class="layer L4"></div><div class="layer L3"></div><div class="layer L2"></div><div class="layer top">马尔克斯</div></div></div>
+            </div>
+            <div class="board-wood"></div>
+          </div>
+          <div class="shelf-row2">
+            <div class="shelf-grid">
+              <div class="bk-cover cloth-green">小王子</div>
+              <div class="bk-cover cloth-blue">傲慢与偏见</div>
+              <div class="bk-cover cloth-red">三体<span class="pgbar"><i style="width:88%"></i></span></div>
+            </div>
+            <div class="board-wood"></div>
+          </div>
+        </div>
+      </div>
+      <div class="bottomnav">
+        <div class="item active">书架</div>
+        <div class="item">阅读</div>
+        <div class="item">设置</div>
+      </div>
+    </div>
+    <div class="frame-label">书架 — 隔板上封面/书脊混排,在读书夹着歪纸书签</div>
+  </div>
+
+  <div class="frame-wrap">
+    <div class="phone paper-tex">
+      <div class="statusbar"></div>
+      <div class="lib-top"><div class="title">我的书</div><div class="icons">⚙</div></div>
+      <div class="empty">
+        <div class="board"></div>
+        <div class="msg"><b>还没有书</b>连接 Calibre,或导入本地文件</div>
+        <div class="btns"><div class="btn">连接 Calibre</div><div class="btn">导入本地</div></div>
+      </div>
+      <div class="bottomnav">
+        <div class="item active">书架</div>
+        <div class="item">阅读</div>
+        <div class="item">设置</div>
+      </div>
+    </div>
+    <div class="frame-label">书架空态 — 空隔板 + 墨线框按钮</div>
+  </div>
+</div>
+
+<div class="section-divider">阅读器 · Reader（同一张纸的三种光）</div>
+<div class="gallery">
+  <div class="frame-wrap">
+    <div class="phone reader r-day">
+      <div class="statusbar"></div>
+      <div class="rbody">
+        <h2>第三章</h2>
+        <p>阅读区就是纸——纸纹底,墨字,行高 1.8,没有浮起的玻璃板,没有亮色强调。</p>
+        <p>chrome 默认收起,正文铺满。左 1/3 上翻,右 2/3 下翻,中央点击呼出工具。</p>
+        <p>段落间距大于行距,留白如旧书的天地头。</p>
+      </div>
+    </div>
+    <div class="frame-label">阅读器 — 日间纸 · chrome 收起</div>
+  </div>
+
+  <div class="frame-wrap">
+    <div class="phone reader r-day">
+      <div class="statusbar"></div>
+      <div class="r-top"><span>←</span><span class="t">活着 第三章</span><span>⌗</span></div>
+      <div class="rbody" style="opacity:0.5; padding-top:78px;">
+        <p>阅读区就是纸,纸纹底墨字。呼出工具时正文压暗一档,不是浮玻璃。</p>
+        <p>段落间距大于行距。</p>
+      </div>
+      <div class="r-bottom">
+        <div class="r-tools"><div class="t"><span>Aa</span>字号</div><div class="t"><span>☀</span>光</div><div class="t"><span>目</span>目录</div></div>
+        <div class="r-pbar"><div class="track"><i></i><b></b></div><span class="pct">47%</span></div>
+      </div>
+    </div>
+    <div class="frame-label">阅读器 — chrome 呼出（进度=墨线,把手=墨点）</div>
+  </div>
+
+  <div class="frame-wrap">
+    <div class="phone reader r-night">
+      <div class="statusbar"></div>
+      <div class="rbody">
+        <h2>第三章</h2>
+        <p>夜里:纸压暗成暖褐 #2A2620,墨翻成暖白纸色字 #D8CFBC。不是冷黑屏,是关了大灯留一盏暖光读旧书。</p>
+        <p>仍是纸+墨,只是天黑了。</p>
+      </div>
+    </div>
+    <div class="frame-label">阅读器 — 夜灯</div>
+  </div>
+
+  <div class="frame-wrap">
+    <div class="phone reader r-warm">
+      <div class="statusbar"></div>
+      <div class="rbody">
+        <h2>第三章</h2>
+        <p>暖黄:旧纸泛黄 #E8D6B8,深褐字。长时间日间阅读更柔,像晒过太阳的旧书页。</p>
+        <p>三种光,同一张纸,不是换皮肤。</p>
+      </div>
+    </div>
+    <div class="frame-label">阅读器 — 暖黄</div>
+  </div>
+</div>
+
+<div class="section-divider">设置 · Settings</div>
+<div class="gallery">
+  <div class="frame-wrap">
+    <div class="phone paper-tex">
+      <div class="statusbar"></div>
+      <div class="set-top"><span class="ic">←</span><span style="font-family:var(--serif)">设置</span></div>
+      <div class="set-hd"><svg width="80" height="14" viewBox="0 0 80 14"><text x="0" y="11" font-family="serif" font-size="12" fill="#2A2620">阅读</text></svg></div>
+      <div class="set-row">字号<span class="val">18 ›</span></div>
+      <div class="set-row">光<span class="val">日间 ›</span></div>
+      <div class="set-row">翻页<span class="val">滚动 ›</span></div>
+      <div class="set-hd"><svg width="80" height="14" viewBox="0 0 80 14"><text x="0" y="11" font-family="serif" font-size="12" fill="#2A2620">书库</text></svg></div>
+      <div class="set-row">Calibre<span class="val">未连接 ›</span></div>
+      <div class="set-row">存储<span class="val">›</span></div>
+      <div class="set-hd"><svg width="80" height="14" viewBox="0 0 80 14"><text x="0" y="11" font-family="serif" font-size="12" fill="#2A2620">关于</text></svg></div>
+      <div class="set-row">版本<span class="val">0.1.0</span></div>
+      <div class="bottomnav">
+        <div class="item">书架</div>
+        <div class="item">阅读</div>
+        <div class="item active">设置</div>
+      </div>
+    </div>
+    <div class="frame-label">设置 — 纸面分组</div>
+  </div>
+</div>
+
+<div class="section-divider">多分辨率适配 · 自适应封面网格（同一书架，列数随宽度变）</div>
+<div class="resp-row">
+  <div class="frame-wrap">
+    <div class="slab w-phone paper-tex">
+      <div class="bar"></div>
+      <div class="rt"><span class="ti">我的书</span><span class="ic">⌕ ⚙</span></div>
+      <div class="inner">
+        <div class="agrid">
+          <div class="ac cloth-red">活着</div><div class="ac cloth-blue">百年</div><div class="ac cloth-green">围城</div>
+          <div class="ac cloth-blue">简史</div><div class="ac cloth-green">三体</div><div class="ac cloth-red">史记</div>
+        </div>
+      </div>
+      <div style="height:30px;border-top:1px solid rgba(110,102,90,0.3);display:flex;align-items:center;justify-content:space-around;font-family:var(--serif);font-size:11px;color:var(--ink-soft)"><span style="color:var(--ink)">·书架</span><span>阅读</span><span>设置</span></div>
+    </div>
+    <div class="frame-label">Compact &lt;600dp · 3 列 · 底部导航</div>
+  </div>
+
+  <div class="frame-wrap">
+    <div class="slab w-tab paper-tex">
+      <div class="bar"></div>
+      <div class="inner">
+        <div class="rail"><span class="on">书架</span><span>阅读</span><span>设置</span></div>
+        <div style="flex:1">
+          <div class="rt"><span class="ti">我的书</span><span class="ic">⌕</span></div>
+          <div class="agrid">
+            <div class="ac cloth-red">活着</div><div class="ac cloth-blue">百年</div><div class="ac cloth-green">围城</div><div class="ac cloth-blue">简史</div><div class="ac cloth-green">三体</div>
+            <div class="ac cloth-red">史记</div><div class="ac cloth-blue">沉默</div><div class="ac cloth-green">小王子</div><div class="ac cloth-red">围城</div><div class="ac cloth-blue">傲慢</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="frame-label">Medium 600–839dp · 4 列 · 侧轨导航</div>
+  </div>
+
+  <div class="frame-wrap">
+    <div class="slab w-big paper-tex">
+      <div class="bar"></div>
+      <div class="inner">
+        <div class="rail"><span class="on">书架</span><span>阅读</span><span>设置</span></div>
+        <div style="flex:1">
+          <div class="rt"><span class="ti">我的书</span><span class="ic">⌕</span></div>
+          <div class="agrid">
+            <div class="ac cloth-red">活着</div><div class="ac cloth-blue">百年</div><div class="ac cloth-green">围城</div><div class="ac cloth-blue">简史</div><div class="ac cloth-green">三体</div>
+            <div class="ac cloth-red">史记</div><div class="ac cloth-blue">沉默</div><div class="ac cloth-green">小王子</div><div class="ac cloth-red">围城</div><div class="ac cloth-blue">傲慢</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="frame-label">Expanded ≥840dp · 5+ 列 · 内容限宽居中 · 阅读器可双栏</div>
+  </div>
+</div>
+
+</body>
+</html>

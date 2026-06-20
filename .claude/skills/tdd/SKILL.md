@@ -50,7 +50,7 @@ Start inner, build outward. Never mock domain objects — construct real instanc
 - ❌ Testing implementation details (test behavior and output)
 - ❌ `assert True` / tautological assertions
 
-## Readflow-specific examples
+## LinReads-specific examples
 
 ```kotlin
 // Android — domain slice (pure, no mocks)

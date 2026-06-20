@@ -1,0 +1,29 @@
+# LinReads Wiki
+
+- [Home](Home.md)
+- [Architecture Overview](Architecture.md)
+- **[Android Architecture v4](../android-architecture-v4.md) ← 权威规范**
+- **Platforms**
+  - [Platform: Web](Platform-Web.md)
+  - [Platform: Android (deprecated)](Platform-Android.md)
+  - [Platform: HarmonyOS](Platform-HarmonyOS.md)
+- **Reference**
+  - [Calibre API](Calibre-API.md)
+  - [Rendering Engine](Rendering-Engine.md)
+  - [Progress Sync](Progress-Sync.md)
+- **Research**
+  - [Research: Moon+ Reader](Research-MoonReader.md)
+  - [Research: Stylus & Ink](Research-Stylus.md)
+  - [Ink Anchoring Research](../research/ink-anchoring-research.md)
+  - [Engine Make vs Buy](../research/engine-make-vs-buy.md)
+- **Audit Reports**
+  - [Architecture Verification](Architecture-Verification.md)
+  - [Android Architecture Audit](Android-Architecture-Audit.md)
+  - [Architecture Comparison](Architecture-Comparison.md)
+  - [Ink Architecture Gap](Ink-Architecture-Gap.md)
+  - [Final Audit Report (v1)](../audit/final-audit-report-2026-06-18.md)
+  - [V2 Audit Report](../audit/v2-audit-report-2026-06-18.md)
+  - [Round 3 Final Audit](../audit/round3-audit-report-2026-06-18.md)
+- **Project**
+  - [Development Guide](Development-Guide.md)
+  - [Active Work & Roadmap](Active-Work.md)

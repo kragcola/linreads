@@ -22,3 +22,13 @@ dist/
 .DS_Store
 *.log
 .env
+
+# Analysis artifacts — large, not source; excluded to keep repo lean and silence VS Code "too many changes"
+.codegraph/
+.reasonix/
+moonreader-decompiled/
+moonreader-unpacked/
+moonreader-pro.apk
+
+# Reference repos (cloned externals)
+references/

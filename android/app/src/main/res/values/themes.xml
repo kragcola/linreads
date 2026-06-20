@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose-based app: the Activity only needs a no-ActionBar base theme.
+         Material3 theming is applied in Compose (later :core:ui). Using the
+         platform DeviceDefault theme avoids an AppCompat dependency. -->
+    <style name="Theme.LinReads" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar" />
+</resources>

@@ -52,7 +52,7 @@ NO FIXES WITHOUT ROOT CAUSE INVESTIGATION FIRST
 | "One more fix attempt" (after 2+) | 3+ failures = architectural problem |
 | Each fix reveals new problem elsewhere | Wrong architecture, not wrong fix |
 
-## Cross-platform debugging (readflow-specific)
+## Cross-platform debugging (LinReads-specific)
 
 When a bug appears on one platform but not others:
 1. First confirm: does it reproduce on ALL three (Android/HarmonyOS/Web)?

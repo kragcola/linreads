@@ -1,11 +1,11 @@
-# Readflow
+# LinReads
 
 自用阅读器，灵感来自静读天下。三端同步：Android · HarmonyOS · Web。
 
 ## 特性
 
 - 接入 Calibre 书库（局域网 Content Server）
-- EPUB / PDF / MOBI 阅读
+- Web 端基础 EPUB / PDF 阅读；MOBI 和更多格式按架构规划待实现
 - 三端统一阅读进度（待实现）
 
 ## 平台
@@ -14,7 +14,7 @@
 |------|------|--------|
 | Android | `android/` | Kotlin · Jetpack Compose · Ktor |
 | HarmonyOS | `harmony/` | ArkTS · ArkUI |
-| Web | `web/` | React 18 · TypeScript · epubjs · Vite |
+| Web | `web/` | React 18 · TypeScript · epubjs(current) / epub-ts(target) · Vite |
 
 ## Calibre 接入
 

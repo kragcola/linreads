@@ -1,12 +1,12 @@
 ---
 name: accessibility
 description: >
-  WCAG 2.1/2.2 AA accessibility for Readflow. Auto-activates when touching: font size controls,
+  WCAG 2.1/2.2 AA accessibility for LinReads. Auto-activates when touching: font size controls,
   contrast/color, night mode, screen reader support, keyboard navigation, ARIA, touch targets,
   or any reader UI. Use /accessibility for audits and remediation.
 ---
 
-# Accessibility — Readflow
+# Accessibility — LinReads
 
 Reading is inherently an accessibility domain. Our users include people with low vision, dyslexia, motor impairments, and cognitive differences. WCAG AA is the floor, not the ceiling.
 
