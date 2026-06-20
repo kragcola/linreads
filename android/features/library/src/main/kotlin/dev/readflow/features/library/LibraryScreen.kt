@@ -5,10 +5,18 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -22,6 +30,7 @@ import org.koin.androidx.compose.koinViewModel
 
 private val SUPPORTED_MIMES = arrayOf("text/plain", "application/epub+zip", "application/pdf")
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LibraryScreen(
     onOpenBook: (String) -> Unit,
@@ -31,7 +40,6 @@ fun LibraryScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
 
-    // Collect one-shot open-book events → navigate
     LaunchedEffect(Unit) {
         viewModel.openBook.collect { bookId -> onOpenBook(bookId) }
     }
@@ -44,6 +52,24 @@ fun LibraryScreen(
         Scaffold(
             modifier = modifier.fillMaxSize(),
             containerColor = MaterialTheme.colorScheme.background,
+            topBar = {
+                TopAppBar(
+                    title = { Text("书架", style = MaterialTheme.typography.titleLarge) },
+                    actions = {
+                        IconButton(onClick = { launcher.launch(SUPPORTED_MIMES) }) {
+                            Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
+                        }
+                        IconButton(onClick = onSettings) {
+                            Icon(Icons.Outlined.Settings, contentDescription = "设置")
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background,
+                        titleContentColor = MaterialTheme.colorScheme.onBackground,
+                        actionIconContentColor = MaterialTheme.colorScheme.onBackground,
+                    ),
+                )
+            },
         ) { padding ->
             Box(
                 modifier = Modifier.fillMaxSize().padding(padding),

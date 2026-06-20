@@ -15,4 +15,5 @@ dependencies {
     implementation(project(":extensions:api"))
     implementation(libs.coroutines.core)
     implementation(libs.bundles.koin)
+    implementation(libs.compose.material.icons.extended)
 }
