@@ -1,12 +1,8 @@
 package dev.readflow.updater
 
-import android.content.Context
-import android.content.Intent
-import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -57,22 +53,4 @@ class GitHubUpdateChecker(
         }
     }
 
-    suspend fun download(info: UpdateInfo, context: Context): File = withContext(Dispatchers.IO) {
-        val dest = File(context.cacheDir, "update.apk")
-        val conn = URL(info.apkUrl).openConnection() as HttpURLConnection
-        conn.connect()
-        conn.inputStream.use { input -> dest.outputStream().use { input.copyTo(it) } }
-        conn.disconnect()
-        dest
-    }
-
-    fun install(context: Context, apkFile: File) {
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", apkFile)
-        context.startActivity(
-            Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-            },
-        )
-    }
 }
