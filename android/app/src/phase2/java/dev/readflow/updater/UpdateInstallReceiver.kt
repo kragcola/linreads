@@ -25,6 +25,13 @@ class UpdateInstallReceiver : BroadcastReceiver() {
     private fun onInstallRequested(context: Context, intent: Intent) {
         val apkUrl = intent.getStringExtra("apk_url") ?: return
 
+        // Clean up previous download record (and its file) before starting a new one.
+        val prefs = context.getSharedPreferences("update", Context.MODE_PRIVATE)
+        val prevId = prefs.getLong("dl_id", -1)
+        if (prevId != -1L) {
+            context.getSystemService(DownloadManager::class.java).remove(prevId)
+        }
+
         if (!context.packageManager.canRequestPackageInstalls()) {
             context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
                 data = Uri.parse("package:${context.packageName}")
