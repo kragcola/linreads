@@ -1,13 +1,17 @@
 package dev.readflow.core.ui
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -16,14 +20,23 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import dev.readflow.core.model.LibraryItem
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
+import kotlin.math.abs
 
+/**
+ * 书架网格，支持点击、拖拽重排、dwell 悬停建组。
+ *
+ * **手势设计**（根因修复）：
+ * - 点击 → 打开书
+ * - ⋮ 菜单 → 改名/建组/删除（不再用长按弹菜单，消除与拖动的竞态）
+ * - 长按拖动 → 重排（实时让位动画用 `Modifier.animateItem()`）
+ * - 悬停 ~700ms → 高亮目标书 → 松手建组
+ */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun BookGrid(
@@ -38,22 +51,38 @@ fun BookGrid(
     val palette = readflowPalette
     val mutableItems = remember { mutableStateListOf(*items.toTypedArray()) }
     LaunchedEffect(items) {
-        if (items != mutableItems.toList()) { mutableItems.clear(); mutableItems.addAll(items) }
+        if (items != mutableItems.toList()) {
+            mutableItems.clear()
+            mutableItems.addAll(items)
+        }
     }
 
     val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
 
-    var draggedIndex by remember { mutableStateOf(-1) }
+    // ── 拖动状态（grid 绝对坐标系） ──
+    var draggedIndex by remember { mutableIntStateOf(-1) }
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
     var dragStartAbsPos by remember { mutableStateOf(Offset.Zero) }
-    var dropIndex by remember { mutableStateOf(-1) }
+    var currentHoverIndex by remember { mutableIntStateOf(-1) }
+    var dwellTargetIndex by remember { mutableIntStateOf(-1) } // dwell 高亮的目标书
 
+    // dwell 计时
+    var dwellJob by remember { mutableStateOf<Job?>(null) }
+    val dwellThresholdMs = 700L
+    val dwellMoveTolerance = 12.dp // 允许轻微抖动
+
+    // 自动滚动
+    var autoScrollJob by remember { mutableStateOf<Job?>(null) }
+    val scrollEdgeThreshold = 80.dp
+
+    // 菜单/对话框状态
     var contextItem by remember { mutableStateOf<LibraryItem?>(null) }
+    var contextMenuAnchor by remember { mutableStateOf<Int?>(null) } // 菜单绑定的 item index
     var renameItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var renameText by remember { mutableStateOf("") }
-    var groupTargetItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var groupSourceId by remember { mutableStateOf("") }
+    var groupTargetItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var groupName by remember { mutableStateOf("") }
 
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
@@ -67,7 +96,7 @@ fun BookGrid(
         ) {
             itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
                 val isDragging = draggedIndex == index
-                val isDropTarget = dropIndex == index && draggedIndex >= 0 && draggedIndex != index
+                val isDwellTarget = dwellTargetIndex == index && draggedIndex >= 0 && draggedIndex != index
 
                 Column(
                     modifier = Modifier
@@ -75,44 +104,42 @@ fun BookGrid(
                         .graphicsLayer {
                             translationX = if (isDragging) dragOffset.x else 0f
                             translationY = if (isDragging) dragOffset.y else 0f
-                            scaleX = if (isDragging) 1.06f else if (isDropTarget) 0.94f else 1f
-                            scaleY = if (isDragging) 1.06f else if (isDropTarget) 0.94f else 1f
+                            scaleX = if (isDragging) 1.06f else if (isDwellTarget) 0.96f else 1f
+                            scaleY = if (isDragging) 1.06f else if (isDwellTarget) 0.96f else 1f
                             alpha = if (isDragging) 0.85f else 1f
                         }
-                        // 长按→菜单；点击→打开。与下方拖动手势互斥：拖动一旦开始 draggedIndex==index，
-                        // onLongClick 里延迟 80ms 后检测到此状态则不弹菜单。
-                        .combinedClickable(
-                            onClick = { onItemClick(item) },
-                            onLongClick = {
-                                scope.launch {
-                                    delay(80)
-                                    if (draggedIndex != index) contextItem = item
-                                }
-                            },
-                        )
+                        .animateItem() // Compose 原生让位动画
+                        .clickable { onItemClick(item) }
                         .pointerInput(item.key) {
-                            var totalDrag = Offset.Zero
+                            var lastStablePos = Offset.Zero
+                            var dwellStartTime = 0L
+
                             detectDragGesturesAfterLongPress(
                                 onDragStart = { localPos ->
-                                    totalDrag = Offset.Zero
                                     draggedIndex = index
                                     dragOffset = Offset.Zero
-                                    // 记录拖动起始点在 grid 坐标系内的绝对位置
+                                    dwellTargetIndex = -1
+                                    currentHoverIndex = -1
+                                    dwellJob?.cancel()
+                                    autoScrollJob?.cancel()
+
+                                    // 记录起始绝对位置（grid 坐标系）
                                     val itemInfo = gridState.layoutInfo.visibleItemsInfo
                                         .firstOrNull { it.index == index }
                                     dragStartAbsPos = Offset(
                                         (itemInfo?.offset?.x ?: 0).toFloat() + localPos.x,
                                         (itemInfo?.offset?.y ?: 0).toFloat() + localPos.y,
                                     )
+                                    lastStablePos = dragStartAbsPos
+                                    dwellStartTime = System.currentTimeMillis()
                                 },
                                 onDrag = { change, delta ->
-                                    totalDrag += delta
                                     dragOffset += delta
                                     change.consume()
-                                    // 用 grid 坐标系绝对位置命中目标
+
                                     val absPos = dragStartAbsPos + dragOffset
                                     val visInfo = gridState.layoutInfo.visibleItemsInfo
-                                    dropIndex = visInfo
+                                    val newHoverIndex = visInfo
                                         .firstOrNull { info ->
                                             val rx = info.offset.x.toFloat()
                                             val ry = info.offset.y.toFloat()
@@ -120,46 +147,126 @@ fun BookGrid(
                                                 absPos.y in ry..(ry + info.size.height)
                                         }
                                         ?.index?.coerceIn(0, mutableItems.lastIndex)
-                                        ?: dropIndex
+                                        ?: -1
+
+                                    // ── dwell 检测 ──
+                                    if (newHoverIndex != currentHoverIndex) {
+                                        // 移动到新格子，重置 dwell
+                                        dwellJob?.cancel()
+                                        dwellTargetIndex = -1
+                                        currentHoverIndex = newHoverIndex
+                                        lastStablePos = absPos
+                                        dwellStartTime = System.currentTimeMillis()
+
+                                        // 如果新格子是有效目标，启动 dwell 计时
+                                        if (newHoverIndex >= 0 && newHoverIndex != index) {
+                                            val targetItem = mutableItems.getOrNull(newHoverIndex)
+                                            if (item is LibraryItem.Single && targetItem is LibraryItem.Single) {
+                                                dwellJob = scope.launch {
+                                                    delay(dwellThresholdMs)
+                                                    // 计时结束，高亮目标书
+                                                    dwellTargetIndex = newHoverIndex
+                                                }
+                                            }
+                                        }
+                                    } else if (newHoverIndex >= 0 && newHoverIndex != index) {
+                                        // 同一格子内，检测是否移动过多（抖动）
+                                        val moveDistance = (absPos - lastStablePos).getDistance()
+                                        if (moveDistance > dwellMoveTolerance.toPx()) {
+                                            // 抖动过大，重置 dwell
+                                            dwellJob?.cancel()
+                                            dwellTargetIndex = -1
+                                            lastStablePos = absPos
+                                            dwellStartTime = System.currentTimeMillis()
+                                        }
+                                    }
+
+                                    // ── 自动滚动 ──
+                                    val viewportHeight = gridState.layoutInfo.viewportEndOffset -
+                                        gridState.layoutInfo.viewportStartOffset
+                                    val relativeY = absPos.y - gridState.layoutInfo.viewportStartOffset
+                                    val edgeThresholdPx = scrollEdgeThreshold.toPx()
+
+                                    autoScrollJob?.cancel()
+                                    val scrollSpeed = when {
+                                        relativeY < edgeThresholdPx -> -(edgeThresholdPx - relativeY) / 10f
+                                        relativeY > viewportHeight - edgeThresholdPx ->
+                                            (relativeY - (viewportHeight - edgeThresholdPx)) / 10f
+                                        else -> 0f
+                                    }
+
+                                    if (abs(scrollSpeed) > 1f) {
+                                        autoScrollJob = scope.launch {
+                                            while (true) {
+                                                gridState.scrollToItem(
+                                                    index = (gridState.firstVisibleItemIndex + if (scrollSpeed > 0) 1 else -1)
+                                                        .coerceIn(0, mutableItems.lastIndex)
+                                                )
+                                                delay(100)
+                                            }
+                                        }
+                                    }
                                 },
                                 onDragEnd = {
-                                    val target = dropIndex
+                                    val target = currentHoverIndex
+                                    val wasDwelling = dwellTargetIndex >= 0
+
+                                    dwellJob?.cancel()
+                                    autoScrollJob?.cancel()
                                     draggedIndex = -1
                                     dragOffset = Offset.Zero
-                                    dropIndex = -1
-                                    if (totalDrag.getDistance() > 20.dp.toPx() && target >= 0 && target != index) {
+                                    currentHoverIndex = -1
+                                    dwellTargetIndex = -1
+
+                                    if (target >= 0 && target != index) {
                                         val targetItem = mutableItems.getOrNull(target)
                                         if (item is LibraryItem.Single && targetItem is LibraryItem.Single) {
-                                            groupSourceId = item.book.id
-                                            groupTargetItem = targetItem
-                                            groupName = ""
+                                            if (wasDwelling) {
+                                                // dwell 完成 → 建组
+                                                groupSourceId = item.book.id
+                                                groupTargetItem = targetItem
+                                                groupName = ""
+                                            } else {
+                                                // 快速划过 → 重排
+                                                val moved = mutableItems.removeAt(index)
+                                                mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
+                                                onReorder(mutableItems.toList())
+                                            }
                                         } else {
+                                            // 非单本 → 重排
                                             val moved = mutableItems.removeAt(index)
                                             mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
                                             onReorder(mutableItems.toList())
                                         }
                                     }
-                                    // 注意：不在此处触发菜单，菜单由 combinedClickable.onLongClick 负责
                                 },
                                 onDragCancel = {
+                                    dwellJob?.cancel()
+                                    autoScrollJob?.cancel()
                                     draggedIndex = -1
                                     dragOffset = Offset.Zero
-                                    dropIndex = -1
+                                    currentHoverIndex = -1
+                                    dwellTargetIndex = -1
                                 },
                             )
                         },
                 ) {
+                    // ── 封面 + ⋮ 菜单按钮 ──
                     Box(
-                        modifier = Modifier.aspectRatio(Dimens.coverAspectRatio).padding(bottom = Dimens.spaceXs),
+                        modifier = Modifier
+                            .aspectRatio(Dimens.coverAspectRatio)
+                            .padding(bottom = Dimens.spaceXs),
                     ) {
                         when (item) {
                             is LibraryItem.Single -> {
-                                if (isDropTarget && draggedIndex >= 0) {
+                                if (isDwellTarget && draggedIndex >= 0) {
+                                    // dwell 预览：显示即将建组的样子
                                     val dragged = mutableItems.getOrNull(draggedIndex)
                                     if (dragged is LibraryItem.Single) {
                                         BundleStack(
                                             bundle = dev.readflow.core.model.BookBundle(
-                                                "新书组", listOf(dragged.book, item.book)
+                                                "新书组",
+                                                listOf(dragged.book, item.book),
                                             ),
                                         )
                                     } else {
@@ -168,95 +275,197 @@ fun BookGrid(
                                 } else {
                                     BookCover(book = item.book, modifier = Modifier.fillMaxSize())
                                     if (item.book.lastReadAt != null && item.book.progress > 0f) {
-                                        PaperBookmark(book = item.book,
-                                            modifier = Modifier.align(Alignment.TopEnd).padding(end = 8.dp))
+                                        PaperBookmark(
+                                            book = item.book,
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .padding(end = 8.dp),
+                                        )
                                     }
                                 }
                             }
                             is LibraryItem.Bundle -> BundleStack(bundle = item.bundle)
                         }
+
+                        // ⋮ 菜单按钮（右上角，触摸目标 48dp）
+                        IconButton(
+                            onClick = {
+                                contextItem = item
+                                contextMenuAnchor = index
+                            },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .size(Dimens.touchTarget)
+                                .padding(4.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.MoreVert,
+                                contentDescription = "菜单",
+                                tint = palette.ink.copy(alpha = 0.6f),
+                            )
+                        }
                     }
+
                     val title = when (item) {
                         is LibraryItem.Single -> item.book.title
                         is LibraryItem.Bundle -> item.bundle.name
                     }
-                    Text(text = title, style = ReadflowType.bookTitle, color = palette.ink,
-                        maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    if (item is LibraryItem.Single)
-                        Text(text = item.book.author, style = ReadflowType.meta, color = palette.inkSoft,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        text = title,
+                        style = ReadflowType.bookTitle,
+                        color = palette.ink,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    if (item is LibraryItem.Single) {
+                        Text(
+                            text = item.book.author,
+                            style = ReadflowType.meta,
+                            color = palette.inkSoft,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                     ShelfBoard(modifier = Modifier.padding(top = Dimens.spaceXs))
                 }
             }
         }
     }
 
-    // ── Context menu ──────────────────────────────────────────────────────────
+    // ── Context menu（⋮ 触发） ──────────────────────────────────────────
     contextItem?.let { ci ->
         val id = when (ci) {
             is LibraryItem.Single -> ci.book.id
             is LibraryItem.Bundle -> null
         }
-        DropdownMenu(expanded = true, onDismissRequest = { contextItem = null }) {
+        DropdownMenu(
+            expanded = true,
+            onDismissRequest = {
+                contextItem = null
+                contextMenuAnchor = null
+            },
+        ) {
             if (ci is LibraryItem.Single) {
-                DropdownMenuItem(text = { Text("改名") }, onClick = {
-                    renameText = ci.book.title; renameItem = ci; contextItem = null
-                })
-                DropdownMenuItem(text = { Text("建组") }, onClick = {
-                    groupSourceId = ci.book.id; groupTargetItem = null
-                    groupName = ""; contextItem = null
-                })
+                DropdownMenuItem(
+                    text = { Text("改名") },
+                    onClick = {
+                        renameText = ci.book.title
+                        renameItem = ci
+                        contextItem = null
+                        contextMenuAnchor = null
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text("建组") },
+                    onClick = {
+                        groupSourceId = ci.book.id
+                        groupTargetItem = null
+                        groupName = ""
+                        contextItem = null
+                        contextMenuAnchor = null
+                    },
+                )
             }
             if (id != null) {
-                DropdownMenuItem(text = { Text("删除") }, onClick = {
-                    onDelete(id); contextItem = null
-                })
+                DropdownMenuItem(
+                    text = { Text("删除") },
+                    onClick = {
+                        onDelete(id)
+                        contextItem = null
+                        contextMenuAnchor = null
+                    },
+                )
             }
         }
     }
 
-    // ── Rename dialog ──────────────────────────────────────────────────────────
+    // ── Rename dialog ──────────────────────────────────────────────────────
     renameItem?.let { ri ->
         AlertDialog(
             onDismissRequest = { renameItem = null },
             title = { Text("改名") },
             text = {
-                OutlinedTextField(value = renameText, onValueChange = { renameText = it },
-                    singleLine = true, label = { Text("书名") })
+                OutlinedTextField(
+                    value = renameText,
+                    onValueChange = { renameText = it },
+                    singleLine = true,
+                    label = { Text("书名") },
+                )
             },
             confirmButton = {
-                TextButton(onClick = { onRename(ri.book.id, renameText); renameItem = null }) { Text("确定") }
-            },
-            dismissButton = { TextButton(onClick = { renameItem = null }) { Text("取消") } },
-        )
-    }
-
-    // ── Create-group dialog ────────────────────────────────────────────────────
-    if (groupSourceId.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = { groupSourceId = ""; groupTargetItem = null },
-            title = { Text("建组") },
-            text = {
-                OutlinedTextField(value = groupName, onValueChange = { groupName = it },
-                    singleLine = true, label = { Text("组名") })
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    if (groupName.isNotBlank()) {
-                        onMoveToGroup(groupSourceId, groupName)
-                        groupTargetItem?.let { onMoveToGroup(it.book.id, groupName) }
-                    }
-                    groupSourceId = ""; groupTargetItem = null
-                }) { Text("确定") }
+                TextButton(
+                    onClick = {
+                        onRename(ri.book.id, renameText)
+                        renameItem = null
+                    },
+                ) {
+                    Text("确定")
+                }
             },
             dismissButton = {
-                TextButton(onClick = { groupSourceId = ""; groupTargetItem = null }) { Text("取消") }
+                TextButton(onClick = { renameItem = null }) {
+                    Text("取消")
+                }
+            },
+        )
+    }
+
+    // ── Create-group dialog ────────────────────────────────────────────────
+    if (groupSourceId.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = {
+                groupSourceId = ""
+                groupTargetItem = null
+            },
+            title = { Text("建组") },
+            text = {
+                Column {
+                    if (groupTargetItem != null) {
+                        Text(
+                            text = "将与《${groupTargetItem!!.book.title}》建组",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSoft,
+                            modifier = Modifier.padding(bottom = 8.dp),
+                        )
+                    }
+                    OutlinedTextField(
+                        value = groupName,
+                        onValueChange = { groupName = it },
+                        singleLine = true,
+                        label = { Text("组名") },
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (groupName.isNotBlank()) {
+                            onMoveToGroup(groupSourceId, groupName)
+                            groupTargetItem?.let { onMoveToGroup(it.book.id, groupName) }
+                        }
+                        groupSourceId = ""
+                        groupTargetItem = null
+                    },
+                ) {
+                    Text("确定")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        groupSourceId = ""
+                        groupTargetItem = null
+                    },
+                ) {
+                    Text("取消")
+                }
             },
         )
     }
 }
 
-private val LibraryItem.key: String get() = when (this) {
-    is LibraryItem.Single -> "book:${book.id}"
-    is LibraryItem.Bundle -> "bundle:${bundle.name}"
-}
+private val LibraryItem.key: String
+    get() = when (this) {
+        is LibraryItem.Single -> "book:${book.id}"
+        is LibraryItem.Bundle -> "bundle:${bundle.name}"
+    }
