@@ -90,6 +90,7 @@ dependencies {
         implementation(project(":render:txt"))
         implementation(project(":render:epub"))
         implementation(project(":render:pdf"))
+        implementation(project(":render:md"))
         implementation(project(":render:animate"))
         implementation(project(":features:reader"))
         implementation(project(":features:settings"))
