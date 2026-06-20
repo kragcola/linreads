@@ -66,7 +66,6 @@ dependencies {
 
     implementation(platform(libs.compose.bom))
     implementation(libs.bundles.compose)
-    implementation(libs.compose.material.icons.extended)
     debugImplementation(libs.bundles.compose.debug)
     implementation(libs.activity.compose)
     implementation(libs.bundles.koin)

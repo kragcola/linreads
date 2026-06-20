@@ -45,6 +45,7 @@ ktor-client-android = { group = "io.ktor", name = "ktor-client-android", version
 ktor-client-content-negotiation = { group = "io.ktor", name = "ktor-client-content-negotiation", version.ref = "ktor" }
 ktor-serialization-kotlinx-json = { group = "io.ktor", name = "ktor-serialization-kotlinx-json", version.ref = "ktor" }
 coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
+compose-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core" }
 compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
 paging-runtime = { group = "androidx.paging", name = "paging-runtime", version.ref = "paging" }
 paging-compose = { group = "androidx.paging", name = "paging-compose", version.ref = "paging" }
@@ -69,7 +70,7 @@ turbine = { group = "app.cash.turbine", name = "turbine", version.ref = "turbine
 kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinx-serialization-json" }
 
 [bundles]
-compose = ["compose-ui", "compose-material3", "compose-ui-tooling-preview", "lifecycle-runtime-compose", "lifecycle-viewmodel-compose", "navigation-compose"]
+compose = ["compose-ui", "compose-material3", "compose-material-icons-core", "compose-ui-tooling-preview", "lifecycle-runtime-compose", "lifecycle-viewmodel-compose", "navigation-compose"]
 compose-debug = ["compose-ui-tooling"]
 room = ["room-runtime", "room-ktx"]
 koin = ["koin-android", "koin-androidx-compose"]
