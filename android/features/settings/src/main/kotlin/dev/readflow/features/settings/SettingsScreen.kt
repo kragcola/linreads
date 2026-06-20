@@ -1,15 +1,22 @@
 package dev.readflow.features.settings
 
+import android.app.DownloadManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.readflow.core.model.ThemeMode
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.koin.androidx.compose.koinViewModel
 
@@ -17,21 +24,47 @@ import org.koin.androidx.compose.koinViewModel
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
-    /** Returns APK download URL if update available, null if already latest. */
     onCheckForUpdate: suspend () -> String? = { null },
-    /** Called with the APK URL when the user confirms download. */
-    onStartDownload: (String) -> Unit = {},
+    authToken: String = "",
 ) {
     val vm = koinViewModel<SettingsViewModel>()
     val url by vm.calibreBaseUrl.collectAsStateWithLifecycle()
     val fontSize by vm.fontSize.collectAsStateWithLifecycle()
     val theme by vm.themeMode.collectAsStateWithLifecycle()
+    val context = LocalContext.current
 
     var urlDraft by remember(url) { mutableStateOf(url ?: "") }
-
-    // Update check state
     val scope = rememberCoroutineScope()
     var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
+
+    // Poll DownloadManager progress while downloading
+    if (updateState is UpdateState.Downloading) {
+        val dlId = (updateState as UpdateState.Downloading).dlId
+        LaunchedEffect(dlId) {
+            val dm = context.getSystemService(DownloadManager::class.java)
+            while (true) {
+                delay(600)
+                val q = dm.query(DownloadManager.Query().setFilterById(dlId))
+                if (!q.moveToFirst()) { q.close(); updateState = UpdateState.Error("下载失败"); break }
+                val status = q.getInt(q.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                val soFar = q.getLong(q.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
+                val total = q.getLong(q.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
+                q.close()
+                when (status) {
+                    DownloadManager.STATUS_SUCCESSFUL -> {
+                        val uri = dm.getUriForDownloadedFile(dlId)
+                        if (uri != null) { launchInstaller(context, uri); updateState = UpdateState.ReadyToInstall(uri) }
+                        else updateState = UpdateState.Error("安装包丢失")
+                        break
+                    }
+                    DownloadManager.STATUS_FAILED -> { updateState = UpdateState.Error("下载失败"); break }
+                    else -> updateState = UpdateState.Downloading(
+                        progress = if (total > 0) soFar.toFloat() / total else -1f, dlId = dlId,
+                    )
+                }
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -50,58 +83,46 @@ fun SettingsScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             OutlinedTextField(
-                value = urlDraft,
-                onValueChange = { urlDraft = it },
+                value = urlDraft, onValueChange = { urlDraft = it },
                 label = { Text("Calibre 服务器地址") },
                 placeholder = { Text("http://192.168.1.x:8080") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
+                modifier = Modifier.fillMaxWidth(), singleLine = true,
                 trailingIcon = {
-                    if (urlDraft != (url ?: "")) {
+                    if (urlDraft != (url ?: ""))
                         TextButton(onClick = { vm.setCalibreUrl(urlDraft) }) { Text("保存") }
-                    }
                 },
             )
 
             Text("字号：${fontSize}sp", style = MaterialTheme.typography.bodyMedium)
-            Slider(
-                value = fontSize.toFloat(),
-                onValueChange = { vm.setFontSize(it.toInt()) },
-                valueRange = 12f..28f,
-                steps = 7,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Text(
-                text = "这是 ${fontSize}sp 的正文效果。The quick brown fox.",
-                fontSize = fontSize.sp,
-                color = MaterialTheme.colorScheme.onBackground,
-            )
+            Slider(value = fontSize.toFloat(), onValueChange = { vm.setFontSize(it.toInt()) },
+                valueRange = 12f..28f, steps = 7, modifier = Modifier.fillMaxWidth())
+            Text("这是 ${fontSize}sp 的正文效果。The quick brown fox.",
+                fontSize = fontSize.sp, color = MaterialTheme.colorScheme.onBackground)
 
             Text("主题", style = MaterialTheme.typography.bodyMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ThemeMode.entries.forEach { mode ->
-                    FilterChip(
-                        selected = theme == mode,
-                        onClick = { vm.setTheme(mode) },
-                        label = { Text(mode.label()) },
-                    )
+                    FilterChip(selected = theme == mode, onClick = { vm.setTheme(mode) },
+                        label = { Text(mode.label()) })
                 }
             }
 
             HorizontalDivider()
 
-            // Update check
             when (val s = updateState) {
                 UpdateState.Idle -> Button(onClick = {
                     scope.launch {
                         updateState = UpdateState.Checking
                         runCatching { onCheckForUpdate() }
-                            .onSuccess { apkUrl -> updateState = if (apkUrl != null) UpdateState.Available(apkUrl) else UpdateState.UpToDate }
+                            .onSuccess { url -> updateState = if (url != null) UpdateState.Available(url) else UpdateState.UpToDate }
                             .onFailure { updateState = UpdateState.Error(it.message ?: "检查失败") }
                     }
                 }) { Text("检查更新") }
 
-                UpdateState.Checking -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                UpdateState.Checking -> Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                     Text("检查中…", style = MaterialTheme.typography.bodyMedium)
                 }
@@ -110,7 +131,30 @@ fun SettingsScreen(
 
                 is UpdateState.Available -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("发现新版本，点击下载安装", style = MaterialTheme.typography.bodyMedium)
-                    Button(onClick = { onStartDownload(s.apkUrl) }) { Text("下载并安装") }
+                    Button(onClick = {
+                        val (dlId, completedUri) = context.startOrGetDownload(s.apkUrl, authToken)
+                        if (completedUri != null) {
+                            launchInstaller(context, completedUri)
+                            updateState = UpdateState.ReadyToInstall(completedUri)
+                        } else {
+                            updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
+                        }
+                    }) { Text("下载并安装") }
+                }
+
+                is UpdateState.Downloading -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (s.progress < 0f) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        Text("下载中…", style = MaterialTheme.typography.bodyMedium)
+                    } else {
+                        LinearProgressIndicator(progress = { s.progress }, modifier = Modifier.fillMaxWidth())
+                        Text("下载中 ${(s.progress * 100).toInt()}%", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+
+                is UpdateState.ReadyToInstall -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("下载完成", style = MaterialTheme.typography.bodyMedium)
+                    Button(onClick = { launchInstaller(context, s.uri) }) { Text("安装") }
                 }
 
                 is UpdateState.Error -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -122,11 +166,57 @@ fun SettingsScreen(
     }
 }
 
+/**
+ * 若已有完成的下载 → 返回 (dlId, uri)；若正在下载 → 返回 (dlId, null)；
+ * 否则新建下载 → 返回 (newDlId, null)。避免重复下载。
+ */
+private fun Context.startOrGetDownload(apkUrl: String, authToken: String): Pair<Long, Uri?> {
+    val prefs = getSharedPreferences("update", Context.MODE_PRIVATE)
+    val existingId = prefs.getLong("dl_id", -1L)
+    if (existingId != -1L) {
+        val dm = getSystemService(DownloadManager::class.java)
+        val q = dm.query(DownloadManager.Query().setFilterById(existingId))
+        if (q.moveToFirst()) {
+            val status = q.getInt(q.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            q.close()
+            when (status) {
+                DownloadManager.STATUS_SUCCESSFUL -> dm.getUriForDownloadedFile(existingId)
+                    ?.let { return existingId to it }
+                DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING ->
+                    return existingId to null  // reattach to in-progress download
+                else -> {}  // failed/paused: fall through and re-enqueue
+            }
+        } else q.close()
+        dm.remove(existingId)
+    }
+    val dm = getSystemService(DownloadManager::class.java)
+    val dlId = dm.enqueue(
+        DownloadManager.Request(Uri.parse(apkUrl)).apply {
+            if (authToken.isNotEmpty()) addRequestHeader("Authorization", "Bearer $authToken")
+            setTitle("LinReads 更新下载中")
+            setMimeType("application/vnd.android.package-archive")
+            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            setDestinationInExternalFilesDir(this@startOrGetDownload, null, "update.apk")
+        }
+    )
+    prefs.edit().putLong("dl_id", dlId).apply()
+    return dlId to null
+}
+
+private fun launchInstaller(context: Context, uri: Uri) {
+    context.startActivity(Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    })
+}
+
 private sealed interface UpdateState {
     data object Idle : UpdateState
     data object Checking : UpdateState
     data object UpToDate : UpdateState
     data class Available(val apkUrl: String) : UpdateState
+    data class Downloading(val progress: Float, val dlId: Long) : UpdateState
+    data class ReadyToInstall(val uri: Uri) : UpdateState
     data class Error(val msg: String) : UpdateState
 }
 

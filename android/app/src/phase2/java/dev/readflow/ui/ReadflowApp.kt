@@ -88,14 +88,7 @@ fun ReadflowApp() {
                 SettingsScreen(
                     onBack = { navController.popBackStack() },
                     onCheckForUpdate = { AppUpdateManager.checkForUpdate() },
-                    onStartDownload = { apkUrl ->
-                        context.sendBroadcast(
-                            Intent(context, UpdateInstallReceiver::class.java)
-                                .putExtra("apk_url", apkUrl)
-                                .putExtra("tag_name", "dev-latest")
-                                .putExtra("auth_token", dev.readflow.BuildConfig.GITHUB_OTA_TOKEN)
-                        )
-                    },
+                    authToken = dev.readflow.BuildConfig.GITHUB_OTA_TOKEN,
                 )
             }
         }
