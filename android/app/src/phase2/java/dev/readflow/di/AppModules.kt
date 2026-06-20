@@ -128,7 +128,7 @@ val settingsModule = module {
 val featureModule = module {
     viewModel { LibraryViewModel(get(), get(), get()) }
     viewModel { SettingsViewModel(get()) }
-    viewModel { ReaderViewModel(get(), get(), get(), get(), get()) }
+    viewModel { ReaderViewModel(get(), get(), get(), get(), get(), get()) }
 }
 
 val appModules = listOf(coreModule, databaseModule, extensionsModule, renderModule, settingsModule, featureModule)

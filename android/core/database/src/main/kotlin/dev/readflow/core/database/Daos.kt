@@ -6,23 +6,17 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import kotlinx.coroutines.flow.Flow
 
-/** DAO signatures for the 5 tables. Phase 1 scaffold: minimal CRUD surface, no complex queries. */
-
 @Dao
 interface BookDao {
     @Query("SELECT * FROM books ORDER BY lastReadAt DESC")
     fun observeAll(): Flow<List<BookEntity>>
 
-    /**
-     * Shelf rows: every book left-joined with its whole-book progress. Recent-first,
-     * NULL lastReadAt (never opened) last. Powers the library grid (设计文档 §2.1).
-     */
     @Query(
         """
         SELECT b.*, COALESCE(p.totalProgression, 0.0) AS progress
         FROM books b
         LEFT JOIN reading_progress p ON p.bookId = b.id
-        ORDER BY b.lastReadAt IS NULL, b.lastReadAt DESC, b.title COLLATE NOCASE
+        ORDER BY b.sortOrder ASC, b.lastReadAt IS NULL, b.lastReadAt DESC, b.title COLLATE NOCASE
         """,
     )
     fun observeShelf(): Flow<List<BookWithProgress>>
@@ -41,6 +35,18 @@ interface BookDao {
 
     @Query("UPDATE books SET lastReadAt = :ts WHERE id = :id")
     suspend fun updateLastReadAt(id: String, ts: Long)
+
+    @Query("DELETE FROM books WHERE id = :id")
+    suspend fun deleteById(id: String)
+
+    @Query("UPDATE books SET title = :title WHERE id = :id")
+    suspend fun updateTitle(id: String, title: String)
+
+    @Query("UPDATE books SET collectionName = :name WHERE id = :id")
+    suspend fun updateCollectionName(id: String, name: String?)
+
+    @Query("UPDATE books SET sortOrder = :order WHERE id = :id")
+    suspend fun updateSortOrder(id: String, order: Int)
 }
 
 @Dao

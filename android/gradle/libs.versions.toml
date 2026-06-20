@@ -13,6 +13,8 @@ navigation = "2.9.4"
 lifecycle = "2.9.0"
 activity-compose = "1.10.0"
 recyclerview = "1.4.0"
+documentfile = "1.1.0"
+reorderable = "2.3.4"
 datastore = "1.1.4"
 markwon = "4.6.2"
 mupdf = "1.27.0"
@@ -56,6 +58,8 @@ markwon-ext-strikethrough = { group = "io.noties.markwon", name = "ext-strikethr
 mupdf-fitz = { group = "com.artifex.mupdf", name = "fitz", version.ref = "mupdf" }
 jsoup = { group = "org.jsoup", name = "jsoup", version.ref = "jsoup" }
 recyclerview = { group = "androidx.recyclerview", name = "recyclerview", version.ref = "recyclerview" }
+documentfile = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentfile" }
+reorderable = { group = "sh.calvin.reorderable", name = "reorderable", version.ref = "reorderable" }
 # Gradle plugin artifacts — consumed by build-logic convention plugins (compileOnly)
 android-gradlePlugin = { group = "com.android.tools.build", name = "gradle", version.ref = "agp" }
 kotlin-gradlePlugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }

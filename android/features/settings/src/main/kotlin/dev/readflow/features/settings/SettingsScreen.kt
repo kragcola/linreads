@@ -7,6 +7,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.readflow.core.model.ThemeMode
 import kotlinx.coroutines.launch
@@ -69,6 +70,11 @@ fun SettingsScreen(
                 valueRange = 12f..28f,
                 steps = 7,
                 modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                text = "这是 ${fontSize}sp 的正文效果。The quick brown fox.",
+                fontSize = fontSize.sp,
+                color = MaterialTheme.colorScheme.onBackground,
             )
 
             Text("主题", style = MaterialTheme.typography.bodyMedium)

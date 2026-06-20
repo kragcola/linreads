@@ -6,6 +6,8 @@ import androidx.room.PrimaryKey
 
 /** Room entities for the 5 tables in §7.8. Phase 1 scaffold: schema only, no business queries. */
 
+import androidx.room.ColumnInfo
+
 @Entity(tableName = "books")
 data class BookEntity(
     @PrimaryKey val id: String,
@@ -17,6 +19,7 @@ data class BookEntity(
     val localUri: String? = null,
     val lastReadAt: Long? = null,
     val collectionName: String? = null,
+    @ColumnInfo(defaultValue = "0") val sortOrder: Int = 0,
 )
 
 /** Projection for the shelf query: a book row plus its joined whole-book progress. */

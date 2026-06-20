@@ -9,6 +9,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -21,8 +23,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import dev.readflow.core.ui.BookGrid
 import dev.readflow.core.ui.EmptyState
 import dev.readflow.core.ui.PaperSurface
@@ -39,14 +45,21 @@ fun LibraryScreen(
     viewModel: LibraryViewModel = koinViewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
+    val scanResults by viewModel.scanResults.collectAsState()
+    val context = LocalContext.current
 
     LaunchedEffect(Unit) {
         viewModel.openBook.collect { bookId -> onOpenBook(bookId) }
     }
 
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { viewModel.importBook(it) }
     }
+    val folderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let { viewModel.scanFolder(context, it) }
+    }
+
+    var showAddMenu by remember { mutableStateOf(false) }
 
     PaperSurface {
         Scaffold(
@@ -56,8 +69,20 @@ fun LibraryScreen(
                 TopAppBar(
                     title = { Text("书架", style = MaterialTheme.typography.titleLarge) },
                     actions = {
-                        IconButton(onClick = { launcher.launch(SUPPORTED_MIMES) }) {
-                            Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
+                        Box {
+                            IconButton(onClick = { showAddMenu = true }) {
+                                Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
+                            }
+                            DropdownMenu(expanded = showAddMenu, onDismissRequest = { showAddMenu = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("选择文件") },
+                                    onClick = { showAddMenu = false; fileLauncher.launch(SUPPORTED_MIMES) },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("扫描文件夹") },
+                                    onClick = { showAddMenu = false; folderLauncher.launch(null) },
+                                )
+                            }
                         }
                         IconButton(onClick = onSettings) {
                             Icon(Icons.Outlined.Settings, contentDescription = "设置")
@@ -80,14 +105,26 @@ fun LibraryScreen(
                     state.error != null -> Text("加载失败：${state.error}", color = MaterialTheme.colorScheme.onBackground)
                     state.items.isEmpty() -> EmptyState(
                         onConnectCalibre = onSettings,
-                        onImportLocal = { launcher.launch(SUPPORTED_MIMES) },
+                        onImportLocal = { fileLauncher.launch(SUPPORTED_MIMES) },
                     )
                     else -> BookGrid(
                         items = state.items,
                         onItemClick = viewModel::onItemClick,
+                        onDelete = viewModel::deleteBook,
+                        onRename = viewModel::renameBook,
+                        onMoveToGroup = viewModel::moveToGroup,
+                        onReorder = viewModel::reorder,
                     )
                 }
             }
+        }
+
+        scanResults?.let { books ->
+            ImportPreviewSheet(
+                books = books,
+                onImport = { viewModel.importFromFolder(it) },
+                onDismiss = { viewModel.clearScan() },
+            )
         }
     }
 }

@@ -8,6 +8,7 @@ import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -16,20 +17,22 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.ui.ReadflowTheme
 import dev.readflow.features.library.LibraryScreen
 import dev.readflow.features.reader.ReaderIntent
 import dev.readflow.features.reader.ReaderScreen
 import dev.readflow.features.reader.ReaderViewModel
 import dev.readflow.features.settings.SettingsScreen
+import dev.readflow.features.settings.SettingsViewModel
 import dev.readflow.updater.AppUpdateManager
 import dev.readflow.updater.UpdateInstallReceiver
 import org.koin.androidx.compose.koinViewModel
@@ -38,11 +41,9 @@ import org.koin.androidx.compose.koinViewModel
 fun ReadflowApp() {
     val context = LocalContext.current
 
-    // POST_NOTIFICATIONS (Android 13+): launcher must be registered unconditionally — Compose
-    // rules forbid calling remember* inside a conditional.
     val notifLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* no-op: notification silently absent if denied */ }
+    ) { /* no-op */ }
 
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -53,19 +54,22 @@ fun ReadflowApp() {
         }
     }
 
-    // REQUEST_INSTALL_PACKAGES: not a runtime permission — requires Settings navigation.
-    // Re-check on every resume so the dialog clears once the user enables it.
     var showInstallPermDialog by remember {
         mutableStateOf(!context.packageManager.canRequestPackageInstalls())
     }
-
-    // Re-check install permission on every resume (clears dialog if user just enabled it).
     LifecycleResumeEffect(Unit) {
         showInstallPermDialog = !context.packageManager.canRequestPackageInstalls()
         onPauseOrDispose {}
     }
 
-    ReadflowTheme {
+    // Observe theme from settings so changes take effect immediately.
+    val themeVm = koinViewModel<SettingsViewModel>()
+    val themeMode by themeVm.themeMode.collectAsStateWithLifecycle()
+    val systemDark = isSystemInDarkTheme()
+    val darkTheme = themeMode == ThemeMode.DARK || (themeMode == ThemeMode.SYSTEM && systemDark)
+    val sepiaTheme = themeMode == ThemeMode.SEPIA
+
+    ReadflowTheme(darkTheme = darkTheme, sepiaTheme = sepiaTheme) {
         val navController = rememberNavController()
         NavHost(navController = navController, startDestination = "library") {
             composable("library") {

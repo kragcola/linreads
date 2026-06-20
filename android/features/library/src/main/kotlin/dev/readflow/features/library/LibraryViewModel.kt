@@ -1,5 +1,6 @@
 package dev.readflow.features.library
 
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -9,7 +10,9 @@ import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.model.LibraryItem
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.prefs.SettingsRepository
+import dev.readflow.extensions.api.FolderScanner
 import dev.readflow.extensions.api.LocalFileBookSource
+import dev.readflow.extensions.api.ScannedBook
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -34,9 +37,11 @@ class LibraryViewModel(
     private val _uiState = MutableStateFlow(LibraryUiState(isLoading = true))
     val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
 
-    /** One-shot navigation event: bookId to open in reader. */
     private val _openBook = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val openBook: SharedFlow<String> = _openBook.asSharedFlow()
+
+    private val _scanResults = MutableStateFlow<List<ScannedBook>?>(null)
+    val scanResults: StateFlow<List<ScannedBook>?> = _scanResults.asStateFlow()
 
     init {
         viewModelScope.launch {
@@ -59,7 +64,6 @@ class LibraryViewModel(
         _openBook.tryEmit(bookId)
     }
 
-    /** Called after SAF picker returns a Uri. Copies file, upserts to Room. */
     fun importBook(uri: Uri) {
         viewModelScope.launch {
             when (val result = localSource.import(uri)) {
@@ -70,7 +74,52 @@ class LibraryViewModel(
         }
     }
 
-    /** Fetches the Calibre library and upserts all books into Room. */
+    fun scanFolder(context: Context, treeUri: Uri) {
+        viewModelScope.launch {
+            _scanResults.value = FolderScanner.scan(context, treeUri)
+        }
+    }
+
+    fun clearScan() { _scanResults.value = null }
+
+    fun importFromFolder(uris: List<Uri>) {
+        viewModelScope.launch {
+            val metas = uris.mapNotNull { uri ->
+                (localSource.import(uri) as? ReadflowResult.Success)?.value?.first
+            }
+            if (metas.isNotEmpty()) repository.upsertAll(metas)
+        }
+    }
+
+    fun deleteBook(id: String) {
+        viewModelScope.launch { repository.deleteBook(id) }
+    }
+
+    fun renameBook(id: String, title: String) {
+        viewModelScope.launch { repository.renameBook(id, title) }
+    }
+
+    /** After drag reorder, persist new sort positions for the visible flat list. */
+    fun reorder(items: List<LibraryItem>) {
+        viewModelScope.launch {
+            items.forEachIndexed { idx, item ->
+                val ids = when (item) {
+                    is LibraryItem.Single -> listOf(item.book.id)
+                    is LibraryItem.Bundle -> item.bundle.books.map { it.id }
+                }
+                ids.forEach { repository.updateSortOrder(it, idx) }
+            }
+        }
+    }
+
+    fun moveToGroup(bookId: String, groupName: String) {
+        viewModelScope.launch { repository.setCollection(bookId, groupName) }
+    }
+
+    fun removeFromGroup(bookId: String) {
+        viewModelScope.launch { repository.setCollection(bookId, null) }
+    }
+
     fun refreshFromCalibre(baseUrl: String) {
         viewModelScope.launch {
             val calibreRepo = CalibreRepositoryImpl(CalibreClient(baseUrl))

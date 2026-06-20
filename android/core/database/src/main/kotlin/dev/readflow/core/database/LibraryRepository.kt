@@ -8,71 +8,48 @@ import dev.readflow.core.model.LibraryItem
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
-/**
- * Library data facade (Layer 1). Observes the shelf as a list of [LibraryItem]:
- * books sharing a `collectionName` collapse into a [LibraryItem.Bundle], the rest
- * are [LibraryItem.Single]. Ordering preserves the DAO's recent-first sort, with
- * each bundle positioned at its most-recent member (设计文档 §2.1 / §2.1.2).
- */
-class LibraryRepository(
-    private val bookDao: BookDao,
-) {
+class LibraryRepository(private val bookDao: BookDao) {
+
     fun observeShelf(): Flow<List<LibraryItem>> =
         bookDao.observeShelf().map { rows -> groupIntoItems(rows.map { it.toMeta() }) }
 
     suspend fun count(): Int = bookDao.count()
-
     suspend fun upsertBook(book: BookMeta) = bookDao.upsert(book.toEntity())
-
-    suspend fun upsertAll(books: List<BookMeta>) =
-        bookDao.upsertAll(books.map { it.toEntity() })
+    suspend fun upsertAll(books: List<BookMeta>) = bookDao.upsertAll(books.map { it.toEntity() })
+    suspend fun deleteBook(id: String) = bookDao.deleteById(id)
+    suspend fun renameBook(id: String, title: String) = bookDao.updateTitle(id, title)
+    suspend fun setCollection(id: String, name: String?) = bookDao.updateCollectionName(id, name)
+    suspend fun updateSortOrder(id: String, order: Int) = bookDao.updateSortOrder(id, order)
 
     private fun groupIntoItems(books: List<BookMeta>): List<LibraryItem> {
         val items = mutableListOf<LibraryItem>()
         val seenCollections = mutableSetOf<String>()
-        val byCollection = books.filter { it.collectionName != null }
-            .groupBy { it.collectionName!! }
-
+        val byCollection = books.filter { it.collectionName != null }.groupBy { it.collectionName!! }
         for (book in books) {
-            val collection = book.collectionName
-            if (collection == null) {
+            val col = book.collectionName
+            if (col == null) {
                 items += LibraryItem.Single(book)
-            } else if (seenCollections.add(collection)) {
-                // First (most-recent) member of this collection anchors the bundle's position.
-                val members = byCollection.getValue(collection)
-                if (members.size == 1) {
-                    items += LibraryItem.Single(members.first())
-                } else {
-                    items += LibraryItem.Bundle(BookBundle(collection, members))
-                }
+            } else if (seenCollections.add(col)) {
+                val members = byCollection.getValue(col)
+                items += if (members.size == 1) LibraryItem.Single(members.first())
+                         else LibraryItem.Bundle(BookBundle(col, members))
             }
         }
         return items
     }
 }
 
-private fun BookWithProgress.toMeta(): BookMeta = BookMeta(
-    id = book.id,
-    title = book.title,
-    author = book.author,
+private fun BookWithProgress.toMeta() = BookMeta(
+    id = book.id, title = book.title, author = book.author,
     format = runCatching { BookFormat.valueOf(book.format) }.getOrDefault(BookFormat.UNKNOWN),
     coverUrl = book.coverUrl,
-    downloadStatus = runCatching { DownloadStatus.valueOf(book.downloadStatus) }
-        .getOrDefault(DownloadStatus.NOT_DOWNLOADED),
-    localUri = book.localUri,
-    lastReadAt = book.lastReadAt,
-    collectionName = book.collectionName,
+    downloadStatus = runCatching { DownloadStatus.valueOf(book.downloadStatus) }.getOrDefault(DownloadStatus.NOT_DOWNLOADED),
+    localUri = book.localUri, lastReadAt = book.lastReadAt, collectionName = book.collectionName,
     progress = progress,
 )
 
-private fun BookMeta.toEntity(): BookEntity = BookEntity(
-    id = id,
-    title = title,
-    author = author,
-    format = format.name,
-    coverUrl = coverUrl,
-    downloadStatus = downloadStatus.name,
-    localUri = localUri,
-    lastReadAt = lastReadAt,
+private fun BookMeta.toEntity() = BookEntity(
+    id = id, title = title, author = author, format = format.name, coverUrl = coverUrl,
+    downloadStatus = downloadStatus.name, localUri = localUri, lastReadAt = lastReadAt,
     collectionName = collectionName,
 )

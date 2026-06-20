@@ -79,12 +79,13 @@ class LocalFileBookSource(
                 )
 
                 val title = fileName.substringBeforeLast('.')
+                val coverUri = CoverExtractor.extract(context, outFile, format, id)
                 val meta = BookMeta(
                     id = id,
                     title = title,
                     author = "未知作者",
                     format = format,
-                    coverUrl = null,
+                    coverUrl = coverUri,
                     downloadStatus = DownloadStatus.DOWNLOADED,
                     localUri = Uri.fromFile(outFile).toString(),
                     lastReadAt = null,

@@ -11,12 +11,14 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.PageTransitionHostFactory
 import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReaderEngineRegistry
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.debounce
@@ -40,6 +42,7 @@ class ReaderViewModel(
     private val bookDao: BookDao,
     private val progressDao: ReadingProgressDao,
     private val syncManager: SyncManager,
+    private val settings: SettingsRepository,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ReaderUiState())
@@ -80,6 +83,8 @@ class ReaderViewModel(
         viewModelScope.launch {
             val engine = engineRegistry.resolve(uri)
             engine.openBook(uri)
+            // Apply persisted font size.
+            engine.setFontSize(settings.fontSize.first().toFloat())
             // Restore saved progress
             bookId?.let { id ->
                 progressDao.get(id)?.let { saved ->
@@ -133,9 +138,26 @@ class ReaderViewModel(
     }
 
     private fun close() {
+        val bookId = currentBookId
+        val locator = _uiState.value.engine?.currentLocator?.value
         progressJob?.cancel()
         val engine = _uiState.value.engine
         viewModelScope.launch {
+            // Force-save progress before close so debounce doesn't swallow it.
+            if (bookId != null && locator != null && (locator.totalProgression ?: 0f) > 0f) {
+                val now = System.currentTimeMillis()
+                progressDao.upsert(
+                    ReadingProgressEntity(
+                        bookId = bookId,
+                        locatorJson = Json.encodeToString(locator),
+                        totalProgression = locator.totalProgression ?: 0f,
+                        progressPercent = locator.totalProgression ?: 0f,
+                        updatedAt = now,
+                        deviceId = "local",
+                    ),
+                )
+                bookDao.updateLastReadAt(bookId, now)
+            }
             engine?.close()
             _uiState.value = ReaderUiState()
         }

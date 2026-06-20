@@ -56,6 +56,7 @@ Android v4lite：书库（本地导入 + Calibre LAN）、TXT/EPUB/PDF 三引擎
 
 | Skill | 强制触发范围 |
 |-------|------------|
+| `android-native-dev` | `android/**` 任意代码改动；措辞含「Material Design/Compose/Gradle/构建/无障碍/触摸目标」；补充 linreads-dev 的通用 Android 标准层 |
 | `linreads-dev` | `web/src/**`、`android/**`、`harmony/**`、`shared/**` 任意代码改动；任务措辞含「实现/开发/加/改/修/新增/重构」 |
 | `linreads-epub` | `web/src/pages/Reader.tsx`、任何含 epubjs/epub-ts/CFI 的文件；措辞含「EPUB/epubjs/epub-ts/CFI/书签/章节/渲染/翻页」 |
 | `linreads-sync` | `shared/**`、任何含 sync/progress 的文件；措辞含「进度同步/LWW/书签同步」 |

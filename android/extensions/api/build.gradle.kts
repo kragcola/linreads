@@ -10,4 +10,5 @@ dependencies {
     implementation(project(":core:model"))
     implementation(project(":core:database"))
     implementation(libs.coroutines.core)
+    implementation(libs.documentfile)
 }

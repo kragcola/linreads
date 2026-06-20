@@ -56,13 +56,30 @@ private val DarkColors = darkColorScheme(
     outline = ReadflowColors.InkNightSoft,
 )
 
+private val SepiaColors = lightColorScheme(
+    background = Color(0xFFF4EEDD),
+    onBackground = Color(0xFF3A2E1A),
+    surface = Color(0xFFF4EEDD),
+    onSurface = Color(0xFF3A2E1A),
+    surfaceVariant = Color(0xFFEBE0CA),
+    onSurfaceVariant = Color(0xFF6B5A3E),
+    primary = Color(0xFF3A2E1A),
+    onPrimary = Color(0xFFF4EEDD),
+    outline = Color(0xFF6B5A3E),
+)
+
 @Composable
 fun ReadflowTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
+    sepiaTheme: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     MaterialTheme(
-        colorScheme = if (darkTheme) DarkColors else LightColors,
+        colorScheme = when {
+            sepiaTheme -> SepiaColors
+            darkTheme -> DarkColors
+            else -> LightColors
+        },
         typography = ReadflowTypography,
         content = content,
     )

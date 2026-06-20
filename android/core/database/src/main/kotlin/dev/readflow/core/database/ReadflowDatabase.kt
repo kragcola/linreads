@@ -1,9 +1,10 @@
 package dev.readflow.core.database
 
+import androidx.room.AutoMigration
 import androidx.room.Database
 import androidx.room.RoomDatabase
 
-/** Room database aggregating the 5 tables (§7.8). Phase 1 scaffold. */
+/** Room database aggregating the 5 tables (§7.8). */
 @Database(
     entities = [
         BookEntity::class,
@@ -12,8 +13,11 @@ import androidx.room.RoomDatabase
         InkStrokeEntity::class,
         BookmarkEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = true,
+    autoMigrations = [
+        AutoMigration(from = 2, to = 3),
+    ],
 )
 abstract class ReadflowDatabase : RoomDatabase() {
     abstract fun bookDao(): BookDao
