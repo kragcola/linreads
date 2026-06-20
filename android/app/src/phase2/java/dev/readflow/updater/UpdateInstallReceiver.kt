@@ -24,6 +24,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
 
     private fun onInstallRequested(context: Context, intent: Intent) {
         val apkUrl = intent.getStringExtra("apk_url") ?: return
+        val authToken = intent.getStringExtra("auth_token") ?: ""
 
         // Clean up previous download record (and its file) before starting a new one.
         val prefs = context.getSharedPreferences("update", Context.MODE_PRIVATE)
@@ -43,6 +44,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
         val dm = context.getSystemService(DownloadManager::class.java)
         val dlId = dm.enqueue(
             DownloadManager.Request(Uri.parse(apkUrl)).apply {
+                if (authToken.isNotEmpty()) addRequestHeader("Authorization", "Bearer $authToken")
                 setTitle("LinReads 更新下载中")
                 setMimeType("application/vnd.android.package-archive")
                 setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)

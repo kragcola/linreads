@@ -93,6 +93,7 @@ fun ReadflowApp() {
                             Intent(context, UpdateInstallReceiver::class.java)
                                 .putExtra("apk_url", apkUrl)
                                 .putExtra("tag_name", "dev-latest")
+                                .putExtra("auth_token", dev.readflow.BuildConfig.GITHUB_OTA_TOKEN)
                         )
                     },
                 )
