@@ -34,8 +34,7 @@ object AppUpdateManager {
     }
 
     /** Returns the APK download URL if a newer build is available, null otherwise. */
-    suspend fun checkForUpdate(): String? =
-        runCatching { checker.check() }.getOrNull()?.apkUrl
+    suspend fun checkForUpdate(): String? = checker.check()?.apkUrl
 
     private fun postNotification(ctx: Context, info: UpdateInfo) {
         val nm = ctx.getSystemService(NotificationManager::class.java)

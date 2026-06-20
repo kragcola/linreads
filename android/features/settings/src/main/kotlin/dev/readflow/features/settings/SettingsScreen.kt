@@ -89,8 +89,9 @@ fun SettingsScreen(
                 UpdateState.Idle -> Button(onClick = {
                     scope.launch {
                         updateState = UpdateState.Checking
-                        val apkUrl = onCheckForUpdate()
-                        updateState = if (apkUrl != null) UpdateState.Available(apkUrl) else UpdateState.UpToDate
+                        runCatching { onCheckForUpdate() }
+                            .onSuccess { apkUrl -> updateState = if (apkUrl != null) UpdateState.Available(apkUrl) else UpdateState.UpToDate }
+                            .onFailure { updateState = UpdateState.Error(it.message ?: "检查失败") }
                     }
                 }) { Text("检查更新") }
 
@@ -105,6 +106,11 @@ fun SettingsScreen(
                     Text("发现新版本，点击下载安装", style = MaterialTheme.typography.bodyMedium)
                     Button(onClick = { onStartDownload(s.apkUrl) }) { Text("下载并安装") }
                 }
+
+                is UpdateState.Error -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("✗ ${s.msg}", style = MaterialTheme.typography.bodyMedium)
+                    TextButton(onClick = { updateState = UpdateState.Idle }) { Text("重试") }
+                }
             }
         }
     }
@@ -115,6 +121,7 @@ private sealed interface UpdateState {
     data object Checking : UpdateState
     data object UpToDate : UpdateState
     data class Available(val apkUrl: String) : UpdateState
+    data class Error(val msg: String) : UpdateState
 }
 
 private fun ThemeMode.label() = when (this) {

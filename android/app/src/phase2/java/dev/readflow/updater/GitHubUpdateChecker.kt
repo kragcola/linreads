@@ -3,6 +3,7 @@ package dev.readflow.updater
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
@@ -27,7 +28,7 @@ class GitHubUpdateChecker(
             connectTimeout = 8_000; readTimeout = 8_000
         }
         try {
-            if (conn.responseCode != 200) return@withContext null
+            if (conn.responseCode != 200) throw IOException("HTTP ${conn.responseCode}")
             val root = JSONObject(conn.inputStream.bufferedReader().readText())
             val body = root.optString("body", "")
 
