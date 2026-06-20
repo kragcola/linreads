@@ -7,9 +7,11 @@
 | Web | Dev server | `cd web && npm run dev` |
 | Web | Build | `cd web && npm run build` |
 | Web | Type check | `cd web && npx tsc --noEmit` |
-| Android | Build debug APK | `cd android && ./gradlew assembleDebug` |
+| Android | Build debug APK (phase 2) | `cd android && ./gradlew -Preadflow.phase=2 assembleDebug` |
+| Android | Build phase 1 (foundation) | `cd android && ./gradlew -Preadflow.phase=1 assembleDebug` |
 | Android | Run tests | `cd android && ./gradlew test` |
 | Android | Lint | `cd android && ./gradlew lint` |
+| Android | Push OTA update to tablet | `git push` → Actions builds → tablet notified automatically |
 | HarmonyOS | Build | DevEco Studio → Build → Build Hap |
 
 ## Architecture
@@ -43,10 +45,10 @@ Key design choices:
 | 平台 | 书库列表 | EPUB 阅读 | PDF 阅读 | 进度同步 |
 |------|---------|----------|---------|---------|
 | Web | ✅ | ✅ 基础 | ✅ iframe | ❌ 待做 |
-| Android | ⚠️ scaffold | ❌ 待做 | ❌ 待做 | ❌ 待做 |
+| Android | ✅ v4lite | ✅ 原生重排 | ✅ PdfRenderer | ⚠️ LWW骨架 |
 | HarmonyOS | ✅ 基础列表 | ❌ 待做 | ❌ 待做 | ❌ 待做 |
 
-Android/HarmonyOS 目前只有 UI 骨架 + CalibreClient，尚未连接到真实列表。
+Android v4lite：书库（本地导入 + Calibre LAN）、TXT/EPUB/PDF 三引擎、设置持久化、进度保存、OTA 更新。
 
 ## Skill 自动触发
 
@@ -67,6 +69,29 @@ Android/HarmonyOS 目前只有 UI 骨架 + CalibreClient，尚未连接到真实
 compact 后恢复：若 system-reminder 已注入对应 `### Skill:` 内容，视为已加载，**不再重复 invoke**。新会话首次触及上述范围必须 invoke 一次。
 
 compact 后任务判定：system-reminder 注入的 `### Skill:` 段尾若带 `ARGUMENTS:` 字段，那是会话早期的历史入参，不是当前任务。以 compact summary 的 Primary Request and Intent 为准；当 ARGUMENTS 与 summary 冲突时，**忽略 ARGUMENTS**，如不确定主动向用户确认一次。
+
+## Dev Testing — OTA 推送更新
+
+改完代码后，**一条命令**把新版推到远端平板：
+
+```bash
+git add -A && git commit -m "feat: ..." && git push
+```
+
+自动流程：
+1. `git push` → GitHub Actions 触发（见 [`.github/workflows/android-release.yml`](.github/workflows/android-release.yml)）
+2. Actions 构建 `phase=2` debug APK，~3-4 分钟
+3. 上传到 [`dev-latest` Release](https://github.com/kragcola/linreads/releases/tag/dev-latest)
+4. 平板切到前台后约 8 秒：弹出系统通知「LinReads 新版本可用」
+5. 点通知 → 下载 → 系统安装器 → 完成
+
+**平板首次配置（一次性）：**
+- 设置 → 应用 → 特殊权限 → 安装未知来源应用 → 允许 LinReads
+- 无需 USB/ADB/开发者模式
+
+**相关文件：**
+- [`app/src/phase2/java/dev/readflow/updater/`](android/app/src/phase2/java/dev/readflow/updater/) — 更新检查/下载/安装逻辑
+- `BuildConfig.GITHUB_REPO` = `kragcola/linreads`，`BUILD_TAG` 由 CI 注入
 
 ## Workflow
 
