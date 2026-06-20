@@ -9,17 +9,28 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.readflow.core.model.ThemeMode
+import kotlinx.coroutines.launch
 import org.koin.androidx.compose.koinViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(onBack: () -> Unit) {
+fun SettingsScreen(
+    onBack: () -> Unit,
+    /** Returns APK download URL if update available, null if already latest. */
+    onCheckForUpdate: suspend () -> String? = { null },
+    /** Called with the APK URL when the user confirms download. */
+    onStartDownload: (String) -> Unit = {},
+) {
     val vm = koinViewModel<SettingsViewModel>()
     val url by vm.calibreBaseUrl.collectAsStateWithLifecycle()
     val fontSize by vm.fontSize.collectAsStateWithLifecycle()
     val theme by vm.themeMode.collectAsStateWithLifecycle()
 
     var urlDraft by remember(url) { mutableStateOf(url ?: "") }
+
+    // Update check state
+    val scope = rememberCoroutineScope()
+    var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
 
     Scaffold(
         topBar = {
@@ -37,7 +48,6 @@ fun SettingsScreen(onBack: () -> Unit) {
             Modifier.padding(padding).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            // Calibre server URL
             OutlinedTextField(
                 value = urlDraft,
                 onValueChange = { urlDraft = it },
@@ -52,7 +62,6 @@ fun SettingsScreen(onBack: () -> Unit) {
                 },
             )
 
-            // Font size
             Text("字号：${fontSize}sp", style = MaterialTheme.typography.bodyMedium)
             Slider(
                 value = fontSize.toFloat(),
@@ -62,7 +71,6 @@ fun SettingsScreen(onBack: () -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
             )
 
-            // Theme
             Text("主题", style = MaterialTheme.typography.bodyMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ThemeMode.entries.forEach { mode ->
@@ -73,8 +81,40 @@ fun SettingsScreen(onBack: () -> Unit) {
                     )
                 }
             }
+
+            HorizontalDivider()
+
+            // Update check
+            when (val s = updateState) {
+                UpdateState.Idle -> Button(onClick = {
+                    scope.launch {
+                        updateState = UpdateState.Checking
+                        val apkUrl = onCheckForUpdate()
+                        updateState = if (apkUrl != null) UpdateState.Available(apkUrl) else UpdateState.UpToDate
+                    }
+                }) { Text("检查更新") }
+
+                UpdateState.Checking -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Text("检查中…", style = MaterialTheme.typography.bodyMedium)
+                }
+
+                UpdateState.UpToDate -> Text("✓ 已是最新版本", style = MaterialTheme.typography.bodyMedium)
+
+                is UpdateState.Available -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("发现新版本，点击下载安装", style = MaterialTheme.typography.bodyMedium)
+                    Button(onClick = { onStartDownload(s.apkUrl) }) { Text("下载并安装") }
+                }
+            }
         }
     }
+}
+
+private sealed interface UpdateState {
+    data object Idle : UpdateState
+    data object Checking : UpdateState
+    data object UpToDate : UpdateState
+    data class Available(val apkUrl: String) : UpdateState
 }
 
 private fun ThemeMode.label() = when (this) {

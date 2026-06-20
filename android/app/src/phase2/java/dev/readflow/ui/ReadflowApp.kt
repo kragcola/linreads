@@ -31,12 +31,12 @@ import dev.readflow.features.reader.ReaderScreen
 import dev.readflow.features.reader.ReaderViewModel
 import dev.readflow.features.settings.SettingsScreen
 import dev.readflow.updater.AppUpdateManager
+import dev.readflow.updater.UpdateInstallReceiver
 import org.koin.androidx.compose.koinViewModel
 
 @Composable
 fun ReadflowApp() {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
     // POST_NOTIFICATIONS (Android 13+): launcher must be registered unconditionally — Compose
     // rules forbid calling remember* inside a conditional.
@@ -59,9 +59,9 @@ fun ReadflowApp() {
         mutableStateOf(!context.packageManager.canRequestPackageInstalls())
     }
 
+    // Re-check install permission on every resume (clears dialog if user just enabled it).
     LifecycleResumeEffect(Unit) {
         showInstallPermDialog = !context.packageManager.canRequestPackageInstalls()
-        AppUpdateManager.checkOnForeground(context, scope)
         onPauseOrDispose {}
     }
 
@@ -81,7 +81,17 @@ fun ReadflowApp() {
                 ReaderScreen(viewModel = vm, onBack = { navController.popBackStack() })
             }
             composable("settings") {
-                SettingsScreen(onBack = { navController.popBackStack() })
+                SettingsScreen(
+                    onBack = { navController.popBackStack() },
+                    onCheckForUpdate = { AppUpdateManager.checkForUpdate() },
+                    onStartDownload = { apkUrl ->
+                        context.sendBroadcast(
+                            Intent(context, UpdateInstallReceiver::class.java)
+                                .putExtra("apk_url", apkUrl)
+                                .putExtra("tag_name", "dev-latest")
+                        )
+                    },
+                )
             }
         }
 
