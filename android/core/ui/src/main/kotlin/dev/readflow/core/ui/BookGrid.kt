@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyGridItemInfo
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -73,11 +74,8 @@ fun BookGrid(
 ) {
     val palette = readflowPalette
     val mutableItems = remember { mutableStateListOf(*items.toTypedArray()) }
-    LaunchedEffect(items.size, items.sumOf { it.key.hashCode() }) {
-        // 仅在外部items有新增/删除时才全量同步，排序变化由拖拽直接管理
-        val currentKeys = mutableItems.map { it.key }.toSet()
-        val newKeys = items.map { it.key }.toSet()
-        if (currentKeys != newKeys) {
+    LaunchedEffect(items) {
+        if (mutableItems.toList() != items) {
             mutableItems.clear()
             mutableItems.addAll(items)
         }
@@ -538,7 +536,7 @@ fun BookGrid(
                             }
                         }
 
-                        // ⋮ 菜单按钮
+                        // ⋮ 菜单按钮（半透明黑底 + 白色图标，任何封面可见）
                         if (!isDragging) {
                             IconButton(
                                 onClick = {
@@ -548,13 +546,14 @@ fun BookGrid(
                                 modifier = Modifier
                                     .align(Alignment.TopEnd)
                                     .zIndex(2f)
-                                    .size(40.dp),
+                                    .size(32.dp)
+                                    .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(6.dp)),
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.MoreVert,
                                     contentDescription = "菜单",
-                                    tint = palette.ink.copy(alpha = 0.45f),
-                                    modifier = Modifier.size(20.dp),
+                                    tint = Color.White.copy(alpha = 0.85f),
+                                    modifier = Modifier.size(18.dp),
                                 )
                             }
 

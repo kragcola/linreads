@@ -24,7 +24,7 @@ import org.koin.androidx.compose.koinViewModel
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
-    onCheckForUpdate: suspend () -> String? = { null },
+    onCheckForUpdate: suspend () -> Pair<String, String>? = { null },
     authToken: String = "",
     buildTag: String = "",
 ) {
@@ -124,7 +124,10 @@ fun SettingsScreen(
                     scope.launch {
                         updateState = UpdateState.Checking
                         runCatching { onCheckForUpdate() }
-                            .onSuccess { url -> updateState = if (url != null) UpdateState.Available(url) else UpdateState.UpToDate }
+                            .onSuccess { result ->
+                                updateState = if (result != null) UpdateState.Available(result.first, result.second)
+                                else UpdateState.UpToDate
+                            }
                             .onFailure { updateState = UpdateState.Error(it.message ?: "检查失败") }
                     }
                 }) { Text("检查更新") }
@@ -141,6 +144,14 @@ fun SettingsScreen(
 
                 is UpdateState.Available -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("发现新版本，点击下载安装", style = MaterialTheme.typography.bodyMedium)
+                    if (s.notes.isNotBlank()) {
+                        Text(
+                            text = s.notes,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 8,
+                        )
+                    }
                     Button(
                         onClick = {
                             val dlId = context.startFreshDownload(s.apkUrl, authToken)
@@ -234,7 +245,7 @@ private sealed interface UpdateState {
     data object Idle : UpdateState
     data object Checking : UpdateState
     data object UpToDate : UpdateState
-    data class Available(val apkUrl: String) : UpdateState
+    data class Available(val apkUrl: String, val notes: String = "") : UpdateState
     data class Downloading(val progress: Float, val dlId: Long) : UpdateState
     data class ReadyToInstall(val uri: Uri) : UpdateState
     data class Error(val msg: String) : UpdateState

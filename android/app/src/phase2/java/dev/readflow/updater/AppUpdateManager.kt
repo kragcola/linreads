@@ -33,8 +33,14 @@ object AppUpdateManager {
         }
     }
 
-    /** Returns the APK download URL if a newer build is available, null otherwise. */
-    suspend fun checkForUpdate(): String? = checker.check()?.apkUrl
+    /** Returns (apkUrl, notes) if newer build available, null otherwise. */
+    suspend fun checkForUpdate(): Pair<String, String>? {
+        val info = checker.check() ?: return null
+        val notes = info.notes.lineSequence()
+            .filterNot { it.startsWith("BUILD_TAG:") || it.startsWith("Commit:") || it.startsWith("Branch:") || it.startsWith("Time:") }
+            .joinToString("\n").trim()
+        return info.apkUrl to notes
+    }
 
     private fun postNotification(ctx: Context, info: UpdateInfo) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
