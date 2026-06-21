@@ -96,6 +96,7 @@ fun BookGrid(
     var dwellTargetKey by remember { mutableStateOf("") }
     var isInCancelZone by remember { mutableStateOf(false) }
     var reorderPreviewActive by remember { mutableStateOf(false) }
+    var dragGeneration by remember { mutableIntStateOf(0) }
 
     // dwell 计时
     var dwellJob by remember { mutableStateOf<Job?>(null) }
@@ -244,7 +245,7 @@ fun BookGrid(
                         }
                         .then(if (!isDragging) Modifier.animateItem() else Modifier)
                         .clickable { onItemClick(item) }
-                        .pointerInput(item.key) {
+                        .pointerInput(item.key, dragGeneration) {
                             var dwellLocalStart = 0L
 
                             detectDragGesturesAfterLongPress(
@@ -446,6 +447,7 @@ fun BookGrid(
                                     dwellProgress = 0f
                                     reorderPreviewActive = false
                                     isInCancelZone = false
+                                    dragGeneration++
                                 },
                                 onDragCancel = {
                                     dwellJob?.cancel()
@@ -463,6 +465,7 @@ fun BookGrid(
                                     dwellProgress = 0f
                                     reorderPreviewActive = false
                                     isInCancelZone = false
+                                    dragGeneration++
                                 },  // onDragCancel
                             )  // detectDragGesturesAfterLongPress
                         },
