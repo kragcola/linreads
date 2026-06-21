@@ -33,7 +33,7 @@ data class ReaderUiState(
     val bookTitle: String = "",
     val fontSizeSp: Float = 16f,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
-    val isUiVisible: Boolean = true,
+    val isUiVisible: Boolean = false,  // 默认隐藏，点中间呼出
 )
 
 class ReaderViewModel(
@@ -117,7 +117,6 @@ class ReaderViewModel(
                     )
                 )
                 bookDao.updateLastReadAt(bookId, now)
-                // LWW sync (no-op with NoOpSyncBackend; activates with future backends)
                 syncManager.syncProgress(
                     bookId,
                     ReadingProgress(bookId, locator, locator.totalProgression ?: 0f, now, "local"),
@@ -144,7 +143,7 @@ class ReaderViewModel(
         val engine = _uiState.value.engine
         viewModelScope.launch {
             // Force-save progress before close so debounce doesn't swallow it.
-            if (bookId != null && locator != null && (locator.totalProgression ?: 0f) > 0f) {
+            if (bookId != null && locator != null) {
                 val now = System.currentTimeMillis()
                 progressDao.upsert(
                     ReadingProgressEntity(

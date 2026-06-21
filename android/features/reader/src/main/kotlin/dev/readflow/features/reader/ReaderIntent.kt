@@ -14,4 +14,6 @@ sealed interface ReaderIntent {
     data class SetMode(val mode: ReadingMode) : ReaderIntent
     data class SetTheme(val theme: ThemeMode) : ReaderIntent
     data object ToggleChrome : ReaderIntent
+    data object FontPanel : ReaderIntent
+    data object ThemePanel : ReaderIntent
 }
