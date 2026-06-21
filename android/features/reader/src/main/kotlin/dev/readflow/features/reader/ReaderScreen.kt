@@ -11,10 +11,9 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.FormatSize
-import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.Timeline
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -128,18 +127,18 @@ fun ReaderScreen(
                                 horizontalArrangement = Arrangement.SpaceEvenly,
                             ) {
                                 if (ReaderFeature.TOC in features) {
-                                    ReaderMenuButton("目录", Icons.Default.List) {
+                                    ReaderMenuButton("目录", Icons.Default.Menu) {
                                         // TODO: TOC panel
                                     }
                                 }
                                 if (ReaderFeature.PROGRESS in features) {
                                     val pct = ((locator.totalProgression ?: 0f) * 100).toInt()
-                                    ReaderMenuButton("${pct}%", Icons.Default.Timeline) {
+                                    ReaderMenuButton("${pct}%", Icons.Default.MoreVert) {
                                         // TODO: Go to position
                                     }
                                 }
                                 if (ReaderFeature.FONT in features) {
-                                    ReaderMenuButton("字体", Icons.Default.FormatSize) {
+                                    ReaderMenuButton("字体", Icons.Default.Edit) {
                                         viewModel.onIntent(ReaderIntent.FontPanel)
                                     }
                                 }
