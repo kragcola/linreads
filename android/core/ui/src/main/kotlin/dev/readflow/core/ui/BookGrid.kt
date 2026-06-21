@@ -217,7 +217,7 @@ fun BookGrid(
             ),
             horizontalArrangement = Arrangement.spacedBy(Dimens.gridGapCompact),
             verticalArrangement = Arrangement.spacedBy(Dimens.gridGapCompact),
-            modifier = Modifier.widthIn(max = Dimens.maxContentWidth),
+            modifier = Modifier.zIndex(1f).widthIn(max = Dimens.maxContentWidth),
         ) {
             itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
                 val isDragging = dragItemKey == item.key
@@ -667,12 +667,12 @@ fun BookGrid(
             }
         }
 
-        // ── 整行联通书架隔板 ──
-        Canvas(modifier = Modifier.fillMaxSize()) {
+        // ── 整行联通书架隔板（zIndex=-1 放在网格后面）──
+        Canvas(modifier = Modifier.fillMaxSize().zIndex(-1f)) {
             val visInfo = gridState.layoutInfo.visibleItemsInfo
             val processedRows = mutableSetOf<Int>()
             for (info in visInfo) {
-                val rowY = info.offset.y + info.size.height
+                val rowY = (info.offset.y + info.size.height).toInt()
                 if (processedRows.add(rowY)) {
                     // 插板：暖色细板 + 上投影，联通整行
                     val boardY = rowY.toFloat()
@@ -737,11 +737,21 @@ fun BookGrid(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        if (isBundleDelete) {
+                        // Save bundle books before removal
+                        val bundleBooksForDelete = if (isBundleDelete) {
                             val bundleName = did.removePrefix("bundle:")
-                            val bundleBooks = mutableItems.filterIsInstance<LibraryItem.Bundle>()
+                            items.filterIsInstance<LibraryItem.Bundle>()
                                 .firstOrNull { it.bundle.name == bundleName }?.bundle?.books ?: emptyList()
-                            bundleBooks.forEach { onDelete(it.id) }
+                        } else emptyList()
+                        // Optimistic: remove from UI immediately
+                        mutableItems.removeAll {
+                            when {
+                                isBundleDelete -> it is LibraryItem.Bundle && it.bundle.name == did.removePrefix("bundle:")
+                                else -> it is LibraryItem.Single && it.book.id == did
+                            }
+                        }
+                        if (isBundleDelete) {
+                            bundleBooksForDelete.forEach { onDelete(it.id) }
                         } else {
                             onDelete(did)
                         }
@@ -762,7 +772,18 @@ fun BookGrid(
             title = { Text("拆组") },
             text = { Text("确定要拆散《${name}》吗？\n组内书籍将恢复为单本显示。") },
             confirmButton = {
-                TextButton(onClick = { onUngroup(name); ungroupConfirmName = null }) { Text("拆组") }
+                TextButton(onClick = {
+                    // Optimistic: expand bundle to singles immediately
+                    val idx = mutableItems.indexOfFirst { it is LibraryItem.Bundle && it.bundle.name == name }
+                    if (idx >= 0) {
+                        val bundle = mutableItems[idx] as LibraryItem.Bundle
+                        mutableItems.removeAt(idx)
+                        bundle.bundle.books.forEachIndexed { offset, book ->
+                            mutableItems.add(idx + offset, LibraryItem.Single(book))
+                        }
+                    }
+                    onUngroup(name); ungroupConfirmName = null
+                }) { Text("拆组") }
             },
             dismissButton = {
                 TextButton(onClick = { ungroupConfirmName = null }) { Text("取消") }
@@ -783,7 +804,16 @@ fun BookGrid(
                 )
             },
             confirmButton = {
-                TextButton(onClick = { onRename(ri.book.id, renameText); renameItem = null }) { Text("确定") }
+                TextButton(onClick = {
+                    val bookId = ri.book.id
+                    // Optimistic: rename in UI immediately
+                    mutableItems.replaceAll { item ->
+                        if (item is LibraryItem.Single && item.book.id == bookId)
+                            item.copy(book = item.book.copy(title = renameText))
+                        else item
+                    }
+                    onRename(bookId, renameText); renameItem = null
+                }) { Text("确定") }
             },
             dismissButton = {
                 TextButton(onClick = { renameItem = null }) { Text("取消") }
@@ -808,6 +838,12 @@ fun BookGrid(
                 TextButton(
                     onClick = {
                         if (renameText.isNotBlank()) {
+                            // Optimistic: rename in UI immediately
+                            mutableItems.replaceAll { item ->
+                                if (item is LibraryItem.Bundle && item.bundle.name == old)
+                                    item.copy(bundle = item.bundle.copy(name = renameText))
+                                else item
+                            }
                             onRenameBundle(old, renameText)
                         }
                         renameBundleOldName = null

@@ -72,14 +72,27 @@ fun ReaderScreen(
                         }.also { it.bind(engine) }
                     }
 
-                    // Document view — tap toggles chrome
+                    // Document view — no touch handling here, overlay catches taps
                     AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { ctx -> FrameLayout(ctx).apply { addView(host.hostView()) } },
+                    )
+                    // Invisible overlay — only middle third toggles chrome
+                    Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .pointerInput(Unit) {
-                                detectTapGestures { viewModel.onIntent(ReaderIntent.ToggleChrome) }
+                                detectTapGestures { offset ->
+                                    val h = size.height.toFloat()
+                                    if (h > 0) {
+                                        val yRatio = offset.y / h
+                                        // Only middle third (0.33–0.66) toggles chrome
+                                        if (yRatio in 0.33f..0.66f) {
+                                            viewModel.onIntent(ReaderIntent.ToggleChrome)
+                                        }
+                                    }
+                                }
                             },
-                        factory = { ctx -> FrameLayout(ctx).apply { addView(host.hostView()) } },
                     )
 
                     // ── Top chrome: 书名 + 返回 ──
