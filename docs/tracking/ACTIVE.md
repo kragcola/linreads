@@ -1,6 +1,6 @@
 # Active Work
 
-_最后更新：2026-06-21_
+_最后更新：2026-06-22_
 
 Mode: `task`
 Objective: v4lite 本地阅读闭环（用户验收 Phase A）— **L1–L5 全部 ✅**，Phase A 功能条件已满足
@@ -8,7 +8,7 @@ Active tracker: [linreads-architecture-docs-2026-06-18.md](linreads-architecture
 v4lite 执行文档: [../android-v4lite-plan.md](../android-v4lite-plan.md)
 Test ledger: N/A
 
-> ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。后续 27 个提交为体验打磨。
+> ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
 ## 当前状态
 
@@ -18,6 +18,7 @@ Test ledger: N/A
 - EPUB/PDF/TXT/MD 四引擎就位
 - Settings（URL/字号/主题/更新）可用
 - OTA 更新系统完整（检查→下载→进度→安装）
+- ACTION_VIEW/ACTION_SEND 系统入口已接入现有本地导入链路（resolver 单测 + phase2 构建通过；真机文件管理器 smoke 待跑）
 - 非 v4lite 原计划附加：Dwell 建组、拖拽排序、文件夹批量导入、Bundle 详情页
 
 ## v4lite 阶段状态
@@ -34,7 +35,7 @@ Test ledger: N/A
 
 - [x] 安装后不需要账号/Calibre/网络/选引擎
 - [x] SAF 导入 TXT/EPUB/PDF 后书架刷新显示
-- [x] ACTION_VIEW 从文件管理器打开可直接阅读
+- [x] ACTION_VIEW/ACTION_SEND 代码入口已接入，可导入后直接进入 reader（真机 smoke 待补）
 - [x] 最近阅读列表正确（lastReadAt 降序）
 - [x] 关闭再开书进度恢复（TXT/EPUB/PDF 各有 locator）
 - [x] 字号调整 + 主题切换（白/暗/护眼/系统）生效
@@ -49,6 +50,7 @@ Test ledger: N/A
 | L3 EPUB 分页模式 | 当前仅连续滚动；ViewPager2 分页为 v4 最高风险项，待独立 gate |
 | L5 性能测量 | 冷启动/首屏/翻页/内存峰值未正式测量 |
 | L5 TalkBack | 无障碍 smoke test 未执行 |
+| L5 文件入口 smoke | ACTION_VIEW/ACTION_SEND 已有代码入口；需真机从文件管理器/分享面板验证 |
 | EPUB 总进度分母 | totalProgression 预扫全书字符数待实现（v4 §7.1） |
 | 进度同步 | LWW 骨架已就位（NoOpSyncBackend），实际后端待做 |
 | 进程死亡恢复 | SavedStateHandle + EngineStateStore 两层恢复待验证 |
@@ -56,7 +58,7 @@ Test ledger: N/A
 
 ## 下一步
 
-- Phase A 性能测量 + TalkBack smoke
+- Phase A 性能测量 + TalkBack + 文件入口 smoke
 - EPUB 分页模式 gate（v4 最高技术风险）
 - Calibre 书源接入（Phase B）
 - 进度同步后端选型与实现（Phase D）
@@ -64,5 +66,5 @@ Test ledger: N/A
 ## 恢复备注
 
 - v4lite L1–L5 已全部完成，当前在体验打磨阶段
-- 27 个增量提交（6/20–6/21）主要是 OTA 更新系统 + 6 项需求完善
+- 6/20 之后的增量提交主要是 OTA 更新系统、书架交互、reader 菜单/触摸和体验打磨
 - 详细证据、风险、回滚见 active tracker

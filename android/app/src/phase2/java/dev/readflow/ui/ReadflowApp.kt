@@ -25,8 +25,11 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import dev.readflow.core.database.LibraryRepository
+import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.ui.ReadflowTheme
+import dev.readflow.extensions.api.LocalFileBookSource
 import dev.readflow.features.library.LibraryScreen
 import dev.readflow.features.reader.ReaderIntent
 import dev.readflow.features.reader.ReaderScreen
@@ -34,11 +37,14 @@ import dev.readflow.features.reader.ReaderViewModel
 import dev.readflow.features.settings.SettingsScreen
 import dev.readflow.features.settings.SettingsViewModel
 import dev.readflow.updater.AppUpdateManager
-import dev.readflow.updater.UpdateInstallReceiver
 import org.koin.androidx.compose.koinViewModel
+import org.koin.core.context.GlobalContext
 
 @Composable
-fun ReadflowApp() {
+fun ReadflowApp(
+    incomingBookUri: Uri? = null,
+    onIncomingBookConsumed: () -> Unit = {},
+) {
     val context = LocalContext.current
 
     val notifLauncher = rememberLauncherForActivityResult(
@@ -71,6 +77,27 @@ fun ReadflowApp() {
 
     ReadflowTheme(darkTheme = darkTheme, sepiaTheme = sepiaTheme) {
         val navController = rememberNavController()
+        val localSource = remember { GlobalContext.get().get<LocalFileBookSource>() }
+        val libraryRepository = remember { GlobalContext.get().get<LibraryRepository>() }
+        var incomingImportError by remember { mutableStateOf<String?>(null) }
+
+        LaunchedEffect(incomingBookUri) {
+            val uri = incomingBookUri ?: return@LaunchedEffect
+            onIncomingBookConsumed()
+            when (val result = localSource.import(uri)) {
+                is ReadflowResult.Success -> {
+                    val book = result.value.first
+                    libraryRepository.upsertBook(book)
+                    navController.navigate("reader/${book.id}") {
+                        launchSingleTop = true
+                    }
+                }
+                is ReadflowResult.Failure -> {
+                    incomingImportError = result.error.message
+                }
+            }
+        }
+
         NavHost(navController = navController, startDestination = "library") {
             composable("library") {
                 LibraryScreen(
@@ -93,6 +120,19 @@ fun ReadflowApp() {
                     buildTag = dev.readflow.BuildConfig.BUILD_TAG,
                 )
             }
+        }
+
+        incomingImportError?.let { message ->
+            AlertDialog(
+                onDismissRequest = { incomingImportError = null },
+                title = { Text("无法打开文件") },
+                text = { Text(message) },
+                confirmButton = {
+                    TextButton(onClick = { incomingImportError = null }) {
+                        Text("知道了")
+                    }
+                },
+            )
         }
 
         if (showInstallPermDialog) {

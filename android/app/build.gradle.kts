@@ -64,6 +64,11 @@ android {
     }
 
     buildFeatures { compose = true; buildConfig = true }
+    testOptions {
+        unitTests.all {
+            it.useJUnitPlatform()
+        }
+    }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -114,6 +119,5 @@ dependencies {
     implementation(libs.bundles.room)
     // Other render engines (epub/pdf/md) + settings: shells only, wired when implemented
     // Handwriting (:ink): Phase 3
-    // Testing:
-    // testImplementation(libs.bundles.test)
+    testImplementation(libs.junit5)
 }

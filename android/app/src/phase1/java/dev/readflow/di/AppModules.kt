@@ -4,6 +4,8 @@ import android.app.Application
 import androidx.room.Room
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.database.ReadflowDatabase
+import dev.readflow.core.prefs.DataStoreSettingsRepository
+import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.NoOpSyncBackend
 import dev.readflow.core.sync.SyncBackend
 import dev.readflow.core.sync.SyncManager
@@ -53,11 +55,15 @@ val extensionsModule = module {
     single { FirstLaunchSeeder(androidContext(), get(), get()) }
 }
 
-val featureModule = module {
-    viewModel { LibraryViewModel(get()) }
+val settingsModule = module {
+    single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
 }
 
-val appModules = listOf(coreModule, databaseModule, extensionsModule, featureModule)
+val featureModule = module {
+    viewModel { LibraryViewModel(get(), get(), get()) }
+}
+
+val appModules = listOf(coreModule, databaseModule, extensionsModule, settingsModule, featureModule)
 
 /** Call from Application.onCreate after Koin start to seed sample books on first launch. */
 fun seedIfFirstLaunch(app: Application, seeder: FirstLaunchSeeder) {

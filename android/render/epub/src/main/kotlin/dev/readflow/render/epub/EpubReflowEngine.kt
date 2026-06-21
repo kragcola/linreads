@@ -11,6 +11,8 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReadingMode
@@ -46,9 +48,13 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
     private val _chapterInfo = MutableStateFlow(ChapterInfo(0, 1, "", 0f))
     override val chapterInfo: StateFlow<ChapterInfo> = _chapterInfo.asStateFlow()
 
+    private val _tableOfContents = MutableStateFlow<List<TocEntry>>(emptyList())
+    override val tableOfContents: StateFlow<List<TocEntry>> = _tableOfContents.asStateFlow()
+
     private var paras: List<EpubPara> = emptyList()
     private var chapterBoundaries: List<ChapterBoundary> = emptyList()
     private var fontSizeSp: Float = 18f
+    private var themeMode: ThemeMode = ThemeMode.SYSTEM
     private var recyclerView: RecyclerView? = null
 
     /** Start index (inclusive) and end index (exclusive) of each chapter in paras. */
@@ -73,17 +79,17 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
         withContext(Dispatchers.Main) {
             _pageCount.value = paras.size
             _chapterInfo.value = ChapterInfo(0, chapterBoundaries.size, chapterBoundaries.firstOrNull()?.title ?: "", 0f)
+            _tableOfContents.value = buildToc(chapterBoundaries, paras.size)
         }
         _currentLocator.value
     }
 
     override fun createView(): View {
-        val night = (context.resources.configuration.uiMode and
-            Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
         return RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
-            adapter = EpubParaAdapter(paras, fontSizeSp)
-            setBackgroundColor(if (night) Color.rgb(0x2A, 0x26, 0x20) else Color.rgb(0xED, 0xE6, 0xD6))
+            val palette = paletteFor(themeMode, resources.configuration)
+            adapter = EpubParaAdapter(paras, fontSizeSp, palette.ink)
+            setBackgroundColor(palette.paper)
             clipToPadding = false
             val padV = (24 * resources.displayMetrics.density).toInt()
             setPadding(0, padV, 0, padV)
@@ -150,6 +156,19 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
         return boundaries
     }
 
+    private fun buildToc(boundaries: List<ChapterBoundary>, total: Int): List<TocEntry> =
+        boundaries
+            .filter { it.endExclusive > it.startInclusive }
+            .map { boundary ->
+                TocEntry(
+                    title = boundary.title,
+                    locator = Locator(
+                        strategy = LocatorStrategy.Section(boundary.spineIndex, boundary.startInclusive, 0),
+                        totalProgression = if (total > 0) boundary.startInclusive.toFloat() / total else 0f,
+                    ),
+                )
+            }
+
     override suspend fun goTo(locator: Locator) {
         val idx = (locator.strategy as? LocatorStrategy.Section)?.elementIndex ?: 0
         withContext(Dispatchers.Main) {
@@ -157,12 +176,48 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
         }
     }
 
-    override suspend fun close() { recyclerView = null; paras = emptyList() }
+    override suspend fun close() {
+        recyclerView = null
+        paras = emptyList()
+        chapterBoundaries = emptyList()
+        _tableOfContents.value = emptyList()
+    }
 
     override suspend fun setFontSize(sp: Float) {
         fontSizeSp = sp
         (recyclerView?.adapter as? EpubParaAdapter)?.updateFontSize(sp)
     }
 
+    override suspend fun setTheme(mode: ThemeMode) {
+        themeMode = mode
+        val palette = paletteFor(mode, context.resources.configuration)
+        recyclerView?.setBackgroundColor(palette.paper)
+        (recyclerView?.adapter as? EpubParaAdapter)?.updateInkColor(palette.ink)
+    }
+
     override suspend fun setMode(mode: ReadingMode) { /* CONTINUOUS only in v4 lite */ }
+
+    private companion object {
+        val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
+        val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
+        val PAPER_LIGHT = Color.rgb(0xFA, 0xFA, 0xF8)
+        val PAPER_SEPIA = Color.rgb(0xF5, 0xF0, 0xE8)
+
+        private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {
+            val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                Configuration.UI_MODE_NIGHT_YES
+            return when (mode) {
+                ThemeMode.LIGHT -> ReaderPalette(PAPER_LIGHT, EpubParaAdapter.INK_DAY)
+                ThemeMode.DARK -> ReaderPalette(PAPER_NIGHT, EpubParaAdapter.INK_NIGHT)
+                ThemeMode.SEPIA -> ReaderPalette(PAPER_SEPIA, EpubParaAdapter.INK_DAY)
+                ThemeMode.SYSTEM -> if (systemNight) {
+                    ReaderPalette(PAPER_NIGHT, EpubParaAdapter.INK_NIGHT)
+                } else {
+                    ReaderPalette(PAPER_DAY, EpubParaAdapter.INK_DAY)
+                }
+            }
+        }
+    }
 }
+
+private data class ReaderPalette(val paper: Int, val ink: Int)

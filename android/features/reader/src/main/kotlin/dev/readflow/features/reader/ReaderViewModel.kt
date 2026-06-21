@@ -11,6 +11,7 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.TocEntry
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.PageTransitionHostFactory
@@ -34,6 +35,7 @@ data class ReaderUiState(
     val fontSizeSp: Float = 16f,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val isUiVisible: Boolean = false,  // 默认隐藏，点中间呼出
+    val activePanel: ReaderPanel? = null,
 )
 
 class ReaderViewModel(
@@ -54,12 +56,17 @@ class ReaderViewModel(
     fun onIntent(intent: ReaderIntent) = when (intent) {
         is ReaderIntent.OpenById -> openById(intent.bookId)
         is ReaderIntent.OpenBook -> openByUri(null, intent.uri)
-        is ReaderIntent.CloseBook -> close()
+        ReaderIntent.CloseBook -> close()
         is ReaderIntent.GoTo -> goTo(intent.locator)
+        is ReaderIntent.GoToTocEntry -> goToTocEntry(intent.entry)
         is ReaderIntent.SetFontSize -> setFontSize(intent.sp)
-        is ReaderIntent.SetTheme -> _uiState.update { it.copy(themeMode = intent.theme) }
-        is ReaderIntent.ToggleChrome -> _uiState.update { it.copy(isUiVisible = !it.isUiVisible) }
-        else -> Unit
+        is ReaderIntent.SetMode -> setMode(intent.mode)
+        is ReaderIntent.SetTheme -> setTheme(intent.theme)
+        is ReaderIntent.OpenPanel -> _uiState.update { it.copy(activePanel = intent.panel, isUiVisible = true) }
+        ReaderIntent.ClosePanel -> _uiState.update { it.copy(activePanel = null) }
+        ReaderIntent.ToggleChrome -> _uiState.update { it.copy(isUiVisible = !it.isUiVisible, activePanel = null) }
+        ReaderIntent.FontPanel -> _uiState.update { it.copy(activePanel = ReaderPanel.FONT, isUiVisible = true) }
+        ReaderIntent.ThemePanel -> _uiState.update { it.copy(activePanel = ReaderPanel.THEME, isUiVisible = true) }
     }
 
     private fun openById(bookId: String) {
@@ -83,8 +90,10 @@ class ReaderViewModel(
         viewModelScope.launch {
             val engine = engineRegistry.resolve(uri)
             engine.openBook(uri)
-            // Apply persisted font size.
-            engine.setFontSize(settings.fontSize.first().toFloat())
+            val savedFontSize = settings.fontSize.first().toFloat()
+            val savedTheme = settings.themeMode.first()
+            engine.setFontSize(savedFontSize)
+            engine.setTheme(savedTheme)
             // Restore saved progress
             bookId?.let { id ->
                 progressDao.get(id)?.let { saved ->
@@ -94,7 +103,16 @@ class ReaderViewModel(
                 }
             }
             currentBookId = bookId
-            _uiState.update { it.copy(loadingState = LoadingState.Loaded, engine = engine, bookTitle = title) }
+            _uiState.update {
+                it.copy(
+                    loadingState = LoadingState.Loaded,
+                    engine = engine,
+                    bookTitle = title,
+                    fontSizeSp = savedFontSize,
+                    themeMode = savedTheme,
+                    activePanel = null,
+                )
+            }
             watchProgress(engine, bookId)
         }
     }
@@ -128,12 +146,37 @@ class ReaderViewModel(
     private fun goTo(locator: Locator) {
         val engine = _uiState.value.engine ?: return
         viewModelScope.launch { engine.goTo(locator) }
+        _uiState.update { it.copy(activePanel = null) }
+    }
+
+    private fun goToTocEntry(entry: TocEntry) {
+        val engine = _uiState.value.engine ?: return
+        viewModelScope.launch { engine.goToTocEntry(entry) }
+        _uiState.update { it.copy(activePanel = null, isUiVisible = false) }
     }
 
     private fun setFontSize(sp: Float) {
         val engine = _uiState.value.engine ?: return
-        _uiState.update { it.copy(fontSizeSp = sp) }
-        viewModelScope.launch { engine.setFontSize(sp) }
+        val clamped = sp.coerceIn(MIN_FONT_SP, MAX_FONT_SP)
+        _uiState.update { it.copy(fontSizeSp = clamped) }
+        viewModelScope.launch {
+            engine.setFontSize(clamped)
+            settings.setFontSize(clamped.toInt())
+        }
+    }
+
+    private fun setTheme(theme: ThemeMode) {
+        val engine = _uiState.value.engine
+        _uiState.update { it.copy(themeMode = theme) }
+        viewModelScope.launch {
+            settings.setThemeMode(theme)
+            engine?.setTheme(theme)
+        }
+    }
+
+    private fun setMode(mode: dev.readflow.render.api.ReadingMode) {
+        val engine = _uiState.value.engine ?: return
+        viewModelScope.launch { engine.setMode(mode) }
     }
 
     private fun close() {
@@ -160,5 +203,10 @@ class ReaderViewModel(
             engine?.close()
             _uiState.value = ReaderUiState()
         }
+    }
+
+    private companion object {
+        const val MIN_FONT_SP = 12f
+        const val MAX_FONT_SP = 32f
     }
 }

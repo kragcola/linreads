@@ -5,6 +5,8 @@ import android.view.View
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
+import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.TocEntry
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,10 +49,18 @@ interface ReaderEngine {
     /** Jump to next (+1) or previous (-1) chapter. No-op if at boundary. */
     suspend fun goToAdjacentChapter(delta: Int) {}
 
+    /** Navigable document outline for the reader TOC panel. */
+    val tableOfContents: StateFlow<List<TocEntry>>
+        get() = MutableStateFlow(emptyList<TocEntry>()).asStateFlow()
+
+    /** Jump to a table-of-contents entry. Default delegates to [goTo]. */
+    suspend fun goToTocEntry(entry: TocEntry) = goTo(entry.locator)
+
     suspend fun search(query: String): List<Locator> = emptyList()
 
     // Layout control (reflow formats)
     suspend fun setFontSize(sp: Float)
+    suspend fun setTheme(mode: ThemeMode) {}
     suspend fun setMode(mode: ReadingMode)
 
     // View lifecycle / acceleration cache (semantic position lives in ReaderState.currentLocator)

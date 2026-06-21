@@ -12,6 +12,8 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Edit
@@ -26,8 +28,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import dev.readflow.core.model.LoadingState
+import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.TransitionType
 import dev.readflow.render.api.PagingKind
 import kotlinx.coroutines.launch
@@ -182,6 +187,15 @@ fun ReaderScreen(
                             }
                             // ── 分隔线 ──
                             HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
+                            ReaderControlPanel(
+                                panel = state.activePanel,
+                                tocEntries = engine.tableOfContents.collectAsState().value,
+                                fontSizeSp = state.fontSizeSp,
+                                themeMode = state.themeMode,
+                                onTocClick = { viewModel.onIntent(ReaderIntent.GoToTocEntry(it)) },
+                                onFontSizeChange = { viewModel.onIntent(ReaderIntent.SetFontSize(it)) },
+                                onThemeChange = { viewModel.onIntent(ReaderIntent.SetTheme(it)) },
+                            )
                             // ── 快捷功能按钮 ──
                             Surface(
                                 color = MaterialTheme.colorScheme.background.copy(alpha = 0.92f),
@@ -193,7 +207,9 @@ fun ReaderScreen(
                                     horizontalArrangement = Arrangement.SpaceEvenly,
                                 ) {
                                     if (ReaderFeature.TOC in features) {
-                                        ReaderMenuButton("目录", Icons.Default.Menu) { /* TODO: TOC */ }
+                                        ReaderMenuButton("目录", Icons.Default.Menu) {
+                                            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.TOC))
+                                        }
                                     }
                                     if (ReaderFeature.FONT in features) {
                                         ReaderMenuButton("字体", Icons.Default.Edit) {
@@ -213,6 +229,153 @@ fun ReaderScreen(
             }
         }
     }
+}
+
+@Composable
+private fun ReaderControlPanel(
+    panel: ReaderPanel?,
+    tocEntries: List<TocEntry>,
+    fontSizeSp: Float,
+    themeMode: ThemeMode,
+    onTocClick: (TocEntry) -> Unit,
+    onFontSizeChange: (Float) -> Unit,
+    onThemeChange: (ThemeMode) -> Unit,
+) {
+    AnimatedVisibility(visible = panel != null) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = MaterialTheme.colorScheme.background.copy(alpha = 0.96f),
+        ) {
+            when (panel) {
+                ReaderPanel.TOC -> TocPanel(tocEntries, onTocClick)
+                ReaderPanel.FONT -> FontPanel(fontSizeSp, onFontSizeChange)
+                ReaderPanel.THEME -> ThemePanel(themeMode, onThemeChange)
+                null -> Unit
+            }
+        }
+    }
+}
+
+@Composable
+private fun TocPanel(
+    tocEntries: List<TocEntry>,
+    onTocClick: (TocEntry) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 320.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("目录", style = MaterialTheme.typography.titleSmall)
+        if (tocEntries.isEmpty()) {
+            Text(
+                "暂无目录",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 12.dp),
+            )
+        } else {
+            LazyColumn {
+                items(tocEntries) { entry ->
+                    Text(
+                        text = entry.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clickable { onTocClick(entry) }
+                            .padding(
+                                start = (entry.level.coerceIn(0, 4) * 16).dp,
+                                top = 14.dp,
+                                end = 8.dp,
+                                bottom = 14.dp,
+                            ),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FontPanel(
+    fontSizeSp: Float,
+    onFontSizeChange: (Float) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("字体", style = MaterialTheme.typography.titleSmall)
+            Text("${fontSizeSp.toInt()}sp", style = MaterialTheme.typography.labelLarge)
+        }
+        Slider(
+            value = fontSizeSp.coerceIn(12f, 32f),
+            onValueChange = onFontSizeChange,
+            valueRange = 12f..32f,
+            steps = 19,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            text = "阅读正文预览",
+            fontSize = fontSizeSp.coerceIn(12f, 32f).sp,
+            lineHeight = (fontSizeSp.coerceIn(12f, 32f) * 1.7f).sp,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+    }
+}
+
+@Composable
+private fun ThemePanel(
+    themeMode: ThemeMode,
+    onThemeChange: (ThemeMode) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text("主题", style = MaterialTheme.typography.titleSmall)
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            ThemeMode.entries.chunked(2).forEach { rowModes ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    rowModes.forEach { mode ->
+                        FilterChip(
+                            selected = themeMode == mode,
+                            onClick = { onThemeChange(mode) },
+                            label = { Text(mode.readerLabel(), maxLines = 1) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    if (rowModes.size == 1) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun ThemeMode.readerLabel() = when (this) {
+    ThemeMode.SYSTEM -> "跟随系统"
+    ThemeMode.LIGHT -> "日间"
+    ThemeMode.DARK -> "夜间"
+    ThemeMode.SEPIA -> "护眼"
 }
 
 private class ReaderTapContainer(

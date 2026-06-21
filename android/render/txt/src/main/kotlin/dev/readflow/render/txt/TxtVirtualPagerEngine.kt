@@ -10,6 +10,8 @@ import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReadingMode
@@ -45,8 +47,12 @@ class TxtVirtualPagerEngine(
     private val _pageCount = MutableStateFlow(0)
     override val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
 
+    private val _tableOfContents = MutableStateFlow<List<TocEntry>>(emptyList())
+    override val tableOfContents: StateFlow<List<TocEntry>> = _tableOfContents.asStateFlow()
+
     private var paragraphs: List<String> = emptyList()
     private var fontSizeSp: Float = 18f
+    private var themeMode: ThemeMode = ThemeMode.SYSTEM
     private var recyclerView: RecyclerView? = null
 
     override suspend fun supports(uri: Uri): Boolean = true
@@ -60,17 +66,16 @@ class TxtVirtualPagerEngine(
             .map { it.trim() }
             .filter { it.isNotEmpty() }
         _pageCount.value = paragraphs.size
+        _tableOfContents.value = buildToc(paragraphs)
         _currentLocator.value
     }
 
     override fun createView(): View {
         val rv = RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
-            adapter = TxtParagraphAdapter(paragraphs, fontSizeSp)
-            // 阅读区即纸：纸色背景（夜间暖褐压暗），呼应设计文档 §2.3。
-            val night = (resources.configuration.uiMode and
-                Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
-            setBackgroundColor(if (night) PAPER_NIGHT else PAPER_DAY)
+            val palette = paletteFor(themeMode, resources.configuration)
+            adapter = TxtParagraphAdapter(paragraphs, fontSizeSp, palette.ink)
+            setBackgroundColor(palette.paper)
             clipToPadding = false
             val padV = (24 * resources.displayMetrics.density).toInt()
             setPadding(0, padV, 0, padV)
@@ -82,6 +87,32 @@ class TxtVirtualPagerEngine(
         }
         recyclerView = rv
         return rv
+    }
+
+    private fun buildToc(paragraphs: List<String>): List<TocEntry> {
+        if (paragraphs.isEmpty()) return emptyList()
+        val entries = paragraphs.mapIndexedNotNull { index, paragraph ->
+            val heading = paragraph.lineSequence().firstOrNull()?.trim().orEmpty()
+            if (!isTxtHeading(heading)) return@mapIndexedNotNull null
+            TocEntry(
+                title = heading.take(48),
+                locator = Locator(
+                    strategy = LocatorStrategy.Section(0, index, 0),
+                    totalProgression = index.toFloat() / paragraphs.size,
+                ),
+            )
+        }
+        return entries.ifEmpty {
+            listOf(
+                TocEntry(
+                    title = "正文",
+                    locator = Locator(
+                        strategy = LocatorStrategy.Section(0, 0, 0),
+                        totalProgression = 0f,
+                    ),
+                )
+            )
+        }
     }
 
     private fun reportProgression(rv: RecyclerView) {
@@ -110,11 +141,19 @@ class TxtVirtualPagerEngine(
     override suspend fun close() {
         recyclerView = null
         paragraphs = emptyList()
+        _tableOfContents.value = emptyList()
     }
 
     override suspend fun setFontSize(sp: Float) {
         fontSizeSp = sp
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateFontSize(sp)
+    }
+
+    override suspend fun setTheme(mode: ThemeMode) {
+        themeMode = mode
+        val palette = paletteFor(mode, context.resources.configuration)
+        recyclerView?.setBackgroundColor(palette.paper)
+        (recyclerView?.adapter as? TxtParagraphAdapter)?.updateInkColor(palette.ink)
     }
 
     override suspend fun setMode(mode: ReadingMode) {
@@ -124,5 +163,28 @@ class TxtVirtualPagerEngine(
     private companion object {
         val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
         val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
+        val PAPER_LIGHT = Color.rgb(0xFA, 0xFA, 0xF8)
+        val PAPER_SEPIA = Color.rgb(0xF5, 0xF0, 0xE8)
+        private val TXT_HEADING = Regex("""^(第.{1,12}[章节回卷部篇集].*|Chapter\s+\d+.*|CHAPTER\s+\d+.*)$""")
+
+        private fun isTxtHeading(value: String): Boolean =
+            value.length in 2..48 && TXT_HEADING.matches(value)
+
+        private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {
+            val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                Configuration.UI_MODE_NIGHT_YES
+            return when (mode) {
+                ThemeMode.LIGHT -> ReaderPalette(PAPER_LIGHT, TxtParagraphAdapter.INK_DAY)
+                ThemeMode.DARK -> ReaderPalette(PAPER_NIGHT, TxtParagraphAdapter.INK_NIGHT)
+                ThemeMode.SEPIA -> ReaderPalette(PAPER_SEPIA, TxtParagraphAdapter.INK_DAY)
+                ThemeMode.SYSTEM -> if (systemNight) {
+                    ReaderPalette(PAPER_NIGHT, TxtParagraphAdapter.INK_NIGHT)
+                } else {
+                    ReaderPalette(PAPER_DAY, TxtParagraphAdapter.INK_DAY)
+                }
+            }
+        }
     }
 }
+
+private data class ReaderPalette(val paper: Int, val ink: Int)

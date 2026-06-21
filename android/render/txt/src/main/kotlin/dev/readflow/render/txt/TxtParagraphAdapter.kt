@@ -1,6 +1,5 @@
 package dev.readflow.render.txt
 
-import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.util.TypedValue
@@ -18,6 +17,7 @@ import androidx.recyclerview.widget.RecyclerView
 class TxtParagraphAdapter(
     private val paragraphs: List<String>,
     private var fontSizeSp: Float,
+    private var inkColor: Int = INK_DAY,
 ) : RecyclerView.Adapter<TxtParagraphAdapter.ParagraphHolder>() {
 
     class ParagraphHolder(val container: FrameLayout, val textView: TextView) :
@@ -25,9 +25,6 @@ class TxtParagraphAdapter(
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ParagraphHolder {
         val density = parent.resources.displayMetrics.density
-        val night = (parent.resources.configuration.uiMode and
-            Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
-        val inkColor = if (night) INK_NIGHT else INK_DAY
         val maxLineWidthPx = (MAX_LINE_WIDTH_DP * density).toInt()
 
         val tv = TextView(parent.context).apply {
@@ -56,6 +53,7 @@ class TxtParagraphAdapter(
 
     override fun onBindViewHolder(holder: ParagraphHolder, position: Int) {
         holder.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
+        holder.textView.setTextColor(inkColor)
         holder.textView.text = paragraphs[position]
     }
 
@@ -66,7 +64,12 @@ class TxtParagraphAdapter(
         notifyDataSetChanged()
     }
 
-    private companion object {
+    fun updateInkColor(color: Int) {
+        inkColor = color
+        notifyDataSetChanged()
+    }
+
+    companion object {
         val INK_DAY = Color.rgb(0x2A, 0x26, 0x20)
         val INK_NIGHT = Color.rgb(0xD8, 0xCF, 0xBC)
         const val MAX_LINE_WIDTH_DP = 680f
