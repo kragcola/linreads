@@ -208,6 +208,41 @@ fun BookGrid(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
+        // ── 整行联通书架隔板（先渲染 = 在网格后面）──
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val visInfo = gridState.layoutInfo.visibleItemsInfo
+            val processedRows = mutableSetOf<Int>()
+            for (info in visInfo) {
+                // 用 top edge 做行标识 — 同行 item 的 offset.y 一致
+                val rowY = info.offset.y
+                if (processedRows.add(rowY)) {
+                    // 整行底板：暖木色 + 上下投影
+                    val boardY = rowY.toFloat()
+                    val boardH = 4.dp.toPx()
+                    val shadowH = 5.dp.toPx()
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            colors = listOf(Color(0x1A000000), Color.Transparent),
+                            startY = boardY - shadowH,
+                            endY = boardY,
+                        ),
+                        topLeft = Offset(0f, boardY - shadowH),
+                        size = Size(size.width, shadowH),
+                    )
+                    drawRect(
+                        color = Color(0xFFD4C9AE),
+                        topLeft = Offset(0f, boardY),
+                        size = Size(size.width, boardH),
+                    )
+                    drawRect(
+                        color = Color(0x12000000),
+                        topLeft = Offset(0f, boardY + boardH),
+                        size = Size(size.width, 0.5.dp.toPx()),
+                    )
+                }
+            }
+        }
+
         LazyVerticalGrid(
             state = gridState,
             columns = GridCells.Adaptive(minSize = Dimens.coverTargetWidthPhone),
@@ -217,7 +252,7 @@ fun BookGrid(
             ),
             horizontalArrangement = Arrangement.spacedBy(Dimens.gridGapCompact),
             verticalArrangement = Arrangement.spacedBy(Dimens.gridGapCompact),
-            modifier = Modifier.zIndex(1f).widthIn(max = Dimens.maxContentWidth),
+            modifier = Modifier.widthIn(max = Dimens.maxContentWidth),
         ) {
             itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
                 val isDragging = dragItemKey == item.key
@@ -667,38 +702,6 @@ fun BookGrid(
             }
         }
 
-        // ── 整行联通书架隔板（zIndex=-1 放在网格后面）──
-        Canvas(modifier = Modifier.fillMaxSize().zIndex(-1f)) {
-            val visInfo = gridState.layoutInfo.visibleItemsInfo
-            val processedRows = mutableSetOf<Int>()
-            for (info in visInfo) {
-                val rowY = (info.offset.y + info.size.height).toInt()
-                if (processedRows.add(rowY)) {
-                    // 插板：暖色细板 + 上投影，联通整行
-                    val boardY = rowY.toFloat()
-                    val boardH = 4.dp.toPx()
-                    val shadowH = 5.dp.toPx()
-                    drawRect(
-                        brush = Brush.verticalGradient(
-                            colors = listOf(Color(0x1A000000), Color.Transparent),
-                            startY = boardY - shadowH,
-                            endY = boardY,
-                        ),
-                        topLeft = Offset(0f, boardY - shadowH),
-                        size = Size(size.width, shadowH),
-                    )
-                    drawRect(
-                        color = Color(0xFFD4C9AE),
-                        topLeft = Offset(0f, boardY),
-                        size = Size(size.width, boardH),
-                    )
-                    drawRect(
-                        color = Color(0x12000000),
-                        topLeft = Offset(0f, boardY + boardH),
-                        size = Size(size.width, 0.5.dp.toPx()),
-                    )
-                }
-            }
         }
 
         // ── 取消区 Overlay ──
