@@ -89,6 +89,7 @@ fun ReadflowApp() {
                     onBack = { navController.popBackStack() },
                     onCheckForUpdate = { AppUpdateManager.checkForUpdate() },
                     authToken = dev.readflow.BuildConfig.GITHUB_OTA_TOKEN,
+                    buildTag = dev.readflow.BuildConfig.BUILD_TAG,
                 )
             }
         }

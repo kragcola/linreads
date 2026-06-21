@@ -26,6 +26,7 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onCheckForUpdate: suspend () -> String? = { null },
     authToken: String = "",
+    buildTag: String = "",
 ) {
     val vm = koinViewModel<SettingsViewModel>()
     val url by vm.calibreBaseUrl.collectAsStateWithLifecycle()
@@ -111,7 +112,7 @@ fun SettingsScreen(
 
             // 诊断：显示当前 BUILD_TAG
             Text(
-                text = "构建标识：${dev.readflow.BuildConfig.BUILD_TAG}",
+                text = "构建标识：${buildTag}",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
             )
