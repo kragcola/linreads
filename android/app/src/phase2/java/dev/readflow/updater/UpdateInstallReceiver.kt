@@ -26,11 +26,39 @@ class UpdateInstallReceiver : BroadcastReceiver() {
         val apkUrl = intent.getStringExtra("apk_url") ?: return
         val authToken = intent.getStringExtra("auth_token") ?: ""
 
-        // Clean up previous download record (and its file) before starting a new one.
         val prefs = context.getSharedPreferences("update", Context.MODE_PRIVATE)
         val prevId = prefs.getLong("dl_id", -1)
+
+        // Check if we have a completed download already
         if (prevId != -1L) {
-            context.getSystemService(DownloadManager::class.java).remove(prevId)
+            val dm = context.getSystemService(DownloadManager::class.java)
+            val q = dm.query(DownloadManager.Query().setFilterById(prevId))
+            if (q.moveToFirst()) {
+                val status = q.getInt(q.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                q.close()
+                when (status) {
+                    DownloadManager.STATUS_SUCCESSFUL -> {
+                        // Old completed download exists - verify it's still valid
+                        val uri = dm.getUriForDownloadedFile(prevId)
+                        if (uri != null) {
+                            launchInstaller(context, uri)
+                            return
+                        }
+                        // File missing, clean up and re-download
+                        dm.remove(prevId)
+                    }
+                    DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING -> {
+                        // Download already in progress - do nothing
+                        return
+                    }
+                    else -> {
+                        // Failed/paused - clean up and restart
+                        dm.remove(prevId)
+                    }
+                }
+            } else {
+                q.close()
+            }
         }
 
         if (!context.packageManager.canRequestPackageInstalls()) {
@@ -46,13 +74,20 @@ class UpdateInstallReceiver : BroadcastReceiver() {
             DownloadManager.Request(Uri.parse(apkUrl)).apply {
                 if (authToken.isNotEmpty()) addRequestHeader("Authorization", "Bearer $authToken")
                 setTitle("LinReads 更新下载中")
+                setDescription("正在下载新版本…")
                 setMimeType("application/vnd.android.package-archive")
-                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                 setDestinationInExternalFilesDir(context, null, "update.apk")
             }
         )
-        context.getSharedPreferences("update", Context.MODE_PRIVATE)
-            .edit().putLong("dl_id", dlId).apply()
+        prefs.edit().putLong("dl_id", dlId).apply()
+    }
+
+    private fun launchInstaller(context: Context, uri: Uri) {
+        context.startActivity(Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        })
     }
 
     private fun onDownloadComplete(context: Context, intent: Intent) {
@@ -64,7 +99,10 @@ class UpdateInstallReceiver : BroadcastReceiver() {
         val dm = context.getSystemService(DownloadManager::class.java)
         val apkUri = dm.getUriForDownloadedFile(dlId) ?: return
 
-        // Post "tap to install" notification — startActivity directly is blocked on API 29+
+        // Automatically launch installer after download completes
+        launchInstaller(context, apkUri)
+
+        // Also post a notification as a fallback if auto-install doesn't trigger
         val installIntent = PendingIntent.getActivity(
             context, 0,
             Intent(Intent.ACTION_VIEW).apply {

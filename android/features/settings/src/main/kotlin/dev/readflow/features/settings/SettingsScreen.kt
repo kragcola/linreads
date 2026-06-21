@@ -131,15 +131,18 @@ fun SettingsScreen(
 
                 is UpdateState.Available -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("发现新版本，点击下载安装", style = MaterialTheme.typography.bodyMedium)
-                    Button(onClick = {
-                        val (dlId, completedUri) = context.startOrGetDownload(s.apkUrl, authToken)
-                        if (completedUri != null) {
-                            launchInstaller(context, completedUri)
-                            updateState = UpdateState.ReadyToInstall(completedUri)
-                        } else {
-                            updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
-                        }
-                    }) { Text("下载并安装") }
+                    Button(
+                        onClick = {
+                            val (dlId, completedUri) = context.startOrGetDownload(s.apkUrl, authToken)
+                            if (completedUri != null) {
+                                launchInstaller(context, completedUri)
+                                updateState = UpdateState.ReadyToInstall(completedUri)
+                            } else {
+                                updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
+                            }
+                        },
+                        enabled = true
+                    ) { Text("下载并安装") }
                 }
 
                 is UpdateState.Downloading -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -150,6 +153,16 @@ fun SettingsScreen(
                         LinearProgressIndicator(progress = { s.progress }, modifier = Modifier.fillMaxWidth())
                         Text("下载中 ${(s.progress * 100).toInt()}%", style = MaterialTheme.typography.bodyMedium)
                     }
+                    TextButton(
+                        onClick = {
+                            // Cancel download and reset state
+                            val dm = context.getSystemService(DownloadManager::class.java)
+                            dm.remove(s.dlId)
+                            context.getSharedPreferences("update", Context.MODE_PRIVATE)
+                                .edit().remove("dl_id").apply()
+                            updateState = UpdateState.Idle
+                        }
+                    ) { Text("取消下载") }
                 }
 
                 is UpdateState.ReadyToInstall -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -167,8 +180,9 @@ fun SettingsScreen(
 }
 
 /**
- * 若已有完成的下载 → 返回 (dlId, uri)；若正在下载 → 返回 (dlId, null)；
- * 否则新建下载 → 返回 (newDlId, null)。避免重复下载。
+ * 若已有完成的下载 → 检查版本，若版本相同则删除旧包并重新下载，返回 (newDlId, null)；
+ * 若正在下载 → 返回 (dlId, null)；否则新建下载 → 返回 (newDlId, null)。
+ * 避免重复下载并确保下载的是新版本。
  */
 private fun Context.startOrGetDownload(apkUrl: String, authToken: String): Pair<Long, Uri?> {
     val prefs = getSharedPreferences("update", Context.MODE_PRIVATE)
@@ -178,22 +192,42 @@ private fun Context.startOrGetDownload(apkUrl: String, authToken: String): Pair<
         val q = dm.query(DownloadManager.Query().setFilterById(existingId))
         if (q.moveToFirst()) {
             val status = q.getInt(q.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            val uri = q.getString(q.getColumnIndexOrThrow(DownloadManager.COLUMN_URI))
             q.close()
             when (status) {
-                DownloadManager.STATUS_SUCCESSFUL -> dm.getUriForDownloadedFile(existingId)
-                    ?.let { return existingId to it }
-                DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING ->
-                    return existingId to null  // reattach to in-progress download
-                else -> {}  // failed/paused: fall through and re-enqueue
+                DownloadManager.STATUS_SUCCESSFUL -> {
+                    // Check if the completed download is for the same URL
+                    if (uri == apkUrl) {
+                        dm.getUriForDownloadedFile(existingId)?.let {
+                            return existingId to it
+                        }
+                    }
+                    // Different URL or file missing - remove old download
+                    dm.remove(existingId)
+                }
+                DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING -> {
+                    // Check if it's downloading the same URL
+                    if (uri == apkUrl) {
+                        return existingId to null  // reattach to in-progress download
+                    }
+                    // Different URL - cancel old download
+                    dm.remove(existingId)
+                }
+                else -> {
+                    // failed/paused: clean up
+                    dm.remove(existingId)
+                }
             }
-        } else q.close()
-        dm.remove(existingId)
+        } else {
+            q.close()
+        }
     }
     val dm = getSystemService(DownloadManager::class.java)
     val dlId = dm.enqueue(
         DownloadManager.Request(Uri.parse(apkUrl)).apply {
             if (authToken.isNotEmpty()) addRequestHeader("Authorization", "Bearer $authToken")
             setTitle("LinReads 更新下载中")
+            setDescription("正在下载新版本…")
             setMimeType("application/vnd.android.package-archive")
             setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
             setDestinationInExternalFilesDir(this@startOrGetDownload, null, "update.apk")
