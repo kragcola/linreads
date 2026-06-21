@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -662,7 +663,40 @@ fun BookGrid(
                         overflow = TextOverflow.Ellipsis,
                     )
                     if (item is LibraryItem.Single) { /* 作者识别不到，已移除 */ }
-                    ShelfBoard(modifier = Modifier.padding(top = Dimens.spaceXs))
+                }
+            }
+        }
+
+        // ── 整行联通书架隔板 ──
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val visInfo = gridState.layoutInfo.visibleItemsInfo
+            val processedRows = mutableSetOf<Int>()
+            for (info in visInfo) {
+                val rowY = info.offset.y + info.size.height
+                if (processedRows.add(rowY)) {
+                    // 插板：暖色细板 + 上投影，联通整行
+                    val boardY = rowY.toFloat()
+                    val boardH = 4.dp.toPx()
+                    val shadowH = 5.dp.toPx()
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            colors = listOf(Color(0x1A000000), Color.Transparent),
+                            startY = boardY - shadowH,
+                            endY = boardY,
+                        ),
+                        topLeft = Offset(0f, boardY - shadowH),
+                        size = Size(size.width, shadowH),
+                    )
+                    drawRect(
+                        color = Color(0xFFD4C9AE),
+                        topLeft = Offset(0f, boardY),
+                        size = Size(size.width, boardH),
+                    )
+                    drawRect(
+                        color = Color(0x12000000),
+                        topLeft = Offset(0f, boardY + boardH),
+                        size = Size(size.width, 0.5.dp.toPx()),
+                    )
                 }
             }
         }
