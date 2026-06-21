@@ -1,8 +1,11 @@
 package dev.readflow.core.ui
 
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.tween
+import android.view.HapticFeedbackConstants
+import android.view.HapticFeedbackConstants
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
@@ -10,7 +13,6 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
-import android.view.HapticFeedbackConstants
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
@@ -22,6 +24,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
@@ -33,15 +38,20 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.roundToInt
+
+/** 拖拽时手指命中的区域类型 */
+private enum class DragZone { GAP_ABOVE, BOOK, GAP_BELOW, CANCEL }
 
 /**
  * 书架网格，支持点击、拖拽重排、dwell 悬停建组。
  *
- * **手势设计**（根因修复）：
+ * **手势设计 v2**：
  * - 点击 → 打开书
- * - ⋮ 菜单 → 改名/建组/删除（不再用长按弹菜单，消除与拖动的竞态）
- * - 长按拖动 → 重排（实时让位动画用 `Modifier.animateItem()`）
- * - 悬停 ~700ms → 高亮目标书 → 松手建组
+ * - ⋮ 菜单 → 改名/建组/删除
+ * - 长按拖动到间隙区（上下30%）→ 实时换位预览，松手生效
+ * - 长按拖动到书本区（中间40%）→ 停留700ms建组，环形进度倒计时
+ * - 拖到屏幕底部取消区 → 红色提示，松手回到原位
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -67,17 +77,23 @@ fun BookGrid(
     val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
 
-    // ── 拖动状态（grid 绝对坐标系） ──
-    var draggedIndex by remember { mutableIntStateOf(-1) }
+    // ── 拖动状态 ──
+    var dragItemKey by remember { mutableStateOf("") }
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
     var dragStartAbsPos by remember { mutableStateOf(Offset.Zero) }
-    var currentHoverIndex by remember { mutableIntStateOf(-1) }
-    var dwellTargetIndex by remember { mutableIntStateOf(-1) } // dwell 高亮的目标书
+    var currentInsertIndex by remember { mutableIntStateOf(-1) }
+    var currentHoverKey by remember { mutableStateOf("") }
+    var currentZone by remember { mutableStateOf(DragZone.GAP_BELOW) }
+    var dwellTargetKey by remember { mutableStateOf("") }
+    var isInCancelZone by remember { mutableStateOf(false) }
+    var reorderPreviewActive by remember { mutableStateOf(false) }
 
     // dwell 计时
     var dwellJob by remember { mutableStateOf<Job?>(null) }
+    var dwellStartTime by remember { mutableStateOf(0L) }
+    var dwellProgress by remember { mutableStateOf(0f) }
     val dwellThresholdMs = 700L
-    val dwellMoveTolerance = 12.dp // 允许轻微抖动
+    val dwellMoveTolerance = 12.dp
 
     // 自动滚动
     var autoScrollJob by remember { mutableStateOf<Job?>(null) }
@@ -85,7 +101,7 @@ fun BookGrid(
 
     // 菜单/对话框状态
     var contextItem by remember { mutableStateOf<LibraryItem?>(null) }
-    var contextMenuAnchor by remember { mutableStateOf<Int?>(null) } // 菜单绑定的 item index
+    var contextMenuAnchor by remember { mutableStateOf<Int?>(null) }
     var renameItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var renameText by remember { mutableStateOf("") }
     var groupSourceId by remember { mutableStateOf("") }
@@ -94,21 +110,97 @@ fun BookGrid(
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
     var deleteConfirmLabel by remember { mutableStateOf("") }
     var ungroupConfirmName by remember { mutableStateOf<String?>(null) }
-    var dragCooldown by remember { mutableStateOf(false) }
 
-    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+    // 取消区高度
+    val cancelZoneHeight = 64.dp
+
+    /** 根据手指绝对位置和 item info 计算命中区域 */
+    fun hitZone(absPos: Offset, info: LazyGridItemInfo): DragZone {
+        val itemTop = info.offset.y.toFloat()
+        val itemH = info.size.height.toFloat()
+        val zoneH = itemH * 0.30f
+        val relY = absPos.y - itemTop
+        return when {
+            relY < zoneH -> DragZone.GAP_ABOVE
+            relY < itemH - zoneH -> DragZone.BOOK
+            else -> DragZone.GAP_BELOW
+        }
+    }
+
+    /** 根据手指位置找到插入目标 index 和所在 zone */
+    fun findDropTarget(absPos: Offset): Pair<Int, DragZone> {
+        val visInfo = gridState.layoutInfo.visibleItemsInfo
+        if (visInfo.isEmpty()) return -1 to DragZone.GAP_BELOW
+
+        // 手指在最后一个 item 下方 → 插入到末尾
+        val last = visInfo.last()
+        if (absPos.y > last.offset.y + last.size.height) {
+            return mutableItems.lastIndex to DragZone.GAP_BELOW
+        }
+        // 手指在第一个 item 上方 → 插入到开头
+        val first = visInfo.first()
+        if (absPos.y < first.offset.y) {
+            return 0 to DragZone.GAP_ABOVE
+        }
+
+        // 找到覆盖手指的 item
+        val hitInfo = visInfo.firstOrNull { info ->
+            val rx = info.offset.x.toFloat()
+            val ry = info.offset.y.toFloat()
+            absPos.x in rx..(rx + info.size.width) &&
+                absPos.y in ry..(ry + info.size.height)
+        }
+        if (hitInfo != null) {
+            val zone = hitZone(absPos, hitInfo)
+            val insertIdx = when (zone) {
+                DragZone.GAP_ABOVE -> hitInfo.index
+                DragZone.BOOK -> hitInfo.index // 书本区返回自身index，由调用方处理
+                DragZone.GAP_BELOW -> (hitInfo.index + 1).coerceAtMost(mutableItems.lastIndex)
+                DragZone.CANCEL -> currentInsertIndex
+            }
+            return insertIdx to zone
+        }
+
+        // 没有直接命中 — 找最近的 item
+        val nearest = visInfo.minByOrNull { abs(absPos.y - (it.offset.y + it.size.height / 2f)) }
+        return nearest?.let {
+            val z = hitZone(absPos.copy(y = (it.offset.y + it.size.height / 2f).toFloat()), it)
+            val idx = if (z == DragZone.GAP_ABOVE) it.index else (it.index + 1).coerceAtMost(mutableItems.lastIndex)
+            idx to z
+        } ?: (-1 to DragZone.GAP_BELOW)
+    }
+
+    /** 拖拽中实时重排：移除被拖拽的 item 并插入到新位置 */
+    fun performLiveReorder(insertIdx: Int) {
+        if (!reorderPreviewActive) return
+        val dragIdx = mutableItems.indexOfFirst { it.key == dragItemKey }
+        if (dragIdx < 0) return
+        val targetIdx = if (insertIdx > dragIdx) insertIdx - 1 else insertIdx
+        if (targetIdx == dragIdx) return
+        val moved = mutableItems.removeAt(dragIdx)
+        mutableItems.add(targetIdx.coerceIn(0, mutableItems.size), moved)
+    }
+
+    /** 根据 item key 找它的 info */
+    fun infoForKey(key: String) = gridState.layoutInfo.visibleItemsInfo
+        .firstOrNull { mutableItems.getOrNull(it.index)?.key == key }
+
+    Box(modifier = modifier.fillMaxSize()) {
         LazyVerticalGrid(
             state = gridState,
             columns = GridCells.Adaptive(minSize = Dimens.coverTargetWidthPhone),
-            contentPadding = PaddingValues(horizontal = Dimens.screenEdge, vertical = Dimens.spaceMd),
+            contentPadding = PaddingValues(
+                horizontal = Dimens.screenEdge,
+                vertical = Dimens.spaceMd,
+            ),
             horizontalArrangement = Arrangement.spacedBy(Dimens.gridGapCompact),
             verticalArrangement = Arrangement.spacedBy(Dimens.gridGapCompact),
             modifier = Modifier.widthIn(max = Dimens.maxContentWidth),
         ) {
             itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
-                val isDragging = draggedIndex == index
-                val isDwellTarget = dwellTargetIndex == index && draggedIndex >= 0 && draggedIndex != index
-                val isHoverTarget = currentHoverIndex == index && draggedIndex >= 0 && draggedIndex != index && dwellTargetIndex < 0
+                val isDragging = dragItemKey == item.key
+                val isDwellTarget = dwellTargetKey == item.key && dragItemKey.isNotEmpty() && dragItemKey != item.key
+                val isInsertPlaceholder = reorderPreviewActive && currentInsertIndex == index && dragItemKey != item.key && currentZone != DragZone.BOOK
                 val view = LocalView.current
 
                 Column(
@@ -117,103 +209,141 @@ fun BookGrid(
                         .graphicsLayer {
                             translationX = if (isDragging) dragOffset.x else 0f
                             translationY = if (isDragging) dragOffset.y else 0f
-                            scaleX = if (isDragging) 1.15f else if (isDwellTarget) 0.94f else if (isHoverTarget) 1f else 1f
-                            scaleY = if (isDragging) 1.15f else if (isDwellTarget) 0.94f else if (isHoverTarget) 1f else 1f
-                            alpha = if (isDragging) 0.8f else if (isDwellTarget) 1f else if (isHoverTarget) 0.35f else 1f
+                            scaleX = if (isDragging) 1.10f else if (isDwellTarget) 0.94f else 1f
+                            scaleY = if (isDragging) 1.10f else if (isDwellTarget) 0.94f else 1f
+                            alpha = if (isDragging) 0.7f else 1f
                             shadowElevation = if (isDragging) 8f else 0f
                         }
                         .animateItem()
                         .clickable { onItemClick(item) }
                         .pointerInput(item.key, index) {
-                            var lastStablePos = Offset.Zero
-                            var dwellStartTime = 0L
+                            var dwellLocalStart = 0L
 
                             detectDragGesturesAfterLongPress(
                                 onDragStart = { localPos ->
-                                    // Issue 3: animateItem 动画期间禁止新拖拽
-                                    if (!dragCooldown) {
-                                        draggedIndex = index
+                                    if (dragItemKey.isEmpty()) {
+                                        dragItemKey = item.key
                                         dragOffset = Offset.Zero
-                                        dwellTargetIndex = -1
-                                        currentHoverIndex = -1
+                                        dwellTargetKey = ""
+                                        currentHoverKey = ""
+                                        currentInsertIndex = -1
+                                        currentZone = DragZone.GAP_BELOW
+                                        reorderPreviewActive = false
+                                        isInCancelZone = false
                                         dwellJob?.cancel()
                                         autoScrollJob?.cancel()
+                                        dwellProgress = 0f
 
-                                        // 触觉反馈：长按激活拖拽
                                         view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
 
-                                        // 记录起始绝对位置（grid 坐标系）
                                         val itemInfo = gridState.layoutInfo.visibleItemsInfo
                                             .firstOrNull { it.index == index }
                                         dragStartAbsPos = Offset(
                                             (itemInfo?.offset?.x ?: 0).toFloat() + localPos.x,
                                             (itemInfo?.offset?.y ?: 0).toFloat() + localPos.y,
                                         )
-                                        lastStablePos = dragStartAbsPos
-                                        dwellStartTime = System.currentTimeMillis()
+                                        dwellLocalStart = System.currentTimeMillis()
+                                        dwellStartTime = dwellLocalStart
                                     }
                                 },
                                 onDrag = { change, delta ->
+                                    if (dragItemKey != item.key) return@detectDragGesturesAfterLongPress
                                     dragOffset += delta
                                     change.consume()
 
                                     val absPos = dragStartAbsPos + dragOffset
-                                    val visInfo = gridState.layoutInfo.visibleItemsInfo
-                                    val newHoverIndex = visInfo
-                                        .firstOrNull { info ->
-                                            val rx = info.offset.x.toFloat()
-                                            val ry = info.offset.y.toFloat()
-                                            absPos.x in rx..(rx + info.size.width) &&
-                                                absPos.y in ry..(ry + info.size.height)
+
+                                    // ── 取消区检测 ──
+                                    val viewportHeight = gridState.layoutInfo.viewportEndOffset -
+                                        gridState.layoutInfo.viewportStartOffset
+                                    val cancelTop = viewportHeight - cancelZoneHeight.toPx()
+                                    val newInCancel = absPos.y > cancelTop
+                                    if (newInCancel != isInCancelZone) {
+                                        isInCancelZone = newInCancel
+                                        if (newInCancel) {
+                                            // 进入取消区：回退所有实时换位
+                                            dwellJob?.cancel()
+                                            dwellTargetKey = ""
+                                            dwellProgress = 0f
+                                            reorderPreviewActive = false
+                                            currentInsertIndex = -1
+                                            // 恢复原始顺序
+                                            mutableItems.clear()
+                                            mutableItems.addAll(items)
                                         }
-                                        ?.index?.coerceIn(0, mutableItems.lastIndex)
-                                        ?: -1
+                                    }
 
-                                    // ── dwell 检测 ──
-                                    if (newHoverIndex != currentHoverIndex) {
-                                        // 移动到新格子，重置 dwell
+                                    if (isInCancelZone) return@detectDragGesturesAfterLongPress
+
+                                    // ── 正常区：命中检测 ──
+                                    val (insertIdx, zone) = findDropTarget(absPos)
+                                    val hitInfo = gridState.layoutInfo.visibleItemsInfo
+                                        .firstOrNull { absPos.y in it.offset.y.toFloat()..(it.offset.y + it.size.height).toFloat() }
+                                    val hoverKey = hitInfo?.let { mutableItems.getOrNull(it.index)?.key } ?: ""
+
+                                    if (zone != currentZone || hoverKey != currentHoverKey) {
                                         dwellJob?.cancel()
-                                        dwellTargetIndex = -1
-                                        currentHoverIndex = newHoverIndex
-                                        lastStablePos = absPos
-                                        dwellStartTime = System.currentTimeMillis()
+                                        dwellTargetKey = ""
+                                        dwellProgress = 0f
+                                        currentZone = zone
+                                        currentHoverKey = hoverKey
+                                        dwellLocalStart = System.currentTimeMillis()
+                                        dwellStartTime = dwellLocalStart
 
-                                        // 如果新格子是有效目标，启动 dwell 计时
-                                        if (newHoverIndex >= 0 && newHoverIndex != index) {
-                                            val targetItem = mutableItems.getOrNull(newHoverIndex)
-                                            if (item is LibraryItem.Single && (targetItem is LibraryItem.Single || targetItem is LibraryItem.Bundle)) {
-                                                dwellJob = scope.launch {
-                                                    delay(dwellThresholdMs)
-                                                    dwellTargetIndex = newHoverIndex
+                                        when (zone) {
+                                            DragZone.GAP_ABOVE, DragZone.GAP_BELOW -> {
+                                                // 间隙区 → 实时换位
+                                                reorderPreviewActive = true
+                                                currentInsertIndex = insertIdx
+                                                performLiveReorder(insertIdx)
+                                            }
+                                            DragZone.BOOK -> {
+                                                // 书本区 → 停止实时换位（恢复原位）+ 启动 dwell
+                                                reorderPreviewActive = false
+                                                currentInsertIndex = -1
+                                                // 恢复原始顺序
+                                                val orig = items.toList()
+                                                if (mutableItems.toList() != orig) {
+                                                    mutableItems.clear()
+                                                    mutableItems.addAll(orig)
+                                                }
+
+                                                val targetItem = mutableItems.getOrNull(insertIdx)
+                                                if (targetItem != null && hoverKey != dragItemKey) {
+                                                    val dragItem = mutableItems.firstOrNull { it.key == dragItemKey }
+                                                    if (dragItem is LibraryItem.Single &&
+                                                        (targetItem is LibraryItem.Single || targetItem is LibraryItem.Bundle)) {
+                                                        dwellJob = scope.launch {
+                                                            while (isActive) {
+                                                                delay(50)
+                                                                val elapsed = System.currentTimeMillis() - dwellLocalStart
+                                                                dwellProgress = (elapsed.toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
+                                                                if (elapsed >= dwellThresholdMs) {
+                                                                    dwellTargetKey = hoverKey
+                                                                    dwellProgress = 1f
+                                                                    break
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
+                                            DragZone.CANCEL -> {}
                                         }
-                                    } else if (newHoverIndex >= 0 && newHoverIndex != index) {
-                                        // 同一格子内，检测是否移动过多（抖动）
-                                        val moveDistance = (absPos - lastStablePos).getDistance()
-                                        if (moveDistance > dwellMoveTolerance.toPx()) {
-                                            // 抖动过大，重置 dwell
-                                            dwellJob?.cancel()
-                                            dwellTargetIndex = -1
-                                            lastStablePos = absPos
-                                            dwellStartTime = System.currentTimeMillis()
-                                        }
+                                    } else if (zone == DragZone.BOOK && hoverKey.isNotEmpty() && hoverKey != dragItemKey) {
+                                        // 同一书本区内，更新 dwell 进度
+                                        dwellProgress = ((System.currentTimeMillis() - dwellLocalStart).toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
                                     }
 
                                     // ── 自动滚动 ──
-                                    val viewportHeight = gridState.layoutInfo.viewportEndOffset -
-                                        gridState.layoutInfo.viewportStartOffset
                                     val relativeY = absPos.y - gridState.layoutInfo.viewportStartOffset
-                                    val edgeThresholdPx = scrollEdgeThreshold.toPx()
-
                                     autoScrollJob?.cancel()
                                     val scrollSpeed = when {
-                                        relativeY < edgeThresholdPx -> -(edgeThresholdPx - relativeY) / 10f
-                                        relativeY > viewportHeight - edgeThresholdPx ->
-                                            (relativeY - (viewportHeight - edgeThresholdPx)) / 10f
+                                        relativeY < scrollEdgeThreshold.toPx() -> -(scrollEdgeThreshold.toPx() - relativeY) / 10f
+                                        relativeY > viewportHeight - scrollEdgeThreshold.toPx() ->
+                                            (relativeY - (viewportHeight - scrollEdgeThreshold.toPx())) / 10f
                                         else -> 0f
                                     }
-
                                     if (abs(scrollSpeed) > 1f) {
                                         autoScrollJob = scope.launch {
                                             while (true) {
@@ -227,56 +357,59 @@ fun BookGrid(
                                     }
                                 },
                                 onDragEnd = {
-                                    val target = currentHoverIndex
-                                    val wasDwelling = dwellTargetIndex >= 0
-
                                     dwellJob?.cancel()
                                     autoScrollJob?.cancel()
-                                    draggedIndex = -1
-                                    dragOffset = Offset.Zero
-                                    currentHoverIndex = -1
-                                    dwellTargetIndex = -1
 
-                                    if (target >= 0 && target != index) {
-                                        val targetItem = mutableItems.getOrNull(target)
-                                        if (item is LibraryItem.Single) {
-                                            when {
-                                                wasDwelling && targetItem is LibraryItem.Bundle -> {
-                                                    // dwell 到已有组 → 直接加入
-                                                    onMoveToGroup(item.book.id, targetItem.bundle.name)
-                                                }
-                                                wasDwelling && targetItem is LibraryItem.Single -> {
-                                                    // dwell 完成 → 新建组（弹对话框）
-                                                    groupSourceId = item.book.id
+                                    if (isInCancelZone) {
+                                        // 取消：恢复原始顺序
+                                        mutableItems.clear()
+                                        mutableItems.addAll(items)
+                                    } else if (reorderPreviewActive && currentInsertIndex >= 0) {
+                                        // 换位生效：恢复到最终位置（已在实时重排中完成）并持久化
+                                        onReorder(mutableItems.toList())
+                                    } else if (dwellTargetKey.isNotEmpty()) {
+                                        // 建组
+                                        val dragItem = mutableItems.firstOrNull { it.key == dragItemKey }
+                                        val targetItem = mutableItems.firstOrNull { it.key == dwellTargetKey }
+                                        if (dragItem is LibraryItem.Single) {
+                                            when (targetItem) {
+                                                is LibraryItem.Bundle -> onMoveToGroup(dragItem.book.id, targetItem.bundle.name)
+                                                is LibraryItem.Single -> {
+                                                    groupSourceId = dragItem.book.id
                                                     groupTargetItem = targetItem
                                                     groupName = ""
                                                 }
-                                                else -> {
-                                                    // 快速划过 → 重排
-                                                    val moved = mutableItems.removeAt(index)
-                                                    mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
-                                                    onReorder(mutableItems.toList())
-                                                    dragCooldown = true
-                                                    scope.launch { delay(350); dragCooldown = false }
-                                                }
+                                                else -> {}
                                             }
-                                        } else {
-                                            // 非单本 → 重排
-                                            val moved = mutableItems.removeAt(index)
-                                            mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
-                                            onReorder(mutableItems.toList())
-                                            dragCooldown = true
-                                            scope.launch { delay(350); dragCooldown = false }
                                         }
                                     }
+
+                                    // 重置
+                                    dragItemKey = ""
+                                    dragOffset = Offset.Zero
+                                    currentHoverKey = ""
+                                    currentInsertIndex = -1
+                                    currentZone = DragZone.GAP_BELOW
+                                    dwellTargetKey = ""
+                                    dwellProgress = 0f
+                                    reorderPreviewActive = false
+                                    isInCancelZone = false
                                 },
                                 onDragCancel = {
                                     dwellJob?.cancel()
                                     autoScrollJob?.cancel()
-                                    draggedIndex = -1
+                                    // 恢复原始顺序
+                                    mutableItems.clear()
+                                    mutableItems.addAll(items)
+                                    dragItemKey = ""
                                     dragOffset = Offset.Zero
-                                    currentHoverIndex = -1
-                                    dwellTargetIndex = -1
+                                    currentHoverKey = ""
+                                    currentInsertIndex = -1
+                                    currentZone = DragZone.GAP_BELOW
+                                    dwellTargetKey = ""
+                                    dwellProgress = 0f
+                                    reorderPreviewActive = false
+                                    isInCancelZone = false
                                 },
                             )
                         },
@@ -289,8 +422,20 @@ fun BookGrid(
                     ) {
                         when (item) {
                             is LibraryItem.Single -> {
-                                if (isDwellTarget && draggedIndex >= 0) {
-                                    val dragged = mutableItems.getOrNull(draggedIndex)
+                                if (isInsertPlaceholder) {
+                                    // 虚化占位框（间隙区拖入时的插入预览）
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .border(2.dp, MaterialTheme.colorScheme.primary, shape = MaterialTheme.shapes.medium)
+                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), shape = MaterialTheme.shapes.medium),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text("← 插入此处", style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))
+                                    }
+                                } else if (isDwellTarget && dragItemKey.isNotEmpty()) {
+                                    val dragged = mutableItems.firstOrNull { it.key == dragItemKey }
                                     if (dragged is LibraryItem.Single) {
                                         BundleStack(
                                             bundle = dev.readflow.core.model.BookBundle(
@@ -314,14 +459,19 @@ fun BookGrid(
                                 }
                             }
                             is LibraryItem.Bundle -> {
-                                if (isDwellTarget && draggedIndex >= 0) {
-                                    val dragged = mutableItems.getOrNull(draggedIndex)
+                                if (isInsertPlaceholder) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .border(2.dp, MaterialTheme.colorScheme.primary, shape = MaterialTheme.shapes.medium)
+                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), shape = MaterialTheme.shapes.medium),
+                                        contentAlignment = Alignment.Center,
+                                    ) { Text("← 插入此处", style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)) }
+                                } else if (isDwellTarget && dragItemKey.isNotEmpty()) {
+                                    val dragged = mutableItems.firstOrNull { it.key == dragItemKey }
                                     if (dragged is LibraryItem.Single) {
-                                        BundleStack(
-                                            bundle = item.bundle.copy(
-                                                books = item.bundle.books + dragged.book,
-                                            ),
-                                        )
+                                        BundleStack(bundle = item.bundle.copy(books = item.bundle.books + dragged.book))
                                     } else {
                                         BundleStack(bundle = item.bundle)
                                     }
@@ -331,92 +481,112 @@ fun BookGrid(
                             }
                         }
 
-                        // ⋮ 菜单按钮（右上角，40dp 视觉 + 4dp padding 内边距）
-                        IconButton(
-                            onClick = {
-                                contextItem = item
-                                contextMenuAnchor = index
-                            },
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .size(40.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.MoreVert,
-                                contentDescription = "菜单",
-                                tint = palette.ink.copy(alpha = 0.45f),
-                                modifier = Modifier.size(20.dp),
-                            )
+                        // dwell 进度环（书本区停留计时）
+                        if (currentHoverKey == item.key && currentZone == DragZone.BOOK &&
+                            dragItemKey.isNotEmpty() && dragItemKey != item.key && dwellTargetKey.isEmpty()) {
+                            Canvas(modifier = Modifier.fillMaxSize().padding(2.dp)) {
+                                val stroke = 6.dp.toPx()
+                                val arcSize = Size(size.width - stroke, size.height - stroke)
+                                val topLeft = Offset(stroke / 2, stroke / 2)
+                                drawArc(
+                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                                    startAngle = -90f,
+                                    sweepAngle = dwellProgress * 360f,
+                                    useCenter = false,
+                                    topLeft = topLeft,
+                                    size = arcSize,
+                                    style = Stroke(width = stroke, cap = androidx.compose.ui.graphics.StrokeCap.Round),
+                                )
+                            }
                         }
 
-                        // ── Context menu（锚定到本 item 的封面 Box）──
-                        if (contextMenuAnchor == index) {
-                            DropdownMenu(
-                                expanded = true,
-                                onDismissRequest = {
-                                    contextItem = null
-                                    contextMenuAnchor = null
+                        // ⋮ 菜单按钮
+                        if (!isDragging && !isInsertPlaceholder) {
+                            IconButton(
+                                onClick = {
+                                    contextItem = item
+                                    contextMenuAnchor = index
                                 },
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .size(40.dp),
                             ) {
-                                when (item) {
-                                    is LibraryItem.Single -> {
-                                        DropdownMenuItem(
-                                            text = { Text("改名") },
-                                            onClick = {
-                                                renameText = item.book.title
-                                                renameItem = item
-                                                contextItem = null
-                                                contextMenuAnchor = null
-                                            },
-                                            leadingIcon = { Icon(Icons.Default.Edit, null) },
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("建组") },
-                                            onClick = {
-                                                // Issue 2: 单书建组需要两本书，进入选书模式
-                                                groupSourceId = item.book.id
-                                                groupTargetItem = null
-                                                groupName = ""
-                                                contextItem = null
-                                                contextMenuAnchor = null
-                                            },
-                                            leadingIcon = { Icon(Icons.Default.Add, null) },
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("删除") },
-                                            onClick = {
-                                                deleteConfirmId = item.book.id
-                                                deleteConfirmLabel = "《${item.book.title}》"
-                                                contextItem = null
-                                                contextMenuAnchor = null
-                                            },
-                                            leadingIcon = {
-                                                Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
-                                            },
-                                        )
-                                    }
-                                    is LibraryItem.Bundle -> {
-                                        DropdownMenuItem(
-                                            text = { Text("拆组") },
-                                            onClick = {
-                                                ungroupConfirmName = item.bundle.name
-                                                contextItem = null
-                                                contextMenuAnchor = null
-                                            },
-                                            leadingIcon = { Icon(Icons.Default.Close, null) },
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("删除") },
-                                            onClick = {
-                                                deleteConfirmId = "bundle:${item.bundle.name}"
-                                                deleteConfirmLabel = "《${item.bundle.name}》(${item.bundle.books.size}本)"
-                                                contextItem = null
-                                                contextMenuAnchor = null
-                                            },
-                                            leadingIcon = {
-                                                Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
-                                            },
-                                        )
+                                Icon(
+                                    imageVector = Icons.Default.MoreVert,
+                                    contentDescription = "菜单",
+                                    tint = palette.ink.copy(alpha = 0.45f),
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+
+                            // ── Context menu ──
+                            if (contextMenuAnchor == index) {
+                                DropdownMenu(
+                                    expanded = true,
+                                    onDismissRequest = {
+                                        contextItem = null
+                                        contextMenuAnchor = null
+                                    },
+                                ) {
+                                    when (item) {
+                                        is LibraryItem.Single -> {
+                                            DropdownMenuItem(
+                                                text = { Text("改名") },
+                                                onClick = {
+                                                    renameText = item.book.title
+                                                    renameItem = item
+                                                    contextItem = null
+                                                    contextMenuAnchor = null
+                                                },
+                                                leadingIcon = { Icon(Icons.Default.Edit, null) },
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("建组") },
+                                                onClick = {
+                                                    groupSourceId = item.book.id
+                                                    groupTargetItem = null
+                                                    groupName = ""
+                                                    contextItem = null
+                                                    contextMenuAnchor = null
+                                                },
+                                                leadingIcon = { Icon(Icons.Default.Add, null) },
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("删除") },
+                                                onClick = {
+                                                    deleteConfirmId = item.book.id
+                                                    deleteConfirmLabel = "《${item.book.title}》"
+                                                    contextItem = null
+                                                    contextMenuAnchor = null
+                                                },
+                                                leadingIcon = {
+                                                    Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
+                                                },
+                                            )
+                                        }
+                                        is LibraryItem.Bundle -> {
+                                            DropdownMenuItem(
+                                                text = { Text("拆组") },
+                                                onClick = {
+                                                    ungroupConfirmName = item.bundle.name
+                                                    contextItem = null
+                                                    contextMenuAnchor = null
+                                                },
+                                                leadingIcon = { Icon(Icons.Default.Close, null) },
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("删除") },
+                                                onClick = {
+                                                    deleteConfirmId = "bundle:${item.bundle.name}"
+                                                    deleteConfirmLabel = "《${item.bundle.name}》(${item.bundle.books.size}本)"
+                                                    contextItem = null
+                                                    contextMenuAnchor = null
+                                                },
+                                                leadingIcon = {
+                                                    Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
+                                                },
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -434,16 +604,37 @@ fun BookGrid(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (item is LibraryItem.Single) {
-                        // Issue 4: 作者识别不到，暂时移除
-                    }
+                    if (item is LibraryItem.Single) { /* 作者识别不到，已移除 */ }
                     ShelfBoard(modifier = Modifier.padding(top = Dimens.spaceXs))
                 }
             }
         }
+
+        // ── 取消区 Overlay ──
+        if (dragItemKey.isNotEmpty()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .height(cancelZoneHeight)
+                    .background(
+                        if (isInCancelZone) MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
+                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = if (isInCancelZone) "松手取消移位" else "拖到此处取消",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (isInCancelZone) MaterialTheme.colorScheme.onError
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
     }
 
-    // ── Delete confirmation dialog ─────────────────────────────────────────
+    // ── Dialogs (unchanged) ─────────────────────────────────────────────────
+
     deleteConfirmId?.let { did ->
         val isBundleDelete = did.startsWith("bundle:")
         AlertDialog(
@@ -456,7 +647,6 @@ fun BookGrid(
                 TextButton(
                     onClick = {
                         if (isBundleDelete) {
-                            // Delete all books in the bundle
                             val bundleName = did.removePrefix("bundle:")
                             val bundleBooks = mutableItems.filterIsInstance<LibraryItem.Bundle>()
                                 .firstOrNull { it.bundle.name == bundleName }?.bundle?.books ?: emptyList()
@@ -475,7 +665,6 @@ fun BookGrid(
         )
     }
 
-    // ── Ungroup confirmation dialog ────────────────────────────────────────
     ungroupConfirmName?.let { name ->
         AlertDialog(
             onDismissRequest = { ungroupConfirmName = null },
@@ -490,7 +679,6 @@ fun BookGrid(
         )
     }
 
-    // ── Rename dialog ──────────────────────────────────────────────────────
     renameItem?.let { ri ->
         AlertDialog(
             onDismissRequest = { renameItem = null },
@@ -504,41 +692,25 @@ fun BookGrid(
                 )
             },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        onRename(ri.book.id, renameText)
-                        renameItem = null
-                    },
-                ) {
-                    Text("确定")
-                }
+                TextButton(onClick = { onRename(ri.book.id, renameText); renameItem = null }) { Text("确定") }
             },
             dismissButton = {
-                TextButton(onClick = { renameItem = null }) {
-                    Text("取消")
-                }
+                TextButton(onClick = { renameItem = null }) { Text("取消") }
             },
         )
     }
 
-    // ── Create-group dialog ────────────────────────────────────────────────
     if (groupSourceId.isNotEmpty()) {
-        // Issue 2: 单书建组需要两本书。无目标书时显示提示，不创建一人组。
         if (groupTargetItem == null) {
             AlertDialog(
                 onDismissRequest = { groupSourceId = "" },
                 title = { Text("建组") },
                 text = { Text("建组需要两本书。\n请长按拖动本书到目标书上，\n停留片刻即可建组。") },
-                confirmButton = {
-                    TextButton(onClick = { groupSourceId = "" }) { Text("知道了") }
-                },
+                confirmButton = { TextButton(onClick = { groupSourceId = "" }) { Text("知道了") } },
             )
         } else {
             AlertDialog(
-                onDismissRequest = {
-                    groupSourceId = ""
-                    groupTargetItem = null
-                },
+                onDismissRequest = { groupSourceId = ""; groupTargetItem = null },
                 title = { Text("建组") },
                 text = {
                     Column {
@@ -566,19 +738,10 @@ fun BookGrid(
                             groupSourceId = ""
                             groupTargetItem = null
                         },
-                    ) {
-                        Text("确定")
-                    }
+                    ) { Text("确定") }
                 },
                 dismissButton = {
-                    TextButton(
-                        onClick = {
-                            groupSourceId = ""
-                            groupTargetItem = null
-                        },
-                    ) {
-                        Text("取消")
-                    }
+                    TextButton(onClick = { groupSourceId = ""; groupTargetItem = null }) { Text("取消") }
                 },
             )
         }
