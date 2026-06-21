@@ -144,7 +144,7 @@ fun BookGrid(
             return 0 to DragZone.GAP_ABOVE
         }
 
-        // 找到覆盖手指的 item
+        // 找到 X 轴和 Y 轴都覆盖手指的 item
         val hitInfo = visInfo.firstOrNull { info ->
             val rx = info.offset.x.toFloat()
             val ry = info.offset.y.toFloat()
@@ -155,20 +155,48 @@ fun BookGrid(
             val zone = hitZone(absPos, hitInfo)
             val insertIdx = when (zone) {
                 DragZone.GAP_ABOVE -> hitInfo.index
-                DragZone.BOOK -> hitInfo.index // 书本区返回自身index，由调用方处理
+                DragZone.BOOK -> hitInfo.index
                 DragZone.GAP_BELOW -> (hitInfo.index + 1).coerceAtMost(mutableItems.lastIndex)
                 DragZone.CANCEL -> currentInsertIndex
             }
             return insertIdx to zone
         }
 
-        // 没有直接命中 — 找最近的 item
-        val nearest = visInfo.minByOrNull { abs(absPos.y - (it.offset.y + it.size.height / 2f)) }
-        return nearest?.let {
-            val z = hitZone(absPos.copy(y = (it.offset.y + it.size.height / 2f).toFloat()), it)
-            val idx = if (z == DragZone.GAP_ABOVE) it.index else (it.index + 1).coerceAtMost(mutableItems.lastIndex)
-            idx to z
-        } ?: (-1 to DragZone.GAP_BELOW)
+        // 没有直接 XY 命中 → 手指在行列间隙中
+        // 找到 Y 轴覆盖的 item（同一行），用实际手指位置判断 zone
+        val sameRow = visInfo.filter { info ->
+            val ry = info.offset.y.toFloat()
+            absPos.y in ry..(ry + info.size.height)
+        }
+        if (sameRow.isNotEmpty()) {
+            // 手指在行内但 X 轴未覆盖 → X 间隙 → 找到最近 item，用实际 Y 判断上下间隙
+            val nearest = sameRow.minByOrNull {
+                val cx = it.offset.x + it.size.width / 2f
+                abs(absPos.x - cx)
+            }!!
+            val zone = hitZone(absPos, nearest) // 用实际手指 Y
+            val insertIdx = when {
+                zone == DragZone.GAP_ABOVE -> nearest.index
+                absPos.x < (nearest.offset.x + nearest.size.width / 2f) -> nearest.index
+                else -> (nearest.index + 1).coerceAtMost(mutableItems.lastIndex)
+            }
+            return insertIdx to zone
+        }
+
+        // 完全不在任何行内 → 用二维距离找最近 item，强制视为间隙
+        val nearest = visInfo.minByOrNull { info ->
+            val cx = info.offset.x + info.size.width / 2f
+            val cy = info.offset.y + info.size.height / 2f
+            val dx = absPos.x - cx
+            val dy = absPos.y - cy
+            dx * dx + dy * dy
+        } ?: return -1 to DragZone.GAP_BELOW
+
+        // 手指不在 item 上 → 强制间隙区，禁止触发 dwell
+        val zone = if (absPos.y < nearest.offset.y + nearest.size.height / 2f) DragZone.GAP_ABOVE else DragZone.GAP_BELOW
+        val insertIdx = if (zone == DragZone.GAP_ABOVE) nearest.index
+            else (nearest.index + 1).coerceAtMost(mutableItems.lastIndex)
+        return insertIdx to zone
     }
 
     /** 拖拽中实时重排：移除被拖拽的 item 并插入到新位置 */
