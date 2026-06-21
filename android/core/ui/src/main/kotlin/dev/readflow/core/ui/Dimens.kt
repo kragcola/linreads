@@ -3,6 +3,7 @@ package dev.readflow.core.ui
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 
@@ -60,7 +61,7 @@ val readflowPalette: ReadflowPalette
         val cs = MaterialTheme.colorScheme
         // onBackground is ink-colored: dark ink → light paper, light ink → dark paper
         val inkLuminance = (cs.onBackground.red + cs.onBackground.green + cs.onBackground.blue) / 3f
-        val isDark = inkLuminance > 0.5f
+        val isDark = java.lang.Float.compare(inkLuminance, 0.5f) > 0
         return if (isDark) {
             ReadflowPalette(
                 paper = ReadflowColors.PaperNight,
