@@ -123,7 +123,7 @@ fun BookGrid(
                         }
                         .animateItem() // Compose 原生让位动画
                         .clickable { onItemClick(item) }
-                        .pointerInput(item.key) {
+                        .pointerInput(item.key, index) {
                             var lastStablePos = Offset.Zero
                             var dwellStartTime = 0L
 
