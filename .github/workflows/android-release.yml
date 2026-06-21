@@ -32,12 +32,17 @@ jobs:
 
       - name: Upload to Cloudflare Pages
         run: |
-          mkdir -p deploy
-          cp android/app/build/outputs/apk/ota/app-ota.apk deploy/
-          npx wrangler pages deploy deploy --project-name=linreads --branch=main
+          # Upload APK to CF Pages via direct deployment API
+          curl -sS -X POST \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/pages/projects/linreads/deployments" \
+            -H "Authorization: Bearer $CF_PAGES_TOKEN" \
+            -H "Content-Type: multipart/form-data" \
+            -F "file=@android/app/build/outputs/apk/ota/app-ota.apk;filename=app-ota.apk" \
+            | tee /tmp/cf-result.json
+          grep -q '"success":true' /tmp/cf-result.json || { cat /tmp/cf-result.json; exit 1; }
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_PAGES_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_PAGES_TOKEN: ${{ secrets.CF_PAGES_TOKEN }}
 
       - name: Publish dev-latest release
         uses: softprops/action-gh-release@v2
