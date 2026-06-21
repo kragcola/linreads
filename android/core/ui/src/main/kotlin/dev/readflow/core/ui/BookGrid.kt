@@ -3,6 +3,7 @@ package dev.readflow.core.ui
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
@@ -108,6 +109,7 @@ fun BookGrid(
             itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
                 val isDragging = draggedIndex == index
                 val isDwellTarget = dwellTargetIndex == index && draggedIndex >= 0 && draggedIndex != index
+                val isHoverTarget = currentHoverIndex == index && draggedIndex >= 0 && draggedIndex != index && dwellTargetIndex < 0
                 val view = LocalView.current
 
                 Column(
@@ -121,7 +123,7 @@ fun BookGrid(
                             alpha = if (isDragging) 0.8f else 1f
                             shadowElevation = if (isDragging) 8f else 0f
                         }
-                        .animateItem() // Compose 原生让位动画
+                        .animateItem()
                         .clickable { onItemClick(item) }
                         .pointerInput(item.key, index) {
                             var lastStablePos = Offset.Zero
@@ -275,6 +277,20 @@ fun BookGrid(
                             )
                         },
                 ) {
+                    // ── 拖拽换位指示线 ──
+                    if (isHoverTarget) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(3.dp)
+                                .padding(horizontal = 4.dp)
+                                .background(
+                                    color = MaterialTheme.colorScheme.primary,
+                                    shape = MaterialTheme.shapes.extraSmall,
+                                ),
+                        )
+                    }
+
                     // ── 封面 + ⋮ 菜单按钮 ──
                     Box(
                         modifier = Modifier
