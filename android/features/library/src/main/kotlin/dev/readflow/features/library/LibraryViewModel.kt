@@ -147,6 +147,10 @@ class LibraryViewModel(
         viewModelScope.launch { repository.ungroupBundle(name) }
     }
 
+    fun renameBundle(oldName: String, newName: String) {
+        viewModelScope.launch { repository.renameBundle(oldName, newName) }
+    }
+
     fun refreshFromCalibre(baseUrl: String) {
         viewModelScope.launch {
             val calibreRepo = CalibreRepositoryImpl(CalibreClient(baseUrl))

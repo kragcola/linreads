@@ -52,24 +52,30 @@ data class ReadflowPalette(
     val inkSoft: Color,
 )
 
-/** Theme-aware palette accessor for composables that need raw paper/ink values. */
+/** Theme-aware palette accessor — follows MaterialTheme, respecting app theme mode. */
 val readflowPalette: ReadflowPalette
     @Composable
     @ReadOnlyComposable
-    get() = if (isSystemInDarkTheme()) {
-        ReadflowPalette(
-            paper = ReadflowColors.PaperNight,
-            paperDeep = ReadflowColors.PaperNightDeep,
-            paperShadow = Color(0xFF14110D),
-            ink = ReadflowColors.InkNight,
-            inkSoft = ReadflowColors.InkNightSoft,
-        )
-    } else {
-        ReadflowPalette(
-            paper = ReadflowColors.Paper,
-            paperDeep = ReadflowColors.PaperDeep,
-            paperShadow = ReadflowColors.PaperShadow,
-            ink = ReadflowColors.Ink,
-            inkSoft = ReadflowColors.InkSoft,
-        )
+    get() {
+        val cs = MaterialTheme.colorScheme
+        // onBackground is ink-colored: dark ink → light paper, light ink → dark paper
+        val inkLuminance = (cs.onBackground.red + cs.onBackground.green + cs.onBackground.blue) / 3f
+        val isDark = inkLuminance > 0.5f
+        return if (isDark) {
+            ReadflowPalette(
+                paper = ReadflowColors.PaperNight,
+                paperDeep = ReadflowColors.PaperNightDeep,
+                paperShadow = Color(0xFF14110D),
+                ink = cs.onBackground,
+                inkSoft = cs.onSurfaceVariant,
+            )
+        } else {
+            ReadflowPalette(
+                paper = cs.background,
+                paperDeep = cs.surfaceVariant,
+                paperShadow = ReadflowColors.PaperShadow,
+                ink = cs.onBackground,
+                inkSoft = cs.onSurfaceVariant,
+            )
+        }
     }

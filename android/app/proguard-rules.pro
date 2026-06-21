@@ -27,6 +27,16 @@
     kotlinx.serialization.KSerializer serializer(...);
 }
 
+# Keep callback lambdas from being stripped by R8
+-keepclassmembers class dev.readflow.core.ui.BookGridKt {
+    *** onItemClick(...);
+    *** onDelete(...);
+    *** onRename(...);
+    *** onMoveToGroup(...);
+    *** onReorder(...);
+    *** onUngroup(...);
+}
+
 # Keep data classes used in serialization
 -keep class dev.readflow.core.model.** { *; }
 

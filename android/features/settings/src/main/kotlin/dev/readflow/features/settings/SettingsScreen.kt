@@ -110,9 +110,11 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
-            // 诊断：显示当前 BUILD_TAG
+            // 诊断：显示当前构建标识
+            val buildNum = buildTag.removePrefix("dev-").substringBefore("-").takeIf { it.all { c -> c.isDigit() } }
+            val tagDisplay = if (buildNum != null) "构建 #$buildNum" else buildTag
             Text(
-                text = "构建标识：${buildTag}",
+                text = tagDisplay,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
             )

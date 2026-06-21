@@ -68,6 +68,7 @@ fun BookGrid(
     onMoveToGroup: (String, String) -> Unit = { _, _ -> },
     onReorder: (List<LibraryItem>) -> Unit = {},
     onUngroup: (String) -> Unit = {},
+    onRenameBundle: (String, String) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     val palette = readflowPalette
@@ -119,6 +120,7 @@ fun BookGrid(
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
     var deleteConfirmLabel by remember { mutableStateOf("") }
     var ungroupConfirmName by remember { mutableStateOf<String?>(null) }
+    var renameBundleOldName by remember { mutableStateOf<String?>(null) }
 
     // 取消区高度
     val cancelZoneHeight = 64.dp
@@ -418,9 +420,9 @@ fun BookGrid(
                                                 when (targetItem) {
                                                     is LibraryItem.Bundle -> onMoveToGroup(dragItem.book.id, targetItem.bundle.name)
                                                     is LibraryItem.Single -> {
-                                                        groupSourceId = dragItem.book.id
-                                                        groupTargetItem = targetItem
-                                                        groupName = ""
+                                                        // 自动以第一本书名建组，不弹对话框
+                                                        onMoveToGroup(dragItem.book.id, dragItem.book.title)
+                                                        onMoveToGroup(targetItem.book.id, dragItem.book.title)
                                                     }
                                                     else -> {}
                                                 }
@@ -545,6 +547,7 @@ fun BookGrid(
                                 },
                                 modifier = Modifier
                                     .align(Alignment.TopEnd)
+                                    .zIndex(2f)
                                     .size(40.dp),
                             ) {
                                 Icon(
@@ -601,6 +604,15 @@ fun BookGrid(
                                             )
                                         }
                                         is LibraryItem.Bundle -> {
+                                            DropdownMenuItem(
+                                                text = { Text("改名") },
+                                                onClick = {
+                                                    renameText = item.bundle.name
+                                                    renameBundleOldName = item.bundle.name
+                                                    contextItem = null; contextMenuAnchor = null
+                                                },
+                                                leadingIcon = { Icon(Icons.Default.Edit, null) },
+                                            )
                                             DropdownMenuItem(
                                                 text = { Text("拆组") },
                                                 onClick = {
@@ -732,6 +744,35 @@ fun BookGrid(
             },
             dismissButton = {
                 TextButton(onClick = { renameItem = null }) { Text("取消") }
+            },
+        )
+    }
+
+    // Bundle rename dialog
+    renameBundleOldName?.let { old ->
+        AlertDialog(
+            onDismissRequest = { renameBundleOldName = null },
+            title = { Text("重命名书组") },
+            text = {
+                OutlinedTextField(
+                    value = renameText,
+                    onValueChange = { renameText = it },
+                    singleLine = true,
+                    label = { Text("组名") },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (renameText.isNotBlank()) {
+                            onRenameBundle(old, renameText)
+                        }
+                        renameBundleOldName = null
+                    },
+                ) { Text("确定") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameBundleOldName = null }) { Text("取消") }
             },
         )
     }

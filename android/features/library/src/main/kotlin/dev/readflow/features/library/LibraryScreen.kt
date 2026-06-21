@@ -121,6 +121,7 @@ fun LibraryScreen(
                         onMoveToGroup = viewModel::moveToGroup,
                         onReorder = viewModel::reorder,
                         onUngroup = viewModel::ungroupBundle,
+                        onRenameBundle = viewModel::renameBundle,
                     )
                 }
             }

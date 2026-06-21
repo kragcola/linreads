@@ -32,6 +32,7 @@ import dev.readflow.core.model.BookMeta
 fun BookCover(
     book: BookMeta,
     modifier: Modifier = Modifier,
+    showProgress: Boolean = true,
 ) {
     val palette = readflowPalette
     val clothColor = remember(book.id) { clothColorFor(book.id) }
@@ -41,7 +42,6 @@ fun BookCover(
             .clip(RoundedCornerShape(Dimens.coverCorner))
             .drawWithContent {
                 drawContent()
-                // 磨损暗角：四角向内的暖灰渐隐，像旧书边角磨损。
                 drawRect(
                     brush = Brush.radialGradient(
                         colors = listOf(Color.Transparent, Color(0x33000000)),
@@ -63,25 +63,14 @@ fun BookCover(
             PlainStampedCover(book, clothColor, palette)
         }
 
-        // 底部细进度条（墨色填充），仅在读过(progress>0)时出现。
-        if (book.progress > 0f) {
-            Box(
+        // 圆形进度指示器（右下角）
+        if (showProgress && book.progress > 0f) {
+            PaperProgress(
+                progress = book.progress.coerceIn(0f, 1f),
                 modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .fillMaxWidth()
-                    .drawBehind {
-                        val h = 3.dp.toPx()
-                        val y = size.height - h
-                        drawRect(
-                            color = palette.ink.copy(alpha = 0.82f),
-                            topLeft = Offset(0f, y),
-                            size = size.copy(
-                                width = size.width * book.progress.coerceIn(0f, 1f),
-                                height = h,
-                            ),
-                        )
-                    },
-            ) {}
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 6.dp, bottom = 6.dp),
+            )
         }
     }
 }

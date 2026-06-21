@@ -45,6 +45,9 @@ interface BookDao {
     @Query("UPDATE books SET collectionName = :name WHERE id = :id")
     suspend fun updateCollectionName(id: String, name: String?)
 
+    @Query("UPDATE books SET collectionName = :newName WHERE collectionName = :oldName")
+    suspend fun renameCollection(oldName: String, newName: String)
+
     @Query("UPDATE books SET collectionName = NULL WHERE collectionName = :name")
     suspend fun clearCollection(name: String)
 
