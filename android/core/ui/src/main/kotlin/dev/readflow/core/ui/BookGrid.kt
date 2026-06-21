@@ -43,6 +43,12 @@ import kotlin.math.abs
 /** 拖拽时手指命中的区域类型 */
 private enum class DragZone { GAP_ABOVE, BOOK, GAP_BELOW, CANCEL }
 
+private val LibraryItem.key: String
+    get() = when (this) {
+        is LibraryItem.Single -> "book:${book.id}"
+        is LibraryItem.Bundle -> "bundle:${bundle.name}"
+    }
+
 /**
  * 书架网格，支持点击、拖拽重排、dwell 悬停建组。
  *
@@ -781,9 +787,3 @@ fun BookGrid(
         }
     }
 }
-
-private val LibraryItem.key: String
-    get() = when (this) {
-        is LibraryItem.Single -> "book:${book.id}"
-        is LibraryItem.Bundle -> "bundle:${bundle.name}"
-    }
