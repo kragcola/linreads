@@ -3,8 +3,11 @@ package dev.readflow.render.api
 import android.net.Uri
 import android.view.View
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 enum class ReadingMode { SCROLL, PAGED }
 
@@ -34,6 +37,15 @@ interface ReaderEngine {
     suspend fun goTo(locator: Locator)
     val currentLocator: StateFlow<Locator>
     val pageCount: StateFlow<Int>
+
+    /** Chapter info for the bottom chrome progress bar. Emits on each position change. */
+    val chapterInfo: StateFlow<ChapterInfo>
+        get() = kotlinx.coroutines.flow.MutableStateFlow(
+            ChapterInfo(0, 1, "", 0f)
+        ).asStateFlow()
+
+    /** Jump to next (+1) or previous (-1) chapter. No-op if at boundary. */
+    suspend fun goToAdjacentChapter(delta: Int) {}
 
     suspend fun search(query: String): List<Locator> = emptyList()
 

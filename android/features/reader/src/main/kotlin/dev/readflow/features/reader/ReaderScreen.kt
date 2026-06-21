@@ -19,6 +19,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.pointer.pointerInput
@@ -27,6 +28,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.TransitionType
 import dev.readflow.render.api.PagingKind
+import kotlinx.coroutines.launch
 
 /**
  * 阅读器菜单功能项 — debug 阶段全部默认显示。
@@ -48,6 +50,7 @@ fun ReaderScreen(
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.uiState.collectAsState()
+    val scope = rememberCoroutineScope()
 
     Box(
         modifier = modifier
@@ -115,49 +118,99 @@ fun ReaderScreen(
                         )
                     }
 
-                    // ── Bottom chrome: 进度条 + 功能菜单 ──
+                    // ── Bottom chrome: 章节进度栏 + 快捷菜单 ──
                     AnimatedVisibility(
                         visible = state.isUiVisible,
                         modifier = Modifier.align(Alignment.BottomStart),
                         enter = slideInVertically { it } + fadeIn(),
                         exit = slideOutVertically { it } + fadeOut(),
                     ) {
+                        val chapter by engine.chapterInfo.collectAsState()
                         val locator by engine.currentLocator.collectAsState()
                         Column(modifier = Modifier.fillMaxWidth()) {
-                            // 细进度条
+                            // 全书总进度细条
                             LinearProgressIndicator(
                                 progress = { (locator.totalProgression ?: 0f).coerceIn(0f, 1f) },
                                 modifier = Modifier.fillMaxWidth().height(2.dp),
                                 color = MaterialTheme.colorScheme.primary,
                                 trackColor = MaterialTheme.colorScheme.surfaceVariant,
                             )
-                            // 功能菜单栏
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.92f))
-                                    .padding(vertical = 4.dp, horizontal = 8.dp),
-                                horizontalArrangement = Arrangement.SpaceEvenly,
+                            // 章节导航栏
+                            Surface(
+                                color = MaterialTheme.colorScheme.background.copy(alpha = 0.92f),
+                                modifier = Modifier.fillMaxWidth(),
                             ) {
-                                if (ReaderFeature.TOC in features) {
-                                    ReaderMenuButton("目录", Icons.Default.Menu) {
-                                        // TODO: TOC panel
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    // ← 上一章
+                                    IconButton(
+                                        onClick = { scope.launch { engine.goToAdjacentChapter(-1) } },
+                                        modifier = Modifier.size(36.dp),
+                                        enabled = chapter.currentIndex > 0,
+                                    ) {
+                                        Text(
+                                            "←",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = if (chapter.currentIndex > 0)
+                                                MaterialTheme.colorScheme.onBackground
+                                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                        )
+                                    }
+                                    // 章节信息 + 本章进度
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                    ) {
+                                        Text(
+                                            text = "${chapter.currentTitle} · ${(chapter.progressInChapter * 100).toInt()}%",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.onBackground,
+                                            maxLines = 1,
+                                        )
+                                        Text(
+                                            text = "${chapter.currentIndex + 1} / ${chapter.totalChapters}章",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                        )
+                                    }
+                                    // → 下一章
+                                    IconButton(
+                                        onClick = { scope.launch { engine.goToAdjacentChapter(+1) } },
+                                        modifier = Modifier.size(36.dp),
+                                        enabled = chapter.currentIndex < chapter.totalChapters - 1,
+                                    ) {
+                                        Text(
+                                            "→",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = if (chapter.currentIndex < chapter.totalChapters - 1)
+                                                MaterialTheme.colorScheme.onBackground
+                                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                        )
                                     }
                                 }
-                                if (ReaderFeature.PROGRESS in features) {
-                                    val pct = ((locator.totalProgression ?: 0f) * 100).toInt()
-                                    ReaderMenuButton("${pct}%", Icons.Default.MoreVert) {
-                                        // TODO: Go to position
+                                // 快捷功能按钮行
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                                    horizontalArrangement = Arrangement.SpaceEvenly,
+                                ) {
+                                    if (ReaderFeature.TOC in features) {
+                                        ReaderMenuButton("目录", Icons.Default.Menu) { /* TODO: TOC */ }
                                     }
-                                }
-                                if (ReaderFeature.FONT in features) {
-                                    ReaderMenuButton("字体", Icons.Default.Edit) {
-                                        viewModel.onIntent(ReaderIntent.FontPanel)
+                                    if (ReaderFeature.FONT in features) {
+                                        ReaderMenuButton("字体", Icons.Default.Edit) {
+                                            viewModel.onIntent(ReaderIntent.FontPanel)
+                                        }
                                     }
-                                }
-                                if (ReaderFeature.THEME in features) {
-                                    ReaderMenuButton("主题", Icons.Default.Menu) {
-                                        viewModel.onIntent(ReaderIntent.ThemePanel)
+                                    if (ReaderFeature.THEME in features) {
+                                        ReaderMenuButton("主题", Icons.Default.MoreVert) {
+                                            viewModel.onIntent(ReaderIntent.ThemePanel)
+                                        }
                                     }
                                 }
                             }

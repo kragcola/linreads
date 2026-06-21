@@ -8,6 +8,7 @@ import android.view.View
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.render.api.PagingKind
@@ -42,9 +43,21 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
     private val _pageCount = MutableStateFlow(0)
     override val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
 
+    private val _chapterInfo = MutableStateFlow(ChapterInfo(0, 1, "", 0f))
+    override val chapterInfo: StateFlow<ChapterInfo> = _chapterInfo.asStateFlow()
+
     private var paras: List<EpubPara> = emptyList()
+    private var chapterBoundaries: List<ChapterBoundary> = emptyList()
     private var fontSizeSp: Float = 18f
     private var recyclerView: RecyclerView? = null
+
+    /** Start index (inclusive) and end index (exclusive) of each chapter in paras. */
+    private data class ChapterBoundary(
+        val spineIndex: Int,
+        val startInclusive: Int,
+        val endExclusive: Int,
+        val title: String,
+    )
 
     override suspend fun supports(uri: Uri): Boolean = true
 
@@ -56,7 +69,11 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
             }
         }
         paras = EpubParser().parse(tmp)
-        withContext(Dispatchers.Main) { _pageCount.value = paras.size }
+        chapterBoundaries = buildChapterBoundaries(paras)
+        withContext(Dispatchers.Main) {
+            _pageCount.value = paras.size
+            _chapterInfo.value = ChapterInfo(0, chapterBoundaries.size, chapterBoundaries.firstOrNull()?.title ?: "", 0f)
+        }
         _currentLocator.value
     }
 
@@ -87,6 +104,50 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
             progression = ratio,
             totalProgression = ratio,
         )
+        // Update chapter info
+        updateChapterInfo(first)
+    }
+
+    private fun updateChapterInfo(paraIndex: Int) {
+        val chapter = chapterBoundaries.firstOrNull { paraIndex in it.startInclusive until it.endExclusive }
+            ?: chapterBoundaries.firstOrNull() ?: return
+        val chapterIdx = chapterBoundaries.indexOf(chapter)
+        val chapterSize = chapter.endExclusive - chapter.startInclusive
+        val positionInChapter = (paraIndex - chapter.startInclusive).coerceAtLeast(0)
+        val progressInChapter = if (chapterSize > 0) positionInChapter.toFloat() / chapterSize else 0f
+        _chapterInfo.value = ChapterInfo(
+            currentIndex = chapterIdx,
+            totalChapters = chapterBoundaries.size,
+            currentTitle = chapter.title,
+            progressInChapter = progressInChapter,
+        )
+    }
+
+    override suspend fun goToAdjacentChapter(delta: Int) {
+        val info = _chapterInfo.value
+        val targetIdx = (info.currentIndex + delta).coerceIn(0, chapterBoundaries.lastIndex)
+        if (targetIdx == info.currentIndex) return
+        val target = chapterBoundaries[targetIdx]
+        withContext(Dispatchers.Main) {
+            (recyclerView?.layoutManager as? LinearLayoutManager)
+                ?.scrollToPositionWithOffset(target.startInclusive, 0)
+        }
+    }
+
+    private fun buildChapterBoundaries(paras: List<EpubPara>): List<ChapterBoundary> {
+        if (paras.isEmpty()) return listOf(ChapterBoundary(0, 0, 0, ""))
+        val boundaries = mutableListOf<ChapterBoundary>()
+        var start = 0
+        var currentSpine = paras.first().spineIndex
+        for (i in paras.indices) {
+            if (paras[i].spineIndex != currentSpine) {
+                boundaries += ChapterBoundary(currentSpine, start, i, "第${currentSpine + 1}章")
+                start = i
+                currentSpine = paras[i].spineIndex
+            }
+        }
+        boundaries += ChapterBoundary(currentSpine, start, paras.size, if (boundaries.isEmpty()) "正文" else "第${currentSpine + 1}章")
+        return boundaries
     }
 
     override suspend fun goTo(locator: Locator) {
