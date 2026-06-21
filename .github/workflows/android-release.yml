@@ -30,6 +30,15 @@ jobs:
         working-directory: android
         run: ./gradlew -Preadflow.phase=2 :app:assembleOta
 
+      - name: Upload to Cloudflare Pages
+        run: |
+          mkdir -p deploy
+          cp android/app/build/outputs/apk/ota/app-ota.apk deploy/
+          npx wrangler pages deploy deploy --project-name=linreads --branch=main
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_PAGES_TOKEN }}
+
       - name: Publish dev-latest release
         uses: softprops/action-gh-release@v2
         with:
