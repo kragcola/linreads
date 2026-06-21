@@ -32,7 +32,7 @@ class LibraryRepository(private val bookDao: BookDao) {
                 items += LibraryItem.Single(book)
             } else if (seenCollections.add(col)) {
                 val members = byCollection.getValue(col)
-                items += if (members.size == 1) LibraryItem.Single(members.first())
+                items += if (members.size == 1) LibraryItem.Bundle(BookBundle(col, members))
                          else LibraryItem.Bundle(BookBundle(col, members))
             }
         }

@@ -3,7 +3,6 @@ package dev.readflow.core.ui
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
@@ -118,9 +117,9 @@ fun BookGrid(
                         .graphicsLayer {
                             translationX = if (isDragging) dragOffset.x else 0f
                             translationY = if (isDragging) dragOffset.y else 0f
-                            scaleX = if (isDragging) 1.15f else if (isDwellTarget) 0.94f else 1f
-                            scaleY = if (isDragging) 1.15f else if (isDwellTarget) 0.94f else 1f
-                            alpha = if (isDragging) 0.8f else 1f
+                            scaleX = if (isDragging) 1.15f else if (isDwellTarget) 0.94f else if (isHoverTarget) 1f else 1f
+                            scaleY = if (isDragging) 1.15f else if (isDwellTarget) 0.94f else if (isHoverTarget) 1f else 1f
+                            alpha = if (isDragging) 0.8f else if (isDwellTarget) 1f else if (isHoverTarget) 0.35f else 1f
                             shadowElevation = if (isDragging) 8f else 0f
                         }
                         .animateItem()
@@ -182,10 +181,9 @@ fun BookGrid(
                                         // 如果新格子是有效目标，启动 dwell 计时
                                         if (newHoverIndex >= 0 && newHoverIndex != index) {
                                             val targetItem = mutableItems.getOrNull(newHoverIndex)
-                                            if (item is LibraryItem.Single && targetItem is LibraryItem.Single) {
+                                            if (item is LibraryItem.Single && (targetItem is LibraryItem.Single || targetItem is LibraryItem.Bundle)) {
                                                 dwellJob = scope.launch {
                                                     delay(dwellThresholdMs)
-                                                    // 计时结束，高亮目标书
                                                     dwellTargetIndex = newHoverIndex
                                                 }
                                             }
@@ -241,20 +239,26 @@ fun BookGrid(
 
                                     if (target >= 0 && target != index) {
                                         val targetItem = mutableItems.getOrNull(target)
-                                        if (item is LibraryItem.Single && targetItem is LibraryItem.Single) {
-                                            if (wasDwelling) {
-                                                // dwell 完成 → 建组
-                                                groupSourceId = item.book.id
-                                                groupTargetItem = targetItem
-                                                groupName = ""
-                                            } else {
-                                                // 快速划过 → 重排
-                                                val moved = mutableItems.removeAt(index)
-                                                mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
-                                                onReorder(mutableItems.toList())
-                                                // Issue 3: 重排后冷却 350ms，等 animateItem 结束
-                                                dragCooldown = true
-                                                scope.launch { delay(350); dragCooldown = false }
+                                        if (item is LibraryItem.Single) {
+                                            when {
+                                                wasDwelling && targetItem is LibraryItem.Bundle -> {
+                                                    // dwell 到已有组 → 直接加入
+                                                    onMoveToGroup(item.book.id, targetItem.bundle.name)
+                                                }
+                                                wasDwelling && targetItem is LibraryItem.Single -> {
+                                                    // dwell 完成 → 新建组（弹对话框）
+                                                    groupSourceId = item.book.id
+                                                    groupTargetItem = targetItem
+                                                    groupName = ""
+                                                }
+                                                else -> {
+                                                    // 快速划过 → 重排
+                                                    val moved = mutableItems.removeAt(index)
+                                                    mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
+                                                    onReorder(mutableItems.toList())
+                                                    dragCooldown = true
+                                                    scope.launch { delay(350); dragCooldown = false }
+                                                }
                                             }
                                         } else {
                                             // 非单本 → 重排
@@ -277,20 +281,6 @@ fun BookGrid(
                             )
                         },
                 ) {
-                    // ── 拖拽换位指示线 ──
-                    if (isHoverTarget) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(3.dp)
-                                .padding(horizontal = 4.dp)
-                                .background(
-                                    color = MaterialTheme.colorScheme.primary,
-                                    shape = MaterialTheme.shapes.extraSmall,
-                                ),
-                        )
-                    }
-
                     // ── 封面 + ⋮ 菜单按钮 ──
                     Box(
                         modifier = Modifier
@@ -300,12 +290,11 @@ fun BookGrid(
                         when (item) {
                             is LibraryItem.Single -> {
                                 if (isDwellTarget && draggedIndex >= 0) {
-                                    // dwell 预览：显示即将建组的样子
                                     val dragged = mutableItems.getOrNull(draggedIndex)
                                     if (dragged is LibraryItem.Single) {
                                         BundleStack(
                                             bundle = dev.readflow.core.model.BookBundle(
-                                                "新书组",
+                                                item.book.title,
                                                 listOf(dragged.book, item.book),
                                             ),
                                         )
@@ -324,7 +313,22 @@ fun BookGrid(
                                     }
                                 }
                             }
-                            is LibraryItem.Bundle -> BundleStack(bundle = item.bundle)
+                            is LibraryItem.Bundle -> {
+                                if (isDwellTarget && draggedIndex >= 0) {
+                                    val dragged = mutableItems.getOrNull(draggedIndex)
+                                    if (dragged is LibraryItem.Single) {
+                                        BundleStack(
+                                            bundle = item.bundle.copy(
+                                                books = item.bundle.books + dragged.book,
+                                            ),
+                                        )
+                                    } else {
+                                        BundleStack(bundle = item.bundle)
+                                    }
+                                } else {
+                                    BundleStack(bundle = item.bundle)
+                                }
+                            }
                         }
 
                         // ⋮ 菜单按钮（右上角，40dp 视觉 + 4dp padding 内边距）
