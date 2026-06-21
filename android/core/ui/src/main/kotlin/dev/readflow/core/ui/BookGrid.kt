@@ -226,34 +226,23 @@ fun BookGrid(
                 Column(
                     modifier = Modifier
                         .zIndex(if (isDragging) 1f else 0f)
-                        .then(
+                        .graphicsLayer {
+                            // Calvin 公式补偿实时换位导致的 item 位移
                             if (isDragging) {
-                                // Calvin公式: visualOffset = dragOffset + (initialPos - currentPos)
-                                // 禁止 animateItem，避免与 graphicsLayer 叠加导致漂移
-                                var currentItemOffset = Offset.Zero
                                 val dragInfo = gridState.layoutInfo.visibleItemsInfo
                                     .firstOrNull { mutableItems.getOrNull(it.index)?.key == dragItemKey }
-                                if (dragInfo != null) {
-                                    currentItemOffset = Offset(dragInfo.offset.x.toFloat(), dragInfo.offset.y.toFloat())
-                                }
-                                val visualOffset = dragOffset + (dragInitialItemOffset - currentItemOffset)
-                                Modifier.graphicsLayer {
-                                    translationX = visualOffset.x
-                                    translationY = visualOffset.y
-                                    scaleX = 1.10f
-                                    scaleY = 1.10f
-                                    alpha = 0.7f
-                                    shadowElevation = 8f
-                                }
+                                val cur = if (dragInfo != null) Offset(dragInfo.offset.x.toFloat(), dragInfo.offset.y.toFloat()) else Offset.Zero
+                                val vo = dragOffset + (dragInitialItemOffset - cur)
+                                translationX = vo.x; translationY = vo.y
+                                scaleX = 1.10f; scaleY = 1.10f; alpha = 0.7f; shadowElevation = 8f
                             } else {
-                                Modifier
-                                    .graphicsLayer {
-                                        scaleX = if (isDwellTarget) 0.94f else 1f
-                                        scaleY = if (isDwellTarget) 0.94f else 1f
-                                    }
-                                    .animateItem()
+                                translationX = 0f; translationY = 0f
+                                scaleX = if (isDwellTarget) 0.94f else 1f
+                                scaleY = if (isDwellTarget) 0.94f else 1f
+                                alpha = 1f; shadowElevation = 0f
                             }
-                        )
+                        }
+                        .then(if (!isDragging) Modifier.animateItem() else Modifier)
                         .clickable { onItemClick(item) }
                         .pointerInput(item.key) {
                             var dwellLocalStart = 0L
