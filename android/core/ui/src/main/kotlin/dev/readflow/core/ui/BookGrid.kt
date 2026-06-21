@@ -89,6 +89,7 @@ fun BookGrid(
     var dragItemKey by remember { mutableStateOf("") }
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
     var dragStartAbsPos by remember { mutableStateOf(Offset.Zero) }
+    var dragInitialItemOffset by remember { mutableStateOf(Offset.Zero) }
     var currentInsertIndex by remember { mutableIntStateOf(-1) }
     var currentHoverKey by remember { mutableStateOf("") }
     var currentZone by remember { mutableStateOf(DragZone.GAP_BELOW) }
@@ -225,15 +226,34 @@ fun BookGrid(
                 Column(
                     modifier = Modifier
                         .zIndex(if (isDragging) 1f else 0f)
-                        .graphicsLayer {
-                            translationX = if (isDragging) dragOffset.x else 0f
-                            translationY = if (isDragging) dragOffset.y else 0f
-                            scaleX = if (isDragging) 1.10f else if (isDwellTarget) 0.94f else 1f
-                            scaleY = if (isDragging) 1.10f else if (isDwellTarget) 0.94f else 1f
-                            alpha = if (isDragging) 0.7f else 1f
-                            shadowElevation = if (isDragging) 8f else 0f
-                        }
-                        .animateItem()
+                        .then(
+                            if (isDragging) {
+                                // Calvin公式: visualOffset = dragOffset + (initialPos - currentPos)
+                                // 禁止 animateItem，避免与 graphicsLayer 叠加导致漂移
+                                var currentItemOffset = Offset.Zero
+                                val dragInfo = gridState.layoutInfo.visibleItemsInfo
+                                    .firstOrNull { mutableItems.getOrNull(it.index)?.key == dragItemKey }
+                                if (dragInfo != null) {
+                                    currentItemOffset = Offset(dragInfo.offset.x.toFloat(), dragInfo.offset.y.toFloat())
+                                }
+                                val visualOffset = dragOffset + (dragInitialItemOffset - currentItemOffset)
+                                Modifier.graphicsLayer {
+                                    translationX = visualOffset.x
+                                    translationY = visualOffset.y
+                                    scaleX = 1.10f
+                                    scaleY = 1.10f
+                                    alpha = 0.7f
+                                    shadowElevation = 8f
+                                }
+                            } else {
+                                Modifier
+                                    .graphicsLayer {
+                                        scaleX = if (isDwellTarget) 0.94f else 1f
+                                        scaleY = if (isDwellTarget) 0.94f else 1f
+                                    }
+                                    .animateItem()
+                            }
+                        )
                         .clickable { onItemClick(item) }
                         .pointerInput(item.key) {
                             var dwellLocalStart = 0L
@@ -260,6 +280,10 @@ fun BookGrid(
                                         dragStartAbsPos = Offset(
                                             (itemInfo?.offset?.x ?: 0).toFloat() + localPos.x,
                                             (itemInfo?.offset?.y ?: 0).toFloat() + localPos.y,
+                                        )
+                                        dragInitialItemOffset = Offset(
+                                            (itemInfo?.offset?.x ?: 0).toFloat(),
+                                            (itemInfo?.offset?.y ?: 0).toFloat(),
                                         )
                                         dwellLocalStart = System.currentTimeMillis()
                                         dwellStartTime = dwellLocalStart
@@ -425,6 +449,7 @@ fun BookGrid(
                                     // 重置
                                     dragItemKey = ""
                                     dragOffset = Offset.Zero
+                                    dragInitialItemOffset = Offset.Zero
                                     currentHoverKey = ""
                                     currentInsertIndex = -1
                                     currentZone = DragZone.GAP_BELOW
@@ -441,6 +466,7 @@ fun BookGrid(
                                     mutableItems.addAll(items)
                                     dragItemKey = ""
                                     dragOffset = Offset.Zero
+                                    dragInitialItemOffset = Offset.Zero
                                     currentHoverKey = ""
                                     currentInsertIndex = -1
                                     currentZone = DragZone.GAP_BELOW
@@ -448,8 +474,8 @@ fun BookGrid(
                                     dwellProgress = 0f
                                     reorderPreviewActive = false
                                     isInCancelZone = false
-                                },
-                            )
+                                },  // onDragCancel
+                            )  // detectDragGesturesAfterLongPress
                         },
                 ) {
                     // ── 封面 + ⋮ 菜单按钮 ──
