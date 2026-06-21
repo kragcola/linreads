@@ -94,6 +94,7 @@ fun BookGrid(
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
     var deleteConfirmLabel by remember { mutableStateOf("") }
     var ungroupConfirmName by remember { mutableStateOf<String?>(null) }
+    var dragCooldown by remember { mutableStateOf(false) }
 
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         LazyVerticalGrid(
@@ -128,25 +129,28 @@ fun BookGrid(
 
                             detectDragGesturesAfterLongPress(
                                 onDragStart = { localPos ->
-                                    draggedIndex = index
-                                    dragOffset = Offset.Zero
-                                    dwellTargetIndex = -1
-                                    currentHoverIndex = -1
-                                    dwellJob?.cancel()
-                                    autoScrollJob?.cancel()
+                                    // Issue 3: animateItem 动画期间禁止新拖拽
+                                    if (!dragCooldown) {
+                                        draggedIndex = index
+                                        dragOffset = Offset.Zero
+                                        dwellTargetIndex = -1
+                                        currentHoverIndex = -1
+                                        dwellJob?.cancel()
+                                        autoScrollJob?.cancel()
 
-                                    // 触觉反馈：长按激活拖拽
-                                    view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                        // 触觉反馈：长按激活拖拽
+                                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
 
-                                    // 记录起始绝对位置（grid 坐标系）
-                                    val itemInfo = gridState.layoutInfo.visibleItemsInfo
-                                        .firstOrNull { it.index == index }
-                                    dragStartAbsPos = Offset(
-                                        (itemInfo?.offset?.x ?: 0).toFloat() + localPos.x,
-                                        (itemInfo?.offset?.y ?: 0).toFloat() + localPos.y,
-                                    )
-                                    lastStablePos = dragStartAbsPos
-                                    dwellStartTime = System.currentTimeMillis()
+                                        // 记录起始绝对位置（grid 坐标系）
+                                        val itemInfo = gridState.layoutInfo.visibleItemsInfo
+                                            .firstOrNull { it.index == index }
+                                        dragStartAbsPos = Offset(
+                                            (itemInfo?.offset?.x ?: 0).toFloat() + localPos.x,
+                                            (itemInfo?.offset?.y ?: 0).toFloat() + localPos.y,
+                                        )
+                                        lastStablePos = dragStartAbsPos
+                                        dwellStartTime = System.currentTimeMillis()
+                                    }
                                 },
                                 onDrag = { change, delta ->
                                     dragOffset += delta
@@ -246,12 +250,17 @@ fun BookGrid(
                                                 val moved = mutableItems.removeAt(index)
                                                 mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
                                                 onReorder(mutableItems.toList())
+                                                // Issue 3: 重排后冷却 350ms，等 animateItem 结束
+                                                dragCooldown = true
+                                                scope.launch { delay(350); dragCooldown = false }
                                             }
                                         } else {
                                             // 非单本 → 重排
                                             val moved = mutableItems.removeAt(index)
                                             mutableItems.add(target.coerceIn(0, mutableItems.size), moved)
                                             onReorder(mutableItems.toList())
+                                            dragCooldown = true
+                                            scope.launch { delay(350); dragCooldown = false }
                                         }
                                     }
                                 },
@@ -302,7 +311,7 @@ fun BookGrid(
                             is LibraryItem.Bundle -> BundleStack(bundle = item.bundle)
                         }
 
-                        // ⋮ 菜单按钮（右上角，视觉 28dp + padding 10dp = 48dp 有效触摸区）
+                        // ⋮ 菜单按钮（右上角，40dp 视觉 + 4dp padding 内边距）
                         IconButton(
                             onClick = {
                                 contextItem = item
@@ -310,14 +319,13 @@ fun BookGrid(
                             },
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
-                                .size(28.dp)
-                                .padding(10.dp),  // 补偿触摸目标
+                                .size(40.dp),
                         ) {
                             Icon(
                                 imageVector = Icons.Default.MoreVert,
                                 contentDescription = "菜单",
-                                tint = palette.ink.copy(alpha = 0.5f),
-                                modifier = Modifier.size(16.dp),
+                                tint = palette.ink.copy(alpha = 0.45f),
+                                modifier = Modifier.size(20.dp),
                             )
                         }
 
@@ -345,6 +353,7 @@ fun BookGrid(
                                         DropdownMenuItem(
                                             text = { Text("建组") },
                                             onClick = {
+                                                // Issue 2: 单书建组需要两本书，进入选书模式
                                                 groupSourceId = item.book.id
                                                 groupTargetItem = null
                                                 groupName = ""
@@ -406,13 +415,7 @@ fun BookGrid(
                         overflow = TextOverflow.Ellipsis,
                     )
                     if (item is LibraryItem.Single) {
-                        Text(
-                            text = item.book.author,
-                            style = ReadflowType.meta,
-                            color = palette.inkSoft,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+                        // Issue 4: 作者识别不到，暂时移除
                     }
                     ShelfBoard(modifier = Modifier.padding(top = Dimens.spaceXs))
                 }
@@ -500,55 +503,65 @@ fun BookGrid(
 
     // ── Create-group dialog ────────────────────────────────────────────────
     if (groupSourceId.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = {
-                groupSourceId = ""
-                groupTargetItem = null
-            },
-            title = { Text("建组") },
-            text = {
-                Column {
-                    if (groupTargetItem != null) {
+        // Issue 2: 单书建组需要两本书。无目标书时显示提示，不创建一人组。
+        if (groupTargetItem == null) {
+            AlertDialog(
+                onDismissRequest = { groupSourceId = "" },
+                title = { Text("建组") },
+                text = { Text("建组需要两本书。\n请长按拖动本书到目标书上，\n停留片刻即可建组。") },
+                confirmButton = {
+                    TextButton(onClick = { groupSourceId = "" }) { Text("知道了") }
+                },
+            )
+        } else {
+            AlertDialog(
+                onDismissRequest = {
+                    groupSourceId = ""
+                    groupTargetItem = null
+                },
+                title = { Text("建组") },
+                text = {
+                    Column {
                         Text(
                             text = "将与《${groupTargetItem!!.book.title}》建组",
                             style = MaterialTheme.typography.bodySmall,
                             color = palette.inkSoft,
                             modifier = Modifier.padding(bottom = 8.dp),
                         )
+                        OutlinedTextField(
+                            value = groupName,
+                            onValueChange = { groupName = it },
+                            singleLine = true,
+                            label = { Text("组名") },
+                        )
                     }
-                    OutlinedTextField(
-                        value = groupName,
-                        onValueChange = { groupName = it },
-                        singleLine = true,
-                        label = { Text("组名") },
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        if (groupName.isNotBlank()) {
-                            onMoveToGroup(groupSourceId, groupName)
-                            groupTargetItem?.let { onMoveToGroup(it.book.id, groupName) }
-                        }
-                        groupSourceId = ""
-                        groupTargetItem = null
-                    },
-                ) {
-                    Text("确定")
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        groupSourceId = ""
-                        groupTargetItem = null
-                    },
-                ) {
-                    Text("取消")
-                }
-            },
-        )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            if (groupName.isNotBlank()) {
+                                onMoveToGroup(groupSourceId, groupName)
+                                groupTargetItem?.let { onMoveToGroup(it.book.id, groupName) }
+                            }
+                            groupSourceId = ""
+                            groupTargetItem = null
+                        },
+                    ) {
+                        Text("确定")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = {
+                            groupSourceId = ""
+                            groupTargetItem = null
+                        },
+                    ) {
+                        Text("取消")
+                    }
+                },
+            )
+        }
     }
 }
 
