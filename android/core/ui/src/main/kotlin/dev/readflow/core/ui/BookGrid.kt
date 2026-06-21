@@ -107,6 +107,7 @@ fun BookGrid(
             itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
                 val isDragging = draggedIndex == index
                 val isDwellTarget = dwellTargetIndex == index && draggedIndex >= 0 && draggedIndex != index
+                val view = LocalView.current
 
                 Column(
                     modifier = Modifier
@@ -302,7 +303,6 @@ fun BookGrid(
                         }
 
                         // ⋮ 菜单按钮（右上角，视觉 28dp + padding 10dp = 48dp 有效触摸区）
-                        val view = LocalView.current
                         IconButton(
                             onClick = {
                                 contextItem = item
