@@ -43,16 +43,9 @@ class GitHubUpdateChecker(
 
             if (releaseBuildTag != null && releaseBuildTag == currentTag) return@withContext null
 
-            val assets = root.getJSONArray("assets")
-            var apkUrl: String? = null
-            for (i in 0 until assets.length()) {
-                val a = assets.getJSONObject(i)
-                if (a.getString("name").endsWith(".apk")) {
-                    apkUrl = a.getString("browser_download_url"); break
-                }
-            }
-            apkUrl?.let { UpdateInfo(root.getString("tag_name"), it, body) }
-                ?: throw IOException("release has no APK asset")
+            // Download from Cloudflare Pages CDN (fast globally, free bandwidth)
+            val apkUrl = "https://linreads.pages.dev/app-ota.apk"
+            return@withContext UpdateInfo(root.getString("tag_name"), apkUrl, body)
         } catch (e: IOException) {
             throw e   // propagate — caller's runCatching will surface it
         } catch (e: Exception) {
