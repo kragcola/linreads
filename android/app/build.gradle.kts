@@ -51,6 +51,15 @@ android {
     buildTypes {
         debug { signingConfig = signingConfigs.getByName("linreads") }
         release { signingConfig = signingConfigs.getByName("linreads") }
+        create("ota") {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            signingConfig = signingConfigs.getByName("linreads")
+        }
     }
 
     buildFeatures { compose = true; buildConfig = true }
