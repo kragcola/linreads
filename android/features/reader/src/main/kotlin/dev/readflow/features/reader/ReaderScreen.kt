@@ -1,6 +1,5 @@
 package dev.readflow.features.reader
 
-import android.view.GestureDetector
 import android.view.MotionEvent
 import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
@@ -76,27 +75,38 @@ fun ReaderScreen(
                         }.also { it.bind(engine) }
                     }
 
-                    // Document view — native touch: tap toggles chrome, scroll passes through
+                    // Document view — manual tap detection, never consumes events
                     AndroidView(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
                             val frame = FrameLayout(ctx).apply { addView(host.hostView()) }
-                            val tapDetector = GestureDetector(ctx,
-                                object : GestureDetector.SimpleOnGestureListener() {
-                                    override fun onSingleTapUp(e: MotionEvent): Boolean {
-                                        val h = frame.height.toFloat()
-                                        if (h > 0) {
-                                            val yRatio = e.y / h
-                                            if (yRatio in 0.33f..0.66f) {
-                                                viewModel.onIntent(ReaderIntent.ToggleChrome)
+                            var downTime = 0L
+                            var downX = 0f
+                            var downY = 0f
+                            frame.setOnTouchListener { _, event ->
+                                when (event.action) {
+                                    MotionEvent.ACTION_DOWN -> {
+                                        downTime = System.currentTimeMillis()
+                                        downX = event.x
+                                        downY = event.y
+                                    }
+                                    MotionEvent.ACTION_UP -> {
+                                        val dt = System.currentTimeMillis() - downTime
+                                        val dy = kotlin.math.abs(event.y - downY)
+                                        val dx = kotlin.math.abs(event.x - downX)
+                                        // Tap: <200ms, <20px movement
+                                        if (dt < 200 && dy < 20 && dx < 20) {
+                                            val h = frame.height.toFloat()
+                                            if (h > 0) {
+                                                val yRatio = event.y / h
+                                                if (yRatio in 0.33f..0.66f) {
+                                                    viewModel.onIntent(ReaderIntent.ToggleChrome)
+                                                }
                                             }
                                         }
-                                        return false // never consume — let RecyclerView scroll
                                     }
-                                })
-                            frame.setOnTouchListener { _, event ->
-                                tapDetector.onTouchEvent(event)
-                                false // always return false — event passes to children
+                                }
+                                false // NEVER consume — RecyclerView must receive all events
                             }
                             frame
                         },
