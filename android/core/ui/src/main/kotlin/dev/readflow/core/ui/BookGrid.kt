@@ -4,7 +4,6 @@ import android.view.HapticFeedbackConstants
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
@@ -221,7 +220,6 @@ fun BookGrid(
             itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
                 val isDragging = dragItemKey == item.key
                 val isDwellTarget = dwellTargetKey == item.key && dragItemKey.isNotEmpty() && dragItemKey != item.key
-                val isInsertPlaceholder = reorderPreviewActive && currentInsertIndex == index && dragItemKey != item.key && currentZone != DragZone.BOOK
                 val view = LocalView.current
 
                 Column(
@@ -462,19 +460,7 @@ fun BookGrid(
                     ) {
                         when (item) {
                             is LibraryItem.Single -> {
-                                if (isInsertPlaceholder) {
-                                    // 虚化占位框（间隙区拖入时的插入预览）
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .border(2.dp, MaterialTheme.colorScheme.primary, shape = MaterialTheme.shapes.medium)
-                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), shape = MaterialTheme.shapes.medium),
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Text("← 插入此处", style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f))
-                                    }
-                                } else if (isDwellTarget && dragItemKey.isNotEmpty()) {
+                                if (isDwellTarget && dragItemKey.isNotEmpty()) {
                                     val dragged = mutableItems.firstOrNull { it.key == dragItemKey }
                                     if (dragged is LibraryItem.Single) {
                                         BundleStack(
@@ -499,16 +485,7 @@ fun BookGrid(
                                 }
                             }
                             is LibraryItem.Bundle -> {
-                                if (isInsertPlaceholder) {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .border(2.dp, MaterialTheme.colorScheme.primary, shape = MaterialTheme.shapes.medium)
-                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f), shape = MaterialTheme.shapes.medium),
-                                        contentAlignment = Alignment.Center,
-                                    ) { Text("← 插入此处", style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)) }
-                                } else if (isDwellTarget && dragItemKey.isNotEmpty()) {
+                                if (isDwellTarget && dragItemKey.isNotEmpty()) {
                                     val dragged = mutableItems.firstOrNull { it.key == dragItemKey }
                                     if (dragged is LibraryItem.Single) {
                                         BundleStack(bundle = item.bundle.copy(books = item.bundle.books + dragged.book))
@@ -542,7 +519,7 @@ fun BookGrid(
                         }
 
                         // ⋮ 菜单按钮
-                        if (!isDragging && !isInsertPlaceholder) {
+                        if (!isDragging) {
                             IconButton(
                                 onClick = {
                                     contextItem = item
