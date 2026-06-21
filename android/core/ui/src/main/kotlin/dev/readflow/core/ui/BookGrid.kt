@@ -702,8 +702,6 @@ fun BookGrid(
             }
         }
 
-        }
-
         // ── 取消区 Overlay ──
         if (dragItemKey.isNotEmpty()) {
             Box(
