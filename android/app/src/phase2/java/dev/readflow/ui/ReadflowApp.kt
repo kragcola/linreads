@@ -87,7 +87,8 @@ fun ReadflowApp() {
             composable("settings") {
                 SettingsScreen(
                     onBack = { navController.popBackStack() },
-                    onCheckForUpdate = { AppUpdateManager.checkForUpdate() },
+                    onCheckForUpdate = { AppUpdateManager.checkForUpdate(context) },
+                    cachedNotes = AppUpdateManager.getCachedNotes(context),
                     authToken = dev.readflow.BuildConfig.GITHUB_OTA_TOKEN,
                     buildTag = dev.readflow.BuildConfig.BUILD_TAG,
                 )

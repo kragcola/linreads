@@ -20,6 +20,8 @@ object AppUpdateManager {
 
     private const val CHANNEL_ID = "linreads_update"
     private const val NOTIF_ID = 9001
+    private const val PREFS_NAME = "update"
+    private const val KEY_CACHED_NOTES = "cached_notes"
 
     private val checker = GitHubUpdateChecker(
         repoSlug = BuildConfig.GITHUB_REPO,
@@ -34,12 +36,34 @@ object AppUpdateManager {
     }
 
     /** Returns (apkUrl, notes) if newer build available, null otherwise. */
-    suspend fun checkForUpdate(): Pair<String, String>? {
+    suspend fun checkForUpdate(context: Context): Pair<String, String>? {
         val info = checker.check() ?: return null
-        val notes = info.notes.lineSequence()
-            .filterNot { it.startsWith("BUILD_TAG:") || it.startsWith("Commit:") || it.startsWith("Branch:") || it.startsWith("Time:") }
-            .joinToString("\n").trim()
+        val notes = extractNotes(info.notes)
+        // Cache notes for always-visible display
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putString(KEY_CACHED_NOTES, notes).apply()
         return info.apkUrl to notes
+    }
+
+    /** Get the last cached update notes (survives app restart). */
+    fun getCachedNotes(context: Context): String =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_CACHED_NOTES, "") ?: ""
+
+    /** Extract human-readable notes from release body, keeping only real content. */
+    private fun extractNotes(raw: String): String {
+        // Split at "---" separator: content before separator is the commit message
+        val parts = raw.split("\n---\n", limit = 2)
+        val body = parts.firstOrNull()?.trim() ?: ""
+        // If body is empty, try filtering technical metadata (old format fallback)
+        if (body.isBlank()) {
+            return raw.lineSequence()
+                .filterNot { it.startsWith("BUILD_TAG:") || it.startsWith("Commit:") ||
+                            it.startsWith("Branch:") || it.startsWith("Time:") ||
+                            it.startsWith("---") }
+                .joinToString("\n").trim()
+        }
+        return body
     }
 
     private fun postNotification(ctx: Context, info: UpdateInfo) {

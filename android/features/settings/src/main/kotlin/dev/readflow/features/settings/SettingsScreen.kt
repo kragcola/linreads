@@ -24,7 +24,8 @@ import org.koin.androidx.compose.koinViewModel
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
-    onCheckForUpdate: suspend () -> Pair<String, String>? = { null },
+    onCheckForUpdate: suspend (Context) -> Pair<String, String>? = { null },
+    cachedNotes: String = "",
     authToken: String = "",
     buildTag: String = "",
 ) {
@@ -110,7 +111,7 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
-            // 诊断：显示当前构建标识
+            // 诊断：显示当前构建标识 + 更新日志
             val buildNum = buildTag.removePrefix("dev-").substringBefore("-").takeIf { it.all { c -> c.isDigit() } }
             val tagDisplay = if (buildNum != null) "构建 #$buildNum" else buildTag
             Text(
@@ -118,12 +119,32 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
             )
+            // 始终显示缓存的更新日志（中文 commit message）
+            if (cachedNotes.isNotBlank()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "更新日志",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                ) {
+                    Text(
+                        text = cachedNotes,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(8.dp),
+                    )
+                }
+            }
 
             when (val s = updateState) {
                 UpdateState.Idle -> Button(onClick = {
                     scope.launch {
                         updateState = UpdateState.Checking
-                        runCatching { onCheckForUpdate() }
+                        runCatching { onCheckForUpdate(context) }
                             .onSuccess { result ->
                                 updateState = if (result != null) UpdateState.Available(result.first, result.second)
                                 else UpdateState.UpToDate

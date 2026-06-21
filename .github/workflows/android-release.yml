@@ -36,10 +36,12 @@ jobs:
           tag_name: dev-latest
           name: "Dev build #${{ github.run_number }}"
           body: |
+            ${{ github.event.head_commit.message }}
+            
+            ---
             BUILD_TAG: ${{ env.BUILD_TAG }}
             Commit: ${{ github.sha }}
             Branch: ${{ github.ref_name }}
-            Time: ${{ github.event.head_commit.timestamp }}
           files: android/app/build/outputs/apk/ota/app-ota.apk
           prerelease: true
           make_latest: false
