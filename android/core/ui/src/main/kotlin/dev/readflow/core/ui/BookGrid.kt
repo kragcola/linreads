@@ -306,11 +306,17 @@ fun BookGrid(
 
                                     // ── 正常区：命中检测 ──
                                     val (insertIdx, zone) = findDropTarget(absPos)
-                                    val hitInfo = gridState.layoutInfo.visibleItemsInfo
-                                        .firstOrNull { absPos.y in it.offset.y.toFloat()..(it.offset.y + it.size.height).toFloat() }
-                                    val hoverKey = hitInfo?.let { mutableItems.getOrNull(it.index)?.key } ?: ""
+                                    // hoverKey 需要 XY 双轴命中（用于 dwell 目标书定位）
+                                    val hoverHit = gridState.layoutInfo.visibleItemsInfo
+                                        .firstOrNull { info ->
+                                            val rx = info.offset.x.toFloat()
+                                            val ry = info.offset.y.toFloat()
+                                            absPos.x in rx..(rx + info.size.width) &&
+                                                absPos.y in ry..(ry + info.size.height)
+                                        }
+                                    val hoverKey = hoverHit?.let { mutableItems.getOrNull(it.index)?.key } ?: ""
 
-                                    if (zone != currentZone || hoverKey != currentHoverKey) {
+                                    if (zone != currentZone || (zone == DragZone.BOOK && hoverKey != currentHoverKey) || (zone != DragZone.BOOK && insertIdx != currentInsertIndex)) {
                                         dwellJob?.cancel()
                                         dwellTargetKey = ""
                                         dwellProgress = 0f
