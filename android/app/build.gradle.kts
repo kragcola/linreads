@@ -59,6 +59,7 @@ android {
                 "proguard-rules.pro",
             )
             signingConfig = signingConfigs.getByName("linreads")
+            matchingFallbacks += listOf("release")
         }
     }
 
