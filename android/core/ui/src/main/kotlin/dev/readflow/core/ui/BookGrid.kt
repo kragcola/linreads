@@ -39,7 +39,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
-import kotlin.math.roundToInt
 
 /** 拖拽时手指命中的区域类型 */
 private enum class DragZone { GAP_ABOVE, BOOK, GAP_BELOW, CANCEL }
@@ -68,8 +67,11 @@ fun BookGrid(
 ) {
     val palette = readflowPalette
     val mutableItems = remember { mutableStateListOf(*items.toTypedArray()) }
-    LaunchedEffect(items) {
-        if (items != mutableItems.toList()) {
+    LaunchedEffect(items.size, items.sumOf { it.key.hashCode() }) {
+        // 仅在外部items有新增/删除时才全量同步，排序变化由拖拽直接管理
+        val currentKeys = mutableItems.map { it.key }.toSet()
+        val newKeys = items.map { it.key }.toSet()
+        if (currentKeys != newKeys) {
             mutableItems.clear()
             mutableItems.addAll(items)
         }
@@ -94,7 +96,6 @@ fun BookGrid(
     var dwellStartTime by remember { mutableStateOf(0L) }
     var dwellProgress by remember { mutableStateOf(0f) }
     val dwellThresholdMs = 700L
-    val dwellMoveTolerance = 12.dp
 
     // 自动滚动
     var autoScrollJob by remember { mutableStateOf<Job?>(null) }
@@ -119,7 +120,7 @@ fun BookGrid(
     fun hitZone(absPos: Offset, info: LazyGridItemInfo): DragZone {
         val itemTop = info.offset.y.toFloat()
         val itemH = info.size.height.toFloat()
-        val zoneH = itemH * 0.30f
+        val zoneH = itemH * 0.40f  // 上下各40% = 间隙，中间20% = 书本
         val relY = absPos.y - itemTop
         return when {
             relY < zoneH -> DragZone.GAP_ABOVE
@@ -199,21 +200,6 @@ fun BookGrid(
         return insertIdx to zone
     }
 
-    /** 拖拽中实时重排：移除被拖拽的 item 并插入到新位置 */
-    fun performLiveReorder(insertIdx: Int) {
-        if (!reorderPreviewActive) return
-        val dragIdx = mutableItems.indexOfFirst { it.key == dragItemKey }
-        if (dragIdx < 0) return
-        val targetIdx = if (insertIdx > dragIdx) insertIdx - 1 else insertIdx
-        if (targetIdx == dragIdx) return
-        val moved = mutableItems.removeAt(dragIdx)
-        mutableItems.add(targetIdx.coerceIn(0, mutableItems.size), moved)
-    }
-
-    /** 根据 item key 找它的 info */
-    fun infoForKey(key: String) = gridState.layoutInfo.visibleItemsInfo
-        .firstOrNull { mutableItems.getOrNull(it.index)?.key == key }
-
     Box(modifier = modifier.fillMaxSize()) {
         LazyVerticalGrid(
             state = gridState,
@@ -245,7 +231,7 @@ fun BookGrid(
                         }
                         .animateItem()
                         .clickable { onItemClick(item) }
-                        .pointerInput(item.key, index) {
+                        .pointerInput(item.key) {
                             var dwellLocalStart = 0L
 
                             detectDragGesturesAfterLongPress(
@@ -290,23 +276,18 @@ fun BookGrid(
                                     if (newInCancel != isInCancelZone) {
                                         isInCancelZone = newInCancel
                                         if (newInCancel) {
-                                            // 进入取消区：回退所有实时换位
                                             dwellJob?.cancel()
                                             dwellTargetKey = ""
                                             dwellProgress = 0f
                                             reorderPreviewActive = false
                                             currentInsertIndex = -1
-                                            // 恢复原始顺序
-                                            mutableItems.clear()
-                                            mutableItems.addAll(items)
                                         }
                                     }
 
                                     if (isInCancelZone) return@detectDragGesturesAfterLongPress
 
-                                    // ── 正常区：命中检测 ──
+                                    // ── 命中检测 ──
                                     val (insertIdx, zone) = findDropTarget(absPos)
-                                    // hoverKey 需要 XY 双轴命中（用于 dwell 目标书定位）
                                     val hoverHit = gridState.layoutInfo.visibleItemsInfo
                                         .firstOrNull { info ->
                                             val rx = info.offset.x.toFloat()
@@ -316,58 +297,67 @@ fun BookGrid(
                                         }
                                     val hoverKey = hoverHit?.let { mutableItems.getOrNull(it.index)?.key } ?: ""
 
-                                    if (zone != currentZone || (zone == DragZone.BOOK && hoverKey != currentHoverKey) || (zone != DragZone.BOOK && insertIdx != currentInsertIndex)) {
-                                        dwellJob?.cancel()
-                                        dwellTargetKey = ""
-                                        dwellProgress = 0f
-                                        currentZone = zone
-                                        currentHoverKey = hoverKey
-                                        dwellLocalStart = System.currentTimeMillis()
-                                        dwellStartTime = dwellLocalStart
+                                    // ── 状态迁移 ──
+                                    val bookChanged = zone == DragZone.BOOK && (zone != currentZone || hoverKey != currentHoverKey)
+                                    val gapChanged = zone != DragZone.BOOK && (zone != currentZone || insertIdx != currentInsertIndex)
+                                    val sameBook = zone == DragZone.BOOK && zone == currentZone && hoverKey == currentHoverKey
 
-                                        when (zone) {
-                                            DragZone.GAP_ABOVE, DragZone.GAP_BELOW -> {
-                                                // 间隙区 → 实时换位
-                                                reorderPreviewActive = true
-                                                currentInsertIndex = insertIdx
-                                                performLiveReorder(insertIdx)
-                                            }
-                                            DragZone.BOOK -> {
-                                                // 书本区 → 停止实时换位（恢复原位）+ 启动 dwell
-                                                reorderPreviewActive = false
-                                                currentInsertIndex = -1
-                                                // 恢复原始顺序
-                                                val orig = items.toList()
-                                                if (mutableItems.toList() != orig) {
-                                                    mutableItems.clear()
-                                                    mutableItems.addAll(orig)
-                                                }
+                                    when {
+                                        bookChanged -> {
+                                            // 进入/切换到书本区 → 暂停换位 + 启动 dwell
+                                            dwellJob?.cancel()
+                                            dwellTargetKey = ""
+                                            dwellProgress = 0f
+                                            reorderPreviewActive = false
+                                            currentInsertIndex = -1
+                                            currentZone = zone
+                                            currentHoverKey = hoverKey
+                                            dwellLocalStart = System.currentTimeMillis()
+                                            dwellStartTime = dwellLocalStart
 
-                                                val targetItem = mutableItems.getOrNull(insertIdx)
-                                                if (targetItem != null && hoverKey != dragItemKey) {
-                                                    val dragItem = mutableItems.firstOrNull { it.key == dragItemKey }
-                                                    if (dragItem is LibraryItem.Single &&
-                                                        (targetItem is LibraryItem.Single || targetItem is LibraryItem.Bundle)) {
-                                                        dwellJob = scope.launch {
-                                                            while (true) {
-                                                                delay(50)
-                                                                val elapsed = System.currentTimeMillis() - dwellLocalStart
-                                                                dwellProgress = (elapsed.toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
-                                                                if (elapsed >= dwellThresholdMs) {
-                                                                    dwellTargetKey = hoverKey
-                                                                    dwellProgress = 1f
-                                                                    break
-                                                                }
+                                            val targetItem = mutableItems.getOrNull(insertIdx)
+                                            if (targetItem != null && hoverKey != dragItemKey) {
+                                                val dragItem = mutableItems.firstOrNull { it.key == dragItemKey }
+                                                if (dragItem is LibraryItem.Single &&
+                                                    (targetItem is LibraryItem.Single || targetItem is LibraryItem.Bundle)) {
+                                                    dwellJob = scope.launch {
+                                                        while (true) {
+                                                            delay(50)
+                                                            val elapsed = System.currentTimeMillis() - dwellLocalStart
+                                                            dwellProgress = (elapsed.toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
+                                                            if (elapsed >= dwellThresholdMs) {
+                                                                dwellTargetKey = hoverKey
+                                                                dwellProgress = 1f
+                                                                break
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
-                                            DragZone.CANCEL -> {}
                                         }
-                                    } else if (zone == DragZone.BOOK && hoverKey.isNotEmpty() && hoverKey != dragItemKey) {
-                                        // 同一书本区内，更新 dwell 进度
-                                        dwellProgress = ((System.currentTimeMillis() - dwellLocalStart).toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
+                                        sameBook -> {
+                                            // 同一书本区内 → 更新进度
+                                            dwellProgress = ((System.currentTimeMillis() - dwellLocalStart).toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
+                                        }
+                                        gapChanged -> {
+                                            // 进入/切换到间隙区 → 实时换位
+                                            dwellJob?.cancel()
+                                            dwellTargetKey = ""
+                                            dwellProgress = 0f
+                                            currentZone = zone
+                                            currentHoverKey = ""
+                                            currentInsertIndex = insertIdx
+                                            reorderPreviewActive = true
+
+                                            val dragIdx = mutableItems.indexOfFirst { it.key == dragItemKey }
+                                            if (dragIdx >= 0 && insertIdx >= 0) {
+                                                val targetIdx = if (insertIdx > dragIdx) insertIdx - 1 else insertIdx
+                                                if (targetIdx != dragIdx && targetIdx in 0 until mutableItems.size) {
+                                                    val moved = mutableItems.removeAt(dragIdx)
+                                                    mutableItems.add(targetIdx, moved)
+                                                }
+                                            }
+                                        }
                                     }
 
                                     // ── 自动滚动 ──
@@ -390,32 +380,40 @@ fun BookGrid(
                                             }
                                         }
                                     }
-                                },
+
                                 onDragEnd = {
                                     dwellJob?.cancel()
                                     autoScrollJob?.cancel()
 
-                                    if (isInCancelZone) {
-                                        // 取消：恢复原始顺序
-                                        mutableItems.clear()
-                                        mutableItems.addAll(items)
-                                    } else if (reorderPreviewActive && currentInsertIndex >= 0) {
-                                        // 换位生效：恢复到最终位置（已在实时重排中完成）并持久化
-                                        onReorder(mutableItems.toList())
-                                    } else if (dwellTargetKey.isNotEmpty()) {
-                                        // 建组
-                                        val dragItem = mutableItems.firstOrNull { it.key == dragItemKey }
-                                        val targetItem = mutableItems.firstOrNull { it.key == dwellTargetKey }
-                                        if (dragItem is LibraryItem.Single) {
-                                            when (targetItem) {
-                                                is LibraryItem.Bundle -> onMoveToGroup(dragItem.book.id, targetItem.bundle.name)
-                                                is LibraryItem.Single -> {
-                                                    groupSourceId = dragItem.book.id
-                                                    groupTargetItem = targetItem
-                                                    groupName = ""
+                                    when {
+                                        isInCancelZone -> {
+                                            // 取消 → 恢复拖拽前顺序
+                                            mutableItems.clear()
+                                            mutableItems.addAll(items)
+                                        }
+                                        dwellTargetKey.isNotEmpty() -> {
+                                            // dwell 完成 → 建组
+                                            val dragItem = mutableItems.firstOrNull { it.key == dragItemKey }
+                                            val targetItem = mutableItems.firstOrNull { it.key == dwellTargetKey }
+                                            if (dragItem is LibraryItem.Single) {
+                                                when (targetItem) {
+                                                    is LibraryItem.Bundle -> onMoveToGroup(dragItem.book.id, targetItem.bundle.name)
+                                                    is LibraryItem.Single -> {
+                                                        groupSourceId = dragItem.book.id
+                                                        groupTargetItem = targetItem
+                                                        groupName = ""
+                                                    }
+                                                    else -> {}
                                                 }
-                                                else -> {}
                                             }
+                                        }
+                                        reorderPreviewActive -> {
+                                            // 换位预览中松手 → 提交当前顺序
+                                            onReorder(mutableItems.toList())
+                                        }
+                                        currentInsertIndex >= 0 -> {
+                                            // 兜底：手指在间隙区但 preview 未激活 → 仍提交
+                                            onReorder(mutableItems.toList())
                                         }
                                     }
 
@@ -433,7 +431,7 @@ fun BookGrid(
                                 onDragCancel = {
                                     dwellJob?.cancel()
                                     autoScrollJob?.cancel()
-                                    // 恢复原始顺序
+                                    // 恢复拖拽前顺序
                                     mutableItems.clear()
                                     mutableItems.addAll(items)
                                     dragItemKey = ""
