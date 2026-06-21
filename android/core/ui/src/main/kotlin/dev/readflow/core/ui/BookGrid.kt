@@ -1,7 +1,6 @@
 package dev.readflow.core.ui
 
 import android.view.HapticFeedbackConstants
-import android.view.HapticFeedbackConstants
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -10,6 +9,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridItemInfo
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
@@ -314,7 +314,7 @@ fun BookGrid(
                                                     if (dragItem is LibraryItem.Single &&
                                                         (targetItem is LibraryItem.Single || targetItem is LibraryItem.Bundle)) {
                                                         dwellJob = scope.launch {
-                                                            while (isActive) {
+                                                            while (true) {
                                                                 delay(50)
                                                                 val elapsed = System.currentTimeMillis() - dwellLocalStart
                                                                 dwellProgress = (elapsed.toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
@@ -484,18 +484,19 @@ fun BookGrid(
                         // dwell 进度环（书本区停留计时）
                         if (currentHoverKey == item.key && currentZone == DragZone.BOOK &&
                             dragItemKey.isNotEmpty() && dragItemKey != item.key && dwellTargetKey.isEmpty()) {
+                            val ringColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
                             Canvas(modifier = Modifier.fillMaxSize().padding(2.dp)) {
                                 val stroke = 6.dp.toPx()
                                 val arcSize = Size(size.width - stroke, size.height - stroke)
                                 val topLeft = Offset(stroke / 2, stroke / 2)
                                 drawArc(
-                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                                    color = ringColor,
                                     startAngle = -90f,
                                     sweepAngle = dwellProgress * 360f,
                                     useCenter = false,
                                     topLeft = topLeft,
                                     size = arcSize,
-                                    style = Stroke(width = stroke, cap = androidx.compose.ui.graphics.StrokeCap.Round),
+                                    style = Stroke(width = stroke, cap = StrokeCap.Round),
                                 )
                             }
                         }
