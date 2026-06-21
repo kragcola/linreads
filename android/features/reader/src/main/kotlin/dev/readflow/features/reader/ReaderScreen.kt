@@ -1,5 +1,7 @@
 package dev.readflow.features.reader
 
+import android.view.GestureDetector
+import android.view.MotionEvent
 import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -7,7 +9,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -22,7 +24,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import dev.readflow.core.model.LoadingState
@@ -75,27 +76,30 @@ fun ReaderScreen(
                         }.also { it.bind(engine) }
                     }
 
-                    // Document view — no touch handling here, overlay catches taps
+                    // Document view — native touch: tap toggles chrome, scroll passes through
                     AndroidView(
                         modifier = Modifier.fillMaxSize(),
-                        factory = { ctx -> FrameLayout(ctx).apply { addView(host.hostView()) } },
-                    )
-                    // Invisible overlay — only middle third toggles chrome
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .pointerInput(Unit) {
-                                detectTapGestures { offset ->
-                                    val h = size.height.toFloat()
-                                    if (h > 0) {
-                                        val yRatio = offset.y / h
-                                        // Only middle third (0.33–0.66) toggles chrome
-                                        if (yRatio in 0.33f..0.66f) {
-                                            viewModel.onIntent(ReaderIntent.ToggleChrome)
+                        factory = { ctx ->
+                            val frame = FrameLayout(ctx).apply { addView(host.hostView()) }
+                            val tapDetector = GestureDetector(ctx,
+                                object : GestureDetector.SimpleOnGestureListener() {
+                                    override fun onSingleTapUp(e: MotionEvent): Boolean {
+                                        val h = frame.height.toFloat()
+                                        if (h > 0) {
+                                            val yRatio = e.y / h
+                                            if (yRatio in 0.33f..0.66f) {
+                                                viewModel.onIntent(ReaderIntent.ToggleChrome)
+                                            }
                                         }
+                                        return false // never consume — let RecyclerView scroll
                                     }
-                                }
-                            },
+                                })
+                            frame.setOnTouchListener { _, event ->
+                                tapDetector.onTouchEvent(event)
+                                false // always return false — event passes to children
+                            }
+                            frame
+                        },
                     )
 
                     // ── Top chrome: 书名 + 返回 ──
@@ -135,68 +139,68 @@ fun ReaderScreen(
                                 color = MaterialTheme.colorScheme.primary,
                                 trackColor = MaterialTheme.colorScheme.surfaceVariant,
                             )
-                            // 章节导航栏
+                            // ── 章节导航栏（独立一行）──
                             Surface(
                                 color = MaterialTheme.colorScheme.background.copy(alpha = 0.92f),
-                                modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(vertical = 4.dp),
+                                        .padding(vertical = 6.dp, horizontal = 12.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    // ← 上一章
-                                    IconButton(
-                                        onClick = { scope.launch { engine.goToAdjacentChapter(-1) } },
-                                        modifier = Modifier.size(36.dp),
-                                        enabled = chapter.currentIndex > 0,
-                                    ) {
-                                        Text(
-                                            "←",
-                                            style = MaterialTheme.typography.titleMedium,
-                                            color = if (chapter.currentIndex > 0)
-                                                MaterialTheme.colorScheme.onBackground
-                                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
-                                        )
-                                    }
-                                    // 章节信息 + 本章进度
+                                    Text(
+                                        "←",
+                                        modifier = Modifier
+                                            .clickable(enabled = chapter.currentIndex > 0) {
+                                                scope.launch { engine.goToAdjacentChapter(-1) }
+                                            }
+                                            .padding(8.dp),
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = if (chapter.currentIndex > 0)
+                                            MaterialTheme.colorScheme.onBackground
+                                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                    )
                                     Column(
                                         modifier = Modifier.weight(1f),
                                         horizontalAlignment = Alignment.CenterHorizontally,
                                     ) {
                                         Text(
-                                            text = "${chapter.currentTitle} · ${(chapter.progressInChapter * 100).toInt()}%",
-                                            style = MaterialTheme.typography.labelMedium,
+                                            text = chapter.currentTitle,
+                                            style = MaterialTheme.typography.labelLarge,
                                             color = MaterialTheme.colorScheme.onBackground,
                                             maxLines = 1,
                                         )
                                         Text(
-                                            text = "${chapter.currentIndex + 1} / ${chapter.totalChapters}章",
+                                            text = "${chapter.currentIndex + 1} / ${chapter.totalChapters}章 · ${(chapter.progressInChapter * 100).toInt()}%",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                                         )
                                     }
-                                    // → 下一章
-                                    IconButton(
-                                        onClick = { scope.launch { engine.goToAdjacentChapter(+1) } },
-                                        modifier = Modifier.size(36.dp),
-                                        enabled = chapter.currentIndex < chapter.totalChapters - 1,
-                                    ) {
-                                        Text(
-                                            "→",
-                                            style = MaterialTheme.typography.titleMedium,
-                                            color = if (chapter.currentIndex < chapter.totalChapters - 1)
-                                                MaterialTheme.colorScheme.onBackground
-                                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
-                                        )
-                                    }
+                                    Text(
+                                        "→",
+                                        modifier = Modifier
+                                            .clickable(enabled = chapter.currentIndex < chapter.totalChapters - 1) {
+                                                scope.launch { engine.goToAdjacentChapter(+1) }
+                                            }
+                                            .padding(8.dp),
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = if (chapter.currentIndex < chapter.totalChapters - 1)
+                                            MaterialTheme.colorScheme.onBackground
+                                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                    )
                                 }
-                                // 快捷功能按钮行
+                            }
+                            // ── 分隔线 ──
+                            HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
+                            // ── 快捷功能按钮 ──
+                            Surface(
+                                color = MaterialTheme.colorScheme.background.copy(alpha = 0.92f),
+                            ) {
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                                        .padding(horizontal = 8.dp, vertical = 4.dp),
                                     horizontalArrangement = Arrangement.SpaceEvenly,
                                 ) {
                                     if (ReaderFeature.TOC in features) {
