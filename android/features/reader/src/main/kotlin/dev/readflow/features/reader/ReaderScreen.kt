@@ -1,6 +1,8 @@
 package dev.readflow.features.reader
 
+import android.content.Context
 import android.view.MotionEvent
+import android.view.ViewConfiguration
 import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -75,40 +77,17 @@ fun ReaderScreen(
                         }.also { it.bind(engine) }
                     }
 
-                    // Document view — manual tap detection, never consumes events
+                    // Document view — observe taps in dispatch, then pass events through to the engine view.
                     AndroidView(
                         modifier = Modifier.fillMaxSize(),
                         factory = { ctx ->
-                            val frame = FrameLayout(ctx).apply { addView(host.hostView()) }
-                            var downTime = 0L
-                            var downX = 0f
-                            var downY = 0f
-                            frame.setOnTouchListener { _, event ->
-                                when (event.action) {
-                                    MotionEvent.ACTION_DOWN -> {
-                                        downTime = System.currentTimeMillis()
-                                        downX = event.x
-                                        downY = event.y
-                                    }
-                                    MotionEvent.ACTION_UP -> {
-                                        val dt = System.currentTimeMillis() - downTime
-                                        val dy = kotlin.math.abs(event.y - downY)
-                                        val dx = kotlin.math.abs(event.x - downX)
-                                        // Tap: <200ms, <20px movement
-                                        if (dt < 200 && dy < 20 && dx < 20) {
-                                            val h = frame.height.toFloat()
-                                            if (h > 0) {
-                                                val yRatio = event.y / h
-                                                if (yRatio in 0.33f..0.66f) {
-                                                    viewModel.onIntent(ReaderIntent.ToggleChrome)
-                                                }
-                                            }
-                                        }
-                                    }
+                            ReaderTapContainer(ctx) { yRatio ->
+                                if (yRatio in 0.33f..0.66f) {
+                                    viewModel.onIntent(ReaderIntent.ToggleChrome)
                                 }
-                                false // NEVER consume — RecyclerView must receive all events
+                            }.apply {
+                                addView(host.hostView())
                             }
-                            frame
                         },
                     )
 
@@ -233,6 +212,55 @@ fun ReaderScreen(
                 }
             }
         }
+    }
+}
+
+private class ReaderTapContainer(
+    context: Context,
+    private val onTap: (yRatio: Float) -> Unit,
+) : FrameLayout(context) {
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
+    private val maxTapDurationMs = ViewConfiguration.getLongPressTimeout()
+    private var downTime = 0L
+    private var downX = 0f
+    private var downY = 0f
+    private var trackingTap = false
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        var tapYRatio: Float? = null
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                trackingTap = true
+                downTime = event.eventTime
+                downX = event.x
+                downY = event.y
+            }
+            MotionEvent.ACTION_UP -> {
+                val dt = event.eventTime - downTime
+                val dx = kotlin.math.abs(event.x - downX)
+                val dy = kotlin.math.abs(event.y - downY)
+                if (trackingTap && dt <= maxTapDurationMs && dx <= touchSlop && dy <= touchSlop && height > 0) {
+                    tapYRatio = event.y / height.toFloat()
+                }
+                trackingTap = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = kotlin.math.abs(event.x - downX)
+                val dy = kotlin.math.abs(event.y - downY)
+                if (dx > touchSlop || dy > touchSlop) {
+                    trackingTap = false
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                trackingTap = false
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                trackingTap = false
+            }
+        }
+        val handled = super.dispatchTouchEvent(event)
+        tapYRatio?.let(onTap)
+        return handled
     }
 }
 
