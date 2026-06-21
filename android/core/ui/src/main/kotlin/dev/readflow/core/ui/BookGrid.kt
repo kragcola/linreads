@@ -365,7 +365,6 @@ fun BookGrid(
                                             }
                                         }
                                     }
-                                    } // close gapChanged/outer when
 
                                     // ── 自动滚动 ──
                                     val relativeY = absPos.y - gridState.layoutInfo.viewportStartOffset
