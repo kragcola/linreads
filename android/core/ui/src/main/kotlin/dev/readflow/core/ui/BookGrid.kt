@@ -7,7 +7,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyGridItemInfo
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -536,7 +535,7 @@ fun BookGrid(
                             }
                         }
 
-                        // ⋮ 菜单按钮（半透明黑底 + 白色图标，任何封面可见）
+                        // ⋮ 菜单按钮（双层描边图标：暗底描边 + 白顶，任何封面可见）
                         if (!isDragging) {
                             IconButton(
                                 onClick = {
@@ -546,15 +545,26 @@ fun BookGrid(
                                 modifier = Modifier
                                     .align(Alignment.TopEnd)
                                     .zIndex(2f)
-                                    .size(32.dp)
-                                    .background(Color.Black.copy(alpha = 0.35f), RoundedCornerShape(6.dp)),
+                                    .size(36.dp),
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.MoreVert,
-                                    contentDescription = "菜单",
-                                    tint = Color.White.copy(alpha = 0.85f),
-                                    modifier = Modifier.size(18.dp),
-                                )
+                                Box(contentAlignment = Alignment.Center) {
+                                    // 底层：暗色羽化描边（稍大）
+                                    Icon(
+                                        imageVector = Icons.Default.MoreVert,
+                                        contentDescription = null,
+                                        tint = Color.Black.copy(alpha = 0.35f),
+                                        modifier = Modifier
+                                            .size(22.dp)
+                                            .graphicsLayer { scaleX = 1.2f; scaleY = 1.2f },
+                                    )
+                                    // 顶层：白色三点
+                                    Icon(
+                                        imageVector = Icons.Default.MoreVert,
+                                        contentDescription = "菜单",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                }
                             }
 
                             // ── Context menu ──
