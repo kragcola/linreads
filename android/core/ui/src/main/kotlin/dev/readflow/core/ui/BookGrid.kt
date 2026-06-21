@@ -365,6 +365,7 @@ fun BookGrid(
                                             }
                                         }
                                     }
+                                    } // close gapChanged/outer when
 
                                     // ── 自动滚动 ──
                                     val relativeY = absPos.y - gridState.layoutInfo.viewportStartOffset
@@ -387,6 +388,7 @@ fun BookGrid(
                                         }
                                     }
 
+                                }, // close onDrag lambda
                                 onDragEnd = {
                                     dwellJob?.cancel()
                                     autoScrollJob?.cancel()
