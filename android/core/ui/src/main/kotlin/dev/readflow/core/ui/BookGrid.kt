@@ -10,7 +10,12 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import android.view.HapticFeedbackConstants
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -19,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
@@ -46,6 +52,7 @@ fun BookGrid(
     onRename: (String, String) -> Unit = { _, _ -> },
     onMoveToGroup: (String, String) -> Unit = { _, _ -> },
     onReorder: (List<LibraryItem>) -> Unit = {},
+    onUngroup: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val palette = readflowPalette
@@ -84,6 +91,9 @@ fun BookGrid(
     var groupSourceId by remember { mutableStateOf("") }
     var groupTargetItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var groupName by remember { mutableStateOf("") }
+    var deleteConfirmId by remember { mutableStateOf<String?>(null) }
+    var deleteConfirmLabel by remember { mutableStateOf("") }
+    var ungroupConfirmName by remember { mutableStateOf<String?>(null) }
 
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
         LazyVerticalGrid(
@@ -104,9 +114,10 @@ fun BookGrid(
                         .graphicsLayer {
                             translationX = if (isDragging) dragOffset.x else 0f
                             translationY = if (isDragging) dragOffset.y else 0f
-                            scaleX = if (isDragging) 1.06f else if (isDwellTarget) 0.96f else 1f
-                            scaleY = if (isDragging) 1.06f else if (isDwellTarget) 0.96f else 1f
-                            alpha = if (isDragging) 0.85f else 1f
+                            scaleX = if (isDragging) 1.15f else if (isDwellTarget) 0.94f else 1f
+                            scaleY = if (isDragging) 1.15f else if (isDwellTarget) 0.94f else 1f
+                            alpha = if (isDragging) 0.8f else 1f
+                            shadowElevation = if (isDragging) 8f else 0f
                         }
                         .animateItem() // Compose 原生让位动画
                         .clickable { onItemClick(item) }
@@ -122,6 +133,9 @@ fun BookGrid(
                                     currentHoverIndex = -1
                                     dwellJob?.cancel()
                                     autoScrollJob?.cancel()
+
+                                    // 触觉反馈：长按激活拖拽
+                                    view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
 
                                     // 记录起始绝对位置（grid 坐标系）
                                     val itemInfo = gridState.layoutInfo.visibleItemsInfo
@@ -287,7 +301,8 @@ fun BookGrid(
                             is LibraryItem.Bundle -> BundleStack(bundle = item.bundle)
                         }
 
-                        // ⋮ 菜单按钮（右上角，触摸目标 48dp）
+                        // ⋮ 菜单按钮（右上角，视觉 28dp + padding 10dp = 48dp 有效触摸区）
+                        val view = LocalView.current
                         IconButton(
                             onClick = {
                                 contextItem = item
@@ -295,14 +310,87 @@ fun BookGrid(
                             },
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
-                                .size(Dimens.touchTarget)
-                                .padding(4.dp),
+                                .size(28.dp)
+                                .padding(10.dp),  // 补偿触摸目标
                         ) {
                             Icon(
                                 imageVector = Icons.Default.MoreVert,
                                 contentDescription = "菜单",
-                                tint = palette.ink.copy(alpha = 0.6f),
+                                tint = palette.ink.copy(alpha = 0.5f),
+                                modifier = Modifier.size(16.dp),
                             )
+                        }
+
+                        // ── Context menu（锚定到本 item 的封面 Box）──
+                        if (contextMenuAnchor == index) {
+                            DropdownMenu(
+                                expanded = true,
+                                onDismissRequest = {
+                                    contextItem = null
+                                    contextMenuAnchor = null
+                                },
+                            ) {
+                                when (item) {
+                                    is LibraryItem.Single -> {
+                                        DropdownMenuItem(
+                                            text = { Text("改名") },
+                                            onClick = {
+                                                renameText = item.book.title
+                                                renameItem = item
+                                                contextItem = null
+                                                contextMenuAnchor = null
+                                            },
+                                            leadingIcon = { Icon(Icons.Default.Edit, null) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("建组") },
+                                            onClick = {
+                                                groupSourceId = item.book.id
+                                                groupTargetItem = null
+                                                groupName = ""
+                                                contextItem = null
+                                                contextMenuAnchor = null
+                                            },
+                                            leadingIcon = { Icon(Icons.Default.Add, null) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("删除") },
+                                            onClick = {
+                                                deleteConfirmId = item.book.id
+                                                deleteConfirmLabel = "《${item.book.title}》"
+                                                contextItem = null
+                                                contextMenuAnchor = null
+                                            },
+                                            leadingIcon = {
+                                                Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
+                                            },
+                                        )
+                                    }
+                                    is LibraryItem.Bundle -> {
+                                        DropdownMenuItem(
+                                            text = { Text("拆组") },
+                                            onClick = {
+                                                ungroupConfirmName = item.bundle.name
+                                                contextItem = null
+                                                contextMenuAnchor = null
+                                            },
+                                            leadingIcon = { Icon(Icons.Default.Close, null) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("删除") },
+                                            onClick = {
+                                                deleteConfirmId = "bundle:${item.bundle.name}"
+                                                deleteConfirmLabel = "《${item.bundle.name}》(${item.bundle.books.size}本)"
+                                                contextItem = null
+                                                contextMenuAnchor = null
+                                            },
+                                            leadingIcon = {
+                                                Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
+                                            },
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -332,51 +420,51 @@ fun BookGrid(
         }
     }
 
-    // ── Context menu（⋮ 触发） ──────────────────────────────────────────
-    contextItem?.let { ci ->
-        val id = when (ci) {
-            is LibraryItem.Single -> ci.book.id
-            is LibraryItem.Bundle -> null
-        }
-        DropdownMenu(
-            expanded = true,
-            onDismissRequest = {
-                contextItem = null
-                contextMenuAnchor = null
+    // ── Delete confirmation dialog ─────────────────────────────────────────
+    deleteConfirmId?.let { did ->
+        val isBundleDelete = did.startsWith("bundle:")
+        AlertDialog(
+            onDismissRequest = { deleteConfirmId = null },
+            title = { Text("确认删除") },
+            text = {
+                Text("确定要删除 ${deleteConfirmLabel} 吗？\n${if (isBundleDelete) "组内全部书籍将被移出书架。" else "阅读进度将一并删除。"}")
             },
-        ) {
-            if (ci is LibraryItem.Single) {
-                DropdownMenuItem(
-                    text = { Text("改名") },
+            confirmButton = {
+                TextButton(
                     onClick = {
-                        renameText = ci.book.title
-                        renameItem = ci
-                        contextItem = null
-                        contextMenuAnchor = null
+                        if (isBundleDelete) {
+                            // Delete all books in the bundle
+                            val bundleName = did.removePrefix("bundle:")
+                            val bundleBooks = mutableItems.filterIsInstance<LibraryItem.Bundle>()
+                                .firstOrNull { it.bundle.name == bundleName }?.bundle?.books ?: emptyList()
+                            bundleBooks.forEach { onDelete(it.id) }
+                        } else {
+                            onDelete(did)
+                        }
+                        deleteConfirmId = null
                     },
-                )
-                DropdownMenuItem(
-                    text = { Text("建组") },
-                    onClick = {
-                        groupSourceId = ci.book.id
-                        groupTargetItem = null
-                        groupName = ""
-                        contextItem = null
-                        contextMenuAnchor = null
-                    },
-                )
-            }
-            if (id != null) {
-                DropdownMenuItem(
-                    text = { Text("删除") },
-                    onClick = {
-                        onDelete(id)
-                        contextItem = null
-                        contextMenuAnchor = null
-                    },
-                )
-            }
-        }
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteConfirmId = null }) { Text("取消") }
+            },
+        )
+    }
+
+    // ── Ungroup confirmation dialog ────────────────────────────────────────
+    ungroupConfirmName?.let { name ->
+        AlertDialog(
+            onDismissRequest = { ungroupConfirmName = null },
+            title = { Text("拆组") },
+            text = { Text("确定要拆散《${name}》吗？\n组内书籍将恢复为单本显示。") },
+            confirmButton = {
+                TextButton(onClick = { onUngroup(name); ungroupConfirmName = null }) { Text("拆组") }
+            },
+            dismissButton = {
+                TextButton(onClick = { ungroupConfirmName = null }) { Text("取消") }
+            },
+        )
     }
 
     // ── Rename dialog ──────────────────────────────────────────────────────

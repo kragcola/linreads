@@ -4,6 +4,60 @@
 
 ---
 
+## 2026-06-21
+
+### OTA 更新 UX 打磨
+- 设置页下载进度条（LinearProgressIndicator + 百分比），替代静默通知
+- 下载中按钮禁用 + 取消下载功能
+- 下载完成后自动拉起系统安装器
+- 检查已缓存的下载 URL，避免安装旧版本 APK
+- 下载前清理过期 DownloadManager 记录
+- 影响范围：`features/settings/SettingsScreen.kt`（~260 行）；真机 OTA 验证通过
+
+## 2026-06-20
+
+### v4lite L1–L5 全部落地（commit `38367f5`）
+- **L1 书库接入**：LibraryScreen 真实数据流 + SAF picker 导入 + Navigation 书架→阅读器
+- **L2 Reader 完善**：ReaderScreen(113行) + ReaderViewModel(165行) MVI + 进度 2s debounce 持久化 + 字号/主题/chrome toggle
+- **L3 EPUB 原生重排**：EpubReflowEngine(107行) + EpubParser + EpubParaAdapter；ZipFile+jsoup→RecyclerView 连续滚动；Locator.Section(spineIndex, elementIndex, charOffset)
+- **L4 PDF 引擎**：PdfRendererEngine(107行) + PdfPageAdapter；逐页 ImageView + ViewPager2 分页
+- **L5 Phase A 验收**：ACTION_VIEW/ACTION_SEND intent-filter、进度恢复、最近阅读排序、RFC1918 网络安全
+- **额外引擎**：Markdown 引擎（MarkdownEngine.kt 106行，Markwon，BookFormat.MD）
+- **OTA 更新系统**：GitHubUpdateChecker + AppUpdateManager + UpdateInstallReceiver；前台检查→通知→DownloadManager→安装
+- **Settings 完整 UI**：Calibre URL / 字号滑块(12-28sp) / 主题切换(白/暗/护眼/系统) / 手动检查更新
+- **render 全部模块就位**：api(121行) / epub(204行) / pdf(163行) / txt(202行) / md(106行) / animate(2文件) / mupdf(空壳)
+- **features 全部模块就位**：library / reader / settings
+- **core:prefs** SettingsRepository（DataStore）已存在并被 ReaderViewModel import
+- **core:sync** SyncManager + NoOpSyncBackend 已存在并被 ReaderViewModel import（LWW 骨架，实际 no-op）
+- **build-logic/** 4 个 convention plugin 已落地
+- 验证：`-Preadflow.phase=2 :app:assembleDebug` BUILD SUCCESSFUL；真机 OTA 安装验证通过
+- 影响范围：14 个 render/features 模块从空壳→实现 + app Phase 1/2 双 sourceSet；总计约 2000 行 Kotlin
+
+### OTA 更新系统迭代（13 个增量提交）
+- 手动 HTTP → DownloadManager（`9819723`）
+- POST_NOTIFICATIONS 权限 + 版本比较修正（`f3aa680`）
+- goAsync() 解决后台启动 Activity 限制（`66a4018`）
+- GitHub 私有仓库 Bearer token 认证（`4017054`/`a7f8373`/`b46def6`/`604d251`）
+- 权限引导 REQUEST_INSTALL_PACKAGES（`17e5bec`）
+- 设置页手动「检查更新」按钮（`35dfc2d`）
+- HTTP 错误不再静默吞掉（`149067c`/`d7ac74f`）
+- 应用内下载进度 + 自动拉起安装器 + 跳过重复下载（`a59bc83`/`049e45f`）
+
+### 功能增强（非 v4lite 原计划）
+- **6 项需求合包**（`a3c96f8`）：进度持久化完善、主题切换、封面展示、文件夹批量导入、拖拽排序建组、字体预览
+- **Dwell 悬停建组**（`1ad420c`）：长按悬停触发建组 + 根因修复
+- **Bundle 详情页 + 拖拽优化**（`c1b8c78`）：长按菜单计时修正、拖拽命中坐标修正、Bundle 堆叠视觉打磨
+
+### 构建/签名/CI
+- 签名：KEYSTORE_BASE64 环境变量（`2d8aa39`）、CI 固定 debug keystore（`1c4fb7a`/`e401896`）
+- 减包：material-icons-extended → core（`ec58bfd`）
+- 种子书「测试安装文本」（`3b7ba45`）、Seeder SharedPrefs 追踪（`a88b0da`）
+
+### Bug 修复
+- 边缘到边缘状态栏 + 顶栏导入/设置按钮（`a0ee647`）
+- SAF 文件名用 OpenableColumns.DISPLAY_NAME 解析（`7d21d0b`）
+- 旧 DownloadManager 记录清理（`3b7ba45`）
+
 ## 2026-06-19
 
 ## 2026-06-19

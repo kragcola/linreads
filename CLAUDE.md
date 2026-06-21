@@ -96,7 +96,7 @@ git add -A && git commit -m "feat: ..." && git push
 
 ## Workflow
 
-涉及 EPUB 渲染的改动：先读 `linreads-epub` SKILL → 检查 CFI 书签兼容性 → 改代码 → 在真实 EPUB 文件上验证（别只用合成数据）。
+涉及 EPUB 渲染的改动：先读 `linreads-epub` SKILL。**Web 端**：检查 CFI 书签兼容性。**Android 端**：无 CFI（v4 ADR-EPUB-Engine，定位用 spine+charOffset+progression），改代码后在真实 EPUB 文件上验证（别只用合成数据）。
 
 涉及进度同步的改动：先读 `linreads-sync` SKILL → 明确 LWW/Union 策略 → 离线优先（本地先写，后台同步）。
 

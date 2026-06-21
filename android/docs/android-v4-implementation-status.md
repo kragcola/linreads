@@ -1,8 +1,8 @@
 # LinReads Android v4 实现进度追踪
 
 > **文档目的**: 对照 `android-architecture-v4.md` 规划，逐条追踪实际实现状态。
-> **最后更新**: 2026-06-19
-> **当前 Phase**: 构建 Phase 1（基建期，书库浏览 + 本地导入 + 进度存储）
+> **最后更新**: 2026-06-21
+> **当前 Phase**: v4lite L1–L5 全部完成，Phase A 功能就绪，当前在体验打磨 + 性能测量阶段
 
 ---
 
@@ -10,9 +10,9 @@
 
 | Phase | 目标 | 状态 | 备注 |
 |-------|------|------|------|
-| **A 无账号本地阅读闭环** | 安装后直接打开本地书并继续阅读（落构建 Phase 2） | 🟡 **进行中** | 书架 ✅、本地导入 ✅、进度存储 ✅；阅读器 ⏳（Phase 2） |
-| **B Calibre 可选书源** | 连接流程短、失败可理解 | ⏳ **待做** | CalibreClient 基础就绪，待连接向导 UI |
-| **C 阅读质量闭环** | 主流格式稳定阅读、设置不打扰 | ⏳ **待做** | Phase 2 渲染引擎 |
+| **A 无账号本地阅读闭环** | 安装后直接打开本地书并继续阅读 | ✅ **功能就绪** | 书架+导入+阅读+进度+设置全链路通；性能/TalkBack 测量待补 |
+| **B Calibre 可选书源** | 连接流程短、失败可理解 | ⏳ **待做** | CalibreClient 基础就绪，设置可配 URL；待连接向导+搜索+下载 UI |
+| **C 阅读质量闭环** | 主流格式稳定阅读、设置不打扰 | 🟡 **进行中** | 四引擎已就绪；性能/TalkBack 测量待补 |
 | **D 数据出口与离线缓存** | 用户能控制自己的书和数据 | ⏳ **待做** | 导出/恢复机制待实现 |
 | **E 精品增强** | Ink/TTS/OPDS/Sync/DOCX/CBZ 逐个进入不污染基础体验 | ⏳ **待做** | Phase 3+ |
 
@@ -30,24 +30,24 @@
 |------|------|------|
 | `:core:calibre` | ✅ **完成** | `CalibreClient` 基础 HTTP 客户端，未连接 UI |
 | `:core:database` | ✅ **完成** | Room 5 表（books/reading_progress/bookmarks/text_annotations/ink_strokes）+ `LibraryRepository`，含 `observeShelf()` 分组逻辑 |
-| `:core:prefs` | ⏳ **待创建** | DataStore Preferences（baseUrl/字号/主题/deviceId/engineOverrides） |
-| `:core:sync` | ⏳ **待创建** | `SyncBackend` + `NoOpSyncBackend` + `SyncManager` |
+| `:core:prefs` | ✅ **完成** | `SettingsRepository`（DataStore），字号/主题/Calibre URL 持久化，被 ReaderViewModel/SettingsViewModel import |
+| `:core:sync` | ✅ **完成** | `SyncBackend` 接口 + `NoOpSyncBackend` + `SyncManager`（LWW 骨架，实际 no-op，被 ReaderViewModel import）|
 | `:extensions:api` | ✅ **完成** | `BookSource`/`Extension` SPI/`ReaderEventBus`/`LocalFileBookSource`/`FirstLaunchSeeder` |
 
 ### Layer 2 — 渲染抽象
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `:render:api` | ⏳ **待创建** | `ReaderEngine`/`EngineDescriptor`/`ReaderEngineRegistry`/`PageTransitionHost` 接口（Phase 2 前置） |
+| `:render:api` | ✅ **完成** | `ReaderEngine`(49行)/`EngineDescriptor`/`ReaderEngineRegistry`(46行)/`PageTransitionHost`(26行) 接口全部就位 |
 
 ### Layer 3 — 渲染实现
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `:render:epub` | ⏳ **待创建** | 原生重排（jsoup→AnnotatedString），无 WebView（Phase 2） |
-| `:render:pdf` | ⏳ **待创建** | PdfRenderer（Phase 2） |
-| `:render:txt` | ⏳ **待创建** | RecyclerView + TxtVirtualPager（Phase 2） |
-| `:render:md` | ⏳ **待创建** | Markwon Spannables（Phase 2） |
-| `:render:mupdf` | ⏳ **待创建** | DOCX/CBZ，optional（Phase 3） |
-| `:render:animate` | ⏳ **待创建** | `PageTransitionHost` 实现（Phase 2） |
+| `:render:epub` | ✅ **完成** | EpubReflowEngine(107行)+EpubParser+EpubParaAdapter；ZipFile+jsoup→RecyclerView 连续滚动（v4lite 基础，分页待 gate）|
+| `:render:pdf` | ✅ **完成** | PdfRendererEngine(107行)+PdfPageAdapter；逐页 ImageView+ViewPager2 分页 |
+| `:render:txt` | ✅ **完成** | TxtVirtualPagerEngine(128行)+TxtParagraphAdapter；RecyclerView 虚拟分页 |
+| `:render:md` | ✅ **完成** | MarkdownEngine(106行)；Markwon Spannables→RecyclerView |
+| `:render:mupdf` | ⏳ **待创建** | DOCX/CBZ，optional（Phase 3）；仅空壳 build.gradle.kts |
+| `:render:animate` | ✅ **完成** | NoTransitionHost + DefaultPageTransitionHostFactory |
 
 ### Layer 4 — Ink
 | 模块 | 状态 | 说明 |
@@ -62,9 +62,9 @@
 ### Layer 6 — 功能模块
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `:features:library` | ✅ **基础完成** | `LibraryScreen` + `LibraryViewModel`（真实数据流）；`onItemClick` 待连接 Navigation |
-| `:features:reader` | ⏳ **待创建** | `ReaderScreen` + `ReaderViewModel`（MVI）+ `ReaderRootLayout`（Phase 2） |
-| `:features:settings` | ⏳ **待创建** | Phase 2 |
+| `:features:library` | ✅ **完成** | `LibraryScreen` + `LibraryViewModel`（真实数据流、SAF picker、Dwell 建组、拖拽排序、文件夹导入、Bundle 详情页）|
+| `:features:reader` | ✅ **完成** | `ReaderScreen`(113行) + `ReaderViewModel`(165行 MVI) + `ReaderRootLayout`；进度 2s debounce→Room、字号/主题/chrome toggle |
+| `:features:settings` | ✅ **完成** | `SettingsScreen`(262行) + `SettingsViewModel`；Calibre URL/字号滑块/主题切换/OTA 手动检查更新+下载进度+自动安装 |
 
 ### Layer 7 — 扩展
 | 模块 | 状态 | 说明 |
@@ -76,7 +76,7 @@
 ### Layer 8 — 应用组装
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| `:app` | ✅ **Phase 1 就绪** | Koin DI + MainActivity + Navigation host（当前仅 LibraryScreen）；Phase 2 需补 reader 导航 |
+| `:app` | ✅ **v4lite 就绪** | Koin DI + MainActivity + Navigation host（Library→Reader→Settings 完整路由）+ Phase 1/2 双 sourceSet + OTA 更新集成 |
 
 ---
 
@@ -86,7 +86,7 @@
 | 项目 | 状态 | 说明 |
 |------|------|------|
 | `gradle/libs.versions.toml` | ✅ | 版本目录维护中 |
-| `build-logic/` convention plugins | ⏳ | 当前各模块直接配置；Phase 1 step 2 任务待收敛 |
+| `build-logic/` convention plugins | ✅ | 4 个 convention plugin：ReadflowJvmLibrary/ReadflowAndroidLibrary/ReadflowCompose/ReadflowFeature |
 | `settings.gradle.kts` 分阶段 include | ✅ | `readflow.phase` property 驱动，默认 phase=1 |
 | Phase 1 可编译闭环 | ✅ | `-Preadflow.phase=1 assembleDebug` 通过 |
 
@@ -95,10 +95,10 @@
 |------|------|---------|
 | `:core:model` 纯数据类型 | ✅ | `BookMeta.kt`（含 `LibraryItem`/`BookBundle`）、`Locator.kt`、`ReadflowError.kt`、`LoadingState.kt` |
 | `:core:calibre` 基础客户端 | ✅ | `CalibreClient.kt`（未连接 UI） |
-| `:core:prefs` SettingsRepository | ⏳ | 待创建（DataStore + engineOverrides/deviceId） |
+| `:core:prefs` SettingsRepository | ✅ | DataStore 持久化字号/主题/Calibre URL；被 ReaderViewModel/SettingsViewModel 使用 |
 | `:core:database` Room 5 表 | ✅ | `Entities.kt`、`Daos.kt`、`ReadflowDatabase.kt`（version=2） |
 | `LibraryRepository` | ✅ | `observeShelf()` 含分组逻辑（`collectionName` → `BookBundle`） |
-| `:core:sync` NoOpSyncBackend | ⏳ | 待创建 |
+| `:core:sync` NoOpSyncBackend | ✅ | SyncBackend 接口 + NoOpSyncBackend + SyncManager 就位；ReaderViewModel 已 import |
 
 ### 3.3 UI 层
 | 项目 | 状态 | 实现文件 |
@@ -117,7 +117,7 @@
 |------|------|------|
 | `LibraryScreen` | ✅ | `PaperSurface` + loading/error/empty/grid 条件渲染 |
 | `LibraryViewModel` | ✅ | 观察 `LibraryRepository.observeShelf()`，真实数据流 |
-| Navigation 连接 | 🟡 | `onItemClick()` 待实现（Phase 2 需 reader route） |
+| Navigation 连接 | ✅ | LibraryScreen → ReaderScreen → SettingsScreen 完整路由；onItemClick 已连接 |
 
 ### 3.5 本地导入与播种
 | 项目 | 状态 | 实现文件 |
@@ -134,10 +134,10 @@
 ### 4.1 设计原则（§1）
 | 原则 | 状态 | 说明 |
 |------|------|------|
-| 可插拔引擎 | ⏳ | `ReaderEngineRegistry` 待 Phase 2 实现 |
-| 混合视图（Hybrid View） | ⏳ | `ReaderRootLayout` 待 Phase 2 |
-| MVI 单向数据流 | ✅ | `LibraryViewModel` 已遵循；`ReaderViewModel` 待 Phase 2 |
-| 离线优先 | ✅ | Room 本地存储 + 2s debounce（架构预留，持久化逻辑待 Phase 2） |
+| 可插拔引擎 | ✅ | `ReaderEngineRegistry.resolve(uri)` 按扩展名自动选引擎，Koin multibind 注册 |
+| 混合视图（Hybrid View） | ✅ | `ReaderScreen` AndroidView 挂载引擎 View + Compose chrome overlay |
+| MVI 单向数据流 | ✅ | `LibraryViewModel`(StateFlow) + `ReaderViewModel`(MVI Intent→State) 全部遵循 |
+| 离线优先 | ✅ | Room 本地存储 + 进度 2s debounce→ReadingProgressEntity；SyncManager LWW 骨架 |
 | 依赖倒置 | ✅ | 当前已遵循（`:features:library` → `:core:database` 抽象） |
 | 用户轻量优先 | ✅ | Phase 1 无账号/网络/同步依赖 |
 | 可实现性优先 | ✅ | 模型全部可序列化，已验证编译通过 |
@@ -146,18 +146,18 @@
 | # | 裁决 | 状态 | 说明 |
 |---|------|------|------|
 | V1 | `ReadflowError` 纯数据 + `ReadflowException` 分层 | ✅ | `ReadflowError.kt` 已落地，`Kind` 枚举 + factory methods |
-| V2 | `ReaderEngine` 线程契约 | ⏳ | 接口设计已明确，待 Phase 2 实现 |
-| V3 | `EngineDescriptor` 懒加载 + Registry 线程安全 | ⏳ | Phase 2 |
-| V4 | `SyncBackend` 移出 Layer 0 至 `:core:sync` | ⏳ | 模块待创建 |
+| V2 | `ReaderEngine` 线程契约 | ✅ | `withContext(Dispatchers.IO)` 包裹 IO，Main 线程回调 |
+| V3 | `EngineDescriptor` 懒加载 + Registry 线程安全 | ✅ | Koin multibind 懒加载，resolve() 按扩展名匹配 |
+| V4 | `SyncBackend` 移出 Layer 0 至 `:core:sync` | ✅ | `:core:sync` 模块就位，SyncManager+NoOpSyncBackend |
 | V5 | Koin multibind 统一扩展发现 | ✅ | `FirstLaunchSeeder` 已用 Koin 注入 |
-| V6 | `PageTransitionHost` 拆分 | ⏳ | Phase 2 接口设计 |
+| V6 | `PageTransitionHost` 拆分 | ✅ | `PageTransitionHost` 接口 + `NoTransitionHost` + `DefaultPageTransitionHostFactory` + paged/continuous 工厂方法 |
 | V7 | `BookSource.download()` 返回 `DownloadedAsset` | ✅ | `LocalFileBookSource.import()` 已遵循 |
 | V8 | MuPDF optional | ⏳ | Phase 3 |
-| V9 | EPUB 去 WebView 删 nanohttpd | ⏳ | Phase 2 原生重排 |
-| V10 | TXT 字符边界对齐 | ⏳ | Phase 2 |
+| V9 | EPUB 去 WebView 删 nanohttpd | ✅ | EpubReflowEngine 纯原生 RecyclerView，无 WebView/JS/CFI/nanohttpd |
+| V10 | TXT 字符边界对齐 | ✅ | TxtVirtualPagerEngine Paging3 + ByteOffset locator |
 | V11 | 用户轻量契约为 P0 gate | ✅ | Phase A 进行中 |
 | V12 | 文档不硬编码版本 | ✅ | 以 `libs.versions.toml` 为准 |
-| E1 | EPUB 原生重排（jsoup→AnnotatedString） | ⏳ | Phase 2 核心任务 |
+| E1 | EPUB 原生重排（jsoup→AnnotatedString） | ✅ | EpubReflowEngine + EpubParser（jsoup）+ EpubParaAdapter；连续滚动基础就位 |
 | E2 | `Locator` 增 `totalProgression` 同步主键 | ✅ | `Locator.kt` 已落地 |
 | E3 | 可选兼容 KOSync | ⏳ | Phase 3 |
 
@@ -166,38 +166,41 @@
 |------|------|------|
 | `Locator` 带 payload 的 `LocatorStrategy` | ✅ | `Section`/`Page`/`ByteOffset`/`Unknown` sealed interface |
 | `ReaderState` 真正可序列化 | ✅ | 全部字段可 `@Serializable` |
-| 进程死亡恢复链（两层） | ⏳ | `SavedStateHandle` 机制待 Phase 2 `ReaderViewModel` 验证 |
-| `EngineStateStore` | ⏳ | 接口定义待 `:render:api`，实现在 `:app` |
+| 进程死亡恢复链（两层） | 🟡 | `ReaderViewModel` close() 强制保存进度；SavedStateHandle + EngineStateStore 正式两层机制待验证 |
+| `EngineStateStore` | 🟡 | 加速缓存仓库接口待定义（`:render:api`），当前 close() 直接写 Room 作为兜底 |
 | Room 5 表 + 索引 | ✅ | `books`/`reading_progress`/`bookmarks`/`text_annotations`/`ink_strokes` |
 | 同步元数据（`updatedAt`/`deviceId`） | ✅ | `Bookmark`/`ReadingProgress` 已含字段 |
-| `deviceId` 生成与持久化 | ⏳ | 待 `:core:prefs` 实现 |
-| `totalProgression` 三端统一口径 | ✅ | 规范已定义（§7.1 F3），实现待 Phase 2 EPUB 引擎 |
+| `deviceId` 生成与持久化 | 🟡 | 当前硬编码 "local"；正式 UUID 生成+持久化待 `:core:prefs` 补全 |
+| `totalProgression` 三端统一口径 | 🟡 | 规范已定义（§7.1 F3）；EpubReflowEngine 用 para count 近似，全书预扫待实现 |
 
 ---
 
 ## 五、待办事项（按优先级）
 
-### P0 — Phase 1 收尾
-- [ ] **创建 `:core:prefs` 模块**：DataStore Preferences（baseUrl/字号/主题/deviceId/engineOverrides）
-- [ ] **创建 `:core:sync` 模块**：`SyncBackend` 接口 + `NoOpSyncBackend` 实现
-- [ ] **`build-logic/` convention plugins**：收敛重复的 `build.gradle.kts` 配置
-- [ ] **`LibraryViewModel.onItemClick()` 占位实现**：Phase 1 可先 Toast 提示「Phase 2 将打开阅读器」
-- [ ] **`EmptyState` 按钮连接**：`onConnectCalibre` 导航到设置（Phase 2 Settings）；`onImportLocal` 触发 SAF picker
+### P0 — Phase A 收尾（性能+无障碍测量）
+- [x] **创建 `:core:prefs` 模块**：DataStore Preferences（字号/主题/Calibre URL）
+- [x] **创建 `:core:sync` 模块**：`SyncBackend` 接口 + `NoOpSyncBackend` + SyncManager
+- [x] **`build-logic/` convention plugins**：4 个 convention plugin 已落地
+- [x] **`LibraryViewModel.onItemClick()`**：已连接 ReaderScreen 导航
+- [x] **`EmptyState` 按钮连接**：Connect Calibre → Settings；Import Local → SAF picker
+- [ ] **性能测量**：冷启动 < 2s / 1MB TXT首开 < 500ms / EPUB首章 < 1s / 翻页 < 50ms / 内存 < 200MB PSS
+- [ ] **TalkBack smoke test**：ReaderScreen chrome 元素 contentDescription、书架卡片无障碍访问
 
-### P1 — Phase 2 准备（阅读器核心）
-- [ ] **创建 `:render:api` 模块**：`ReaderEngine`/`EngineDescriptor`/`ReaderEngineRegistry`/`PageTransitionHost` 接口
-- [ ] **创建 `:render:epub` 模块**：jsoup 解析 + `ReaderItem` + AnnotatedString 渲染（连续滚动优先）
-- [ ] **创建 `:render:pdf` 模块**：PdfRenderer + ImageView
-- [ ] **创建 `:render:txt` 模块**：RecyclerView + TxtVirtualPager + 字符边界对齐
-- [ ] **创建 `:render:md` 模块**：Markwon Spannables
-- [ ] **创建 `:render:animate` 模块**：`SlideFadeTransitionHost` + `NoTransitionHost`
-- [ ] **创建 `:features:reader` 模块**：`ReaderScreen` + `ReaderViewModel`(MVI) + `ReaderRootLayout`（Hybrid View）
-- [ ] **创建 `:features:settings` 模块**：Settings UI + Calibre 连接向导
-- [ ] **Navigation 连接**：LibraryScreen → ReaderScreen 路由
+### P1 — 阅读器核心（✅ 已完成）
+- [x] **创建 `:render:api` 模块**：`ReaderEngine`/`EngineDescriptor`/`ReaderEngineRegistry`/`PageTransitionHost` 接口
+- [x] **创建 `:render:epub` 模块**：jsoup 解析 + EpubPara + RecyclerView 连续滚动
+- [x] **创建 `:render:pdf` 模块**：PdfRenderer + ImageView + ViewPager2 分页
+- [x] **创建 `:render:txt` 模块**：RecyclerView + TxtVirtualPager + 字符边界对齐
+- [x] **创建 `:render:md` 模块**：Markwon Spannables
+- [x] **创建 `:render:animate` 模块**：NoTransitionHost + DefaultPageTransitionHostFactory
+- [x] **创建 `:features:reader` 模块**：ReaderScreen + ReaderViewModel(MVI) + ReaderRootLayout（Hybrid View）
+- [x] **创建 `:features:settings` 模块**：Settings UI + Calibre URL + 字号/主题 + OTA 更新
+- [x] **Navigation 连接**：LibraryScreen → ReaderScreen 路由
 
-### P2 — Phase 2 增强
-- [ ] **`totalProgression` 计算实现**：EPUB 引擎预扫全书纯文本字符数（§7.1 F3）
-- [ ] **进程死亡恢复验证**：`SavedStateHandle` + `EngineStateStore` 往返测试
+### P2 — v4lite 待补（Phase A 收尾）
+- [ ] **`totalProgression` 计算实现**：EPUB 引擎预扫全书纯文本字符数（§7.1 F3，当前用 para count 近似）
+- [ ] **EPUB 分页模式**：ViewPager2 per-page ComposeView（v4 最高技术风险，独立 gate）
+- [ ] **进程死亡恢复验证**：`SavedStateHandle` + `EngineStateStore` 往返测试（当前 close() 强制写 Room 兜底）
 - [ ] **TalkBack smoke test**：无障碍基础验证（§12.7）
 - [ ] **性能预算测量**：冷启动/首屏/翻页/内存峰值（§12.8）
 
@@ -211,58 +214,68 @@
 
 ## 六、当前 APK 状态
 
-### Phase 1 构建
+### v4lite 构建
 | 指标 | 当前值 | 目标 | 状态 |
 |------|--------|------|------|
 | 最低 SDK | 26 (Android 8.0) | — | ✅ |
 | 目标 SDK | 36 (Android 14+) | — | ✅ |
-| base APK 大小 | ~8MB (估) | < 25MB | ✅ |
-| 包含渲染引擎 | 无 | Phase 2 加入 | — |
-| 功能 | 书架浏览 + 本地导入 + 进度存储 | Phase 1 范围 | ✅ |
+| base APK 大小 | ~10MB (估) | < 25MB | ✅ |
+| 包含渲染引擎 | TXT+EPUB+PDF+MD 四引擎 | v4lite 范围 | ✅ |
+| 功能 | 书架+导入+阅读+设置+OTA | Phase A 范围 | ✅ |
 
 ### 已验证功能
-- ✅ 首次启动自动播种 3 本示例书（`assets/sample_books/`）
-- ✅ 书架网格显示：封面 + 书名 + 作者 + 进度条 + 书签（有阅读进度时）
+- ✅ 首次启动自动播种示例书（assets/sample_books/）
+- ✅ 书架网格显示：封面 + 书名 + 作者 + 进度条 + 书签
 - ✅ 纸质感背景 + 木质隔板沿
-- ✅ 空书架状态（EmptyState）
-- ✅ Material3 暗色/亮色主题切换
-- ✅ Room 数据库迁移（v1 → v2，增 `collectionName` 字段）
+- ✅ 空书架状态 + 导入按钮
+- ✅ SAF 本地文件导入（单文件 + 文件夹批量）
+- ✅ TXT/EPUB/PDF/MD 四格式阅读
+- ✅ 字号调整（12-28sp slider）
+- ✅ 主题切换（白/暗/护眼/系统）
+- ✅ 阅读进度持久化（Room，2s debounce）
+- ✅ 关闭重开进度恢复
+- ✅ Settings 完整 UI（Calibre URL / 字号 / 主题 / OTA 检查更新）
+- ✅ OTA 更新系统（检查→DownloadManager→进度条→自动安装）
+- ✅ 真机 OTA 安装验证通过
+- ✅ Room 数据库迁移（v1→v2）
 
-### 未验证功能（Phase 1 范围内）
-- ⏳ Calibre 连接（CalibreClient 就绪，UI 未连接）
-- ⏳ SAF 本地文件导入（LocalFileBookSource 就绪，UI picker 未触发）
-- ⏳ 点击书籍进入阅读（Phase 2 ReaderScreen 未创建）
-- ⏳ 设置界面（Phase 2）
+### 未验证/待补
+- ⏳ Calibre 连接端到端（CalibreClient 就绪，设置 URL 可持久化，但未在真机上连真实 Calibre 服务器验证）
+- ⏳ 性能测量（冷启动/首屏/翻页/内存）
+- ⏳ TalkBack 无障碍 smoke test
+- ⏳ EPUB 分页模式（当前仅连续滚动）
 
 ---
 
 ## 七、已知问题
 
-1. **`build-logic/` 未创建**（§10.2）：当前各模块直接在 `build.gradle.kts` 重复配置，待收敛为 convention plugins。
-2. **Navigation 未完整连接**：`LibraryViewModel.onItemClick()` 为 TODO 占位，Phase 2 需补 reader route。
-3. **`:core:prefs` 缺失**：baseUrl/字号/主题/deviceId 持久化逻辑待实现。
+1. **EPUB 仅连续滚动**：分页模式（ViewPager2 per-page ComposeView）为 v4 最高风险项，独立 gate，不绑定基础阅读链路。
+2. **totalProgression 近似**：EPUB 引擎用 para count 近似全书进度，精确预扫待实现（v4 §7.1）。
+3. **deviceId 硬编码**：当前为 "local"，正式 UUID 生成待 `:core:prefs` 补全。
 4. **adb 命令不可用**：当前环境中 `adb` 未配置到 PATH，需通过完整路径调用或配置环境变量。
+5. **mupdf/ink 空壳**：`:render:mupdf` 和 `:ink` 仅 build.gradle.kts，Phase 3 实装。
 
 ---
 
 ## 八、下一步行动
 
-### 立即可做（Phase 1 收尾）
-1. **创建 `:core:prefs` 和 `:core:sync` 模块**，完成 Phase 1 模块闭环。
-2. **实现 `LibraryViewModel.onItemClick()` 占位逻辑**（如 Toast 或 Log），避免点击无反馈。
-3. **修正网格列数验证**：确认不同屏幕密度下的列数符合设计预期（手机 2-3 列，平板更多）。
+### 立即可做（Phase A 收尾）
+1. **性能测量**：冷启动/首屏/翻页/内存峰值正式测量并记录。
+2. **TalkBack smoke test**：ReaderScreen chrome 元素无障碍标签验证。
+3. **Calibre 端到端验证**：真机上连真实 Calibre 服务器测试搜索和下载。
 
-### Phase 2 启动条件
-- [ ] Phase 1 所有模块（9 个）编译通过且功能验证完成
-- [ ] `:render:api` 接口设计评审通过
-- [ ] 至少一种格式引擎（TXT 或 PDF）实现完成
+### 下一阶段启动条件（Phase B+）
+- [ ] Phase A 性能 + TalkBack 测量完成
+- [ ] EPUB 分页模式 gate 决策（做/不做/推迟）
+- [ ] Calibre 书源接入（连接向导→搜索→下载→阅读）
 
 ### 验收标准（Phase A：无账号本地阅读闭环）
-- [ ] 用户能从设备/文件管理器分享文件到 Readflow
-- [ ] 导入的书显示在书架上
-- [ ] 点击书籍进入阅读器（Phase 2）
-- [ ] 阅读进度本地保存并在重启后恢复
-- [ ] 无需 Calibre/账号/网络即可完成上述流程
+- [x] 用户能从设备/文件管理器分享文件到 Readflow
+- [x] 导入的书显示在书架上
+- [x] 点击书籍进入阅读器
+- [x] 阅读进度本地保存并在重启后恢复
+- [x] 无需 Calibre/账号/网络即可完成上述流程
+- [ ] 性能测量和 TalkBack 验证
 
 ---
 

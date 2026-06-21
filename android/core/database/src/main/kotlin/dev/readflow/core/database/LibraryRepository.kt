@@ -19,6 +19,7 @@ class LibraryRepository(private val bookDao: BookDao) {
     suspend fun deleteBook(id: String) = bookDao.deleteById(id)
     suspend fun renameBook(id: String, title: String) = bookDao.updateTitle(id, title)
     suspend fun setCollection(id: String, name: String?) = bookDao.updateCollectionName(id, name)
+    suspend fun ungroupBundle(name: String) = bookDao.clearCollection(name)
     suspend fun updateSortOrder(id: String, order: Int) = bookDao.updateSortOrder(id, order)
 
     private fun groupIntoItems(books: List<BookMeta>): List<LibraryItem> {

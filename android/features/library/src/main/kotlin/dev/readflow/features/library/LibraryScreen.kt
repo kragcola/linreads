@@ -120,6 +120,7 @@ fun LibraryScreen(
                         onRename = viewModel::renameBook,
                         onMoveToGroup = viewModel::moveToGroup,
                         onReorder = viewModel::reorder,
+                        onUngroup = viewModel::ungroupBundle,
                     )
                 }
             }

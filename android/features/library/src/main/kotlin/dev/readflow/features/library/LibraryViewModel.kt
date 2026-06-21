@@ -143,6 +143,10 @@ class LibraryViewModel(
         viewModelScope.launch { repository.setCollection(bookId, null) }
     }
 
+    fun ungroupBundle(name: String) {
+        viewModelScope.launch { repository.ungroupBundle(name) }
+    }
+
     fun refreshFromCalibre(baseUrl: String) {
         viewModelScope.launch {
             val calibreRepo = CalibreRepositoryImpl(CalibreClient(baseUrl))
