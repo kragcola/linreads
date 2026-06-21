@@ -55,8 +55,8 @@ class GitHubUpdateChecker(
                 ?: throw IOException("release has no APK asset")
         } catch (e: IOException) {
             throw e   // propagate — caller's runCatching will surface it
-        } catch (_: Exception) {
-            null      // JSON/parse error: treat as no update (don't crash)
+        } catch (e: Exception) {
+            throw IOException("update check failed: ${e.message}", e)
         } finally {
             conn.disconnect()
         }

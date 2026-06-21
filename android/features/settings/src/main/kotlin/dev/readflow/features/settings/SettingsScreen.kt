@@ -109,6 +109,13 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
+            // 诊断：显示当前 BUILD_TAG
+            Text(
+                text = "构建标识：${dev.readflow.BuildConfig.BUILD_TAG}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+            )
+
             when (val s = updateState) {
                 UpdateState.Idle -> Button(onClick = {
                     scope.launch {
