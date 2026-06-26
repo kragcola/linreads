@@ -16,6 +16,7 @@ internal data class EpubPageSlice(
     val links: List<EpubTextLink> = emptyList(),
     val textSegments: List<EpubPageTextSegment> = emptyList(),
     val endParagraphIndex: Int = paragraphIndex,
+    val visualLineCount: Int = 1,
 )
 
 internal data class EpubPageTextSegment(
@@ -25,6 +26,7 @@ internal data class EpubPageTextSegment(
     val text: String,
     val textStyle: EpubPageTextStyle = EpubPageTextStyle(),
     val links: List<EpubTextLink> = emptyList(),
+    val visualLineCount: Int = 1,
 )
 
 internal enum class EpubPageMeasurement {
@@ -256,6 +258,7 @@ internal fun epubMeasuredPagedLayout(
                         textStyle = textStyle,
                         measurement = measurement,
                         links = links.pageLocalLinks(startOffset, endOffset),
+                        visualLineCount = lineEnd - lineStart + 1,
                     ),
                 )
                 lineStart = lineEnd + 1
@@ -301,8 +304,12 @@ private fun packAdjacentShortTextPages(
             return@forEach
         }
         val pageLines = page.lineCount().coerceAtLeast(1)
-        if (pendingPages.isNotEmpty() && usedLines + pageLines > linesPerPage) {
+        val separatorLines = if (pendingPages.isEmpty()) 0 else 1
+        if (pendingPages.isNotEmpty() && usedLines + separatorLines + pageLines > linesPerPage) {
             flushPages()
+        }
+        if (pendingPages.isNotEmpty()) {
+            usedLines += separatorLines
         }
         pendingPages += page
         usedLines += pageLines
@@ -327,6 +334,7 @@ private fun EpubPageSlice.toTextSegment(textProvider: (Int) -> String): EpubPage
         text = text.substring(start, end),
         textStyle = textStyle,
         links = links,
+        visualLineCount = lineCount(),
     )
 }
 
@@ -345,15 +353,16 @@ private fun pageSliceForSegments(
         links = first.links,
         textSegments = segments,
         endParagraphIndex = last.paragraphIndex,
+        visualLineCount = (segments.sumOf { it.visualLineCount } + (segments.size - 1)).coerceAtLeast(1),
     )
 }
 
 private fun EpubPageSlice.lineCount(): Int =
     if (textSegments.isEmpty()) {
-        1
+        visualLineCount.coerceAtLeast(1)
     } else {
         textSegments.sumOf { segment ->
-            segment.text.count { it == '\n' } + 1
+            segment.visualLineCount.coerceAtLeast(1)
         }.coerceAtLeast(1)
     }
 

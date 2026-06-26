@@ -403,8 +403,8 @@ class EpubPageMappingTest {
 
         assertEquals(
             listOf(
-                EpubPageSlice(paragraphIndex = 0, startOffset = 0, endOffset = 31),
-                EpubPageSlice(paragraphIndex = 0, startOffset = 31, endOffset = 47),
+                EpubPageSlice(paragraphIndex = 0, startOffset = 0, endOffset = 31, visualLineCount = 3),
+                EpubPageSlice(paragraphIndex = 0, startOffset = 31, endOffset = 47, visualLineCount = 2),
             ),
             pages,
         )
@@ -447,6 +447,71 @@ class EpubPageMappingTest {
         assertEquals(EpubPageSliceKind.Text, pages.single().kind)
         assertEquals(0, pages.single().paragraphIndex)
         assertEquals(2, pages.single().endParagraphIndex)
+    }
+
+    @Test
+    fun `block paged layout does not pack measured text beyond line capacity`() {
+        val first = "First paragraph wraps to two visual lines."
+        val second = "Second paragraph also wraps to two visual lines."
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(first, second)))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(first, headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Text(second, headingLevel = null, paragraphIndex = 1),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 72,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ ->
+                listOf(0 to text.length / 2, text.length / 2 to text.length)
+            },
+        )
+
+        assertEquals(2, pages.size)
+        assertEquals(0, pages[0].paragraphIndex)
+        assertEquals(0, pages[0].endParagraphIndex)
+        assertEquals(1, pages[1].paragraphIndex)
+    }
+
+    @Test
+    fun `block paged layout counts paragraph separator lines while packing short text`() {
+        val paras = epubParasWithCharacterOffsets(listOf(listOf("One.", "Two.", "Three.")))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text("One.", headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Text("Two.", headingLevel = null, paragraphIndex = 1),
+                    EpubDisplayBlock.Text("Three.", headingLevel = null, paragraphIndex = 2),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 72,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        assertEquals(2, pages.size)
+        assertEquals(0, pages[0].paragraphIndex)
+        assertEquals(1, pages[0].endParagraphIndex)
+        assertEquals(2, pages[1].paragraphIndex)
     }
 
     @Test
@@ -671,12 +736,14 @@ class EpubPageMappingTest {
                     startOffset = 0,
                     endOffset = 20,
                     measurement = EpubPageMeasurement.ComposeTextLayoutResult,
+                    visualLineCount = 2,
                 ),
                 EpubPageSlice(
                     paragraphIndex = 0,
                     startOffset = 20,
                     endOffset = text.length,
                     measurement = EpubPageMeasurement.ComposeTextLayoutResult,
+                    visualLineCount = 2,
                 ),
             ),
             pages,

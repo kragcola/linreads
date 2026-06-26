@@ -236,6 +236,80 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `paged runtime packs dialogue micro paragraphs without one sentence pages`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val lines = listOf(
+            "“醒了吗？”",
+            "“嗯。”",
+            "窗外雨声很轻。",
+            "她把灯按暗。",
+            "“再睡一会儿。”",
+            "“好。”",
+        )
+        val epub = tempDir.newFile("dialogue-micro-paragraphs.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to lines.joinToString(
+                prefix = "<html><body>",
+                separator = "",
+                postfix = "</body></html>",
+            ) { line -> "<p>$line</p>" },
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        val slice = findTaggedSlice(page)
+
+        assertEquals(1, engine.pageCount.value)
+        assertEquals(0, slice?.paragraphIndex)
+        assertEquals(lines.lastIndex, slice?.endParagraphIndex)
+        assertEquals(lines.joinToString(separator = "\n\n"), page.getTag(R.id.epub_compose_text_surface))
+    }
+
+    @Test
+    fun `paged runtime keeps linked text isolated while packing following plain paragraphs`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("linked-paragraph-isolated-from-packed-plain-text.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p><a href="https://example.com/note">Tap note</a></p>
+                  <p>Plain follow.</p>
+                  <p>Plain tail.</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val linkedPage = engine.createPageView(0)
+        val plainPage = engine.createPageView(1)
+        @Suppress("UNCHECKED_CAST")
+        val links = linkedPage.getTag(R.id.epub_compose_text_links) as? List<EpubTextLink>
+
+        assertEquals(2, engine.pageCount.value)
+        assertEquals("Tap note", linkedPage.getTag(R.id.epub_compose_text_surface))
+        assertTrue(links.orEmpty().isNotEmpty())
+        assertEquals("Plain follow.\n\nPlain tail.", plainPage.getTag(R.id.epub_compose_text_surface))
+    }
+
+    @Test
     fun `paged runtime makes compose text visible while selection overlay stays non visual`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val text = "Visible Compose EPUB paged text."
