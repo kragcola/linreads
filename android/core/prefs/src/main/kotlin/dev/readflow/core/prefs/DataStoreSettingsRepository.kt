@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
@@ -28,6 +29,12 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
 
     override val lineSpacing: Flow<Float> =
         context.dataStore.data.map { it[KEY_LINE_SPACING] ?: 1.75f }
+
+    override val readingMode: Flow<ReaderReadingMode> =
+        context.dataStore.data.map {
+            runCatching { ReaderReadingMode.valueOf(it[KEY_READING_MODE] ?: "") }
+                .getOrDefault(ReaderReadingMode.SCROLL)
+        }
 
     override val themeMode: Flow<ThemeMode> =
         context.dataStore.data.map {
@@ -50,6 +57,10 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
 
     override suspend fun setLineSpacing(multiplier: Float) {
         context.dataStore.edit { it[KEY_LINE_SPACING] = multiplier }
+    }
+
+    override suspend fun setReadingMode(mode: ReaderReadingMode) {
+        context.dataStore.edit { it[KEY_READING_MODE] = mode.name }
     }
 
     override suspend fun setThemeMode(mode: ThemeMode) {
@@ -76,6 +87,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_CALIBRE_URL = stringPreferencesKey("calibre_url")
         val KEY_FONT_SIZE = intPreferencesKey("font_size")
         val KEY_LINE_SPACING = floatPreferencesKey("line_spacing")
+        val KEY_READING_MODE = stringPreferencesKey("reading_mode")
         val KEY_THEME = stringPreferencesKey("theme_mode")
         val KEY_DEVICE_ID = stringPreferencesKey("device_id")
     }

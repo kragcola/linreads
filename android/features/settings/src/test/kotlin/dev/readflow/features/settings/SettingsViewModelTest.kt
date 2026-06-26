@@ -13,6 +13,7 @@ import dev.readflow.core.database.LinReadsBackupExportStore
 import dev.readflow.core.database.LinReadsBackupRestoreResult
 import dev.readflow.core.database.LinReadsBackupRestoreStore
 import dev.readflow.core.model.Bookmark
+import dev.readflow.core.model.ReaderReadingMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -315,6 +316,7 @@ class SettingsViewModelTest {
         override val calibreBaseUrl = MutableStateFlow<String?>(null)
         override val fontSize = MutableStateFlow(18)
         override val lineSpacing = MutableStateFlow(1.75f)
+        override val readingMode = MutableStateFlow(ReaderReadingMode.SCROLL)
         override val themeMode = MutableStateFlow(ThemeMode.SYSTEM)
         override val deviceId = MutableStateFlow("device")
         override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
@@ -331,6 +333,10 @@ class SettingsViewModelTest {
 
         override suspend fun setLineSpacing(multiplier: Float) {
             lineSpacing.value = multiplier
+        }
+
+        override suspend fun setReadingMode(mode: ReaderReadingMode) {
+            readingMode.value = mode
         }
 
         override suspend fun setThemeMode(mode: ThemeMode) {

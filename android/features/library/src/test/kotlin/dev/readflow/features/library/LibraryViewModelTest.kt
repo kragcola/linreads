@@ -8,6 +8,7 @@ import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
 import dev.readflow.core.model.ReadflowResult
+import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.extensions.api.LocalBookImporter
@@ -182,6 +183,7 @@ class LibraryViewModelTest {
         override val calibreBaseUrl = MutableStateFlow<String?>("http://192.168.1.5:8080")
         override val fontSize = MutableStateFlow(18)
         override val lineSpacing = MutableStateFlow(1.75f)
+        override val readingMode = MutableStateFlow(ReaderReadingMode.SCROLL)
         override val themeMode = MutableStateFlow(ThemeMode.SYSTEM)
         override val deviceId = MutableStateFlow("device")
         override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
@@ -190,6 +192,7 @@ class LibraryViewModelTest {
         }
         override suspend fun setFontSize(size: Int) = Unit
         override suspend fun setLineSpacing(multiplier: Float) = Unit
+        override suspend fun setReadingMode(mode: ReaderReadingMode) = Unit
         override suspend fun setThemeMode(mode: ThemeMode) = Unit
         override suspend fun setEngineOverride(format: BookFormat, engineId: String?) = Unit
     }

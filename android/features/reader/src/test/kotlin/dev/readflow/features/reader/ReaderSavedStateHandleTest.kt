@@ -19,6 +19,7 @@ import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.ReaderState
+import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
@@ -102,6 +103,54 @@ class ReaderSavedStateHandleTest {
         assertEquals(ThemeMode.DARK, saved.theme)
         assertEquals(true, saved.isUiVisible)
         assertEquals(LoadingState.Loaded, saved.loadingState)
+    }
+
+    @Test
+    fun `persists and restores paged reading mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val handle = SavedStateHandle()
+        val settings = FakeSettingsRepository()
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(handle = handle, engine = engine, settings = settings)
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.SetMode(ReadingMode.PAGED))
+        advanceUntilIdle()
+
+        val json = handle.get<String>(READER_STATE_SAVED_STATE_KEY)
+        assertNotNull(json)
+        val saved = Json.decodeFromString<ReaderState>(json!!)
+        assertEquals(ReaderReadingMode.PAGED, saved.readingMode)
+        assertEquals(ReaderReadingMode.PAGED, settings.readingMode.value)
+
+        val reopenedEngine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val reopened = readerViewModel(handle = handle, engine = reopenedEngine, settings = settings)
+        reopened.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        assertEquals(ReadingMode.PAGED, reopened.uiState.value.readingMode)
+        assertEquals(PagingKind.PAGED, reopenedEngine.pagingKind.value)
+    }
+
+    @Test
+    fun `restores paged reading mode from settings after destination is recreated`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            readingMode.value = ReaderReadingMode.PAGED
+        }
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        assertEquals(ReadingMode.PAGED, viewModel.uiState.value.readingMode)
+        assertEquals(PagingKind.PAGED, engine.pagingKind.value)
     }
 
     @Test
@@ -329,6 +378,7 @@ class ReaderSavedStateHandleTest {
         progressDao: FakeProgressDao = FakeProgressDao(),
         syncManager: SyncManager = SyncManager(NoOpSyncBackend()),
         textAnnotationDao: TextAnnotationDao = FakeTextAnnotationDao(),
+        settings: FakeSettingsRepository = FakeSettingsRepository(),
     ): ReaderViewModel =
         ReaderViewModel(
             savedStateHandle = handle,
@@ -359,7 +409,7 @@ class ReaderSavedStateHandleTest {
             bookmarkDao = FakeBookmarkDao(),
             textAnnotationDao = textAnnotationDao,
             syncManager = syncManager,
-            settings = FakeSettingsRepository(),
+            settings = settings,
             engineStateStore = engineStateStore,
         )
 
@@ -572,6 +622,7 @@ class ReaderSavedStateHandleTest {
         override val calibreBaseUrl = MutableStateFlow<String?>(null)
         override val fontSize = MutableStateFlow(16)
         override val lineSpacing = MutableStateFlow(1.75f)
+        override val readingMode = MutableStateFlow(ReaderReadingMode.SCROLL)
         override val themeMode = MutableStateFlow(ThemeMode.LIGHT)
         override val deviceId = MutableStateFlow("device-id")
         override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
@@ -584,6 +635,9 @@ class ReaderSavedStateHandleTest {
         }
         override suspend fun setLineSpacing(multiplier: Float) {
             lineSpacing.value = multiplier
+        }
+        override suspend fun setReadingMode(mode: ReaderReadingMode) {
+            readingMode.value = mode
         }
         override suspend fun setThemeMode(mode: ThemeMode) {
             themeMode.value = mode

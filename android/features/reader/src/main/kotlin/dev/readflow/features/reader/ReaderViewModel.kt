@@ -12,6 +12,7 @@ import dev.readflow.core.database.TextAnnotationDao
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.ReaderState
+import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ThemeMode
@@ -118,6 +119,7 @@ class ReaderViewModel(
     }
 
     private fun openById(bookId: String) {
+        val restoredForBook = restoredReaderState?.takeIf { it.bookId == bookId }
         _uiState.update { it.copy(loadingState = LoadingState.Loading) }
         currentBookId = bookId
         persistReaderState(bookId = bookId, loadingState = LoadingState.Loading)
@@ -136,13 +138,17 @@ class ReaderViewModel(
                 persistReaderState(bookId = bookId, loadingState = LoadingState.Error(error), error = error)
                 return@launch
             }
-            openByUri(bookId, uri, book.title)
+            openByUri(bookId, uri, book.title, restoredForBook)
         }
     }
 
-    private fun openByUri(bookId: String?, uri: Uri, title: String = "") {
+    private fun openByUri(
+        bookId: String?,
+        uri: Uri,
+        title: String = "",
+        restoredForBook: ReaderState? = restoredReaderState?.takeIf { it.bookId == bookId },
+    ) {
         viewModelScope.launch {
-            val restoredForBook = restoredReaderState?.takeIf { it.bookId == bookId }
             val engine = runCatching { engineRegistry.resolve(uri) }.getOrElse { error ->
                 val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
                 _uiState.update { it.copy(loadingState = LoadingState.Error(readflowError), bookTitle = title) }
@@ -166,6 +172,11 @@ class ReaderViewModel(
             engine.setFontSize(savedFontSize)
             engine.setLineSpacing(savedLineSpacing)
             engine.setTheme(savedTheme)
+            val savedReadingMode = (restoredForBook?.readingMode ?: settings.readingMode.first()).toReadingMode()
+                ?.takeIf { it in engine.supportedModes }
+            savedReadingMode?.let { mode ->
+                runCatching { engine.setMode(mode) }
+            }
             val restoredLocator = restoredForBook?.currentLocator
             val persistedLocator = bookId?.let { id ->
                 progressDao.get(id)?.let { saved ->
@@ -505,6 +516,7 @@ class ReaderViewModel(
         if (mode !in engine.supportedModes) return
         viewModelScope.launch {
             engine.setMode(mode)
+            settings.setReadingMode(mode.toReaderReadingMode())
             _uiState.update {
                 it.copy(
                     readingMode = engine.pagingKind.value.toReadingMode(),
@@ -576,6 +588,7 @@ class ReaderViewModel(
             loadingState = loadingState,
             currentLocator = currentLocator,
             fontSize = state.fontSizeSp.toInt(),
+            readingMode = state.readingMode.toReaderReadingMode(),
             theme = state.themeMode,
             isUiVisible = state.isUiVisible,
             error = error,
@@ -655,8 +668,19 @@ private fun ReaderState?.toReaderUiState(): ReaderUiState {
         },
         bookTitle = restored.bookMeta?.title.orEmpty(),
         fontSizeSp = restored.fontSize.toFloat(),
+        readingMode = restored.readingMode.toReadingMode(),
         themeMode = restored.theme,
         isUiVisible = restored.isUiVisible,
         canBookmark = true,
     )
+}
+
+private fun ReaderReadingMode.toReadingMode(): ReadingMode = when (this) {
+    ReaderReadingMode.SCROLL -> ReadingMode.SCROLL
+    ReaderReadingMode.PAGED -> ReadingMode.PAGED
+}
+
+private fun ReadingMode.toReaderReadingMode(): ReaderReadingMode = when (this) {
+    ReadingMode.SCROLL -> ReaderReadingMode.SCROLL
+    ReadingMode.PAGED -> ReaderReadingMode.PAGED
 }

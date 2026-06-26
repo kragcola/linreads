@@ -79,6 +79,11 @@ import java.io.File
 import java.util.Collections
 import java.util.WeakHashMap
 
+internal enum class EpubImagePlacement {
+    FullPage,
+    Inline,
+}
+
 /**
  * EPUB native reflow engine (v4 §12.3 ADR-EPUB-Engine).
  * ZipFile + jsoup → typed ReaderItem model → TextView paragraph stream.
@@ -204,6 +209,17 @@ class EpubReflowEngine private constructor(
         val pageIndex: Int,
     )
 
+    private data class PagedTextRenderSegment(
+        val source: EpubPageTextSegment,
+        val renderStart: Int,
+        val renderEnd: Int,
+    )
+
+    private data class PagedTextRenderContent(
+        val text: String,
+        val segments: List<PagedTextRenderSegment>,
+    )
+
     override suspend fun supports(uri: Uri): Boolean = true
 
     override suspend fun openBook(uri: Uri): Locator {
@@ -272,12 +288,7 @@ class EpubReflowEngine private constructor(
         if (slice.kind is EpubPageSliceKind.Image) {
             return createImagePageView(slice, safePageIndex, total)
         }
-        val paragraphIndex = slice.paragraphIndex.coerceIn(0, paras.lastIndex.coerceAtLeast(0))
-        val fullText = lazyBook?.paragraphAt(paragraphIndex)?.text.orEmpty()
-        val pageText = fullText.substring(
-            slice.startOffset.coerceIn(0, fullText.length),
-            slice.endOffset.coerceIn(0, fullText.length).coerceAtLeast(slice.startOffset.coerceIn(0, fullText.length)),
-        )
+        val pageText = pageTextFor(slice)
         val highlightRanges = highlightRangesForPageSlice(slice)
         val palette = paletteFor(themeMode, context.resources.configuration)
         val pageProgressDescription = "第 ${safePageIndex + 1} 页，共 $total 页"
@@ -311,19 +322,42 @@ class EpubReflowEngine private constructor(
         val image = slice.kind as EpubPageSliceKind.Image
         val palette = paletteFor(themeMode, context.resources.configuration)
         val density = context.resources.displayMetrics.density
+        val placement = epubImagePlacementFor(slice, pageIndex)
         val imageView = ImageView(context).apply {
             layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
+                when (placement) {
+                    EpubImagePlacement.FullPage -> FrameLayout.LayoutParams.MATCH_PARENT
+                    EpubImagePlacement.Inline -> FrameLayout.LayoutParams.WRAP_CONTENT
+                },
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 Gravity.CENTER,
             ).apply {
                 maxWidth = (MAX_LINE_WIDTH_DP * density).toInt()
             }
             adjustViewBounds = true
-            maxHeight = (760 * density).toInt()
+            maxHeight = (
+                when (placement) {
+                    EpubImagePlacement.FullPage -> FULL_PAGE_IMAGE_MAX_HEIGHT_DP
+                    EpubImagePlacement.Inline -> INLINE_IMAGE_MAX_HEIGHT_DP
+                } * density
+                ).toInt()
             minimumHeight = (48 * density).toInt()
-            setPadding((28 * density).toInt(), (24 * density).toInt(), (28 * density).toInt(), (24 * density).toInt())
+            val horizontalPadding = when (placement) {
+                EpubImagePlacement.FullPage -> 16
+                EpubImagePlacement.Inline -> 28
+            }
+            val verticalPadding = when (placement) {
+                EpubImagePlacement.FullPage -> 12
+                EpubImagePlacement.Inline -> 24
+            }
+            setPadding(
+                (horizontalPadding * density).toInt(),
+                (verticalPadding * density).toInt(),
+                (horizontalPadding * density).toInt(),
+                (verticalPadding * density).toInt(),
+            )
             scaleType = ImageView.ScaleType.FIT_CENTER
+            setTag(R.id.epub_image_placement, placement)
             contentDescription = imagePageContentDescription(image, pageIndex, total)
             setImageBitmap(epubFile?.let { decodeEpubImage(it, image.href) })
         }
@@ -336,6 +370,19 @@ class EpubReflowEngine private constructor(
             tag = slice
             addView(imageView)
         }.also { trackImagePageView(it, pageIndex, slice) }
+    }
+
+    private fun epubImagePlacementFor(slice: EpubPageSlice, pageIndex: Int): EpubImagePlacement {
+        if (pageIndex != 0) return EpubImagePlacement.Inline
+        val para = paras.getOrNull(slice.paragraphIndex) ?: return EpubImagePlacement.Inline
+        val sameSpineHasTextBeforeOrAtImage = paras
+            .take(slice.paragraphIndex + 1)
+            .any { it.spineIndex == para.spineIndex && it.text.isNotBlank() }
+        return if (sameSpineHasTextBeforeOrAtImage) {
+            EpubImagePlacement.Inline
+        } else {
+            EpubImagePlacement.FullPage
+        }
     }
 
     override fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?) {
@@ -481,6 +528,10 @@ class EpubReflowEngine private constructor(
     ) {
         val activePageState = activePagedTextPages[composeView] ?: return
         if (activePageState.slice != slice) return
+        if (slice.textSegments.size > 1) {
+            updateMultiSegmentPagedTextSelection(composeView, slice, start, end, selectionHighlightState)
+            return
+        }
         val pageTextLength = (slice.endOffset - slice.startOffset).coerceAtLeast(0)
         val pageText = pageTextFor(slice)
         val (selectionStart, selectionEnd) = epubSelectionRangeOnCodePointBoundaries(
@@ -527,6 +578,59 @@ class EpubReflowEngine private constructor(
             R.id.epub_compose_text_selection_highlight_range,
             composeSelectionHighlight,
         )
+        composeView.setTag(
+            R.id.epub_compose_text_annotated_string,
+            epubComposeAnnotatedText(
+                text = pageText,
+                highlightRanges = highlightRangesForPageSlice(slice),
+                links = slice.links,
+                selectionHighlightRange = composeSelectionHighlight,
+                linkClickHandler = composeLinkClickHandler(composeView, slice),
+            ),
+        )
+        selectionHighlightState.value = composeSelectionHighlight
+    }
+
+    private fun updateMultiSegmentPagedTextSelection(
+        composeView: ComposeView,
+        slice: EpubPageSlice,
+        start: Int,
+        end: Int,
+        selectionHighlightState: MutableState<ReaderTextHighlightRange?>,
+    ) {
+        val content = pageTextRenderContent(slice)
+        val pageText = content.text
+        val pageTextLength = pageText.length
+        val (selectionStart, selectionEnd) = epubSelectionRangeOnCodePointBoundaries(
+            text = pageText,
+            selectionStart = start.coerceIn(0, pageTextLength),
+            selectionEnd = end.coerceIn(0, pageTextLength),
+        )
+        val segment = content.segments.firstOrNull { renderSegment ->
+            selectionStart < renderSegment.renderEnd && selectionEnd > renderSegment.renderStart
+        }
+        val textSelection = segment?.let { renderSegment ->
+            val localStart = (selectionStart - renderSegment.renderStart)
+                .coerceIn(0, renderSegment.renderEnd - renderSegment.renderStart)
+            val localEnd = (selectionEnd - renderSegment.renderStart)
+                .coerceIn(0, renderSegment.renderEnd - renderSegment.renderStart)
+            epubTextSelection(
+                indexedParas = paras,
+                paragraphIndex = renderSegment.source.paragraphIndex,
+                selectionStart = renderSegment.source.startOffset + localStart,
+                selectionEnd = renderSegment.source.startOffset + localEnd,
+            ) { index -> lazyBook?.paragraphAt(index) }
+        }
+        _currentTextSelection.value = textSelection
+        val composeSelectionHighlight = textSelection?.let {
+            ReaderTextHighlightRange(
+                start = selectionStart,
+                end = selectionEnd,
+                color = EpubComposeSelectionHighlightColor,
+            )
+        }
+        composeView.setTag(R.id.epub_compose_text_selection_range, composeSelectionHighlight?.let { it.start to it.end })
+        composeView.setTag(R.id.epub_compose_text_selection_highlight_range, composeSelectionHighlight)
         composeView.setTag(
             R.id.epub_compose_text_annotated_string,
             epubComposeAnnotatedText(
@@ -835,18 +939,57 @@ class EpubReflowEngine private constructor(
     }
 
     private fun pageTextFor(slice: EpubPageSlice): String {
+        if (slice.textSegments.isNotEmpty()) {
+            return pageTextRenderContent(slice).text
+        }
         val fullText = lazyBook?.paragraphAt(slice.paragraphIndex)?.text.orEmpty()
         val start = slice.startOffset.coerceIn(0, fullText.length)
         val end = slice.endOffset.coerceIn(0, fullText.length).coerceAtLeast(start)
         return fullText.substring(start, end)
     }
 
+    private fun pageTextRenderContent(slice: EpubPageSlice): PagedTextRenderContent {
+        val text = StringBuilder()
+        val segments = mutableListOf<PagedTextRenderSegment>()
+        slice.textSegments.forEachIndexed { index, segment ->
+            if (index > 0) {
+                text.append("\n\n")
+            }
+            val fullText = lazyBook?.paragraphAt(segment.paragraphIndex)?.text ?: segment.text
+            val start = segment.startOffset.coerceIn(0, fullText.length)
+            val end = segment.endOffset.coerceIn(0, fullText.length).coerceAtLeast(start)
+            val renderStart = text.length
+            text.append(fullText.substring(start, end))
+            segments += PagedTextRenderSegment(
+                source = segment,
+                renderStart = renderStart,
+                renderEnd = text.length,
+            )
+        }
+        return PagedTextRenderContent(text = text.toString(), segments = segments)
+    }
+
     private fun highlightRangesForPageSlice(slice: EpubPageSlice) =
-        highlightRangesForParagraph(slice.paragraphIndex).mapNotNull { range ->
-            val start = maxOf(range.start, slice.startOffset)
-            val end = minOf(range.end, slice.endOffset)
-            if (start >= end) return@mapNotNull null
-            range.copy(start = start - slice.startOffset, end = end - slice.startOffset)
+        if (slice.textSegments.isNotEmpty()) {
+            val content = pageTextRenderContent(slice)
+            content.segments.flatMap { segment ->
+                highlightRangesForParagraph(segment.source.paragraphIndex).mapNotNull { range ->
+                    val start = maxOf(range.start, segment.source.startOffset)
+                    val end = minOf(range.end, segment.source.endOffset)
+                    if (start >= end) return@mapNotNull null
+                    range.copy(
+                        start = segment.renderStart + start - segment.source.startOffset,
+                        end = segment.renderStart + end - segment.source.startOffset,
+                    )
+                }
+            }
+        } else {
+            highlightRangesForParagraph(slice.paragraphIndex).mapNotNull { range ->
+                val start = maxOf(range.start, slice.startOffset)
+                val end = minOf(range.end, slice.endOffset)
+                if (start >= end) return@mapNotNull null
+                range.copy(start = start - slice.startOffset, end = end - slice.startOffset)
+            }
         }
 
     private fun warmCacheAround(paragraphIndex: Int) {
@@ -933,6 +1076,8 @@ class EpubReflowEngine private constructor(
         container.tag = slice
         container.setBackgroundColor(palette.paper)
         val imageView = container.findEpubImageView() ?: return
+        val placement = epubImagePlacementFor(slice, pageIndex)
+        imageView.setTag(R.id.epub_image_placement, placement)
         imageView.contentDescription = imagePageContentDescription(slice.kind, pageIndex, total)
         imageView.setImageBitmap(epubFile?.let { decodeEpubImage(it, slice.kind.href) })
     }
@@ -1063,10 +1208,11 @@ class EpubReflowEngine private constructor(
         selectionHighlightState: MutableState<ReaderTextHighlightRange?>,
     ) {
         val textLayout = currentComposeTextLayout(slice.textStyle)
+        val pageLinks = pageLinksFor(slice)
         val annotatedText = epubComposeAnnotatedText(
             text = pageText,
             highlightRanges = highlightRanges,
-            links = slice.links,
+            links = pageLinks,
             selectionHighlightRange = selectionHighlightState.value,
             linkClickHandler = composeLinkClickHandler(this, slice),
         )
@@ -1074,7 +1220,7 @@ class EpubReflowEngine private constructor(
         setTag(R.id.epub_compose_text_annotated_string, annotatedText)
         setTag(R.id.epub_compose_text_surface_visible, true)
         setTag(R.id.epub_compose_text_highlight_ranges, highlightRanges)
-        setTag(R.id.epub_compose_text_links, slice.links)
+        setTag(R.id.epub_compose_text_links, pageLinks)
         val composeLinkClickCallback = composeLinkClickHandler(this, slice)
         setTag(R.id.epub_compose_text_link_callback, composeLinkClickCallback)
         setTag(R.id.epub_compose_text_link_tap_wired, true)
@@ -1106,11 +1252,24 @@ class EpubReflowEngine private constructor(
                 textStyle = currentComposeTextStyle(slice.textStyle).copy(color = ComposeColor(palette.ink)),
                 textLayout = textLayout,
                 highlightRanges = highlightRanges,
-                links = slice.links,
+                links = pageLinks,
                 selectionHighlightRange = selectionHighlightState.value,
                 onComposeSelectionRange = composeSelectionCallback,
                 onComposeLinkClick = composeLinkClickCallback,
             )
+        }
+    }
+
+    private fun pageLinksFor(slice: EpubPageSlice): List<EpubTextLink> {
+        if (slice.textSegments.size <= 1) return slice.links
+        val content = pageTextRenderContent(slice)
+        return content.segments.flatMap { segment ->
+            segment.source.links.map { link ->
+                link.copy(
+                    start = segment.renderStart + link.start,
+                    end = segment.renderStart + link.end,
+                )
+            }
         }
     }
 
@@ -1149,6 +1308,8 @@ class EpubReflowEngine private constructor(
         const val MAX_LINE_WIDTH_DP = 680
         const val PAGE_HORIZONTAL_PADDING_DP = 28
         const val PAGE_VERTICAL_PADDING_DP = 24
+        const val FULL_PAGE_IMAGE_MAX_HEIGHT_DP = 760
+        const val INLINE_IMAGE_MAX_HEIGHT_DP = 360
         const val AVERAGE_PAGE_CHARACTER_SAMPLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz一二三四五六七八九十"
         val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
         val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)

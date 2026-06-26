@@ -411,6 +411,45 @@ class EpubPageMappingTest {
     }
 
     @Test
+    fun `block paged layout packs adjacent short text blocks onto one page`() {
+        val paras = epubParasWithCharacterOffsets(
+            listOf(
+                listOf(
+                    "First short sentence.",
+                    "Second short sentence.",
+                    "Third short sentence.",
+                ),
+            ),
+        )
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text("First short sentence.", headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Text("Second short sentence.", headingLevel = null, paragraphIndex = 1),
+                    EpubDisplayBlock.Text("Third short sentence.", headingLevel = null, paragraphIndex = 2),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        assertEquals(1, pages.size)
+        assertEquals(EpubPageSliceKind.Text, pages.single().kind)
+        assertEquals(0, pages.single().paragraphIndex)
+        assertEquals(2, pages.single().endParagraphIndex)
+    }
+
+    @Test
     fun `paged layout inserts cached image blocks as standalone slices`() {
         val paras = epubParasWithCharacterOffsets(listOf(listOf("Intro text", "Body text")))
 

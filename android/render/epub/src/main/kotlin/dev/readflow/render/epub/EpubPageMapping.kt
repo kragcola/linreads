@@ -14,6 +14,17 @@ internal data class EpubPageSlice(
     val textStyle: EpubPageTextStyle = EpubPageTextStyle(),
     val measurement: EpubPageMeasurement = EpubPageMeasurement.StaticLayout,
     val links: List<EpubTextLink> = emptyList(),
+    val textSegments: List<EpubPageTextSegment> = emptyList(),
+    val endParagraphIndex: Int = paragraphIndex,
+)
+
+internal data class EpubPageTextSegment(
+    val paragraphIndex: Int,
+    val startOffset: Int,
+    val endOffset: Int,
+    val text: String,
+    val textStyle: EpubPageTextStyle = EpubPageTextStyle(),
+    val links: List<EpubTextLink> = emptyList(),
 )
 
 internal enum class EpubPageMeasurement {
@@ -253,6 +264,99 @@ internal fun epubMeasuredPagedLayout(
     }
 }
 
+private fun packAdjacentShortTextPages(
+    pages: List<EpubPageSlice>,
+    metrics: EpubPageMetrics,
+    measurement: EpubPageMeasurement,
+    textProvider: (Int) -> String,
+): List<EpubPageSlice> {
+    if (pages.size < 2) return pages
+    val contentHeight = (metrics.viewportHeightPx - metrics.verticalPaddingPx).coerceAtLeast(1)
+    val linesPerPage = (contentHeight / metrics.lineHeightPx.coerceAtLeast(1f)).toInt().coerceAtLeast(1)
+    val packed = mutableListOf<EpubPageSlice>()
+    val pendingPages = mutableListOf<EpubPageSlice>()
+    var usedLines = 0
+
+    fun flushPages() {
+        if (pendingPages.isEmpty()) return
+        packed += if (pendingPages.size == 1) {
+            pendingPages.single()
+        } else {
+            pageSliceForSegments(
+                pendingPages.map { page ->
+                    page.toTextSegment(textProvider)
+                },
+                measurement,
+            )
+        }
+        pendingPages.clear()
+        usedLines = 0
+    }
+
+    pages.forEach { page ->
+        val canPack = page.canPackWithAdjacentText()
+        if (!canPack) {
+            flushPages()
+            packed += page
+            return@forEach
+        }
+        val pageLines = page.lineCount().coerceAtLeast(1)
+        if (pendingPages.isNotEmpty() && usedLines + pageLines > linesPerPage) {
+            flushPages()
+        }
+        pendingPages += page
+        usedLines += pageLines
+    }
+    flushPages()
+    return packed
+}
+
+private fun EpubPageSlice.canPackWithAdjacentText(): Boolean =
+    kind == EpubPageSliceKind.Text &&
+        textStyle == EpubPageTextStyle() &&
+        links.isEmpty()
+
+private fun EpubPageSlice.toTextSegment(textProvider: (Int) -> String): EpubPageTextSegment {
+    val text = textProvider(paragraphIndex)
+    val start = startOffset.coerceIn(0, text.length)
+    val end = endOffset.coerceIn(0, text.length).coerceAtLeast(start)
+    return EpubPageTextSegment(
+        paragraphIndex = paragraphIndex,
+        startOffset = startOffset,
+        endOffset = endOffset,
+        text = text.substring(start, end),
+        textStyle = textStyle,
+        links = links,
+    )
+}
+
+private fun pageSliceForSegments(
+    segments: List<EpubPageTextSegment>,
+    measurement: EpubPageMeasurement,
+): EpubPageSlice {
+    val first = segments.first()
+    val last = segments.last()
+    return EpubPageSlice(
+        paragraphIndex = first.paragraphIndex,
+        startOffset = first.startOffset,
+        endOffset = if (first.paragraphIndex == last.paragraphIndex) last.endOffset else first.endOffset,
+        textStyle = first.textStyle,
+        measurement = measurement,
+        links = first.links,
+        textSegments = segments,
+        endParagraphIndex = last.paragraphIndex,
+    )
+}
+
+private fun EpubPageSlice.lineCount(): Int =
+    if (textSegments.isEmpty()) {
+        1
+    } else {
+        textSegments.sumOf { segment ->
+            segment.text.count { it == '\n' } + 1
+        }.coerceAtLeast(1)
+    }
+
 internal data class EpubTextLayoutLineRange(
     val start: Int,
     val end: Int,
@@ -316,16 +420,23 @@ internal fun epubPagedLayoutWithBlocks(
     val emittedParagraphs = mutableSetOf<Int>()
     val nextImageAnchorOffsets = mutableMapOf<Int, Int>()
     return buildList {
+        val pendingTextPages = mutableListOf<EpubPageSlice>()
+
+        fun flushPendingTextPages() {
+            if (pendingTextPages.isEmpty()) return
+            addAll(packAdjacentShortTextPages(pendingTextPages.toList(), metrics, measurement, textProvider))
+            pendingTextPages.clear()
+        }
+
         blocks.forEach { block ->
             when (block) {
                 is EpubDisplayBlock.Text -> if (emittedParagraphs.add(block.paragraphIndex)) {
-                    addAll(
-                        pagesByParagraph[block.paragraphIndex].orEmpty().map { page ->
-                            page.copy(textStyle = block.toPageTextStyle())
-                        },
-                    )
+                    pendingTextPages += pagesByParagraph[block.paragraphIndex].orEmpty().map { page ->
+                        page.copy(textStyle = block.toPageTextStyle())
+                    }
                 }
                 is EpubDisplayBlock.Image -> {
+                    flushPendingTextPages()
                     emittedParagraphs += block.paragraphIndex
                     val imageAnchorOffset = nextImageAnchorOffsets.nextImageAnchorOffsetForParagraph(
                         paras = paras,
@@ -341,14 +452,16 @@ internal fun epubPagedLayoutWithBlocks(
                         ),
                     )
                 }
-                is EpubDisplayBlock.Break -> Unit
+                is EpubDisplayBlock.Break -> flushPendingTextPages()
             }
         }
+        flushPendingTextPages()
         textPages.forEach { page ->
             if (emittedParagraphs.add(page.paragraphIndex)) {
-                addAll(pagesByParagraph[page.paragraphIndex].orEmpty())
+                pendingTextPages += pagesByParagraph[page.paragraphIndex].orEmpty()
             }
         }
+        flushPendingTextPages()
     }
 }
 

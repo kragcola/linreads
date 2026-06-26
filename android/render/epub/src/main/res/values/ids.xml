@@ -22,4 +22,5 @@
     <item name="epub_selection_overlay_behind_compose_text" type="id" />
     <item name="epub_selection_bridge_hosted_in_compose_tree" type="id" />
     <item name="epub_selection_overlay_accessibility_hidden" type="id" />
+    <item name="epub_image_placement" type="id" />
 </resources>

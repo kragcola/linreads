@@ -2,6 +2,12 @@ package dev.readflow.core.model
 
 import kotlinx.serialization.Serializable
 
+@Serializable
+enum class ReaderReadingMode {
+    SCROLL,
+    PAGED,
+}
+
 /**
  * Fully serializable reader UI/session state (§7.2, P0-A). Holds NO View reference.
  * Transits SavedStateHandle as a JSON String (F4); engine accelerator caches live
@@ -17,6 +23,7 @@ data class ReaderState(
     val totalPages: Int = 0,
     val currentPageIndex: Int = 0,
     val fontSize: Int = 18,
+    val readingMode: ReaderReadingMode = ReaderReadingMode.SCROLL,
     val theme: ThemeMode = ThemeMode.SYSTEM,
     val zoomLevel: Float = 1.0f,
     val panOffset: Offset = Offset.Zero,

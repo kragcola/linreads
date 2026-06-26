@@ -138,6 +138,48 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `paged runtime sizes image only cover as full page image`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("cover-image-sizing.epub")
+        writeEpub(
+            epub,
+            "OEBPS/cover.xhtml" to "<html><body><img src=\"images/cover.png\" alt=\"Cover art\"/></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        val imageView = findView(page, ImageView::class.java)
+
+        assertNotNull(imageView)
+        assertEquals(EpubImagePlacement.FullPage, imageView?.getTag(R.id.epub_image_placement))
+    }
+
+    @Test
+    fun `paged runtime keeps inline marker images from being enlarged to full page`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("inline-marker-image-sizing.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Scene text.</p><img src=\"images/marker.png\" alt=\"Marker\"/><p>More text.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val imagePage = (0 until engine.pageCount.value)
+            .map { engine.createPageView(it) }
+            .first { findView(it, ImageView::class.java) != null }
+        val imageView = findView(imagePage, ImageView::class.java)
+
+        assertNotNull(imageView)
+        assertEquals(EpubImagePlacement.Inline, imageView?.getTag(R.id.epub_image_placement))
+    }
+
+    @Test
     fun `paged runtime exposes compose text surface state`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val text = "Compose surfaced EPUB paged text."
@@ -155,6 +197,42 @@ class EpubReflowEngineTest {
 
         assertTrue(page is ComposeView)
         assertEquals(text, page.getTag(R.id.epub_compose_text_surface))
+    }
+
+    @Test
+    fun `paged runtime renders adjacent short paragraphs on one text page`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("short-paragraphs-one-page.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>First short sentence.</p>
+                  <p>Second short sentence.</p>
+                  <p>Third short sentence.</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        val slice = findTaggedSlice(page)
+
+        assertEquals(1, engine.pageCount.value)
+        assertEquals(0, slice?.paragraphIndex)
+        assertEquals(2, slice?.endParagraphIndex)
+        assertEquals(
+            "First short sentence.\n\nSecond short sentence.\n\nThird short sentence.",
+            page.getTag(R.id.epub_compose_text_surface),
+        )
     }
 
     @Test
