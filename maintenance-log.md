@@ -6,6 +6,12 @@
 
 ## 2026-06-27
 
+### Android v4 Dev build #116 release black-box extreme EPUB smoke
+- 范围：继续按“产品实际测试工程师”口径做发布包黑盒，不改产品代码。下载 `dev-latest/app-ota.apk` / `Dev build #116` 到 `/tmp/readflow-dev116-release-blackbox-20260627/app-ota.apk`（大小 `9,729,356`，SHA-256 `90c9f2464feda4f876a1ae141b3485cb380e2239b0a0852468eb02af40a6164b`），安装到 `emulator-5554`，`pm clear dev.readflow` 后用 MediaStore `content://media/external/file/424` 走 `ACTION_VIEW` 冷启动极端 EPUB，启动 `TotalTime=1353ms`
+- 样本：`/tmp/readflow-dev116-release-blackbox-20260627/dev116-extreme-reader.epub` 覆盖 120 个混合 safe-style 微短段、6 个后续短 chapter spine（每章 10 个短块）、48 个无空格中文长句片段和 24 个尾句短段；验证路径为发布包 + 外部存储 MediaStore URI + 用户可见 `排版 -> 分页` 切换，再用 shell 横滑逐页采样
+- 结果：首屏 `cold-start.xml` 同时暴露 `DEV116` 正文和 reader surface `阅读内容，捏合调整字号`，未出现 `Allow Readflow to send you notifications?`、`需要安装权限`、`前往设置` 或 `暂不`。分页后采样 31 页，正文页最多同页 packed `15` 个微短段、`10` 个短章 marker、`48` 个无空格长句片段、`20` 个尾句；`pages_with_2plus_markers=19`，logcat critical grep 为 0。#116 发布包未复现“一句一页”或首读权限弹窗阻断
+- 边界：这仍是 AVD release APK + MediaStore shell launch + UIAutomator/XML/screenshot 证据，不是物理平板、人手文件管理器/分享面板、真人 TalkBack speech/focus traversal、真实性能 benchmark、真实 SAF DocumentsUI 或真实 Calibre LAN/认证证据；`A-01` 保持 `VERIFY`，`PAGE-05` 保持 `PARTIAL`
+
 ### Android v4 dev114 follow-up：PAGE-05 short lazy spines + staged VERIFY/PARTIAL rerun
 - 修复/回归范围：`Dev build #114` / commit `d7b2b10` 已包含 lazy EPUB short spines packed 修复；本次只追加验收回填和 test 同步修正，不改产品分页逻辑。`EpubPagedRuntimeSmokeTest.epubPagedPacksShortChapterSpinesRuntime` 在切到 paged mode 后不再无条件 `pressBack()`，避免 Android 16/tablet-like AVD 把 `MainActivity` 退到后台导致 `Unable to find reader surface` 的测试同步假阴性
 - PAGE-05 复验：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；`git diff --check` 通过；targeted `adb shell am instrument -w -e class 'dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksShortChapterSpinesRuntime' dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`。证据 `/tmp/readflow-page05-short-spines-fixed-20260627/page05-epub-runtime-smoke/packed-short-spines-summary.txt` 记录 `chapter_count=6`、`tracked_content_count=60`、`page_count=12`、`traversed_page_count=12`、`all_headings_seen=true`、`all_markers_seen=true`，且每章 `marker_seen_count=10` / `max_markers_on_page=10`，说明后续 lazy spines 没有退回“一句一页”
