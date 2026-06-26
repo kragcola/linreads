@@ -510,9 +510,36 @@ class EpubPagedRuntimeSmokeTest {
             takeScreenshot("packed-micro-after-next.png")
             dumpHierarchy("packed-micro-after-next.xml")
 
+            dragLineSpacingSliderToMax()
+            waitForCondition("expected EPUB line spacing preference to increase after dragging the visible slider") {
+                runBlocking { settings.lineSpacing.first() > 1.85f }
+            }
+            waitForCondition("expected packed micro-paragraph EPUB page count to stay below paragraph count after line spacing") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    itemCount in 1 until lines.size
+                }
+            }
+
+            val afterLineSpacing = scenario.withActivity { activity ->
+                val composePage = checkNotNull(activity.currentEpubComposePageRootOrNull()) {
+                    "Unable to find packed micro-paragraph page after line spacing"
+                }
+                PackedMicroAfterLineSpacing(
+                    currentItem = activity.findEpubViewPager()?.pagerCurrentItem() ?: -1,
+                    itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: -1,
+                    pageText = composePage.composeTextSurface().orEmpty(),
+                    pageProgress = composePage.composePageProgressDescription(),
+                    persistedLineSpacing = runBlocking { settings.lineSpacing.first() },
+                )
+            }
+            takeScreenshot("packed-micro-after-line-spacing.png")
+            dumpHierarchy("packed-micro-after-line-spacing.xml")
+
             val firstPageLineCount = lines.count { line -> baseline.pageText.contains(line) }
             val afterPinchLineCount = lines.count { line -> afterPinch.pageText.contains(line) }
             val secondPageLineCount = lines.count { line -> afterNext.pageText.contains(line) }
+            val afterLineSpacingLineCount = lines.count { line -> afterLineSpacing.pageText.contains(line) }
             writeTextEvidence(
                 "packed-micro-summary.txt",
                 buildString {
@@ -532,6 +559,12 @@ class EpubPagedRuntimeSmokeTest {
                     appendLine("after_next_page_progress=${afterNext.pageProgress}")
                     appendLine("after_next_line_count=$secondPageLineCount")
                     appendLine("after_next_page_text=${afterNext.pageText}")
+                    appendLine("after_line_spacing_current_item=${afterLineSpacing.currentItem}")
+                    appendLine("after_line_spacing_page_count=${afterLineSpacing.itemCount}")
+                    appendLine("after_line_spacing_page_progress=${afterLineSpacing.pageProgress}")
+                    appendLine("after_line_spacing_line_count=$afterLineSpacingLineCount")
+                    appendLine("after_line_spacing_persisted=${afterLineSpacing.persistedLineSpacing}")
+                    appendLine("after_line_spacing_page_text=${afterLineSpacing.pageText}")
                 },
             )
 
@@ -561,6 +594,18 @@ class EpubPagedRuntimeSmokeTest {
             assertTrue(
                 "expected the next packed page to contain readable paragraph text",
                 secondPageLineCount >= 1,
+            )
+            assertTrue(
+                "expected line spacing change to persist above the default",
+                afterLineSpacing.persistedLineSpacing > 1.85f,
+            )
+            assertTrue(
+                "expected packed paging to stay below paragraph count after line spacing changes",
+                afterLineSpacing.itemCount in 1 until lines.size,
+            )
+            assertTrue(
+                "expected line spacing repagination to avoid one short paragraph per page",
+                afterLineSpacingLineCount >= 2,
             )
         }
     }
@@ -657,6 +702,22 @@ class EpubPagedRuntimeSmokeTest {
         openBottomPanel(buttonText = "排版", expectedText = "阅读正文预览")
         waitForObject(By.text("分页")).click()
         waitForObject(By.text("滚动"))
+    }
+
+    private fun dragLineSpacingSliderToMax() {
+        if (device.wait(Until.findObject(By.desc("行距")), 750) == null) {
+            openBottomPanel(buttonText = "排版", expectedText = "阅读正文预览")
+        }
+        val slider = waitForObject(By.desc("行距"))
+        val bounds = slider.visibleBounds
+        device.swipe(
+            bounds.centerX(),
+            bounds.centerY(),
+            bounds.right - 24,
+            bounds.centerY(),
+            24,
+        )
+        device.waitForIdle()
     }
 
     private fun openBottomPanel(buttonText: String, expectedText: String) {
@@ -1106,6 +1167,14 @@ class EpubPagedRuntimeSmokeTest {
         val currentItem: Int,
         val pageText: String,
         val pageProgress: String?,
+    )
+
+    private data class PackedMicroAfterLineSpacing(
+        val currentItem: Int,
+        val itemCount: Int,
+        val pageText: String,
+        val pageProgress: String?,
+        val persistedLineSpacing: Float,
     )
 
     private data class Point(val x: Float, val y: Float) {

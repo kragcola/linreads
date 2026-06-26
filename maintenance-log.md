@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed 行距重分页 AVD runtime 补证
+- 回填 `PAGE-05` / `UX-04`：在 36 个微短段 EPUB reader-route smoke 中，通过用户可见 `排版` 面板拖动 `行距` slider 到 2.2x，验证 line-spacing 触发 paged Compose 重分页后仍保持 packed，而不是回归“一段一页”
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；targeted `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksMicroParagraphsWithoutOneSentencePagesRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (4 tests)`
+- 证据：`/tmp/readflow-page05-packed-line-spacing-runtime-20260626/full-class/page05-epub-runtime-smoke/packed-micro-summary.txt` 记录 baseline `paragraph_count=36` / `page_count=3` / 第 1 页 14 段；pinch 后 `after_pinch_page_count=4`；行距 slider 拖动后 `after_line_spacing_persisted=2.2`、`after_line_spacing_page_count=5`、第 3 页仍含 `Line 017..024` 8 段；logcat grep 未命中 crash/ANR/recycled-bitmap
+- 边界：这是 AVD instrumentation + UIAutomator slider + screenshot/XML/tag summary 证据，不是真实手机/平板手指调参、TalkBack speech/action-mode、跨屏视觉调校或帧率/PSS 预算；`PAGE-05` 保持 `PARTIAL`，`UX-04` 保持 `VERIFY`
+
 ### Android v4 EPUB packed 字号重分页 AVD runtime 补证
 - 回填 `PAGE-05` / `UX-02`：在同一个 36 个微短段 EPUB reader-route smoke 中追加 instrumentation 多指 pinch 放大，验证字号从 18sp 提升并持久化到 25sp 后，paged Compose 重分页仍保持 packed，而不是回归到“一段一页”
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；targeted `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksMicroParagraphsWithoutOneSentencePagesRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (4 tests)`
