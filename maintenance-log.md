@@ -6,6 +6,12 @@
 
 ## 2026-06-27
 
+### Android v4 EPUB mixed safe-style packed pagination fix / dev build push
+- 发现：`dev-latest` / `Dev build #107` release 黑盒用 `/tmp/readflow-dev107-extreme-smoke/dev107-extreme-pack.epub` 覆盖 120 个 micro paragraph、中文对话、list item、blockquote、`<br/>` 诗行、长无空格中文段与尾句；micro paragraph 区域已 packed，但混合 safe style 区域在 `/tmp/readflow-dev107-extreme-smoke/epub-blackbox/page-sampling.txt` 与 `page-12.xml` 起暴露 `DEV107 对话001`、`DEV107 清单002`、`DEV107 旁白003` 等一页一个短块，属于“一句一页”家族的真实阅读连续性回归
+- 修复：`EpubPageMapping.packAdjacentShortTextPages()` 仍只允许无链接、非 heading、非 pre/table/image 的 `Body/ListItem/Blockquote` 文本块合页，但不再要求相邻 safe blocks 的 `textStyle` 完全相同；跨 spine 仍禁止合并，标题、代码、表格、图片、链接仍保持隔离
+- 验证：新增 `EpubPageMappingTest.block paged layout packs adjacent safe mixed text styles` 覆盖 Body + ListItem + Blockquote；`./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubPageMappingTest"` 通过；`git diff --check` 通过；`./gradlew -Preadflow.phase=2 :app:assembleOta` 通过，本地 `app-ota.apk` 大小 `9,729,356`，SHA-256 `d44afde08dd10c387654a1e69abcda16267d29b57127c8c602401be2cf886512`
+- 边界：本轮没有把 fixed-debug 采样误写成 release 复验；新修复需要 push 后由 GitHub Actions 刷新 `dev-latest`，再在平板或至少新 release APK 上做黑盒复验。当前证据仍是 AVD/release #107 发现 + 本地单测/构建，非真实物理平板、真实 TalkBack speech、真实性能 benchmark、真实 Calibre LAN 或真实 SAF DocumentsUI；`PAGE-05` 保持 `PARTIAL`
+
 ### Android v4 VERIFY/PARTIAL staged rerun：release 黑盒 + TalkBack 设置态 + A-02/Calibre/SAF 模拟
 - 范围：继续按文档剩余项做阶段性验收回填；`adb devices -l` 仅发现 `emulator-5554`，屏幕为 tablet-like override（`1600x2560` / density `320`），没有真实手机/平板在线，因此本轮不把 AVD、fake server、ActivityMonitor 或 UIAutomator 证据冒充为物理设备、真实 TalkBack speech、真实 DocumentsUI 或真实 Calibre LAN
 - release 黑盒：在已安装 `dev-latest` / `Dev build #105` OTA 包上，用 MediaStore `content://media/external/file/300` + `--grant-read-uri-permission` 打开长 TXT；冷启动 `TotalTime=1573ms`，reader surface 出现且无权限错误。随后黑盒手势切到 scroll、滚到中段 `paragraph 056..067`，再经 `排版 -> 分页` 切回 paged，`/tmp/readflow-release-blackbox-20260627/release-blackbox-summary.txt` 显示 paged 后仍落在 `paragraph 062`，没有回到 `paragraph 000` / 第 1 页；同窗口 logcat 关键 grep 未命中 Readflow crash/ANR/security/recycled-bitmap

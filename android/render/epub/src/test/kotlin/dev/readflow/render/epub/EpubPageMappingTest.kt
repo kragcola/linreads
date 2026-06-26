@@ -690,6 +690,62 @@ class EpubPageMappingTest {
     }
 
     @Test
+    fun `block paged layout packs adjacent safe mixed text styles`() {
+        val paras = epubParasWithCharacterOffsets(
+            listOf(
+                listOf(
+                    "Dialogue line.",
+                    "• List line.",
+                    "Quoted line.",
+                ),
+            ),
+        )
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text("Dialogue line.", headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Text(
+                        "• List line.",
+                        headingLevel = null,
+                        paragraphIndex = 1,
+                        kind = EpubTextKind.ListItem,
+                    ),
+                    EpubDisplayBlock.Text(
+                        "Quoted line.",
+                        headingLevel = null,
+                        paragraphIndex = 2,
+                        kind = EpubTextKind.Blockquote,
+                    ),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        assertEquals(1, pages.size)
+        assertEquals(0, pages.single().paragraphIndex)
+        assertEquals(2, pages.single().endParagraphIndex)
+        assertEquals(
+            listOf(
+                EpubPageTextStyle(kind = EpubTextKind.Body),
+                EpubPageTextStyle(kind = EpubTextKind.ListItem),
+                EpubPageTextStyle(kind = EpubTextKind.Blockquote),
+            ),
+            pages.single().textSegments.map { it.textStyle },
+        )
+    }
+
+    @Test
     fun `block paged layout keeps adjacent preformatted blocks isolated`() {
         val paras = epubParasWithCharacterOffsets(listOf(listOf("code one", "code two")))
 

@@ -334,7 +334,7 @@ private fun EpubPageTextStyle.isSafeToPackWithAdjacentText(): Boolean =
 private fun EpubPageSlice.canPackAcrossSpineWith(next: EpubPageSlice, paras: List<EpubPara>): Boolean {
     val currentSpine = paras.getOrNull(endParagraphIndex)?.spineIndex ?: return false
     val nextSpine = paras.getOrNull(next.paragraphIndex)?.spineIndex ?: return false
-    return currentSpine == nextSpine && textStyle == next.textStyle
+    return currentSpine == nextSpine
 }
 
 private fun EpubPageSlice.toTextSegment(textProvider: (Int) -> String): EpubPageTextSegment {
