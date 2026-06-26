@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 A-03 repo-owned 无障碍 AVD runtime 补证
+- 回填 `A-03`：新增 phase2 AndroidTest `A03AccessibilityRuntimeSmokeTest`，把此前散落在 `/tmp/readflow-a03-*` 的 reader/library XML 证据固化为仓库可回归测试；测试用真实 `MainActivity` + FileProvider EPUB 走 “ACTION_VIEW 导入 -> reader -> 返回书库 -> 书卡打开 -> reader chrome -> TOC/search/bookmark/annotation/font/theme 面板” 路径
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebugAndroidTest` 通过；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.a03.A03AccessibilityRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；当前 AVD 运行后 `enabled_accessibility_services=com.google.android.marvin.talkback/com.google.android.marvin.talkback.TalkBackService`、`accessibility_enabled=1`、`touch_exploration_enabled=1`
+- 证据：`/tmp/readflow-a03-accessibility-runtime-20260626/a03-accessibility-runtime-smoke/a03-accessibility-summary.txt` 记录书卡 `打开 a03-accessibility-*`、书卡菜单 `<title> 的菜单`、reader surface `阅读内容，捏合调整字号`、accessibility action `显示或隐藏阅读工具栏`、chrome `返回|添加书签|上一章|下一章|目录|搜索|书签|标注|排版|主题`、TOC `1 级目录，A03 Start`、搜索 `执行搜索|清空搜索`、空面板 `暂无书签|暂无标注`、排版 `字号/16sp` 与 `行距/1.75x`、主题 `跟随系统|日间|夜间|护眼`；同目录拉取 22 个截图/XML/DB 快照，外层保存 logcat 与 accessibility settings；logcat grep 未命中 crash/ANR/OOM/recycled-bitmap/SecurityException/FileNotFound/AssertionError/FAILURES
+- 边界：这是 AVD instrumentation + UIAutomator/XML/screenshot 证据，虽然当前 AVD TalkBack/touch exploration 处于开启状态，但没有物理手机/平板、真人完整焦点顺序、TalkBack speech/TTS 人耳确认或真实手势遍历；`A-03` 保持 `PARTIAL`
+
 ### Android v4 A-01 外部文件入口 AVD runtime 补证
 - 回填 `A-01`：把 2026-06-22 临时 `/tmp/readflow-share-smoke` synthetic sender 证据固化为 repo-owned phase2 AndroidTest；新增测试 APK 侧 `A01ExternalBookProvider`，通过外部 `content://dev.readflow.test.a01bookprovider/...` provider 模拟 SAF/分享来源，再用 `ACTION_VIEW` 与 `ACTION_SEND` 覆盖 TXT/MD/EPUB/PDF 导入入口
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` 通过；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.a01.A01IncomingBookRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`，grouped test 内覆盖 8 个 case（VIEW/SEND × TXT/MD/EPUB/PDF）
