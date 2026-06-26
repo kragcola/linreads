@@ -1587,9 +1587,6 @@ class EpubPagedRuntimeSmokeTest {
                             allMarkers.any { marker -> pageText.contains(marker) })
                 }
             }
-            device.pressBack()
-            device.waitForIdle()
-
             val pages = mutableListOf<OrientationPackedSummary>()
             pages += scenario.withActivity { activity ->
                 activity.orientationPackedSummary()
