@@ -515,6 +515,36 @@ class EpubPageMappingTest {
     }
 
     @Test
+    fun `block paged layout does not pack short text across spine boundary`() {
+        val paras = epubParasWithCharacterOffsets(listOf(listOf("Chapter end."), listOf("Next chapter.")))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text("Chapter end.", headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Text("Next chapter.", headingLevel = null, paragraphIndex = 1),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        assertEquals(2, pages.size)
+        assertEquals(0, pages[0].paragraphIndex)
+        assertEquals(0, pages[0].endParagraphIndex)
+        assertEquals(1, pages[1].paragraphIndex)
+    }
+
+    @Test
     fun `paged layout inserts cached image blocks as standalone slices`() {
         val paras = epubParasWithCharacterOffsets(listOf(listOf("Intro text", "Body text")))
 

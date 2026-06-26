@@ -310,6 +310,33 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `paged runtime does not merge short text across chapter spines`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("short-chapters-stay-on-separate-pages.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one end.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two start.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val firstPage = engine.createPageView(0)
+        val secondPage = engine.createPageView(1)
+
+        assertEquals(2, engine.pageCount.value)
+        assertEquals("Chapter one end.", firstPage.getTag(R.id.epub_compose_text_surface))
+        assertEquals("Chapter two start.", secondPage.getTag(R.id.epub_compose_text_surface))
+    }
+
+    @Test
     fun `paged runtime makes compose text visible while selection overlay stays non visual`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val text = "Visible Compose EPUB paged text."

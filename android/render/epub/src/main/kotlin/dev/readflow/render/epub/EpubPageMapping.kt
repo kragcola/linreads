@@ -269,6 +269,7 @@ internal fun epubMeasuredPagedLayout(
 
 private fun packAdjacentShortTextPages(
     pages: List<EpubPageSlice>,
+    paras: List<EpubPara>,
     metrics: EpubPageMetrics,
     measurement: EpubPageMeasurement,
     textProvider: (Int) -> String,
@@ -303,6 +304,9 @@ private fun packAdjacentShortTextPages(
             packed += page
             return@forEach
         }
+        if (pendingPages.isNotEmpty() && !pendingPages.last().canPackAcrossSpineWith(page, paras)) {
+            flushPages()
+        }
         val pageLines = page.lineCount().coerceAtLeast(1)
         val separatorLines = if (pendingPages.isEmpty()) 0 else 1
         if (pendingPages.isNotEmpty() && usedLines + separatorLines + pageLines > linesPerPage) {
@@ -322,6 +326,12 @@ private fun EpubPageSlice.canPackWithAdjacentText(): Boolean =
     kind == EpubPageSliceKind.Text &&
         textStyle == EpubPageTextStyle() &&
         links.isEmpty()
+
+private fun EpubPageSlice.canPackAcrossSpineWith(next: EpubPageSlice, paras: List<EpubPara>): Boolean {
+    val currentSpine = paras.getOrNull(endParagraphIndex)?.spineIndex ?: return false
+    val nextSpine = paras.getOrNull(next.paragraphIndex)?.spineIndex ?: return false
+    return currentSpine == nextSpine
+}
 
 private fun EpubPageSlice.toTextSegment(textProvider: (Int) -> String): EpubPageTextSegment {
     val text = textProvider(paragraphIndex)
@@ -433,7 +443,7 @@ internal fun epubPagedLayoutWithBlocks(
 
         fun flushPendingTextPages() {
             if (pendingTextPages.isEmpty()) return
-            addAll(packAdjacentShortTextPages(pendingTextPages.toList(), metrics, measurement, textProvider))
+            addAll(packAdjacentShortTextPages(pendingTextPages.toList(), paras, metrics, measurement, textProvider))
             pendingTextPages.clear()
         }
 
