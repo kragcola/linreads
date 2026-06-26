@@ -6,6 +6,12 @@
 
 ## 2026-06-27
 
+### Android v4 PAGE-05 noisy exported CJK EPUB regression coverage
+- 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksNoisyExportedCjkBlocksRuntime`，把“导出版/网页抓取版 EPUB”常见噪声结构纳入仓库回归：72 个短中文对话/list/blockquote/ruby/br 块、13 个空段、9 个 `<hr/>`、48 个无空格中文长句片段和 16 个尾声短句，重点防止这类混排再次退回“一句一页”或空白/装饰页
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；`git diff --check` 通过；`./gradlew -Preadflow.phase=2 :app:installDebugAndroidTest` 通过；targeted `adb -s emulator-5554 shell am instrument -w -e class 'dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksNoisyExportedCjkBlocksRuntime' dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`
+- 证据：`/tmp/readflow-page05-noisy-export-20260627/page05-epub-runtime-smoke/packed-noisy-export-summary.txt` 记录 `tracked_content_count=136`、`page_count=11`、`max_packed_page_budget=45`；采样正文页各 packed 9 个短块，长无空格中文页 packed 48 个长句片段，尾页 packed 16 个尾声短句；截图/XML 已同目录拉取，critical logcat grep 为 0
+- 边界：这是 `emulator-5554` AVD reader-route + UIAutomator/XML/screenshot/tag summary 证据，不是真实物理平板、人手翻页、TalkBack speech/action-mode、帧率/PSS、真实 Calibre 或真实 SAF evidence；`PAGE-05` 继续保持 `PARTIAL`
+
 ### Android v4 Calibre runtime smoke port-override hardening
 - 背景：late staged rerun 发现宿主 8081 被 Docker 容器 `qq-bot` 占用（`0.0.0.0:8081->8080/tcp`），而 `CalibreGroupedRuntimeSmokeTest` 固定使用 `http://10.0.2.2:8081`，导致 fake-Calibre 模拟验收会被本机无关服务阻塞；这属于验收基础设施脆弱性，不是产品功能失败
 - 修复：`CalibreGroupedRuntimeSmokeTest` 新增 instrumentation 参数 `calibreBaseUrl` / `calibreHostHint`，默认仍保留旧的 `10.0.2.2:8081` guided-probe 路径；传入自定义 `calibreBaseUrl` 时改走 Settings 显式 URL `测试连接` 文案（`已连接到 Calibre，发现 1 本书`），并用该 URL 校验 cover/download/events/offline/remove。`CalibreDownloadFailureRuntimeSmokeTest` 同样新增 `calibreBaseUrl` 参数，避免固定 18081

@@ -1306,6 +1306,222 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedPacksNoisyExportedCjkBlocksRuntime() {
+        val title = "page05-export-noise-${UUID.randomUUID().toString().take(8)}"
+        val heading = "导出版混排压力"
+        val dialogueMarkers = (1..72).map { index ->
+            "噪声${index.toString().padStart(3, '0')}"
+        }
+        val longSegments = (1..48).map { index ->
+            "长句${index.toString().padStart(3, '0')}窗外雨声贴着玻璃往下滑灯影落在旧书页"
+        }
+        val longParagraph = longSegments.joinToString(separator = "")
+        val tailEntries = (1..16).map { index ->
+            "尾声${index.toString().padStart(3, '0')}：还亮着。"
+        }
+        var blankParagraphCount = 0
+        var separatorCount = 0
+        val body = buildString {
+            appendLine("<h2>$heading</h2>")
+            dialogueMarkers.forEachIndexed { index, marker ->
+                if (index > 0 && index % 9 == 0) {
+                    appendLine("<p><span> </span></p>")
+                    blankParagraphCount += 1
+                    appendLine("<hr/>")
+                    separatorCount += 1
+                }
+                appendLine(
+                    when (index % 6) {
+                        0 -> "<p><span>$marker</span><br/><span>“嗯。”</span></p>"
+                        1 -> "<p><em>$marker：“不行。”</em></p>"
+                        2 -> "<blockquote><p><strong>$marker：门响。</strong></p></blockquote>"
+                        3 -> "<ul><li><span>$marker：钥匙。</span></li></ul>"
+                        4 -> "<p><span></span><ruby>$marker<rt>noise</rt></ruby>：雨落。</p>"
+                        else -> "<p><span><em>$marker：等等。</em></span><br/><span>尾音。</span></p>"
+                    },
+                )
+                if (index % 14 == 0) {
+                    appendLine("<p>   </p>")
+                    blankParagraphCount += 1
+                }
+            }
+            appendLine("<hr/>")
+            separatorCount += 1
+            appendLine("<p>$longParagraph</p>")
+            appendLine("<hr/>")
+            separatorCount += 1
+            tailEntries.forEachIndexed { index, entry ->
+                appendLine(
+                    if (index % 4 == 0) {
+                        "<p><span></span><strong>$entry</strong></p>"
+                    } else {
+                        "<p><span>$entry</span></p>"
+                    },
+                )
+            }
+        }
+        val trackedContentCount = dialogueMarkers.size + longSegments.size + tailEntries.size
+        val maxPackedPageBudget = trackedContentCount / 3
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        $body
+                      </body>
+                    </html>
+                """.trimIndent(),
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected noisy exported CJK EPUB reader to enter packed paged mode") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    itemCount in 2..maxPackedPageBudget &&
+                        (pageText.contains(heading) || dialogueMarkers.any { marker -> pageText.contains(marker) })
+                }
+            }
+
+            val samples = mutableListOf<OrientationPackedSummary>()
+            samples += scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-noisy-export-page-0.png")
+            dumpHierarchy("packed-noisy-export-page-0.xml")
+
+            repeat(4) { sampleIndex ->
+                val previous = samples.last()
+                if (previous.currentItem >= previous.itemCount - 1) return@repeat
+                performReaderAccessibilityAction(
+                    scenario = scenario,
+                    action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+                )
+                waitForCondition("expected noisy exported reader to advance to a non-blank packed page") {
+                    scenario.withActivity { activity ->
+                        (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > previous.currentItem &&
+                            activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                                ?.let { pageText -> pageText.isNotBlank() && pageText != previous.pageText } == true
+                    }
+                }
+                samples += scenario.withActivity { activity ->
+                    activity.orientationPackedSummary()
+                }
+                takeScreenshot("packed-noisy-export-page-${sampleIndex + 1}.png")
+                dumpHierarchy("packed-noisy-export-page-${sampleIndex + 1}.xml")
+            }
+
+            var longPage: OrientationPackedSummary? = samples.firstOrNull { sample ->
+                longSegments.any { segment -> sample.pageText.contains(segment) }
+            }
+            var tailPage = samples.last()
+            var tailTurns = 0
+            while (
+                tailEntries.none { entry -> tailPage.pageText.contains(entry) } &&
+                tailPage.currentItem < tailPage.itemCount - 1 &&
+                tailTurns < tailPage.itemCount
+            ) {
+                val previousItem = tailPage.currentItem
+                performReaderAccessibilityAction(
+                    scenario = scenario,
+                    action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+                )
+                waitForCondition("expected noisy exported pagination to keep advancing toward tail entries") {
+                    scenario.withActivity { activity ->
+                        (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > previousItem
+                    }
+                }
+                tailPage = scenario.withActivity { activity ->
+                    activity.orientationPackedSummary()
+                }
+                if (longPage == null && longSegments.any { segment -> tailPage.pageText.contains(segment) }) {
+                    longPage = tailPage
+                }
+                tailTurns += 1
+            }
+            takeScreenshot("packed-noisy-export-tail.png")
+            dumpHierarchy("packed-noisy-export-tail.xml")
+
+            val sampleDialogueCounts = samples.map { sample ->
+                dialogueMarkers.count { marker -> sample.pageText.contains(marker) }
+            }
+            val sampleLongSegmentCounts = samples.map { sample ->
+                longSegments.count { segment -> sample.pageText.contains(segment) }
+            }
+            val capturedLongPage = checkNotNull(longPage) {
+                "Expected noisy exported EPUB pagination to expose the long unspaced CJK section before tail entries"
+            }
+            val longPageSegmentCount = longSegments.count { segment -> capturedLongPage.pageText.contains(segment) }
+            val tailEntryCount = tailEntries.count { entry -> tailPage.pageText.contains(entry) }
+            writeTextEvidence(
+                "packed-noisy-export-summary.txt",
+                buildString {
+                    appendLine("heading=$heading")
+                    appendLine("dialogue_marker_count=${dialogueMarkers.size}")
+                    appendLine("long_segment_count=${longSegments.size}")
+                    appendLine("tail_entry_count=${tailEntries.size}")
+                    appendLine("tracked_content_count=$trackedContentCount")
+                    appendLine("blank_paragraph_count=$blankParagraphCount")
+                    appendLine("separator_count=$separatorCount")
+                    appendLine("long_paragraph_has_space=${longParagraph.contains(' ')}")
+                    appendLine("max_packed_page_budget=$maxPackedPageBudget")
+                    appendLine("page_count=${samples.first().itemCount}")
+                    samples.forEachIndexed { index, sample ->
+                        appendLine("sample_${index}_current_item=${sample.currentItem}")
+                        appendLine("sample_${index}_page_progress=${sample.pageProgress}")
+                        appendLine("sample_${index}_dialogue_count=${sampleDialogueCounts[index]}")
+                        appendLine("sample_${index}_long_segment_count=${sampleLongSegmentCounts[index]}")
+                        appendLine("sample_${index}_page_text=${sample.pageText}")
+                    }
+                    appendLine("long_current_item=${capturedLongPage.currentItem}")
+                    appendLine("long_page_progress=${capturedLongPage.pageProgress}")
+                    appendLine("long_segment_count_on_page=$longPageSegmentCount")
+                    appendLine("long_page_text=${capturedLongPage.pageText}")
+                    appendLine("tail_turns=$tailTurns")
+                    appendLine("tail_current_item=${tailPage.currentItem}")
+                    appendLine("tail_page_progress=${tailPage.pageProgress}")
+                    appendLine("tail_entry_count=$tailEntryCount")
+                    appendLine("tail_page_text=${tailPage.pageText}")
+                },
+            )
+
+            assertEquals(0, samples.first().currentItem)
+            assertTrue("expected noisy exported CJK EPUB to produce multiple sampled pages", samples.size >= 2)
+            assertFalse("expected long paragraph to contain no ASCII spaces", longParagraph.contains(' '))
+            assertTrue(
+                "expected noisy exported page count to stay well below tracked content count",
+                samples.first().itemCount in 2..maxPackedPageBudget,
+            )
+            assertTrue(
+                "expected sampled noisy exported pages to never be blank",
+                samples.all { sample -> sample.pageText.isNotBlank() },
+            )
+            assertTrue(
+                "expected the first page to expose heading or multiple dialogue blocks",
+                samples.first().pageText.contains(heading) || sampleDialogueCounts.first() >= 2,
+            )
+            assertTrue(
+                "expected at least one sampled noisy exported page to pack multiple dialogue blocks",
+                sampleDialogueCounts.any { count -> count >= 2 },
+            )
+            assertTrue(
+                "expected long unspaced section to remain readable and packed when reached",
+                longPageSegmentCount >= 4,
+            )
+            assertTrue(
+                "expected short tail entries to remain packed instead of one per page",
+                tailEntryCount >= 2,
+            )
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)
