@@ -7,6 +7,9 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityNodeInfo
@@ -36,6 +39,7 @@ import java.io.File
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlin.math.max
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -455,15 +459,41 @@ class EpubPagedRuntimeSmokeTest {
             takeScreenshot("packed-micro-baseline.png")
             dumpHierarchy("packed-micro-baseline.xml")
 
+            dispatchPinchOut(scenario.withActivity { activity -> activity.findReaderSurface() })
+            waitForCondition("expected EPUB font size preference to increase after pinch preview") {
+                runBlocking { settings.fontSize.first() > 18 }
+            }
+            waitForCondition("expected packed micro-paragraph EPUB page count to stay below paragraph count after pinch") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    itemCount in 1 until lines.size
+                }
+            }
+
+            val afterPinch = scenario.withActivity { activity ->
+                val composePage = checkNotNull(activity.currentEpubComposePageRootOrNull()) {
+                    "Unable to find packed micro-paragraph page after pinch"
+                }
+                PackedMicroAfterPinch(
+                    currentItem = activity.findEpubViewPager()?.pagerCurrentItem() ?: -1,
+                    itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: -1,
+                    pageText = composePage.composeTextSurface().orEmpty(),
+                    pageProgress = composePage.composePageProgressDescription(),
+                    persistedFontSize = runBlocking { settings.fontSize.first() },
+                )
+            }
+            takeScreenshot("packed-micro-after-pinch.png")
+            dumpHierarchy("packed-micro-after-pinch.xml")
+
             performReaderAccessibilityAction(
                 scenario = scenario,
                 action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
             )
             waitForCondition("expected packed micro-paragraph EPUB reader to advance to the next packed page") {
                 scenario.withActivity { activity ->
-                    (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > baseline.currentItem &&
+                    (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > afterPinch.currentItem &&
                         activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
-                            ?.let { it != baseline.pageText } == true
+                            ?.let { it != afterPinch.pageText } == true
                 }
             }
 
@@ -481,6 +511,7 @@ class EpubPagedRuntimeSmokeTest {
             dumpHierarchy("packed-micro-after-next.xml")
 
             val firstPageLineCount = lines.count { line -> baseline.pageText.contains(line) }
+            val afterPinchLineCount = lines.count { line -> afterPinch.pageText.contains(line) }
             val secondPageLineCount = lines.count { line -> afterNext.pageText.contains(line) }
             writeTextEvidence(
                 "packed-micro-summary.txt",
@@ -491,6 +522,12 @@ class EpubPagedRuntimeSmokeTest {
                     appendLine("baseline_page_progress=${baseline.pageProgress}")
                     appendLine("baseline_line_count=$firstPageLineCount")
                     appendLine("baseline_page_text=${baseline.pageText}")
+                    appendLine("after_pinch_current_item=${afterPinch.currentItem}")
+                    appendLine("after_pinch_page_count=${afterPinch.itemCount}")
+                    appendLine("after_pinch_page_progress=${afterPinch.pageProgress}")
+                    appendLine("after_pinch_line_count=$afterPinchLineCount")
+                    appendLine("after_pinch_persisted_font_size_sp=${afterPinch.persistedFontSize}")
+                    appendLine("after_pinch_page_text=${afterPinch.pageText}")
                     appendLine("after_next_current_item=${afterNext.currentItem}")
                     appendLine("after_next_page_progress=${afterNext.pageProgress}")
                     appendLine("after_next_line_count=$secondPageLineCount")
@@ -508,7 +545,19 @@ class EpubPagedRuntimeSmokeTest {
                 "expected the first paged Compose page to contain multiple short paragraphs",
                 firstPageLineCount >= 2,
             )
-            assertTrue(afterNext.currentItem > baseline.currentItem)
+            assertTrue(
+                "expected pinch to increase the persisted EPUB font size",
+                afterPinch.persistedFontSize > 18,
+            )
+            assertTrue(
+                "expected packed paging to stay below paragraph count after typography changes",
+                afterPinch.itemCount in 1 until lines.size,
+            )
+            assertTrue(
+                "expected repaginated page to keep readable packed content",
+                afterPinchLineCount >= 1,
+            )
+            assertTrue(afterNext.currentItem > afterPinch.currentItem)
             assertTrue(
                 "expected the next packed page to contain readable paragraph text",
                 secondPageLineCount >= 1,
@@ -687,6 +736,131 @@ class EpubPagedRuntimeSmokeTest {
 
     private fun takeScreenshot(name: String) {
         device.takeScreenshot(File(evidenceDir(), name))
+    }
+
+    private fun dispatchPinchOut(target: View) {
+        val width = target.width.toFloat().coerceAtLeast(1f)
+        val height = target.height.toFloat().coerceAtLeast(1f)
+        val centerX = width / 2f
+        val centerY = max(height * 0.35f, 120f)
+        val maxHalfSpan = (width / 2f) - 32f
+        val startHalfSpan = max(width * 0.04f, 32f).coerceAtMost(maxHalfSpan)
+        val endHalfSpan = max(width * 0.32f, 180f).coerceAtMost(maxHalfSpan)
+        dispatchPinchGesture(
+            target = target,
+            pointerOneStart = Point(centerX - startHalfSpan, centerY),
+            pointerTwoStart = Point(centerX + startHalfSpan, centerY),
+            pointerOneEnd = Point(centerX - endHalfSpan, centerY),
+            pointerTwoEnd = Point(centerX + endHalfSpan, centerY),
+        )
+    }
+
+    private fun dispatchPinchGesture(
+        target: View,
+        pointerOneStart: Point,
+        pointerTwoStart: Point,
+        pointerOneEnd: Point,
+        pointerTwoEnd: Point,
+        steps: Int = 6,
+    ) {
+        val downTime = SystemClock.uptimeMillis()
+        var eventTime = downTime
+
+        dispatchTouchEvent(
+            target,
+            motionEvent(downTime, eventTime, MotionEvent.ACTION_DOWN, listOf(pointerOneStart)),
+        )
+        eventTime += EVENT_STEP_MS
+        dispatchTouchEvent(
+            target,
+            motionEvent(
+                downTime,
+                eventTime,
+                MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                listOf(pointerOneStart, pointerTwoStart),
+            ),
+        )
+        repeat(steps) { step ->
+            val progress = (step + 1) / steps.toFloat()
+            eventTime += EVENT_STEP_MS
+            dispatchTouchEvent(
+                target,
+                motionEvent(
+                    downTime,
+                    eventTime,
+                    MotionEvent.ACTION_MOVE,
+                    listOf(
+                        pointerOneStart.interpolateTo(pointerOneEnd, progress),
+                        pointerTwoStart.interpolateTo(pointerTwoEnd, progress),
+                    ),
+                ),
+            )
+        }
+        eventTime += EVENT_STEP_MS
+        dispatchTouchEvent(
+            target,
+            motionEvent(
+                downTime,
+                eventTime,
+                MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                listOf(pointerOneEnd, pointerTwoEnd),
+            ),
+        )
+        eventTime += EVENT_STEP_MS
+        dispatchTouchEvent(
+            target,
+            motionEvent(downTime, eventTime, MotionEvent.ACTION_UP, listOf(pointerOneEnd)),
+        )
+    }
+
+    private fun dispatchTouchEvent(target: View, event: MotionEvent) {
+        try {
+            instrumentation.runOnMainSync {
+                target.dispatchTouchEvent(event)
+            }
+        } finally {
+            event.recycle()
+        }
+        instrumentation.waitForIdleSync()
+        device.waitForIdle()
+    }
+
+    private fun motionEvent(
+        downTime: Long,
+        eventTime: Long,
+        action: Int,
+        coordinates: List<Point>,
+    ): MotionEvent {
+        val properties = Array(coordinates.size) { index ->
+            MotionEvent.PointerProperties().apply {
+                id = index
+                toolType = MotionEvent.TOOL_TYPE_FINGER
+            }
+        }
+        val pointerCoords = Array(coordinates.size) { index ->
+            MotionEvent.PointerCoords().apply {
+                x = coordinates[index].x
+                y = coordinates[index].y
+                pressure = 1f
+                size = 1f
+            }
+        }
+        return MotionEvent.obtain(
+            downTime,
+            eventTime,
+            action,
+            coordinates.size,
+            properties,
+            pointerCoords,
+            0,
+            0,
+            1f,
+            1f,
+            0,
+            0,
+            InputDevice.SOURCE_TOUCHSCREEN,
+            0,
+        )
     }
 
     private fun writeTextEvidence(name: String, text: String) {
@@ -920,11 +1094,27 @@ class EpubPagedRuntimeSmokeTest {
         val pageProgress: String?,
     )
 
+    private data class PackedMicroAfterPinch(
+        val currentItem: Int,
+        val itemCount: Int,
+        val pageText: String,
+        val pageProgress: String?,
+        val persistedFontSize: Int,
+    )
+
     private data class PackedMicroAfterNext(
         val currentItem: Int,
         val pageText: String,
         val pageProgress: String?,
     )
+
+    private data class Point(val x: Float, val y: Float) {
+        fun interpolateTo(other: Point, progress: Float): Point =
+            Point(
+                x = x + (other.x - x) * progress,
+                y = y + (other.y - y) * progress,
+            )
+    }
 
     private companion object {
         private const val EPUB_READER_DESC = "阅读内容，捏合调整字号"
@@ -932,6 +1122,7 @@ class EpubPagedRuntimeSmokeTest {
         private const val VIEW_PAGER_CLASS_NAME = "androidx.viewpager2.widget.ViewPager2"
         private const val RECYCLER_VIEW_CLASS_NAME = "androidx.recyclerview.widget.RecyclerView"
         private const val EPUB_ADAPTER_CLASS_NAME = "dev.readflow.render.epub.EpubParaAdapter"
+        private const val EVENT_STEP_MS = 16L
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
         private val DB_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
     }
