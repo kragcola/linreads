@@ -15,4 +15,7 @@ dependencies {
     implementation(project(":extensions:api"))
     implementation(libs.coroutines.core)
     implementation(libs.bundles.koin)
+
+    testImplementation(libs.junit4)
+    testImplementation(libs.coroutines.test)
 }

@@ -10,4 +10,5 @@ import dev.readflow.core.model.ReadflowResult
 interface CalibreRepository {
     suspend fun search(query: String, offset: Int = 0, limit: Int = 100): ReadflowResult<List<BookMeta>>
     suspend fun metadata(bookId: String): ReadflowResult<BookMeta>
+    suspend fun download(bookId: String): ReadflowResult<BookMeta>
 }

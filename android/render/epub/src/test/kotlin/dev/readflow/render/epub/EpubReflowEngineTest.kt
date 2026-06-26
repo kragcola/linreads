@@ -1,0 +1,1737 @@
+package dev.readflow.render.epub
+
+import android.app.Application
+import android.content.Intent
+import android.graphics.drawable.ColorDrawable
+import android.net.Uri
+import android.view.ViewGroup
+import android.widget.ImageView
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.style.TextDecoration
+import dev.readflow.core.model.Locator
+import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.ReaderTextAnnotation
+import dev.readflow.render.api.ReaderTextHighlightRange
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.junit.rules.TemporaryFolder
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
+import java.io.File
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
+@OptIn(ExperimentalCoroutinesApi::class)
+class EpubReflowEngineTest {
+
+    @get:Rule
+    val tempDir = TemporaryFolder()
+
+    private val dispatcher = StandardTestDispatcher()
+
+    @After
+    fun tearDown() {
+        Dispatchers.resetMain()
+    }
+
+    @Test
+    fun `paged runtime can use compose text layout measurement source`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-measured.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>First compose measured paragraph.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        val slice = findTaggedSlice(page)
+
+        assertEquals(EpubPageMeasurement.ComposeTextLayoutResult, slice?.measurement)
+    }
+
+    @Test
+    fun `paged runtime uses real compose text layout measurement by default`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("default-compose-measured.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Default runtime Compose measurement paragraph wraps into visual text layout lines for pagination.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        val slice = findTaggedSlice(page)
+
+        assertEquals(EpubPageMeasurement.ComposeTextLayoutResult, slice?.measurement)
+    }
+
+    @Test
+    fun `paged runtime renders text pages with compose view host`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-page-host.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Compose hosted EPUB paged text.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertNotNull(findView(page, ComposeView::class.java))
+    }
+
+    @Test
+    fun `paged runtime returns compose view as text page root`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-page-root.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Root ComposeView EPUB paged text.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertTrue(page is ComposeView)
+        assertEquals(null, page.contentDescription)
+        assertEquals("第 1 页，共 1 页", page.stateDescription)
+        assertEquals("第 1 页，共 1 页", page.getTag(R.id.epub_compose_page_progress_description))
+        assertEquals(true, page.getTag(R.id.epub_compose_page_root_delegates_accessibility_to_text))
+        assertNotNull(page.tag as? EpubPageSlice)
+    }
+
+    @Test
+    fun `paged runtime exposes compose text surface state`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose surfaced EPUB paged text."
+        val epub = tempDir.newFile("compose-text-surface.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertTrue(page is ComposeView)
+        assertEquals(text, page.getTag(R.id.epub_compose_text_surface))
+    }
+
+    @Test
+    fun `paged runtime makes compose text visible while selection overlay stays non visual`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Visible Compose EPUB paged text."
+        val epub = tempDir.newFile("visible-compose-text-surface.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertTrue(page is ComposeView)
+        assertEquals(true, page.getTag(R.id.epub_compose_text_surface_visible))
+        assertEquals(false, page.getTag(R.id.epub_selection_overlay_visible))
+    }
+
+    @Test
+    fun `paged runtime exposes compose text selection container state`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Selectable Compose EPUB paged text."
+        val epub = tempDir.newFile("compose-selection-container.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(true, page.getTag(R.id.epub_compose_text_selection_enabled))
+        assertEquals(false, page.getTag(R.id.epub_selection_overlay_visible))
+    }
+
+    @Test
+    fun `paged runtime exposes compose text selection callback bridge`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose callback selection for paged EPUB text."
+        val selectionStart = text.indexOf("callback")
+        val selectionEnd = selectionStart + "callback".length
+        val epub = tempDir.newFile("compose-selection-callback.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        assertNotNull(callback)
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(selectionStart to selectionEnd, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(
+            ReaderTextHighlightRange(selectionStart, selectionEnd, EpubComposeSelectionHighlightColor),
+            page.getTag(R.id.epub_compose_text_selection_highlight_range),
+        )
+        assertEquals("callback", engine.currentTextSelection.value?.selectedText)
+    }
+
+    @Test
+    fun `paged runtime mirrors trimmed compose callback selection range into compose state`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Alpha - beta"
+        val selectionStart = text.indexOf("-")
+        val selectionEnd = text.length
+        val trimmedStart = text.indexOf("beta")
+        val epub = tempDir.newFile("compose-selection-trimmed-callback.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        assertNotNull(callback)
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(trimmedStart to selectionEnd, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(
+            ReaderTextHighlightRange(trimmedStart, selectionEnd, EpubComposeSelectionHighlightColor),
+            page.getTag(R.id.epub_compose_text_selection_highlight_range),
+        )
+        assertEquals("beta", engine.currentTextSelection.value?.selectedText)
+    }
+
+    @Test
+    fun `paged runtime keeps compose callback selection on code point boundaries`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "\uD840\uDC00文 selection"
+        val epub = tempDir.newFile("compose-selection-codepoint-boundary.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        assertNotNull(callback)
+        callback?.invoke(0, 1)
+
+        assertEquals(0 to 2, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals("\uD840\uDC00", engine.currentTextSelection.value?.selectedText)
+    }
+
+    @Test
+    fun `paged runtime keeps compose callback selection on combining mark boundaries`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val selectedText = "e\u0301"
+        val text = "Caf${selectedText} selection"
+        val selectionStart = text.indexOf(selectedText)
+        val epub = tempDir.newFile("compose-selection-combining-mark-boundary.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        assertNotNull(callback)
+        callback?.invoke(selectionStart, selectionStart + 1)
+
+        assertEquals(
+            selectionStart to selectionStart + selectedText.length,
+            page.getTag(R.id.epub_compose_text_selection_range),
+        )
+        assertEquals(selectedText, engine.currentTextSelection.value?.selectedText)
+    }
+
+    @Test
+    fun `paged runtime updates compose selection without selection aware text view bridge`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose owns paged EPUB selection without a view bridge."
+        val selectionStart = text.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val reboundSelectionStart = text.indexOf("Compose")
+        val reboundSelectionEnd = reboundSelectionStart + "Compose".length
+        val epub = tempDir.newFile("compose-selection-without-view-bridge.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+        assertNotNull(callback)
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(selectionStart to selectionEnd, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals("selection", engine.currentTextSelection.value?.selectedText)
+
+        engine.setTextAnnotations(emptyList())
+        @Suppress("UNCHECKED_CAST")
+        val reboundCallback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        reboundCallback?.invoke(reboundSelectionStart, reboundSelectionEnd)
+
+        assertEquals(reboundSelectionStart to reboundSelectionEnd, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals("Compose", engine.currentTextSelection.value?.selectedText)
+    }
+
+    @Test
+    fun `paged runtime rebinds active compose page to rebuilt line spacing slice`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Reflowed Compose pages should stop using stale slices after line spacing changes."
+        val epub = tempDir.newFile("compose-rebuilt-line-spacing-slice.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val activePage = engine.createPageView(0)
+        val originalSurface = activePage.getTag(R.id.epub_compose_text_surface) as? String
+
+        engine.setLineSpacing(20f)
+        val freshPage = engine.createPageView(0)
+        val reboundSurface = activePage.getTag(R.id.epub_compose_text_surface) as? String
+        val freshSurface = freshPage.getTag(R.id.epub_compose_text_surface) as? String
+
+        assertTrue(originalSurface.orEmpty().length > freshSurface.orEmpty().length)
+        assertEquals(freshPage.tag, activePage.tag)
+        assertEquals(freshSurface, reboundSurface)
+    }
+
+    @Test
+    fun `paged runtime clears page local compose selection when line spacing rebuilds slices`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Selected Compose text should not survive as stale page local offsets after repagination."
+        val selectionStart = text.indexOf("Compose")
+        val selectionEnd = selectionStart + "Compose".length
+        val epub = tempDir.newFile("compose-selection-cleared-after-repagination.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        callback?.invoke(selectionStart, selectionEnd)
+        engine.setLineSpacing(20f)
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+    }
+
+    @Test
+    fun `paged runtime clears compose selection when page navigation leaves active page`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Selection should clear when paged navigation moves to the next EPUB page. " +
+            (1..240).joinToString(separator = "") { index -> ('a' + (index % 26)).toString() }
+        val selectionStart = text.indexOf("Selection")
+        val selectionEnd = selectionStart + "Selection".length
+        val epub = tempDir.newFile("compose-selection-cleared-after-page-navigation.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        assertTrue(engine.pageCount.value > 1)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        callback?.invoke(selectionStart, selectionEnd)
+        engine.goTo(Locator(LocatorStrategy.Page(1, engine.pageCount.value)))
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+    }
+
+    @Test
+    fun `scroll runtime does not request paged navigation for section goTo`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("scroll-goto-no-paged-request.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>First paragraph.</p><p>Second paragraph.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+        val requestedPages = mutableListOf<Int>()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setPageRequestCallback { requestedPages += it }
+        engine.goTo(Locator(LocatorStrategy.Section(spineIndex = 0, elementIndex = 1, charOffset = 0)))
+
+        assertTrue(requestedPages.isEmpty())
+        val strategy = engine.currentLocator.value.strategy as LocatorStrategy.Section
+        assertEquals(1, strategy.elementIndex)
+    }
+
+    @Test
+    fun `paged runtime retires active compose text page when repagination maps page to image slice`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = (1..30).joinToString(separator = " ") { index -> "word$index" }
+        val epub = tempDir.newFile("compose-text-page-rebound-to-image.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p><img src=\"cover.png\" alt=\"Cover\"/></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        engine.setLineSpacing(40f)
+        assertTrue(engine.pageCount.value > 2)
+        val activeTextPage = engine.createPageView(1)
+        @Suppress("UNCHECKED_CAST")
+        val callback = activeTextPage.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        callback?.invoke(0, 1)
+
+        engine.setLineSpacing(0.1f)
+        val freshImagePage = engine.createPageView(1)
+
+        assertNotNull(findView(freshImagePage, ImageView::class.java))
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(false, activeTextPage.getTag(R.id.epub_compose_text_surface_visible))
+        assertEquals(false, activeTextPage.getTag(R.id.epub_compose_text_selection_enabled))
+        assertEquals(null, activeTextPage.getTag(R.id.epub_compose_text_selection_callback))
+        assertEquals(null, activeTextPage.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, activeTextPage.getTag(R.id.epub_compose_text_selection_highlight_range))
+        assertEquals(null, activeTextPage.getTag(R.id.epub_compose_page_progress_description))
+        assertEquals(false, activeTextPage.getTag(R.id.epub_compose_page_root_delegates_accessibility_to_text))
+        assertEquals(null, activeTextPage.stateDescription)
+    }
+
+    @Test
+    fun `paged runtime updates compose page progress after line spacing rebuilds page count`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = (1..120).joinToString(separator = "") { index -> ('a' + (index % 26)).toString() }
+        val epub = tempDir.newFile("compose-progress-updated-after-repagination.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val activePage = engine.createPageView(0)
+        val originalProgress = activePage.getTag(R.id.epub_compose_page_progress_description) as? String
+
+        engine.setLineSpacing(20f)
+        val freshPage = engine.createPageView(0)
+        val freshProgress = freshPage.getTag(R.id.epub_compose_page_progress_description) as? String
+
+        assertTrue(originalProgress != freshProgress)
+        assertEquals(freshProgress, activePage.getTag(R.id.epub_compose_page_progress_description))
+        assertEquals(freshPage.stateDescription, activePage.stateDescription)
+    }
+
+    @Test
+    fun `paged runtime clears compose selection state for blank compose selection`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Alpha beta"
+        val selectionStart = text.indexOf(" ")
+        val selectionEnd = selectionStart + 1
+        val epub = tempDir.newFile("compose-blank-selection.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+    }
+
+    @Test
+    fun `paged runtime exposes compose text gesture selection wiring`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose gesture selection for paged EPUB text."
+        val epub = tempDir.newFile("compose-selection-gesture.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(true, page.getTag(R.id.epub_compose_text_gesture_selection_wired))
+        assertEquals(true, page.getTag(R.id.epub_compose_text_long_press_selection_wired))
+        assertEquals(true, page.getTag(R.id.epub_compose_text_selection_enabled))
+        assertNotNull(page.getTag(R.id.epub_compose_text_selection_callback))
+    }
+
+    @Test
+    fun `paged runtime avoids selection view bridge while compose gesture text owns foreground`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose gesture foreground for paged EPUB text."
+        val epub = tempDir.newFile("compose-selection-foreground.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+        assertEquals(false, page.getTag(R.id.epub_selection_overlay_behind_compose_text))
+        assertEquals(false, page.getTag(R.id.epub_selection_bridge_hosted_in_compose_tree))
+        assertEquals(true, page.getTag(R.id.epub_compose_text_gesture_selection_wired))
+    }
+
+    @Test
+    fun `paged runtime exposes compose text semantics without transparent overlay accessibility`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Accessible Compose text for paged EPUB reading."
+        val epub = tempDir.newFile("compose-text-accessibility.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+        assertEquals(true, page.getTag(R.id.epub_compose_text_semantics_exposed))
+        assertEquals(true, page.getTag(R.id.epub_selection_overlay_accessibility_hidden))
+    }
+
+    @Test
+    fun `paged runtime keeps selection view bridge absent after compose text rebind`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Accessible rebind Compose text for paged EPUB reading."
+        val highlightStart = text.indexOf("rebind")
+        val highlightEnd = highlightStart + "rebind".length
+        val epub = tempDir.newFile("compose-text-accessibility-rebind.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        engine.setTextAnnotations(
+            listOf(
+                ReaderTextAnnotation(
+                    id = "highlight-rebind",
+                    start = Locator(
+                        strategy = LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 0,
+                            charOffset = highlightStart,
+                        ),
+                    ),
+                    end = Locator(
+                        strategy = LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 0,
+                            charOffset = highlightEnd,
+                        ),
+                    ),
+                    selectedText = "rebind",
+                    note = null,
+                    color = 0x66FFCC00,
+                ),
+            ),
+        )
+
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+        assertEquals(true, page.getTag(R.id.epub_selection_overlay_accessibility_hidden))
+    }
+
+    @Test
+    fun `paged runtime keeps selection view bridge out of touch and focus after compose text rebind`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Bridge only Compose selection overlay for paged EPUB reading."
+        val highlightStart = text.indexOf("Bridge")
+        val highlightEnd = highlightStart + "Bridge".length
+        val epub = tempDir.newFile("compose-text-overlay-touch-bridge.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+
+        engine.setTextAnnotations(
+            listOf(
+                ReaderTextAnnotation(
+                    id = "highlight-bridge",
+                    start = Locator(
+                        strategy = LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 0,
+                            charOffset = highlightStart,
+                        ),
+                    ),
+                    end = Locator(
+                        strategy = LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 0,
+                            charOffset = highlightEnd,
+                        ),
+                    ),
+                    selectedText = "Bridge",
+                    note = null,
+                    color = 0x66FFCC00,
+                ),
+            ),
+        )
+
+        assertEquals(true, page.getTag(R.id.epub_compose_text_gesture_selection_wired))
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+    }
+
+    @Test
+    fun `paged runtime keeps selection view bridge out of native selection while compose callback selects text`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose callback owns paged EPUB selection while the overlay stays inert."
+        val selectionStart = text.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val epub = tempDir.newFile("compose-selection-with-inert-overlay.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+        assertNotNull(callback)
+
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(selectionStart to selectionEnd, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals("selection", engine.currentTextSelection.value?.selectedText)
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+    }
+
+    @Test
+    fun `paged runtime keeps selection view bridge absent while compose surface owns content after rebind`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose surface owns paged EPUB text while the overlay stays empty."
+        val highlightStart = text.indexOf("surface")
+        val highlightEnd = highlightStart + "surface".length
+        val selectionStart = text.indexOf("Compose")
+        val selectionEnd = selectionStart + "Compose".length
+        val epub = tempDir.newFile("compose-text-with-empty-overlay.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+        assertEquals(text, page.getTag(R.id.epub_compose_text_surface))
+
+        engine.setTextAnnotations(
+            listOf(
+                ReaderTextAnnotation(
+                    id = "highlight-empty-overlay",
+                    start = Locator(
+                        strategy = LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 0,
+                            charOffset = highlightStart,
+                        ),
+                    ),
+                    end = Locator(
+                        strategy = LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 0,
+                            charOffset = highlightEnd,
+                        ),
+                    ),
+                    selectedText = "surface",
+                    note = null,
+                    color = 0x66FFCC00,
+                ),
+            ),
+        )
+
+        assertEquals(text, page.getTag(R.id.epub_compose_text_surface))
+        assertEquals(null, page.getTag(R.id.epub_selection_overlay_view))
+
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(selectionStart to selectionEnd, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals("Compose", engine.currentTextSelection.value?.selectedText)
+    }
+
+    @Test
+    fun `paged runtime exposes compose text highlight ranges`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose highlighted EPUB paged text."
+        val highlightStart = text.indexOf("highlighted")
+        val highlightEnd = highlightStart + "highlighted".length
+        val epub = tempDir.newFile("compose-highlighted-text-surface.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setTextAnnotations(
+            listOf(
+                ReaderTextAnnotation(
+                    id = "highlight-1",
+                    start = Locator(
+                        strategy = LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 0,
+                            charOffset = highlightStart,
+                        ),
+                    ),
+                    end = Locator(
+                        strategy = LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 0,
+                            charOffset = highlightEnd,
+                        ),
+                    ),
+                    selectedText = "highlighted",
+                    note = null,
+                    color = 0x66FFCC00,
+                ),
+            ),
+        )
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(
+            listOf(ReaderTextHighlightRange(highlightStart, highlightEnd, 0x66FFCC00)),
+            page.getTag(R.id.epub_compose_text_highlight_ranges),
+        )
+    }
+
+    @Test
+    fun `paged runtime exposes compose text style and layout state`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose blockquote EPUB paged text."
+        val epub = tempDir.newFile("compose-layout-state.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><blockquote>$text</blockquote></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(
+            EpubPageTextStyle(kind = EpubTextKind.Blockquote),
+            page.getTag(R.id.epub_compose_text_style),
+        )
+        assertEquals(
+            EpubComposeTextLayout(
+                paddingStartDp = 46,
+                paddingEndDp = 28,
+                paddingTopDp = 24,
+                paddingBottomDp = 24,
+                horizontalScroll = false,
+            ),
+            page.getTag(R.id.epub_compose_text_layout),
+        )
+    }
+
+    @Test
+    fun `paged runtime exposes compose text link ranges`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-text-links.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Read the <a href="notes.xhtml#n1">note</a>.</p>
+                </body></html>
+            """.trimIndent(),
+            "OEBPS/notes.xhtml" to "<html><body><p id=\"n1\">Linked note.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(
+            listOf(EpubTextLink(start = 9, end = 13, href = "OEBPS/notes.xhtml#n1", isExternal = false)),
+            page.getTag(R.id.epub_compose_text_links),
+        )
+    }
+
+    @Test
+    fun `paged runtime exposes compose link callback that navigates internal links`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-link-callback.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Read the <a href="notes.xhtml#n1">note</a>.</p>
+                </body></html>
+            """.trimIndent(),
+            "OEBPS/notes.xhtml" to "<html><body><p id=\"n1\">Linked note.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+        val requestedPages = mutableListOf<Int>()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        engine.setPageRequestCallback { requestedPages += it }
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_link_callback) as? (EpubTextLink) -> Unit
+        @Suppress("UNCHECKED_CAST")
+        val links = page.getTag(R.id.epub_compose_text_links) as? List<EpubTextLink>
+
+        assertNotNull(callback)
+        assertEquals(true, page.getTag(R.id.epub_compose_text_link_tap_wired))
+
+        callback?.invoke(links.orEmpty().single())
+
+        val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertEquals(1, strategy?.elementIndex)
+        assertEquals(listOf(1), requestedPages)
+    }
+
+    @Test
+    fun `paged runtime exposes compose url annotations for inline links`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-link-annotations.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Read the <a href="notes.xhtml#n1">note</a> and <a href="https://example.com">site</a>.</p>
+                </body></html>
+            """.trimIndent(),
+            "OEBPS/notes.xhtml" to "<html><body><p id=\"n1\">Linked note.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        val annotatedText = page.getTag(R.id.epub_compose_text_annotated_string) as? AnnotatedString
+        assertNotNull(annotatedText)
+        assertEquals("Read the note and site.", annotatedText?.text)
+
+        val annotations = annotatedText
+            ?.getStringAnnotations(tag = "URL", start = 0, end = annotatedText.length)
+            .orEmpty()
+        assertEquals(2, annotations.size)
+        assertEquals("OEBPS/notes.xhtml#n1", annotations[0].item)
+        assertEquals(9, annotations[0].start)
+        assertEquals(13, annotations[0].end)
+        assertEquals("https://example.com", annotations[1].item)
+        assertEquals(18, annotations[1].start)
+        assertEquals(22, annotations[1].end)
+
+        val linkSpans = annotatedText
+            ?.spanStyles
+            .orEmpty()
+            .filter { it.item.textDecoration == TextDecoration.Underline }
+        assertEquals(2, linkSpans.size)
+        assertEquals(9, linkSpans[0].start)
+        assertEquals(13, linkSpans[0].end)
+        assertEquals(18, linkSpans[1].start)
+        assertEquals(22, linkSpans[1].end)
+    }
+
+    @Test
+    fun `paged runtime exposes compose link annotations for inline links`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-link-annotations-native.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Read the <a href="notes.xhtml#n1">note</a> and <a href="https://example.com">site</a>.</p>
+                </body></html>
+            """.trimIndent(),
+            "OEBPS/notes.xhtml" to "<html><body><p id=\"n1\">Linked note.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        val annotatedText = page.getTag(R.id.epub_compose_text_annotated_string) as? AnnotatedString
+        assertNotNull(annotatedText)
+
+        val linkAnnotations = annotatedText
+            ?.getLinkAnnotations(start = 0, end = annotatedText.length)
+            .orEmpty()
+        assertEquals(2, linkAnnotations.size)
+        assertEquals(9, linkAnnotations[0].start)
+        assertEquals(13, linkAnnotations[0].end)
+        assertEquals("OEBPS/notes.xhtml#n1", (linkAnnotations[0].item as? LinkAnnotation.Url)?.url)
+        assertEquals(TextDecoration.Underline, linkAnnotations[0].item.styles?.style?.textDecoration)
+        assertEquals(18, linkAnnotations[1].start)
+        assertEquals(22, linkAnnotations[1].end)
+        assertEquals("https://example.com", (linkAnnotations[1].item as? LinkAnnotation.Url)?.url)
+        assertEquals(TextDecoration.Underline, linkAnnotations[1].item.styles?.style?.textDecoration)
+    }
+
+    @Test
+    fun `paged runtime exposes compose link annotation listener for internal links`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-link-annotation-listener.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Read the <a href="notes.xhtml#n1">note</a>.</p>
+                </body></html>
+            """.trimIndent(),
+            "OEBPS/notes.xhtml" to "<html><body><p id=\"n1\">Linked note.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+        val requestedPages = mutableListOf<Int>()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        engine.setPageRequestCallback { requestedPages += it }
+        val page = engine.createPageView(0)
+
+        val annotatedText = page.getTag(R.id.epub_compose_text_annotated_string) as? AnnotatedString
+        assertNotNull(annotatedText)
+        val linkAnnotation = annotatedText
+            ?.getLinkAnnotations(start = 0, end = annotatedText.length)
+            .orEmpty()
+            .single()
+            .item as? LinkAnnotation.Url
+        assertNotNull(linkAnnotation?.linkInteractionListener)
+
+        linkAnnotation?.linkInteractionListener?.onClick(linkAnnotation)
+
+        val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertEquals(1, strategy?.elementIndex)
+        assertEquals(listOf(1), requestedPages)
+    }
+
+    @Test
+    fun `paged runtime internal links can target image fragments`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-link-image-fragment.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Read the <a href="notes.xhtml#scene">scene</a>.</p>
+                </body></html>
+            """.trimIndent(),
+            "OEBPS/notes.xhtml" to """
+                <html><body>
+                  <p>Q</p>
+                  <img id="scene" src="scene.png" alt="Scene"/>
+                  <p>R</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+        )
+        val requestedPages = mutableListOf<Int>()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        engine.setPageRequestCallback { requestedPages += it }
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_link_callback) as? (EpubTextLink) -> Unit
+        @Suppress("UNCHECKED_CAST")
+        val links = page.getTag(R.id.epub_compose_text_links) as? List<EpubTextLink>
+
+        callback?.invoke(links.orEmpty().single())
+
+        val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertEquals(1, strategy?.spineIndex)
+        assertEquals(1, strategy?.elementIndex)
+        assertEquals(1, strategy?.charOffset)
+        val textPageIndex = engine.pageIndexForLocator(
+            Locator(
+                LocatorStrategy.Section(
+                    spineIndex = 1,
+                    elementIndex = 1,
+                    charOffset = 0,
+                ),
+            ),
+        )
+        val imagePageIndex = engine.pageIndexForLocator(engine.currentLocator.value)
+        assertTrue(imagePageIndex > textPageIndex)
+        assertEquals(listOf(imagePageIndex), requestedPages)
+        assertNull(findView(engine.createPageView(textPageIndex), ImageView::class.java))
+        assertNotNull(findView(engine.createPageView(imagePageIndex), ImageView::class.java))
+    }
+
+    @Test
+    fun `paged runtime starts on image only cover spine without blank text page`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("image-only-cover-spine.epub")
+        writeEpub(
+            epub,
+            "OEBPS/cover.xhtml" to """
+                <html><body>
+                  <img id="cover-art" src="cover.png" alt="Cover art"/>
+                </body></html>
+            """.trimIndent(),
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Chapter one text.</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+
+        val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertEquals(0, strategy?.spineIndex)
+        assertEquals(0, strategy?.elementIndex)
+        assertEquals(0, strategy?.charOffset)
+        assertNotNull(findView(engine.createPageView(0), ImageView::class.java))
+        assertNull(findView(engine.createPageView(1), ImageView::class.java))
+    }
+
+    @Test
+    fun `paged runtime ignores stale compose link activation after switching to scroll mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-stale-link-activation.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Visit the <a href="https://example.com">site</a>.</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_link_callback) as? (EpubTextLink) -> Unit
+        @Suppress("UNCHECKED_CAST")
+        val links = page.getTag(R.id.epub_compose_text_links) as? List<EpubTextLink>
+        val annotatedText = page.getTag(R.id.epub_compose_text_annotated_string) as? AnnotatedString
+        val linkAnnotation = annotatedText
+            ?.getLinkAnnotations(start = 0, end = annotatedText.length)
+            .orEmpty()
+            .single()
+            .item as? LinkAnnotation.Url
+
+        assertNotNull(callback)
+        assertNotNull(linkAnnotation?.linkInteractionListener)
+
+        engine.setMode(ReadingMode.SCROLL)
+        callback?.invoke(links.orEmpty().single())
+        linkAnnotation?.linkInteractionListener?.onClick(linkAnnotation)
+
+        assertEquals(null, shadowOf(context).nextStartedActivity)
+    }
+
+    @Test
+    fun `paged runtime clears compose selection when link navigation leaves active page`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-link-selection-cleanup.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Read the <a href="notes.xhtml#n1">note</a> after selecting text.</p>
+                </body></html>
+            """.trimIndent(),
+            "OEBPS/notes.xhtml" to "<html><body><p id=\"n1\">Linked note.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val selectionCallback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        @Suppress("UNCHECKED_CAST")
+        val linkCallback = page.getTag(R.id.epub_compose_text_link_callback) as? (EpubTextLink) -> Unit
+        @Suppress("UNCHECKED_CAST")
+        val links = page.getTag(R.id.epub_compose_text_links) as? List<EpubTextLink>
+
+        selectionCallback?.invoke(0, 4)
+        assertEquals("Read", engine.currentTextSelection.value?.selectedText)
+
+        linkCallback?.invoke(links.orEmpty().single())
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+    }
+
+    @Test
+    fun `paged runtime clears compose selection when external link opens intent`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-external-link-selection-cleanup.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Visit the <a href="https://example.com">site</a> after selecting text.</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val selectionCallback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        @Suppress("UNCHECKED_CAST")
+        val linkCallback = page.getTag(R.id.epub_compose_text_link_callback) as? (EpubTextLink) -> Unit
+        @Suppress("UNCHECKED_CAST")
+        val links = page.getTag(R.id.epub_compose_text_links) as? List<EpubTextLink>
+
+        selectionCallback?.invoke(0, 5)
+        assertEquals("Visit", engine.currentTextSelection.value?.selectedText)
+
+        linkCallback?.invoke(links.orEmpty().single())
+
+        val intent = shadowOf(context).nextStartedActivity
+        assertEquals(Intent.ACTION_VIEW, intent.action)
+        assertEquals(Uri.parse("https://example.com"), intent.data)
+        assertTrue(intent.flags and Intent.FLAG_ACTIVITY_NEW_TASK != 0)
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+    }
+
+    @Test
+    fun `paged runtime mirrors compose callback selection range into compose state`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose selection state for paged EPUB text."
+        val selectionStart = text.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val epub = tempDir.newFile("compose-selection-state.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        assertNotNull(callback)
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(selectionStart to selectionEnd, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals("selection", engine.currentTextSelection.value?.selectedText)
+    }
+
+    @Test
+    fun `paged runtime exposes compose selection highlight range`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose selection highlight for paged EPUB text."
+        val selectionStart = text.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val epub = tempDir.newFile("compose-selection-highlight.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(
+            ReaderTextHighlightRange(selectionStart, selectionEnd, EpubComposeSelectionHighlightColor),
+            page.getTag(R.id.epub_compose_text_selection_highlight_range),
+        )
+    }
+
+    @Test
+    fun `paged runtime clears compose selection range with engine selection`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose selection clearing for paged EPUB text."
+        val selectionStart = text.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val epub = tempDir.newFile("compose-selection-clear.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+
+        callback?.invoke(selectionStart, selectionEnd)
+        engine.clearTextSelection()
+
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+        assertEquals(null, engine.currentTextSelection.value)
+    }
+
+    @Test
+    fun `paged runtime clears compose selection when opening another book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstText = "Compose selection must not leak into the next EPUB book."
+        val selectionStart = firstText.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val firstEpub = tempDir.newFile("compose-selection-first-book.epub")
+        val secondEpub = tempDir.newFile("compose-selection-second-book.epub")
+        writeEpub(
+            firstEpub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$firstText</p></body></html>",
+        )
+        writeEpub(
+            secondEpub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Second book has a clean selection state.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(firstEpub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        callback?.invoke(selectionStart, selectionEnd)
+
+        engine.openBook(Uri.fromFile(secondEpub))
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(null, engine.currentTextSelection.value)
+    }
+
+    @Test
+    fun `paged runtime clears compose text page state when closing book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose selection must not survive after closing the EPUB book."
+        val selectionStart = text.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val epub = tempDir.newFile("compose-selection-close-book.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        callback?.invoke(selectionStart, selectionEnd)
+
+        engine.close()
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(false, page.getTag(R.id.epub_compose_text_surface_visible))
+        assertEquals(false, page.getTag(R.id.epub_compose_text_selection_enabled))
+        assertEquals(false, page.getTag(R.id.epub_compose_text_semantics_exposed))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_callback))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(null, engine.currentTextSelection.value)
+    }
+
+    @Test
+    fun `paged runtime clears book progress state when closing book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("close-clears-book-progress.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one text.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two text.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+
+        assertTrue(engine.pageCount.value > 0)
+        assertTrue(engine.tableOfContents.value.isNotEmpty())
+        assertTrue(engine.currentLocator.value.strategy is LocatorStrategy.Section)
+
+        engine.close()
+
+        assertEquals(0, engine.pageCount.value)
+        assertEquals(LocatorStrategy.Unknown, engine.currentLocator.value.strategy)
+        assertEquals(0, engine.chapterInfo.value.currentIndex)
+        assertEquals(1, engine.chapterInfo.value.totalChapters)
+        assertEquals("", engine.chapterInfo.value.currentTitle)
+        assertEquals(0f, engine.chapterInfo.value.progressInChapter)
+        assertTrue(engine.tableOfContents.value.isEmpty())
+    }
+
+    @Test
+    fun `paged runtime clears compose selection when switching to scroll mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose selection must not survive when the EPUB reader switches modes."
+        val selectionStart = text.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val epub = tempDir.newFile("compose-selection-mode-switch.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        callback?.invoke(selectionStart, selectionEnd)
+
+        engine.setMode(ReadingMode.SCROLL)
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+    }
+
+    @Test
+    fun `paged runtime ignores stale compose selection callback after switching to scroll mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose selection callback must not write after switching to scroll mode."
+        val selectionStart = text.indexOf("selection")
+        val selectionEnd = selectionStart + "selection".length
+        val epub = tempDir.newFile("compose-selection-stale-mode-callback.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        callback?.invoke(selectionStart, selectionEnd)
+
+        engine.setMode(ReadingMode.SCROLL)
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+    }
+
+    @Test
+    fun `paged runtime clears compose page progress semantics when switching to scroll mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("compose-page-progress-mode-switch.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Compose page progress should retire with paged text.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals("第 1 页，共 1 页", page.getTag(R.id.epub_compose_page_progress_description))
+        assertEquals(true, page.getTag(R.id.epub_compose_page_root_delegates_accessibility_to_text))
+        assertEquals("第 1 页，共 1 页", page.stateDescription)
+
+        engine.setMode(ReadingMode.SCROLL)
+
+        assertEquals(null, page.getTag(R.id.epub_compose_page_progress_description))
+        assertEquals(false, page.getTag(R.id.epub_compose_page_root_delegates_accessibility_to_text))
+        assertEquals(null, page.stateDescription)
+    }
+
+    @Test
+    fun `paged runtime clears compose text page state when switching to scroll mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val text = "Compose text page state must not survive after switching to scroll mode."
+        val selectionStart = text.indexOf("text")
+        val selectionEnd = selectionStart + "text".length
+        val epub = tempDir.newFile("compose-page-state-mode-switch.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        callback?.invoke(selectionStart, selectionEnd)
+
+        engine.setMode(ReadingMode.SCROLL)
+
+        assertEquals(null, engine.currentTextSelection.value)
+        assertEquals(false, page.getTag(R.id.epub_compose_text_surface_visible))
+        assertEquals(false, page.getTag(R.id.epub_compose_text_selection_enabled))
+        assertEquals(false, page.getTag(R.id.epub_compose_text_gesture_selection_wired))
+        assertEquals(false, page.getTag(R.id.epub_compose_text_long_press_selection_wired))
+        assertEquals(false, page.getTag(R.id.epub_compose_text_semantics_exposed))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_callback))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(null, page.getTag(R.id.epub_compose_text_selection_highlight_range))
+
+        callback?.invoke(selectionStart, selectionEnd)
+
+        assertEquals(null, engine.currentTextSelection.value)
+    }
+
+    @Test
+    fun `paged runtime clears image page accessibility state when switching to scroll mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("image-page-state-mode-switch.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Text before the image.</p><img src=\"cover.png\" alt=\"Cover art\"/></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val imagePage = (0 until engine.pageCount.value)
+            .map { pageIndex -> engine.createPageView(pageIndex) }
+            .first { page -> findView(page, ImageView::class.java) != null }
+        val imageView = findView(imagePage, ImageView::class.java)
+
+        assertNotNull(imageView)
+        assertTrue(imageView?.contentDescription?.contains("Cover art") == true)
+
+        engine.setMode(ReadingMode.SCROLL)
+
+        assertEquals(null, imageView?.contentDescription)
+    }
+
+    @Test
+    fun `paged runtime clears image page drawable state when switching to scroll mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("image-page-drawable-mode-switch.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Text before the image.</p><img src=\"cover.png\" alt=\"Cover art\"/></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val imagePage = (0 until engine.pageCount.value)
+            .map { pageIndex -> engine.createPageView(pageIndex) }
+            .first { page -> findView(page, ImageView::class.java) != null }
+        val imageView = findView(imagePage, ImageView::class.java)
+        imageView?.setImageDrawable(ColorDrawable(0xFFFF0000.toInt()))
+
+        assertNotNull(imageView?.drawable)
+
+        engine.setMode(ReadingMode.SCROLL)
+
+        assertEquals(null, imageView?.drawable)
+    }
+
+    @Test
+    fun `paged runtime updates active image page progress after page count changes`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val trailingText = (1..160).joinToString(separator = " ") { index -> "tail$index" }
+        val epub = tempDir.newFile("image-page-progress-after-repagination.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to
+                "<html><body><p>G</p><img src=\"cover.png\" alt=\"Cover art\"/><p>$trailingText</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val activeImagePage = engine.createPageView(1)
+        val activeImageView = findView(activeImagePage, ImageView::class.java)
+        val originalDescription = activeImageView?.contentDescription?.toString()
+
+        engine.setLineSpacing(20f)
+        val freshImagePage = engine.createPageView(1)
+        val freshImageView = findView(freshImagePage, ImageView::class.java)
+
+        assertNotNull(activeImageView)
+        assertNotNull(freshImageView)
+        assertTrue(originalDescription != freshImageView?.contentDescription?.toString())
+        assertEquals(freshImageView?.contentDescription, activeImageView?.contentDescription)
+    }
+
+    private fun findTaggedSlice(view: android.view.View): EpubPageSlice? {
+        (view.tag as? EpubPageSlice)?.let { return it }
+        val group = view as? ViewGroup ?: return null
+        for (index in 0 until group.childCount) {
+            findTaggedSlice(group.getChildAt(index))?.let { return it }
+        }
+        return null
+    }
+
+    private fun <T : android.view.View> findView(view: android.view.View, type: Class<T>): T? {
+        if (type.isInstance(view)) return type.cast(view)
+        val group = view as? ViewGroup ?: return null
+        for (index in 0 until group.childCount) {
+            findView(group.getChildAt(index), type)?.let { return it }
+        }
+        return null
+    }
+
+    private fun oneCharacterPerLineMeasurer() =
+        EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+            text.indices.map { index -> EpubTextLayoutLineRange(index, index + 1) }
+        }
+
+    private fun writeEpub(file: File, vararg spineEntries: Pair<String, String>) {
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, content: String) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(content.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+
+            add(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            add(
+                "OEBPS/content.opf",
+                buildString {
+                    appendLine("<package version=\"3.0\">")
+                    appendLine("  <manifest>")
+                    spineEntries.forEachIndexed { index, (path, _) ->
+                        appendLine("    <item id=\"c$index\" href=\"${path.removePrefix("OEBPS/")}\" media-type=\"application/xhtml+xml\"/>")
+                    }
+                    appendLine("  </manifest>")
+                    appendLine("  <spine>")
+                    spineEntries.forEachIndexed { index, _ ->
+                        appendLine("    <itemref idref=\"c$index\"/>")
+                    }
+                    appendLine("  </spine>")
+                    appendLine("</package>")
+                },
+            )
+            spineEntries.forEach { (path, content) -> add(path, content) }
+        }
+    }
+}

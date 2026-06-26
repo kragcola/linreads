@@ -28,12 +28,22 @@ class NoTransitionHost(
 
     override fun setTransition(type: TransitionType) { /* no-op: continuous scroll */ }
     override fun setOffscreenPageLimit(limit: Int) { /* no-op */ }
-    override suspend fun next() { /* no-op: scrolling is user-driven */ }
-    override suspend fun previous() { /* no-op */ }
+    override suspend fun next() = moveBy(+1)
+    override suspend fun previous() = moveBy(-1)
     override fun setOnPageSettled(callback: (pageIndex: Int) -> Unit) { /* no-op */ }
 
     override fun unbind() {
         container.removeAllViews()
         engine = null
+    }
+
+    private suspend fun moveBy(delta: Int) {
+        val activeEngine = engine ?: return
+        val target = moveLocatorBy(
+            locator = activeEngine.currentLocator.value,
+            totalItems = activeEngine.pageCount.value,
+            delta = delta,
+        ) ?: return
+        activeEngine.goTo(target)
     }
 }

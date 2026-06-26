@@ -16,6 +16,7 @@ import dev.readflow.features.library.LibraryScreen
 @Composable
 fun ReadflowApp(
     incomingBookUri: Uri? = null,
+    incomingBookMimeType: String? = null,
     onIncomingBookConsumed: () -> Unit = {},
 ) {
     LaunchedEffect(incomingBookUri) {

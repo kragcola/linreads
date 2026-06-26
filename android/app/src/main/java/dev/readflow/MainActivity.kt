@@ -13,15 +13,20 @@ import dev.readflow.ui.ReadflowApp
 
 class MainActivity : ComponentActivity() {
     private var incomingBookUri: Uri? by mutableStateOf(null)
+    private var incomingBookMimeType: String? by mutableStateOf(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        incomingBookUri = intent.extractIncomingBookUri()
+        updateIncomingBook(intent)
         enableEdgeToEdge()
         setContent {
             ReadflowApp(
                 incomingBookUri = incomingBookUri,
-                onIncomingBookConsumed = { incomingBookUri = null },
+                incomingBookMimeType = incomingBookMimeType,
+                onIncomingBookConsumed = {
+                    incomingBookUri = null
+                    incomingBookMimeType = null
+                },
             )
         }
     }
@@ -29,6 +34,11 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        updateIncomingBook(intent)
+    }
+
+    private fun updateIncomingBook(intent: Intent) {
         incomingBookUri = intent.extractIncomingBookUri()
+        incomingBookMimeType = if (incomingBookUri != null) intent.type else null
     }
 }

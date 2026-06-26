@@ -5,6 +5,7 @@ import android.view.View
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
+import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,6 +15,11 @@ import kotlinx.coroutines.flow.asStateFlow
 enum class ReadingMode { SCROLL, PAGED }
 
 enum class PagingKind { PAGED, CONTINUOUS }
+
+fun PagingKind.toReadingMode(): ReadingMode = when (this) {
+    PagingKind.PAGED -> ReadingMode.PAGED
+    PagingKind.CONTINUOUS -> ReadingMode.SCROLL
+}
 
 /**
  * THREADING CONTRACT (v4 §5.1, P0-C):
@@ -27,6 +33,8 @@ interface ReaderEngine {
     val format: BookFormat
     val priority: Int
     val pagingKind: StateFlow<PagingKind>
+    val supportedModes: Set<ReadingMode>
+        get() = setOf(pagingKind.value.toReadingMode())
     val supportsSearch: Boolean
     suspend fun supports(uri: Uri): Boolean
 
@@ -60,6 +68,7 @@ interface ReaderEngine {
 
     // Layout control (reflow formats)
     suspend fun setFontSize(sp: Float)
+    suspend fun setLineSpacing(multiplier: Float) {}
     suspend fun setTheme(mode: ThemeMode) {}
     suspend fun setMode(mode: ReadingMode)
 
@@ -68,4 +77,32 @@ interface ReaderEngine {
     fun onViewDetached(view: View) {}
     suspend fun saveState(): ByteArray = ByteArray(0)
     suspend fun restoreState(state: ByteArray) {}
+}
+
+/**
+ * Optional capability for fixed-page engines that can provide one independent
+ * page view at a time. ViewPager2 hosts use this without forcing reflow engines
+ * into page rendering before they are ready.
+ */
+interface PagedReaderEngine : ReaderEngine {
+    fun createPageView(pageIndex: Int): View
+    fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?)
+
+    fun pageIndexForLocator(locator: Locator): Int {
+        val total = pageCount.value.coerceAtLeast(1)
+        val index = when (val strategy = locator.strategy) {
+            is LocatorStrategy.Page -> strategy.index
+            is LocatorStrategy.Section -> strategy.elementIndex
+            is LocatorStrategy.ByteOffset,
+            LocatorStrategy.Unknown,
+            -> locator.totalProgression?.let { (it * total).toInt() } ?: 0
+        }
+        return index.coerceIn(0, total - 1)
+    }
+}
+
+/** Optional capability for fixed-layout engines that support transient matrix zoom. */
+interface ZoomableReaderEngine : ReaderEngine {
+    val zoomScale: StateFlow<Float>
+    suspend fun setZoom(scale: Float)
 }

@@ -63,7 +63,14 @@ private fun Intent.streamUriStrings(): List<String> {
     val stream = extras?.get(Intent.EXTRA_STREAM) ?: return emptyList()
     return when (stream) {
         is Uri -> listOf(stream.toString())
-        is ArrayList<*> -> stream.filterIsInstance<Uri>().map { it.toString() }
+        is String -> listOf(stream)
+        is ArrayList<*> -> stream.mapNotNull {
+            when (it) {
+                is Uri -> it.toString()
+                is String -> it
+                else -> null
+            }
+        }
         else -> emptyList()
     }
 }

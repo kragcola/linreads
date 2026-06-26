@@ -1,13 +1,27 @@
 package dev.readflow.di
 
 import androidx.room.Room
+import dev.readflow.core.calibre.CalibreEndpointProbe
+import dev.readflow.core.calibre.CalibreConnectionTester
+import dev.readflow.core.calibre.CalibreClient
+import dev.readflow.core.calibre.CalibreRepository
+import dev.readflow.core.calibre.CalibreRepositoryImpl
+import dev.readflow.core.calibre.GuidedCalibreEndpointProbe
+import dev.readflow.core.calibre.createCalibreConnectionTester
 import dev.readflow.core.database.LibraryRepository
+import dev.readflow.core.database.LibraryStore
+import dev.readflow.core.database.LinReadsBackupExportStore
+import dev.readflow.core.database.LinReadsBackupExporter
+import dev.readflow.core.database.LinReadsBackupRestoreStore
+import dev.readflow.core.database.LinReadsBackupRestorer
 import dev.readflow.core.database.ReadflowDatabase
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.sync.NoOpSyncBackend
 import dev.readflow.core.sync.SyncBackend
 import dev.readflow.core.sync.SyncManager
+import dev.readflow.engine.AndroidEngineStateStore
 import dev.readflow.extensions.api.FirstLaunchSeeder
+import dev.readflow.extensions.api.LocalBookImporter
 import dev.readflow.extensions.api.LocalFileBookSource
 import dev.readflow.extensions.api.ReaderEventBus
 import dev.readflow.features.library.LibraryViewModel
@@ -17,6 +31,7 @@ import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.features.settings.SettingsViewModel
 import dev.readflow.render.animate.DefaultPageTransitionHostFactory
 import dev.readflow.render.api.EngineDescriptor
+import dev.readflow.render.api.EngineStateStore
 import dev.readflow.render.api.PageTransitionHostFactory
 import dev.readflow.render.api.ReaderEngineRegistry
 import dev.readflow.render.epub.EpubReflowEngine
@@ -31,6 +46,7 @@ import kotlinx.coroutines.launch
 import org.koin.android.ext.koin.androidContext
 import org.koin.core.module.dsl.viewModel
 import org.koin.core.qualifier.named
+import java.io.File
 import org.koin.dsl.module
 
 val coreModule = module {
@@ -42,7 +58,7 @@ val coreModule = module {
 val databaseModule = module {
     single {
         Room.databaseBuilder(androidContext(), ReadflowDatabase::class.java, "readflow.db")
-            .fallbackToDestructiveMigration()
+            .fallbackToDestructiveMigration(dropAllTables = true)
             .build()
     }
     single { get<ReadflowDatabase>().bookDao() }
@@ -51,10 +67,14 @@ val databaseModule = module {
     single { get<ReadflowDatabase>().inkStrokeDao() }
     single { get<ReadflowDatabase>().bookmarkDao() }
     single { LibraryRepository(get()) }
+    single<LibraryStore> { get<LibraryRepository>() }
+    single<LinReadsBackupExportStore> { LinReadsBackupExporter(get(), get(), get()) }
+    single<LinReadsBackupRestoreStore> { LinReadsBackupRestorer(get(), get(), get()) }
 }
 
 val extensionsModule = module {
     single { LocalFileBookSource(androidContext()) }
+    single<LocalBookImporter> { get<LocalFileBookSource>() }
     single { FirstLaunchSeeder(androidContext(), get(), get()) }
 }
 
@@ -119,16 +139,27 @@ val renderModule = module {
         )
     }
     single<PageTransitionHostFactory> { DefaultPageTransitionHostFactory(androidContext()) }
+    single<EngineStateStore> { AndroidEngineStateStore(androidContext().cacheDir) }
 }
 
 val settingsModule = module {
     single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
+    single<CalibreConnectionTester> { createCalibreConnectionTester() }
+    single<CalibreEndpointProbe> { GuidedCalibreEndpointProbe(get()) }
+    single<(String) -> CalibreRepository> {
+        { baseUrl ->
+            CalibreRepositoryImpl(
+                client = CalibreClient(baseUrl),
+                booksDir = File(androidContext().filesDir, "books"),
+            )
+        }
+    }
 }
 
 val featureModule = module {
-    viewModel { LibraryViewModel(get(), get(), get()) }
-    viewModel { SettingsViewModel(get()) }
-    viewModel { ReaderViewModel(get(), get(), get(), get(), get(), get()) }
+    viewModel { LibraryViewModel(get(), get(), get(), get()) }
+    viewModel { SettingsViewModel(get(), get(), get(), get(), get(), get()) }
+    viewModel { ReaderViewModel(get(), get(), get(), get(), get(), get(), get(), get(), get(), get()) }
 }
 
 val appModules = listOf(coreModule, databaseModule, extensionsModule, renderModule, settingsModule, featureModule)

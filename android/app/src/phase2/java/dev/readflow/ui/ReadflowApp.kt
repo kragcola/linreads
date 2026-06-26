@@ -43,6 +43,7 @@ import org.koin.core.context.GlobalContext
 @Composable
 fun ReadflowApp(
     incomingBookUri: Uri? = null,
+    incomingBookMimeType: String? = null,
     onIncomingBookConsumed: () -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -83,8 +84,7 @@ fun ReadflowApp(
 
         LaunchedEffect(incomingBookUri) {
             val uri = incomingBookUri ?: return@LaunchedEffect
-            onIncomingBookConsumed()
-            when (val result = localSource.import(uri)) {
+            when (val result = localSource.import(uri, incomingBookMimeType)) {
                 is ReadflowResult.Success -> {
                     val book = result.value.first
                     libraryRepository.upsertBook(book)
@@ -96,6 +96,7 @@ fun ReadflowApp(
                     incomingImportError = result.error.message
                 }
             }
+            onIncomingBookConsumed()
         }
 
         NavHost(navController = navController, startDestination = "library") {

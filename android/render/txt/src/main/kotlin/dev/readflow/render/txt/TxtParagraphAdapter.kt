@@ -8,6 +8,9 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
+import dev.readflow.render.api.ReaderTextHighlightRange
+import dev.readflow.render.api.SelectionAwareTextView
+import dev.readflow.render.api.withTextHighlightSpans
 
 /**
  * Renders one paragraph per row. 排版按设计文档 §1.3：宋体（serif 占位，思源宋体待打包）、
@@ -15,19 +18,23 @@ import androidx.recyclerview.widget.RecyclerView
  * 两侧留纸边，不铺满。横向内边距舒适。
  */
 class TxtParagraphAdapter(
-    private val paragraphs: List<String>,
+    private val paragraphCount: Int,
+    private val paragraphProvider: (Int) -> String,
     private var fontSizeSp: Float,
+    private var lineSpacingMultiplier: Float,
     private var inkColor: Int = INK_DAY,
+    private val highlightRangesProvider: (paragraphIndex: Int) -> List<ReaderTextHighlightRange> = { emptyList() },
+    private val onSelectionChanged: (paragraphIndex: Int, start: Int, end: Int) -> Unit = { _, _, _ -> },
 ) : RecyclerView.Adapter<TxtParagraphAdapter.ParagraphHolder>() {
 
-    class ParagraphHolder(val container: FrameLayout, val textView: TextView) :
+    class ParagraphHolder(val container: FrameLayout, val textView: SelectionAwareTextView) :
         RecyclerView.ViewHolder(container)
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ParagraphHolder {
         val density = parent.resources.displayMetrics.density
         val maxLineWidthPx = (MAX_LINE_WIDTH_DP * density).toInt()
 
-        val tv = TextView(parent.context).apply {
+        val tv = SelectionAwareTextView(parent.context).apply {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -36,10 +43,11 @@ class TxtParagraphAdapter(
             val padH = (24 * density).toInt()
             val padV = (10 * density).toInt()
             setPadding(padH, padV, padH, padV)
-            setLineSpacing(0f, 1.75f)
+            setLineSpacing(0f, lineSpacingMultiplier)
             gravity = Gravity.START
             setTextColor(inkColor)
             typeface = Typeface.SERIF
+            setTextIsSelectable(true)
         }
         val container = FrameLayout(parent.context).apply {
             layoutParams = RecyclerView.LayoutParams(
@@ -53,19 +61,33 @@ class TxtParagraphAdapter(
 
     override fun onBindViewHolder(holder: ParagraphHolder, position: Int) {
         holder.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
+        holder.textView.setLineSpacing(0f, lineSpacingMultiplier)
         holder.textView.setTextColor(inkColor)
-        holder.textView.text = paragraphs[position]
+        holder.textView.text = paragraphProvider(position)
+            .withTextHighlightSpans(highlightRangesProvider(position))
+        holder.textView.onSelectionRangeChanged = { start, end ->
+            onSelectionChanged(position, start, end)
+        }
     }
 
-    override fun getItemCount(): Int = paragraphs.size
+    override fun getItemCount(): Int = paragraphCount
 
     fun updateFontSize(sp: Float) {
         fontSizeSp = sp
         notifyDataSetChanged()
     }
 
+    fun updateLineSpacing(multiplier: Float) {
+        lineSpacingMultiplier = multiplier
+        notifyDataSetChanged()
+    }
+
     fun updateInkColor(color: Int) {
         inkColor = color
+        notifyDataSetChanged()
+    }
+
+    fun updateTextAnnotations() {
         notifyDataSetChanged()
     }
 

@@ -4,6 +4,12 @@ plugins {
 
 android {
     namespace = "dev.readflow.features.reader"
+
+    testOptions {
+        unitTests.all {
+            it.useJUnitPlatform()
+        }
+    }
 }
 
 dependencies {
@@ -16,4 +22,10 @@ dependencies {
     implementation(libs.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.bundles.koin)
+
+    testImplementation(libs.junit5)
+    testImplementation(libs.junit4)
+    testRuntimeOnly(libs.junit.vintage)
+    testImplementation(libs.coroutines.test)
+    testImplementation(libs.robolectric)
 }

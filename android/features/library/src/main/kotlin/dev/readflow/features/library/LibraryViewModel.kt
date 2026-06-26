@@ -4,15 +4,16 @@ import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import dev.readflow.core.calibre.CalibreClient
-import dev.readflow.core.calibre.CalibreRepositoryImpl
-import dev.readflow.core.database.LibraryRepository
+import dev.readflow.core.calibre.CalibreRepository
+import dev.readflow.core.database.LibraryStore
 import dev.readflow.core.model.BookBundle
+import dev.readflow.core.model.BookMeta
+import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.extensions.api.FolderScanner
-import dev.readflow.extensions.api.LocalFileBookSource
+import dev.readflow.extensions.api.LocalBookImporter
 import dev.readflow.extensions.api.ScannedBook
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -22,11 +23,25 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+
+enum class LibraryFilter { ALL, OFFLINE }
 
 data class LibraryUiState(
     val isLoading: Boolean = false,
     val items: List<LibraryItem> = emptyList(),
+    val error: String? = null,
+    val filter: LibraryFilter = LibraryFilter.ALL,
+    val offlineCount: Int = 0,
+)
+
+data class CalibreSearchUiState(
+    val query: String = "",
+    val isSearching: Boolean = false,
+    val results: List<BookMeta> = emptyList(),
+    val downloadingBookId: String? = null,
+    val message: String? = null,
     val error: String? = null,
 )
 
@@ -37,9 +52,10 @@ data class ScanProgress(
 )
 
 class LibraryViewModel(
-    private val repository: LibraryRepository,
-    private val localSource: LocalFileBookSource,
+    private val repository: LibraryStore,
+    private val localSource: LocalBookImporter,
     private val settings: SettingsRepository,
+    private val calibreRepositoryFactory: (String) -> CalibreRepository,
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(LibraryUiState(isLoading = true))
@@ -54,18 +70,21 @@ class LibraryViewModel(
     private val _scanProgress = MutableStateFlow<ScanProgress?>(null)
     val scanProgress: StateFlow<ScanProgress?> = _scanProgress.asStateFlow()
 
+    private val _calibreSearchState = MutableStateFlow(CalibreSearchUiState())
+    val calibreSearchState: StateFlow<CalibreSearchUiState> = _calibreSearchState.asStateFlow()
+
     private var scanJob: Job? = null
+    private var allShelfItems: List<LibraryItem> = emptyList()
+    private var libraryFilter: LibraryFilter = LibraryFilter.ALL
 
     init {
         viewModelScope.launch {
             repository.observeShelf()
                 .catch { e -> _uiState.value = LibraryUiState(error = e.message ?: "加载失败") }
-                .collect { items -> _uiState.value = LibraryUiState(isLoading = false, items = items) }
-        }
-        viewModelScope.launch {
-            settings.calibreBaseUrl.collect { url ->
-                if (!url.isNullOrBlank()) refreshFromCalibre(url)
-            }
+                .collect { items ->
+                    allShelfItems = items
+                    publishShelf()
+                }
         }
     }
 
@@ -119,6 +138,16 @@ class LibraryViewModel(
         viewModelScope.launch { repository.deleteBook(id) }
     }
 
+    fun removeDownloadedAsset(id: String) {
+        viewModelScope.launch {
+            val removed = repository.removeDownloadedAsset(id)
+            _calibreSearchState.value = _calibreSearchState.value.copy(
+                message = if (removed) "已移除本地下载" else "未找到可移除的下载",
+                error = null,
+            )
+        }
+    }
+
     fun renameBook(id: String, title: String) {
         viewModelScope.launch { repository.renameBook(id, title) }
     }
@@ -151,14 +180,122 @@ class LibraryViewModel(
         viewModelScope.launch { repository.renameBundle(oldName, newName) }
     }
 
-    fun refreshFromCalibre(baseUrl: String) {
+    fun setLibraryFilter(filter: LibraryFilter) {
+        libraryFilter = filter
+        publishShelf()
+    }
+
+    fun updateCalibreQuery(query: String) {
+        _calibreSearchState.value = _calibreSearchState.value.copy(query = query, error = null, message = null)
+    }
+
+    fun searchCalibre() {
         viewModelScope.launch {
-            val calibreRepo = CalibreRepositoryImpl(CalibreClient(baseUrl))
-            when (val result = calibreRepo.search("")) {
-                is ReadflowResult.Success -> result.value.forEach { repository.upsertBook(it) }
-                is ReadflowResult.Failure -> _uiState.value =
-                    _uiState.value.copy(error = "Calibre: ${result.error.message}")
+            val baseUrl = settings.calibreBaseUrl.first()
+            if (baseUrl.isNullOrBlank()) {
+                _calibreSearchState.value = _calibreSearchState.value.copy(
+                    error = "请先在设置中连接 Calibre",
+                    message = null,
+                )
+                return@launch
+            }
+            _calibreSearchState.value = _calibreSearchState.value.copy(
+                isSearching = true,
+                error = null,
+                message = null,
+            )
+            val calibreRepo = runCatching { calibreRepositoryFactory(baseUrl) }
+                .getOrElse { error ->
+                    _calibreSearchState.value = _calibreSearchState.value.copy(
+                        isSearching = false,
+                        error = "Calibre: ${error.message ?: "服务器地址无效"}",
+                    )
+                    return@launch
+            }
+            val query = _calibreSearchState.value.query
+            when (val result = calibreRepo.search(query)) {
+                is ReadflowResult.Success -> _calibreSearchState.value = _calibreSearchState.value.copy(
+                    isSearching = false,
+                    results = result.value,
+                    message = if (result.value.isEmpty()) "没有找到匹配的 Calibre 书籍" else null,
+                )
+                is ReadflowResult.Failure -> _calibreSearchState.value = _calibreSearchState.value.copy(
+                    isSearching = false,
+                    error = "Calibre: ${result.error.message}",
+                )
             }
         }
     }
+
+    fun downloadCalibreBook(bookId: String) {
+        viewModelScope.launch {
+            val baseUrl = settings.calibreBaseUrl.first()
+            if (baseUrl.isNullOrBlank()) {
+                _calibreSearchState.value = _calibreSearchState.value.copy(error = "请先在设置中连接 Calibre")
+                return@launch
+            }
+            _calibreSearchState.value = _calibreSearchState.value.copy(
+                downloadingBookId = bookId,
+                error = null,
+                message = null,
+            )
+            val calibreRepo = runCatching { calibreRepositoryFactory(baseUrl) }
+                .getOrElse { error ->
+                    _calibreSearchState.value = _calibreSearchState.value.copy(
+                        downloadingBookId = null,
+                        error = "Calibre: ${error.message ?: "服务器地址无效"}",
+                    )
+                    return@launch
+                }
+            when (val result = calibreRepo.download(bookId)) {
+                is ReadflowResult.Success -> {
+                    repository.upsertBook(result.value)
+                    _calibreSearchState.value = _calibreSearchState.value.copy(
+                        downloadingBookId = null,
+                        message = "已下载《${result.value.title}》",
+                    )
+                }
+                is ReadflowResult.Failure -> _calibreSearchState.value = _calibreSearchState.value.copy(
+                    downloadingBookId = null,
+                    error = "Calibre: ${result.error.message}",
+                )
+            }
+        }
+    }
+
+    private fun publishShelf() {
+        _uiState.value = _uiState.value.copy(
+            isLoading = false,
+            items = allShelfItems.filterFor(libraryFilter),
+            filter = libraryFilter,
+            offlineCount = allShelfItems.offlineReadableCount(),
+        )
+    }
 }
+
+private fun List<LibraryItem>.filterFor(filter: LibraryFilter): List<LibraryItem> =
+    when (filter) {
+        LibraryFilter.ALL -> this
+        LibraryFilter.OFFLINE -> mapNotNull { item ->
+            when (item) {
+                is LibraryItem.Single ->
+                    item.takeIf { it.book.isOfflineReadable }
+                is LibraryItem.Bundle -> {
+                    val offlineBooks = item.bundle.books.filter { it.isOfflineReadable }
+                    if (offlineBooks.isEmpty()) null else item.copy(bundle = item.bundle.copy(books = offlineBooks))
+                }
+            }
+        }
+    }
+
+private fun List<LibraryItem>.offlineReadableCount(): Int =
+    sumOf { item ->
+        when (item) {
+            is LibraryItem.Single -> if (item.book.isOfflineReadable) 1 else 0
+            is LibraryItem.Bundle -> item.bundle.books.count { it.isOfflineReadable }
+        }
+    }
+
+private val BookMeta.isOfflineReadable: Boolean
+    get() = localUri != null &&
+        (!id.startsWith("calibre-") || downloadStatus == DownloadStatus.DOWNLOADED)

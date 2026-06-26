@@ -31,9 +31,13 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
+import dev.readflow.core.model.BookMeta
+import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -48,6 +52,11 @@ private val LibraryItem.key: String
         is LibraryItem.Single -> "book:${book.id}"
         is LibraryItem.Bundle -> "bundle:${bundle.name}"
     }
+
+private val BookMeta.canRemoveDownload: Boolean
+    get() = id.startsWith("calibre-") &&
+        downloadStatus == DownloadStatus.DOWNLOADED &&
+        localUri != null
 
 /**
  * 书架网格，支持点击、拖拽重排、dwell 悬停建组。
@@ -70,6 +79,7 @@ fun BookGrid(
     onReorder: (List<LibraryItem>) -> Unit = {},
     onUngroup: (String) -> Unit = {},
     onRenameBundle: (String, String) -> Unit = { _, _ -> },
+    onRemoveDownload: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val palette = readflowPalette
@@ -258,9 +268,22 @@ fun BookGrid(
                 val isDragging = dragItemKey == item.key
                 val isDwellTarget = dwellTargetKey == item.key && dragItemKey.isNotEmpty() && dragItemKey != item.key
                 val view = LocalView.current
+                val title = when (item) {
+                    is LibraryItem.Single -> item.book.title
+                    is LibraryItem.Bundle -> item.bundle.name
+                }
+                val openDescription = when (item) {
+                    is LibraryItem.Single -> "打开 ${item.book.title}"
+                    is LibraryItem.Bundle -> "打开书组 ${item.bundle.name}，共 ${item.bundle.books.size} 本"
+                }
+                val menuDescription = when (item) {
+                    is LibraryItem.Single -> "${item.book.title} 的菜单"
+                    is LibraryItem.Bundle -> "书组 ${item.bundle.name} 的菜单"
+                }
 
                 Column(
                     modifier = Modifier
+                        .fillMaxWidth()
                         .zIndex(if (isDragging) 1f else 0f)
                         .graphicsLayer {
                             // Calvin 公式补偿实时换位导致的 item 位移
@@ -279,6 +302,7 @@ fun BookGrid(
                             }
                         }
                         .then(if (!isDragging) Modifier.animateItem() else Modifier)
+                        .semantics { contentDescription = openDescription }
                         .clickable { onItemClick(item) }
                         .pointerInput(item.key, dragGeneration) {
                             var dwellLocalStart = 0L
@@ -596,7 +620,7 @@ fun BookGrid(
                                     // 顶层：白色三点
                                     Icon(
                                         imageVector = Icons.Default.MoreVert,
-                                        contentDescription = "菜单",
+                                        contentDescription = menuDescription,
                                         tint = Color.White,
                                         modifier = Modifier.size(20.dp),
                                     )
@@ -635,6 +659,17 @@ fun BookGrid(
                                                 },
                                                 leadingIcon = { Icon(Icons.Default.Add, null) },
                                             )
+                                            if (item.book.canRemoveDownload) {
+                                                DropdownMenuItem(
+                                                    text = { Text("移除下载") },
+                                                    onClick = {
+                                                        onRemoveDownload(item.book.id)
+                                                        contextItem = null
+                                                        contextMenuAnchor = null
+                                                    },
+                                                    leadingIcon = { Icon(Icons.Default.Close, null) },
+                                                )
+                                            }
                                             DropdownMenuItem(
                                                 text = { Text("删除") },
                                                 onClick = {
@@ -686,17 +721,15 @@ fun BookGrid(
                         }
                     }
 
-                    val title = when (item) {
-                        is LibraryItem.Single -> item.book.title
-                        is LibraryItem.Bundle -> item.bundle.name
-                    }
                     Text(
                         text = title,
+                        modifier = Modifier.padding(horizontal = Dimens.spaceXs),
                         style = ReadflowType.bookTitle,
                         color = palette.ink,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
+                    Spacer(modifier = Modifier.height(Dimens.spaceSm))
                     if (item is LibraryItem.Single) { /* 作者识别不到，已移除 */ }
                 }
             }

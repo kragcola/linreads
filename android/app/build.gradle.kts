@@ -20,6 +20,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "GITHUB_REPO", "\"kragcola/linreads\"")
         buildConfigField("String", "BUILD_TAG", "\"$buildTag\"")
         buildConfigField("String", "GITHUB_OTA_TOKEN", "\"${System.getenv("GITHUB_OTA_TOKEN") ?: ""}\"" )
@@ -86,6 +87,16 @@ android {
                 java.srcDir("src/phase1/java")
             }
         }
+        getByName("test") {
+            if (readflowPhase >= 2) {
+                java.srcDir("src/phase2Test/java")
+            }
+        }
+        getByName("androidTest") {
+            if (readflowPhase >= 2) {
+                java.srcDir("src/phase2AndroidTest/java")
+            }
+        }
     }
 }
 
@@ -120,4 +131,12 @@ dependencies {
     // Other render engines (epub/pdf/md) + settings: shells only, wired when implemented
     // Handwriting (:ink): Phase 3
     testImplementation(libs.junit5)
+    testImplementation(libs.coroutines.test)
+    androidTestImplementation(libs.junit4)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.rules)
+    androidTestImplementation(libs.espresso.core)
+    androidTestImplementation(libs.uiautomator)
 }

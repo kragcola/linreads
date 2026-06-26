@@ -14,12 +14,14 @@ import kotlinx.coroutines.flow.Flow
 interface SettingsRepository {
     val calibreBaseUrl: Flow<String?>
     val fontSize: Flow<Int>
+    val lineSpacing: Flow<Float>
     val themeMode: Flow<ThemeMode>
     val deviceId: Flow<String>
     val engineOverrides: Flow<Map<BookFormat, String>>
 
     suspend fun setCalibreBaseUrl(url: String)
     suspend fun setFontSize(size: Int)
+    suspend fun setLineSpacing(multiplier: Float)
     suspend fun setThemeMode(mode: ThemeMode)
     suspend fun setEngineOverride(format: BookFormat, engineId: String?)
 }

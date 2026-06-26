@@ -1,8 +1,14 @@
 package dev.readflow.features.reader
 
 import android.content.Context
+import android.os.Bundle
+import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.View
 import android.view.ViewConfiguration
+import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -11,30 +17,48 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.TransitionType
 import dev.readflow.render.api.PagingKind
+import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.ZoomableReaderEngine
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -43,8 +67,11 @@ import kotlinx.coroutines.launch
  */
 enum class ReaderFeature(val label: String) {
     TOC("目录"),
+    SEARCH("搜索"),
+    BOOKMARKS("书签"),
+    ANNOTATIONS("标注"),
     PROGRESS("进度"),
-    FONT("字体"),
+    FONT("排版"),
     THEME("主题"),
 }
 
@@ -75,26 +102,97 @@ fun ReaderScreen(
                 if (engine == null) {
                     Text("无内容", color = MaterialTheme.colorScheme.onBackground)
                 } else {
-                    val host = remember(engine) {
-                        when (engine.pagingKind.value) {
+                    val pagingKind by engine.pagingKind.collectAsState()
+                    val host = remember(engine, pagingKind) {
+                        when (pagingKind) {
                             PagingKind.CONTINUOUS -> viewModel.hostFactory.continuous()
-                            PagingKind.PAGED -> viewModel.hostFactory.paged(TransitionType.SLIDE)
+                            PagingKind.PAGED -> viewModel.hostFactory.paged(TransitionType.CURL)
                         }.also { it.bind(engine) }
+                    }
+                    DisposableEffect(host) {
+                        onDispose { host.unbind() }
                     }
 
                     // Document view — observe taps in dispatch, then pass events through to the engine view.
-                    AndroidView(
-                        modifier = Modifier.fillMaxSize(),
-                        factory = { ctx ->
-                            ReaderTapContainer(ctx) { yRatio ->
-                                if (yRatio in 0.33f..0.66f) {
-                                    viewModel.onIntent(ReaderIntent.ToggleChrome)
-                                }
-                            }.apply {
-                                addView(host.hostView())
+                    val zoomableEngine = engine as? ZoomableReaderEngine
+                    val zoomScaleFlow = remember(engine) {
+                        zoomableEngine?.zoomScale ?: MutableStateFlow(1f)
+                    }
+                    val zoomScale by zoomScaleFlow.collectAsState()
+                    val readerFocusRequester = remember { FocusRequester() }
+                    fun handleReaderKey(nativeEvent: KeyEvent): Boolean {
+                        if (state.activePanel != null) return false
+                        val action = readerTapZoneForKey(nativeEvent.keyCode, nativeEvent.isShiftPressed) ?: return false
+                        if (nativeEvent.action == KeyEvent.ACTION_UP) {
+                            when (action) {
+                                ReaderTapZone.PreviousPage -> scope.launch { host.previous() }
+                                ReaderTapZone.ToggleChrome -> viewModel.onIntent(ReaderIntent.ToggleChrome)
+                                ReaderTapZone.NextPage -> scope.launch { host.next() }
                             }
-                        },
-                    )
+                        }
+                        return true
+                    }
+                    LaunchedEffect(host, state.activePanel) {
+                        if (state.activePanel == null) {
+                            readerFocusRequester.requestFocus()
+                        }
+                    }
+                    key(host) {
+                        AndroidView(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .onPreviewKeyEvent { handleReaderKey(it.nativeKeyEvent) }
+                                .focusRequester(readerFocusRequester)
+                                .focusable(),
+                            factory = { ctx ->
+                                ReaderTapContainer(
+                                    context = ctx,
+                                    onAction = { zone ->
+                                        when (zone) {
+                                            ReaderTapZone.PreviousPage -> scope.launch { host.previous() }
+                                            ReaderTapZone.ToggleChrome -> viewModel.onIntent(ReaderIntent.ToggleChrome)
+                                            ReaderTapZone.NextPage -> scope.launch { host.next() }
+                                        }
+                                    },
+                                    onFontSizePreview = {
+                                        viewModel.onIntent(ReaderIntent.PreviewFontSize(it))
+                                    },
+                                    onZoomPreview = {
+                                        viewModel.onIntent(ReaderIntent.PreviewZoom(it))
+                                    },
+                                ).apply {
+                                    setDocumentView(host.hostView())
+                                    requestFocus()
+                                }
+                            },
+                            update = { view ->
+                                view.setDocumentView(host.hostView())
+                                view.currentFontSizeSp = state.fontSizeSp
+                                view.currentZoomScale = zoomScale
+                                view.isZoomPinchEnabled = zoomableEngine != null
+                                view.isPagedTapZonesEnabled = pagingKind == PagingKind.PAGED
+                                view.isFontPinchEnabled = engine.format != BookFormat.PDF
+                            },
+                        )
+                    }
+
+                    state.textSelection?.let { selection ->
+                        TextSelectionActions(
+                            selectedText = selection.selectedText,
+                            onHighlight = {
+                                viewModel.onIntent(ReaderIntent.SaveTextAnnotation(note = null))
+                            },
+                            onSaveNote = {
+                                viewModel.onIntent(ReaderIntent.SaveTextAnnotation(note = it))
+                            },
+                            onClear = {
+                                viewModel.onIntent(ReaderIntent.ClearTextSelection)
+                            },
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(horizontal = 12.dp, vertical = 76.dp),
+                        )
+                    }
 
                     // ── Top chrome: 书名 + 返回 ──
                     AnimatedVisibility(
@@ -108,6 +206,26 @@ fun ReaderScreen(
                             navigationIcon = {
                                 IconButton(onClick = onBack) {
                                     Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回")
+                                }
+                            },
+                            actions = {
+                                IconButton(
+                                    onClick = { viewModel.onIntent(ReaderIntent.ToggleBookmark) },
+                                    enabled = state.canBookmark,
+                                ) {
+                                    Icon(
+                                        Icons.Default.Edit,
+                                        contentDescription = if (state.bookmarks.isCurrentBookmarked) {
+                                            "移除书签"
+                                        } else {
+                                            "添加书签"
+                                        },
+                                        tint = if (state.bookmarks.isCurrentBookmarked) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onBackground
+                                        },
+                                    )
                                 }
                             },
                             colors = TopAppBarDefaults.topAppBarColors(
@@ -125,11 +243,24 @@ fun ReaderScreen(
                     ) {
                         val chapter by engine.chapterInfo.collectAsState()
                         val locator by engine.currentLocator.collectAsState()
+                        val overallProgressDescription = readerProgressPercentText(locator.totalProgression)
+                        val chapterProgressDescription = readerChapterProgressDescription(
+                            title = chapter.currentTitle,
+                            currentIndex = chapter.currentIndex,
+                            totalChapters = chapter.totalChapters,
+                            progressInChapter = chapter.progressInChapter,
+                        )
                         Column(modifier = Modifier.fillMaxWidth()) {
                             // 全书总进度细条
                             LinearProgressIndicator(
                                 progress = { (locator.totalProgression ?: 0f).coerceIn(0f, 1f) },
-                                modifier = Modifier.fillMaxWidth().height(2.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(2.dp)
+                                    .semantics {
+                                        contentDescription = "全书进度"
+                                        stateDescription = overallProgressDescription
+                                    },
                                 color = MaterialTheme.colorScheme.primary,
                                 trackColor = MaterialTheme.colorScheme.surfaceVariant,
                             )
@@ -146,6 +277,7 @@ fun ReaderScreen(
                                     Text(
                                         "←",
                                         modifier = Modifier
+                                            .semantics { contentDescription = "上一章" }
                                             .clickable(enabled = chapter.currentIndex > 0) {
                                                 scope.launch { engine.goToAdjacentChapter(-1) }
                                             }
@@ -156,7 +288,11 @@ fun ReaderScreen(
                                         else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
                                     )
                                     Column(
-                                        modifier = Modifier.weight(1f),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .semantics(mergeDescendants = true) {
+                                                contentDescription = chapterProgressDescription
+                                            },
                                         horizontalAlignment = Alignment.CenterHorizontally,
                                     ) {
                                         Text(
@@ -174,6 +310,7 @@ fun ReaderScreen(
                                     Text(
                                         "→",
                                         modifier = Modifier
+                                            .semantics { contentDescription = "下一章" }
                                             .clickable(enabled = chapter.currentIndex < chapter.totalChapters - 1) {
                                                 scope.launch { engine.goToAdjacentChapter(+1) }
                                             }
@@ -191,9 +328,24 @@ fun ReaderScreen(
                                 panel = state.activePanel,
                                 tocEntries = engine.tableOfContents.collectAsState().value,
                                 fontSizeSp = state.fontSizeSp,
+                                lineSpacing = state.lineSpacing,
+                                readingMode = state.readingMode,
+                                supportedModes = state.supportedModes,
                                 themeMode = state.themeMode,
+                                searchState = state.search,
+                                bookmarkState = state.bookmarks,
+                                annotationState = state.annotations,
                                 onTocClick = { viewModel.onIntent(ReaderIntent.GoToTocEntry(it)) },
+                                onBookmarkClick = { viewModel.onIntent(ReaderIntent.GoToBookmark(it)) },
+                                onBookmarkRemove = { viewModel.onIntent(ReaderIntent.RemoveBookmark(it)) },
+                                onAnnotationClick = { viewModel.onIntent(ReaderIntent.GoToAnnotation(it)) },
+                                onSearchQueryChange = { viewModel.onIntent(ReaderIntent.SetSearchQuery(it)) },
+                                onSearchSubmit = { viewModel.onIntent(ReaderIntent.SubmitSearch) },
+                                onSearchResultClick = { viewModel.onIntent(ReaderIntent.GoToSearchResult(it)) },
+                                onSearchClear = { viewModel.onIntent(ReaderIntent.ClearSearch) },
                                 onFontSizeChange = { viewModel.onIntent(ReaderIntent.SetFontSize(it)) },
+                                onLineSpacingChange = { viewModel.onIntent(ReaderIntent.SetLineSpacing(it)) },
+                                onModeChange = { viewModel.onIntent(ReaderIntent.SetMode(it)) },
                                 onThemeChange = { viewModel.onIntent(ReaderIntent.SetTheme(it)) },
                             )
                             // ── 快捷功能按钮 ──
@@ -211,8 +363,23 @@ fun ReaderScreen(
                                             viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.TOC))
                                         }
                                     }
+                                    if (ReaderFeature.SEARCH in features) {
+                                        ReaderMenuButton("搜索", Icons.Default.Search) {
+                                            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.SEARCH))
+                                        }
+                                    }
+                                    if (ReaderFeature.BOOKMARKS in features) {
+                                        ReaderMenuButton("书签", Icons.Default.Edit) {
+                                            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.BOOKMARKS))
+                                        }
+                                    }
+                                    if (ReaderFeature.ANNOTATIONS in features) {
+                                        ReaderMenuButton("标注", Icons.Default.Edit) {
+                                            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.ANNOTATIONS))
+                                        }
+                                    }
                                     if (ReaderFeature.FONT in features) {
-                                        ReaderMenuButton("字体", Icons.Default.Edit) {
+                                        ReaderMenuButton("排版", Icons.Default.Edit) {
                                             viewModel.onIntent(ReaderIntent.FontPanel)
                                         }
                                     }
@@ -236,9 +403,24 @@ private fun ReaderControlPanel(
     panel: ReaderPanel?,
     tocEntries: List<TocEntry>,
     fontSizeSp: Float,
+    lineSpacing: Float,
+    readingMode: ReadingMode,
+    supportedModes: Set<ReadingMode>,
     themeMode: ThemeMode,
+    searchState: ReaderSearchState,
+    bookmarkState: ReaderBookmarkState,
+    annotationState: ReaderAnnotationState,
     onTocClick: (TocEntry) -> Unit,
+    onBookmarkClick: (ReaderBookmarkItem) -> Unit,
+    onBookmarkRemove: (ReaderBookmarkItem) -> Unit,
+    onAnnotationClick: (ReaderAnnotationItem) -> Unit,
+    onSearchQueryChange: (String) -> Unit,
+    onSearchSubmit: () -> Unit,
+    onSearchResultClick: (ReaderSearchResult) -> Unit,
+    onSearchClear: () -> Unit,
     onFontSizeChange: (Float) -> Unit,
+    onLineSpacingChange: (Float) -> Unit,
+    onModeChange: (ReadingMode) -> Unit,
     onThemeChange: (ThemeMode) -> Unit,
 ) {
     AnimatedVisibility(visible = panel != null) {
@@ -248,9 +430,270 @@ private fun ReaderControlPanel(
         ) {
             when (panel) {
                 ReaderPanel.TOC -> TocPanel(tocEntries, onTocClick)
-                ReaderPanel.FONT -> FontPanel(fontSizeSp, onFontSizeChange)
+                ReaderPanel.BOOKMARKS -> BookmarkPanel(
+                    bookmarkState = bookmarkState,
+                    onBookmarkClick = onBookmarkClick,
+                    onBookmarkRemove = onBookmarkRemove,
+                )
+                ReaderPanel.ANNOTATIONS -> AnnotationPanel(
+                    annotationState = annotationState,
+                    onAnnotationClick = onAnnotationClick,
+                )
+                ReaderPanel.SEARCH -> SearchPanel(
+                    searchState = searchState,
+                    onQueryChange = onSearchQueryChange,
+                    onSubmit = onSearchSubmit,
+                    onResultClick = onSearchResultClick,
+                    onClear = onSearchClear,
+                )
+                ReaderPanel.FONT -> FontPanel(
+                    fontSizeSp = fontSizeSp,
+                    lineSpacing = lineSpacing,
+                    readingMode = readingMode,
+                    supportedModes = supportedModes,
+                    onFontSizeChange = onFontSizeChange,
+                    onLineSpacingChange = onLineSpacingChange,
+                    onModeChange = onModeChange,
+                )
                 ReaderPanel.THEME -> ThemePanel(themeMode, onThemeChange)
                 null -> Unit
+            }
+        }
+    }
+}
+
+@Composable
+private fun TextSelectionActions(
+    selectedText: String,
+    onHighlight: () -> Unit,
+    onSaveNote: (String) -> Unit,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var note by remember(selectedText) { mutableStateOf("") }
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        tonalElevation = 6.dp,
+        shadowElevation = 6.dp,
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = selectedText.trim().replace('\n', ' ').take(80),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+            )
+            OutlinedTextField(
+                value = note,
+                onValueChange = { note = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                label = { Text("笔记") },
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onClear) {
+                    Text("取消")
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                OutlinedButton(onClick = onHighlight) {
+                    Text("高亮")
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Button(onClick = { onSaveNote(note) }) {
+                    Text("保存")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BookmarkPanel(
+    bookmarkState: ReaderBookmarkState,
+    onBookmarkClick: (ReaderBookmarkItem) -> Unit,
+    onBookmarkRemove: (ReaderBookmarkItem) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 320.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("书签", style = MaterialTheme.typography.titleSmall)
+        if (bookmarkState.items.isEmpty()) {
+            Text(
+                "暂无书签",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 12.dp),
+            )
+        } else {
+            LazyColumn {
+                items(bookmarkState.items) { bookmark ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = bookmark.label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            maxLines = 1,
+                            modifier = Modifier
+                                .weight(1f)
+                                .semantics {
+                                    contentDescription = bookmark.accessibilityLabel()
+                                }
+                                .clickable { onBookmarkClick(bookmark) }
+                                .padding(horizontal = 8.dp, vertical = 14.dp),
+                        )
+                        IconButton(onClick = { onBookmarkRemove(bookmark) }) {
+                            Icon(Icons.Default.Clear, contentDescription = "删除${bookmark.label}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AnnotationPanel(
+    annotationState: ReaderAnnotationState,
+    onAnnotationClick: (ReaderAnnotationItem) -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 320.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("标注", style = MaterialTheme.typography.titleSmall)
+        if (annotationState.items.isEmpty()) {
+            Text(
+                "暂无标注",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 12.dp),
+            )
+        } else {
+            LazyColumn {
+                items(annotationState.items) { annotation ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .semantics {
+                                contentDescription = annotation.accessibilityLabel()
+                            }
+                            .clickable { onAnnotationClick(annotation) }
+                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = annotation.selectedText.trim().replace('\n', ' '),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onBackground,
+                            maxLines = 2,
+                        )
+                        annotation.note?.let { note ->
+                            Text(
+                                text = note,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchPanel(
+    searchState: ReaderSearchState,
+    onQueryChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onResultClick: (ReaderSearchResult) -> Unit,
+    onClear: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 360.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("搜索", style = MaterialTheme.typography.titleSmall)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedTextField(
+                value = searchState.query,
+                onValueChange = onQueryChange,
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                label = { Text("关键词") },
+            )
+            IconButton(
+                onClick = onSubmit,
+                enabled = searchState.query.isNotBlank() && !searchState.isSearching,
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
+            ) {
+                Icon(Icons.Default.Search, contentDescription = "执行搜索")
+            }
+            IconButton(
+                onClick = onClear,
+                enabled = searchState.query.isNotBlank() || searchState.results.isNotEmpty(),
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
+            ) {
+                Icon(Icons.Default.Clear, contentDescription = "清空搜索")
+            }
+        }
+        if (searchState.isSearching) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+        searchState.message?.let { message ->
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+        }
+        if (searchState.results.isNotEmpty()) {
+            LazyColumn {
+                items(searchState.results) { result ->
+                    Text(
+                        text = result.readerLabel(),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        maxLines = 1,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .semantics {
+                                contentDescription = result.readerAccessibilityLabel()
+                            }
+                            .clickable { onResultClick(result) }
+                            .padding(horizontal = 8.dp, vertical = 14.dp),
+                    )
+                }
             }
         }
     }
@@ -287,6 +730,9 @@ private fun TocPanel(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
+                            .semantics {
+                                contentDescription = readerTocAccessibilityLabel(entry)
+                            }
                             .clickable { onTocClick(entry) }
                             .padding(
                                 start = (entry.level.coerceIn(0, 4) * 16).dp,
@@ -304,20 +750,25 @@ private fun TocPanel(
 @Composable
 private fun FontPanel(
     fontSizeSp: Float,
+    lineSpacing: Float,
+    readingMode: ReadingMode,
+    supportedModes: Set<ReadingMode>,
     onFontSizeChange: (Float) -> Unit,
+    onLineSpacingChange: (Float) -> Unit,
+    onModeChange: (ReadingMode) -> Unit,
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("字体", style = MaterialTheme.typography.titleSmall)
+            Text("排版", style = MaterialTheme.typography.titleSmall)
             Text("${fontSizeSp.toInt()}sp", style = MaterialTheme.typography.labelLarge)
         }
         Slider(
@@ -325,7 +776,12 @@ private fun FontPanel(
             onValueChange = onFontSizeChange,
             valueRange = 12f..32f,
             steps = 19,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics {
+                    contentDescription = "字号"
+                    stateDescription = "${fontSizeSp.toInt()}sp"
+                },
         )
         Text(
             text = "阅读正文预览",
@@ -333,7 +789,46 @@ private fun FontPanel(
             lineHeight = (fontSizeSp.coerceIn(12f, 32f) * 1.7f).sp,
             color = MaterialTheme.colorScheme.onBackground,
         )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("行距", style = MaterialTheme.typography.labelLarge)
+            Text("${"%.2f".format(lineSpacing)}x", style = MaterialTheme.typography.labelLarge)
+        }
+        Slider(
+            value = lineSpacing.coerceIn(1.4f, 2.2f),
+            onValueChange = onLineSpacingChange,
+            valueRange = 1.4f..2.2f,
+            steps = 7,
+            modifier = Modifier
+                .fillMaxWidth()
+                .semantics {
+                    contentDescription = "行距"
+                    stateDescription = "${"%.2f".format(lineSpacing)}倍"
+                },
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            ReadingMode.entries.forEach { mode ->
+                FilterChip(
+                    selected = readingMode == mode,
+                    enabled = mode in supportedModes,
+                    onClick = { onModeChange(mode) },
+                    label = { Text(mode.readerLabel(), maxLines = 1) },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
     }
+}
+
+private fun ReadingMode.readerLabel() = when (this) {
+    ReadingMode.SCROLL -> "滚动"
+    ReadingMode.PAGED -> "分页"
 }
 
 @Composable
@@ -380,19 +875,105 @@ private fun ThemeMode.readerLabel() = when (this) {
 
 private class ReaderTapContainer(
     context: Context,
-    private val onTap: (yRatio: Float) -> Unit,
+    private val onAction: (ReaderTapZone) -> Unit,
+    private val onFontSizePreview: (Float) -> Unit,
+    private val onZoomPreview: (Float) -> Unit,
 ) : FrameLayout(context) {
+    private var documentView: View? = null
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private val maxTapDurationMs = ViewConfiguration.getLongPressTimeout()
+    private val scaleDetector = ScaleGestureDetector(
+        context,
+        object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                trackingTap = false
+                activeScaleFactor = 1f
+                activePinchMode = when {
+                    isZoomPinchEnabled -> {
+                        pinchStartZoomScale = currentZoomScale
+                        PinchMode.ZOOM
+                    }
+                    isFontPinchEnabled -> {
+                        pinchStartFontSizeSp = currentFontSizeSp
+                        PinchMode.FONT
+                    }
+                    else -> PinchMode.NONE
+                }
+                return activePinchMode != PinchMode.NONE
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                activeScaleFactor *= detector.scaleFactor
+                when (activePinchMode) {
+                    PinchMode.FONT -> onFontSizePreview(
+                        scaledReaderFontSize(pinchStartFontSizeSp, activeScaleFactor),
+                    )
+                    PinchMode.ZOOM -> onZoomPreview(
+                        scaledReaderZoom(pinchStartZoomScale, activeScaleFactor),
+                    )
+                    PinchMode.NONE -> return false
+                }
+                return true
+            }
+        },
+    )
     private var downTime = 0L
     private var downX = 0f
     private var downY = 0f
     private var trackingTap = false
+    private var activePinchMode = PinchMode.NONE
+    private var pinchStartFontSizeSp = 18f
+    private var pinchStartZoomScale = 1f
+    private var activeScaleFactor = 1f
+    var currentFontSizeSp = 18f
+    var currentZoomScale = 1f
+    var isZoomPinchEnabled = false
+        set(value) {
+            field = value
+            refreshContentDescription()
+        }
+    var isPagedTapZonesEnabled = false
+    var isFontPinchEnabled = true
+        set(value) {
+            field = value
+            refreshContentDescription()
+        }
+
+    init {
+        isFocusable = true
+        isFocusableInTouchMode = true
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
+        contentDescription = "阅读内容，捏合调整字号"
+    }
+
+    private fun refreshContentDescription() {
+        contentDescription = when {
+            isZoomPinchEnabled -> "阅读内容，捏合缩放页面"
+            isFontPinchEnabled -> "阅读内容，捏合调整字号"
+            else -> "阅读内容"
+        }
+    }
+
+    fun setDocumentView(view: View) {
+        if (documentView === view) return
+        (view.parent as? ViewGroup)?.removeView(view)
+        removeAllViews()
+        addView(
+            view,
+            LayoutParams(
+                LayoutParams.MATCH_PARENT,
+                LayoutParams.MATCH_PARENT,
+            ),
+        )
+        documentView = view
+    }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
-        var tapYRatio: Float? = null
+        scaleDetector.onTouchEvent(event)
+        var tapZoneRatio: Float? = null
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                documentView?.clearReaderInteractiveTapReports()
                 trackingTap = true
                 downTime = event.eventTime
                 downX = event.x
@@ -402,12 +983,17 @@ private class ReaderTapContainer(
                 val dt = event.eventTime - downTime
                 val dx = kotlin.math.abs(event.x - downX)
                 val dy = kotlin.math.abs(event.y - downY)
-                if (trackingTap && dt <= maxTapDurationMs && dx <= touchSlop && dy <= touchSlop && height > 0) {
-                    tapYRatio = event.y / height.toFloat()
-                }
+                val wasTrackingTap = trackingTap
                 trackingTap = false
+                activePinchMode = PinchMode.NONE
+                if (wasTrackingTap && dt <= maxTapDurationMs && dx <= touchSlop && dy <= touchSlop && width > 0) {
+                    tapZoneRatio = event.x / width.toFloat()
+                }
             }
             MotionEvent.ACTION_MOVE -> {
+                if (event.pointerCount > 1 || scaleDetector.isInProgress) {
+                    trackingTap = false
+                }
                 val dx = kotlin.math.abs(event.x - downX)
                 val dy = kotlin.math.abs(event.y - downY)
                 if (dx > touchSlop || dy > touchSlop) {
@@ -419,12 +1005,100 @@ private class ReaderTapContainer(
             }
             MotionEvent.ACTION_CANCEL -> {
                 trackingTap = false
+                activePinchMode = PinchMode.NONE
             }
         }
         val handled = super.dispatchTouchEvent(event)
-        tapYRatio?.let(onTap)
+        tapZoneRatio?.let { ratio ->
+            val interactiveTapConsumed = documentView?.consumeReaderInteractiveTapReport() == true
+            readerTapZoneForTap(
+                xRatio = ratio,
+                interactiveChildConsumedTap = interactiveTapConsumed,
+                pagedTapZonesEnabled = isPagedTapZonesEnabled,
+            )?.let(onAction)
+        }
         return handled
     }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val action = readerTapZoneForKey(event.keyCode, event.isShiftPressed) ?: return super.dispatchKeyEvent(event)
+        if (event.action == KeyEvent.ACTION_UP) {
+            onAction(action)
+        }
+        return true
+    }
+
+    override fun onInitializeAccessibilityNodeInfo(info: AccessibilityNodeInfo) {
+        super.onInitializeAccessibilityNodeInfo(info)
+        info.className = FrameLayout::class.java.name
+        if (isPagedTapZonesEnabled) {
+            info.addAction(
+                AccessibilityNodeInfo.AccessibilityAction(
+                    AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD,
+                    "上一页",
+                ),
+            )
+            info.addAction(
+                AccessibilityNodeInfo.AccessibilityAction(
+                    AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+                    "下一页",
+                ),
+            )
+        }
+        info.addAction(
+            AccessibilityNodeInfo.AccessibilityAction(
+                AccessibilityNodeInfo.ACTION_CLICK,
+                "显示或隐藏阅读工具栏",
+            ),
+        )
+    }
+
+    override fun performAccessibilityAction(action: Int, arguments: Bundle?): Boolean {
+        return when (action) {
+            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD -> {
+                if (!isPagedTapZonesEnabled) return super.performAccessibilityAction(action, arguments)
+                onAction(ReaderTapZone.PreviousPage)
+                true
+            }
+            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD -> {
+                if (!isPagedTapZonesEnabled) return super.performAccessibilityAction(action, arguments)
+                onAction(ReaderTapZone.NextPage)
+                true
+            }
+            AccessibilityNodeInfo.ACTION_CLICK -> {
+                onAction(ReaderTapZone.ToggleChrome)
+                true
+            }
+            else -> super.performAccessibilityAction(action, arguments)
+        }
+    }
+
+    private enum class PinchMode { NONE, FONT, ZOOM }
+}
+
+private fun View.clearReaderInteractiveTapReports() {
+    setTag(dev.readflow.render.api.R.id.selection_aware_interactive_tap_consumed, false)
+    if (this is ViewGroup) {
+        for (index in 0 until childCount) {
+            getChildAt(index).clearReaderInteractiveTapReports()
+        }
+    }
+}
+
+private fun View.consumeReaderInteractiveTapReport(): Boolean {
+    val tagId = dev.readflow.render.api.R.id.selection_aware_interactive_tap_consumed
+    if (getTag(tagId) == true) {
+        setTag(tagId, false)
+        return true
+    }
+    if (this is ViewGroup) {
+        for (index in 0 until childCount) {
+            if (getChildAt(index).consumeReaderInteractiveTapReport()) {
+                return true
+            }
+        }
+    }
+    return false
 }
 
 @Composable
@@ -433,9 +1107,17 @@ private fun ReaderMenuButton(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     onClick: () -> Unit,
 ) {
-    TextButton(onClick = onClick, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)) {
+    TextButton(
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+        modifier = Modifier
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+            .semantics(mergeDescendants = true) {
+                contentDescription = label
+            },
+    ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Icon(icon, contentDescription = label, modifier = Modifier.size(22.dp),
+            Icon(icon, contentDescription = null, modifier = Modifier.size(22.dp),
                 tint = MaterialTheme.colorScheme.onBackground)
             Text(label, style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onBackground)

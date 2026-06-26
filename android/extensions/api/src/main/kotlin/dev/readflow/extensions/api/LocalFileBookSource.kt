@@ -24,7 +24,7 @@ import java.util.UUID
  */
 class LocalFileBookSource(
     private val context: Context,
-) : BookSource {
+) : BookSource, LocalBookImporter {
 
     override val sourceId = "local"
     override val sourceName = "本地文件"
@@ -49,24 +49,31 @@ class LocalFileBookSource(
      * Imports a file from [uri] (SAF/Intent). Copies to files/books/, returns
      * [DownloadedAsset] + derived [BookMeta]. Caller (feature layer) upserts meta to Room.
      */
-    suspend fun import(uri: Uri): ReadflowResult<Pair<BookMeta, DownloadedAsset>> =
+    override suspend fun import(
+        uri: Uri,
+        mimeType: String?,
+    ): ReadflowResult<Pair<BookMeta, DownloadedAsset>> =
         withContext(Dispatchers.IO) {
             try {
                 // SAF URIs (content://) encode an opaque ID in lastPathSegment, not
                 // the real filename. Query OpenableColumns.DISPLAY_NAME to get the
                 // actual name, then fall back to the URI path only as a last resort.
-                val fileName = context.contentResolver
+                val rawFileName = context.contentResolver
                     .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
                     ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
                     ?: uri.lastPathSegment?.substringAfterLast('/')
                     ?: "unknown.txt"
-                val ext = fileName.substringAfterLast('.', "")
+                val mimeExt = extensionFromMimeType(mimeType)
+                    ?: extensionFromMimeType(context.contentResolver.getType(uri))
+                val rawExt = rawFileName.substringAfterLast('.', "")
+                val ext = rawExt.ifBlank { mimeExt.orEmpty() }
                 val format = BookFormat.fromExtension(ext)
                 if (format == BookFormat.UNKNOWN) {
                     return@withContext ReadflowResult.Failure(
                         ReadflowError.unsupported("不支持的格式: $ext"),
                     )
                 }
+                val fileName = if (rawExt.isBlank()) "$rawFileName.$ext" else rawFileName
 
                 val booksDir = File(context.filesDir, "books").apply { mkdirs() }
                 val id = UUID.randomUUID().toString()
@@ -106,4 +113,13 @@ class LocalFileBookSource(
 
     override suspend fun download(bookId: String, format: String) =
         ReadflowResult.Failure(ReadflowError.unsupported("本地源无下载操作"))
+
+    private fun extensionFromMimeType(mimeType: String?): String? =
+        when (mimeType?.substringBefore(';')?.trim()?.lowercase()) {
+            "text/plain" -> "txt"
+            "text/markdown", "text/x-markdown" -> "md"
+            "application/epub+zip" -> "epub"
+            "application/pdf" -> "pdf"
+            else -> null
+        }
 }

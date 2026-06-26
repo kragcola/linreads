@@ -1,0 +1,25 @@
+<resources>
+    <item name="epub_compose_text_surface" type="id" />
+    <item name="epub_compose_text_annotated_string" type="id" />
+    <item name="epub_compose_text_surface_visible" type="id" />
+    <item name="epub_compose_text_highlight_ranges" type="id" />
+    <item name="epub_compose_text_links" type="id" />
+    <item name="epub_compose_text_link_callback" type="id" />
+    <item name="epub_compose_text_link_tap_wired" type="id" />
+    <item name="epub_compose_text_selection_range" type="id" />
+    <item name="epub_compose_text_selection_highlight_range" type="id" />
+    <item name="epub_compose_text_selection_enabled" type="id" />
+    <item name="epub_compose_text_selection_callback" type="id" />
+    <item name="epub_compose_text_gesture_selection_wired" type="id" />
+    <item name="epub_compose_text_long_press_selection_wired" type="id" />
+    <item name="epub_compose_text_semantics_exposed" type="id" />
+    <item name="epub_compose_page_progress_description" type="id" />
+    <item name="epub_compose_page_root_delegates_accessibility_to_text" type="id" />
+    <item name="epub_compose_text_style" type="id" />
+    <item name="epub_compose_text_layout" type="id" />
+    <item name="epub_selection_overlay_view" type="id" />
+    <item name="epub_selection_overlay_visible" type="id" />
+    <item name="epub_selection_overlay_behind_compose_text" type="id" />
+    <item name="epub_selection_bridge_hosted_in_compose_tree" type="id" />
+    <item name="epub_selection_overlay_accessibility_hidden" type="id" />
+</resources>

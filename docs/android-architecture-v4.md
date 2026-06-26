@@ -521,12 +521,13 @@ lifecycleScope.launch { engine.pagingKind.collect { mountHostFor(it) } }
 
 **运行时切换阅读模式（R-6）**：`pagingKind`（§5.1）声明引擎的**默认**分页形态，但用户经 `setMode(SCROLL/PAGED)`（§4.4）可在阅读中切换滚动↔分页。约定：`ReaderEngine` 暴露 `val pagingKind: StateFlow<PagingKind>`（而非常量），`ReaderRootLayout` 观察其变化——值变时 `host.unbind()` → 按新值经 `hostFactory` 取新 host → `bind` 并以 `currentLocator` 恢复位置。这样「Phase1 仅 CONTINUOUS、Phase2 支持运行时切 PAGED」「同一 EPUB 引擎实例两种形态」都被覆盖，不需换引擎实例。
 
-### 5.7 MuPDF optional gate（DOCX/CBZ，决策：optional/按需）
+### 5.7 Optional DOCX/CBZ gate（MuPDF license decision）
 
-- DOCX/CBZ 标为 **optional engine**，**不进 base APK**（§3.3 CI 约束 5）。
-- 通过 feature flag + ABI split / 后续动态交付隔离 ~15MB `.so` 与冷启动成本。
-- 首次启用前完成 **ADR-MuPDF-License**（AGPL/商业授权裁决，见 §12.4）。
-- 用户在不安装该能力时，DOCX/CBZ 显示「此格式需启用扩展支持」而非静默失败。
+- DOCX/CBZ 保持 **optional / deferred**，**不进 base APK**（§3.3 CI 约束 5）。
+- 2026-06-23 `ADR-MuPDF-License` 已裁决：当前里程碑不启用 AGPL MuPDF 路线；任何 MuPDF-linked binary 必须先满足完整 AGPL 合规或商业授权。
+- DOCX 不再假定由 MuPDF Core 直接支持；当前官方资料把 Office DOC/DOCX 放在 PyMuPDF Pro / conversion-layer 范畴，故 DOCX optional engine 延期。
+- CBZ 可被 MuPDF 支持，但本轮也延期；若未来优先级升高，先评估无 AGPL 的 first-party ZIP image pager，再比较 MuPDF。
+- 用户打开 DOCX/CBZ 时应显示「此格式当前未启用」与后续路线说明，而非静默失败。
 
 ## 六、Ink / 手写笔集成
 
@@ -1087,7 +1088,7 @@ phaseInclude(3, ":render:mupdf", ":ink",
 
 ### Phase 3：精品增强（Phase D + E）
 
-数据出口（`LinReads Backup` 导出/恢复、离线缓存）→ `:render:mupdf`（optional，DOCX/CBZ，过 MuPDF license ADR）→ `:extensions:tts`/`:extensions:stats`/`:extensions:opds` → `:ink` 实现（`CanvasView` + `InProgressStrokesView` + 触摸路由 + `InkToolbar`）。每能力独立 ADR + 权限说明 + 包体积预算 + 关闭路径。
+数据出口（`LinReads Backup` 导出/恢复、离线缓存）→ `:extensions:tts`/`:extensions:stats`/`:extensions:opds` → `:ink` 实现（`CanvasView` + `InProgressStrokesView` + 触摸路由 + `InkToolbar`）。DOCX/CBZ 已由 `ADR-MuPDF-License` 延期，不再作为当前 Phase 3 默认下一项。每能力独立 ADR + 权限说明 + 包体积预算 + 关闭路径。
 
 ---
 
@@ -1167,13 +1168,13 @@ R1 `ReaderState` 不含 View 引用；R2 `Locator` 唯一定义在 `:core:model`
 | R-3 | ReaderItem→渲染降级矩阵 | §5.5 |
 | R-7 | pinch 预览+ACTION_UP 提交重排 | §4.4 |
 
-### 12.4 ADR-MuPDF-License（DOCX/CBZ optional，待裁决）
+### 12.4 ADR-MuPDF-License（DOCX/CBZ optional，2026-06-23 裁决）
 
-MuPDF 为 AGPL / 商业双授权。启用 DOCX/CBZ 前须裁决：开源发布走 AGPL 合规（公开源码）还是购商业授权；`.so` ~15MB 经 ABI split / 动态交付隔离；评估自研/转换式/服务端预处理替代。**未完成本 ADR 前 `:render:mupdf` 不得默认打包**。
+详见 `docs/audit/adr-mupdf-license-2026-06-23.md`。结论：当前纯阅读回填不启用 AGPL MuPDF；base APK 必须保持 MuPDF-free；任何 MuPDF-linked binary 都必须先完成 AGPL 合规或商业授权。DOCX 因当前官方资料未显示为 MuPDF Core 标准输入而延期；CBZ 虽可由 MuPDF 支持，但本轮也延期，未来优先评估无 AGPL 的 first-party ZIP image pager。
 
 ### 12.5 关键技术选型
 
-EPUB→原生重排（jsoup→AnnotatedString，无 WebView）；PDF→系统 PdfRenderer；DOCX/CBZ→MuPDF JNI（optional）；MD→Markwon Spannables；TXT→RecyclerView+Paging3+FileChannel；翻页→PageTransitionHost(ViewPager2)；DI→Koin；HTTP→Ktor；序列化→kotlinx.serialization；同步(P1)→NoOpSyncBackend（可选 KoSync 互通）。
+EPUB→原生重排（jsoup→AnnotatedString，无 WebView）；PDF→系统 PdfRenderer；DOCX/CBZ→当前延期（MuPDF 不进 base，未来另行 ADR 更新）；MD→Markwon Spannables；TXT→RecyclerView+Paging3+FileChannel；翻页→PageTransitionHost(ViewPager2)；DI→Koin；HTTP→Ktor；序列化→kotlinx.serialization；同步(P1)→NoOpSyncBackend（可选 KoSync 互通）。
 
 ### 12.6 安全 / 权限矩阵（R1）
 

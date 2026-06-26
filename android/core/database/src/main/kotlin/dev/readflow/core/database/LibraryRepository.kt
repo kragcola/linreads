@@ -8,20 +8,46 @@ import dev.readflow.core.model.LibraryItem
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 
-class LibraryRepository(private val bookDao: BookDao) {
+interface LibraryStore {
+    fun observeShelf(): Flow<List<LibraryItem>>
+    suspend fun count(): Int
+    suspend fun upsertBook(book: BookMeta)
+    suspend fun upsertAll(books: List<BookMeta>)
+    suspend fun deleteBook(id: String)
+    suspend fun removeDownloadedAsset(id: String): Boolean
+    suspend fun renameBook(id: String, title: String)
+    suspend fun setCollection(id: String, name: String?)
+    suspend fun renameBundle(oldName: String, newName: String)
+    suspend fun ungroupBundle(name: String)
+    suspend fun updateSortOrder(id: String, order: Int)
+}
 
-    fun observeShelf(): Flow<List<LibraryItem>> =
+class LibraryRepository(
+    private val bookDao: BookDao,
+    private val downloadedBookCache: DownloadedBookCacheStore = DownloadedBookCache(bookDao),
+) : LibraryStore {
+
+    override fun observeShelf(): Flow<List<LibraryItem>> =
         bookDao.observeShelf().map { rows -> groupIntoItems(rows.map { it.toMeta() }) }
 
-    suspend fun count(): Int = bookDao.count()
-    suspend fun upsertBook(book: BookMeta) = bookDao.upsert(book.toEntity())
-    suspend fun upsertAll(books: List<BookMeta>) = bookDao.upsertAll(books.map { it.toEntity() })
-    suspend fun deleteBook(id: String) = bookDao.deleteById(id)
-    suspend fun renameBook(id: String, title: String) = bookDao.updateTitle(id, title)
-    suspend fun setCollection(id: String, name: String?) = bookDao.updateCollectionName(id, name)
-    suspend fun renameBundle(oldName: String, newName: String) = bookDao.renameCollection(oldName, newName)
-    suspend fun ungroupBundle(name: String) = bookDao.clearCollection(name)
-    suspend fun updateSortOrder(id: String, order: Int) = bookDao.updateSortOrder(id, order)
+    override suspend fun count(): Int = bookDao.count()
+    override suspend fun upsertBook(book: BookMeta) {
+        bookDao.upsert(book.toEntity())
+        trimCacheIfDownloadedRemote(book)
+    }
+
+    override suspend fun upsertAll(books: List<BookMeta>) {
+        bookDao.upsertAll(books.map { it.toEntity() })
+        books.lastOrNull { it.isDownloadedRemoteCacheBook() }?.let { downloadedBookCache.trim(it.id) }
+    }
+    override suspend fun deleteBook(id: String) = bookDao.deleteById(id)
+    override suspend fun removeDownloadedAsset(id: String): Boolean =
+        downloadedBookCache.removeDownloadedAsset(id) != null
+    override suspend fun renameBook(id: String, title: String) = bookDao.updateTitle(id, title)
+    override suspend fun setCollection(id: String, name: String?) = bookDao.updateCollectionName(id, name)
+    override suspend fun renameBundle(oldName: String, newName: String) = bookDao.renameCollection(oldName, newName)
+    override suspend fun ungroupBundle(name: String) = bookDao.clearCollection(name)
+    override suspend fun updateSortOrder(id: String, order: Int) = bookDao.updateSortOrder(id, order)
 
     private fun groupIntoItems(books: List<BookMeta>): List<LibraryItem> {
         val items = mutableListOf<LibraryItem>()
@@ -39,7 +65,18 @@ class LibraryRepository(private val bookDao: BookDao) {
         }
         return items
     }
+
+    private suspend fun trimCacheIfDownloadedRemote(book: BookMeta) {
+        if (book.isDownloadedRemoteCacheBook()) {
+            downloadedBookCache.trim(protectedBookId = book.id)
+        }
+    }
 }
+
+private fun BookMeta.isDownloadedRemoteCacheBook(): Boolean =
+    id.startsWith(DownloadedBookCachePlanner.REMOTE_CACHE_ID_PREFIX) &&
+        downloadStatus == DownloadStatus.DOWNLOADED &&
+        localUri != null
 
 private fun BookWithProgress.toMeta() = BookMeta(
     id = book.id, title = book.title, author = book.author,

@@ -12,14 +12,27 @@ sealed interface ReaderIntent {
     data object CloseBook : ReaderIntent
     data class GoTo(val locator: Locator) : ReaderIntent
     data class SetFontSize(val sp: Float) : ReaderIntent
+    data class PreviewFontSize(val sp: Float) : ReaderIntent
+    data class PreviewZoom(val scale: Float) : ReaderIntent
+    data class SetLineSpacing(val multiplier: Float) : ReaderIntent
     data class SetMode(val mode: ReadingMode) : ReaderIntent
     data class SetTheme(val theme: ThemeMode) : ReaderIntent
     data class OpenPanel(val panel: ReaderPanel) : ReaderIntent
     data class GoToTocEntry(val entry: TocEntry) : ReaderIntent
+    data object ToggleBookmark : ReaderIntent
+    data class GoToBookmark(val bookmark: ReaderBookmarkItem) : ReaderIntent
+    data class RemoveBookmark(val bookmark: ReaderBookmarkItem) : ReaderIntent
+    data class SaveTextAnnotation(val note: String?) : ReaderIntent
+    data class GoToAnnotation(val annotation: ReaderAnnotationItem) : ReaderIntent
+    data class SetSearchQuery(val query: String) : ReaderIntent
+    data class GoToSearchResult(val result: ReaderSearchResult) : ReaderIntent
+    data object SubmitSearch : ReaderIntent
+    data object ClearSearch : ReaderIntent
+    data object ClearTextSelection : ReaderIntent
     data object ClosePanel : ReaderIntent
     data object ToggleChrome : ReaderIntent
     data object FontPanel : ReaderIntent
     data object ThemePanel : ReaderIntent
 }
 
-enum class ReaderPanel { TOC, FONT, THEME }
+enum class ReaderPanel { TOC, SEARCH, BOOKMARKS, ANNOTATIONS, FONT, THEME }

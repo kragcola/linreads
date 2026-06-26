@@ -4,9 +4,15 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.outlined.FileDownload
+import androidx.compose.material.icons.outlined.FileUpload
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -20,7 +26,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.koin.androidx.compose.koinViewModel
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
@@ -31,13 +37,40 @@ fun SettingsScreen(
 ) {
     val vm = koinViewModel<SettingsViewModel>()
     val url by vm.calibreBaseUrl.collectAsStateWithLifecycle()
+    val urlError by vm.calibreUrlError.collectAsStateWithLifecycle()
+    val connectionState by vm.calibreConnectionState.collectAsStateWithLifecycle()
     val fontSize by vm.fontSize.collectAsStateWithLifecycle()
     val theme by vm.themeMode.collectAsStateWithLifecycle()
+    val syncStatus by vm.syncStatus.collectAsStateWithLifecycle()
+    val backupExportState by vm.backupExportState.collectAsStateWithLifecycle()
+    val backupRestoreState by vm.backupRestoreState.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     var urlDraft by remember(url) { mutableStateOf(url ?: "") }
     val scope = rememberCoroutineScope()
     var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
+    val isBackupBusy = backupExportState is BackupExportUiState.Exporting ||
+        backupRestoreState is BackupRestoreUiState.Restoring
+    val backupLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val output = context.contentResolver.openOutputStream(uri)
+        if (output == null) {
+            vm.backupExportFailed("导出失败：无法写入选择的位置")
+        } else {
+            vm.exportBackup(output)
+        }
+    }
+    val restoreLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val input = context.contentResolver.openInputStream(uri)
+        if (input == null) {
+            vm.backupRestoreFailed("恢复失败：无法读取选择的文件")
+        } else {
+            vm.restoreBackup(input)
+        }
+    }
 
     // Poll DownloadManager progress while downloading
     if (updateState is UpdateState.Downloading) {
@@ -81,19 +114,66 @@ fun SettingsScreen(
         },
     ) { padding ->
         Column(
-            Modifier.padding(padding).padding(horizontal = 16.dp),
+            Modifier
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             OutlinedTextField(
-                value = urlDraft, onValueChange = { urlDraft = it },
+                value = urlDraft,
+                onValueChange = {
+                    urlDraft = it
+                    vm.clearCalibreConnectionState()
+                },
                 label = { Text("Calibre 服务器地址") },
                 placeholder = { Text("http://192.168.1.x:8080") },
-                modifier = Modifier.fillMaxWidth(), singleLine = true,
-                trailingIcon = {
-                    if (urlDraft != (url ?: ""))
-                        TextButton(onClick = { vm.setCalibreUrl(urlDraft) }) { Text("保存") }
+                isError = urlError != null,
+                supportingText = {
+                    if (urlError != null) {
+                        Text(urlError.orEmpty())
+                    }
                 },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
             )
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { vm.testCalibreConnection(urlDraft) },
+                    enabled = connectionState !is CalibreConnectionUiState.Checking,
+                ) { Text("测试连接") }
+                OutlinedButton(
+                    onClick = { vm.probeCalibreConnection(urlDraft) },
+                    enabled = connectionState !is CalibreConnectionUiState.Checking,
+                ) { Text("探测常用端口") }
+                if (urlDraft != (url ?: "")) {
+                    TextButton(onClick = { vm.setCalibreUrl(urlDraft) }) { Text("仅保存") }
+                }
+            }
+            when (val state = connectionState) {
+                CalibreConnectionUiState.Idle -> Unit
+                CalibreConnectionUiState.Checking -> Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Text("正在测试 Calibre 连接", style = MaterialTheme.typography.bodyMedium)
+                }
+                is CalibreConnectionUiState.Success -> ConnectionResultText(
+                    title = state.message,
+                    detail = state.nextStep,
+                    isError = false,
+                )
+                is CalibreConnectionUiState.Failure -> ConnectionResultText(
+                    title = state.message,
+                    detail = state.nextStep,
+                    isError = true,
+                )
+            }
 
             Text("字号：${fontSize}sp", style = MaterialTheme.typography.bodyMedium)
             Slider(value = fontSize.toFloat(), onValueChange = { vm.setFontSize(it.toInt()) },
@@ -107,6 +187,88 @@ fun SettingsScreen(
                     FilterChip(selected = theme == mode, onClick = { vm.setTheme(mode) },
                         label = { Text(mode.label()) })
                 }
+            }
+
+            HorizontalDivider()
+
+            Text("同步", style = MaterialTheme.typography.bodyMedium)
+            ConnectionResultText(
+                title = syncStatus.title,
+                detail = syncStatus.detail,
+                isError = !syncStatus.isRemoteSyncEnabled,
+            )
+
+            HorizontalDivider()
+
+            Text("备份", style = MaterialTheme.typography.bodyMedium)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { backupLauncher.launch("LinReads Backup.zip") },
+                    enabled = !isBackupBusy,
+                ) {
+                    Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("导出备份")
+                }
+                OutlinedButton(
+                    onClick = {
+                        restoreLauncher.launch(
+                            arrayOf(
+                                "application/zip",
+                                "application/octet-stream",
+                                "application/x-zip-compressed",
+                            ),
+                        )
+                    },
+                    enabled = !isBackupBusy,
+                ) {
+                    Icon(Icons.Outlined.FileUpload, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("恢复备份")
+                }
+            }
+            when (val state = backupExportState) {
+                BackupExportUiState.Idle -> Unit
+                BackupExportUiState.Exporting -> Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Text("正在导出备份", style = MaterialTheme.typography.bodyMedium)
+                }
+                is BackupExportUiState.Success -> ConnectionResultText(
+                    title = state.message,
+                    detail = "备份文件包含进度、书签、标注 manifest。",
+                    isError = false,
+                )
+                is BackupExportUiState.Failure -> ConnectionResultText(
+                    title = state.message,
+                    detail = "请重新选择可写入的位置。",
+                    isError = true,
+                )
+            }
+            when (val state = backupRestoreState) {
+                BackupRestoreUiState.Idle -> Unit
+                BackupRestoreUiState.Restoring -> Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Text("正在恢复备份", style = MaterialTheme.typography.bodyMedium)
+                }
+                is BackupRestoreUiState.Success -> ConnectionResultText(
+                    title = state.message,
+                    detail = "已按更新时间合并进度、书签和标注，本地书库不会被覆盖。",
+                    isError = false,
+                )
+                is BackupRestoreUiState.Failure -> ConnectionResultText(
+                    title = state.message,
+                    detail = "请选择 LinReads Backup ZIP 文件。",
+                    isError = true,
+                )
             }
 
             HorizontalDivider()
@@ -212,6 +374,23 @@ fun SettingsScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun ConnectionResultText(title: String, detail: String, isError: Boolean) {
+    val color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.bodyMedium,
+            color = color,
+        )
+        Text(
+            text = detail,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

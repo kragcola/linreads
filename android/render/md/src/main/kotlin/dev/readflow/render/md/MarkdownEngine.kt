@@ -14,7 +14,13 @@ import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderEngine
+import dev.readflow.render.api.ReaderTextAnnotation
+import dev.readflow.render.api.ReaderTextSelection
 import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.SelectionAwareTextView
+import dev.readflow.render.api.TextAnnotatableReaderEngine
+import dev.readflow.render.api.TextSelectableReaderEngine
+import dev.readflow.render.api.withTextHighlightSpans
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
 import io.noties.markwon.ext.tables.TablePlugin
@@ -24,12 +30,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 
-class MarkdownEngine(private val context: Context) : ReaderEngine {
+class MarkdownEngine(private val context: Context) : ReaderEngine, TextSelectableReaderEngine, TextAnnotatableReaderEngine {
 
     override val id: String = "md-markwon"
     override val format: BookFormat = BookFormat.MD
     override val priority: Int = 0
-    override val supportsSearch: Boolean = false
+    override val supportsSearch: Boolean = true
 
     private val _pagingKind = MutableStateFlow(PagingKind.CONTINUOUS)
     override val pagingKind: StateFlow<PagingKind> = _pagingKind.asStateFlow()
@@ -45,12 +51,17 @@ class MarkdownEngine(private val context: Context) : ReaderEngine {
     private val _tableOfContents = MutableStateFlow<List<TocEntry>>(emptyList())
     override val tableOfContents: StateFlow<List<TocEntry>> = _tableOfContents.asStateFlow()
 
-    private var rawMarkdown: String = ""
-    private var lineCount: Int = 0
+    private val _currentTextSelection = MutableStateFlow<ReaderTextSelection?>(null)
+    override val currentTextSelection: StateFlow<ReaderTextSelection?> = _currentTextSelection.asStateFlow()
+
+    private var document: MarkdownDocument = MarkdownDocument.parse("")
     private var fontSizeSp: Float = 18f
+    private var lineSpacingMultiplier: Float = 1.75f
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
+    private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
     private var scrollView: ScrollView? = null
     private var textView: TextView? = null
+    private var suppressLocatorUpdates = false
 
     private val markwon by lazy {
         Markwon.builder(context)
@@ -62,34 +73,41 @@ class MarkdownEngine(private val context: Context) : ReaderEngine {
     override suspend fun supports(uri: Uri): Boolean = true
 
     override suspend fun openBook(uri: Uri): Locator = withContext(Dispatchers.IO) {
-        rawMarkdown = context.contentResolver.openInputStream(uri)?.use {
+        val markdown = context.contentResolver.openInputStream(uri)?.use {
             it.readBytes().toString(Charsets.UTF_8)
         } ?: ""
-        lineCount = rawMarkdown.lineSequence().count().coerceAtLeast(1)
-        _tableOfContents.value = buildToc(rawMarkdown)
-        _currentLocator.value
+        val parsed = MarkdownDocument.parse(markdown)
+        val initial = parsed.locatorForOffset(0)
+        document = parsed
+        withContext(Dispatchers.Main) {
+            _tableOfContents.value = parsed.tableOfContents
+            _currentLocator.value = initial
+        }
+        initial
     }
 
     override fun createView(): View {
         val palette = paletteFor(themeMode, context.resources.configuration)
-        val tv = TextView(context).apply {
+        val tv = SelectionAwareTextView(context).apply {
             textSize = fontSizeSp
+            setLineSpacing(0f, lineSpacingMultiplier)
             setPadding(48, 48, 48, 48)
             setTextColor(palette.ink)
+            setTextIsSelectable(true)
+            onSelectionRangeChanged = ::updateTextSelection
         }
-        markwon.setMarkdown(tv, rawMarkdown)
+        markwon.setMarkdown(tv, document.markdown)
+        applyTextAnnotations(tv)
         textView = tv
 
         val sv = ScrollView(context).apply {
             setBackgroundColor(palette.paper)
             addView(tv)
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
-                val maxScroll = (tv.height - height).coerceAtLeast(1)
-                val ratio = (scrollY.toFloat() / maxScroll).coerceIn(0f, 1f)
-                _currentLocator.value = Locator(
-                    strategy = LocatorStrategy.ByteOffset(scrollY.toLong(), 0),
-                    progression = ratio,
-                    totalProgression = ratio,
+                if (suppressLocatorUpdates) return@setOnScrollChangeListener
+                _currentLocator.value = document.locatorForRenderedOffset(
+                    renderedOffset = tv.characterOffsetForScrollY(scrollY),
+                    renderedText = tv.text,
                 )
             }
         }
@@ -97,59 +115,111 @@ class MarkdownEngine(private val context: Context) : ReaderEngine {
         return sv
     }
 
-    private fun buildToc(markdown: String): List<TocEntry> {
-        if (markdown.isBlank()) return emptyList()
-        var lineIndex = 0
-        val entries = mutableListOf<TocEntry>()
-        markdown.lineSequence().forEach { line ->
-            val trimmed = line.trimStart()
-            val hashes = trimmed.takeWhile { it == '#' }.length
-            if (hashes in 1..6 && trimmed.getOrNull(hashes) == ' ') {
-                val title = trimmed.drop(hashes).trim()
-                if (title.isNotEmpty()) {
-                    entries += TocEntry(
-                        title = title.take(80),
-                        locator = Locator(
-                            strategy = LocatorStrategy.Section(0, lineIndex, 0),
-                            totalProgression = lineIndex.toFloat() / lineCount,
-                        ),
-                        level = hashes - 1,
-                    )
-                }
-            }
-            lineIndex += 1
-        }
-        return entries.ifEmpty { listOf(TocEntry("正文", Locator(LocatorStrategy.Section(0, 0, 0), totalProgression = 0f))) }
-    }
-
     override suspend fun goTo(locator: Locator) {
+        val offset = document.offsetFor(locator)
         scrollView?.post {
             val sv = scrollView ?: return@post
             val tv = textView ?: return@post
+            val renderedOffset = document.renderedOffsetFor(locator, tv.text)
             val maxScroll = (tv.height - sv.height).coerceAtLeast(0)
-            val y = when (val s = locator.strategy) {
-                is LocatorStrategy.ByteOffset -> s.offset.toInt().coerceIn(0, maxScroll)
-                is LocatorStrategy.Section -> {
-                    val ratio = s.elementIndex.toFloat() / lineCount.coerceAtLeast(1)
-                    (maxScroll * ratio).toInt().coerceIn(0, maxScroll)
-                }
-                else -> 0
-            }
+            val y = tv.scrollYForCharacterOffset(renderedOffset).coerceIn(0, maxScroll)
             sv.scrollTo(0, y)
+            _currentLocator.value = document.locatorForOffset(offset)
         }
+    }
+
+    override suspend fun search(query: String): List<Locator> = withContext(Dispatchers.Default) {
+        document.search(query)
+    }
+
+    override fun clearTextSelection() {
+        _currentTextSelection.value = null
+        val selectionAwareTextView = textView as? SelectionAwareTextView ?: return
+        val sv = scrollView ?: return
+        suppressLocatorUpdates = true
+        try {
+            selectionAwareTextView.clearNativeTextSelection()
+        } finally {
+            suppressLocatorUpdates = false
+        }
+        _currentLocator.value = document.locatorForRenderedOffset(
+            renderedOffset = selectionAwareTextView.characterOffsetForScrollY(sv.scrollY),
+            renderedText = selectionAwareTextView.text,
+        )
+    }
+
+    override fun setTextAnnotations(annotations: List<ReaderTextAnnotation>) {
+        textAnnotations = annotations
+        textView?.let(::applyTextAnnotations)
+    }
+
+    private fun applyTextAnnotations(view: TextView) {
+        val highlightedText = view.text.withTextHighlightSpans(document.highlightRanges(textAnnotations, view.text))
+        val sv = scrollView
+        if (sv == null) {
+            view.text = highlightedText
+            return
+        }
+
+        val previousScrollY = sv.scrollY
+        val previousLocator = _currentLocator.value
+        suppressLocatorUpdates = true
+        try {
+            view.text = highlightedText
+            val immediateMaxScroll = (view.height - sv.height).coerceAtLeast(0)
+            val immediateRestoreScrollY = previousScrollY.coerceIn(0, immediateMaxScroll)
+            if (immediateRestoreScrollY != sv.scrollY) {
+                sv.scrollTo(0, immediateRestoreScrollY)
+            }
+        } finally {
+            suppressLocatorUpdates = false
+        }
+        sv.post {
+            val activeScrollView = scrollView ?: return@post
+            val activeTextView = textView ?: return@post
+            val maxScroll = (activeTextView.height - activeScrollView.height).coerceAtLeast(0)
+            val locatorScrollY = activeTextView.scrollYForCharacterOffset(
+                document.renderedOffsetFor(previousLocator, activeTextView.text),
+            ).coerceIn(0, maxScroll)
+            val restoreScrollY = when {
+                previousScrollY > 0 -> previousScrollY.coerceIn(0, maxScroll)
+                else -> locatorScrollY
+            }
+            suppressLocatorUpdates = true
+            try {
+                activeScrollView.scrollTo(0, restoreScrollY)
+            } finally {
+                suppressLocatorUpdates = false
+            }
+            _currentLocator.value = document.locatorForRenderedOffset(
+                renderedOffset = activeTextView.characterOffsetForScrollY(restoreScrollY),
+                renderedText = activeTextView.text,
+            )
+        }
+    }
+
+    private fun updateTextSelection(start: Int, end: Int) {
+        val displayedText = textView?.text?.toString().orEmpty()
+        _currentTextSelection.value = document.selectionForRenderedOffsets(start, end, displayedText)
     }
 
     override suspend fun close() {
         scrollView = null
         textView = null
-        rawMarkdown = ""
-        lineCount = 0
+        document = MarkdownDocument.parse("")
+        _currentTextSelection.value = null
+        textAnnotations = emptyList()
         _tableOfContents.value = emptyList()
     }
 
     override suspend fun setFontSize(sp: Float) {
         fontSizeSp = sp
         textView?.textSize = sp
+    }
+
+    override suspend fun setLineSpacing(multiplier: Float) {
+        lineSpacingMultiplier = multiplier
+        textView?.setLineSpacing(0f, multiplier)
     }
 
     override suspend fun setTheme(mode: ThemeMode) {
@@ -184,6 +254,20 @@ class MarkdownEngine(private val context: Context) : ReaderEngine {
             }
         }
     }
+}
+
+private fun TextView.characterOffsetForScrollY(scrollY: Int): Int {
+    val layout = layout ?: return 0
+    val vertical = (scrollY - totalPaddingTop).coerceAtLeast(0)
+    val visualLine = layout.getLineForVertical(vertical)
+    return layout.getLineStart(visualLine).coerceIn(0, text.length)
+}
+
+private fun TextView.scrollYForCharacterOffset(offset: Int): Int {
+    val layout = layout ?: return 0
+    val safeOffset = offset.coerceIn(0, text.length)
+    val visualLine = layout.getLineForOffset(safeOffset)
+    return layout.getLineTop(visualLine) + totalPaddingTop
 }
 
 private data class ReaderPalette(val paper: Int, val ink: Int)

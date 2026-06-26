@@ -29,15 +29,29 @@ data class CalibreBookMeta(
  * baseUrl/credentials are injected (never hardcoded, C2). Phase 1 scaffold:
  * method shapes are real, business mapping/repository logic lands with feature work.
  */
-class CalibreClient(
-    private val baseUrl: String,
-    private val username: String = "",
-    private val password: String = "",
-    private val libraryId: String = "calibre-library",
+class CalibreClient internal constructor(
+    baseUrl: String,
+    private val username: String,
+    private val password: String,
+    private val libraryId: String,
+    private val http: HttpClient,
 ) {
-    private val http = HttpClient {
-        install(ContentNegotiation) { json() }
-    }
+    constructor(
+        baseUrl: String,
+        username: String = "",
+        password: String = "",
+        libraryId: String = "calibre-library",
+    ) : this(
+        baseUrl = baseUrl,
+        username = username,
+        password = password,
+        libraryId = libraryId,
+        http = HttpClient {
+            install(ContentNegotiation) { json() }
+        },
+    )
+
+    private val baseUrl = requireValidCalibreBaseUrl(baseUrl)
 
     suspend fun search(query: String = "", num: Int = 100, offset: Int = 0): CalibreSearchResult =
         http.get("$baseUrl/ajax/search") {
@@ -56,4 +70,9 @@ class CalibreClient(
         "$baseUrl/get/$format/$id/$libraryId"
 
     fun coverUrl(id: Int) = "$baseUrl/get/cover/$id/$libraryId"
+
+    suspend fun downloadBytes(id: Int, format: String): ByteArray =
+        http.get(downloadUrl(id, format)) {
+            if (username.isNotBlank()) basicAuth(username, password)
+        }.body()
 }

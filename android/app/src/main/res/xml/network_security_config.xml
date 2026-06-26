@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Cleartext HTTP for LAN Calibre server (Android 9+ blocks cleartext by default).
-  Phase 1 placeholder: add the user-configured Calibre host here, or switch to a
-  runtime config. Do NOT hardcode a real baseUrl (C2).
+  Cleartext HTTP is needed for user-configured LAN Calibre servers on Android 9+.
+  Network Security Config cannot express RFC1918 CIDR ranges or runtime user hosts,
+  so Calibre HTTP is constrained in code by CalibreUrlPolicy:
+  only localhost and RFC1918 IPv4 hosts (10/8, 172.16/12, 192.168/16) are accepted.
+  Do NOT hardcode a real baseUrl (C2).
 -->
 <network-security-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">192.168.0.0</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

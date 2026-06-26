@@ -1,10 +1,55 @@
 package dev.readflow.render.epub
 
+import android.content.Intent
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
+import android.text.TextPaint
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.ImageView
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color as ComposeColor
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.LinkInteractionListener
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.createFontFamilyResolver
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.BookFormat
@@ -13,28 +58,94 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
+import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.PagingKind
-import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.ReaderTextAnnotation
+import dev.readflow.render.api.ReaderTextHighlightRange
+import dev.readflow.render.api.ReaderTextSelection
+import dev.readflow.render.api.TextAnnotatableReaderEngine
+import dev.readflow.render.api.TextSelectableReaderEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Collections
+import java.util.WeakHashMap
 
 /**
  * EPUB native reflow engine (v4 §12.3 ADR-EPUB-Engine).
- * ZipFile + jsoup → flat paragraph list → RecyclerView continuous scroll.
+ * ZipFile + jsoup → typed ReaderItem model → TextView paragraph stream.
  * No WebView / epubjs / CFI.
- * Locator = Section(spineIndex, elementIndex=flatPos, charOffset=0).
+ * Locator = Section(spineIndex, elementIndex=flatPos, charOffset=spine char start).
  */
-class EpubReflowEngine(private val context: Context) : ReaderEngine {
+internal sealed interface EpubPageLineMeasurer {
+    fun measure(
+        text: String,
+        contentWidthPx: Int,
+        textStyle: EpubPageTextStyle,
+    ): List<Pair<Int, Int>>
+
+    val measurement: EpubPageMeasurement
+
+    data class StaticLayout(
+        val lineBreaker: (
+            text: String,
+            contentWidthPx: Int,
+            textStyle: EpubPageTextStyle,
+        ) -> List<Pair<Int, Int>>,
+    ) : EpubPageLineMeasurer {
+        override val measurement: EpubPageMeasurement = EpubPageMeasurement.StaticLayout
+
+        override fun measure(
+            text: String,
+            contentWidthPx: Int,
+            textStyle: EpubPageTextStyle,
+        ): List<Pair<Int, Int>> = lineBreaker(text, contentWidthPx, textStyle)
+    }
+
+    data class ComposeTextLayoutResult(
+        val lineBreaker: (
+            text: String,
+            contentWidthPx: Int,
+            textStyle: EpubPageTextStyle,
+        ) -> List<EpubTextLayoutLineRange>,
+    ) : EpubPageLineMeasurer {
+        override val measurement: EpubPageMeasurement = EpubPageMeasurement.ComposeTextLayoutResult
+
+        override fun measure(
+            text: String,
+            contentWidthPx: Int,
+            textStyle: EpubPageTextStyle,
+        ): List<Pair<Int, Int>> = lineBreaker(text, contentWidthPx, textStyle)
+            .map { it.start to it.end }
+    }
+}
+
+class EpubReflowEngine private constructor(
+    private val context: Context,
+    private val pageLineMeasurer: EpubPageLineMeasurer?,
+    @Suppress("UNUSED_PARAMETER") private val constructorMarker: Unit?,
+) : PagedReaderEngine, TextSelectableReaderEngine, TextAnnotatableReaderEngine {
+
+    constructor(context: Context) : this(context, pageLineMeasurer = null, constructorMarker = null)
+
+    internal constructor(
+        context: Context,
+        pageLineMeasurer: EpubPageLineMeasurer,
+    ) : this(context, pageLineMeasurer = pageLineMeasurer, constructorMarker = null)
 
     override val id = "epub-reflow"
     override val format = BookFormat.EPUB
     override val priority = 0
-    override val supportsSearch = false
+    override val supportsSearch = true
+    override val supportedModes: Set<ReadingMode> = setOf(ReadingMode.SCROLL, ReadingMode.PAGED)
 
     private val _pagingKind = MutableStateFlow(PagingKind.CONTINUOUS)
     override val pagingKind: StateFlow<PagingKind> = _pagingKind.asStateFlow()
@@ -51,11 +162,28 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
     private val _tableOfContents = MutableStateFlow<List<TocEntry>>(emptyList())
     override val tableOfContents: StateFlow<List<TocEntry>> = _tableOfContents.asStateFlow()
 
+    private val _currentTextSelection = MutableStateFlow<ReaderTextSelection?>(null)
+    override val currentTextSelection: StateFlow<ReaderTextSelection?> = _currentTextSelection.asStateFlow()
+
     private var paras: List<EpubPara> = emptyList()
+    private var lazyBook: EpubLazyBook? = null
+    private var displayBlockCount: Int = 0
+    private var epubFile: File? = null
+    private var internalLinkTargetIndexes: Map<String, EpubTargetPosition> = emptyMap()
+    private var spineCharCounts: List<Int> = emptyList()
+    private var pagedSlices: List<EpubPageSlice> = emptyList()
     private var chapterBoundaries: List<ChapterBoundary> = emptyList()
     private var fontSizeSp: Float = 18f
+    private var lineSpacingMultiplier: Float = 1.75f
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
+    private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
     private var recyclerView: RecyclerView? = null
+    private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
+    private var cacheJob: Job? = null
+    private var cacheScope: CoroutineScope? = null
+    private val activePageContainers = Collections.newSetFromMap(WeakHashMap<View, Boolean>())
+    private val activePagedTextPages = WeakHashMap<ComposeView, EpubPagedTextPageState>()
+    private val activePagedImagePages = WeakHashMap<View, EpubPagedImagePageState>()
 
     /** Start index (inclusive) and end index (exclusive) of each chapter in paras. */
     private data class ChapterBoundary(
@@ -65,30 +193,67 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
         val title: String,
     )
 
+    private data class EpubPagedTextPageState(
+        val slice: EpubPageSlice,
+        val pageIndex: Int,
+        val selectionHighlightState: MutableState<ReaderTextHighlightRange?>,
+    )
+
+    private data class EpubPagedImagePageState(
+        val slice: EpubPageSlice,
+        val pageIndex: Int,
+    )
+
     override suspend fun supports(uri: Uri): Boolean = true
 
-    override suspend fun openBook(uri: Uri): Locator = withContext(Dispatchers.IO) {
-        val tmp = File(context.cacheDir, "epub_${uri.hashCode()}.epub")
-        if (!tmp.exists()) {
-            context.contentResolver.openInputStream(uri)?.use { src ->
-                tmp.outputStream().use { dst -> src.copyTo(dst) }
+    override suspend fun openBook(uri: Uri): Locator {
+        resetBookStateForOpen()
+        return withContext(Dispatchers.IO) {
+            val tmp = File(context.cacheDir, "epub_${uri.hashCode()}.epub")
+            if (!tmp.exists()) {
+                context.contentResolver.openInputStream(uri)?.use { src ->
+                    tmp.outputStream().use { dst -> src.copyTo(dst) }
+                }
             }
+            epubFile = tmp
+            cacheJob?.cancel()
+            cacheJob = SupervisorJob()
+            cacheScope = CoroutineScope(cacheJob!! + Dispatchers.IO)
+            val book = EpubParser().parseLazyBook(tmp)
+            lazyBook = book
+            book.prefetchAroundParagraph(0)
+            paras = book.paras
+            internalLinkTargetIndexes = epubInternalLinkTargetIndexes(book.spinePaths, paras, book.fragmentTargetIndexes)
+            spineCharCounts = epubSpineCharCounts(paras)
+            pagedSlices = buildPagedSlices()
+            chapterBoundaries = buildChapterBoundaries(paras)
+            displayBlockCount = book.blockCount
+            val initial = epubLocatorForIndex(paras, index = 0)
+            withContext(Dispatchers.Main) {
+                updatePageCount()
+                _chapterInfo.value = ChapterInfo(0, chapterBoundaries.size, chapterBoundaries.firstOrNull()?.title ?: "", 0f)
+                _tableOfContents.value = book.tableOfContents.ifEmpty { buildToc(chapterBoundaries, paras.size) }
+                _currentLocator.value = initial
+            }
+            initial
         }
-        paras = EpubParser().parse(tmp)
-        chapterBoundaries = buildChapterBoundaries(paras)
-        withContext(Dispatchers.Main) {
-            _pageCount.value = paras.size
-            _chapterInfo.value = ChapterInfo(0, chapterBoundaries.size, chapterBoundaries.firstOrNull()?.title ?: "", 0f)
-            _tableOfContents.value = buildToc(chapterBoundaries, paras.size)
-        }
-        _currentLocator.value
     }
 
     override fun createView(): View {
         return RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
             val palette = paletteFor(themeMode, resources.configuration)
-            adapter = EpubParaAdapter(paras, fontSizeSp, palette.ink)
+            adapter = EpubParaAdapter(
+                blockCount = displayBlockCount,
+                blockProvider = { index -> lazyBook?.blockAt(index) },
+                imageLoader = { href -> epubFile?.let { decodeEpubImage(it, href) } },
+                onLinkClick = ::handleLinkClick,
+                onTextSelectionChanged = ::updateTextSelection,
+                highlightRangesProvider = ::highlightRangesForParagraph,
+                fontSizeSp = fontSizeSp,
+                lineSpacingMultiplier = lineSpacingMultiplier,
+                inkColor = palette.ink,
+            )
             setBackgroundColor(palette.paper)
             clipToPadding = false
             val padV = (24 * resources.displayMetrics.density).toInt()
@@ -99,19 +264,96 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
         }.also { recyclerView = it }
     }
 
+    override fun createPageView(pageIndex: Int): View {
+        val pages = pagedSlices.ifEmpty { buildPagedSlices().also { pagedSlices = it } }
+        val total = pages.size.coerceAtLeast(1)
+        val safePageIndex = pageIndex.coerceIn(0, total - 1)
+        val slice = pages.getOrNull(safePageIndex) ?: EpubPageSlice(paragraphIndex = 0, startOffset = 0, endOffset = 0)
+        if (slice.kind is EpubPageSliceKind.Image) {
+            return createImagePageView(slice, safePageIndex, total)
+        }
+        val paragraphIndex = slice.paragraphIndex.coerceIn(0, paras.lastIndex.coerceAtLeast(0))
+        val fullText = lazyBook?.paragraphAt(paragraphIndex)?.text.orEmpty()
+        val pageText = fullText.substring(
+            slice.startOffset.coerceIn(0, fullText.length),
+            slice.endOffset.coerceIn(0, fullText.length).coerceAtLeast(slice.startOffset.coerceIn(0, fullText.length)),
+        )
+        val highlightRanges = highlightRangesForPageSlice(slice)
+        val palette = paletteFor(themeMode, context.resources.configuration)
+        val pageProgressDescription = "第 ${safePageIndex + 1} 页，共 $total 页"
+        val composeSelectionHighlightState = mutableStateOf<ReaderTextHighlightRange?>(null)
+        val composeView = ComposeView(context).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER,
+            )
+            setBackgroundColor(palette.paper)
+            tag = slice
+            setTag(R.id.epub_compose_text_surface, pageText)
+            setTag(R.id.epub_compose_text_surface_visible, true)
+            setTag(R.id.epub_compose_text_highlight_ranges, highlightRanges)
+            setTag(R.id.epub_compose_text_links, slice.links)
+            setTag(R.id.epub_selection_overlay_view, null)
+            setTag(R.id.epub_selection_overlay_visible, false)
+            setTag(R.id.epub_selection_overlay_behind_compose_text, false)
+            setTag(R.id.epub_selection_bridge_hosted_in_compose_tree, false)
+            setTag(R.id.epub_selection_overlay_accessibility_hidden, true)
+            setTag(R.id.epub_compose_text_selection_enabled, true)
+            setTag(R.id.epub_compose_text_semantics_exposed, true)
+            applyComposePageAccessibilityProgress(pageProgressDescription)
+            bindEpubComposeTextPage(pageText, slice, highlightRanges, palette, composeSelectionHighlightState)
+        }
+        return composeView.also { trackPageView(it, safePageIndex, slice, composeSelectionHighlightState) }
+    }
+
+    private fun createImagePageView(slice: EpubPageSlice, pageIndex: Int, total: Int): View {
+        val image = slice.kind as EpubPageSliceKind.Image
+        val palette = paletteFor(themeMode, context.resources.configuration)
+        val density = context.resources.displayMetrics.density
+        val imageView = ImageView(context).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            ).apply {
+                maxWidth = (MAX_LINE_WIDTH_DP * density).toInt()
+            }
+            adjustViewBounds = true
+            maxHeight = (760 * density).toInt()
+            minimumHeight = (48 * density).toInt()
+            setPadding((28 * density).toInt(), (24 * density).toInt(), (28 * density).toInt(), (24 * density).toInt())
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            contentDescription = imagePageContentDescription(image, pageIndex, total)
+            setImageBitmap(epubFile?.let { decodeEpubImage(it, image.href) })
+        }
+        return FrameLayout(context).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            setBackgroundColor(palette.paper)
+            tag = slice
+            addView(imageView)
+        }.also { trackImagePageView(it, pageIndex, slice) }
+    }
+
+    override fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?) {
+        pageRequestCallback = callback
+    }
+
+    override fun pageIndexForLocator(locator: Locator): Int =
+        epubPageIndexFromLocator(locator, pagedSlices, paras)
+
     private fun reportProgression(rv: RecyclerView) {
         val total = paras.size.takeIf { it > 0 } ?: return
         val lm = rv.layoutManager as? LinearLayoutManager ?: return
-        val first = lm.findFirstVisibleItemPosition().coerceAtLeast(0)
-        val para = paras.getOrNull(first) ?: return
-        val ratio = first.toFloat() / total
-        _currentLocator.value = Locator(
-            strategy = LocatorStrategy.Section(para.spineIndex, first, 0),
-            progression = ratio,
-            totalProgression = ratio,
-        )
-        // Update chapter info
-        updateChapterInfo(first)
+        val firstBlock = lm.findFirstVisibleItemPosition().coerceAtLeast(0)
+        val firstParagraph = lazyBook?.blockAt(firstBlock)?.paragraphIndex ?: firstBlock
+        val safeIndex = firstParagraph.coerceIn(0, total - 1)
+        warmCacheAround(safeIndex)
+        _currentLocator.value = epubLocatorForIndex(paras, safeIndex)
+        updateChapterInfo(safeIndex)
     }
 
     private fun updateChapterInfo(paraIndex: Int) {
@@ -134,10 +376,7 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
         val targetIdx = (info.currentIndex + delta).coerceIn(0, chapterBoundaries.lastIndex)
         if (targetIdx == info.currentIndex) return
         val target = chapterBoundaries[targetIdx]
-        withContext(Dispatchers.Main) {
-            (recyclerView?.layoutManager as? LinearLayoutManager)
-                ?.scrollToPositionWithOffset(target.startInclusive, 0)
-        }
+        goTo(epubLocatorForIndex(paras, target.startInclusive))
     }
 
     private fun buildChapterBoundaries(paras: List<EpubPara>): List<ChapterBoundary> {
@@ -167,25 +406,222 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
                         totalProgression = if (total > 0) boundary.startInclusive.toFloat() / total else 0f,
                     ),
                 )
-            }
+    }
 
     override suspend fun goTo(locator: Locator) {
-        val idx = (locator.strategy as? LocatorStrategy.Section)?.elementIndex ?: 0
+        val previousPageIndex = if (_pagingKind.value == PagingKind.PAGED) {
+            epubPageIndexFromLocator(_currentLocator.value, pagedSlices, paras)
+        } else {
+            null
+        }
+        val pageIndex = if (_pagingKind.value == PagingKind.PAGED) {
+            epubPageIndexFromLocator(locator, pagedSlices, paras)
+        } else {
+            null
+        }
+        val shouldClearPageSelection = previousPageIndex != null &&
+            pageIndex != null &&
+            pageIndex != previousPageIndex
+        val idx = if (_pagingKind.value == PagingKind.PAGED && locator.strategy is LocatorStrategy.Page) {
+            pagedSlices.getOrNull(pageIndex ?: 0)?.paragraphIndex ?: epubIndexFromLocator(locator, paras.size)
+        } else {
+            epubIndexFromLocator(locator, paras.size)
+        }
+        val target = if (_pagingKind.value == PagingKind.PAGED && pageIndex != null) {
+            pagedSlices.getOrNull(pageIndex)?.let { epubLocatorForPageSlice(paras, it) }
+                ?: epubLocatorForIndex(paras, idx)
+        } else {
+            epubLocatorForIndex(paras, idx)
+        }
+        withContext(Dispatchers.IO) {
+            lazyBook?.prefetchAroundParagraph(idx)
+        }
+        val targetBlock = lazyBook?.blockIndexForParagraph(idx) ?: idx
         withContext(Dispatchers.Main) {
-            (recyclerView?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(idx, 0)
+            if (shouldClearPageSelection) {
+                clearTextSelection()
+            }
+            (recyclerView?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(targetBlock, 0)
+            _currentLocator.value = target
+            updateChapterInfo(idx)
+            if (_pagingKind.value == PagingKind.PAGED) {
+                pageRequestCallback?.invoke(pageIndex ?: epubPageIndexFromLocator(target, pagedSlices, paras))
+            }
         }
     }
 
-    override suspend fun close() {
+    override suspend fun search(query: String): List<Locator> = withContext(Dispatchers.IO) {
+        epubSearchLocators(paras, query) { index -> lazyBook?.paragraphAt(index) }
+    }
+
+    override fun clearTextSelection() {
+        _currentTextSelection.value = null
+        clearActiveComposeSelectionRanges()
+    }
+
+    override fun setTextAnnotations(annotations: List<ReaderTextAnnotation>) {
+        textAnnotations = annotations
+        (recyclerView?.adapter as? EpubParaAdapter)?.updateTextAnnotations()
+        activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
+    }
+
+    private fun updateTextSelection(paragraphIndex: Int, start: Int, end: Int) {
+        _currentTextSelection.value = epubTextSelection(paras, paragraphIndex, start, end) { index ->
+            lazyBook?.paragraphAt(index)
+        }
+    }
+
+    private fun updatePagedTextSelection(
+        composeView: ComposeView,
+        paragraphIndex: Int,
+        slice: EpubPageSlice,
+        start: Int,
+        end: Int,
+        selectionHighlightState: MutableState<ReaderTextHighlightRange?>,
+    ) {
+        val activePageState = activePagedTextPages[composeView] ?: return
+        if (activePageState.slice != slice) return
+        val pageTextLength = (slice.endOffset - slice.startOffset).coerceAtLeast(0)
+        val pageText = pageTextFor(slice)
+        val (selectionStart, selectionEnd) = epubSelectionRangeOnCodePointBoundaries(
+            text = pageText,
+            selectionStart = start.coerceIn(0, pageTextLength),
+            selectionEnd = end.coerceIn(0, pageTextLength),
+        )
+        val paragraph = lazyBook?.paragraphAt(paragraphIndex) ?: paras.getOrNull(paragraphIndex)
+        val trimmedParagraphRange = paragraph?.text?.let { text ->
+            epubNormalizedTextSelectionRange(
+                text = text,
+                selectionStart = selectionStart + slice.startOffset,
+                selectionEnd = selectionEnd + slice.startOffset,
+            )
+        }
+        val textSelection = epubTextSelection(
+            indexedParas = paras,
+            paragraphIndex = paragraphIndex,
+            selectionStart = selectionStart + slice.startOffset,
+            selectionEnd = selectionEnd + slice.startOffset,
+        ) { index -> lazyBook?.paragraphAt(index) }
+        val composeSelectionRange = if (textSelection == null) {
+            null
+        } else {
+            trimmedParagraphRange?.let { (trimmedStart, trimmedEnd) ->
+                val localStart = (trimmedStart - slice.startOffset).coerceIn(0, pageTextLength)
+                val localEnd = (trimmedEnd - slice.startOffset).coerceIn(0, pageTextLength)
+                if (localStart < localEnd) localStart to localEnd else null
+            }
+        }
+        _currentTextSelection.value = textSelection
+        val composeSelectionHighlight = composeSelectionRange?.let { (rangeStart, rangeEnd) ->
+            ReaderTextHighlightRange(
+                start = rangeStart,
+                end = rangeEnd,
+                color = EpubComposeSelectionHighlightColor,
+            )
+        }
+        composeView.setTag(
+            R.id.epub_compose_text_selection_range,
+            composeSelectionRange,
+        )
+        composeView.setTag(
+            R.id.epub_compose_text_selection_highlight_range,
+            composeSelectionHighlight,
+        )
+        composeView.setTag(
+            R.id.epub_compose_text_annotated_string,
+            epubComposeAnnotatedText(
+                text = pageText,
+                highlightRanges = highlightRangesForPageSlice(slice),
+                links = slice.links,
+                selectionHighlightRange = composeSelectionHighlight,
+                linkClickHandler = composeLinkClickHandler(composeView, slice),
+            ),
+        )
+        selectionHighlightState.value = composeSelectionHighlight
+    }
+
+    private fun resetBookStateForOpen() {
+        cacheJob?.cancel()
+        cacheJob = null
+        cacheScope = null
+        activePagedTextPages.keys.toList().forEach { composeView ->
+            composeView.clearEpubComposeTextPageForBookReset()
+        }
+        activePageContainers.toList().forEach { container ->
+            container.clearEpubImagePageForBookReset()
+        }
+        activePageContainers.clear()
+        activePagedTextPages.clear()
+        activePagedImagePages.clear()
+        lazyBook?.close()
+        lazyBook = null
         recyclerView = null
         paras = emptyList()
+        displayBlockCount = 0
+        epubFile = null
+        internalLinkTargetIndexes = emptyMap()
+        spineCharCounts = emptyList()
+        pagedSlices = emptyList()
         chapterBoundaries = emptyList()
+        textAnnotations = emptyList()
+        _currentTextSelection.value = null
+        _currentLocator.value = Locator(LocatorStrategy.Unknown)
+        _chapterInfo.value = ChapterInfo(0, 1, "", 0f)
         _tableOfContents.value = emptyList()
+        _pageCount.value = 0
+    }
+
+    private fun highlightRangesForParagraph(paragraphIndex: Int) =
+        epubHighlightRanges(paras, paragraphIndex, textAnnotations)
+
+    override suspend fun close() {
+        recyclerView = null
+        pageRequestCallback = null
+        cacheJob?.cancel()
+        cacheJob = null
+        cacheScope = null
+        activePagedTextPages.keys.toList().forEach { composeView ->
+            composeView.clearEpubComposeTextPageForBookReset()
+        }
+        activePageContainers.toList().forEach { container ->
+            container.clearEpubImagePageForBookReset()
+        }
+        activePageContainers.clear()
+        activePagedTextPages.clear()
+        activePagedImagePages.clear()
+        lazyBook?.close()
+        lazyBook = null
+        paras = emptyList()
+        displayBlockCount = 0
+        epubFile = null
+        internalLinkTargetIndexes = emptyMap()
+        spineCharCounts = emptyList()
+        pagedSlices = emptyList()
+        chapterBoundaries = emptyList()
+        _currentTextSelection.value = null
+        textAnnotations = emptyList()
+        _currentLocator.value = Locator(LocatorStrategy.Unknown)
+        _chapterInfo.value = ChapterInfo(0, 1, "", 0f)
+        _tableOfContents.value = emptyList()
+        _pageCount.value = 0
     }
 
     override suspend fun setFontSize(sp: Float) {
         fontSizeSp = sp
+        rebuildPagedSlices()
+        clearTextSelection()
         (recyclerView?.adapter as? EpubParaAdapter)?.updateFontSize(sp)
+        activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
+        activePagedImagePages.keys.toList().forEach(::rebindActiveImagePage)
+    }
+
+    override suspend fun setLineSpacing(multiplier: Float) {
+        lineSpacingMultiplier = multiplier
+        rebuildPagedSlices()
+        clearTextSelection()
+        (recyclerView?.adapter as? EpubParaAdapter)?.updateLineSpacing(multiplier)
+        activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
+        activePagedImagePages.keys.toList().forEach(::rebindActiveImagePage)
     }
 
     override suspend fun setTheme(mode: ThemeMode) {
@@ -193,11 +629,527 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
         val palette = paletteFor(mode, context.resources.configuration)
         recyclerView?.setBackgroundColor(palette.paper)
         (recyclerView?.adapter as? EpubParaAdapter)?.updateInkColor(palette.ink)
+        activePageContainers.forEach { it.setBackgroundColor(palette.paper) }
+        activePagedTextPages.keys.toList().forEach { rebindActiveComposeTextPage(it, palette) }
     }
 
-    override suspend fun setMode(mode: ReadingMode) { /* CONTINUOUS only in v4 lite */ }
+    override suspend fun setMode(mode: ReadingMode) {
+        val targetKind = when (mode) {
+            ReadingMode.SCROLL -> PagingKind.CONTINUOUS
+            ReadingMode.PAGED -> PagingKind.PAGED
+        }
+        withContext(Dispatchers.Main) {
+            val paragraphIndex = currentParagraphIndex()
+            val shouldClearModeSelection = targetKind != _pagingKind.value
+            if (shouldClearModeSelection) {
+                clearTextSelection()
+                if (targetKind == PagingKind.CONTINUOUS) {
+                    activePagedTextPages.keys.toList().forEach { composeView ->
+                        composeView.clearEpubComposeTextPageForBookReset()
+                    }
+                    activePageContainers.toList().forEach { container ->
+                        container.clearEpubImagePageForBookReset()
+                    }
+                    activePagedTextPages.clear()
+                    activePageContainers.clear()
+                    activePagedImagePages.clear()
+                }
+            }
+            _pagingKind.value = targetKind
+            _currentLocator.value = epubLocatorForIndex(paras, paragraphIndex)
+            updatePageCount()
+            if (targetKind == PagingKind.PAGED) {
+                pageRequestCallback?.invoke(epubPageIndexFromLocator(_currentLocator.value, pagedSlices, paras))
+            }
+        }
+    }
+
+    private fun currentParagraphIndex(): Int =
+        if (_pagingKind.value == PagingKind.PAGED && _currentLocator.value.strategy is LocatorStrategy.Page) {
+            pagedSlices.getOrNull(epubPageIndexFromLocator(_currentLocator.value, pagedSlices, paras))?.paragraphIndex ?: 0
+        } else {
+            epubIndexFromLocator(_currentLocator.value, paras.size)
+        }
+
+    private fun handleLinkClick(link: EpubTextLink) {
+        if (link.isExternal) {
+            clearTextSelection()
+            openExternalLink(link.href)
+        } else {
+            goToInternalLink(link.href)
+        }
+    }
+
+    private fun openExternalLink(href: String) {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(href)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { context.startActivity(intent) }
+    }
+
+    private fun goToInternalLink(href: String) {
+        val key = epubInternalLinkTargetKey(href)
+        if (key.isEmpty()) return
+        val targetPosition = internalLinkTargetIndexes[key] ?: return
+        val target = epubLocatorForTarget(paras, targetPosition)
+        if (_pagingKind.value == PagingKind.PAGED) {
+            clearTextSelection()
+            _currentLocator.value = target
+            updateChapterInfo(targetPosition.paragraphIndex)
+            pageRequestCallback?.invoke(epubPageIndexFromLocator(target, pagedSlices, paras))
+            return
+        }
+        recyclerView?.post {
+            val targetBlock = lazyBook?.blockIndexForParagraph(targetPosition.paragraphIndex)
+                ?: targetPosition.paragraphIndex
+            (recyclerView?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(targetBlock, 0)
+            _currentLocator.value = target
+            updateChapterInfo(targetPosition.paragraphIndex)
+        }
+    }
+
+    private fun buildPagedSlices(): List<EpubPageSlice> =
+        currentPageLineMeasurer().let { measurer ->
+            epubPagedLayoutWithBlocks(
+                paras = paras,
+                textProvider = { index -> lazyBook?.cachedParagraphAt(index)?.text.orEmpty() },
+                blockProvider = { lazyBook?.cachedBlocks().orEmpty() },
+                metrics = currentPageMetrics(),
+                lineBreaker = { text, contentWidth, textStyle ->
+                    measurer.measure(text, contentWidth, textStyle)
+                },
+                measurement = measurer.measurement,
+            )
+        }
+
+    private fun currentPageLineMeasurer(): EpubPageLineMeasurer =
+        pageLineMeasurer ?: EpubPageLineMeasurer.ComposeTextLayoutResult { text, contentWidth, textStyle ->
+            currentComposeTextLayoutLines(text, contentWidth, textStyle)
+        }
+
+    private fun currentComposeTextLayoutLines(
+        text: String,
+        contentWidthPx: Int,
+        textStyle: EpubPageTextStyle,
+    ): List<EpubTextLayoutLineRange> {
+        val measurer = TextMeasurer(
+            defaultFontFamilyResolver = createFontFamilyResolver(context),
+            defaultDensity = Density(
+                density = context.resources.displayMetrics.density,
+                fontScale = context.resources.configuration.fontScale,
+            ),
+            defaultLayoutDirection = LayoutDirection.Ltr,
+            cacheSize = 8,
+        )
+        val layout = measurer.measure(
+            text = text,
+            style = currentComposeTextStyle(textStyle),
+            constraints = Constraints(maxWidth = contentWidthPx.coerceAtLeast(1)),
+        )
+        return (0 until layout.lineCount).map { line ->
+            EpubTextLayoutLineRange(
+                start = layout.getLineStart(line).coerceIn(0, text.length),
+                end = layout.getLineEnd(line, visibleEnd = true).coerceIn(0, text.length),
+            )
+        }
+    }
+
+    private fun currentComposeTextStyle(style: EpubPageTextStyle): TextStyle {
+        val headingBoost = when (style.headingLevel) {
+            1 -> 5f
+            2 -> 3f
+            3 -> 1.5f
+            else -> 0f
+        }
+        return TextStyle(
+            fontSize = (fontSizeSp + headingBoost).sp,
+            lineHeight = (fontSizeSp * lineSpacingMultiplier).sp,
+            fontFamily = when {
+                style.kind == EpubTextKind.Preformatted || style.kind == EpubTextKind.Table -> FontFamily.Monospace
+                else -> FontFamily.Serif
+            },
+            fontWeight = if (style.headingLevel != null) FontWeight.Bold else FontWeight.Normal,
+        )
+    }
+
+    private fun currentComposeTextLayout(style: EpubPageTextStyle): EpubComposeTextLayout {
+        val leadingPadding = PAGE_HORIZONTAL_PADDING_DP + (style.indentLevel * 24) +
+            if (style.kind == EpubTextKind.Blockquote) 18 else 0
+        return EpubComposeTextLayout(
+            paddingStartDp = leadingPadding,
+            paddingEndDp = PAGE_HORIZONTAL_PADDING_DP,
+            paddingTopDp = PAGE_VERTICAL_PADDING_DP,
+            paddingBottomDp = PAGE_VERTICAL_PADDING_DP,
+            horizontalScroll = style.kind == EpubTextKind.Preformatted,
+        )
+    }
+
+    private fun rebuildPagedSlices() {
+        pagedSlices = buildPagedSlices()
+        updatePageCount()
+        if (_pagingKind.value == PagingKind.PAGED) {
+            pageRequestCallback?.invoke(epubPageIndexFromLocator(_currentLocator.value, pagedSlices, paras))
+        }
+    }
+
+    private fun currentPageMetrics(): EpubPageMetrics {
+        val metrics = context.resources.displayMetrics
+        val horizontalPaddingPx = (PAGE_HORIZONTAL_PADDING_DP * metrics.density * 2).toInt()
+        val verticalPaddingPx = (PAGE_VERTICAL_PADDING_DP * metrics.density * 2).toInt()
+        val textSizePx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, metrics)
+        val averageCharacterWidthPx = currentPageTextPaint()
+            .measureText(AVERAGE_PAGE_CHARACTER_SAMPLE)
+            .div(AVERAGE_PAGE_CHARACTER_SAMPLE.length)
+            .coerceAtLeast(1f)
+        return EpubPageMetrics(
+            viewportWidthPx = metrics.widthPixels.coerceAtLeast(1),
+            viewportHeightPx = metrics.heightPixels.coerceAtLeast(1),
+            horizontalPaddingPx = horizontalPaddingPx,
+            verticalPaddingPx = verticalPaddingPx,
+            averageCharacterWidthPx = averageCharacterWidthPx,
+            lineHeightPx = (textSizePx * lineSpacingMultiplier).coerceAtLeast(1f),
+        )
+    }
+
+    private fun currentPageTextPaint(style: EpubPageTextStyle = EpubPageTextStyle()): TextPaint {
+        val metrics = context.resources.displayMetrics
+        val headingBoost = when (style.headingLevel) {
+            1 -> 5f
+            2 -> 3f
+            3 -> 1.5f
+            else -> 0f
+        }
+        return TextPaint().apply {
+            textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp + headingBoost, metrics)
+            typeface = when {
+                style.kind == EpubTextKind.Preformatted || style.kind == EpubTextKind.Table -> Typeface.MONOSPACE
+                style.headingLevel != null -> Typeface.DEFAULT_BOLD
+                else -> Typeface.SERIF
+            }
+        }
+    }
+
+    private fun updatePageCount() {
+        _pageCount.value = when (_pagingKind.value) {
+            PagingKind.CONTINUOUS -> paras.size
+            PagingKind.PAGED -> pagedSlices.size
+        }
+    }
+
+    private fun pageTextFor(slice: EpubPageSlice): String {
+        val fullText = lazyBook?.paragraphAt(slice.paragraphIndex)?.text.orEmpty()
+        val start = slice.startOffset.coerceIn(0, fullText.length)
+        val end = slice.endOffset.coerceIn(0, fullText.length).coerceAtLeast(start)
+        return fullText.substring(start, end)
+    }
+
+    private fun highlightRangesForPageSlice(slice: EpubPageSlice) =
+        highlightRangesForParagraph(slice.paragraphIndex).mapNotNull { range ->
+            val start = maxOf(range.start, slice.startOffset)
+            val end = minOf(range.end, slice.endOffset)
+            if (start >= end) return@mapNotNull null
+            range.copy(start = start - slice.startOffset, end = end - slice.startOffset)
+        }
+
+    private fun warmCacheAround(paragraphIndex: Int) {
+        val book = lazyBook ?: return
+        cacheScope?.launch {
+            book.prefetchAroundParagraph(paragraphIndex)
+        }
+    }
+
+    private fun trackPageView(
+        container: ComposeView,
+        pageIndex: Int,
+        slice: EpubPageSlice,
+        selectionHighlightState: MutableState<ReaderTextHighlightRange?>,
+    ) {
+        trackPageContainer(container) {
+            activePagedTextPages.remove(container)
+        }
+        activePagedTextPages[container] = EpubPagedTextPageState(slice, pageIndex, selectionHighlightState)
+    }
+
+    private fun trackImagePageView(
+        container: View,
+        pageIndex: Int,
+        slice: EpubPageSlice,
+    ) {
+        trackPageContainer(container) {
+            activePagedImagePages.remove(container)
+        }
+        activePagedImagePages[container] = EpubPagedImagePageState(slice, pageIndex)
+    }
+
+    private fun rebindActiveComposeTextPage(
+        composeView: ComposeView,
+        palette: ReaderPalette = paletteFor(themeMode, context.resources.configuration),
+    ) {
+        val pageState = activePagedTextPages[composeView] ?: return
+        val total = pagedSlices.size.coerceAtLeast(1)
+        val pageIndex = pageState.pageIndex.coerceIn(0, total - 1)
+        val slice = pagedSlices.getOrNull(pageIndex) ?: pageState.slice
+        if (slice.kind is EpubPageSliceKind.Image) {
+            activePagedTextPages.remove(composeView)
+            composeView.retireEpubComposeTextPage(
+                slice = slice,
+                palette = palette,
+                selectionHighlightState = pageState.selectionHighlightState,
+            )
+            return
+        }
+        if (slice != pageState.slice || pageIndex != pageState.pageIndex) {
+            activePagedTextPages[composeView] = pageState.copy(slice = slice, pageIndex = pageIndex)
+            composeView.tag = slice
+        }
+        composeView.applyComposePageAccessibilityProgress("第 ${pageIndex + 1} 页，共 $total 页")
+        val pageText = pageTextFor(slice)
+        val highlightRanges = highlightRangesForPageSlice(slice)
+        composeView.bindEpubComposeTextPage(
+            pageText = pageText,
+            slice = slice,
+            highlightRanges = highlightRanges,
+            palette = palette,
+            selectionHighlightState = pageState.selectionHighlightState,
+        )
+    }
+
+    private fun rebindActiveImagePage(
+        container: View,
+        palette: ReaderPalette = paletteFor(themeMode, context.resources.configuration),
+    ) {
+        val pageState = activePagedImagePages[container] ?: return
+        val total = pagedSlices.size.coerceAtLeast(1)
+        val pageIndex = pageState.pageIndex.coerceIn(0, total - 1)
+        val slice = pagedSlices.getOrNull(pageIndex) ?: pageState.slice
+        if (slice.kind !is EpubPageSliceKind.Image) {
+            activePagedImagePages.remove(container)
+            container.tag = slice
+            container.setBackgroundColor(palette.paper)
+            container.clearEpubImagePageForBookReset()
+            return
+        }
+        if (slice != pageState.slice || pageIndex != pageState.pageIndex) {
+            activePagedImagePages[container] = pageState.copy(slice = slice, pageIndex = pageIndex)
+        }
+        container.tag = slice
+        container.setBackgroundColor(palette.paper)
+        val imageView = container.findEpubImageView() ?: return
+        imageView.contentDescription = imagePageContentDescription(slice.kind, pageIndex, total)
+        imageView.setImageBitmap(epubFile?.let { decodeEpubImage(it, slice.kind.href) })
+    }
+
+    private fun clearActiveComposeSelectionRanges() {
+        activePagedTextPages.forEach { (composeView, pageState) ->
+            val pageText = pageTextFor(pageState.slice)
+            composeView.setTag(R.id.epub_compose_text_selection_range, null)
+            composeView.setTag(R.id.epub_compose_text_selection_highlight_range, null)
+            composeView.setTag(
+                R.id.epub_compose_text_annotated_string,
+                epubComposeAnnotatedText(
+                    text = pageText,
+                    highlightRanges = highlightRangesForPageSlice(pageState.slice),
+                    links = pageState.slice.links,
+                    linkClickHandler = composeLinkClickHandler(composeView, pageState.slice),
+                ),
+            )
+            pageState.selectionHighlightState.value = null
+        }
+    }
+
+    private fun ComposeView.retireEpubComposeTextPage(
+        slice: EpubPageSlice,
+        palette: ReaderPalette,
+        selectionHighlightState: MutableState<ReaderTextHighlightRange?>,
+    ) {
+        _currentTextSelection.value = null
+        selectionHighlightState.value = null
+        tag = slice
+        setBackgroundColor(palette.paper)
+        contentDescription = null
+        setTag(R.id.epub_compose_page_progress_description, null)
+        setTag(R.id.epub_compose_page_root_delegates_accessibility_to_text, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            stateDescription = null
+        }
+        setTag(R.id.epub_compose_text_surface, null)
+        setTag(R.id.epub_compose_text_annotated_string, null)
+        setTag(R.id.epub_compose_text_surface_visible, false)
+        setTag(R.id.epub_compose_text_highlight_ranges, emptyList<ReaderTextHighlightRange>())
+        setTag(R.id.epub_compose_text_links, emptyList<EpubTextLink>())
+        setTag(R.id.epub_compose_text_link_callback, null)
+        setTag(R.id.epub_compose_text_link_tap_wired, false)
+        setTag(R.id.epub_compose_text_style, null)
+        setTag(R.id.epub_compose_text_layout, null)
+        setTag(R.id.epub_compose_text_selection_range, null)
+        setTag(R.id.epub_compose_text_selection_highlight_range, null)
+        setTag(R.id.epub_compose_text_selection_enabled, false)
+        setTag(R.id.epub_compose_text_selection_callback, null)
+        setTag(R.id.epub_compose_text_gesture_selection_wired, false)
+        setTag(R.id.epub_compose_text_long_press_selection_wired, false)
+        setTag(R.id.epub_compose_text_semantics_exposed, false)
+        setTag(R.id.epub_selection_overlay_view, null)
+        setTag(R.id.epub_selection_overlay_visible, false)
+        setTag(R.id.epub_selection_overlay_behind_compose_text, false)
+        setTag(R.id.epub_selection_bridge_hosted_in_compose_tree, false)
+        setTag(R.id.epub_selection_overlay_accessibility_hidden, true)
+        setContent {}
+    }
+
+    private fun ComposeView.clearEpubComposeTextPageForBookReset() {
+        contentDescription = null
+        setTag(R.id.epub_compose_page_progress_description, null)
+        setTag(R.id.epub_compose_page_root_delegates_accessibility_to_text, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            stateDescription = null
+        }
+        setTag(R.id.epub_compose_text_surface, null)
+        setTag(R.id.epub_compose_text_annotated_string, null)
+        setTag(R.id.epub_compose_text_surface_visible, false)
+        setTag(R.id.epub_compose_text_highlight_ranges, emptyList<ReaderTextHighlightRange>())
+        setTag(R.id.epub_compose_text_links, emptyList<EpubTextLink>())
+        setTag(R.id.epub_compose_text_link_callback, null)
+        setTag(R.id.epub_compose_text_link_tap_wired, false)
+        setTag(R.id.epub_compose_text_style, null)
+        setTag(R.id.epub_compose_text_layout, null)
+        setTag(R.id.epub_compose_text_selection_range, null)
+        setTag(R.id.epub_compose_text_selection_highlight_range, null)
+        setTag(R.id.epub_compose_text_selection_enabled, false)
+        setTag(R.id.epub_compose_text_selection_callback, null)
+        setTag(R.id.epub_compose_text_gesture_selection_wired, false)
+        setTag(R.id.epub_compose_text_long_press_selection_wired, false)
+        setTag(R.id.epub_compose_text_semantics_exposed, false)
+        setTag(R.id.epub_selection_overlay_view, null)
+        setTag(R.id.epub_selection_overlay_visible, false)
+        setTag(R.id.epub_selection_overlay_behind_compose_text, false)
+        setTag(R.id.epub_selection_bridge_hosted_in_compose_tree, false)
+        setTag(R.id.epub_selection_overlay_accessibility_hidden, true)
+        setContent {}
+    }
+
+    private fun View.clearEpubImagePageForBookReset() {
+        if (this is ImageView) {
+            contentDescription = null
+            setImageDrawable(null)
+        }
+        val group = this as? ViewGroup ?: return
+        for (index in 0 until group.childCount) {
+            group.getChildAt(index).clearEpubImagePageForBookReset()
+        }
+    }
+
+    private fun View.findEpubImageView(): ImageView? {
+        if (this is ImageView) return this
+        val group = this as? ViewGroup ?: return null
+        for (index in 0 until group.childCount) {
+            group.getChildAt(index).findEpubImageView()?.let { return it }
+        }
+        return null
+    }
+
+    private fun imagePageContentDescription(
+        image: EpubPageSliceKind.Image,
+        pageIndex: Int,
+        total: Int,
+    ): String =
+        image.altText
+            ?.takeIf { it.isNotBlank() }
+            ?.let { "$it，第 ${pageIndex + 1} 页，共 $total 页" }
+            ?: "图片，第 ${pageIndex + 1} 页，共 $total 页"
+
+    private fun ComposeView.bindEpubComposeTextPage(
+        pageText: String,
+        slice: EpubPageSlice,
+        highlightRanges: List<ReaderTextHighlightRange>,
+        palette: ReaderPalette,
+        selectionHighlightState: MutableState<ReaderTextHighlightRange?>,
+    ) {
+        val textLayout = currentComposeTextLayout(slice.textStyle)
+        val annotatedText = epubComposeAnnotatedText(
+            text = pageText,
+            highlightRanges = highlightRanges,
+            links = slice.links,
+            selectionHighlightRange = selectionHighlightState.value,
+            linkClickHandler = composeLinkClickHandler(this, slice),
+        )
+        setTag(R.id.epub_compose_text_surface, pageText)
+        setTag(R.id.epub_compose_text_annotated_string, annotatedText)
+        setTag(R.id.epub_compose_text_surface_visible, true)
+        setTag(R.id.epub_compose_text_highlight_ranges, highlightRanges)
+        setTag(R.id.epub_compose_text_links, slice.links)
+        val composeLinkClickCallback = composeLinkClickHandler(this, slice)
+        setTag(R.id.epub_compose_text_link_callback, composeLinkClickCallback)
+        setTag(R.id.epub_compose_text_link_tap_wired, true)
+        setTag(R.id.epub_compose_text_style, slice.textStyle)
+        setTag(R.id.epub_compose_text_layout, textLayout)
+        setTag(R.id.epub_selection_overlay_view, null)
+        setTag(R.id.epub_selection_overlay_visible, false)
+        setTag(R.id.epub_selection_overlay_behind_compose_text, false)
+        setTag(R.id.epub_selection_bridge_hosted_in_compose_tree, false)
+        setTag(R.id.epub_selection_overlay_accessibility_hidden, true)
+        setTag(R.id.epub_compose_text_selection_enabled, true)
+        setTag(R.id.epub_compose_text_semantics_exposed, true)
+        val composeSelectionCallback: (Int, Int) -> Unit = { start, end ->
+            updatePagedTextSelection(
+                composeView = this@bindEpubComposeTextPage,
+                paragraphIndex = slice.paragraphIndex,
+                slice = slice,
+                start = start,
+                end = end,
+                selectionHighlightState = selectionHighlightState,
+            )
+        }
+        setTag(R.id.epub_compose_text_selection_callback, composeSelectionCallback)
+        setTag(R.id.epub_compose_text_gesture_selection_wired, true)
+        setTag(R.id.epub_compose_text_long_press_selection_wired, true)
+        setContent {
+            EpubComposeTextPage(
+                text = pageText,
+                textStyle = currentComposeTextStyle(slice.textStyle).copy(color = ComposeColor(palette.ink)),
+                textLayout = textLayout,
+                highlightRanges = highlightRanges,
+                links = slice.links,
+                selectionHighlightRange = selectionHighlightState.value,
+                onComposeSelectionRange = composeSelectionCallback,
+                onComposeLinkClick = composeLinkClickCallback,
+            )
+        }
+    }
+
+    private fun composeLinkClickHandler(
+        composeView: ComposeView,
+        slice: EpubPageSlice,
+    ): (EpubTextLink) -> Unit = { link ->
+        val activePageState = activePagedTextPages[composeView]
+        if (activePageState?.slice == slice) {
+            handleLinkClick(link)
+        }
+    }
+
+    private fun ComposeView.applyComposePageAccessibilityProgress(description: String) {
+        contentDescription = null
+        setTag(R.id.epub_compose_page_progress_description, description)
+        setTag(R.id.epub_compose_page_root_delegates_accessibility_to_text, true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            stateDescription = description
+        }
+    }
+
+    private fun trackPageContainer(container: View, onDetached: () -> Unit = {}) {
+        activePageContainers.add(container)
+        container.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) = Unit
+
+            override fun onViewDetachedFromWindow(view: View) {
+                activePageContainers.remove(container)
+                onDetached()
+            }
+        })
+    }
 
     private companion object {
+        const val MAX_LINE_WIDTH_DP = 680
+        const val PAGE_HORIZONTAL_PADDING_DP = 28
+        const val PAGE_VERTICAL_PADDING_DP = 24
+        const val AVERAGE_PAGE_CHARACTER_SAMPLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz一二三四五六七八九十"
         val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
         val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
         val PAPER_LIGHT = Color.rgb(0xFA, 0xFA, 0xF8)
@@ -221,3 +1173,167 @@ class EpubReflowEngine(private val context: Context) : ReaderEngine {
 }
 
 private data class ReaderPalette(val paper: Int, val ink: Int)
+
+internal const val EpubComposeSelectionHighlightColor: Int = 0x663B82F6
+
+internal data class EpubComposeTextLayout(
+    val paddingStartDp: Int,
+    val paddingEndDp: Int,
+    val paddingTopDp: Int,
+    val paddingBottomDp: Int,
+    val horizontalScroll: Boolean,
+)
+
+@Composable
+private fun EpubComposeTextPage(
+    text: String,
+    textStyle: TextStyle,
+    textLayout: EpubComposeTextLayout,
+    highlightRanges: List<ReaderTextHighlightRange>,
+    links: List<EpubTextLink>,
+    selectionHighlightRange: ReaderTextHighlightRange?,
+    onComposeSelectionRange: (start: Int, end: Int) -> Unit,
+    onComposeLinkClick: (EpubTextLink) -> Unit,
+) {
+    val horizontalScrollState = rememberScrollState()
+    val scrollModifier = if (textLayout.horizontalScroll) {
+        Modifier.horizontalScroll(horizontalScrollState)
+    } else {
+        Modifier
+    }
+    val textLayoutResultState = remember(text) { mutableStateOf<TextLayoutResult?>(null) }
+    val selectionStartState = remember(text) { mutableStateOf<EpubComposeInitialSelection?>(null) }
+    fun textOffsetAt(position: Offset): Int? =
+        textLayoutResultState.value
+            ?.getOffsetForPosition(position)
+            ?.coerceIn(0, text.length)
+    fun linkAt(position: Offset): EpubTextLink? {
+        val offset = textOffsetAt(position) ?: return null
+        return links.firstOrNull { link ->
+            offset >= link.start && offset < link.end
+        }
+    }
+    val composeLinkTapModifier = Modifier.pointerInput(text, links, onComposeLinkClick) {
+        detectTapGestures(
+            onTap = { position ->
+                linkAt(position)?.let(onComposeLinkClick)
+            },
+        )
+    }
+    val composeSelectionGestureModifier = Modifier.pointerInput(text, onComposeSelectionRange) {
+        detectDragGesturesAfterLongPress(
+            onDragStart = { position ->
+                val initialSelection = textOffsetAt(position)?.let { offset ->
+                    epubComposeInitialSelectionAt(text, offset)
+                }
+                selectionStartState.value = initialSelection
+                if (initialSelection != null) {
+                    onComposeSelectionRange(initialSelection.range.first, initialSelection.range.second)
+                }
+            },
+            onDragEnd = {
+                selectionStartState.value = null
+            },
+            onDragCancel = {
+                selectionStartState.value = null
+            },
+            onDrag = { change, _ ->
+                val focus = textOffsetAt(change.position)
+                val selectionRange = focus?.let { offset ->
+                    epubComposeDragSelectionRange(selectionStartState.value, offset)
+                }
+                if (selectionRange != null) {
+                    onComposeSelectionRange(selectionRange.first, selectionRange.second)
+                }
+            },
+        )
+    }
+    Box(Modifier.fillMaxSize()) {
+        SelectionContainer {
+            BasicText(
+                text = epubComposeAnnotatedText(
+                    text,
+                    highlightRanges,
+                    links,
+                    selectionHighlightRange,
+                    linkClickHandler = onComposeLinkClick,
+                ),
+                style = textStyle,
+                onTextLayout = { layoutResult ->
+                    textLayoutResultState.value = layoutResult
+                },
+                modifier = Modifier
+                    .widthIn(max = 680.dp)
+                    .padding(
+                        start = textLayout.paddingStartDp.dp,
+                        end = textLayout.paddingEndDp.dp,
+                        top = textLayout.paddingTopDp.dp,
+                        bottom = textLayout.paddingBottomDp.dp,
+                    )
+                    .then(scrollModifier)
+                    .then(composeLinkTapModifier)
+                    .then(composeSelectionGestureModifier),
+            )
+        }
+    }
+}
+
+private fun epubComposeAnnotatedText(
+    text: String,
+    highlightRanges: List<ReaderTextHighlightRange>,
+    links: List<EpubTextLink>,
+    selectionHighlightRange: ReaderTextHighlightRange? = null,
+    linkClickHandler: ((EpubTextLink) -> Unit)? = null,
+): AnnotatedString {
+    val builder = AnnotatedString.Builder(text)
+    links.forEach { link ->
+        val start = link.start.coerceIn(0, text.length)
+        val end = link.end.coerceIn(0, text.length)
+        if (start < end && link.href.isNotBlank()) {
+            val linkStyle = SpanStyle(textDecoration = TextDecoration.Underline)
+            builder.addStringAnnotation(
+                tag = "URL",
+                annotation = link.href,
+                start = start,
+                end = end,
+            )
+            builder.addLink(
+                LinkAnnotation.Url(
+                    url = link.href,
+                    styles = TextLinkStyles(style = linkStyle),
+                    linkInteractionListener = linkClickHandler?.let { handler ->
+                        object : LinkInteractionListener {
+                            override fun onClick(linkAnnotation: LinkAnnotation) {
+                                handler(link)
+                            }
+                        }
+                    },
+                ),
+                start = start,
+                end = end,
+            )
+            builder.addStyle(
+                style = linkStyle,
+                start = start,
+                end = end,
+            )
+        }
+    }
+    val ranges = if (selectionHighlightRange == null) {
+        highlightRanges
+    } else {
+        highlightRanges + selectionHighlightRange
+    }
+    ranges.forEach { range ->
+        val start = range.start.coerceIn(0, text.length)
+        val end = range.end.coerceIn(0, text.length)
+        if (start < end) {
+            builder.addStyle(
+                style = SpanStyle(background = ComposeColor(range.color)),
+                start = start,
+                end = end,
+            )
+        }
+    }
+    return builder.toAnnotatedString()
+}
