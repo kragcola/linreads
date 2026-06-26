@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed 横竖屏重分页 AVD runtime 补证
+- 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksMicroParagraphsAfterOrientationChangeRuntime`，通过 48 个微短段 EPUB 在真实 reader route 中从竖屏切到分页，再旋转到横屏，验证 viewport 改变后 paged Compose 会重分页且仍保持 packed，不回归“一段一页”
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；targeted `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksMicroParagraphsAfterOrientationChangeRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (5 tests)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过
+- 证据：`/tmp/readflow-page05-packed-rotation-runtime-20260626/full-class/page05-epub-runtime-smoke/packed-rotation-summary.txt` 记录 portrait `surface=1080x2400`、`page_count=4`、第 1 页 14 段；landscape `surface=2400x1080`、`page_count=8`、第 1 页 6 段；landscape accessibility scroll forward 后第 2 页仍有 `Rotate line 007..012` 6 段；logcat grep 未命中 crash/ANR/recycled-bitmap
+- 边界：这是 AVD orientation/configuration-change + screenshot/XML/tag summary 证据，不是真实手机/平板旋转手感、折叠屏/分屏、TalkBack speech/action-mode、跨屏视觉调校或帧率/PSS 预算；`PAGE-05` 保持 `PARTIAL`
+
 ### Android v4 EPUB packed 行距重分页 AVD runtime 补证
 - 回填 `PAGE-05` / `UX-04`：在 36 个微短段 EPUB reader-route smoke 中，通过用户可见 `排版` 面板拖动 `行距` slider 到 2.2x，验证 line-spacing 触发 paged Compose 重分页后仍保持 packed，而不是回归“一段一页”
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；targeted `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksMicroParagraphsWithoutOneSentencePagesRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (4 tests)`

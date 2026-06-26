@@ -3,6 +3,7 @@ package dev.readflow.page05
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
@@ -74,6 +75,8 @@ class EpubPagedRuntimeSmokeTest {
 
     @After
     fun tearDown() {
+        runCatching { device.setOrientationNatural() }
+        runCatching { device.unfreezeRotation() }
         device.pressHome()
         device.waitForIdle()
     }
@@ -610,6 +613,126 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedPacksMicroParagraphsAfterOrientationChangeRuntime() {
+        val title = "page05-rotate-${UUID.randomUUID().toString().take(8)}"
+        val lines = (1..48).map { index -> "Rotate line ${index.toString().padStart(3, '0')}." }
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to lines.joinToString(
+                    prefix = """
+                        <html xmlns="http://www.w3.org/1999/xhtml">
+                          <body>
+                    """.trimIndent(),
+                    separator = "\n",
+                    postfix = """
+                          </body>
+                        </html>
+                    """.trimIndent(),
+                ) { line -> "<p>$line</p>" },
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected rotate EPUB reader to enter paged mode") {
+                scenario.withActivity { activity ->
+                    activity.findEpubViewPager() != null && activity.currentEpubComposePageRootOrNull() != null
+                }
+            }
+
+            val baseline = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-rotate-portrait.png")
+            dumpHierarchy("packed-rotate-portrait.xml")
+
+            device.setOrientationLeft()
+            device.waitForIdle()
+            waitForCondition("expected emulator to report landscape orientation after rotation") {
+                scenario.withActivity { activity ->
+                    activity.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                }
+            }
+            waitForCondition("expected packed EPUB reader to rebuild into a paged compose page after rotation") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    itemCount in 1 until lines.size && lines.any { line -> pageText.contains(line) }
+                }
+            }
+
+            val landscape = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-rotate-landscape.png")
+            dumpHierarchy("packed-rotate-landscape.xml")
+
+            performReaderAccessibilityAction(
+                scenario = scenario,
+                action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+            )
+            waitForCondition("expected landscape packed EPUB reader to advance to another packed page") {
+                scenario.withActivity { activity ->
+                    (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > landscape.currentItem &&
+                        activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                            ?.let { it != landscape.pageText } == true
+                }
+            }
+
+            val landscapeAfterNext = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-rotate-landscape-after-next.png")
+            dumpHierarchy("packed-rotate-landscape-after-next.xml")
+
+            val baselineLineCount = lines.count { line -> baseline.pageText.contains(line) }
+            val landscapeLineCount = lines.count { line -> landscape.pageText.contains(line) }
+            val landscapeNextLineCount = lines.count { line -> landscapeAfterNext.pageText.contains(line) }
+            writeTextEvidence(
+                "packed-rotation-summary.txt",
+                buildString {
+                    appendLine("paragraph_count=${lines.size}")
+                    appendLine("portrait_orientation=${baseline.orientation}")
+                    appendLine("portrait_surface_width=${baseline.surfaceWidth}")
+                    appendLine("portrait_surface_height=${baseline.surfaceHeight}")
+                    appendLine("portrait_page_count=${baseline.itemCount}")
+                    appendLine("portrait_current_item=${baseline.currentItem}")
+                    appendLine("portrait_page_progress=${baseline.pageProgress}")
+                    appendLine("portrait_line_count=$baselineLineCount")
+                    appendLine("portrait_page_text=${baseline.pageText}")
+                    appendLine("landscape_orientation=${landscape.orientation}")
+                    appendLine("landscape_surface_width=${landscape.surfaceWidth}")
+                    appendLine("landscape_surface_height=${landscape.surfaceHeight}")
+                    appendLine("landscape_page_count=${landscape.itemCount}")
+                    appendLine("landscape_current_item=${landscape.currentItem}")
+                    appendLine("landscape_page_progress=${landscape.pageProgress}")
+                    appendLine("landscape_line_count=$landscapeLineCount")
+                    appendLine("landscape_page_text=${landscape.pageText}")
+                    appendLine("landscape_next_current_item=${landscapeAfterNext.currentItem}")
+                    appendLine("landscape_next_page_progress=${landscapeAfterNext.pageProgress}")
+                    appendLine("landscape_next_line_count=$landscapeNextLineCount")
+                    appendLine("landscape_next_page_text=${landscapeAfterNext.pageText}")
+                },
+            )
+
+            assertEquals(Configuration.ORIENTATION_PORTRAIT, baseline.orientation)
+            assertEquals(Configuration.ORIENTATION_LANDSCAPE, landscape.orientation)
+            assertTrue("expected portrait reader surface to be taller than wide", baseline.surfaceHeight > baseline.surfaceWidth)
+            assertTrue("expected landscape reader surface to be wider than tall", landscape.surfaceWidth > landscape.surfaceHeight)
+            assertTrue("expected portrait packed paging to avoid one page per paragraph", baseline.itemCount in 1 until lines.size)
+            assertTrue("expected landscape packed paging to avoid one page per paragraph", landscape.itemCount in 1 until lines.size)
+            assertTrue("expected portrait page to contain multiple short paragraphs", baselineLineCount >= 2)
+            assertTrue("expected landscape page to contain multiple short paragraphs", landscapeLineCount >= 2)
+            assertTrue(landscapeAfterNext.currentItem > landscape.currentItem)
+            assertTrue("expected landscape next page to contain readable paragraph text", landscapeNextLineCount >= 1)
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)
@@ -1014,6 +1137,22 @@ class EpubPagedRuntimeSmokeTest {
         } as? ImageView
     }
 
+    private fun MainActivity.orientationPackedSummary(): OrientationPackedSummary {
+        val surface = findReaderSurface()
+        val composePage = checkNotNull(currentEpubComposePageRootOrNull()) {
+            "Unable to find current packed EPUB compose page"
+        }
+        return OrientationPackedSummary(
+            orientation = resources.configuration.orientation,
+            surfaceWidth = surface.width,
+            surfaceHeight = surface.height,
+            currentItem = findEpubViewPager()?.pagerCurrentItem() ?: -1,
+            itemCount = findEpubViewPager()?.pagerAdapterItemCount() ?: -1,
+            pageText = composePage.composeTextSurface().orEmpty(),
+            pageProgress = composePage.composePageProgressDescription(),
+        )
+    }
+
     private fun ComposeView.composeTextSurface(): String? =
         getTag(EpubR.id.epub_compose_text_surface) as? String
 
@@ -1175,6 +1314,16 @@ class EpubPagedRuntimeSmokeTest {
         val pageText: String,
         val pageProgress: String?,
         val persistedLineSpacing: Float,
+    )
+
+    private data class OrientationPackedSummary(
+        val orientation: Int,
+        val surfaceWidth: Int,
+        val surfaceHeight: Int,
+        val currentItem: Int,
+        val itemCount: Int,
+        val pageText: String,
+        val pageProgress: String?,
     )
 
     private data class Point(val x: Float, val y: Float) {
