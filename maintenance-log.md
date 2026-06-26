@@ -6,6 +6,13 @@
 
 ## 2026-06-26
 
+### Android v4 Calibre 下载失败态 AVD runtime 补证
+- 回填 `SRC-06`：新增 `CalibreDownloadFailureRuntimeSmokeTest.downloadFailureAfterSearchDoesNotCreateBrokenOfflineBook`，先通过完整 URL `http://10.0.2.2:18081` 连接 fake Calibre，搜索到 `Remote EPUB Smoke` 后主动关闭 server，再点击下载，模拟 LAN/Calibre 睡眠或断网时的真实失败体验
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebugAndroidTest` 通过；`python3 android/test-tools/fake_calibre_server.py --host 127.0.0.1 --port 18081`；targeted instrumentation `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src06.CalibreDownloadFailureRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`
+- 证据：`/tmp/readflow-src06-download-failure-runtime-20260626-pass/calibre-download-failure-runtime-smoke/download-failure-summary.txt` 记录 `serverUnavailableBeforeDownload=true`、`downloadError=Calibre: Failed to connect to /10.0.2.2:18081`、`bookRowAfterFailure=null`、`orphanFilesAfterFailure=`；DB 快照 `after-download-failure-readflow.db` 的 `books` count 为 0；截图证明下载失败后书架仍为 `还没有书` / `连接 Calibre，或导入本地文件`
+- 调试记录：首次 targeted 误以为空书架 ALL 状态会显示 `离线可读 0` filter chip；实际产品在空 ALL 状态直接显示 EmptyState，已修正测试为验证空书架，不把设计行为当失败
+- 边界：这是 AVD + fake Calibre server failure-path 证据，不是真实 Calibre Content Server、真实 LAN/认证服务器、物理手机/平板、大文件下载进度/取消或失败重试 UX；`SRC-06` 保持 `VERIFY`
+
 ### Android v4 EPUB packed 中文混合内容 AVD runtime 补证
 - 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksCjkDialogueAndListItemsRuntime`，用真实 reader route 打开包含章节标题、60 个中文短文本块、中文对话标点、blockquote、list item 和 5 个空段的 EPUB，验证分页模式不会退回“一句一页”或空白页
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin`、`:app:installDebug :app:installDebugAndroidTest` 通过；targeted CJK mixed instrumentation = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (7 tests)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过
