@@ -518,6 +518,52 @@ class EpubPageMappingTest {
     }
 
     @Test
+    fun `section locator at paragraph end restores to packed tail page`() {
+        val first = "First paragraph has enough visual lines to spill a tail onto the next page."
+        val second = "Short follow."
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(first, second)))
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(first, headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Text(second, headingLevel = null, paragraphIndex = 1),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 72,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ ->
+                if (text == first) {
+                    listOf(0 to 18, 18 to 36, 36 to 54, 54 to text.length)
+                } else {
+                    listOf(0 to text.length)
+                }
+            },
+        )
+
+        val locatorAtFirstParagraphEnd = Locator(
+            strategy = LocatorStrategy.Section(
+                spineIndex = 0,
+                elementIndex = 0,
+                charOffset = paras[0].spineCharEnd,
+            ),
+        )
+
+        assertEquals(2, pages.size)
+        assertEquals(0, pages[1].paragraphIndex)
+        assertEquals(1, pages[1].endParagraphIndex)
+        assertEquals(0, pages[1].textSegments.first().paragraphIndex)
+        assertEquals(1, epubPageIndexFromLocator(locatorAtFirstParagraphEnd, pages, paras))
+    }
+
+    @Test
     fun `block paged layout does not pack measured text beyond line capacity`() {
         val first = "First paragraph wraps to two visual lines."
         val second = "Second paragraph also wraps to two visual lines."
