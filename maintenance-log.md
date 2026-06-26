@@ -6,11 +6,19 @@
 
 ## 2026-06-26
 
+### Android v4 SRC-03 fake Calibre cover route 修复与 AVD 复验
+- 根因：上一轮 `CalibreGroupedRuntimeSmokeTest` 等不到 `cover` event 不是 Coil 未发请求，而是 `android/test-tools/fake_calibre_server.py` 先调用泛化 `_handle_download()`，导致 `/get/cover/42/calibre-library` 被当成格式 `cover` 下载请求并返回 `404 unsupported format`，没有进入 `_handle_cover()` 记录事件
+- 修复：fake server 改为先匹配 `_handle_cover()` 再匹配 `_handle_download()`；新增 `android/test-tools/test_fake_calibre_server.py`，直接验证 `/get/cover/42/calibre-library` 返回 `image/png` 且 events 记录 `kind=cover`
+- 测试侧修正：`CalibreGroupedRuntimeSmokeTest` 下载后打开书卡菜单时改为按真实无障碍标签 `Remote EPUB Smoke 的菜单` 查找，而不是旧的裸 `菜单`
+- 验证：`python3 -m unittest android/test-tools/test_fake_calibre_server.py` = `OK`；`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebugAndroidTest` 通过；`python3 android/test-tools/fake_calibre_server.py --host 127.0.0.1 --port 8081`；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src01.CalibreGroupedRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (2 tests)`
+- 证据：`/sdcard/Android/data/dev.readflow/files/calibre-runtime-smoke/download-offline-remove-summary.txt` 记录 `searchCoverEvent={"index":3,"kind":"cover","path":"/get/cover/42/calibre-library","book_id":42}`、`downloadEvent={"index":5,"kind":"download","path":"/get/EPUB/42/calibre-library","book_id":42}`、`downloadedCoverUrlBeforeRemove=http://10.0.2.2:8081/get/cover/42/calibre-library`、离线打开正文和移除下载后 `NOT_DOWNLOADED/localUri=null`
+- 边界：这是 AVD + fake Calibre server runtime 证据；当前仅连接 `emulator-5554`，不是真实平板、真实 Calibre Content Server、真实 LAN、认证服务器或真实封面视觉验收；`SRC-03` 保持 `VERIFY`
+
 ### Android v4 SRC-03 Coil network loader / tablet OTA build
 - 回填 `SRC-03`：为 Calibre 封面 URL 接入 Coil 3 的 OkHttp network fetcher。`ReadflowApplication` 实现 `SingletonImageLoader.Factory`，在 `ImageLoader.Builder(context).components { add(OkHttpNetworkFetcherFactory()) }` 注册 HTTP fetcher；`android/gradle/libs.versions.toml`、app 与 core-ui Gradle 依赖补齐 `coil` / `coil-network-okhttp`
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugKotlin :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` = `BUILD SUCCESSFUL`
-- targeted 失败证据：`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src01.CalibreGroupedRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` 运行 2 个测试、1 个失败，错误为 `Timed out waiting for fake Calibre event kind=cover bookId=42`；fake Calibre events 只观察到 `search` 与 `book_meta`，未观察到 `/get/cover/42/calibre-library`
-- 边界：这次先提交构建用于触发 `main` 的 OTA workflow，方便平板实机更新后继续验证；当前只有 `emulator-5554`，没有真实手机/平板证据。`SRC-03` 仍保持 `VERIFY`，真实 Calibre Content Server、真实 LAN、真实平板封面显示、文件下载、认证服务器和 fake-server cover-request gap 仍待补
+- targeted 失败证据：初跑 `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src01.CalibreGroupedRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` 运行 2 个测试、1 个失败，错误为 `Timed out waiting for fake Calibre event kind=cover bookId=42`；后续已在同日 follow-up 中定位为 fake server 路由顺序并修复，见上一节
+- 边界：这次先提交构建用于触发 `main` 的 OTA workflow，方便平板实机更新后继续验证；当前只有 `emulator-5554`，没有真实手机/平板证据。`SRC-03` 仍保持 `VERIFY`
 
 ### Android v4 SRC-08/SRC-09 SAF UI AVD runtime 补证
 - 回填 `SRC-08/SRC-09`：新增测试 APK 侧 `SafDocumentProvider` 与 phase2 AndroidTest `BackupSafUiRuntimeSmokeTest`，从用户可见 Settings 入口点击 `导出备份` / `恢复备份`，拦截 `ACTION_CREATE_DOCUMENT` / `ACTION_OPEN_DOCUMENT`，把结果指向测试 `content://dev.readflow.test.safdocumentprovider/src08-src09-saf-ui-backup.zip`，覆盖 SAF 文档流而不是只测 app-private ZIP/DB helper

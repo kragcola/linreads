@@ -154,7 +154,7 @@ class CalibreGroupedRuntimeSmokeTest {
             device.pressBack()
             waitForObject(By.text("Remote EPUB Smoke"))
 
-            clickObjectCenter(waitForObject(By.desc("菜单")))
+            clickObjectCenter(waitForObject(By.desc("Remote EPUB Smoke 的菜单")))
             waitForObject(By.text("移除下载")).click()
             waitForObject(By.text("没有离线可读的书"))
             takeScreenshot("after-remove-download.png")

@@ -151,9 +151,9 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
             return
         if self._handle_book_meta(parsed):
             return
-        if self._handle_download(parsed):
-            return
         if self._handle_cover(parsed):
+            return
+        if self._handle_download(parsed):
             return
         self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
