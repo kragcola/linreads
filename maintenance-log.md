@@ -6,6 +6,11 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed 分页定位与页数预算补证
+- 回填 `PAGE-05` / `A-02`：大量短段落 packed 分页新增页数预算守门，120 个微段落在 10 行页高下保持 24 页，防止“一句一页”回归；packed 页内第 2 页中间段落的 `Section` locator 现在会恢复到包含它的 packed page，而不是 fallback 到第一页
+- 验证：RED `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubPageMappingTest.section locator inside a packed text page restores to the containing packed page"` 先失败于 expected page 1 / actual page 0；GREEN 后同测与 `block paged layout keeps many micro paragraphs within page budget` 通过；`./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubPageMappingTest"` 通过
+- 边界：这是 JVM/Robolectric page-budget 与 locator contract 证据，不是真实设备 mixed EPUB 视觉、TalkBack speech/action-mode、Compose selection action-mode、帧率/PSS 内存或 Calibre/SAF 真机 smoke；`PAGE-05` 仍保持 `PARTIAL`，`A-02` 仍保持 `PARTIAL`
+
 ### Android v4 EPUB 分页跨段 selection 补证
 - 回填 `PAGE-05`：短段落合并到同一 paged Compose 页后，跨段拖选现在会把 selection start/end locator 映射到首个/最后一个有效段落，而不是只保存第一个 segment，避免合并页上高亮/笔记跨段丢尾
 - 验证：RED `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubReflowEngineTest.paged runtime maps compose selection across packed paragraphs"` 先失败于 `selectedText` 只包含第一段；GREEN 后同一测试与相邻短段/对话段合并测试通过；`./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubReflowEngineTest" --tests "dev.readflow.render.epub.EpubPageMappingTest"` 通过

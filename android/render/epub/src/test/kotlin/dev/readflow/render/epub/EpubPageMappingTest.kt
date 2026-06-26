@@ -3,6 +3,7 @@ package dev.readflow.render.epub
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -447,6 +448,73 @@ class EpubPageMappingTest {
         assertEquals(EpubPageSliceKind.Text, pages.single().kind)
         assertEquals(0, pages.single().paragraphIndex)
         assertEquals(2, pages.single().endParagraphIndex)
+    }
+
+    @Test
+    fun `block paged layout keeps many micro paragraphs within page budget`() {
+        val paragraphs = (1..120).map { index -> "Line $index." }
+        val paras = epubParasWithCharacterOffsets(listOf(paragraphs))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                paragraphs.mapIndexed { index, text ->
+                    EpubDisplayBlock.Text(text, headingLevel = null, paragraphIndex = index)
+                }
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        assertEquals(24, pages.size)
+        assertTrue(pages.size < paragraphs.size / 4)
+        assertEquals(0, pages.first().paragraphIndex)
+        assertEquals(4, pages.first().endParagraphIndex)
+        assertEquals(115, pages.last().paragraphIndex)
+        assertEquals(119, pages.last().endParagraphIndex)
+    }
+
+    @Test
+    fun `section locator inside a packed text page restores to the containing packed page`() {
+        val paragraphs = (1..12).map { index -> "Line $index." }
+        val paras = epubParasWithCharacterOffsets(listOf(paragraphs))
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                paragraphs.mapIndexed { index, text ->
+                    EpubDisplayBlock.Text(text, headingLevel = null, paragraphIndex = index)
+                }
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        val locatorInsideSecondPackedPage = Locator(
+            strategy = LocatorStrategy.Section(
+                spineIndex = 0,
+                elementIndex = 7,
+                charOffset = paras[7].spineCharStart,
+            ),
+        )
+
+        assertEquals(3, pages.size)
+        assertEquals(1, epubPageIndexFromLocator(locatorInsideSecondPackedPage, pages, paras))
     }
 
     @Test

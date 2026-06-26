@@ -578,11 +578,30 @@ internal fun epubPageIndexFromLocator(
     }
     if (imageIndex >= 0) return imageIndex
     val index = pages.indexOfFirst { page ->
-        page.paragraphIndex == paragraphIndex &&
-            charOffsetInParagraph >= page.startOffset &&
-            charOffsetInParagraph < page.endOffset.coerceAtLeast(page.startOffset + 1)
+        page.containsTextOffset(paragraphIndex, charOffsetInParagraph)
     }
-    return if (index >= 0) index else pages.indexOfFirst { it.paragraphIndex == paragraphIndex }.coerceAtLeast(0)
+    return if (index >= 0) {
+        index
+    } else {
+        pages.indexOfFirst { page ->
+            page.kind == EpubPageSliceKind.Text &&
+                paragraphIndex in page.paragraphIndex..page.endParagraphIndex
+        }.coerceAtLeast(0)
+    }
+}
+
+private fun EpubPageSlice.containsTextOffset(paragraphIndex: Int, charOffsetInParagraph: Int): Boolean {
+    if (kind != EpubPageSliceKind.Text) return false
+    if (textSegments.isNotEmpty()) {
+        return textSegments.any { segment ->
+            segment.paragraphIndex == paragraphIndex &&
+                charOffsetInParagraph >= segment.startOffset &&
+                charOffsetInParagraph < segment.endOffset.coerceAtLeast(segment.startOffset + 1)
+        }
+    }
+    return this.paragraphIndex == paragraphIndex &&
+        charOffsetInParagraph >= startOffset &&
+        charOffsetInParagraph < endOffset.coerceAtLeast(startOffset + 1)
 }
 
 internal fun epubLocatorForPageSlice(paras: List<EpubPara>, page: EpubPageSlice): Locator {
