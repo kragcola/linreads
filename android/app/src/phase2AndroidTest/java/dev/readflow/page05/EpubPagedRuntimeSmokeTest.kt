@@ -1072,6 +1072,97 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedPacksCjkPoemLinesSeparatedByBreaksRuntime() {
+        val title = "page05-cjk-br-${UUID.randomUUID().toString().take(8)}"
+        val poemLines = (1..84).map { index ->
+            "诗行${index.toString().padStart(3, '0')} 雨停在旧屋檐"
+        }
+        val maxPackedPageBudget = poemLines.size / 3
+        val body = poemLines.joinToString(
+            prefix = "<p>",
+            separator = "<br/>",
+            postfix = "</p>",
+        )
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        $body
+                      </body>
+                    </html>
+                """.trimIndent(),
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected CJK break-separated poem EPUB reader to enter packed paged mode") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    itemCount in 2..maxPackedPageBudget &&
+                        poemLines.any { line -> pageText.contains(line) }
+                }
+            }
+
+            val baseline = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-cjk-br-baseline.png")
+            dumpHierarchy("packed-cjk-br-baseline.xml")
+
+            performReaderAccessibilityAction(
+                scenario = scenario,
+                action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+            )
+            waitForCondition("expected CJK break-separated poem reader to advance to another packed page") {
+                scenario.withActivity { activity ->
+                    (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > baseline.currentItem &&
+                        activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                            ?.let { pageText -> pageText.isNotBlank() && pageText != baseline.pageText } == true
+                }
+            }
+
+            val afterNext = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-cjk-br-after-next.png")
+            dumpHierarchy("packed-cjk-br-after-next.xml")
+
+            val baselineLineCount = poemLines.count { line -> baseline.pageText.contains(line) }
+            val nextLineCount = poemLines.count { line -> afterNext.pageText.contains(line) }
+            writeTextEvidence(
+                "packed-cjk-br-summary.txt",
+                buildString {
+                    appendLine("poem_line_count=${poemLines.size}")
+                    appendLine("max_packed_page_budget=$maxPackedPageBudget")
+                    appendLine("page_count=${baseline.itemCount}")
+                    appendLine("baseline_current_item=${baseline.currentItem}")
+                    appendLine("baseline_page_progress=${baseline.pageProgress}")
+                    appendLine("baseline_line_count=$baselineLineCount")
+                    appendLine("baseline_page_text=${baseline.pageText}")
+                    appendLine("next_current_item=${afterNext.currentItem}")
+                    appendLine("next_page_progress=${afterNext.pageProgress}")
+                    appendLine("next_line_count=$nextLineCount")
+                    appendLine("next_page_text=${afterNext.pageText}")
+                },
+            )
+
+            assertEquals(0, baseline.currentItem)
+            assertTrue("expected break-separated CJK page count to stay well below line count", baseline.itemCount in 2..maxPackedPageBudget)
+            assertTrue("expected first break-separated CJK page to contain several poem lines", baselineLineCount >= 4)
+            assertTrue(afterNext.currentItem > baseline.currentItem)
+            assertTrue("expected next break-separated CJK page to contain readable poem lines", afterNext.pageText.isNotBlank())
+            assertTrue("expected next break-separated CJK page to contain several poem lines", nextLineCount >= 4)
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)

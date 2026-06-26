@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed CJK `<br/>` 诗行 AVD runtime 补证
+- 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksCjkPoemLinesSeparatedByBreaksRuntime`，用真实 reader route 打开单个 `<p>` 内 84 行中文诗句并以 `<br/>` 分隔的 EPUB，覆盖诗歌/网文短行被硬换行编码时不应退回“一行一页”
+- 验证：targeted instrumentation `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksCjkPoemLinesSeparatedByBreaksRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (9 tests)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过
+- 证据：`/tmp/readflow-page05-cjk-br-runtime-20260626/full-class/page05-epub-runtime-smoke/packed-cjk-br-summary.txt` 记录 `poem_line_count=84`、`max_packed_page_budget=28`、`page_count=4`；第 1 页含 27 行 `诗行001..027`，accessibility scroll forward 后第 2 页含 27 行 `诗行028..054`；精确 logcat grep 未命中 crash/ANR/recycled-bitmap/`Unable to find reader surface`/AssertionError/FAILURES
+- 边界：这是 AVD reader-route + XML/screenshot/tag summary 证据，不是真实平板中文诗歌视觉、TalkBack speech/action-mode、折叠屏/分屏或帧率/PSS；`PAGE-05` 保持 `PARTIAL`
+
 ### Android v4 EPUB packed 长无空格中文 AVD runtime 补证
 - 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedSlicesLongUnspacedCjkParagraphAndPacksTailRuntime`，用真实 reader route 打开 96 个无 ASCII 空格中文长段片段 + 18 个尾部短句的 EPUB，验证无空格中文长段不会产生空白页或“一句一页”，并验证长段后的短句仍能 packed 到同一页
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` 通过；targeted instrumentation `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedSlicesLongUnspacedCjkParagraphAndPacksTailRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (8 tests)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过
