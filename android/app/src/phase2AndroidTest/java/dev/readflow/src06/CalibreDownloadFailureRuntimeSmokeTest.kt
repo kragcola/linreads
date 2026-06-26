@@ -34,8 +34,11 @@ import org.junit.runner.RunWith
 class CalibreDownloadFailureRuntimeSmokeTest {
 
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
+    private val arguments = InstrumentationRegistry.getArguments()
     private val appContext = ApplicationProvider.getApplicationContext<Context>()
     private val device = UiDevice.getInstance(instrumentation)
+    private val calibreBaseUrl: String =
+        arguments.getString(ARG_CALIBRE_BASE_URL) ?: DEFAULT_SERVER_BASE_URL
 
     @Before
     fun setUp() {
@@ -90,7 +93,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             writeTextEvidence(
                 "download-failure-summary.txt",
                 buildString {
-                    appendLine("serverBaseUrl=$SERVER_BASE_URL")
+                    appendLine("serverBaseUrl=$calibreBaseUrl")
                     appendLine("searchedTitle=Remote EPUB Smoke")
                     appendLine("serverUnavailableBeforeDownload=true")
                     appendLine("downloadError=$errorText")
@@ -113,7 +116,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
     private fun connectCalibreThroughExplicitUrl() {
         waitForObject(By.desc("设置")).click()
         waitForObject(By.text("Calibre 服务器地址"))
-        replaceSingleLineText(SERVER_BASE_URL)
+        replaceSingleLineText(calibreBaseUrl)
         waitForObject(By.text("测试连接")).click()
         waitForObject(By.text("已连接到 Calibre，发现 1 本书"))
         device.pressBack()
@@ -163,7 +166,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
 
     private fun shutdownFakeCalibreServer() {
         runCatching {
-            val connection = URL("$SERVER_BASE_URL/__shutdown__").openConnection() as HttpURLConnection
+            val connection = URL("$calibreBaseUrl/__shutdown__").openConnection() as HttpURLConnection
             connection.connectTimeout = 2_000
             connection.readTimeout = 2_000
             connection.inputStream.use { it.readBytes() }
@@ -174,7 +177,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
     private fun waitForCalibreServerUnavailable() {
         waitForCondition("expected fake Calibre server to be unavailable") {
             runCatching {
-                val connection = URL("$SERVER_BASE_URL/ajax/search?query=&num=1").openConnection() as HttpURLConnection
+                val connection = URL("$calibreBaseUrl/ajax/search?query=&num=1").openConnection() as HttpURLConnection
                 connection.connectTimeout = 250
                 connection.readTimeout = 250
                 connection.inputStream.use { it.readBytes() }
@@ -253,7 +256,8 @@ class CalibreDownloadFailureRuntimeSmokeTest {
 
     private companion object {
         const val DB_NAME = "readflow.db"
-        const val SERVER_BASE_URL = "http://10.0.2.2:18081"
+        const val ARG_CALIBRE_BASE_URL = "calibreBaseUrl"
+        const val DEFAULT_SERVER_BASE_URL = "http://10.0.2.2:18081"
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
     }
 }

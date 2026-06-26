@@ -41,8 +41,17 @@ import org.junit.runners.MethodSorters
 class CalibreGroupedRuntimeSmokeTest {
 
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
+    private val arguments = InstrumentationRegistry.getArguments()
     private val appContext = ApplicationProvider.getApplicationContext<Context>()
     private val device = UiDevice.getInstance(instrumentation)
+    private val calibreBaseUrl: String =
+        arguments.getString(ARG_CALIBRE_BASE_URL) ?: DEFAULT_SERVER_BASE_URL
+    private val calibreHostHint: String =
+        arguments.getString(ARG_CALIBRE_HOST_HINT) ?: DEFAULT_HOST_ONLY_HINT
+    private val calibreUsesDefaultProbe: Boolean =
+        calibreBaseUrl == DEFAULT_SERVER_BASE_URL && calibreHostHint == DEFAULT_HOST_ONLY_HINT
+    private val calibreDisplayAddress: String =
+        calibreBaseUrl.removePrefix("http://").removePrefix("https://")
 
     @Before
     fun setUp() {
@@ -75,20 +84,18 @@ class CalibreGroupedRuntimeSmokeTest {
             waitForObject(By.text("确认手机和 Calibre 在同一局域网，并检查端口是否为 8080"))
             takeScreenshot("settings-failure.png")
 
-            replaceSingleLineText(HOST_ONLY_HINT)
-            waitForObject(By.text("探测常用端口")).click()
-            waitForObject(By.text("已发现 Calibre：10.0.2.2:8081，发现 1 本书"))
-            waitForObject(By.text("已保存该地址，返回书架后可以搜索并下载书籍"))
+            connectCalibre()
             takeScreenshot("settings-probe-success.png")
             writeTextEvidence(
                 "settings-probe-summary.txt",
                 buildString {
-                    appendLine("serverBaseUrl=$SERVER_BASE_URL")
+                    appendLine("serverBaseUrl=$calibreBaseUrl")
                     appendLine("failureUrl=http://10.0.2.2:8090")
                     appendLine("failureMessage=无法连接到服务器")
                     appendLine("failureNextStep=确认手机和 Calibre 在同一局域网，并检查端口是否为 8080")
-                    appendLine("probeHint=$HOST_ONLY_HINT")
-                    appendLine("probeSuccess=已发现 Calibre：10.0.2.2:8081，发现 1 本书")
+                    appendLine("probeHint=$calibreHostHint")
+                    appendLine("connectionMode=${if (calibreUsesDefaultProbe) "probe" else "explicit-url"}")
+                    appendLine("connectionSuccess=${expectedConnectionSuccessText()}")
                 },
             )
         }
@@ -102,9 +109,7 @@ class CalibreGroupedRuntimeSmokeTest {
 
             waitForObject(By.desc("设置")).click()
             waitForObject(By.text("Calibre 服务器地址"))
-            replaceSingleLineText(HOST_ONLY_HINT)
-            waitForObject(By.text("探测常用端口")).click()
-            waitForObject(By.text("已发现 Calibre：10.0.2.2:8081，发现 1 本书"))
+            connectCalibre()
             device.pressBack()
             waitForLibraryLoaded()
 
@@ -127,7 +132,7 @@ class CalibreGroupedRuntimeSmokeTest {
             val downloadedBook = waitForBookRow("calibre-42") { book ->
                 book.downloadStatus == "DOWNLOADED" && !book.localUri.isNullOrBlank()
             }
-            assertEquals("$SERVER_BASE_URL/get/cover/42/calibre-library", downloadedBook.coverUrl)
+            assertEquals("$calibreBaseUrl/get/cover/42/calibre-library", downloadedBook.coverUrl)
             val downloadedFile = checkNotNull(downloadedBook.localUri).let(::fileFromUri)
             assertTrue("expected downloaded file to exist", downloadedFile.isFile)
             val downloadedFileExistsBeforeRemove = downloadedFile.isFile
@@ -168,7 +173,7 @@ class CalibreGroupedRuntimeSmokeTest {
             writeTextEvidence(
                 "download-offline-remove-summary.txt",
                 buildString {
-                    appendLine("serverBaseUrl=$SERVER_BASE_URL")
+                    appendLine("serverBaseUrl=$calibreBaseUrl")
                     appendLine("searchCoverDescription=$searchCoverDescription")
                     appendLine("searchCoverEvent=$coverEvent")
                     appendLine("downloadEvent=$downloadEvent")
@@ -238,6 +243,32 @@ class CalibreGroupedRuntimeSmokeTest {
         }
     }
 
+    private fun connectCalibre() {
+        if (calibreUsesDefaultProbe) {
+            replaceSingleLineText(calibreHostHint)
+            waitForObject(By.text("探测常用端口")).click()
+        } else {
+            replaceSingleLineText(calibreBaseUrl)
+            waitForObject(By.text("测试连接")).click()
+        }
+        waitForObject(By.text(expectedConnectionSuccessText()))
+        waitForObject(By.text(expectedConnectionNextStepText()))
+    }
+
+    private fun expectedConnectionSuccessText(): String =
+        if (calibreUsesDefaultProbe) {
+            "已发现 Calibre：$calibreDisplayAddress，发现 1 本书"
+        } else {
+            "已连接到 Calibre，发现 1 本书"
+        }
+
+    private fun expectedConnectionNextStepText(): String =
+        if (calibreUsesDefaultProbe) {
+            "已保存该地址，返回书架后可以搜索并下载书籍"
+        } else {
+            "返回书架后可以搜索并下载书籍"
+        }
+
     private fun waitForBookRow(
         bookId: String,
         predicate: (BookEntity) -> Boolean,
@@ -289,7 +320,7 @@ class CalibreGroupedRuntimeSmokeTest {
 
     private fun shutdownFakeCalibreServer() {
         runCatching {
-            val connection = URL("$SERVER_BASE_URL/__shutdown__").openConnection() as HttpURLConnection
+            val connection = URL("$calibreBaseUrl/__shutdown__").openConnection() as HttpURLConnection
             connection.connectTimeout = 2_000
             connection.readTimeout = 2_000
             connection.inputStream.use { it.readBytes() }
@@ -298,7 +329,7 @@ class CalibreGroupedRuntimeSmokeTest {
     }
 
     private fun resetFakeCalibreEvents() {
-        val connection = URL("$SERVER_BASE_URL/__reset_events__").openConnection() as HttpURLConnection
+        val connection = URL("$calibreBaseUrl/__reset_events__").openConnection() as HttpURLConnection
         connection.connectTimeout = 2_000
         connection.readTimeout = 2_000
         connection.inputStream.use { it.readBytes() }
@@ -321,7 +352,7 @@ class CalibreGroupedRuntimeSmokeTest {
     }
 
     private fun fakeCalibreEventsJson(): String {
-        val connection = URL("$SERVER_BASE_URL/__events__").openConnection() as HttpURLConnection
+        val connection = URL("$calibreBaseUrl/__events__").openConnection() as HttpURLConnection
         connection.connectTimeout = 2_000
         connection.readTimeout = 2_000
         return try {
@@ -384,8 +415,10 @@ class CalibreGroupedRuntimeSmokeTest {
 
     private companion object {
         const val DB_NAME = "readflow.db"
-        const val HOST_ONLY_HINT = "10.0.2.2"
-        const val SERVER_BASE_URL = "http://10.0.2.2:8081"
+        const val ARG_CALIBRE_BASE_URL = "calibreBaseUrl"
+        const val ARG_CALIBRE_HOST_HINT = "calibreHostHint"
+        const val DEFAULT_HOST_ONLY_HINT = "10.0.2.2"
+        const val DEFAULT_SERVER_BASE_URL = "http://10.0.2.2:8081"
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
         private val DB_TIMEOUT_MS = 8.seconds.inWholeMilliseconds
         @Volatile private var hasInitializedProcessState = false
