@@ -7,6 +7,7 @@ import base64
 import io
 import json
 import sys
+import threading
 import zipfile
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -125,6 +126,8 @@ def build_epub_bytes(book: FakeBook) -> bytes:
 BOOKS = build_books()
 BOOKS_BY_ID = {book.id: book for book in BOOKS}
 EPUB_BYTES_BY_ID = {book.id: build_epub_bytes(book) for book in BOOKS}
+EVENTS: list[dict[str, object]] = []
+EVENTS_LOCK = threading.Lock()
 
 
 class FakeCalibreHandler(BaseHTTPRequestHandler):
@@ -135,6 +138,13 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         if parsed.path == "/__shutdown__":
             self._write_json({"ok": True, "message": "shutting down"})
             self.server.shutdown()
+            return
+        if parsed.path == "/__events__":
+            self._write_json({"events": self._events_snapshot()})
+            return
+        if parsed.path == "/__reset_events__":
+            self._reset_events()
+            self._write_json({"ok": True})
             return
         if parsed.path == "/ajax/search":
             self._handle_search(parsed)
@@ -152,6 +162,7 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         sys.stdout.flush()
 
     def _handle_search(self, parsed) -> None:
+        self._record_event("search", parsed.path)
         params = parse_qs(parsed.query)
         query = params.get("query", [""])[0].strip().lower()
         num = int(params.get("num", ["100"])[0])
@@ -180,6 +191,7 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         if book is None:
             self.send_error(HTTPStatus.NOT_FOUND, "unknown book")
             return True
+        self._record_event("book_meta", parsed.path, book.id)
         self._write_json(
             {
                 "id": book.id,
@@ -203,6 +215,7 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         if book is None:
             self.send_error(HTTPStatus.NOT_FOUND, "unknown book")
             return True
+        self._record_event("download", parsed.path, book.id)
         self._write_bytes("application/epub+zip", EPUB_BYTES_BY_ID[book.id])
         return True
 
@@ -214,6 +227,7 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         if book is None:
             self.send_error(HTTPStatus.NOT_FOUND, "unknown book")
             return True
+        self._record_event("cover", parsed.path, book.id)
         self._write_bytes("image/png", PNG_1X1)
         return True
 
@@ -233,6 +247,25 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _record_event(self, kind: str, path: str, book_id: int | None = None) -> None:
+        with EVENTS_LOCK:
+            EVENTS.append(
+                {
+                    "index": len(EVENTS) + 1,
+                    "kind": kind,
+                    "path": path,
+                    "book_id": book_id,
+                }
+            )
+
+    def _events_snapshot(self) -> list[dict[str, object]]:
+        with EVENTS_LOCK:
+            return list(EVENTS)
+
+    def _reset_events(self) -> None:
+        with EVENTS_LOCK:
+            EVENTS.clear()
 
 
 def main() -> int:

@@ -15,6 +15,7 @@ android {
 dependencies {
     implementation(project(":core:model"))
     implementation(libs.coil.compose)
+    implementation(libs.coil.network.okhttp)
 
     testImplementation(libs.junit5)
 }

@@ -24,6 +24,7 @@ import java.net.URI
 import java.net.URL
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.runBlocking
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -107,6 +108,7 @@ class CalibreGroupedRuntimeSmokeTest {
             device.pressBack()
             waitForLibraryLoaded()
 
+            resetFakeCalibreEvents()
             waitForObject(By.desc("导入书籍")).click()
             waitForObject(By.text("Calibre 搜索")).click()
             waitForObject(By.text("Calibre 书源"))
@@ -114,21 +116,30 @@ class CalibreGroupedRuntimeSmokeTest {
             replaceSingleLineText("smoke")
             waitForObject(By.text("搜索")).click()
             waitForObject(By.text("Remote EPUB Smoke"))
+            val searchCoverDescription = waitForObject(By.desc("Remote EPUB Smoke 封面")).contentDescription
+            val coverEvent = waitForFakeCalibreEvent(kind = "cover", bookId = 42)
+            dumpHierarchy("search-results.xml")
             takeScreenshot("search-results.png")
             waitForObject(By.text("下载")).click()
+            val downloadEvent = waitForFakeCalibreEvent(kind = "download", bookId = 42)
             waitForObject(By.text("已下载《Remote EPUB Smoke》"))
 
             val downloadedBook = waitForBookRow("calibre-42") { book ->
                 book.downloadStatus == "DOWNLOADED" && !book.localUri.isNullOrBlank()
             }
+            assertEquals("$SERVER_BASE_URL/get/cover/42/calibre-library", downloadedBook.coverUrl)
             val downloadedFile = checkNotNull(downloadedBook.localUri).let(::fileFromUri)
             assertTrue("expected downloaded file to exist", downloadedFile.isFile)
             val downloadedFileExistsBeforeRemove = downloadedFile.isFile
+            val calibreEventsBeforeOffline = fakeCalibreEventsJson()
             copyDatabaseSnapshot("downloaded-state")
+            dumpHierarchy("search-downloaded.xml")
             takeScreenshot("search-downloaded.png")
 
             waitForObject(By.text("关闭")).click()
             waitForObject(By.text("Remote EPUB Smoke"))
+            val shelfCoverDescription = waitForObject(By.desc("Remote EPUB Smoke 封面")).contentDescription
+            dumpHierarchy("shelf-after-download.xml")
 
             shutdownFakeCalibreServer()
 
@@ -158,11 +169,17 @@ class CalibreGroupedRuntimeSmokeTest {
                 "download-offline-remove-summary.txt",
                 buildString {
                     appendLine("serverBaseUrl=$SERVER_BASE_URL")
+                    appendLine("searchCoverDescription=$searchCoverDescription")
+                    appendLine("searchCoverEvent=$coverEvent")
+                    appendLine("downloadEvent=$downloadEvent")
+                    appendLine("downloadedCoverUrlBeforeRemove=${downloadedBook.coverUrl}")
                     appendLine("downloadedBookId=${downloadedBook.id}")
                     appendLine("downloadedTitle=${downloadedBook.title}")
                     appendLine("downloadedStatusBeforeRemove=${downloadedBook.downloadStatus}")
                     appendLine("downloadedLocalUriBeforeRemove=${downloadedBook.localUri}")
                     appendLine("downloadedFileExistsBeforeRemove=$downloadedFileExistsBeforeRemove")
+                    appendLine("shelfCoverDescription=$shelfCoverDescription")
+                    appendLine("fakeCalibreEventsBeforeOffline=$calibreEventsBeforeOffline")
                     appendLine("offlineOpenParagraph=Calibre smoke paragraph proves offline reader opening after download.")
                     appendLine("removedStatusAfterRemove=${removedBook.downloadStatus}")
                     appendLine("removedLocalUriAfterRemove=${removedBook.localUri}")
@@ -186,6 +203,7 @@ class CalibreGroupedRuntimeSmokeTest {
         deleteIfExists(File(appContext.getDatabasePath(DB_NAME).path + "-shm"))
         deleteRecursively(File(appContext.filesDir, "books"))
         deleteRecursively(File(appContext.filesDir, "covers"))
+        deleteChildrenRecursively(appContext.cacheDir)
         deleteIfExists(File(appContext.filesDir, "datastore/readflow_settings.preferences_pb"))
         evidenceDir().deleteRecursively()
         evidenceDir().mkdirs()
@@ -255,6 +273,10 @@ class CalibreGroupedRuntimeSmokeTest {
         device.takeScreenshot(screenshot)
     }
 
+    private fun dumpHierarchy(name: String) {
+        device.dumpWindowHierarchy(File(evidenceDir(), name))
+    }
+
     private fun writeTextEvidence(name: String, text: String) {
         File(evidenceDir(), name).writeText(text)
     }
@@ -271,6 +293,40 @@ class CalibreGroupedRuntimeSmokeTest {
             connection.connectTimeout = 2_000
             connection.readTimeout = 2_000
             connection.inputStream.use { it.readBytes() }
+            connection.disconnect()
+        }
+    }
+
+    private fun resetFakeCalibreEvents() {
+        val connection = URL("$SERVER_BASE_URL/__reset_events__").openConnection() as HttpURLConnection
+        connection.connectTimeout = 2_000
+        connection.readTimeout = 2_000
+        connection.inputStream.use { it.readBytes() }
+        connection.disconnect()
+    }
+
+    private fun waitForFakeCalibreEvent(kind: String, bookId: Int): String {
+        val deadline = System.currentTimeMillis() + UI_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            val events = JSONObject(fakeCalibreEventsJson()).getJSONArray("events")
+            for (index in 0 until events.length()) {
+                val event = events.getJSONObject(index)
+                if (event.optString("kind") == kind && event.optInt("book_id", -1) == bookId) {
+                    return event.toString()
+                }
+            }
+            Thread.sleep(100)
+        }
+        error("Timed out waiting for fake Calibre event kind=$kind bookId=$bookId")
+    }
+
+    private fun fakeCalibreEventsJson(): String {
+        val connection = URL("$SERVER_BASE_URL/__events__").openConnection() as HttpURLConnection
+        connection.connectTimeout = 2_000
+        connection.readTimeout = 2_000
+        return try {
+            connection.inputStream.use { it.readBytes().decodeToString() }
+        } finally {
             connection.disconnect()
         }
     }
@@ -314,6 +370,10 @@ class CalibreGroupedRuntimeSmokeTest {
         if (file.exists() && !file.deleteRecursively()) {
             throw IOException("Failed to delete ${file.absolutePath}")
         }
+    }
+
+    private fun deleteChildrenRecursively(directory: File) {
+        directory.listFiles()?.forEach(::deleteRecursively)
     }
 
     private fun copyIfExists(source: File, destination: File) {

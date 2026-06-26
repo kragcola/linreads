@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 SRC-03 Coil network loader / tablet OTA build
+- 回填 `SRC-03`：为 Calibre 封面 URL 接入 Coil 3 的 OkHttp network fetcher。`ReadflowApplication` 实现 `SingletonImageLoader.Factory`，在 `ImageLoader.Builder(context).components { add(OkHttpNetworkFetcherFactory()) }` 注册 HTTP fetcher；`android/gradle/libs.versions.toml`、app 与 core-ui Gradle 依赖补齐 `coil` / `coil-network-okhttp`
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugKotlin :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` = `BUILD SUCCESSFUL`
+- targeted 失败证据：`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src01.CalibreGroupedRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` 运行 2 个测试、1 个失败，错误为 `Timed out waiting for fake Calibre event kind=cover bookId=42`；fake Calibre events 只观察到 `search` 与 `book_meta`，未观察到 `/get/cover/42/calibre-library`
+- 边界：这次先提交构建用于触发 `main` 的 OTA workflow，方便平板实机更新后继续验证；当前只有 `emulator-5554`，没有真实手机/平板证据。`SRC-03` 仍保持 `VERIFY`，真实 Calibre Content Server、真实 LAN、真实平板封面显示、文件下载、认证服务器和 fake-server cover-request gap 仍待补
+
 ### Android v4 SRC-08/SRC-09 SAF UI AVD runtime 补证
 - 回填 `SRC-08/SRC-09`：新增测试 APK 侧 `SafDocumentProvider` 与 phase2 AndroidTest `BackupSafUiRuntimeSmokeTest`，从用户可见 Settings 入口点击 `导出备份` / `恢复备份`，拦截 `ACTION_CREATE_DOCUMENT` / `ACTION_OPEN_DOCUMENT`，把结果指向测试 `content://dev.readflow.test.safdocumentprovider/src08-src09-saf-ui-backup.zip`，覆盖 SAF 文档流而不是只测 app-private ZIP/DB helper
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebugAndroidTest` 通过；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src08.BackupSafUiRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`

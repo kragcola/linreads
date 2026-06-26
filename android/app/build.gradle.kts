@@ -126,6 +126,8 @@ dependencies {
     implementation(libs.bundles.compose)
     debugImplementation(libs.bundles.compose.debug)
     implementation(libs.activity.compose)
+    implementation(libs.coil)
+    implementation(libs.coil.network.okhttp)
     implementation(libs.bundles.koin)
     implementation(libs.bundles.room)
     // Other render engines (epub/pdf/md) + settings: shells only, wired when implemented
