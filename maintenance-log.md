@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 A-02 repo-owned AVD performance proxy smoke
+- 回填 `A-02`：新增 phase2 AndroidTest `A02PerformanceRuntimeSmokeTest`，把性能阶段验收从 ad-hoc shell 测量推进到仓库可回归的 AVD instrumentation smoke；测试通过 app FileProvider 生成 1MB TXT、1MB EPUB 和 20 页 PDF，逐个经 `MainActivity` 打开，记录首屏代理时间、`Debug.MemoryInfo` PSS、`dumpsys meminfo`、`dumpsys gfxinfo`、XML 和截图
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；`./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest` 通过；首次 targeted run 失败于 UIAutomator `StaleObjectException`，根因是测试在手势后读取已 stale 的首屏节点；修正为首屏命中时立即复制 probe 文本后，`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.a02.A02PerformanceRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`
+- 证据：已拉取到 `/tmp/readflow-a02-performance-runtime-20260626/a02-performance-runtime-smoke`；`a02-performance-summary.txt` 记录 TXT/EPUB/PDF 最终首屏代理 `8124ms/10788ms/6783ms`、total PSS `210931/241520/272498KB`、PDF `gfx_p90_ms=150`；`environment.txt` 记录 `device=sdk_gphone64_arm64`、source APK `24325906` bytes、无 native libs、`contains_mupdf_native=false`；run-window logcat grep 未命中 Readflow crash/ANR/recycled-bitmap/security/file errors
+- 边界：这是 noisy AVD instrumentation proxy，包含 test runner/process overhead 与生成语料导入，不是真实手机/平板、真实出版语料、人眼帧感、OTA size gate 或纯 engine-open benchmark；本轮数据反而确认 A-02 不应升格，`A-02` 继续保持 `PARTIAL`
+
 ### Android v4 VERIFY/PARTIAL AVD staged rerun：A-03 + Calibre + SAF
 - 范围：按未完成回填队列继续做当前环境可模拟验收；`adb devices -l` 仅发现 `emulator-5554`，没有真实手机/平板在线，因此本轮不宣称任何真实设备、真实 TalkBack speech、人手 DocumentsUI 或真实 Calibre LAN 证据
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` 通过；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.a03.A03AccessibilityRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src08.BackupSafUiRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；`python3 android/test-tools/fake_calibre_server.py --host 127.0.0.1 --port 8081` + `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src01.CalibreGroupedRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (2 tests)`
