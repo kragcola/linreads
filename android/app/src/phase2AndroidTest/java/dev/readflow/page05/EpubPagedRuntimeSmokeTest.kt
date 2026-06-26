@@ -409,6 +409,113 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedPacksMicroParagraphsWithoutOneSentencePagesRuntime() {
+        val title = "page05-packed-${UUID.randomUUID().toString().take(8)}"
+        val lines = (1..36).map { index -> "Line ${index.toString().padStart(3, '0')}." }
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to lines.joinToString(
+                    prefix = """
+                        <html xmlns="http://www.w3.org/1999/xhtml">
+                          <body>
+                    """.trimIndent(),
+                    separator = "\n",
+                    postfix = """
+                          </body>
+                        </html>
+                    """.trimIndent(),
+                ) { line -> "<p>$line</p>" },
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected packed micro-paragraph EPUB reader to enter paged mode") {
+                scenario.withActivity { activity ->
+                    activity.findEpubViewPager() != null && activity.currentEpubComposePageRootOrNull() != null
+                }
+            }
+
+            val baseline = scenario.withActivity { activity ->
+                val composePage = checkNotNull(activity.currentEpubComposePageRootOrNull()) {
+                    "Unable to find packed micro-paragraph Compose page"
+                }
+                PackedMicroBaseline(
+                    currentItem = activity.findEpubViewPager()?.pagerCurrentItem() ?: -1,
+                    itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: -1,
+                    pageText = composePage.composeTextSurface().orEmpty(),
+                    pageProgress = composePage.composePageProgressDescription(),
+                )
+            }
+            takeScreenshot("packed-micro-baseline.png")
+            dumpHierarchy("packed-micro-baseline.xml")
+
+            performReaderAccessibilityAction(
+                scenario = scenario,
+                action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+            )
+            waitForCondition("expected packed micro-paragraph EPUB reader to advance to the next packed page") {
+                scenario.withActivity { activity ->
+                    (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > baseline.currentItem &&
+                        activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                            ?.let { it != baseline.pageText } == true
+                }
+            }
+
+            val afterNext = scenario.withActivity { activity ->
+                val composePage = checkNotNull(activity.currentEpubComposePageRootOrNull()) {
+                    "Unable to find packed micro-paragraph page after next"
+                }
+                PackedMicroAfterNext(
+                    currentItem = activity.findEpubViewPager()?.pagerCurrentItem() ?: -1,
+                    pageText = composePage.composeTextSurface().orEmpty(),
+                    pageProgress = composePage.composePageProgressDescription(),
+                )
+            }
+            takeScreenshot("packed-micro-after-next.png")
+            dumpHierarchy("packed-micro-after-next.xml")
+
+            val firstPageLineCount = lines.count { line -> baseline.pageText.contains(line) }
+            val secondPageLineCount = lines.count { line -> afterNext.pageText.contains(line) }
+            writeTextEvidence(
+                "packed-micro-summary.txt",
+                buildString {
+                    appendLine("paragraph_count=${lines.size}")
+                    appendLine("page_count=${baseline.itemCount}")
+                    appendLine("baseline_current_item=${baseline.currentItem}")
+                    appendLine("baseline_page_progress=${baseline.pageProgress}")
+                    appendLine("baseline_line_count=$firstPageLineCount")
+                    appendLine("baseline_page_text=${baseline.pageText}")
+                    appendLine("after_next_current_item=${afterNext.currentItem}")
+                    appendLine("after_next_page_progress=${afterNext.pageProgress}")
+                    appendLine("after_next_line_count=$secondPageLineCount")
+                    appendLine("after_next_page_text=${afterNext.pageText}")
+                },
+            )
+
+            assertEquals(0, baseline.currentItem)
+            assertTrue("expected at least one paged EPUB page", baseline.itemCount > 0)
+            assertTrue(
+                "expected packed paging to avoid one page per paragraph",
+                baseline.itemCount < lines.size,
+            )
+            assertTrue(
+                "expected the first paged Compose page to contain multiple short paragraphs",
+                firstPageLineCount >= 2,
+            )
+            assertTrue(afterNext.currentItem > baseline.currentItem)
+            assertTrue(
+                "expected the next packed page to contain readable paragraph text",
+                secondPageLineCount >= 1,
+            )
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)
@@ -804,6 +911,19 @@ class EpubPagedRuntimeSmokeTest {
         val pageText: String?,
         val pageProgress: String?,
         val currentImageDescription: String?,
+    )
+
+    private data class PackedMicroBaseline(
+        val currentItem: Int,
+        val itemCount: Int,
+        val pageText: String,
+        val pageProgress: String?,
+    )
+
+    private data class PackedMicroAfterNext(
+        val currentItem: Int,
+        val pageText: String,
+        val pageProgress: String?,
     )
 
     private companion object {

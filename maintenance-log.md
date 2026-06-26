@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed AVD runtime 页数补证
+- 回填 `PAGE-05`：新增 phase2 AndroidTest `EpubPagedRuntimeSmokeTest.epubPagedPacksMicroParagraphsWithoutOneSentencePagesRuntime`，通过真实 `MainActivity` / FileProvider EPUB / reader 排版面板切到分页模式，验证 36 个微短段不会退回“一段一页”
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin`、`:app:installDebug :app:installDebugAndroidTest` 通过；targeted `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksMicroParagraphsWithoutOneSentencePagesRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；整组 `EpubPagedRuntimeSmokeTest` = `OK (4 tests)`
+- 证据：`/tmp/readflow-page05-packed-runtime-20260626/page05-epub-runtime-smoke/packed-micro-summary.txt` 记录 `paragraph_count=36`、`page_count=3`、第 1 页 `Line 001..014`、第 2 页 `Line 015..028`，并通过 accessibility scroll forward 进入第 2 页；logcat grep 未命中 `FATAL EXCEPTION` / `ANR in dev.readflow` / recycled-bitmap crash
+- 边界：这是 AVD runtime + screenshot/XML/tag summary 证据，不是真实平板手指翻页、TalkBack speech/action-mode、混合 EPUB 视觉调校或帧率/PSS 预算；`PAGE-05` 仍保持 `PARTIAL`
+
 ### Android v4 EPUB packed 跨段高亮恢复补证
 - 回填 `PAGE-05` / `READ-05`：短段落合并到同一 paged Compose 页后，跨第一/第二段保存的 annotation 重开渲染时会拆成两个 page-local highlight range，分别覆盖两段正文，避免合并页上跨段高亮只显示第一段
 - 验证：GREEN-only `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubReflowEngineTest.paged runtime restores highlight ranges across packed paragraphs"` 通过，说明既有实现正确但此前缺直接验收；`./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubReflowEngineTest"` 通过
