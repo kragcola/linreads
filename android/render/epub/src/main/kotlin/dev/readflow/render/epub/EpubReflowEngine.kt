@@ -874,7 +874,7 @@ class EpubReflowEngine private constructor(
             epubPagedLayoutWithBlocks(
                 paras = paras,
                 textProvider = { index -> lazyBook?.cachedParagraphAt(index)?.text.orEmpty() },
-                blockProvider = { lazyBook?.cachedBlocks().orEmpty() },
+                blockProvider = { lazyBook?.layoutBlocks().orEmpty() },
                 metrics = currentPageMetrics(),
                 lineBreaker = { text, contentWidth, textStyle ->
                     measurer.measure(text, contentWidth, textStyle)

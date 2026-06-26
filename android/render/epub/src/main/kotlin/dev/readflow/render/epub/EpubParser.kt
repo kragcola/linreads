@@ -62,6 +62,7 @@ internal class EpubParser {
                     isFixedLayout = pkg.isFixedLayout,
                     blockCount = index.blockCount,
                     paragraphBlockIndexes = index.paragraphBlockIndexes,
+                    layoutBlocks = index.layoutBlocks,
                     maxCachedSpines = maxCachedSpines,
                 )
             }
@@ -83,6 +84,7 @@ internal class EpubParser {
         val paras: List<EpubPara>,
         val blockCount: Int,
         val paragraphBlockIndexes: List<Int>,
+        val layoutBlocks: List<EpubDisplayBlock>,
         val fragmentTargetIndexes: Map<String, EpubTargetPosition>,
     )
 
@@ -119,6 +121,7 @@ internal class EpubParser {
         val spineRefs = mutableListOf<EpubSpineRef>()
         val paras = mutableListOf<EpubPara>()
         val paragraphBlockIndexes = mutableListOf<Int>()
+        val layoutBlocks = mutableListOf<EpubDisplayBlock>()
         var firstParagraphIndex = 0
         var firstBlockIndex = 0
         var documentOffset = 0
@@ -130,6 +133,7 @@ internal class EpubParser {
             val blocks = epubDisplayBlocks(items)
             val localParagraphBlockIndexes = firstBlockIndexesByParagraph(blocks, localParas.size)
             val localFragmentTargets = epubFragmentTargetIndexes(pkg.spineItems.map { it.path }, items)
+            layoutBlocks += blocks.map { block -> block.withParagraphOffset(firstParagraphIndex) }
 
             localParas.forEachIndexed { localParagraphIndex, para ->
                 paras += para.copy(
@@ -163,9 +167,17 @@ internal class EpubParser {
             paras = paras,
             blockCount = firstBlockIndex,
             paragraphBlockIndexes = paragraphBlockIndexes,
+            layoutBlocks = layoutBlocks,
             fragmentTargetIndexes = fragmentTargetIndexes,
         )
     }
+
+    private fun EpubDisplayBlock.withParagraphOffset(offset: Int): EpubDisplayBlock =
+        when (this) {
+            is EpubDisplayBlock.Text -> copy(paragraphIndex = paragraphIndex + offset)
+            is EpubDisplayBlock.Image -> copy(paragraphIndex = paragraphIndex + offset)
+            is EpubDisplayBlock.Break -> copy(paragraphIndex = paragraphIndex + offset)
+        }
 
     private fun firstBlockIndexesByParagraph(blocks: List<EpubDisplayBlock>, paragraphCount: Int): List<Int> {
         val indexes = MutableList(paragraphCount) { -1 }

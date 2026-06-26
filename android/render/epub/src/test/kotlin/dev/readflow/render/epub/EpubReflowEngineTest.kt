@@ -425,6 +425,57 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `paged runtime packs short paragraphs in uncached later spines`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val chapters = (1..6).map { chapterIndex ->
+            val chapter = chapterIndex.toString().padStart(2, '0')
+            val heading = "Short chapter $chapter"
+            val markers = (1..10).map { markerIndex ->
+                "chapter-$chapter-${markerIndex.toString().padStart(2, '0')}"
+            }
+            val body = buildString {
+                appendLine("<h2>$heading</h2>")
+                markers.forEachIndexed { index, marker ->
+                    appendLine(
+                        when (index % 3) {
+                            0 -> "<p>$marker plain.</p>"
+                            1 -> "<ul><li>$marker list.</li></ul>"
+                            else -> "<blockquote><p>$marker quote.</p></blockquote>"
+                        },
+                    )
+                }
+            }
+            "OEBPS/chapter-$chapterIndex.xhtml" to "<html><body>$body</body></html>"
+        }
+        val epub = tempDir.newFile("later-spines-packed.epub")
+        writeEpub(epub, *chapters.toTypedArray())
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+
+        assertTrue(engine.pageCount.value < 30)
+        val pageTexts = (0 until engine.pageCount.value).map { pageIndex ->
+            engine.createPageView(pageIndex).getTag(R.id.epub_compose_text_surface) as String
+        }
+        val laterBodyText = pageTexts.first { text -> text.contains("chapter-03-01") }
+
+        assertTrue(laterBodyText.contains("chapter-03-01"))
+        assertTrue(Regex("chapter-03-\\d{2}").findAll(laterBodyText).count() >= 2)
+        assertTrue(
+            pageTexts
+                .filter { text -> text.contains("chapter-03-") }
+                .all { text -> Regex("chapter-03-\\d{2}").findAll(text).count() >= 2 },
+        )
+    }
+
+    @Test
     fun `paged runtime makes compose text visible while selection overlay stays non visual`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val text = "Visible Compose EPUB paged text."

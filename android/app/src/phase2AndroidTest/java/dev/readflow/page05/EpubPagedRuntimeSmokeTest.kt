@@ -1522,6 +1522,187 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedPacksShortChapterSpinesRuntime() {
+        val title = "page05-short-spines-${UUID.randomUUID().toString().take(8)}"
+        val chapters = (1..6).map { chapterIndex ->
+            val chapter = chapterIndex.toString().padStart(2, '0')
+            val heading = "短章$chapter 夜航"
+            val markers = (1..10).map { markerIndex ->
+                "短章$chapter-${markerIndex.toString().padStart(2, '0')}"
+            }
+            ShortSpineChapter(heading = heading, markers = markers)
+        }
+        val spineEntries = chapters.mapIndexed { chapterIndex, chapter ->
+            val body = buildString {
+                appendLine("<h2>${chapter.heading}</h2>")
+                chapter.markers.forEachIndexed { index, marker ->
+                    appendLine(
+                        when (index % 5) {
+                            0 -> "<p><span>$marker：灯还亮。</span><br/><span>脚步很轻。</span></p>"
+                            1 -> "<ul><li><span>$marker：门缝有风。</span></li></ul>"
+                            2 -> "<blockquote><p><strong>$marker：有人回头。</strong></p></blockquote>"
+                            3 -> "<p><ruby>$marker<rt>spine</rt></ruby>：雨停。</p>"
+                            else -> "<p><em>$marker：继续读。</em></p>"
+                        },
+                    )
+                }
+            }
+            "OEBPS/chapter-${chapterIndex + 1}.xhtml" to """
+                <html xmlns="http://www.w3.org/1999/xhtml">
+                  <body>
+                    $body
+                  </body>
+                </html>
+            """.trimIndent()
+        }
+        val allMarkers = chapters.flatMap { chapter -> chapter.markers }
+        val trackedContentCount = allMarkers.size
+        val maxPackedPageBudget = trackedContentCount / 2
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = spineEntries,
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected short-spine EPUB reader to enter paged mode with readable text") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    writeTextEvidence(
+                        "packed-short-spines-enter-debug.txt",
+                        buildString {
+                            appendLine("item_count=$itemCount")
+                            appendLine("max_packed_page_budget=$maxPackedPageBudget")
+                            appendLine("compose_page_present=${activity.currentEpubComposePageRootOrNull() != null}")
+                            appendLine("page_text=$pageText")
+                        },
+                    )
+                    itemCount >= chapters.size &&
+                        (chapters.any { chapter -> pageText.contains(chapter.heading) } ||
+                            allMarkers.any { marker -> pageText.contains(marker) })
+                }
+            }
+            device.pressBack()
+            device.waitForIdle()
+
+            val pages = mutableListOf<OrientationPackedSummary>()
+            pages += scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-short-spines-page-0.png")
+            dumpHierarchy("packed-short-spines-page-0.xml")
+
+            while (
+                pages.last().currentItem < pages.last().itemCount - 1 &&
+                pages.size < pages.last().itemCount
+            ) {
+                val previous = pages.last()
+                performReaderAccessibilityAction(
+                    scenario = scenario,
+                    action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+                )
+                waitForCondition("expected short-spine pagination to advance to the next readable page") {
+                    scenario.withActivity { activity ->
+                        val currentItem = activity.findEpubViewPager()?.pagerCurrentItem() ?: -1
+                        val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: -1
+                        val composePage = activity.currentEpubComposePageRootOrNull()
+                        val pageText = composePage?.composeTextSurface().orEmpty()
+                        writeTextEvidence(
+                            "packed-short-spines-advance-debug.txt",
+                            buildString {
+                                appendLine("previous_current_item=${previous.currentItem}")
+                                appendLine("current_item=$currentItem")
+                                appendLine("item_count=$itemCount")
+                                appendLine("compose_page_present=${composePage != null}")
+                                appendLine("page_progress=${composePage?.composePageProgressDescription()}")
+                                appendLine("page_text=$pageText")
+                            },
+                        )
+                        currentItem > previous.currentItem && pageText.isNotBlank()
+                    }
+                }
+                pages += scenario.withActivity { activity ->
+                    activity.orientationPackedSummary()
+                }
+                if (pages.size <= 3) {
+                    takeScreenshot("packed-short-spines-page-${pages.lastIndex}.png")
+                    dumpHierarchy("packed-short-spines-page-${pages.lastIndex}.xml")
+                }
+            }
+            takeScreenshot("packed-short-spines-final.png")
+            dumpHierarchy("packed-short-spines-final.xml")
+
+            val allPageText = pages.joinToString(separator = "\n\n") { page -> page.pageText }
+            val headingSeen = chapters.map { chapter ->
+                pages.any { page -> page.pageText.contains(chapter.heading) }
+            }
+            val markerSeenCounts = chapters.map { chapter ->
+                chapter.markers.count { marker -> allPageText.contains(marker) }
+            }
+            val maxMarkersPerChapterPage = chapters.map { chapter ->
+                pages.maxOf { page ->
+                    chapter.markers.count { marker -> page.pageText.contains(marker) }
+                }
+            }
+            val markerCountsPerPage = pages.map { page ->
+                allMarkers.count { marker -> page.pageText.contains(marker) }
+            }
+            writeTextEvidence(
+                "packed-short-spines-summary.txt",
+                buildString {
+                    appendLine("chapter_count=${chapters.size}")
+                    appendLine("markers_per_chapter=${chapters.first().markers.size}")
+                    appendLine("tracked_content_count=$trackedContentCount")
+                    appendLine("max_packed_page_budget=$maxPackedPageBudget")
+                    appendLine("page_count=${pages.first().itemCount}")
+                    appendLine("traversed_page_count=${pages.size}")
+                    appendLine("last_current_item=${pages.last().currentItem}")
+                    appendLine("all_headings_seen=${headingSeen.all { it }}")
+                    appendLine("all_markers_seen=${markerSeenCounts.sum() == trackedContentCount}")
+                    chapters.forEachIndexed { index, chapter ->
+                        appendLine("chapter_${index + 1}_heading=${chapter.heading}")
+                        appendLine("chapter_${index + 1}_heading_seen=${headingSeen[index]}")
+                        appendLine("chapter_${index + 1}_marker_seen_count=${markerSeenCounts[index]}")
+                        appendLine("chapter_${index + 1}_max_markers_on_page=${maxMarkersPerChapterPage[index]}")
+                    }
+                    pages.forEachIndexed { index, page ->
+                        appendLine("page_${index}_current_item=${page.currentItem}")
+                        appendLine("page_${index}_page_progress=${page.pageProgress}")
+                        appendLine("page_${index}_marker_count=${markerCountsPerPage[index]}")
+                        appendLine("page_${index}_text=${page.pageText}")
+                    }
+                },
+            )
+
+            assertEquals(0, pages.first().currentItem)
+            assertEquals(pages.first().itemCount - 1, pages.last().currentItem)
+            assertTrue("expected short-spine EPUB to traverse multiple pages", pages.size >= chapters.size)
+            assertTrue(
+                "expected short-spine page count to stay well below one page per short block",
+                pages.first().itemCount in chapters.size..maxPackedPageBudget,
+            )
+            assertTrue(
+                "expected every short-spine page to contain readable text",
+                pages.all { page -> page.pageText.isNotBlank() },
+            )
+            assertTrue("expected every short chapter heading to be reachable", headingSeen.all { it })
+            assertEquals(
+                "expected every short-spine marker to be reachable while paging through the EPUB",
+                trackedContentCount,
+                markerSeenCounts.sum(),
+            )
+            assertTrue(
+                "expected every short chapter to pack multiple blocks onto at least one page",
+                maxMarkersPerChapterPage.all { count -> count >= 3 },
+            )
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)
@@ -2122,6 +2303,11 @@ class EpubPagedRuntimeSmokeTest {
         val itemCount: Int,
         val pageText: String,
         val pageProgress: String?,
+    )
+
+    private data class ShortSpineChapter(
+        val heading: String,
+        val markers: List<String>,
     )
 
     private data class Point(val x: Float, val y: Float) {

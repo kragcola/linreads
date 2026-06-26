@@ -210,6 +210,7 @@ internal fun epubMeasuredPagedLayout(
                     ).map {
                         it.copy(
                             paragraphIndex = paragraphIndex,
+                            endParagraphIndex = paragraphIndex,
                             textStyle = textStyle,
                             measurement = measurement,
                             links = links.pageLocalLinks(it.startOffset, it.endOffset),

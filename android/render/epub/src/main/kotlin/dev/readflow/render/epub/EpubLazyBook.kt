@@ -25,6 +25,7 @@ internal class EpubLazyBook(
     val isFixedLayout: Boolean,
     val blockCount: Int,
     private val paragraphBlockIndexes: List<Int>,
+    private val layoutBlocks: List<EpubDisplayBlock>,
     maxCachedSpines: Int,
 ) {
     private val cacheLimit = maxCachedSpines.coerceAtLeast(1)
@@ -57,6 +58,9 @@ internal class EpubLazyBook(
         spineRefs.flatMap { ref ->
             cache[ref.spineIndex]?.blocks.orEmpty()
         }
+
+    @Synchronized
+    fun layoutBlocks(): List<EpubDisplayBlock> = layoutBlocks
 
     @Synchronized
     fun blockIndexForParagraph(globalParagraphIndex: Int): Int {
@@ -151,6 +155,7 @@ internal class EpubLazyBook(
                 isFixedLayout = false,
                 blockCount = 0,
                 paragraphBlockIndexes = emptyList(),
+                layoutBlocks = emptyList(),
                 maxCachedSpines = maxCachedSpines,
             )
     }
