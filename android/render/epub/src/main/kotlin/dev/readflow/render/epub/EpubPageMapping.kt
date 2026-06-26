@@ -324,13 +324,17 @@ private fun packAdjacentShortTextPages(
 
 private fun EpubPageSlice.canPackWithAdjacentText(): Boolean =
     kind == EpubPageSliceKind.Text &&
-        textStyle == EpubPageTextStyle() &&
+        textStyle.isSafeToPackWithAdjacentText() &&
         links.isEmpty()
+
+private fun EpubPageTextStyle.isSafeToPackWithAdjacentText(): Boolean =
+    headingLevel == null &&
+        kind in setOf(EpubTextKind.Body, EpubTextKind.ListItem, EpubTextKind.Blockquote)
 
 private fun EpubPageSlice.canPackAcrossSpineWith(next: EpubPageSlice, paras: List<EpubPara>): Boolean {
     val currentSpine = paras.getOrNull(endParagraphIndex)?.spineIndex ?: return false
     val nextSpine = paras.getOrNull(next.paragraphIndex)?.spineIndex ?: return false
-    return currentSpine == nextSpine
+    return currentSpine == nextSpine && textStyle == next.textStyle
 }
 
 private fun EpubPageSlice.toTextSegment(textProvider: (Int) -> String): EpubPageTextSegment {

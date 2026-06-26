@@ -337,6 +337,40 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `paged runtime packs short list items without one item pages`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("short-list-items-one-page.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <ul>
+                    <li>First</li>
+                    <li>Second</li>
+                    <li>Third</li>
+                  </ul>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        val slice = findTaggedSlice(page)
+
+        assertEquals(1, engine.pageCount.value)
+        assertEquals(EpubPageTextStyle(kind = EpubTextKind.ListItem), slice?.textStyle)
+        assertEquals("• First\n\n• Second\n\n• Third", page.getTag(R.id.epub_compose_text_surface))
+    }
+
+    @Test
     fun `paged runtime makes compose text visible while selection overlay stays non visual`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val text = "Visible Compose EPUB paged text."

@@ -545,6 +545,66 @@ class EpubPageMappingTest {
     }
 
     @Test
+    fun `block paged layout packs adjacent short list items with the same style`() {
+        val paras = epubParasWithCharacterOffsets(listOf(listOf("• First", "• Second", "• Third")))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text("• First", headingLevel = null, paragraphIndex = 0, kind = EpubTextKind.ListItem),
+                    EpubDisplayBlock.Text("• Second", headingLevel = null, paragraphIndex = 1, kind = EpubTextKind.ListItem),
+                    EpubDisplayBlock.Text("• Third", headingLevel = null, paragraphIndex = 2, kind = EpubTextKind.ListItem),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        assertEquals(1, pages.size)
+        assertEquals(EpubPageTextStyle(kind = EpubTextKind.ListItem), pages.single().textStyle)
+        assertEquals(0, pages.single().paragraphIndex)
+        assertEquals(2, pages.single().endParagraphIndex)
+    }
+
+    @Test
+    fun `block paged layout keeps adjacent preformatted blocks isolated`() {
+        val paras = epubParasWithCharacterOffsets(listOf(listOf("code one", "code two")))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text("code one", headingLevel = null, paragraphIndex = 0, kind = EpubTextKind.Preformatted),
+                    EpubDisplayBlock.Text("code two", headingLevel = null, paragraphIndex = 1, kind = EpubTextKind.Preformatted),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        assertEquals(2, pages.size)
+        assertEquals(EpubPageTextStyle(kind = EpubTextKind.Preformatted), pages[0].textStyle)
+        assertEquals(EpubPageTextStyle(kind = EpubTextKind.Preformatted), pages[1].textStyle)
+    }
+
+    @Test
     fun `paged layout inserts cached image blocks as standalone slices`() {
         val paras = epubParasWithCharacterOffsets(listOf(listOf("Intro text", "Body text")))
 
