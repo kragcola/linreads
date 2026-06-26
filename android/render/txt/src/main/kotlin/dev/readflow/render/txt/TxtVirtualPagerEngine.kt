@@ -36,6 +36,7 @@ import java.io.File
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.zip.CRC32
+import kotlin.math.abs
 
 /**
  * Minimal TXT engine (v4 §5.3/§5.4). CONTINUOUS scroll via RecyclerView.
@@ -320,9 +321,32 @@ class TxtVirtualPagerEngine(
             ReadingMode.PAGED -> PagingKind.PAGED
         }
         withContext(Dispatchers.Main) {
+            val paragraphIndex = if (_pagingKind.value == PagingKind.CONTINUOUS) {
+                currentVisibleParagraphIndex() ?: currentParagraphIndex()
+            } else {
+                currentParagraphIndex()
+            }
+            _currentLocator.value = locatorForIndex(paragraphIndex)
             _pagingKind.value = targetKind
-            _currentLocator.value = locatorForIndex(currentParagraphIndex())
+            if (targetKind == PagingKind.PAGED) {
+                pageRequestCallback?.invoke(paragraphIndex)
+            }
         }
+    }
+
+    private fun currentVisibleParagraphIndex(): Int? {
+        val rv = recyclerView ?: return null
+        val total = paragraphCount().coerceAtLeast(1)
+        val lm = rv.layoutManager as? LinearLayoutManager ?: return null
+        val viewportCenter = rv.paddingTop + (rv.height - rv.paddingTop - rv.paddingBottom) / 2
+        val centered = (0 until rv.childCount).mapNotNull { index ->
+            val child = rv.getChildAt(index) ?: return@mapNotNull null
+            val position = lm.getPosition(child).takeIf { it != RecyclerView.NO_POSITION } ?: return@mapNotNull null
+            val childCenter = (child.top + child.bottom) / 2
+            position to abs(childCenter - viewportCenter)
+        }.minByOrNull { it.second }?.first
+        return (centered ?: lm.findFirstVisibleItemPosition().takeIf { it != RecyclerView.NO_POSITION })
+            ?.coerceIn(0, total - 1)
     }
 
     private fun trackPageView(container: FrameLayout, textView: TextView) {

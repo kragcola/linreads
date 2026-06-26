@@ -4,6 +4,15 @@
 
 ---
 
+## 2026-06-27
+
+### Android v4 TXT scroll→paged tablet-like anchor fix / dev build push
+- 回填 `UX-03/UX-04`：在 tablet-like AVD 视口（`1600x2560` / density `320`）复现 TXT scroll 模式可见 `paragraph 000..030` 后切到分页却落到 `paragraph 000` / `第 1 页` 的阅读断点风险；根因是 `TxtVirtualPagerEngine.setMode()` 切分页时使用 stale `_currentLocator`，没有先采样用户当前可见阅读焦点
+- 修复：TXT 从连续滚动切到分页前，会在主线程读取当前 `RecyclerView` 可见 child，并选择离 viewport 中心最近的 paragraph 作为锚点；随后更新 `currentLocator`，并在目标为 `PAGED` 时用该锚点触发 `pageRequestCallback`，避免大视口/底部面板场景把用户读到的中段打回第一页
+- 验证：`./gradlew -Preadflow.phase=2 :render:txt:testDebugUnitTest --tests "dev.readflow.render.txt.TxtVirtualPagerEngineTest"` 通过；`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` 通过；targeted `ReaderModeControlsRuntimeSmokeTest#txtModeSwitchKeepsScrolledAnchorVisibleAndPersistsLocator` = `OK (1 test)`；完整 `ReaderModeControlsRuntimeSmokeTest` = `OK (2 tests)`；`EpubPagedRuntimeSmokeTest` 回归 = `OK (10 tests)`；`./gradlew -Preadflow.phase=2 :app:assembleDebug` 通过
+- 证据：`/tmp/readflow-ux03-fixed-20260627/ux03-ux04-runtime-smoke/ux03-mode-switch-summary.txt` 记录 scroll 切换前可见 `0..30`，切到 paged 后 `paged_tag_index=15`、`paged_visible_text=UX03 anchor paragraph 015...`，切回 scroll 后可见 `14..45`，Room `persisted_after_return_total=0.234375`；`ux03-paged-mode.xml` 已显示 `第 16 页，共 64 页` 而不是旧失败态 `第 1 页`。`/tmp/readflow-page05-after-txt-anchor-20260627/page05-epub-runtime-smoke` 记录 PAGE-05 EPUB packed 回归仍通过
+- 边界：这是 AVD tablet-like override + instrumentation 证据，不是真实物理平板、真实 TalkBack speech、真实性能 benchmark、真实 Calibre Content Server/LAN 或真实 SAF DocumentsUI；`UX-03/UX-04` 仍保持 `VERIFY`，`PAGE-05` 仍保持 `PARTIAL`
+
 ## 2026-06-26
 
 ### Android v4 A-02 repo-owned AVD performance proxy smoke

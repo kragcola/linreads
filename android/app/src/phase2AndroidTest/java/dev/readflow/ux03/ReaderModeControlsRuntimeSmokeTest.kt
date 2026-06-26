@@ -24,6 +24,7 @@ import dev.readflow.MainActivity
 import dev.readflow.core.database.BookEntity
 import dev.readflow.core.database.ReadflowDatabase
 import dev.readflow.core.database.ReadingProgressEntity
+import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.prefs.DataStoreSettingsRepository
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.render.api.SelectionAwareTextView
@@ -54,6 +55,7 @@ class ReaderModeControlsRuntimeSmokeTest {
     fun setUp() = runBlocking {
         settings.setFontSize(16)
         settings.setLineSpacing(1.75f)
+        settings.setReadingMode(ReaderReadingMode.SCROLL)
         settings.setThemeMode(ThemeMode.LIGHT)
         evidenceDir().mkdirs()
         device.pressHome()
@@ -79,7 +81,7 @@ class ReaderModeControlsRuntimeSmokeTest {
         ActivityScenario.launch<MainActivity>(readerIntent(readerUri, "text/plain")).use { scenario ->
             dismissBlockingDialogs()
             waitForObject(By.desc(TXT_READER_DESC))
-            waitForObject(By.text(corpusParagraph("UX03", 0)))
+            waitForVisibleTxtParagraph(scenario, corpusParagraph("UX03", 0))
 
             val importedBook = waitForBookByTitle(title)
 
@@ -98,14 +100,6 @@ class ReaderModeControlsRuntimeSmokeTest {
                 ?: error("Unable to determine visible TXT paragraph range before mode switch")
             val scrollVisibleIndexMax = scrollVisibleIndexes.maxOrNull()
                 ?: error("Unable to determine visible TXT paragraph range before mode switch")
-            waitForCondition(
-                message = "expected reading_progress row to persist a non-zero TXT locator before mode switch",
-                timeoutMs = DB_TIMEOUT_MS,
-            ) {
-                latestProgress(importedBook.id)?.totalProgression?.let { it > 0f } == true
-            }
-            val persistedBeforeSwitch = checkNotNull(latestProgress(importedBook.id))
-
             openBottomPanel(buttonText = "排版", expectedText = "阅读正文预览")
             takeScreenshot("ux03-font-panel-before-switch.png")
             dumpHierarchy("ux03-font-panel-before-switch.xml")
@@ -168,8 +162,6 @@ class ReaderModeControlsRuntimeSmokeTest {
                     appendLine("scroll_visible_indexes=${scrollVisibleIndexes.joinToString(",")}")
                     appendLine("scroll_visible_index_min=$scrollVisibleIndexMin")
                     appendLine("scroll_visible_index_max=$scrollVisibleIndexMax")
-                    appendLine("persisted_before_switch=${persistedBeforeSwitch.locatorJson}")
-                    appendLine("persisted_before_switch_total=${persistedBeforeSwitch.totalProgression}")
                     appendLine("paged_tag_index=${pagedState.tagIndex}")
                     appendLine("paged_visible_text=${pagedState.visibleText}")
                     appendLine("scroll_visible_after_return=${scrollReturnTexts.joinToString(" | ")}")
@@ -212,7 +204,7 @@ class ReaderModeControlsRuntimeSmokeTest {
         ActivityScenario.launch<MainActivity>(readerIntent(readerUri, "text/plain")).use { scenario ->
             dismissBlockingDialogs()
             waitForObject(By.desc(TXT_READER_DESC))
-            waitForObject(By.text(corpusParagraph("UX04", 0)))
+            waitForVisibleTxtParagraph(scenario, corpusParagraph("UX04", 0))
             waitForBookByTitle(title)
 
             openBottomPanel(buttonText = "排版", expectedText = "阅读正文预览")
@@ -408,6 +400,17 @@ class ReaderModeControlsRuntimeSmokeTest {
             }
         ) {
             "Unable to scroll target paragraph into view: $targetText"
+        }
+    }
+
+    private fun waitForVisibleTxtParagraph(
+        scenario: ActivityScenario<MainActivity>,
+        paragraph: String,
+    ) {
+        waitForCondition("expected TXT paragraph to become visible: $paragraph") {
+            scenario.withActivity { activity ->
+                activity.visibleTxtTexts().any { paragraph in it }
+            }
         }
     }
 

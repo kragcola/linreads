@@ -9,8 +9,17 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.render.api.PagingKind
+import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.SelectionAwareTextView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -22,9 +31,18 @@ import org.robolectric.Shadows.shadowOf
 import android.os.Looper
 import java.nio.charset.StandardCharsets
 import java.io.File
+import kotlin.math.abs
 
 @RunWith(RobolectricTestRunner::class)
+@OptIn(ExperimentalCoroutinesApi::class)
 class TxtVirtualPagerEngineTest {
+
+    private val dispatcher = StandardTestDispatcher()
+
+    @After
+    fun tearDown() {
+        Dispatchers.resetMain()
+    }
 
     @Test
     fun `openBook reuses app private file uri without creating a temp txt copy`() = runTest {
@@ -75,6 +93,72 @@ class TxtVirtualPagerEngineTest {
             4,
             (view.layoutManager as LinearLayoutManager).findFirstVisibleItemPosition(),
         )
+    }
+
+    @Test
+    fun `setMode paged anchors to visible scroll paragraph instead of stale locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val lines = (0 until 80).map { index ->
+            "Readflow mode switch paragraph %03d keeps the visible anchor stable.".format(index)
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-engine-mode-", suffix = ".txt").toFile()
+        file.writeText(lines.joinToString("\n\n"), charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        val requestedPages = mutableListOf<Int>()
+
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(1080, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(2400, android.view.View.MeasureSpec.EXACTLY),
+        )
+        view.layout(0, 0, 1080, 2400)
+        val layoutManager = view.layoutManager as LinearLayoutManager
+        layoutManager.scrollToPositionWithOffset(24, 0)
+        view.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(1080, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(2400, android.view.View.MeasureSpec.EXACTLY),
+        )
+        view.layout(0, 0, 1080, 2400)
+        assertEquals(24, layoutManager.findFirstVisibleItemPosition())
+        val expectedAnchor = view.centeredAdapterPosition(layoutManager)
+        assertTrue("expected centered paragraph to move beyond the stale first page", expectedAnchor > 0)
+        engine.forceCurrentLocatorForTest(
+            Locator(
+                strategy = LocatorStrategy.Page(0, lines.size),
+                progression = 0f,
+                totalProgression = 0f,
+            ),
+        )
+        engine.setPageRequestCallback(requestedPages::add)
+
+        engine.setMode(ReadingMode.PAGED)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(PagingKind.PAGED, engine.pagingKind.value)
+        assertEquals(expectedAnchor, requestedPages.single())
+        assertEquals(expectedAnchor, engine.pageIndexForLocator(engine.currentLocator.value))
+    }
+
+    private fun TxtVirtualPagerEngine.forceCurrentLocatorForTest(locator: Locator) {
+        @Suppress("UNCHECKED_CAST")
+        val currentLocator = TxtVirtualPagerEngine::class.java
+            .getDeclaredField("_currentLocator")
+            .apply { isAccessible = true }
+            .get(this) as MutableStateFlow<Locator>
+        currentLocator.value = locator
+    }
+
+    private fun RecyclerView.centeredAdapterPosition(layoutManager: LinearLayoutManager): Int {
+        val viewportCenter = paddingTop + (height - paddingTop - paddingBottom) / 2
+        return (0 until childCount).mapNotNull { index ->
+            val child = getChildAt(index) ?: return@mapNotNull null
+            val position = layoutManager.getPosition(child).takeIf { it != RecyclerView.NO_POSITION }
+                ?: return@mapNotNull null
+            val childCenter = (child.top + child.bottom) / 2
+            position to abs(childCenter - viewportCenter)
+        }.minByOrNull { it.second }?.first ?: error("no visible RecyclerView children")
     }
 
     @Test
