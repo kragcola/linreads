@@ -6,6 +6,11 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed 跨段高亮恢复补证
+- 回填 `PAGE-05` / `READ-05`：短段落合并到同一 paged Compose 页后，跨第一/第二段保存的 annotation 重开渲染时会拆成两个 page-local highlight range，分别覆盖两段正文，避免合并页上跨段高亮只显示第一段
+- 验证：GREEN-only `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubReflowEngineTest.paged runtime restores highlight ranges across packed paragraphs"` 通过，说明既有实现正确但此前缺直接验收；`./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubReflowEngineTest"` 通过
+- 边界：这是 Robolectric/code-contract 证据，不是真实设备 Compose action-mode、TalkBack speech、视觉高亮截图、帧率/PSS 或备份/同步导出；`PAGE-05` 仍保持 `PARTIAL`，`READ-05` 仍保持 `VERIFY`
+
 ### Android v4 EPUB packed 段末 locator 边界补证
 - 回填 `PAGE-05`：长段落尾页与下一短段打包到同一 paged page 时，精确落在长段末尾的 `Section` locator 现在会恢复到包含 tail segment 的 packed page，而不是被 packed 范围 fallback 抢回该段第一页
 - 验证：RED `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubPageMappingTest.section locator at paragraph end restores to packed tail page"` 先失败于 expected page 1 / actual page 0；GREEN 后同测与 packed locator/page-budget 相邻测试通过；`./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubPageMappingTest"` 通过

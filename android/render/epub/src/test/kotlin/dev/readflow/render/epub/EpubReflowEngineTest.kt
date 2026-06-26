@@ -1130,6 +1130,62 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `paged runtime restores highlight ranges across packed paragraphs`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val first = "First short sentence."
+        val second = "Second short sentence."
+        val third = "Third short sentence."
+        val epub = tempDir.newFile("packed-paragraph-cross-highlight.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>$first</p>
+                  <p>$second</p>
+                  <p>$third</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setTextAnnotations(
+            listOf(
+                ReaderTextAnnotation(
+                    id = "packed-cross-highlight",
+                    start = Locator(LocatorStrategy.Section(spineIndex = 0, elementIndex = 0, charOffset = 0)),
+                    end = Locator(
+                        LocatorStrategy.Section(
+                            spineIndex = 0,
+                            elementIndex = 1,
+                            charOffset = first.length + second.length,
+                        ),
+                    ),
+                    selectedText = "$first\n\n$second",
+                    note = null,
+                    color = 0x66FFCC00,
+                ),
+            ),
+        )
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+
+        assertEquals(
+            listOf(
+                ReaderTextHighlightRange(0, first.length, 0x66FFCC00),
+                ReaderTextHighlightRange(first.length + 2, first.length + 2 + second.length, 0x66FFCC00),
+            ),
+            page.getTag(R.id.epub_compose_text_highlight_ranges),
+        )
+    }
+
+    @Test
     fun `paged runtime exposes compose text style and layout state`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val text = "Compose blockquote EPUB paged text."
