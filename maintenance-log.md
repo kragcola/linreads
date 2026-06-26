@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed 装饰分隔/超短对话 AVD runtime 补证
+- 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedSkipsDecorativeSeparatorsAndPacksTinyDialogueRuntime`，用真实 reader route 打开含 64 个超短中文 `碎句`、14 个空白段、9 个 `<hr/>`、em/strong/span/ruby 内联包裹的 EPUB，覆盖短句小说/网文里装饰分隔和空白段把分页打碎的“一句一页”风险
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；`./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest` 通过；targeted instrumentation `adb -s emulator-5554 shell am instrument -w -e class 'dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedSkipsDecorativeSeparatorsAndPacksTinyDialogueRuntime' dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug :app:assembleOta` 通过
+- 证据：`/tmp/readflow-page05-decorative-runtime-20260626/page05-epub-runtime-smoke/packed-decorative-summary.txt` 记录 `fragment_count=64`、`blank_paragraph_count=14`、`separator_count=9`、`page_count=8`；采样第 1~4 页均非空白，每页各含 8 个真实碎句，未落到装饰/空白页；同次 logcat grep 未命中 crash/ANR/recycled-bitmap/`Unable to find reader surface`/AssertionError/FAILURES
+- 边界：这是 AVD reader-route + XML/screenshot/tag summary 证据，不是真实平板短句小说视觉、TalkBack speech/action-mode、真实手指翻页 ergonomics 或帧率/PSS；`PAGE-05` 保持 `PARTIAL`
+
 ### Android v4 SRC-03 fake Calibre cover route 修复与 AVD 复验
 - 根因：上一轮 `CalibreGroupedRuntimeSmokeTest` 等不到 `cover` event 不是 Coil 未发请求，而是 `android/test-tools/fake_calibre_server.py` 先调用泛化 `_handle_download()`，导致 `/get/cover/42/calibre-library` 被当成格式 `cover` 下载请求并返回 `404 unsupported format`，没有进入 `_handle_cover()` 记录事件
 - 修复：fake server 改为先匹配 `_handle_cover()` 再匹配 `_handle_download()`；新增 `android/test-tools/test_fake_calibre_server.py`，直接验证 `/get/cover/42/calibre-library` 返回 `image/png` 且 events 记录 `kind=cover`

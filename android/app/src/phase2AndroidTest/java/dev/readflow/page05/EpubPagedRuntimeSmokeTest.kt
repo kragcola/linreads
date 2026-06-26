@@ -1163,6 +1163,149 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedSkipsDecorativeSeparatorsAndPacksTinyDialogueRuntime() {
+        val title = "page05-decorative-${UUID.randomUUID().toString().take(8)}"
+        val fragments = (1..64).map { index ->
+            when (index % 8) {
+                0 -> "碎句${index.toString().padStart(3, '0')}：——"
+                1 -> "碎句${index.toString().padStart(3, '0')}：“嗯。”"
+                2 -> "碎句${index.toString().padStart(3, '0')}：“不。”"
+                3 -> "碎句${index.toString().padStart(3, '0')}：……"
+                4 -> "碎句${index.toString().padStart(3, '0')}：“等等。”"
+                5 -> "碎句${index.toString().padStart(3, '0')}：灯灭。"
+                6 -> "碎句${index.toString().padStart(3, '0')}：雨停。"
+                else -> "碎句${index.toString().padStart(3, '0')}：“走。”"
+            }
+        }
+        var blankParagraphCount = 0
+        var separatorCount = 0
+        val body = buildString {
+            appendLine("<p> </p>")
+            blankParagraphCount += 1
+            appendLine("<hr/>")
+            separatorCount += 1
+            fragments.forEachIndexed { index, fragment ->
+                if (index > 0 && index % 8 == 0) {
+                    appendLine("<hr/>")
+                    separatorCount += 1
+                }
+                if (index % 10 == 0) {
+                    appendLine("<p><span> </span></p>")
+                    blankParagraphCount += 1
+                }
+                appendLine(
+                    when (index % 5) {
+                        0 -> "<p><span>$fragment</span></p>"
+                        1 -> "<p><em>$fragment</em></p>"
+                        2 -> "<p><strong>$fragment</strong></p>"
+                        3 -> "<p>$fragment<ruby>雨<rt>yu</rt></ruby></p>"
+                        else -> "<p><span><em>$fragment</em></span></p>"
+                    },
+                )
+                if (index % 13 == 0) {
+                    appendLine("<p>   </p>")
+                    blankParagraphCount += 1
+                }
+            }
+            appendLine("<hr/>")
+            separatorCount += 1
+            appendLine("<p> </p>")
+            blankParagraphCount += 1
+        }
+        val maxPackedPageBudget = fragments.size / 2
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        $body
+                      </body>
+                    </html>
+                """.trimIndent(),
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected decorative separator EPUB reader to enter packed paged mode") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    itemCount in 2..maxPackedPageBudget &&
+                        fragments.any { fragment -> pageText.contains(fragment) }
+                }
+            }
+
+            val samples = mutableListOf<OrientationPackedSummary>()
+            samples += scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-decorative-page-0.png")
+            dumpHierarchy("packed-decorative-page-0.xml")
+
+            repeat(3) { sampleIndex ->
+                val previous = samples.last()
+                if (previous.currentItem >= previous.itemCount - 1) return@repeat
+                performReaderAccessibilityAction(
+                    scenario = scenario,
+                    action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+                )
+                waitForCondition("expected decorative separator reader to advance to a non-blank packed page") {
+                    scenario.withActivity { activity ->
+                        (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > previous.currentItem &&
+                            activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                                ?.let { pageText -> pageText.isNotBlank() && pageText != previous.pageText } == true
+                    }
+                }
+                samples += scenario.withActivity { activity ->
+                    activity.orientationPackedSummary()
+                }
+                takeScreenshot("packed-decorative-page-${sampleIndex + 1}.png")
+                dumpHierarchy("packed-decorative-page-${sampleIndex + 1}.xml")
+            }
+
+            val sampleFragmentCounts = samples.map { sample ->
+                fragments.count { fragment -> sample.pageText.contains(fragment) }
+            }
+            writeTextEvidence(
+                "packed-decorative-summary.txt",
+                buildString {
+                    appendLine("fragment_count=${fragments.size}")
+                    appendLine("blank_paragraph_count=$blankParagraphCount")
+                    appendLine("separator_count=$separatorCount")
+                    appendLine("max_packed_page_budget=$maxPackedPageBudget")
+                    appendLine("page_count=${samples.first().itemCount}")
+                    samples.forEachIndexed { index, sample ->
+                        appendLine("sample_${index}_current_item=${sample.currentItem}")
+                        appendLine("sample_${index}_page_progress=${sample.pageProgress}")
+                        appendLine("sample_${index}_fragment_count=${sampleFragmentCounts[index]}")
+                        appendLine("sample_${index}_page_text=${sample.pageText}")
+                    }
+                },
+            )
+
+            assertEquals(0, samples.first().currentItem)
+            assertTrue("expected multiple sampled decorative separator pages", samples.size >= 2)
+            assertTrue(
+                "expected decorative separator page count to stay well below one page per tiny fragment",
+                samples.first().itemCount in 2..maxPackedPageBudget,
+            )
+            assertTrue(
+                "expected sampled decorative separator pages to never be blank",
+                samples.all { sample -> sample.pageText.isNotBlank() },
+            )
+            assertTrue(
+                "expected every sampled decorative separator page to contain multiple real dialogue fragments",
+                sampleFragmentCounts.all { count -> count >= 2 },
+            )
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)
