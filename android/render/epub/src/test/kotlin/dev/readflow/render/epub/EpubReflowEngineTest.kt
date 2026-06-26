@@ -236,6 +236,60 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `paged runtime maps compose selection across packed paragraphs`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val first = "First short sentence."
+        val second = "Second short sentence."
+        val third = "Third short sentence."
+        val epub = tempDir.newFile("packed-paragraph-cross-selection.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>$first</p>
+                  <p>$second</p>
+                  <p>$third</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        val pageText = page.getTag(R.id.epub_compose_text_surface) as String
+        @Suppress("UNCHECKED_CAST")
+        val callback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        val selectionStart = pageText.indexOf(first)
+        val selectionEnd = pageText.indexOf("\n\n$third")
+
+        assertNotNull(callback)
+        callback?.invoke(selectionStart, selectionEnd)
+        val selection = engine.currentTextSelection.value
+
+        assertEquals("$first\n\n$second", selection?.selectedText)
+        assertEquals(
+            LocatorStrategy.Section(spineIndex = 0, elementIndex = 0, charOffset = 0),
+            selection?.start?.strategy,
+        )
+        assertEquals(
+            LocatorStrategy.Section(spineIndex = 0, elementIndex = 1, charOffset = first.length + second.length),
+            selection?.end?.strategy,
+        )
+        assertEquals(selectionStart to selectionEnd, page.getTag(R.id.epub_compose_text_selection_range))
+        assertEquals(
+            ReaderTextHighlightRange(selectionStart, selectionEnd, EpubComposeSelectionHighlightColor),
+            page.getTag(R.id.epub_compose_text_selection_highlight_range),
+        )
+    }
+
+    @Test
     fun `paged runtime packs dialogue micro paragraphs without one sentence pages`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val lines = listOf(

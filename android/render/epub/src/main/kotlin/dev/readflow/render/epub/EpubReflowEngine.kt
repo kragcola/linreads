@@ -220,6 +220,19 @@ class EpubReflowEngine private constructor(
         val segments: List<PagedTextRenderSegment>,
     )
 
+    private data class PagedTextSelectionPart(
+        val paragraphIndex: Int,
+        val paragraphStart: Int,
+        val paragraphEnd: Int,
+        val renderStart: Int,
+        val renderEnd: Int,
+    )
+
+    private data class PagedTextSelectionMapping(
+        val selection: ReaderTextSelection,
+        val highlightRange: ReaderTextHighlightRange,
+    )
+
     override suspend fun supports(uri: Uri): Boolean = true
 
     override suspend fun openBook(uri: Uri): Locator {
@@ -606,29 +619,14 @@ class EpubReflowEngine private constructor(
             selectionStart = start.coerceIn(0, pageTextLength),
             selectionEnd = end.coerceIn(0, pageTextLength),
         )
-        val segment = content.segments.firstOrNull { renderSegment ->
-            selectionStart < renderSegment.renderEnd && selectionEnd > renderSegment.renderStart
-        }
-        val textSelection = segment?.let { renderSegment ->
-            val localStart = (selectionStart - renderSegment.renderStart)
-                .coerceIn(0, renderSegment.renderEnd - renderSegment.renderStart)
-            val localEnd = (selectionEnd - renderSegment.renderStart)
-                .coerceIn(0, renderSegment.renderEnd - renderSegment.renderStart)
-            epubTextSelection(
-                indexedParas = paras,
-                paragraphIndex = renderSegment.source.paragraphIndex,
-                selectionStart = renderSegment.source.startOffset + localStart,
-                selectionEnd = renderSegment.source.startOffset + localEnd,
-            ) { index -> lazyBook?.paragraphAt(index) }
-        }
+        val mappedSelection = multiSegmentTextSelection(
+            content = content,
+            selectionStart = selectionStart,
+            selectionEnd = selectionEnd,
+        )
+        val textSelection = mappedSelection?.selection
         _currentTextSelection.value = textSelection
-        val composeSelectionHighlight = textSelection?.let {
-            ReaderTextHighlightRange(
-                start = selectionStart,
-                end = selectionEnd,
-                color = EpubComposeSelectionHighlightColor,
-            )
-        }
+        val composeSelectionHighlight = mappedSelection?.highlightRange
         composeView.setTag(R.id.epub_compose_text_selection_range, composeSelectionHighlight?.let { it.start to it.end })
         composeView.setTag(R.id.epub_compose_text_selection_highlight_range, composeSelectionHighlight)
         composeView.setTag(
@@ -642,6 +640,67 @@ class EpubReflowEngine private constructor(
             ),
         )
         selectionHighlightState.value = composeSelectionHighlight
+    }
+
+    private fun multiSegmentTextSelection(
+        content: PagedTextRenderContent,
+        selectionStart: Int,
+        selectionEnd: Int,
+    ): PagedTextSelectionMapping? {
+        val selectedParts = content.segments.mapNotNull { renderSegment ->
+            val segmentLength = renderSegment.renderEnd - renderSegment.renderStart
+            val localStart = (selectionStart - renderSegment.renderStart).coerceIn(0, segmentLength)
+            val localEnd = (selectionEnd - renderSegment.renderStart).coerceIn(0, segmentLength)
+            if (localStart >= localEnd) return@mapNotNull null
+            val paragraphIndex = renderSegment.source.paragraphIndex
+            val fullText = lazyBook?.paragraphAt(paragraphIndex)?.text ?: renderSegment.source.text
+            val paragraphStart = renderSegment.source.startOffset + localStart
+            val paragraphEnd = renderSegment.source.startOffset + localEnd
+            val (trimmedStart, trimmedEnd) = epubNormalizedTextSelectionRange(
+                text = fullText,
+                selectionStart = paragraphStart,
+                selectionEnd = paragraphEnd,
+            ) ?: return@mapNotNull null
+            PagedTextSelectionPart(
+                paragraphIndex = paragraphIndex,
+                paragraphStart = trimmedStart,
+                paragraphEnd = trimmedEnd,
+                renderStart = renderSegment.renderStart + trimmedStart - renderSegment.source.startOffset,
+                renderEnd = renderSegment.renderStart + trimmedEnd - renderSegment.source.startOffset,
+            )
+        }
+        val firstPart = selectedParts.firstOrNull() ?: return null
+        val lastPart = selectedParts.last()
+        val startLocator = locatorForTextSelectionOffset(firstPart.paragraphIndex, firstPart.paragraphStart) ?: return null
+        val endLocator = locatorForTextSelectionOffset(lastPart.paragraphIndex, lastPart.paragraphEnd) ?: return null
+        return PagedTextSelectionMapping(
+            selection = ReaderTextSelection(
+                start = startLocator,
+                end = endLocator,
+                selectedText = content.text.substring(firstPart.renderStart, lastPart.renderEnd),
+            ),
+            highlightRange = ReaderTextHighlightRange(
+                start = firstPart.renderStart,
+                end = lastPart.renderEnd,
+                color = EpubComposeSelectionHighlightColor,
+            ),
+        )
+    }
+
+    private fun locatorForTextSelectionOffset(paragraphIndex: Int, paragraphOffset: Int): Locator? {
+        val para = paras.getOrNull(paragraphIndex) ?: return null
+        val totalChars = epubTotalChars(paras).coerceAtLeast(1).toFloat()
+        val documentOffset = para.documentCharStart + paragraphOffset
+        val totalProgression = (documentOffset.toFloat() / totalChars).coerceIn(0f, 1f)
+        return Locator(
+            strategy = LocatorStrategy.Section(
+                spineIndex = para.spineIndex,
+                elementIndex = paragraphIndex,
+                charOffset = para.spineCharStart + paragraphOffset,
+            ),
+            progression = totalProgression,
+            totalProgression = totalProgression,
+        )
     }
 
     private fun resetBookStateForOpen() {

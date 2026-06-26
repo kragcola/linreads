@@ -6,6 +6,11 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB 分页跨段 selection 补证
+- 回填 `PAGE-05`：短段落合并到同一 paged Compose 页后，跨段拖选现在会把 selection start/end locator 映射到首个/最后一个有效段落，而不是只保存第一个 segment，避免合并页上高亮/笔记跨段丢尾
+- 验证：RED `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubReflowEngineTest.paged runtime maps compose selection across packed paragraphs"` 先失败于 `selectedText` 只包含第一段；GREEN 后同一测试与相邻短段/对话段合并测试通过；`./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --tests "dev.readflow.render.epub.EpubReflowEngineTest" --tests "dev.readflow.render.epub.EpubPageMappingTest"` 通过
+- 边界：这是 Robolectric/code-contract 证据，不是真实设备 Compose selection action-mode、TalkBack speech、混合 EPUB 视觉或性能预算；`PAGE-05` 仍保持 `PARTIAL`
+
 ### Android v4 纯阅读 AVD 尾项补证
 - 回填 `UX-02`：不再把 AVD 口径写成“无法模拟双指 pinch”。基于 `ReaderPinchRuntimeSmokeTest` 的 instrumentation multi-touch 注入，`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.ux02.ReaderPinchRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` 通过 `OK (2 tests)`
 - 证据：`/tmp/readflow-ux02-runtime-20260626-final/ux02-runtime-smoke/txt-summary.txt` 记录 TXT 字号预览 `16sp -> 22sp`、可见文本 `42.0px -> 59.294098px`、持久化 `font_size_sp=22`；`pdf-summary.txt` 记录 PDF `FIT_CENTER -> MATRIX`，`matrix_scale_x/y=1.4117643`，并保留前后截图
