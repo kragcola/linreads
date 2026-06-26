@@ -163,10 +163,18 @@ class A01IncomingBookRuntimeSmokeTest {
         )
 
         ActivityScenario.launch<MainActivity>(incomingIntent(case, uri)).use {
-            dismissBlockingDialogs()
+            assertNoBlockingStartupDialogs(title)
             waitForObjectOrDump(By.descStartsWith("阅读内容"), "${title}-reader-wait-failure")
+            assertNoBlockingStartupDialogs(title)
             val readerProbe = case.expectedReaderText?.let {
-                waitForObjectOrDump(By.textContains(it), "${title}-reader-probe-failure").text.orEmpty()
+                val exposedText = device.wait(Until.findObject(By.textContains(it)), 3_000)
+                if (exposedText != null) {
+                    exposedText.text.orEmpty()
+                } else {
+                    takeScreenshot("${title}-reader-visual-probe.png")
+                    dumpHierarchy("${title}-reader-visual-probe.xml")
+                    "reader_surface_visible_text_not_exposed_to_uiautomator:$it"
+                }
             } ?: waitForObjectOrDump(By.desc("第 1 页，共 1 页"), "${title}-pdf-page-probe-failure")
                 .contentDescription
                 .orEmpty()
@@ -254,12 +262,25 @@ class A01IncomingBookRuntimeSmokeTest {
         copyIfExists(File(dbFile.path + "-shm"), File(evidenceDir(), "$label-readflow.db-shm"))
     }
 
-    private fun dismissBlockingDialogs() {
-        val dismissTexts = listOf("暂不", "Not now", "不允许", "Don't allow", "Don’t allow")
-        dismissTexts.forEach { text ->
-            device.wait(Until.findObject(By.text(text)), 1_000)?.click()
-            device.waitForIdle()
+    private fun assertNoBlockingStartupDialogs(title: String) {
+        device.waitForIdle(1_000)
+        val blockedByNotificationPrompt =
+            device.findObject(By.textContains("send you notifications")) != null ||
+                device.findObject(By.text("Allow")) != null ||
+                device.findObject(By.text("Don’t allow")) != null ||
+                device.findObject(By.text("Don't allow")) != null
+        val blockedByInstallPrompt =
+            device.findObject(By.text("需要安装权限")) != null ||
+                device.findObject(By.text("前往设置")) != null ||
+                device.findObject(By.text("暂不")) != null
+        if (blockedByNotificationPrompt || blockedByInstallPrompt) {
+            takeScreenshot("$title-blocking-startup-dialog.png")
+            dumpHierarchy("$title-blocking-startup-dialog.xml")
         }
+        assertTrue(
+            "ACTION_VIEW/ACTION_SEND book open must not be blocked by notification/install permission dialogs",
+            !blockedByNotificationPrompt && !blockedByInstallPrompt,
+        )
     }
 
     private fun dumpHierarchy(name: String) {

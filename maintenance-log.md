@@ -6,6 +6,15 @@
 
 ## 2026-06-27
 
+### Android v4 first-read permission prompt removal / A-01 regression
+- 发现：`Dev build #109` release APK（远端 `app-ota.apk` 大小 `9,729,356`，SHA-256 `157bbe6bebb43ddbbcd50a40ed7320412e40d3dfc7a460b92a36f8439591906d`）安装到 `emulator-5554` 后，清数据并通过 MediaStore `content://media/external/file/306` 打开极端 EPUB；冷启动 `TotalTime=1121ms`，但首屏被 Android 13+ 系统通知权限弹窗 `Allow Readflow to send you notifications?` 阻断，`/tmp/readflow-dev109-release-blackbox/epub-extreme/page-sampling.txt` 第 1~24 次 dump 全是 `Allow / Don’t allow`，用户无法直接进入阅读
+- 根因：phase2 `ReadflowApp` 在 app 启动时无条件请求 `POST_NOTIFICATIONS`，且无条件检查/弹出未知来源安装权限对话；这把 OTA 更新权限前置到了本地阅读入口，违背“打开书即阅读”的用户体验
+- 修复：移除 `ReadflowApp` 启动时的通知权限请求和未知来源安装权限弹窗；保留 Settings 更新入口，用户主动点击 `下载并安装` 时才检查未知来源安装权限，缺失时跳转系统设置并显示可恢复提示。下载进度仍在 Settings 内展示，不再要求首读路径申请通知权限
+- 验证：`./gradlew -Preadflow.phase=2 :features:settings:compileDebugKotlin :app:compileDebugKotlin :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` 通过；`A01IncomingBookRuntimeSmokeTest` 新增 `assertNoBlockingStartupDialogs()`，不再自动点掉权限弹窗，并覆盖 ACTION_VIEW/ACTION_SEND × TXT/MD/EPUB/PDF；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.a01.A01IncomingBookRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`。同测截图证明 TXT 首读正文可见，但 UIAutomator XML 不一定暴露 TXT 文本节点，因此测试记录 `reader_surface_visible_text_not_exposed_to_uiautomator` 并用 reader surface + DB row 作为稳定入口证据
+- 追加黑盒：修复后的 debug build 清数据后通过同一 `content://media/external/file/306` 打开 EPUB，冷启动 `TotalTime=1766ms`，`/tmp/readflow-dev109-fixed-debug-blackbox/epub-extreme/page-sampling.txt` 显示 `blocked_dialog=False` 且 reader surface/正文 markers 出现；该轮默认停在 EPUB 连续模式 micro 区域，不能替代 #108 的 release 分页 mixed safe-style packed 复验
+- 构建：`git diff --check` 通过；`./gradlew -Preadflow.phase=2 :app:assembleOta` 通过，本地 `android/app/build/outputs/apk/ota/app-ota.apk` 大小 `9,729,356`，SHA-256 `86fb569893ba8d81d70be6df12abd69ef2287811a1b85f50e4ffcdc5caa99e6d`
+- 边界：当前修复已在 debug/install + AVD instrumentation 通过，但 #109 release 仍是旧包；需要提交推送生成 #110 后，再下载远端 release APK 做清数据 ACTION_VIEW 首读无弹窗复验。A-01 仍保持 `VERIFY`，因为真实手机/平板、OEM 文件管理器、Android sharesheet、DocumentsUI 或第三方文件 App 尚未完成
+
 ### Android v4 EPUB mixed safe-style packed pagination fix / dev build push
 - 发现：`dev-latest` / `Dev build #107` release 黑盒用 `/tmp/readflow-dev107-extreme-smoke/dev107-extreme-pack.epub` 覆盖 120 个 micro paragraph、中文对话、list item、blockquote、`<br/>` 诗行、长无空格中文段与尾句；micro paragraph 区域已 packed，但混合 safe style 区域在 `/tmp/readflow-dev107-extreme-smoke/epub-blackbox/page-sampling.txt` 与 `page-12.xml` 起暴露 `DEV107 对话001`、`DEV107 清单002`、`DEV107 旁白003` 等一页一个短块，属于“一句一页”家族的真实阅读连续性回归
 - 修复：`EpubPageMapping.packAdjacentShortTextPages()` 仍只允许无链接、非 heading、非 pre/table/image 的 `Body/ListItem/Blockquote` 文本块合页，但不再要求相邻 safe blocks 的 `textStyle` 完全相同；跨 spine 仍禁止合并，标题、代码、表格、图片、链接仍保持隔离

@@ -4,6 +4,7 @@ import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.rememberScrollState
@@ -337,8 +338,13 @@ fun SettingsScreen(
                     }
                     Button(
                         onClick = {
-                            val dlId = context.startFreshDownload(s.apkUrl, authToken)
-                            updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
+                            if (!context.packageManager.canRequestPackageInstalls()) {
+                                context.openUnknownAppSourcesSettings()
+                                updateState = UpdateState.Error("请先允许 LinReads 安装未知来源应用，然后返回重试")
+                            } else {
+                                val dlId = context.startFreshDownload(s.apkUrl, authToken)
+                                updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
+                            }
                         },
                         enabled = true
                     ) { Text("下载并安装") }
@@ -438,6 +444,13 @@ private fun launchInstaller(context: Context, uri: Uri) {
     context.startActivity(Intent(Intent.ACTION_VIEW).apply {
         setDataAndType(uri, "application/vnd.android.package-archive")
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+    })
+}
+
+private fun Context.openUnknownAppSourcesSettings() {
+    startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+        data = Uri.parse("package:$packageName")
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     })
 }
 
