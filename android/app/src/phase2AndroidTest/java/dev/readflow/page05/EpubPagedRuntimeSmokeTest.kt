@@ -837,6 +837,112 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedPacksCjkDialogueAndListItemsRuntime() {
+        val title = "page05-cjk-packed-${UUID.randomUUID().toString().take(8)}"
+        val chapterTitle = "第一章 雨声"
+        val entries = (1..60).map { index ->
+            when (index % 6) {
+                0 -> "清单${index.toString().padStart(3, '0')}：旧伞。"
+                1 -> "对话${index.toString().padStart(3, '0')}：“醒了吗？”"
+                2 -> "对话${index.toString().padStart(3, '0')}：“嗯。”"
+                3 -> "旁白${index.toString().padStart(3, '0')}：雨声很轻。"
+                4 -> "旁白${index.toString().padStart(3, '0')}：灯被按暗。"
+                else -> "引文${index.toString().padStart(3, '0')}：“别回头。”"
+            }
+        }
+        val blankParagraphCount = entries.indices.count { index -> index > 0 && index % 10 == 0 }
+        val bodyBlocks = entries.mapIndexed { index, text ->
+            val spacer = if (index > 0 && index % 10 == 0) "<p> </p>" else ""
+            val block = when {
+                text.startsWith("清单") -> "<ul><li>$text</li></ul>"
+                text.startsWith("引文") -> "<blockquote><p>$text</p></blockquote>"
+                else -> "<p>$text</p>"
+            }
+            spacer + block
+        }.joinToString(separator = "\n")
+        val body = "<h1>$chapterTitle</h1>\n$bodyBlocks"
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        $body
+                      </body>
+                    </html>
+                """.trimIndent(),
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected CJK dialogue/list EPUB reader to enter packed paged mode") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    itemCount in 1 until entries.size &&
+                        (pageText.contains(chapterTitle) || entries.any { entry -> pageText.contains(entry) })
+                }
+            }
+
+            val baseline = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-cjk-dialogue-baseline.png")
+            dumpHierarchy("packed-cjk-dialogue-baseline.xml")
+
+            performReaderAccessibilityAction(
+                scenario = scenario,
+                action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+            )
+            waitForCondition("expected CJK dialogue/list packed reader to advance without landing on a blank page") {
+                scenario.withActivity { activity ->
+                    (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > baseline.currentItem &&
+                        activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                            ?.let { pageText -> pageText.isNotBlank() && pageText != baseline.pageText } == true
+                }
+            }
+
+            val afterNext = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-cjk-dialogue-after-next.png")
+            dumpHierarchy("packed-cjk-dialogue-after-next.xml")
+
+            val baselineEntryCount = entries.count { entry -> baseline.pageText.contains(entry) }
+            val nextEntryCount = entries.count { entry -> afterNext.pageText.contains(entry) }
+            writeTextEvidence(
+                "packed-cjk-dialogue-summary.txt",
+                buildString {
+                    appendLine("chapter_title=$chapterTitle")
+                    appendLine("content_entry_count=${entries.size}")
+                    appendLine("blank_paragraph_count=$blankParagraphCount")
+                    appendLine("page_count=${baseline.itemCount}")
+                    appendLine("baseline_current_item=${baseline.currentItem}")
+                    appendLine("baseline_page_progress=${baseline.pageProgress}")
+                    appendLine("baseline_entry_count=$baselineEntryCount")
+                    appendLine("baseline_page_text=${baseline.pageText}")
+                    appendLine("next_current_item=${afterNext.currentItem}")
+                    appendLine("next_page_progress=${afterNext.pageProgress}")
+                    appendLine("next_entry_count=$nextEntryCount")
+                    appendLine("next_page_text=${afterNext.pageText}")
+                },
+            )
+
+            assertEquals(0, baseline.currentItem)
+            assertTrue("expected CJK mixed content page to avoid blank first page", baseline.pageText.isNotBlank())
+            assertTrue("expected CJK mixed content to start on the chapter title page", baseline.pageText.contains(chapterTitle))
+            assertTrue("expected CJK mixed content paging to avoid one page per text block", baseline.itemCount in 1 until entries.size)
+            assertTrue(afterNext.currentItem > baseline.currentItem)
+            assertTrue("expected next CJK packed page to contain readable text", afterNext.pageText.isNotBlank())
+            assertTrue("expected next CJK packed page to contain multiple tracked content blocks", nextEntryCount >= 2)
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)

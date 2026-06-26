@@ -6,6 +6,13 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed 中文混合内容 AVD runtime 补证
+- 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksCjkDialogueAndListItemsRuntime`，用真实 reader route 打开包含章节标题、60 个中文短文本块、中文对话标点、blockquote、list item 和 5 个空段的 EPUB，验证分页模式不会退回“一句一页”或空白页
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin`、`:app:installDebug :app:installDebugAndroidTest` 通过；targeted CJK mixed instrumentation = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (7 tests)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过
+- 证据：`/tmp/readflow-page05-cjk-dialogue-runtime-20260626/full-class/page05-epub-runtime-smoke/packed-cjk-dialogue-summary.txt` 记录 `content_entry_count=60`、`blank_paragraph_count=5`、`page_count=31`；第 1 页为章节标题 `第一章 雨声` 且非空白；accessibility scroll forward 后第 2 页含 `对话001`、`对话002`、`旁白003`、`旁白004` 共 4 个中文短块；logcat grep 未命中 crash/ANR/recycled-bitmap/`Unable to find reader surface`/AssertionError
+- 调试记录：首次 targeted 暴露测试样本误把第一个 tracked 文本做成 `<h1>`，导致“首屏必须多个 tracked block”的断言不符合真实章节标题页；已按 evidence 修正为标题页非空、下一正文页 packed 多块
+- 边界：这是 AVD runtime + screenshot/XML/tag summary 证据，不是真实平板中文书籍视觉调校、TalkBack speech/action-mode、折叠屏/分屏或帧率/PSS 预算；`PAGE-05` 保持 `PARTIAL`
+
 ### Android v4 EPUB packed 最大排版横屏 AVD runtime 补证
 - 回填 `PAGE-05` / 低视力阅读边界：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksMicroParagraphsWithMaxTypographyInLandscapeRuntime`，在真实 reader route 中把 EPUB 设置为 32sp 字号、2.2x 行距并强制横屏，验证极端排版下微短段分页仍保持 packed，不回归“一段一页”
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin`、`:app:installDebug :app:installDebugAndroidTest` 通过；targeted 旋转回归 `epubPagedPacksMicroParagraphsAfterOrientationChangeRuntime` = `OK (1 test)`；targeted 最大排版横屏 = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (6 tests)`
