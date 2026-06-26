@@ -25,8 +25,12 @@ internal class PdfPageAdapter(
         attachedValue = { imageView -> (imageView.drawable as? BitmapDrawable)?.bitmap },
         clearAttachment = { imageView -> imageView.setImageDrawable(null) },
     )
+    private val cachePolicy = pdfPageCachePolicy(
+        pageWidthPx = context.resources.displayMetrics.widthPixels,
+        pageHeightPx = firstPageRenderedHeightPx(),
+    )
     private val cache = PdfPageBitmapCache<Bitmap>(
-        maxEntries = PDF_PAGE_CACHE_MAX_PAGES,
+        maxEntries = cachePolicy.maxPages,
         release = { bitmap -> bitmapAttachments.release(bitmap) { it.recycle() } },
     )
 
@@ -47,7 +51,7 @@ internal class PdfPageAdapter(
         holder.iv.setImageBitmap(
             cache.getOrPut(position) { renderPage(position) }
         )
-        cache.retainAround(position, PDF_PAGE_CACHE_RADIUS)
+        cache.retainAround(position, cachePolicy.radius)
     }
 
     override fun getItemCount(): Int = renderer.pageCount
@@ -77,8 +81,14 @@ internal class PdfPageAdapter(
         boundViews.clear()
     }
 
-    private companion object {
-        const val PDF_PAGE_CACHE_RADIUS = 1
-        const val PDF_PAGE_CACHE_MAX_PAGES = PDF_PAGE_CACHE_RADIUS * 2 + 1
+    private fun firstPageRenderedHeightPx(): Int {
+        if (renderer.pageCount <= 0) return context.resources.displayMetrics.heightPixels
+        val page = renderer.openPage(0)
+        return try {
+            val width = context.resources.displayMetrics.widthPixels
+            (width * page.height.toFloat() / page.width).toInt().coerceAtLeast(1)
+        } finally {
+            page.close()
+        }
     }
 }

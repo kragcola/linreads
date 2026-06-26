@@ -75,7 +75,11 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         attachedValue = { imageView -> (imageView.drawable as? BitmapDrawable)?.bitmap },
         clearAttachment = { imageView -> imageView.setImageDrawable(null) },
     )
-    private var pageStore = createPageStore(renderScope)
+    private var pageCachePolicy = pdfPageCachePolicy(
+        pageWidthPx = context.resources.displayMetrics.widthPixels,
+        pageHeightPx = context.resources.displayMetrics.heightPixels,
+    )
+    private var pageStore = createPageStore(renderScope, pageCachePolicy)
 
     override suspend fun supports(uri: Uri): Boolean = true
 
@@ -98,6 +102,13 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         val initial = Locator(LocatorStrategy.Page(0, total), 0f, 0f)
         withContext(Dispatchers.Main) {
             ensureRenderScope()
+            pageCachePolicy = initialBitmap?.let { bitmap ->
+                pdfPageCachePolicy(pageWidthPx = bitmap.width, pageHeightPx = bitmap.height)
+            } ?: pdfPageCachePolicy(
+                pageWidthPx = context.resources.displayMetrics.widthPixels,
+                pageHeightPx = context.resources.displayMetrics.heightPixels,
+            )
+            pageStore = createPageStore(renderScope, pageCachePolicy)
             initialBitmap?.let { pageStore.put(0, it) }
             _pageCount.value = total
             _tableOfContents.value = toc
@@ -140,8 +151,8 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
                 setImageBitmap(bitmap)
                 applyPdfZoom(_zoomScale.value)
             }
-            pageStore.prefetchAround(safeIndex, PDF_PAGE_CACHE_RADIUS, 0 until total)
-            pageStore.retainAround(safeIndex, PDF_PAGE_CACHE_RADIUS)
+            pageStore.prefetchAround(safeIndex, pageCachePolicy.radius, 0 until total)
+            pageStore.retainAround(safeIndex, pageCachePolicy.radius)
         }.also(::trackPageView)
     }
 
@@ -176,8 +187,8 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
             }
             (recyclerView?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(idx, 0)
             _currentLocator.value = target
-            pageStore.prefetchAround(idx, PDF_PAGE_CACHE_RADIUS, 0 until total)
-            pageStore.retainAround(idx, PDF_PAGE_CACHE_RADIUS)
+            pageStore.prefetchAround(idx, pageCachePolicy.radius, 0 until total)
+            pageStore.retainAround(idx, pageCachePolicy.radius)
             pageRequestCallback?.invoke(idx)
         }
     }
@@ -269,14 +280,17 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
     private fun ensureRenderScope() {
         if (renderScope.isActive) return
         renderScope = pdfRenderScope()
-        pageStore = createPageStore(renderScope)
+        pageStore = createPageStore(renderScope, pageCachePolicy)
     }
 
-    private fun createPageStore(scope: CoroutineScope): PdfPageBitmapStore<Bitmap> =
+    private fun createPageStore(
+        scope: CoroutineScope,
+        policy: PdfPageCachePolicy,
+    ): PdfPageBitmapStore<Bitmap> =
         PdfPageBitmapStore(
             scope = scope,
             renderDispatcher = renderDispatcher,
-            maxEntries = PDF_PAGE_CACHE_MAX_PAGES,
+            maxEntries = policy.maxPages,
             release = { bitmap -> pageBitmapAttachments.release(bitmap) { it.recycle() } },
             render = { pageIndex -> renderPageBlocking(pageIndex) },
         )
@@ -320,8 +334,6 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
     private companion object {
         const val MIN_ZOOM_SCALE = 1f
         const val MAX_ZOOM_SCALE = 4f
-        const val PDF_PAGE_CACHE_RADIUS = 1
-        const val PDF_PAGE_CACHE_MAX_PAGES = PDF_PAGE_CACHE_RADIUS * 2 + 1
 
         val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
         val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)

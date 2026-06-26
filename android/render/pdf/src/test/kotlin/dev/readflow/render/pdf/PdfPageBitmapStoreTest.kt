@@ -80,4 +80,29 @@ class PdfPageBitmapStoreTest {
         assertTrue(callbacks.isEmpty())
         assertEquals(0, store.size)
     }
+
+    @Test
+    fun `prefetch around renders both directions through requested radius`() = runTest {
+        val renderCalls = mutableListOf<Int>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val store = PdfPageBitmapStore(
+            scope = this,
+            renderDispatcher = dispatcher,
+            maxEntries = 5,
+            release = {},
+            render = { pageIndex ->
+                renderCalls += pageIndex
+                "page-$pageIndex"
+            },
+        )
+
+        store.prefetchAround(pageIndex = 3, radius = 2, validPages = 0..6)
+        advanceUntilIdle()
+
+        assertEquals(listOf(4, 2, 5, 1), renderCalls)
+        assertEquals("page-1", store.cached(1))
+        assertEquals("page-2", store.cached(2))
+        assertEquals("page-4", store.cached(4))
+        assertEquals("page-5", store.cached(5))
+    }
 }

@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 PDF page-cache 预算化预取补证
+- 回填 `A-02` / `PDF-01`：PDF paged path 与 legacy `PdfPageAdapter` 不再固定当前页 `±1` / 3 张 bitmap，而是按渲染页尺寸在 128MB bitmap 预算内优先使用 `±2` / 5 张预取；高分屏/超大页若 5 张超预算则自动降级为 `±1` / 3 张，再极端时只保留当前页，避免为了预取放大 OOM 风险
+- 验证：RED `./gradlew :render:pdf:testDebugUnitTest --tests "dev.readflow.render.pdf.PdfPageCachePolicyTest"` 先失败于缺少 `pdfPageCachePolicy`；GREEN 后 `./gradlew :render:pdf:testDebugUnitTest` 通过；phase2 `./gradlew -Preadflow.phase=2 :render:pdf:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过；`./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest` 通过
+- 运行态证据：`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.ux05.ReaderPagedKeyboardRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (3 tests)`；`/tmp/readflow-a02-pdf-cache-policy-20260626/ux05-page-runtime-smoke` 记录 PDF reader 仍能通过 accessibility action / D-pad / PAGE keys 翻页，默认 CURL host 可用，zoom 后翻页重置为 `FIT_CENTER` / `1.0`；logcat grep 未命中 crash/ANR/recycled-bitmap/OOM/FAILURES
+- 边界：这是 JVM policy + AVD reader-route 稳定性证据，不是真实平板长 PDF、连续快速 swipe 的 frame/PSS benchmark；`A-02` 保持 `PARTIAL`，`PDF-01` 保持 `VERIFY`
+
 ### Android v4 EPUB packed CJK `<br/>` 诗行 AVD runtime 补证
 - 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksCjkPoemLinesSeparatedByBreaksRuntime`，用真实 reader route 打开单个 `<p>` 内 84 行中文诗句并以 `<br/>` 分隔的 EPUB，覆盖诗歌/网文短行被硬换行编码时不应退回“一行一页”
 - 验证：targeted instrumentation `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksCjkPoemLinesSeparatedByBreaksRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (9 tests)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过
