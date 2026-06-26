@@ -6,6 +6,13 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed 最大排版横屏 AVD runtime 补证
+- 回填 `PAGE-05` / 低视力阅读边界：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksMicroParagraphsWithMaxTypographyInLandscapeRuntime`，在真实 reader route 中把 EPUB 设置为 32sp 字号、2.2x 行距并强制横屏，验证极端排版下微短段分页仍保持 packed，不回归“一段一页”
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin`、`:app:installDebug :app:installDebugAndroidTest` 通过；targeted 旋转回归 `epubPagedPacksMicroParagraphsAfterOrientationChangeRuntime` = `OK (1 test)`；targeted 最大排版横屏 = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (6 tests)`
+- 证据：`/tmp/readflow-page05-packed-max-typography-runtime-20260626/full-class/page05-epub-runtime-smoke/packed-max-typography-summary.txt` 记录 `paragraph_count=72`、`persisted_font_size_sp=32`、`persisted_line_spacing=2.2`、landscape `surface=2400x1080`、`page_count=24`、第 1 页 `A11y line 001..003` 3 段，accessibility scroll forward 后第 2 页 `A11y line 004..006` 3 段；logcat grep 未命中 crash/ANR/recycled-bitmap/`Unable to find reader surface`
+- 测试侧修正：`EpubPagedRuntimeSmokeTest` 的 reader surface 查询增加 nullable helper，让旋转/重建等待期间的短暂 root 缺失返回 `null` 继续轮询，避免 Activity recreation 中的 instrumentation 假失败；生产代码未改
+- 边界：这是 AVD landscape + screenshot/XML/tag summary 证据，不是真实平板低视力排版、TalkBack speech/action-mode、混合 EPUB 视觉调校、折叠屏/分屏或帧率/PSS 预算；`PAGE-05` 保持 `PARTIAL`
+
 ### Android v4 EPUB packed 横竖屏重分页 AVD runtime 补证
 - 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedPacksMicroParagraphsAfterOrientationChangeRuntime`，通过 48 个微短段 EPUB 在真实 reader route 中从竖屏切到分页，再旋转到横屏，验证 viewport 改变后 paged Compose 会重分页且仍保持 packed，不回归“一段一页”
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin` 通过；targeted `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedPacksMicroParagraphsAfterOrientationChangeRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (5 tests)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过

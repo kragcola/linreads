@@ -733,6 +733,110 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedPacksMicroParagraphsWithMaxTypographyInLandscapeRuntime() = runBlocking {
+        settings.setFontSize(32)
+        settings.setLineSpacing(2.2f)
+        device.setOrientationLeft()
+        device.waitForIdle()
+
+        val title = "page05-a11y-max-${UUID.randomUUID().toString().take(8)}"
+        val lines = (1..72).map { index -> "A11y line ${index.toString().padStart(3, '0')}." }
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to lines.joinToString(
+                    prefix = """
+                        <html xmlns="http://www.w3.org/1999/xhtml">
+                          <body>
+                    """.trimIndent(),
+                    separator = "\n",
+                    postfix = """
+                          </body>
+                        </html>
+                    """.trimIndent(),
+                ) { line -> "<p>$line</p>" },
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+            waitForCondition("expected max-typography reader to launch in landscape") {
+                scenario.withActivity { activity ->
+                    activity.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                }
+            }
+
+            switchReaderToPagedMode()
+            waitForCondition("expected max-typography EPUB reader to enter paged mode") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    itemCount in 1 until lines.size && lines.any { line -> pageText.contains(line) }
+                }
+            }
+
+            val baseline = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-max-typography-landscape.png")
+            dumpHierarchy("packed-max-typography-landscape.xml")
+
+            performReaderAccessibilityAction(
+                scenario = scenario,
+                action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+            )
+            waitForCondition("expected max-typography landscape EPUB reader to advance to another packed page") {
+                scenario.withActivity { activity ->
+                    (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > baseline.currentItem &&
+                        activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                            ?.let { it != baseline.pageText } == true
+                }
+            }
+
+            val afterNext = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-max-typography-landscape-after-next.png")
+            dumpHierarchy("packed-max-typography-landscape-after-next.xml")
+
+            val baselineLineCount = lines.count { line -> baseline.pageText.contains(line) }
+            val nextLineCount = lines.count { line -> afterNext.pageText.contains(line) }
+            val persistedFontSize = settings.fontSize.first()
+            val persistedLineSpacing = settings.lineSpacing.first()
+            writeTextEvidence(
+                "packed-max-typography-summary.txt",
+                buildString {
+                    appendLine("paragraph_count=${lines.size}")
+                    appendLine("persisted_font_size_sp=$persistedFontSize")
+                    appendLine("persisted_line_spacing=$persistedLineSpacing")
+                    appendLine("landscape_orientation=${baseline.orientation}")
+                    appendLine("landscape_surface_width=${baseline.surfaceWidth}")
+                    appendLine("landscape_surface_height=${baseline.surfaceHeight}")
+                    appendLine("landscape_page_count=${baseline.itemCount}")
+                    appendLine("landscape_current_item=${baseline.currentItem}")
+                    appendLine("landscape_page_progress=${baseline.pageProgress}")
+                    appendLine("landscape_line_count=$baselineLineCount")
+                    appendLine("landscape_page_text=${baseline.pageText}")
+                    appendLine("landscape_next_current_item=${afterNext.currentItem}")
+                    appendLine("landscape_next_page_progress=${afterNext.pageProgress}")
+                    appendLine("landscape_next_line_count=$nextLineCount")
+                    appendLine("landscape_next_page_text=${afterNext.pageText}")
+                },
+            )
+
+            assertEquals(32, persistedFontSize)
+            assertEquals(2.2f, persistedLineSpacing)
+            assertEquals(Configuration.ORIENTATION_LANDSCAPE, baseline.orientation)
+            assertTrue("expected max-typography reader surface to be wider than tall", baseline.surfaceWidth > baseline.surfaceHeight)
+            assertTrue("expected max-typography packed paging to avoid one page per paragraph", baseline.itemCount in 1 until lines.size)
+            assertTrue("expected max-typography page to contain multiple short paragraphs", baselineLineCount >= 2)
+            assertTrue(afterNext.currentItem > baseline.currentItem)
+            assertTrue("expected max-typography next page to contain readable paragraph text", nextLineCount >= 1)
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)
@@ -1096,29 +1200,35 @@ class EpubPagedRuntimeSmokeTest {
     }
 
     private fun MainActivity.findReaderSurface(): View =
-        checkNotNull(window.decorView.findDescendant { view ->
-            view.contentDescription?.toString()?.startsWith("阅读内容") == true
-        }) {
+        checkNotNull(findReaderSurfaceOrNull()) {
             "Unable to find reader surface"
         }
 
+    private fun MainActivity.findReaderSurfaceOrNull(): View? =
+        window.decorView.findDescendant { view ->
+            view.contentDescription?.toString()?.startsWith("阅读内容") == true
+        }
+
     private fun MainActivity.findEpubViewPager(): View? =
-        findReaderSurface().findDescendant { view ->
+        findReaderSurfaceOrNull()?.findDescendant { view ->
             view.javaClass.name == VIEW_PAGER_CLASS_NAME
         }
 
     private fun MainActivity.findEpubScrollRecyclerView(): View? =
-        findReaderSurface().findDescendant { view ->
+        findReaderSurfaceOrNull()?.findDescendant { view ->
             view.javaClass.name == RECYCLER_VIEW_CLASS_NAME &&
                 view.adapterClassName() == EPUB_ADAPTER_CLASS_NAME
         }
 
     private fun MainActivity.currentEpubComposePageRootOrNull(): ComposeView? {
-        val pager = findEpubViewPager() ?: return null
+        val surface = findReaderSurfaceOrNull() ?: return null
+        val pager = surface.findDescendant { view ->
+            view.javaClass.name == VIEW_PAGER_CLASS_NAME
+        } ?: return null
         val currentItem = pager.pagerCurrentItem()
         val total = pager.pagerAdapterItemCount()
         val expectedProgress = pageLabel(currentItem, total)
-        return findReaderSurface().findDescendant { view ->
+        return surface.findDescendant { view ->
             view is ComposeView &&
                 view.isShown &&
                 view.getTag(EpubR.id.epub_compose_page_progress_description) == expectedProgress
@@ -1126,11 +1236,14 @@ class EpubPagedRuntimeSmokeTest {
     }
 
     private fun MainActivity.currentEpubImagePageViewOrNull(): ImageView? {
-        val pager = findEpubViewPager() ?: return null
+        val surface = findReaderSurfaceOrNull() ?: return null
+        val pager = surface.findDescendant { view ->
+            view.javaClass.name == VIEW_PAGER_CLASS_NAME
+        } ?: return null
         val currentItem = pager.pagerCurrentItem()
         val total = pager.pagerAdapterItemCount()
         val expectedProgress = pageLabel(currentItem, total)
-        return findReaderSurface().findDescendant { view ->
+        return surface.findDescendant { view ->
             view is ImageView &&
                 view.isShown &&
                 view.contentDescription?.toString()?.contains(expectedProgress) == true
