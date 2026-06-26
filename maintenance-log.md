@@ -6,6 +6,13 @@
 
 ## 2026-06-26
 
+### Android v4 SRC-08/SRC-09 SAF UI AVD runtime 补证
+- 回填 `SRC-08/SRC-09`：新增测试 APK 侧 `SafDocumentProvider` 与 phase2 AndroidTest `BackupSafUiRuntimeSmokeTest`，从用户可见 Settings 入口点击 `导出备份` / `恢复备份`，拦截 `ACTION_CREATE_DOCUMENT` / `ACTION_OPEN_DOCUMENT`，把结果指向测试 `content://dev.readflow.test.safdocumentprovider/src08-src09-saf-ui-backup.zip`，覆盖 SAF 文档流而不是只测 app-private ZIP/DB helper
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebugAndroidTest` 通过；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src08.BackupSafUiRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`
+- 证据：`/tmp/readflow-src08-src09-saf-ui-runtime-20260626/backup-saf-ui-runtime-smoke/backup-saf-ui-summary.txt` 记录 `export_intent_action=android.intent.action.CREATE_DOCUMENT`、`restore_intent_action=android.intent.action.OPEN_DOCUMENT`、`export_monitor_hits=1`、`restore_monitor_hits=1`、`exported_zip_size=503`、`manifest_format=linreads-backup`、`manifest_schema=1`、`manifest_counts=progress:1,bookmarks:1,annotations:1`；恢复后 Room 行回到导出侧较新的 `progress={"type":"byte","offset":128} updatedAt=300`、删除态书签 `exported bookmark deleted=true` 和标注 `Readflow note=restored note`；同目录拉取导出/恢复成功截图、XML、ZIP 与恢复后 DB 快照
+- 调试记录：首次 monitor 只按 action 过滤导致真实 DocumentsUI 打开；修正为 `IntentFilter(action).addCategory(Intent.CATEGORY_OPENABLE).addDataType(...)` 后能稳定命中 intent。第二次失败是测试错误地按文件路径找 ZIP，实际 provider 内容已写入；已改为通过 `ContentResolver.openInputStream(exportUri)` 读回导出物
+- 边界：这是 AVD instrumentation 拦截 SAF intent 并返回测试 ContentProvider Uri，不是物理手机/平板的系统 DocumentsUI、OEM 文件管理器或真人手动文件选择；run-window logcat 未见 Readflow crash/ANR/security/file errors，仅有一条无关 GMS `FileNotFoundException`；`SRC-08/SRC-09` 保持 `VERIFY`
+
 ### Android v4 A-03 repo-owned 无障碍 AVD runtime 补证
 - 回填 `A-03`：新增 phase2 AndroidTest `A03AccessibilityRuntimeSmokeTest`，把此前散落在 `/tmp/readflow-a03-*` 的 reader/library XML 证据固化为仓库可回归测试；测试用真实 `MainActivity` + FileProvider EPUB 走 “ACTION_VIEW 导入 -> reader -> 返回书库 -> 书卡打开 -> reader chrome -> TOC/search/bookmark/annotation/font/theme 面板” 路径
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebugAndroidTest` 通过；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.a03.A03AccessibilityRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；当前 AVD 运行后 `enabled_accessibility_services=com.google.android.marvin.talkback/com.google.android.marvin.talkback.TalkBackService`、`accessibility_enabled=1`、`touch_exploration_enabled=1`
