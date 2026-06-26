@@ -943,6 +943,135 @@ class EpubPagedRuntimeSmokeTest {
         }
     }
 
+    @Test
+    fun epubPagedSlicesLongUnspacedCjkParagraphAndPacksTailRuntime() {
+        val title = "page05-cjk-long-${UUID.randomUUID().toString().take(8)}"
+        val longSegments = (1..96).map { index ->
+            "长段${index.toString().padStart(3, '0')}雨声贴着窗格落下灯影慢慢移过书页"
+        }
+        val longParagraph = longSegments.joinToString(separator = "")
+        val tailEntries = (1..18).map { index ->
+            "尾句${index.toString().padStart(3, '0')}：茶还温着。"
+        }
+        val maxPackedPageBudget = (longSegments.size + tailEntries.size) / 4
+        val body = buildString {
+            appendLine("<p>$longParagraph</p>")
+            tailEntries.forEach { entry -> appendLine("<p>$entry</p>") }
+        }
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        $body
+                      </body>
+                    </html>
+                """.trimIndent(),
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected long unspaced CJK EPUB reader to enter paged mode with readable text") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    itemCount in 2..maxPackedPageBudget &&
+                        longSegments.any { segment -> pageText.contains(segment) }
+                }
+            }
+
+            val baseline = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-cjk-long-baseline.png")
+            dumpHierarchy("packed-cjk-long-baseline.xml")
+
+            performReaderAccessibilityAction(
+                scenario = scenario,
+                action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+            )
+            waitForCondition("expected long unspaced CJK paragraph to advance to another readable page") {
+                scenario.withActivity { activity ->
+                    (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > baseline.currentItem &&
+                        activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                            ?.let { pageText -> pageText.isNotBlank() && pageText != baseline.pageText } == true
+                }
+            }
+
+            val afterNext = scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-cjk-long-after-next.png")
+            dumpHierarchy("packed-cjk-long-after-next.xml")
+
+            var tailPage = afterNext
+            var tailTurns = 0
+            while (
+                tailEntries.none { entry -> tailPage.pageText.contains(entry) } &&
+                tailPage.currentItem < tailPage.itemCount - 1 &&
+                tailTurns < tailPage.itemCount
+            ) {
+                val previousItem = tailPage.currentItem
+                performReaderAccessibilityAction(
+                    scenario = scenario,
+                    action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+                )
+                waitForCondition("expected long CJK pagination to keep advancing toward tail entries") {
+                    scenario.withActivity { activity ->
+                        (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > previousItem
+                    }
+                }
+                tailPage = scenario.withActivity { activity ->
+                    activity.orientationPackedSummary()
+                }
+                tailTurns += 1
+            }
+            takeScreenshot("packed-cjk-long-tail.png")
+            dumpHierarchy("packed-cjk-long-tail.xml")
+
+            val baselineSegmentCount = longSegments.count { segment -> baseline.pageText.contains(segment) }
+            val nextSegmentCount = longSegments.count { segment -> afterNext.pageText.contains(segment) }
+            val tailEntryCount = tailEntries.count { entry -> tailPage.pageText.contains(entry) }
+            writeTextEvidence(
+                "packed-cjk-long-summary.txt",
+                buildString {
+                    appendLine("long_segment_count=${longSegments.size}")
+                    appendLine("tail_entry_count=${tailEntries.size}")
+                    appendLine("long_paragraph_has_space=${longParagraph.contains(' ')}")
+                    appendLine("max_packed_page_budget=$maxPackedPageBudget")
+                    appendLine("page_count=${baseline.itemCount}")
+                    appendLine("baseline_current_item=${baseline.currentItem}")
+                    appendLine("baseline_page_progress=${baseline.pageProgress}")
+                    appendLine("baseline_long_segment_count=$baselineSegmentCount")
+                    appendLine("baseline_page_text=${baseline.pageText}")
+                    appendLine("next_current_item=${afterNext.currentItem}")
+                    appendLine("next_page_progress=${afterNext.pageProgress}")
+                    appendLine("next_long_segment_count=$nextSegmentCount")
+                    appendLine("next_page_text=${afterNext.pageText}")
+                    appendLine("tail_turns=$tailTurns")
+                    appendLine("tail_current_item=${tailPage.currentItem}")
+                    appendLine("tail_page_progress=${tailPage.pageProgress}")
+                    appendLine("tail_entry_count=$tailEntryCount")
+                    appendLine("tail_page_text=${tailPage.pageText}")
+                },
+            )
+
+            assertEquals(0, baseline.currentItem)
+            assertFalse("expected test paragraph to contain no ASCII spaces", longParagraph.contains(' '))
+            assertTrue("expected long CJK page count to stay well below tracked segment count", baseline.itemCount in 2..maxPackedPageBudget)
+            assertTrue("expected first long CJK page to contain many long segments", baselineSegmentCount >= 8)
+            assertTrue(afterNext.currentItem > baseline.currentItem)
+            assertTrue("expected next long CJK page to contain readable continuation text", afterNext.pageText.isNotBlank())
+            assertTrue("expected next long CJK page to contain many long segments", nextSegmentCount >= 8)
+            assertTrue("expected short tail entries to remain packed instead of one per page", tailEntryCount >= 2)
+        }
+    }
+
     private fun readerIntent(uri: Uri) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)

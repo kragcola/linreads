@@ -6,6 +6,12 @@
 
 ## 2026-06-26
 
+### Android v4 EPUB packed 长无空格中文 AVD runtime 补证
+- 回填 `PAGE-05`：新增 `EpubPagedRuntimeSmokeTest.epubPagedSlicesLongUnspacedCjkParagraphAndPacksTailRuntime`，用真实 reader route 打开 96 个无 ASCII 空格中文长段片段 + 18 个尾部短句的 EPUB，验证无空格中文长段不会产生空白页或“一句一页”，并验证长段后的短句仍能 packed 到同一页
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` 通过；targeted instrumentation `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.page05.EpubPagedRuntimeSmokeTest#epubPagedSlicesLongUnspacedCjkParagraphAndPacksTailRuntime dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`；完整 `EpubPagedRuntimeSmokeTest` = `OK (8 tests)`；阶段构建 `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过
+- 证据：`/tmp/readflow-page05-cjk-long-runtime-20260626/full-class/page05-epub-runtime-smoke/packed-cjk-long-summary.txt` 记录 `long_segment_count=96`、`tail_entry_count=18`、`long_paragraph_has_space=false`、`page_count=5`；第 1 页含 27 个长段片段，第 2 页含 27 个长段片段，accessibility scroll 到第 4 页时同时包含 `长段082..096` 和 `尾句001..006` 6 个尾句；精确 logcat grep 未命中 crash/ANR/recycled-bitmap/`Unable to find reader surface`/AssertionError
+- 边界：这是 AVD reader-route + XML/screenshot/tag summary 证据，不是真实平板中文书籍视觉、TalkBack speech/action-mode、折叠屏/分屏或帧率/PSS；`PAGE-05` 保持 `PARTIAL`
+
 ### Android v4 Calibre 下载失败态 AVD runtime 补证
 - 回填 `SRC-06`：新增 `CalibreDownloadFailureRuntimeSmokeTest.downloadFailureAfterSearchDoesNotCreateBrokenOfflineBook`，先通过完整 URL `http://10.0.2.2:18081` 连接 fake Calibre，搜索到 `Remote EPUB Smoke` 后主动关闭 server，再点击下载，模拟 LAN/Calibre 睡眠或断网时的真实失败体验
 - 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebugAndroidTest` 通过；`python3 android/test-tools/fake_calibre_server.py --host 127.0.0.1 --port 18081`；targeted instrumentation `adb -s emulator-5554 shell am instrument -w -e class dev.readflow.src06.CalibreDownloadFailureRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`
