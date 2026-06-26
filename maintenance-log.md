@@ -6,6 +6,13 @@
 
 ## 2026-06-26
 
+### Android v4 A-01 外部文件入口 AVD runtime 补证
+- 回填 `A-01`：把 2026-06-22 临时 `/tmp/readflow-share-smoke` synthetic sender 证据固化为 repo-owned phase2 AndroidTest；新增测试 APK 侧 `A01ExternalBookProvider`，通过外部 `content://dev.readflow.test.a01bookprovider/...` provider 模拟 SAF/分享来源，再用 `ACTION_VIEW` 与 `ACTION_SEND` 覆盖 TXT/MD/EPUB/PDF 导入入口
+- 验证：`./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` 通过；`adb -s emulator-5554 shell am instrument -w -e class dev.readflow.a01.A01IncomingBookRuntimeSmokeTest dev.readflow.test/androidx.test.runner.AndroidJUnitRunner` = `OK (1 test)`，grouped test 内覆盖 8 个 case（VIEW/SEND × TXT/MD/EPUB/PDF）
+- 证据：`/tmp/readflow-a01-incoming-runtime-smoke-20260626/a01-incoming-summary.txt` 记录 `case_count=8`，每个 case 都写入 `books` row，格式分别为 `TXT/TXT/MD/MD/EPUB/EPUB/PDF/PDF`，`local_uri` 均为 app-private `file:///data/user/0/dev.readflow/files/books/...`；reader probe 命中 TXT/MD/EPUB sentinel 文本与 PDF `第 1 页，共 1 页`；同目录保留 42 个截图/XML/DB 快照；成功运行窗口 logcat grep 未命中 crash/ANR/OOM/recycled-bitmap/FileNotFound/SecurityException
+- 调试记录：首次 targeted run 卡在 MD 精确文本匹配；设备文件确认 provider 输出正确，Markwon 实际 TextView 文本包含 heading + paragraph，因此测试 probe 从 `By.text(...)` 改为 `By.textContains(...)`，并在 probe 失败时补截图/XML/DB dump，避免未来黑箱失败
+- 边界：这是 AVD + instrumentation external ContentProvider 模拟，不是真实平板系统文件管理器、Android sharesheet、OEM DocumentsUI 或第三方文件 App；`A-01` 保持 `VERIFY`，真机/平板 UI smoke 仍必须补
+
 ### Android v4 PDF page-cache 预算化预取补证
 - 回填 `A-02` / `PDF-01`：PDF paged path 与 legacy `PdfPageAdapter` 不再固定当前页 `±1` / 3 张 bitmap，而是按渲染页尺寸在 128MB bitmap 预算内优先使用 `±2` / 5 张预取；高分屏/超大页若 5 张超预算则自动降级为 `±1` / 3 张，再极端时只保留当前页，避免为了预取放大 OOM 风险
 - 验证：RED `./gradlew :render:pdf:testDebugUnitTest --tests "dev.readflow.render.pdf.PdfPageCachePolicyTest"` 先失败于缺少 `pdfPageCachePolicy`；GREEN 后 `./gradlew :render:pdf:testDebugUnitTest` 通过；phase2 `./gradlew -Preadflow.phase=2 :render:pdf:testDebugUnitTest :app:compileDebugAndroidTestKotlin :app:assembleDebug` 通过；`./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest` 通过
