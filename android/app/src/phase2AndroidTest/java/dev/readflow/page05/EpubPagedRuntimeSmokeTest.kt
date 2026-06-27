@@ -1307,6 +1307,126 @@ class EpubPagedRuntimeSmokeTest {
     }
 
     @Test
+    fun epubPagedIgnoresInvisibleSpacerParagraphsAndPacksTinyCjkRuntime() {
+        val title = "page05-invisible-spacers-${UUID.randomUUID().toString().take(8)}"
+        val fragments = (1..48).map { index ->
+            "隐形${index.toString().padStart(3, '0')}：“还在。”"
+        }
+        val invisibleSpacers = listOf(
+            "&nbsp;",
+            "　",
+            "&#8203;",
+            "&#65279;",
+            "&#8288;",
+            "&#8204;&#8205;",
+            "<span>&nbsp;&#8203;&#65279;&#8288;</span>",
+        )
+        val body = buildString {
+            invisibleSpacers.forEach { spacer -> appendLine("<p>$spacer</p>") }
+            fragments.forEachIndexed { index, fragment ->
+                appendLine("<p>${invisibleSpacers[index % invisibleSpacers.size]}</p>")
+                appendLine("<p><span>$fragment</span></p>")
+                appendLine("<p>${invisibleSpacers[(index + 3) % invisibleSpacers.size]}</p>")
+            }
+            invisibleSpacers.forEach { spacer -> appendLine("<p>$spacer</p>") }
+        }
+        val maxPackedPageBudget = fragments.size / 2
+        val readerUri = createEpubUri(
+            fileName = "$title.epub",
+            spineEntries = listOf(
+                "OEBPS/ch1.xhtml" to """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        $body
+                      </body>
+                    </html>
+                """.trimIndent(),
+            ),
+        )
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(EPUB_READER_DESC))
+
+            switchReaderToPagedMode()
+            waitForCondition("expected invisible-spacer EPUB reader to enter packed paged mode") {
+                scenario.withActivity { activity ->
+                    val itemCount = activity.findEpubViewPager()?.pagerAdapterItemCount() ?: Int.MAX_VALUE
+                    val pageText = activity.currentEpubComposePageRootOrNull()?.composeTextSurface().orEmpty()
+                    itemCount in 1..maxPackedPageBudget &&
+                        fragments.any { fragment -> pageText.contains(fragment) }
+                }
+            }
+
+            val samples = mutableListOf<OrientationPackedSummary>()
+            samples += scenario.withActivity { activity ->
+                activity.orientationPackedSummary()
+            }
+            takeScreenshot("packed-invisible-spacers-page-0.png")
+            dumpHierarchy("packed-invisible-spacers-page-0.xml")
+
+            repeat(3) { sampleIndex ->
+                val previous = samples.last()
+                if (previous.currentItem >= previous.itemCount - 1) return@repeat
+                performReaderAccessibilityAction(
+                    scenario = scenario,
+                    action = AccessibilityNodeInfo.ACTION_SCROLL_FORWARD,
+                )
+                waitForCondition("expected invisible-spacer reader to advance to a readable packed page") {
+                    scenario.withActivity { activity ->
+                        (activity.findEpubViewPager()?.pagerCurrentItem() ?: -1) > previous.currentItem &&
+                            activity.currentEpubComposePageRootOrNull()?.composeTextSurface()
+                                ?.let { pageText ->
+                                    pageText.isNotBlank() &&
+                                        pageText != previous.pageText &&
+                                        fragments.any { fragment -> pageText.contains(fragment) }
+                                } == true
+                    }
+                }
+                samples += scenario.withActivity { activity ->
+                    activity.orientationPackedSummary()
+                }
+                takeScreenshot("packed-invisible-spacers-page-${sampleIndex + 1}.png")
+                dumpHierarchy("packed-invisible-spacers-page-${sampleIndex + 1}.xml")
+            }
+
+            val sampleFragmentCounts = samples.map { sample ->
+                fragments.count { fragment -> sample.pageText.contains(fragment) }
+            }
+            writeTextEvidence(
+                "packed-invisible-spacers-summary.txt",
+                buildString {
+                    appendLine("fragment_count=${fragments.size}")
+                    appendLine("invisible_spacer_shape_count=${invisibleSpacers.size}")
+                    appendLine("max_packed_page_budget=$maxPackedPageBudget")
+                    appendLine("page_count=${samples.first().itemCount}")
+                    samples.forEachIndexed { index, sample ->
+                        appendLine("sample_${index}_current_item=${sample.currentItem}")
+                        appendLine("sample_${index}_page_progress=${sample.pageProgress}")
+                        appendLine("sample_${index}_fragment_count=${sampleFragmentCounts[index]}")
+                        appendLine("sample_${index}_page_text=${sample.pageText}")
+                    }
+                },
+            )
+
+            assertEquals(0, samples.first().currentItem)
+            assertTrue("expected multiple sampled invisible-spacer pages", samples.size >= 2)
+            assertTrue(
+                "expected invisible spacer page count to stay well below one page per tiny fragment",
+                samples.first().itemCount in 1..maxPackedPageBudget,
+            )
+            assertTrue(
+                "expected sampled invisible-spacer pages to never be visually blank",
+                samples.all { sample -> sample.pageText.isNotBlank() },
+            )
+            assertTrue(
+                "expected every sampled invisible-spacer page to contain multiple real CJK fragments",
+                sampleFragmentCounts.all { count -> count >= 2 },
+            )
+        }
+    }
+
+    @Test
     fun epubPagedPacksNoisyExportedCjkBlocksRuntime() {
         val title = "page05-export-noise-${UUID.randomUUID().toString().take(8)}"
         val heading = "导出版混排压力"

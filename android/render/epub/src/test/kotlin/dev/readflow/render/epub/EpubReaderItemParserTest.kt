@@ -175,6 +175,30 @@ class EpubReaderItemParserTest {
     }
 
     @Test
+    fun `invisible spacer paragraphs are ignored`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <p>&nbsp;</p>
+                  <p>　</p>
+                  <p>&#8203;</p>
+                  <p>&#65279;</p>
+                  <p>&#8288;</p>
+                  <p>&#8204;&#8205;</p>
+                  <p>第一句很短。</p>
+                  <p><span>&nbsp;&#8203;&#65279;&#8288;</span></p>
+                  <p>第二句也短。</p>
+                </body></html>
+            """.trimIndent(),
+        )
+
+        assertEquals(2, items.size)
+        assertEquals("第一句很短。", assertInstanceOf(EpubReaderItem.Text::class.java, items[0]).text)
+        assertEquals("第二句也短。", assertInstanceOf(EpubReaderItem.Text::class.java, items[1]).text)
+    }
+
+    @Test
     fun `text and heading reader items can feed existing paragraph renderer`() {
         val paras = epubParasFromReaderItems(
             listOf(

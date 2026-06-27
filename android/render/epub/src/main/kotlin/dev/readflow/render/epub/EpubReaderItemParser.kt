@@ -372,9 +372,9 @@ private fun trimTextWithRanges(
     links: List<EpubTextLink>,
     styleSpans: List<EpubTextStyleSpan>,
 ): TextWithLinks {
-    val first = rawText.indexOfFirst { !it.isWhitespace() }
+    val first = rawText.indexOfFirst { !it.isEpubReaderSpacerChar() }
     if (first < 0) return TextWithLinks("", emptyList(), emptyList())
-    val endExclusive = rawText.indexOfLast { !it.isWhitespace() } + 1
+    val endExclusive = rawText.indexOfLast { !it.isEpubReaderSpacerChar() } + 1
     val text = rawText.substring(first, endExclusive)
     return TextWithLinks(
         text = text,
@@ -406,6 +406,20 @@ private fun EpubTextStyleSpan.trimmed(first: Int, endExclusive: Int): EpubTextSt
     if (clippedStart >= clippedEnd) return null
     return copy(start = clippedStart - first, end = clippedEnd - first)
 }
+
+private fun Char.isEpubReaderSpacerChar(): Boolean =
+    Character.isWhitespace(this) ||
+        Character.isSpaceChar(this) ||
+        this in EPUB_INVISIBLE_SPACER_CHARS
+
+private val EPUB_INVISIBLE_SPACER_CHARS = setOf(
+    '\u180E', // Mongolian vowel separator, used as an invisible spacer in older generated EPUBs.
+    '\u200B', // Zero-width space.
+    '\u200C', // Zero-width non-joiner.
+    '\u200D', // Zero-width joiner.
+    '\u2060', // Word joiner.
+    '\uFEFF', // BOM / zero-width no-break space.
+)
 
 private fun tableText(table: Element): String {
     val rows = table.select("tr").mapNotNull { row ->
