@@ -11,10 +11,10 @@ claiming a quality or performance difference.
 
 | Area | LinReads | Moon+ Reader Pro |
 | --- | --- | --- |
-| App artifact | `dev-latest` is currently `Dev build #123`; the product fix under comparison is commit `956e93f` and was release-black-boxed as `Dev build #122`. | Local artifact exists as `moonreader-pro.apk`; manifest package is `com.flyersoft.moonreaderp`. |
+| App artifact | `dev-latest` is currently `Dev build #124`; the shared-corpus release rerun uses commit `6fa6d2b` / APK SHA-256 `29fa2db2e576e0ed98b0a25d989d9263f78bbc6758f5b43e20f18d4dbdfb6cd7`. | Local artifact exists as `moonreader-pro.apk`; manifest package is `com.flyersoft.moonreaderp`. |
 | Shared file entry | LinReads `ACTION_VIEW` / `ACTION_SEND` is implemented and has repo-owned AVD ContentProvider smoke evidence, but real file-manager/share-sheet evidence is still missing. | `moonreader-unpacked/AndroidManifest.xml` exposes `ActivityMain` with `ACTION_VIEW` for `text/*`, `application/pdf`, `application/epub+zip`, `application/x-mobipocket-ebook`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `application/x-chm`, `application/x-cbz`, and broad `file` / `content` path patterns. |
 | Reader engine reference | LinReads current high-risk evidence is `PAGE-05` EPUB paged mode, `A-02` performance proxy, `A-03` accessibility proxy, SAF, and Calibre fake-server smoke. | Decompiled reference shows `ActivityTxt` is the reader activity, `MRTextView` is the custom text layout surface, `A.setLineSpace()` maps global line spacing into `MRTextView.setLineSpacing()`, and `PDFReader` is a separate `FrameLayout` path. |
-| Black-box status | Shared-corpus AVD shell `ACTION_VIEW` partial run exists on the installed local debug/current-HEAD app (`25ba892`), covering EPUB/TXT/PDF cold open and PDF page-turn. Prior release black-box evidence still exists for the invisible-spacer EPUB on `Dev build #122`. | Shared-corpus AVD shell `ACTION_VIEW` partial run exists on local `moonreader-pro.apk`, covering EPUB/TXT open, EPUB page taps, and a PDF crash. |
+| Black-box status | Shared-corpus AVD shell `ACTION_VIEW` release rerun exists on `Dev build #124`, covering EPUB/TXT/PDF cold open, LinReads EPUB paged sampling, and PDF page-turn. A separate debug/test APK instrumentation rerun covers A-02/A-03/SAF/Calibre simulation only. | Shared-corpus AVD shell `ACTION_VIEW` partial run exists on local `moonreader-pro.apk`, covering EPUB/TXT open, EPUB page taps, and a PDF crash. |
 
 Evidence anchors already inspected:
 
@@ -24,6 +24,7 @@ Evidence anchors already inspected:
 - `moonreader-decompiled/sources/com/flyersoft/books/PDFReader.java`: separate PDF/CBZ/DJVU layout holder.
 - `/tmp/readflow-stage-verify-20260627-dev122/staged-verification-summary.md`: current LinReads staged AVD evidence.
 - `/tmp/readflow-moonreader-linreads-compare-20260627/`: shared-corpus AVD partial comparison evidence from `emulator-5554`.
+- `/tmp/readflow-dev124-release-compare-20260627/`: LinReads `Dev build #124` shared-corpus AVD release rerun plus debug/test APK staged simulation evidence.
 
 ## Shared Corpus
 
@@ -156,6 +157,31 @@ speech, or production performance evidence.
 | PDF cold open | `content://media/external/file/462`, `application/pdf`, reached `MainActivity` with `TotalTime=2021ms`. Screenshot showed `RFMR PDF PAGE 001`; XML exposed `阅读内容，捏合缩放页面` and page content description `第 1 页，共 20 页`. PSS `170151KB`; gfx p90/p95 `450/600ms`; no app-level fatal/ANR/OOM/recycled-bitmap grep hit. |
 | PDF page-turn | Three left swipes advanced from page 1 to page 4; contact sheet showed `RFMR-PDF-001`, `002`, `003`, and `004` pages. After page sampling, XML exposed `第 4 页，共 20 页`, PSS `168642KB`, gfx p90/p95 `113/121ms`, and no app-level fatal/ANR/OOM/recycled-bitmap grep hit. |
 
+## LinReads Dev Build #124 AVD Release Follow-up
+
+Run date: 2026-06-27. Device: `emulator-5554`, Android 16 / API 36,
+tablet-like override `1600x2560` and density `320`. Release artifact:
+`Dev build #124`, APK SHA-256
+`29fa2db2e576e0ed98b0a25d989d9263f78bbc6758f5b43e20f18d4dbdfb6cd7`.
+Fresh MediaStore URIs were EPUB `content://media/external/file/466`, TXT
+`467`, and PDF `468`. Evidence root:
+`/tmp/readflow-dev124-release-compare-20260627/`.
+
+| Scenario | Evidence |
+| --- | --- |
+| EPUB release cold open | Clear-data `ACTION_VIEW` reached `MainActivity` with `TotalTime=1064ms` / `WaitTime=1069ms`; XML exposed `RFMR Chapter 1 Invisible Spacer Stress`, `RFMR-CJK-001..027`, and reader surface `阅读内容，捏合调整字号`; `blocked_dialog=False`; PSS `65183KB`. |
+| EPUB release paged sampling | After visible `排版 -> 分页`, page 0 was the chapter title, pages 1-3 packed CJK micro paragraphs as `20/20/8`, page 4 was the next chapter title, and pages 5-25 covered `RFMR-MIX-001..053`. Some `pre` blocks were isolated as one content block per page, but the sampled CJK micro paragraphs did not regress to one sentence per page. After page sampling PSS was `56643KB`, gfx p90/p95 `97/105ms`; app-fatal/ANR/OOM/recycled-bitmap grep did not hit. |
+| TXT release cold open | Clear-data `ACTION_VIEW` reached `MainActivity` with `TotalTime=904ms` / `WaitTime=916ms`; XML exposed `RFMR-TXT-000001..000028`, reader surface was present, and `blocked_dialog=False`. PSS `60306KB`; gfx p90/p95 `450/450ms`; filtered critical log only contained emulator/GMS noise, not a `dev.readflow` fatal. |
+| PDF release cold open/page-turn | Clear-data `ACTION_VIEW` reached `MainActivity` with `TotalTime=1223ms` / `WaitTime=1226ms`; XML exposed `阅读内容，捏合缩放页面` and `第 1 页，共 20 页`. Three left swipes advanced to `第 4 页，共 20 页`. First-page PSS `90979KB`, after-page PSS `96976KB`, first-window gfx p90/p95 `300/350ms`, after-page gfx p90/p95 `133/150ms`; filtered critical log did not hit app fatal/ANR/OOM/recycled-bitmap. |
+
+Same-run staged simulation, after installing the local debug/test APK, covered
+current VERIFY/PARTIAL proxies only:
+
+- `A02PerformanceRuntimeSmokeTest` = `OK (1 test)`: TXT/EPUB/PDF first-paint proxy `8514/9999/6799ms`, total PSS `225492/252237/303295KB`, PDF gfx p90 `200ms`; boundary remains AVD instrumentation noise, not a real-device benchmark.
+- `A03AccessibilityRuntimeSmokeTest` single rerun = `OK (1 test)`: library card/menu, reader surface action, chrome, TOC/search/bookmark/annotation/font/theme labels; TalkBack settings remained `null/0/0`, so this is XML/action proxy evidence, not human TalkBack speech.
+- `BackupSafUiRuntimeSmokeTest` single rerun = `OK (1 test)`: `ACTION_CREATE_DOCUMENT` / `ACTION_OPEN_DOCUMENT` monitors, schema v1 ZIP, restore of progress/bookmark/annotation; still test ContentProvider/ActivityMonitor, not real DocumentsUI.
+- `CalibreGroupedRuntimeSmokeTest` = `OK (2 tests)` and `CalibreDownloadFailureRuntimeSmokeTest` rerun = `OK (1 test)` via `127.0.0.1:18181` + `adb reverse`: explicit URL, cover/download events, offline open, remove download, and failure cleanup all passed. The first failure run was explained by grouped smoke intentionally shutting down the fake server before failure smoke started.
+
 ## Moon+ Reader Expected Strengths And Risks To Measure
 
 These are hypotheses derived from local decompiled evidence, not black-box
@@ -175,34 +201,33 @@ Fill this only with evidence from the exact shared corpus.
 
 | Scenario | LinReads raw result | LinReads score | Moon+ raw result | Moon+ score | Winner / note |
 | --- | --- | ---: | --- | ---: | --- |
-| S1 EPUB cold open | Local debug/current HEAD: clear-data `content://` cold open `TotalTime=1979ms`; first XML exposes title and `RFMR-CJK-001..027`; PSS `146899KB`; no app-critical grep hit. | 2 | `file://` failed with EACCES. `content://` cold open reached `ActivityTxt` in `1566ms`, but `ClickTip` + immersive `Got it` blocked first content; after dismiss, screenshot exposed title and `RFMR-CJK-001..005`. | 2 | LinReads has less first-read friction and XML accessibility exposure; Moon+ is faster/lower PSS on this AVD but needs extra dismissals. |
-| S1 TXT cold open | Local debug/current HEAD: `TotalTime=2593ms`; XML/screenshot expose `RFMR-TXT-000001..000028`; PSS `137682KB`; no app-critical grep hit. | 2 | `TotalTime=1579ms`; screenshot exposes `RFMR-TXT-000001..000020`; PSS `64820KB`; `WindowLeaked` appears but no observed app death. | 2 | Moon+ wins raw startup/memory; LinReads wins machine-readable accessibility/XML exposure. |
-| S1 PDF cold open | Local debug/current HEAD: `TotalTime=2021ms`; screenshot exposes `RFMR PDF PAGE 001`; XML exposes `第 1 页，共 20 页`; PSS `170151KB`; no app-critical grep hit. | 2 | `TotalTime=1883ms` then app crashes to launcher with `FATAL EXCEPTION: GoldenBoot` / `NullPointerException: println needs a message`; no process left. | 0 | LinReads wins this corpus PDF. |
-| S2 EPUB stress paging | Only default continuous first screen was sampled in this shared-corpus run; XML exposes 27 CJK markers, but same-corpus paged-mode sampling still pending. | - | Ten page taps sampled `RFMR-CJK-001..048` then `RFMR-MIX-001..068`; clean follow-up reached `RFMR-TAIL-001..023`; no blank/one-line sampled page. | 2 | Partial. Moon+ page-turn path sampled; LinReads same-corpus paged path still must be run. |
+| S1 EPUB cold open | Dev build #124 release: clear-data `content://` cold open `TotalTime=1064ms`; first XML exposes title and `RFMR-CJK-001..027`; PSS `65183KB`; no blocking dialog. Earlier local debug run was `1979ms` / PSS `146899KB`. | 2 | `file://` failed with EACCES. `content://` cold open reached `ActivityTxt` in `1566ms`, but `ClickTip` + immersive `Got it` blocked first content; after dismiss, screenshot exposed title and `RFMR-CJK-001..005`. | 2 | LinReads release has less first-read friction and strong XML exposure; Moon+ needs extra dismissals. |
+| S1 TXT cold open | Dev build #124 release: `TotalTime=904ms`; XML exposes `RFMR-TXT-000001..000028`; PSS `60306KB`; no blocking dialog. Earlier local debug run was `2593ms` / PSS `137682KB`. | 2 | `TotalTime=1579ms`; screenshot exposes `RFMR-TXT-000001..000020`; PSS `64820KB`; `WindowLeaked` appears but no observed app death. | 2 | LinReads release wins cold-start in this rerun and exposes text nodes; Moon+ remains lower/noisier memory in the older window but with leak noise. |
+| S1 PDF cold open | Dev build #124 release: `TotalTime=1223ms`; XML exposes `第 1 页，共 20 页`; PSS `90979KB`; no app-fatal grep hit. | 2 | `TotalTime=1883ms` then app crashes to launcher with `FATAL EXCEPTION: GoldenBoot` / `NullPointerException: println needs a message`; no process left. | 0 | LinReads wins this corpus PDF. |
+| S2 EPUB stress paging | Dev build #124 release: visible `排版 -> 分页`; sampled pages 0-25. CJK micro paragraphs packed as `20/20/8`; mixed-style pages reached `RFMR-MIX-053`; no sampled CJK one-sentence-page regression. Some `pre` blocks remain isolated by style. | 2 | Ten page taps sampled `RFMR-CJK-001..048` then `RFMR-MIX-001..068`; clean follow-up reached `RFMR-TAIL-001..023`; no blank/one-line sampled page. | 2 | Partial tie on AVD. Moon+ reached tail markers sooner in its tap window; LinReads release now closes the prior same-corpus paged sampling gap. |
 | S3 low-vision typography | pending shared-corpus run | - | pending | - | pending |
 | S4 mode anchor | pending shared-corpus run | - | pending | - | pending |
 | S5 gestures | pending shared-corpus run | - | pending | - | pending |
-| S6 PDF page-turn | Three left swipes advanced from page 1 to page 4; after sampling XML exposed `第 4 页，共 20 页`, PSS `168642KB`, gfx p90/p95 `113/121ms`, no app-critical grep hit. | 2 | Cannot complete because S1 PDF crashes. | 0 | LinReads wins on this corpus. |
+| S6 PDF page-turn | Dev build #124 release: three left swipes advanced from page 1 to page 4; XML exposed `第 4 页，共 20 页`, after-page PSS `96976KB`, gfx p90/p95 `133/150ms`, no app-fatal grep hit. | 2 | Cannot complete because S1 PDF crashes. | 0 | LinReads wins on this corpus. |
 | S7 search/annotation | pending shared-corpus run | - | pending | - | pending |
 | S8 TalkBack | Not run in this shared-corpus pass. XML proxy is strong for text/PDF page label, but this is not TalkBack speech evidence. | - | Not run in this shared-corpus pass. EPUB/TXT text is visible in screenshots but not exposed as standard text nodes in XML, so TalkBack risk remains unverified. | - | Requires real TalkBack traversal. |
 
 ## Next Execution Steps
 
-1. If release-vs-release comparison is required, install the next LinReads
-   `dev-latest` APK after this documentation/tooling commit is pushed and
-   rerun the shared corpus against that release artifact.
-2. Complete same-corpus S2 paged sampling for LinReads and S3/S4/S5/S7/S8 for
-   both apps on AVD.
-3. Repeat the subset S1/S2/S3/S5/S6/S8 on the physical tablet after it is
+1. Complete same-corpus S3/S4/S5/S7/S8 for both apps on AVD where feasible,
+   keeping debug/test APK instrumentation separate from release black-box data.
+2. Repeat the subset S1/S2/S3/S5/S6/S8 on the physical tablet after it is
    connected.
+3. Run real TalkBack speech/focus traversal and real DocumentsUI/OEM file
+   manager entry on physical devices; keep XML/action proxy evidence separate.
 4. Keep AVD, physical tablet, TalkBack speech, and performance claims separate
    in the result table.
 
 ## Boundary
 
 This document is the comparison protocol and current evidence map. It is not yet
-the final comparison result because the shared-corpus run is only an AVD partial
-pass: LinReads was not release-reinstalled for this pass, S3/S4/S5/S7/S8 remain
-unrun, LinReads same-corpus paged EPUB sampling remains pending, Moon+ PDF
-crashes before page-turn testing, and no physical tablet or real TalkBack speech
-run is recorded.
+the final comparison result because the shared-corpus run is still only an AVD
+partial pass: S3/S4/S5/S7/S8 remain unrun as same-corpus cross-app scenarios,
+Moon+ PDF crashes before page-turn testing, the staged LinReads A-02/A-03/SAF/
+Calibre checks are debug/test APK simulations rather than release or real-device
+proof, and no physical tablet or real TalkBack speech run is recorded.
