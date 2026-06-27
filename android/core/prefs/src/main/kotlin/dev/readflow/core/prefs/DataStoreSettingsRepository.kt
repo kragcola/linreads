@@ -8,9 +8,11 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.TxtEncoding
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flow
@@ -47,6 +49,15 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
 
     override val engineOverrides: Flow<Map<BookFormat, String>> = flowOf(emptyMap())
 
+    override val useSourceHanFont: Flow<Boolean> =
+        context.dataStore.data.map { it[KEY_USE_SOURCE_HAN] ?: true }
+
+    override val txtEncoding: Flow<TxtEncoding> =
+        context.dataStore.data.map {
+            runCatching { TxtEncoding.valueOf(it[KEY_TXT_ENCODING] ?: "AUTO") }
+                .getOrDefault(TxtEncoding.AUTO)
+        }
+
     override suspend fun setCalibreBaseUrl(url: String) {
         context.dataStore.edit { it[KEY_CALIBRE_URL] = url }
     }
@@ -71,6 +82,14 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         // Phase 3: per-format engine override UI
     }
 
+    override suspend fun setUseSourceHanFont(enabled: Boolean) {
+        context.dataStore.edit { it[KEY_USE_SOURCE_HAN] = enabled }
+    }
+
+    override suspend fun setTxtEncoding(encoding: TxtEncoding) {
+        context.dataStore.edit { it[KEY_TXT_ENCODING] = encoding.name }
+    }
+
     private suspend fun readOrCreateDeviceId(): String {
         var value: String? = null
         context.dataStore.edit { preferences ->
@@ -90,5 +109,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_READING_MODE = stringPreferencesKey("reading_mode")
         val KEY_THEME = stringPreferencesKey("theme_mode")
         val KEY_DEVICE_ID = stringPreferencesKey("device_id")
+        val KEY_USE_SOURCE_HAN = booleanPreferencesKey("use_source_han_font")
+        val KEY_TXT_ENCODING = stringPreferencesKey("txt_encoding")
     }
 }

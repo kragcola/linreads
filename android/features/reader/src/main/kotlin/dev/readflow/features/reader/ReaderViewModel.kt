@@ -172,6 +172,11 @@ class ReaderViewModel(
             engine.setFontSize(savedFontSize)
             engine.setLineSpacing(savedLineSpacing)
             engine.setTheme(savedTheme)
+            engine.setSerifFont(settings.useSourceHanFont.first())
+            val txtEnc = settings.txtEncoding.first()
+            if (txtEnc.charsetName != null) {
+                engine.setTxtEncodingOverride(txtEnc.charsetName)
+            }
             val savedReadingMode = (restoredForBook?.readingMode ?: settings.readingMode.first()).toReadingMode()
                 ?.takeIf { it in engine.supportedModes }
             savedReadingMode?.let { mode ->

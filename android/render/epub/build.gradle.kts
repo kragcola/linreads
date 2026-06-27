@@ -22,6 +22,7 @@ android {
 
 dependencies {
     implementation(project(":core:model"))
+    implementation(project(":core:ui"))   // FontProvider (思源宋体加载)
     implementation(project(":render:api"))
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.foundation)

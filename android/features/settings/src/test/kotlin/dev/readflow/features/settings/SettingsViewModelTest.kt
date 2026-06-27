@@ -14,6 +14,7 @@ import dev.readflow.core.database.LinReadsBackupRestoreResult
 import dev.readflow.core.database.LinReadsBackupRestoreStore
 import dev.readflow.core.model.Bookmark
 import dev.readflow.core.model.ReaderReadingMode
+import dev.readflow.core.model.TxtEncoding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -320,6 +321,8 @@ class SettingsViewModelTest {
         override val themeMode = MutableStateFlow(ThemeMode.SYSTEM)
         override val deviceId = MutableStateFlow("device")
         override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
+        override val useSourceHanFont = MutableStateFlow(true)
+        override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         var savedCalibreUrl: String? = null
 
         override suspend fun setCalibreBaseUrl(url: String) {
@@ -349,6 +352,14 @@ class SettingsViewModelTest {
             } else {
                 engineOverrides.value + (format to engineId)
             }
+        }
+
+        override suspend fun setUseSourceHanFont(enabled: Boolean) {
+            useSourceHanFont.value = enabled
+        }
+
+        override suspend fun setTxtEncoding(encoding: TxtEncoding) {
+            txtEncoding.value = encoding
         }
     }
 

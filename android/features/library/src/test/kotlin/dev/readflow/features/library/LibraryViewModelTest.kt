@@ -9,6 +9,7 @@ import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.model.ReaderReadingMode
+import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.extensions.api.LocalBookImporter
@@ -187,6 +188,8 @@ class LibraryViewModelTest {
         override val themeMode = MutableStateFlow(ThemeMode.SYSTEM)
         override val deviceId = MutableStateFlow("device")
         override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
+        override val useSourceHanFont = MutableStateFlow(true)
+        override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         override suspend fun setCalibreBaseUrl(url: String) {
             calibreBaseUrl.value = url
         }
@@ -195,6 +198,8 @@ class LibraryViewModelTest {
         override suspend fun setReadingMode(mode: ReaderReadingMode) = Unit
         override suspend fun setThemeMode(mode: ThemeMode) = Unit
         override suspend fun setEngineOverride(format: BookFormat, engineId: String?) = Unit
+        override suspend fun setUseSourceHanFont(enabled: Boolean) = Unit
+        override suspend fun setTxtEncoding(encoding: TxtEncoding) = Unit
     }
 
     private class FakeCalibreRepository(

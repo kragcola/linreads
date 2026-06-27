@@ -10,6 +10,8 @@ import dev.readflow.core.calibre.validateCalibreBaseUrl
 import dev.readflow.core.database.LinReadsBackupExportStore
 import dev.readflow.core.database.LinReadsBackupRestoreStore
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.ReaderReadingMode
+import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.SyncBackend
 import java.io.InputStream
@@ -69,6 +71,18 @@ class SettingsViewModel(
 
     val themeMode = settings.themeMode
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ThemeMode.SYSTEM)
+
+    val lineSpacing = settings.lineSpacing
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 1.75f)
+
+    val readingMode = settings.readingMode
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ReaderReadingMode.SCROLL)
+
+    val useSourceHanFont = settings.useSourceHanFont
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), true)
+
+    val txtEncoding = settings.txtEncoding
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TxtEncoding.AUTO)
 
     private val _calibreUrlError = MutableStateFlow<String?>(null)
     val calibreUrlError: StateFlow<String?> = _calibreUrlError.asStateFlow()
@@ -201,6 +215,10 @@ class SettingsViewModel(
 
     fun setFontSize(size: Int) { viewModelScope.launch { settings.setFontSize(size) } }
     fun setTheme(mode: ThemeMode) { viewModelScope.launch { settings.setThemeMode(mode) } }
+    fun setLineSpacing(multiplier: Float) { viewModelScope.launch { settings.setLineSpacing(multiplier) } }
+    fun setReadingMode(mode: ReaderReadingMode) { viewModelScope.launch { settings.setReadingMode(mode) } }
+    fun setUseSourceHanFont(enabled: Boolean) { viewModelScope.launch { settings.setUseSourceHanFont(enabled) } }
+    fun setTxtEncoding(encoding: TxtEncoding) { viewModelScope.launch { settings.setTxtEncoding(encoding) } }
 }
 
 private fun String.removeProtocol(): String =

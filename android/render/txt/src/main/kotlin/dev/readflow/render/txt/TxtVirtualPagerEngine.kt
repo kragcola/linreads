@@ -76,7 +76,10 @@ class TxtVirtualPagerEngine(
     private var pendingEngineState: ByteArray? = null
     private var fontSizeSp: Float = 18f
     private var lineSpacingMultiplier: Float = 1.75f
+    private var useSourceHan: Boolean = true
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
+    private var encodingOverride: String? = null
+    private var currentUri: Uri? = null
     private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
     private var recyclerView: RecyclerView? = null
     private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
@@ -87,15 +90,26 @@ class TxtVirtualPagerEngine(
     override suspend fun supports(uri: Uri): Boolean = true
 
     override suspend fun openBook(uri: Uri): Locator = withContext(Dispatchers.IO) {
+        currentUri = uri
         txtDocument?.close()
         pendingProgrammaticScroll = null
         val requiresFingerprint = pendingEngineState != null
         val copied = resolveReadableFile(uri, requiresFingerprint)
+        val overrideDetection = encodingOverride?.let { name ->
+            runCatching { java.nio.charset.Charset.forName(name) }.getOrNull()
+        }?.let { cs ->
+            TxtCharsetDetection(
+                charset = cs,
+                source = TxtCharsetDetectionSource.Fallback,
+                fallbackReason = "user-override"
+            )
+        }
         val document = TxtDocument.index(
             file = copied.file,
             deleteOnClose = copied.deleteOnClose,
             fingerprint = copied.fingerprint,
             cachedEngineState = pendingEngineState,
+            charsetDetection = overrideDetection,
         )
         pendingEngineState = null
         txtDocument = document
@@ -118,6 +132,7 @@ class TxtVirtualPagerEngine(
                 inkColor = palette.ink,
                 highlightRangesProvider = ::highlightRangesForParagraph,
                 onSelectionChanged = ::updateTextSelection,
+                typeface = resolveTypeface(),
             )
             setBackgroundColor(palette.paper)
             clipToPadding = false
@@ -312,6 +327,23 @@ class TxtVirtualPagerEngine(
         fontSizeSp = sp
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateFontSize(sp)
         activePageTextViews.forEach { it.applyTextStyle() }
+    }
+
+    override suspend fun setSerifFont(useSourceHan: Boolean) {
+        this.useSourceHan = useSourceHan
+        withContext(Dispatchers.Main) {
+            (recyclerView?.adapter as? TxtParagraphAdapter)?.updateTypeface(resolveTypeface())
+        }
+    }
+
+    private fun resolveTypeface(): Typeface =
+        if (useSourceHan) dev.readflow.core.ui.FontProvider.sourceHanSerif(context)
+        else Typeface.SERIF
+
+    override suspend fun setTxtEncodingOverride(charsetName: String?) {
+        encodingOverride = charsetName
+        val uri = currentUri ?: return
+        openBook(uri)
     }
 
     override suspend fun setLineSpacing(multiplier: Float) {

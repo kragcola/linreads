@@ -180,6 +180,7 @@ class EpubReflowEngine private constructor(
     private var chapterBoundaries: List<ChapterBoundary> = emptyList()
     private var fontSizeSp: Float = 18f
     private var lineSpacingMultiplier: Float = 1.75f
+    private var useSourceHan: Boolean = true
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
     private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
     private var recyclerView: RecyclerView? = null
@@ -788,6 +789,15 @@ class EpubReflowEngine private constructor(
         activePagedImagePages.keys.toList().forEach(::rebindActiveImagePage)
     }
 
+    override suspend fun setSerifFont(useSourceHan: Boolean) {
+        this.useSourceHan = useSourceHan
+        // Rebind active Compose text pages to pick up new fontFamily
+        withContext(Dispatchers.Main) {
+            activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
+        }
+        (recyclerView?.adapter as? EpubParaAdapter)?.notifyDataSetChanged()
+    }
+
     override suspend fun setTheme(mode: ThemeMode) {
         themeMode = mode
         val palette = paletteFor(mode, context.resources.configuration)
@@ -929,6 +939,7 @@ class EpubReflowEngine private constructor(
             lineHeight = (fontSizeSp * lineSpacingMultiplier).sp,
             fontFamily = when {
                 style.kind == EpubTextKind.Preformatted || style.kind == EpubTextKind.Table -> FontFamily.Monospace
+                useSourceHan -> dev.readflow.core.ui.FontProvider.sourceHanSerifFamily(context)
                 else -> FontFamily.Serif
             },
             fontWeight = if (style.headingLevel != null) FontWeight.Bold else FontWeight.Normal,
@@ -987,6 +998,7 @@ class EpubReflowEngine private constructor(
             typeface = when {
                 style.kind == EpubTextKind.Preformatted || style.kind == EpubTextKind.Table -> Typeface.MONOSPACE
                 style.headingLevel != null -> Typeface.DEFAULT_BOLD
+                useSourceHan -> dev.readflow.core.ui.FontProvider.sourceHanSerif(context)
                 else -> Typeface.SERIF
             }
         }

@@ -69,6 +69,10 @@ interface ReaderEngine {
     // Layout control (reflow formats)
     suspend fun setFontSize(sp: Float)
     suspend fun setLineSpacing(multiplier: Float) {}
+    /** 切换正文字体：true=内置思源宋体，false=系统 Serif。默认空实现。 */
+    suspend fun setSerifFont(useSourceHan: Boolean) {}
+    /** TXT 用户编码覆盖：传 charset 名强制重解码，null=沿用自动检测。默认空实现，仅 TXT 引擎实现。 */
+    suspend fun setTxtEncodingOverride(charsetName: String?) {}
     suspend fun setTheme(mode: ThemeMode) {}
     suspend fun setMode(mode: ReadingMode)
 

@@ -23,8 +23,9 @@ class TxtParagraphAdapter(
     private var fontSizeSp: Float,
     private var lineSpacingMultiplier: Float,
     private var inkColor: Int = INK_DAY,
-    private val highlightRangesProvider: (paragraphIndex: Int) -> List<ReaderTextHighlightRange> = { emptyList() },
-    private val onSelectionChanged: (paragraphIndex: Int, start: Int, end: Int) -> Unit = { _, _, _ -> },
+    private var highlightRangesProvider: (paragraphIndex: Int) -> List<ReaderTextHighlightRange> = { emptyList() },
+    private var onSelectionChanged: (paragraphIndex: Int, start: Int, end: Int) -> Unit = { _, _, _ -> },
+    private var typeface: Typeface = Typeface.SERIF,
 ) : RecyclerView.Adapter<TxtParagraphAdapter.ParagraphHolder>() {
 
     class ParagraphHolder(val container: FrameLayout, val textView: SelectionAwareTextView) :
@@ -46,7 +47,7 @@ class TxtParagraphAdapter(
             setLineSpacing(0f, lineSpacingMultiplier)
             gravity = Gravity.START
             setTextColor(inkColor)
-            typeface = Typeface.SERIF
+            typeface = this@TxtParagraphAdapter.typeface
             setTextIsSelectable(true)
         }
         val container = FrameLayout(parent.context).apply {
@@ -63,6 +64,7 @@ class TxtParagraphAdapter(
         holder.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
         holder.textView.setLineSpacing(0f, lineSpacingMultiplier)
         holder.textView.setTextColor(inkColor)
+        holder.textView.typeface = typeface
         holder.textView.text = paragraphProvider(position)
             .withTextHighlightSpans(highlightRangesProvider(position))
         holder.textView.onSelectionRangeChanged = { start, end ->
@@ -84,6 +86,11 @@ class TxtParagraphAdapter(
 
     fun updateInkColor(color: Int) {
         inkColor = color
+        notifyDataSetChanged()
+    }
+
+    fun updateTypeface(tf: Typeface) {
+        typeface = tf
         notifyDataSetChanged()
     }
 

@@ -23,6 +23,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.ReaderReadingMode
+import dev.readflow.core.model.TxtEncoding
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.koin.androidx.compose.koinViewModel
@@ -42,6 +44,10 @@ fun SettingsScreen(
     val connectionState by vm.calibreConnectionState.collectAsStateWithLifecycle()
     val fontSize by vm.fontSize.collectAsStateWithLifecycle()
     val theme by vm.themeMode.collectAsStateWithLifecycle()
+    val lineSpacing by vm.lineSpacing.collectAsStateWithLifecycle()
+    val readingMode by vm.readingMode.collectAsStateWithLifecycle()
+    val useSourceHanFont by vm.useSourceHanFont.collectAsStateWithLifecycle()
+    val txtEncoding by vm.txtEncoding.collectAsStateWithLifecycle()
     val syncStatus by vm.syncStatus.collectAsStateWithLifecycle()
     val backupExportState by vm.backupExportState.collectAsStateWithLifecycle()
     val backupRestoreState by vm.backupRestoreState.collectAsStateWithLifecycle()
@@ -181,6 +187,34 @@ fun SettingsScreen(
                 valueRange = 12f..28f, steps = 7, modifier = Modifier.fillMaxWidth())
             Text("这是 ${fontSize}sp 的正文效果。The quick brown fox.",
                 fontSize = fontSize.sp, color = MaterialTheme.colorScheme.onBackground)
+
+            Text("行距：${"%.2f".format(lineSpacing)}x", style = MaterialTheme.typography.bodyMedium)
+            Slider(value = lineSpacing, onValueChange = { vm.setLineSpacing(it) },
+                valueRange = 1.2f..2.2f, steps = 4, modifier = Modifier.fillMaxWidth())
+
+            Text("阅读模式", style = MaterialTheme.typography.bodyMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ReaderReadingMode.entries.forEach { mode ->
+                    FilterChip(selected = readingMode == mode, onClick = { vm.setReadingMode(mode) },
+                        label = { Text(mode.label()) })
+                }
+            }
+
+            Text("正文字体", style = MaterialTheme.typography.bodyMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = useSourceHanFont, onClick = { vm.setUseSourceHanFont(true) },
+                    label = { Text("思源宋体（内置）") })
+                FilterChip(selected = !useSourceHanFont, onClick = { vm.setUseSourceHanFont(false) },
+                    label = { Text("系统宋体") })
+            }
+
+            Text("TXT 编码", style = MaterialTheme.typography.bodyMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TxtEncoding.entries.forEach { enc ->
+                    FilterChip(selected = txtEncoding == enc, onClick = { vm.setTxtEncoding(enc) },
+                        label = { Text(enc.label()) })
+                }
+            }
 
             Text("主题", style = MaterialTheme.typography.bodyMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -469,4 +503,18 @@ private fun ThemeMode.label() = when (this) {
     ThemeMode.LIGHT  -> "日间"
     ThemeMode.DARK   -> "夜间"
     ThemeMode.SEPIA  -> "护眼"
+}
+
+private fun ReaderReadingMode.label() = when (this) {
+    ReaderReadingMode.SCROLL -> "滚动"
+    ReaderReadingMode.PAGED -> "翻页"
+}
+
+private fun TxtEncoding.label() = when (this) {
+    TxtEncoding.AUTO -> "自动"
+    TxtEncoding.UTF_8 -> "UTF-8"
+    TxtEncoding.GBK -> "GBK"
+    TxtEncoding.GB18030 -> "GB18030"
+    TxtEncoding.BIG5 -> "Big5"
+    TxtEncoding.SHIFT_JIS -> "Shift_JIS"
 }
