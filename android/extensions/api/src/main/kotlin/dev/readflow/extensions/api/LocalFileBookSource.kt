@@ -12,7 +12,7 @@ import dev.readflow.core.model.ReadflowResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.UUID
+import java.security.MessageDigest
 
 /**
  * Local file book source (Phase 1 基建闭环 §11). Imports a file from SAF/Intent Uri
@@ -76,14 +76,28 @@ class LocalFileBookSource(
                 val fileName = if (rawExt.isBlank()) "$rawFileName.$ext" else rawFileName
 
                 val booksDir = File(context.filesDir, "books").apply { mkdirs() }
-                val id = UUID.randomUUID().toString()
-                val outFile = File(booksDir, "$id.$ext")
+                val stagingFile = File.createTempFile("incoming-", ".$ext", booksDir)
+                val digest = MessageDigest.getInstance("SHA-256")
 
                 context.contentResolver.openInputStream(uri)?.use { input ->
-                    outFile.outputStream().use { input.copyTo(it) }
+                    stagingFile.outputStream().use { output ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            output.write(buffer, 0, read)
+                            digest.update(buffer, 0, read)
+                        }
+                    }
                 } ?: return@withContext ReadflowResult.Failure(
                     ReadflowError.io("无法读取文件"),
                 )
+                val id = localBookIdForDigest(ext, digest.digest())
+                val outFile = File(booksDir, "$id.$ext")
+                if (!stagingFile.renameTo(outFile)) {
+                    stagingFile.copyTo(outFile, overwrite = true)
+                    stagingFile.delete()
+                }
 
                 val title = fileName.substringBeforeLast('.')
                 val coverUri = CoverExtractor.extract(context, outFile, format, id)
@@ -122,4 +136,7 @@ class LocalFileBookSource(
             "application/pdf" -> "pdf"
             else -> null
         }
+
+    private fun localBookIdForDigest(ext: String, digest: ByteArray): String =
+        "local-${ext.lowercase()}-" + digest.joinToString(separator = "") { byte -> "%02x".format(byte) }.take(32)
 }

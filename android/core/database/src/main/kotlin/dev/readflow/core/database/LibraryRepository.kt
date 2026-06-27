@@ -32,7 +32,9 @@ class LibraryRepository(
 
     override suspend fun count(): Int = bookDao.count()
     override suspend fun upsertBook(book: BookMeta) {
-        bookDao.upsert(book.toEntity())
+        val existing = bookDao.getById(book.id)
+        val entity = book.toEntity().preserveShelfStateFrom(existing)
+        bookDao.upsert(entity)
         trimCacheIfDownloadedRemote(book)
     }
 
@@ -92,3 +94,16 @@ private fun BookMeta.toEntity() = BookEntity(
     downloadStatus = downloadStatus.name, localUri = localUri, lastReadAt = lastReadAt,
     collectionName = collectionName,
 )
+
+private fun BookEntity.preserveShelfStateFrom(existing: BookEntity?): BookEntity =
+    if (existing == null || !id.startsWith("local-")) {
+        this
+    } else {
+        copy(
+            title = existing.title,
+            author = existing.author,
+            lastReadAt = existing.lastReadAt,
+            collectionName = existing.collectionName,
+            sortOrder = existing.sortOrder,
+        )
+    }

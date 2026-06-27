@@ -154,6 +154,40 @@ class A01IncomingBookRuntimeSmokeTest {
         assertTrue(results.all { it.localUri.startsWith("file:") })
     }
 
+    @Test
+    fun repeatedActionViewOfSameExternalFileReusesStableOfflineBookRow() {
+        val fileName = uniqueFileName("a01-stable-reopen", "txt")
+        val case = IncomingCase(
+            action = Intent.ACTION_VIEW,
+            fileName = fileName,
+            mimeType = "text/plain",
+            format = BookFormat.TXT,
+            expectedReaderText = TXT_SENTINEL,
+        )
+
+        val first = runIncomingCase(case)
+        device.pressHome()
+        device.waitForIdle()
+        val second = runIncomingCase(case)
+        val rows = booksByTitle(first.title)
+
+        writeTextEvidence(
+            "a01-stable-reopen-summary.txt",
+            buildString {
+                appendLine("title=${first.title}")
+                appendLine("first_book_id=${first.bookId}")
+                appendLine("second_book_id=${second.bookId}")
+                appendLine("first_local_uri=${first.localUri}")
+                appendLine("second_local_uri=${second.localUri}")
+                appendLine("matching_rows=${rows.size}")
+            },
+        )
+
+        assertEquals(first.bookId, second.bookId)
+        assertEquals(first.localUri, second.localUri)
+        assertEquals(1, rows.size)
+    }
+
     private fun runIncomingCase(case: IncomingCase): IncomingResult {
         val uri = externalBookUri(case.fileName)
         val title = case.fileName.substringBeforeLast('.')
@@ -243,12 +277,16 @@ class A01IncomingBookRuntimeSmokeTest {
         }
 
     private fun latestBookByTitle(title: String): BookEntity? {
+        return booksByTitle(title).lastOrNull()
+    }
+
+    private fun booksByTitle(title: String): List<BookEntity> {
         val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
             .allowMainThreadQueries()
             .build()
         return try {
             runBlocking {
-                db.bookDao().observeAll().first().lastOrNull { it.title == title }
+                db.bookDao().observeAll().first().filter { it.title == title }
             }
         } finally {
             db.close()

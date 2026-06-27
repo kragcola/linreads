@@ -26,7 +26,8 @@ online hardware evidence is still only `emulator-5554`
 | S6 PDF | LinReads release opened generated PDF and swiped from page 1 to page 4; MoonReader crashed on same PDF. | LinReads wins this corpus PDF route. MoonReader PDF must be rechecked on real device and broader PDFs before making a product-wide PDF claim. |
 | S7 search / TOC / bookmark / annotation | LinReads proved TOC and bookmark UI/add/list reachability; MoonReader proved search dialog reachability. | S7 remains the thinnest comparison: neither app has a same-corpus black-box proof for search-result jump plus selection/highlight/note persistence. |
 | S8 accessibility proxy | AVD TalkBack settings toggled for both apps; XML snapshots captured reader/chrome/panel nodes. | LinReads exposes body text nodes and reader controls better in XML. MoonReader exposes mostly status/resource IDs. Neither result is human TalkBack speech/focus traversal. |
-| Simulated VERIFY/PARTIAL items | LinReads A-02/A-03/SAF/Calibre staged smokes ran on debug/test APK with fake server, ActivityMonitor, and AVD instrumentation. | Useful regression proxy only. Do not mix with release black-box or real tablet performance/SAF/Calibre claims. |
+| Offline polish from comparison | LinReads local import now uses stable content-derived IDs instead of random UUIDs, and repeated stable local upserts preserve existing shelf state; focused JVM test and AVD A01 repeated `ACTION_VIEW` smoke pass. | This directly addresses the likely root cause of same-file external reopen losing the prior `bookId`; physical-device proof is intentionally deferred. |
+| Simulated VERIFY/PARTIAL items | LinReads A-02/A-03/SAF staged smokes ran on debug/test APK with ActivityMonitor and AVD instrumentation. | Useful regression proxy only. Online/Calibre content is intentionally out of scope for the current offline polish pass. |
 
 ## Improvement And Follow-up Backlog
 
@@ -37,14 +38,38 @@ real-device quality verdict rather than an AVD-stage report.
 | --- | --- | --- | --- |
 | P0 | Real tablet rerun for S1-S6/S8 | Physical tablet screenshots/video notes, logcat, real touch route, and same corpus through system file manager / DocumentsUI. | Missing because no physical tablet was connected during these runs. |
 | P0 | S7 deep proof | For both apps: search a known RFMR marker, tap a concrete result row, prove marker jump, add bookmark, force-stop/reopen, prove bookmark persists, create highlight/note if supported, reopen and prove persistence. | Current ADB run only proved UI reachability. LinReads likely needs result-row tapping after `执行搜索`; MoonReader body XML exposure may force screenshot/video evidence. |
-| P0 | LinReads same-file reopen anchor | Reproduce S4 on current `dev-latest` and physical tablet through library open and file-manager open; inspect whether the shell `ACTION_VIEW` route bypasses stored locator or whether persistence is genuinely weak for external files. | AVD route returned to book start after forced-stop, while immediate mode-switch anchor was fine. |
+| P0 | LinReads same-file reopen anchor | Re-run S4 on current `dev-latest` after stable local import IDs, then later repeat on physical tablet through library open and file-manager open. | Root cause candidate fixed: local imports no longer create a new random `bookId` for the same bytes. Evidence: `LocalFileBookSourceTest` and AVD `A01IncomingBookRuntimeSmokeTest#repeatedActionViewOfSameExternalFileReusesStableOfflineBookRow`. |
 | P1 | Human TalkBack traversal | Record actual spoken/focused order for library card, reader surface, chrome, TOC/search/bookmark/annotation panels, and body reading. | XML proxy favors LinReads, but speech/focus remains unverified. |
 | P1 | Real performance benchmark | Release APK on physical tablet/phone with stable thermal state: cold open, PSS, frame pacing for EPUB/TXT/PDF, and low-vision page turns. | Current A-02 values are noisy AVD instrumentation proxies and cannot be used as user-facing performance verdicts. |
 | P1 | Real SAF / file entry | Android DocumentsUI and OEM file manager/share sheet for EPUB/TXT/PDF, including first-run clear-data behavior. | Repo-owned ContentProvider and ActivityMonitor smokes are green, but real picker UX is missing. |
-| P1 | Real Calibre integration | LAN Calibre Content Server with real URL/auth/offline/remove-download/failure cleanup on tablet. | Fake server via `127.0.0.1:18181` + `adb reverse` proves code paths, not real network/auth UX. |
+| P1 | Real Calibre integration | Deferred until offline reader polish is complete. | Per current route, online content does not need active management before full offline implementation. |
 | P1 | MoonReader PDF breadth check | Re-run generated PDF plus a few real PDFs on physical device before generalizing PDF weakness. | Current crash is valid for this corpus/AVD route, but not enough for a product-wide PDF claim. |
 | P2 | MoonReader evidence capture strategy | For body text not exposed in XML, use screenshots, screen recording, OCR where reliable, and manual marker notes. | XML-based automation undercounts MoonReader body evidence. |
 | P2 | LinReads reader polish candidates | Improve external-file locator restore if reproduced, search result ergonomics/test hooks, selection/highlight automation stability, and physical-device gesture smoothness. | These are candidates derived from the comparison route; do not mark as fixed without follow-up evidence. |
+
+## Offline-First Execution Policy
+
+Current execution policy: all online content and Calibre/LAN work is out of
+scope until the offline reader module is fully polished. Physical-device testing
+is also deferred until implementation is complete. Before that point, acceptance
+evidence should come from JVM tests, Robolectric where useful, and AVD
+instrumentation on the connected emulator.
+
+The first offline polish item from the comparison route is complete at code
+level: local file import now computes a SHA-256 while copying into private
+storage and derives `bookId` as `local-<ext>-<hash-prefix>`. This keeps repeated
+opens of the same offline bytes attached to the same Room book row, progress,
+bookmarks, and annotations. It also isolates identical bytes with different
+reader formats, such as `.txt` and `.md`. A follow-up repository guard preserves
+existing local shelf state when that stable row is upserted again, so a repeated
+external open does not clear user title, `lastReadAt`, collection, or sort order.
+
+Validation:
+
+- RED before fix: `:extensions:api:testDebugUnitTest --tests "dev.readflow.extensions.api.LocalFileBookSourceTest.importing the same offline file twice keeps a stable book id"` failed because IDs differed.
+- GREEN after fix: `./gradlew :extensions:api:testDebugUnitTest` passes.
+- Repository guard: `./gradlew -Preadflow.phase=2 :core:database:testDebugUnitTest --tests "dev.readflow.core.database.DownloadedBookCacheTest.repositoryPreservesLocalShelfStateWhenStableImportIsUpsertedAgain"` passes after failing against plain `REPLACE` semantics.
+- AVD focused smoke: `./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.readflow.a01.A01IncomingBookRuntimeSmokeTest#repeatedActionViewOfSameExternalFileReusesStableOfflineBookRow` passes on `readflow_test(AVD) - 16`.
 
 ## Current Evidence State
 

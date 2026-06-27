@@ -6,6 +6,17 @@
 
 ## 2026-06-27
 
+### Offline local import stable ID polish
+- 范围：按新的目标路线执行，在线内容/Calibre 暂不管理，真实设备验收后置；当前全部精力投入离线模块，并用 JVM/Robolectric/AVD 模拟机证据推进。对比文档里的 LinReads S4 同文件强停重开回书首被拆为离线外部文件导入稳定性问题处理
+- 根因：`LocalFileBookSource.import()` 每次导入外部 URI 都用 `UUID.randomUUID()` 生成新的 `bookId` 和私有文件名；因此同一 `ACTION_VIEW` 文件再次打开会被当作新书，进度、书签、标注都会落在旧 `bookId`，表现为同入口重开回书首
+- 修复：本地导入复制文件时同步计算 SHA-256，生成稳定 `bookId = local-<ext>-<hash-prefix>`，并用同一稳定 ID 命名私有副本；相同字节但不同格式（例如 `.txt` 与 `.md`）用扩展名隔离，避免跨格式撞同一本书
+- 仓储保护：稳定 ID 后，重复导入会走同一 `books` row；为避免 Room `REPLACE` 把本地书架状态洗成新导入默认值，`LibraryRepository.upsertBook()` 对既有 `local-*` row 保留用户标题、`lastReadAt`、分组和排序，只更新新导入资产字段
+- JVM/Robolectric：新增 `LocalFileBookSourceTest`。RED：`LocalFileBookSourceTest.importing the same offline file twice keeps a stable book id` 在随机 UUID 下失败；GREEN 后 `./gradlew :extensions:api:testDebugUnitTest` 通过，并覆盖同文件重复导入稳定 ID/URI 与同字节不同格式隔离
+- JVM repository：新增 `DownloadedBookCacheTest.repositoryPreservesLocalShelfStateWhenStableImportIsUpsertedAgain`。RED 证明 plain `REPLACE` 会把标题覆盖成 incoming filename；GREEN 后 targeted `./gradlew -Preadflow.phase=2 :core:database:testDebugUnitTest --tests "dev.readflow.core.database.DownloadedBookCacheTest.repositoryPreservesLocalShelfStateWhenStableImportIsUpsertedAgain"` 通过
+- AVD 模拟机：扩展 `A01IncomingBookRuntimeSmokeTest`，新增 `repeatedActionViewOfSameExternalFileReusesStableOfflineBookRow`。命令 `./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.readflow.a01.A01IncomingBookRuntimeSmokeTest#repeatedActionViewOfSameExternalFileReusesStableOfflineBookRow` 在 `readflow_test(AVD) - 16` 通过，AndroidTest result 记录 `tests=1 failures=0 errors=0`
+- 文档回填：更新 `docs/research/moonreader-linreads-extreme-reading-comparison.md` 与 `docs/tracking/ACTIVE.md`，明确当前策略是离线优先、在线/Calibre 出队、真机后置；S4 外部同文件锚点问题的根因候选已修，但仍需后续在当前 `dev-latest` 复跑同源 S4 和 S7 搜索/书签/标注深证
+- 边界：这是 debug/test APK + AVD/JVM 证据，不是真实平板验收；goal 继续 active
+
 ### MoonReader vs LinReads route status and improvement backlog
 - 范围：按用户要求把“静读天下 vs LinReads 功能层模拟对比”的当前执行位置和需要改进的地方汇总到文档，不新增产品代码，不把 AVD 证据升级成真实平板结论
 - 文档回填：`docs/research/moonreader-linreads-extreme-reading-comparison.md` 新增 `Route Execution Summary`，汇总 S1-S8 已执行证据：同源语料/协议已建，S1/S2/S6 release rerun、S3 低视力、S4/S5/S7/S8 AVD follow-up 均已阶段性完成；同时明确 A-02/A-03/SAF/Calibre 只是 debug/test APK + AVD/fake-server/ActivityMonitor 代理
