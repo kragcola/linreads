@@ -13,6 +13,7 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TxtEncoding
+import dev.readflow.core.model.FontChoice
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flow
@@ -58,6 +59,11 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
                 .getOrDefault(TxtEncoding.AUTO)
         }
 
+    override val fontChoice: Flow<FontChoice> =
+        context.dataStore.data.map {
+            FontChoice.parse(it[KEY_FONT_CHOICE])
+        }
+
     override suspend fun setCalibreBaseUrl(url: String) {
         context.dataStore.edit { it[KEY_CALIBRE_URL] = url }
     }
@@ -90,6 +96,10 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         context.dataStore.edit { it[KEY_TXT_ENCODING] = encoding.name }
     }
 
+    override suspend fun setFontChoice(choice: FontChoice) {
+        context.dataStore.edit { it[KEY_FONT_CHOICE] = choice.serialize() }
+    }
+
     private suspend fun readOrCreateDeviceId(): String {
         var value: String? = null
         context.dataStore.edit { preferences ->
@@ -111,5 +121,6 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_DEVICE_ID = stringPreferencesKey("device_id")
         val KEY_USE_SOURCE_HAN = booleanPreferencesKey("use_source_han_font")
         val KEY_TXT_ENCODING = stringPreferencesKey("txt_encoding")
+        val KEY_FONT_CHOICE = stringPreferencesKey("font_choice")
     }
 }

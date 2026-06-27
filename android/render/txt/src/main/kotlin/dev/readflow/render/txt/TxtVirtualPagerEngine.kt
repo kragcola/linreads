@@ -77,6 +77,7 @@ class TxtVirtualPagerEngine(
     private var fontSizeSp: Float = 18f
     private var lineSpacingMultiplier: Float = 1.75f
     private var useSourceHan: Boolean = true
+    private var currentFontId: String = "source_han"
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
     private var encodingOverride: String? = null
     private var currentUri: Uri? = null
@@ -331,19 +332,33 @@ class TxtVirtualPagerEngine(
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {
         this.useSourceHan = useSourceHan
+        currentFontId = if (useSourceHan) "source_han" else "system"
+        withContext(Dispatchers.Main) {
+            (recyclerView?.adapter as? TxtParagraphAdapter)?.updateTypeface(resolveTypeface())
+        }
+    }
+
+    override suspend fun setFont(fontId: String) {
+        currentFontId = fontId
+        useSourceHan = fontId == "source_han"
         withContext(Dispatchers.Main) {
             (recyclerView?.adapter as? TxtParagraphAdapter)?.updateTypeface(resolveTypeface())
         }
     }
 
     private fun resolveTypeface(): Typeface =
-        if (useSourceHan) dev.readflow.core.ui.FontProvider.sourceHanSerif(context)
-        else Typeface.SERIF
+        dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
 
     override suspend fun setTxtEncodingOverride(charsetName: String?) {
         encodingOverride = charsetName
         val uri = currentUri ?: return
+        val savedProgression = _currentLocator.value.totalProgression
         openBook(uri)
+        savedProgression?.let { p ->
+            val total = _pageCount.value.coerceAtLeast(1)
+            val targetIndex = (p * total).toInt().coerceIn(0, total - 1)
+            goTo(locatorForIndex(targetIndex, total))
+        }
     }
 
     override suspend fun setLineSpacing(multiplier: Float) {

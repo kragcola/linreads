@@ -12,8 +12,10 @@ import dev.readflow.core.database.LinReadsBackupRestoreStore
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
+import dev.readflow.core.model.FontChoice
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.SyncBackend
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import kotlinx.coroutines.CoroutineDispatcher
@@ -83,6 +85,9 @@ class SettingsViewModel(
 
     val txtEncoding = settings.txtEncoding
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TxtEncoding.AUTO)
+
+    val fontChoice = settings.fontChoice
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), FontChoice.SourceHan)
 
     private val _calibreUrlError = MutableStateFlow<String?>(null)
     val calibreUrlError: StateFlow<String?> = _calibreUrlError.asStateFlow()
@@ -219,6 +224,25 @@ class SettingsViewModel(
     fun setReadingMode(mode: ReaderReadingMode) { viewModelScope.launch { settings.setReadingMode(mode) } }
     fun setUseSourceHanFont(enabled: Boolean) { viewModelScope.launch { settings.setUseSourceHanFont(enabled) } }
     fun setTxtEncoding(encoding: TxtEncoding) { viewModelScope.launch { settings.setTxtEncoding(encoding) } }
+    fun setFontChoice(choice: FontChoice) { viewModelScope.launch { settings.setFontChoice(choice) } }
+
+    /**
+     * 导入自定义字体：把 [input] 拷贝到 [dest]（已由调用方清洗为 fonts 目录内的安全文件名），
+     * 成功后选用该字体。IO 在 [backupDispatcher] 上跑，避免阻塞主线程。
+     */
+    fun importFont(input: InputStream, dest: File, choice: FontChoice.Custom) {
+        viewModelScope.launch {
+            runCatching {
+                withContext(backupDispatcher) {
+                    input.use { ins -> dest.outputStream().use { ins.copyTo(it) } }
+                }
+            }.onSuccess {
+                settings.setFontChoice(choice)
+            }.onFailure {
+                runCatching { dest.delete() }
+            }
+        }
+    }
 }
 
 private fun String.removeProtocol(): String =

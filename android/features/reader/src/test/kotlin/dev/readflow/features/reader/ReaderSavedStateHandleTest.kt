@@ -21,6 +21,7 @@ import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.ReaderState
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
+import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
@@ -723,6 +724,7 @@ class ReaderSavedStateHandleTest {
         override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
         override val useSourceHanFont = MutableStateFlow(true)
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
+        override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
 
         override suspend fun setCalibreBaseUrl(url: String) {
             calibreBaseUrl.value = url
@@ -753,6 +755,10 @@ class ReaderSavedStateHandleTest {
 
         override suspend fun setTxtEncoding(encoding: TxtEncoding) {
             txtEncoding.value = encoding
+        }
+
+        override suspend fun setFontChoice(choice: FontChoice) {
+            fontChoice.value = choice
         }
     }
 }

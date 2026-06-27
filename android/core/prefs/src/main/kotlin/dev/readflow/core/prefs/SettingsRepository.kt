@@ -4,6 +4,7 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TxtEncoding
+import dev.readflow.core.model.FontChoice
 import kotlinx.coroutines.flow.Flow
 
 /**
@@ -23,6 +24,7 @@ interface SettingsRepository {
     val engineOverrides: Flow<Map<BookFormat, String>>
     val useSourceHanFont: Flow<Boolean>
     val txtEncoding: Flow<TxtEncoding>
+    val fontChoice: Flow<FontChoice>
 
     suspend fun setCalibreBaseUrl(url: String)
     suspend fun setFontSize(size: Int)
@@ -32,4 +34,5 @@ interface SettingsRepository {
     suspend fun setEngineOverride(format: BookFormat, engineId: String?)
     suspend fun setUseSourceHanFont(enabled: Boolean)
     suspend fun setTxtEncoding(encoding: TxtEncoding)
+    suspend fun setFontChoice(choice: FontChoice)
 }

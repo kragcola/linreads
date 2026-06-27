@@ -25,6 +25,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
+import dev.readflow.core.model.FontChoice
+import dev.readflow.core.ui.FontProvider
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.koin.androidx.compose.koinViewModel
@@ -48,6 +50,7 @@ fun SettingsScreen(
     val readingMode by vm.readingMode.collectAsStateWithLifecycle()
     val useSourceHanFont by vm.useSourceHanFont.collectAsStateWithLifecycle()
     val txtEncoding by vm.txtEncoding.collectAsStateWithLifecycle()
+    val fontChoice by vm.fontChoice.collectAsStateWithLifecycle()
     val syncStatus by vm.syncStatus.collectAsStateWithLifecycle()
     val backupExportState by vm.backupExportState.collectAsStateWithLifecycle()
     val backupRestoreState by vm.backupRestoreState.collectAsStateWithLifecycle()
@@ -78,6 +81,19 @@ fun SettingsScreen(
             vm.restoreBackup(input)
         }
     }
+    val fontImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val cr = context.contentResolver
+        val rawName = cr.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            ?: uri.lastPathSegment
+        val safeName = rawName?.let { FontProvider.sanitizeFontFileName(it) }
+            ?: return@rememberLauncherForActivityResult  // 非法/非 ttf,otf 文件名，忽略
+        val dest = java.io.File(FontProvider.customFontsDir(context.applicationContext), safeName)
+        val input = cr.openInputStream(uri) ?: return@rememberLauncherForActivityResult
+        vm.importFont(input, dest, FontChoice.Custom(safeName))
+    }
+
 
     // Poll DownloadManager progress while downloading
     if (updateState is UpdateState.Downloading) {
@@ -201,11 +217,29 @@ fun SettingsScreen(
             }
 
             Text("正文字体", style = MaterialTheme.typography.bodyMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = useSourceHanFont, onClick = { vm.setUseSourceHanFont(true) },
-                    label = { Text("思源宋体（内置）") })
-                FilterChip(selected = !useSourceHanFont, onClick = { vm.setUseSourceHanFont(false) },
-                    label = { Text("系统宋体") })
+            var customFonts by remember { mutableStateOf(emptyList<String>()) }
+            // key 于 fontChoice：导入成功会更新 fontChoice，从而刷新列表显示新字体
+            LaunchedEffect(fontChoice) {
+                customFonts = FontProvider.listCustomFonts(context.applicationContext)
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = fontChoice == FontChoice.System, onClick = { vm.setFontChoice(FontChoice.System) },
+                        label = { Text("系统宋体") })
+                    FilterChip(selected = fontChoice == FontChoice.SourceHan, onClick = { vm.setFontChoice(FontChoice.SourceHan) },
+                        label = { Text("思源宋体（内置）") })
+                }
+                customFonts.forEach { name ->
+                    val c = FontChoice.Custom(name)
+                    FilterChip(selected = fontChoice == c, onClick = { vm.setFontChoice(c) },
+                        label = { Text(name) })
+                }
+                OutlinedButton(onClick = {
+                    fontImportLauncher.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream"))
+                    // Refresh list after import (simplified: on next recomposition)
+                }) {
+                    Text("＋ 导入字体")
+                }
             }
 
             Text("TXT 编码", style = MaterialTheme.typography.bodyMedium)

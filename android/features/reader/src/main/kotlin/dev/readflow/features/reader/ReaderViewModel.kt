@@ -17,6 +17,7 @@ import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
+import dev.readflow.core.model.FontChoice
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.EngineStateStore
@@ -88,6 +89,8 @@ class ReaderViewModel(
     private var bookmarkJob: Job? = null
     private var textSelectionJob: Job? = null
     private var annotationJob: Job? = null
+    private var settingsFontJob: Job? = null
+    private var settingsLineSpacingJob: Job? = null
 
     fun onIntent(intent: ReaderIntent) = when (intent) {
         is ReaderIntent.OpenById -> openById(intent.bookId)
@@ -173,6 +176,7 @@ class ReaderViewModel(
             engine.setLineSpacing(savedLineSpacing)
             engine.setTheme(savedTheme)
             engine.setSerifFont(settings.useSourceHanFont.first())
+            engine.setFont(settings.fontChoice.first().serialize())
             val txtEnc = settings.txtEncoding.first()
             if (txtEnc.charsetName != null) {
                 engine.setTxtEncodingOverride(txtEnc.charsetName)
@@ -215,6 +219,7 @@ class ReaderViewModel(
             watchBookmarks(engine, bookId)
             watchTextSelection(engine)
             watchAnnotations(engine, bookId)
+            watchSettings(engine)
             bookId?.let {
                 persistReaderState(bookId = it, locator = engine.currentLocator.value, loadingState = LoadingState.Loaded)
             }
@@ -281,6 +286,23 @@ class ReaderViewModel(
                 val annotations = readerAnnotationStateFor(entities)
                 annotatableEngine.setTextAnnotations(annotations.renderAnnotations)
                 _uiState.update { it.copy(annotations = annotations) }
+            }
+        }
+    }
+
+    private fun watchSettings(engine: ReaderEngine) {
+        settingsFontJob?.cancel()
+        settingsFontJob = viewModelScope.launch {
+            settings.fontChoice.collect { choice ->
+                engine.setFont(choice.serialize())
+            }
+        }
+        settingsLineSpacingJob?.cancel()
+        settingsLineSpacingJob = viewModelScope.launch {
+            settings.lineSpacing.collect { spacing ->
+                val clamped = clampedReaderLineSpacing(spacing)
+                engine.setLineSpacing(clamped)
+                _uiState.update { it.copy(lineSpacing = clamped) }
             }
         }
     }
@@ -548,6 +570,8 @@ class ReaderViewModel(
         bookmarkJob?.cancel()
         textSelectionJob?.cancel()
         annotationJob?.cancel()
+        settingsFontJob?.cancel()
+        settingsLineSpacingJob?.cancel()
         val engine = _uiState.value.engine
         viewModelScope.launch {
             // Force-save progress before close so debounce doesn't swallow it.
