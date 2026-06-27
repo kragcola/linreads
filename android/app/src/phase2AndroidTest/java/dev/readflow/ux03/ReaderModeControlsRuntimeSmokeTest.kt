@@ -194,6 +194,105 @@ class ReaderModeControlsRuntimeSmokeTest {
     }
 
     @Test
+    fun repeatedExternalActionViewRestoresPersistedTxtAnchor() {
+        val targetIndex = 48
+        val fileName = "s4-offline-${UUID.randomUUID().toString().take(8)}.txt"
+        val title = fileName.substringBeforeLast('.')
+        val targetParagraph = corpusParagraph("S4", targetIndex)
+        val readerUri = externalBookUri(fileName)
+        var expectedRestoreIndex = -1
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri, "text/plain")).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(TXT_READER_DESC))
+            waitForVisibleTxtParagraph(scenario, corpusParagraph("S4", 0))
+
+            val importedBook = waitForBookByTitle(title)
+            scrollTxtRecyclerToParagraph(scenario, targetIndex)
+            waitForCondition("expected scrolled TXT anchor paragraph to become visible before reopen") {
+                scenario.withActivity { activity ->
+                    activity.visibleTxtTexts().any { targetParagraph in it }
+                }
+            }
+            val visibleBeforeReopen = scenario.withActivity { activity ->
+                activity.visibleTxtTexts()
+            }
+            val visibleIndexesBeforeReopen = visibleBeforeReopen.map(::paragraphIndexFromText)
+            val visibleIndexRangeBeforeReopen = checkNotNull(visibleIndexesBeforeReopen.minOrNull()) {
+                "expected visible S4 indexes before reopen"
+            }..checkNotNull(visibleIndexesBeforeReopen.maxOrNull()) {
+                "expected visible S4 indexes before reopen"
+            }
+            waitForCondition(
+                message = "expected reading_progress to persist the visible S4 anchor before reopen",
+                timeoutMs = DB_TIMEOUT_MS,
+            ) {
+                latestProgress(importedBook.id)
+                    ?.locatorParagraphIndex()
+                    ?.let { it in visibleIndexRangeBeforeReopen } == true
+            }
+            val persistedBeforeReopen = checkNotNull(latestProgress(importedBook.id))
+            expectedRestoreIndex = persistedBeforeReopen.locatorParagraphIndex()
+            takeScreenshot("ux03-s4-before-reopen.png")
+            dumpHierarchy("ux03-s4-before-reopen.xml")
+            copyDatabaseSnapshot("ux03-s4-before-reopen")
+            writeTextEvidence(
+                "ux03-s4-before-reopen-summary.txt",
+                buildString {
+                    appendLine("book_id=${importedBook.id}")
+                    appendLine("title=$title")
+                    appendLine("target_index=$targetIndex")
+                    appendLine("visible_before_reopen=${visibleBeforeReopen.joinToString(" | ")}")
+                    appendLine("visible_indexes_before_reopen=${visibleIndexesBeforeReopen.joinToString(",")}")
+                    appendLine("expected_restore_index=$expectedRestoreIndex")
+                    appendLine("persisted_before_reopen=${persistedBeforeReopen.locatorJson}")
+                    appendLine("persisted_before_reopen_total=${persistedBeforeReopen.totalProgression}")
+                },
+            )
+        }
+
+        ActivityScenario.launch<MainActivity>(readerIntent(readerUri, "text/plain")).use { reopened ->
+            dismissBlockingDialogs()
+            waitForObject(By.desc(TXT_READER_DESC))
+            waitForCondition("expected repeated ACTION_VIEW to restore the S4 mid-book anchor") {
+                reopened.withActivity { activity ->
+                    val visibleIndexes = activity.visibleTxtTexts().map(::paragraphIndexFromText)
+                    visibleIndexes.any { it in (expectedRestoreIndex - 2)..(expectedRestoreIndex + 8) } &&
+                        visibleIndexes.none { it == 0 }
+                }
+            }
+
+            val visibleAfterReopen = reopened.withActivity { activity ->
+                activity.visibleTxtTexts()
+            }
+            val visibleIndexesAfterReopen = visibleAfterReopen.map(::paragraphIndexFromText)
+            val rows = booksByTitle(title)
+            takeScreenshot("ux03-s4-after-reopen.png")
+            dumpHierarchy("ux03-s4-after-reopen.xml")
+            copyDatabaseSnapshot("ux03-s4-after-reopen")
+            writeTextEvidence(
+                "ux03-s4-after-reopen-summary.txt",
+                buildString {
+                    appendLine("title=$title")
+                    appendLine("matching_rows=${rows.size}")
+                    appendLine("visible_after_reopen=${visibleAfterReopen.joinToString(" | ")}")
+                    appendLine("visible_indexes_after_reopen=${visibleIndexesAfterReopen.joinToString(",")}")
+                },
+            )
+
+            assertEquals("expected repeated external import to reuse one stable book row", 1, rows.size)
+            assertTrue(
+                "expected repeated ACTION_VIEW to restore near persisted paragraph $expectedRestoreIndex, got $visibleIndexesAfterReopen",
+                visibleIndexesAfterReopen.any { it in (expectedRestoreIndex - 2)..(expectedRestoreIndex + 8) },
+            )
+            assertTrue(
+                "expected repeated ACTION_VIEW not to reopen at the first paragraph",
+                visibleIndexesAfterReopen.none { it == 0 },
+            )
+        }
+    }
+
+    @Test
     fun userFacingControlsStayVisibleAndNightThemeAppliesAtRuntime() {
         val title = "ux04-controls-${UUID.randomUUID().toString().take(8)}"
         val readerUri = createTxtUri(
@@ -279,6 +378,13 @@ class ReaderModeControlsRuntimeSmokeTest {
         }
     }
 
+    private fun externalBookUri(fileName: String): Uri =
+        Uri.Builder()
+            .scheme("content")
+            .authority(PROVIDER_AUTHORITY)
+            .appendPath(fileName)
+            .build()
+
     private fun readerIntent(uri: Uri, mimeType: String) =
         Intent(Intent.ACTION_VIEW).apply {
             setClass(appContext, MainActivity::class.java)
@@ -331,6 +437,19 @@ class ReaderModeControlsRuntimeSmokeTest {
             latestBookByTitle(title)
         }
 
+    private fun booksByTitle(title: String): List<BookEntity> {
+        val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
+            .allowMainThreadQueries()
+            .build()
+        return try {
+            runBlocking {
+                db.bookDao().observeAll().first().filter { it.title == title }
+            }
+        } finally {
+            db.close()
+        }
+    }
+
     private fun latestBookByTitle(title: String): BookEntity? {
         val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
             .allowMainThreadQueries()
@@ -354,6 +473,9 @@ class ReaderModeControlsRuntimeSmokeTest {
             db.close()
         }
     }
+
+    private fun ReadingProgressEntity.locatorParagraphIndex(): Int =
+        (totalProgression.coerceIn(0f, 1f) * S4_PARAGRAPH_COUNT).toInt()
 
     private fun copyDatabaseSnapshot(label: String) {
         val dbFile = appContext.getDatabasePath(DB_NAME)
@@ -401,6 +523,29 @@ class ReaderModeControlsRuntimeSmokeTest {
         ) {
             "Unable to scroll target paragraph into view: $targetText"
         }
+    }
+
+    private fun scrollTxtRecyclerToParagraph(
+        scenario: ActivityScenario<MainActivity>,
+        paragraphIndex: Int,
+    ) {
+        scenario.withActivity { activity ->
+            val recyclerView = activity.findTxtScrollRecyclerView()
+                ?: error("Unable to find scroll-mode TXT RecyclerView")
+            val layoutManager = recyclerView.javaClass
+                .getMethod("getLayoutManager")
+                .invoke(recyclerView)
+                ?: error("TXT RecyclerView does not have a layout manager")
+            layoutManager.javaClass
+                .getMethod(
+                    "scrollToPositionWithOffset",
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                )
+                .invoke(layoutManager, paragraphIndex, 0)
+            recyclerView.post { recyclerView.requestLayout() }
+        }
+        device.waitForIdle()
     }
 
     private fun waitForVisibleTxtParagraph(
@@ -554,6 +699,8 @@ class ReaderModeControlsRuntimeSmokeTest {
     private companion object {
         private const val TXT_READER_DESC = "阅读内容，捏合调整字号"
         private const val DB_NAME = "readflow.db"
+        private const val PROVIDER_AUTHORITY = "dev.readflow.test.a01bookprovider"
+        private const val S4_PARAGRAPH_COUNT = 128
         private val NIGHT_PAPER = Color.rgb(0x2A, 0x26, 0x20)
         private const val RECYCLER_VIEW_CLASS_NAME = "androidx.recyclerview.widget.RecyclerView"
         private const val VIEW_PAGER_CLASS_NAME = "androidx.viewpager2.widget.ViewPager2"

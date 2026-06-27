@@ -143,6 +143,9 @@ public final class A01ExternalBookProvider extends ContentProvider {
                 if (fileName.startsWith("s7-offline-")) {
                     return s7TxtBytes(fileName);
                 }
+                if (fileName.startsWith("s4-offline-")) {
+                    return s4TxtBytes();
+                }
                 return (TXT_SENTINEL + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8);
             case "md":
             case "markdown":
@@ -181,6 +184,19 @@ public final class A01ExternalBookProvider extends ContentProvider {
                     .append(padded)
                     .append(" keeps offline search bookmark annotation evidence stable.");
             }
+        }
+        return builder.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private byte[] s4TxtBytes() {
+        StringBuilder builder = new StringBuilder();
+        for (int index = 0; index < 128; index++) {
+            if (index > 0) {
+                builder.append("\n\n");
+            }
+            builder.append("S4 anchor paragraph ")
+                .append(String.format(Locale.US, "%03d", index))
+                .append(" keeps grouped runtime reading evidence stable.");
         }
         return builder.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }
