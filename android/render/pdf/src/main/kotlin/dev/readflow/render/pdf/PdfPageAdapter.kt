@@ -67,7 +67,7 @@ internal class PdfPageAdapter(
         val w = context.resources.displayMetrics.widthPixels
         val h = (w * page.height.toFloat() / page.width).toInt().coerceAtLeast(1)
         return try {
-            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { bmp ->
+            Bitmap.createBitmap(w, h, Bitmap.Config.RGB_565).also { bmp ->
                 page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
             }
         } finally {
