@@ -6,6 +6,13 @@
 
 ## 2026-06-27
 
+### MoonReader vs LinReads route status and improvement backlog
+- 范围：按用户要求把“静读天下 vs LinReads 功能层模拟对比”的当前执行位置和需要改进的地方汇总到文档，不新增产品代码，不把 AVD 证据升级成真实平板结论
+- 文档回填：`docs/research/moonreader-linreads-extreme-reading-comparison.md` 新增 `Route Execution Summary`，汇总 S1-S8 已执行证据：同源语料/协议已建，S1/S2/S6 release rerun、S3 低视力、S4/S5/S7/S8 AVD follow-up 均已阶段性完成；同时明确 A-02/A-03/SAF/Calibre 只是 debug/test APK + AVD/fake-server/ActivityMonitor 代理
+- 改进清单：同一文档新增 `Improvement And Follow-up Backlog`，按 P0/P1/P2 列出真实平板 S1-S6/S8、S7 搜索跳转/书签/高亮笔记持久化、LinReads 外部文件同入口重开锚点、真人 TalkBack、真实性能、真实 SAF/文件入口、真实 Calibre LAN/auth、MoonReader PDF 广度复测、MoonReader 截图/录屏取证策略和 LinReads reader polish 候选项
+- 索引回填：`docs/tracking/ACTIVE.md` 新增路线级状态摘要，指向研究文档并标明当前只是 AVD S1-S8 阶段性完成；下一步 P0 是真实平板重跑、S7 深证和 LinReads 外部文件锚点复核
+- 边界：本次是文档整理，不改变 `dev-latest` APK，不新增模拟结果；goal 继续保持 active，不能标 complete
+
 ### MoonReader vs LinReads S4/S5/S7/S8 AVD follow-up
 - 范围：继续推进“静读天下 vs LinReads 功能层模拟对比”的 S4/S5/S7/S8。当前仍只有 `emulator-5554` / `sdk_gphone64_arm64` 在线，Android 16 / API 36，tablet-like override `1600x2560` density `320`，不声明真实平板。证据根：`/tmp/readflow-s4-s8-compare-20260627/`
 - 路由修正：未指定 component 的同源 EPUB `ACTION_VIEW` 会进入 Android Resolver，首轮 LinReads S4 自动化误落到 MoonReader，已作为无效混入证据废弃。有效对比均使用显式 component：LinReads `dev.readflow/.MainActivity`、MoonReader `com.flyersoft.moonreaderp/.ActivityMain`。LinReads 安装 `dev-latest` / `Dev build #126`，APK SHA-256 `b38c0b145a6b1a2239b47aec45996bef3b170d5d2dbb9df8f9f9957ce694659c`
