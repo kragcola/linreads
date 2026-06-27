@@ -230,7 +230,7 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         return try {
             val width = context.resources.displayMetrics.widthPixels
             val height = (width * page.height.toFloat() / page.width).toInt().coerceAtLeast(1)
-            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
+            Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565).also { bitmap ->
                 page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
             }
         } finally {

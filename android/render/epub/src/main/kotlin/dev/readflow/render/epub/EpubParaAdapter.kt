@@ -35,6 +35,7 @@ internal class EpubParaAdapter(
     private var fontSizeSp: Float,
     private var lineSpacingMultiplier: Float,
     private var inkColor: Int = INK_DAY,
+    private var codeBlockBgColor: Int = CODE_BLOCK_BG_DAY,
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
     inner class TextVH(frame: FrameLayout, val tv: SelectionAwareTextView) : RecyclerView.ViewHolder(frame)
@@ -135,20 +136,35 @@ internal class EpubParaAdapter(
             3 -> 1.5f
             else -> 0f
         }
-        holder.tv.setPadding(leadingPadding, (10 * density).toInt(), horizontalPadding, (10 * density).toInt())
-        holder.tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp + headingBoost)
-        holder.tv.setLineSpacing(0f, lineSpacingMultiplier)
-        holder.tv.setTextColor(inkColor)
-        holder.tv.typeface = when {
-            block.kind == EpubTextKind.Preformatted || block.kind == EpubTextKind.Table -> Typeface.MONOSPACE
-            block.headingLevel != null -> Typeface.DEFAULT_BOLD
-            else -> Typeface.SERIF
+
+        if (block.isCodeBlock) {
+            val codePaddingPx = (8 * density).toInt()
+            holder.tv.setPadding(codePaddingPx, codePaddingPx, codePaddingPx, codePaddingPx)
+            holder.tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp * 0.9f)
+            holder.tv.setLineSpacing(0f, lineSpacingMultiplier)
+            holder.tv.setTextColor(inkColor)
+            holder.tv.typeface = Typeface.MONOSPACE
+            holder.tv.setHorizontallyScrolling(true)
+            holder.tv.isHorizontalScrollBarEnabled = true
+            holder.tv.setBackgroundColor(codeBlockBgColor)
+            holder.tv.text = block.text.replace("\t", "    ")
+        } else {
+            holder.tv.setPadding(leadingPadding, (10 * density).toInt(), horizontalPadding, (10 * density).toInt())
+            holder.tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp + headingBoost)
+            holder.tv.setLineSpacing(0f, lineSpacingMultiplier)
+            holder.tv.setTextColor(inkColor)
+            holder.tv.typeface = when {
+                block.kind == EpubTextKind.Preformatted || block.kind == EpubTextKind.Table -> Typeface.MONOSPACE
+                block.headingLevel != null -> Typeface.DEFAULT_BOLD
+                else -> Typeface.SERIF
+            }
+            holder.tv.setHorizontallyScrolling(block.kind == EpubTextKind.Preformatted)
+            holder.tv.isHorizontalScrollBarEnabled = block.kind == EpubTextKind.Preformatted
+            holder.tv.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+            holder.tv.text = block.toSpannableText().withTextHighlightSpans(
+                highlightRangesProvider(block.paragraphIndex),
+            )
         }
-        holder.tv.setHorizontallyScrolling(block.kind == EpubTextKind.Preformatted)
-        holder.tv.isHorizontalScrollBarEnabled = block.kind == EpubTextKind.Preformatted
-        holder.tv.text = block.toSpannableText().withTextHighlightSpans(
-            highlightRangesProvider(block.paragraphIndex),
-        )
         holder.tv.onSelectionRangeChanged = { start, end ->
             onTextSelectionChanged(block.paragraphIndex, start, end)
         }
@@ -158,7 +174,17 @@ internal class EpubParaAdapter(
 
     private fun bindImage(holder: ImageVH, block: EpubDisplayBlock.Image) {
         holder.image.contentDescription = block.altText?.takeIf { it.isNotBlank() } ?: "图片"
-        holder.image.setImageBitmap(imageLoader(block.href))
+        val bitmap = imageLoader(block.href)
+        holder.image.setImageBitmap(bitmap)
+
+        if (bitmap != null) {
+            val newMaxWidth = calculateImageMaxWidth(
+                holder.itemView.context,
+                bitmap.width,
+                bitmap.height
+            )
+            holder.image.maxWidth = newMaxWidth
+        }
     }
 
     override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
@@ -182,6 +208,11 @@ internal class EpubParaAdapter(
         notifyDataSetChanged()
     }
 
+    fun updateCodeBlockBgColor(color: Int) {
+        codeBlockBgColor = color
+        notifyDataSetChanged()
+    }
+
     fun updateTextAnnotations() {
         notifyDataSetChanged()
     }
@@ -193,6 +224,40 @@ internal class EpubParaAdapter(
 
         val INK_DAY = Color.rgb(0x2A, 0x26, 0x20)
         val INK_NIGHT = Color.rgb(0xD8, 0xCF, 0xBC)
+        val CODE_BLOCK_BG_DAY = Color.rgb(0xF5, 0xF5, 0xF5)
+        val CODE_BLOCK_BG_NIGHT = Color.rgb(0x2A, 0x2A, 0x2A)
+
+        /**
+         * 动态计算图片最大宽度
+         * 横版图(aspect≥1.2)占92%，竖版图保持680dp
+         */
+        private fun calculateImageMaxWidth(
+            context: android.content.Context,
+            imageWidth: Int,
+            imageHeight: Int
+        ): Int {
+            val metrics = context.resources.displayMetrics
+            val density = metrics.density
+            val screenWidthDp = metrics.widthPixels / density
+
+            val aspectRatio = if (imageHeight > 0) {
+                imageWidth.toFloat() / imageHeight.toFloat()
+            } else {
+                1.0f
+            }
+
+            return when {
+                aspectRatio >= 1.2f -> {
+                    (screenWidthDp * 0.92f * density).toInt()
+                }
+                else -> {
+                    kotlin.math.min(
+                        (680 * density).toInt(),
+                        (screenWidthDp * 0.90f * density).toInt()
+                    )
+                }
+            }
+        }
     }
 
     private fun blockAt(position: Int): EpubDisplayBlock =

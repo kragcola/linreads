@@ -282,6 +282,7 @@ class EpubReflowEngine private constructor(
                 fontSizeSp = fontSizeSp,
                 lineSpacingMultiplier = lineSpacingMultiplier,
                 inkColor = palette.ink,
+                codeBlockBgColor = codeBlockBgFor(themeMode, resources.configuration),
             )
             setBackgroundColor(palette.paper)
             clipToPadding = false
@@ -792,6 +793,7 @@ class EpubReflowEngine private constructor(
         val palette = paletteFor(mode, context.resources.configuration)
         recyclerView?.setBackgroundColor(palette.paper)
         (recyclerView?.adapter as? EpubParaAdapter)?.updateInkColor(palette.ink)
+        (recyclerView?.adapter as? EpubParaAdapter)?.updateCodeBlockBgColor(codeBlockBgFor(mode, context.resources.configuration))
         activePageContainers.forEach { it.setBackgroundColor(palette.paper) }
         activePagedTextPages.keys.toList().forEach { rebindActiveComposeTextPage(it, palette) }
     }
@@ -1387,6 +1389,20 @@ class EpubReflowEngine private constructor(
                 } else {
                     ReaderPalette(PAPER_DAY, EpubParaAdapter.INK_DAY)
                 }
+            }
+        }
+
+        private fun codeBlockBgFor(mode: ThemeMode, configuration: Configuration): Int {
+            val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                Configuration.UI_MODE_NIGHT_YES
+            return when (mode) {
+                ThemeMode.DARK -> EpubParaAdapter.CODE_BLOCK_BG_NIGHT
+                ThemeMode.SYSTEM -> if (systemNight) {
+                    EpubParaAdapter.CODE_BLOCK_BG_NIGHT
+                } else {
+                    EpubParaAdapter.CODE_BLOCK_BG_DAY
+                }
+                else -> EpubParaAdapter.CODE_BLOCK_BG_DAY
             }
         }
     }

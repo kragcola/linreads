@@ -46,6 +46,8 @@ internal sealed interface EpubReaderItem {
         val kind: EpubTextKind = EpubTextKind.Body,
         val indentLevel: Int = 0,
         val fragmentIds: List<String> = emptyList(),
+        val isCodeBlock: Boolean = false,
+        val language: String = "",
     ) : EpubReaderItem
 
     data class Heading(

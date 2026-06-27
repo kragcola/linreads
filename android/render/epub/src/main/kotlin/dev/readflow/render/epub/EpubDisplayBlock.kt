@@ -12,6 +12,8 @@ internal sealed interface EpubDisplayBlock {
         val kind: EpubTextKind = EpubTextKind.Body,
         val indentLevel: Int = 0,
         val fragmentIds: List<String> = emptyList(),
+        val isCodeBlock: Boolean = false,
+        val language: String = "",
     ) : EpubDisplayBlock
 
     data class Image(
@@ -55,6 +57,8 @@ internal fun epubDisplayBlocks(items: List<EpubReaderItem>): List<EpubDisplayBlo
                             kind = item.kind,
                             indentLevel = item.indentLevel,
                             fragmentIds = item.fragmentIds,
+                            isCodeBlock = item.isCodeBlock,
+                            language = item.language,
                         ),
                     )
                 }

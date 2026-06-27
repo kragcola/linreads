@@ -454,9 +454,16 @@ internal fun epubPagedLayoutWithBlocks(
 
         blocks.forEach { block ->
             when (block) {
-                is EpubDisplayBlock.Text -> if (emittedParagraphs.add(block.paragraphIndex)) {
-                    pendingTextPages += pagesByParagraph[block.paragraphIndex].orEmpty().map { page ->
-                        page.copy(textStyle = block.toPageTextStyle())
+                is EpubDisplayBlock.Text -> {
+                    // P0-2: Heading保护 - 如果是标题且当前页有内容，先flush到新页
+                    if (block.headingLevel != null && pendingTextPages.isNotEmpty()) {
+                        flushPendingTextPages()
+                    }
+
+                    if (emittedParagraphs.add(block.paragraphIndex)) {
+                        pendingTextPages += pagesByParagraph[block.paragraphIndex].orEmpty().map { page ->
+                            page.copy(textStyle = block.toPageTextStyle())
+                        }
                     }
                 }
                 is EpubDisplayBlock.Image -> {

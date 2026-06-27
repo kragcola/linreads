@@ -95,6 +95,16 @@ private fun collectReaderItems(
             items = items,
             text = rawPreTexts.takeFirstOrNull() ?: preText(element),
             kind = EpubTextKind.Preformatted,
+            isCodeBlock = true,
+            language = element.languageClass(),
+        )
+        "code" -> addPlainTextItem(
+            spineIndex = spineIndex,
+            items = items,
+            text = element.wholeText(),
+            kind = EpubTextKind.Preformatted,
+            isCodeBlock = true,
+            language = element.languageClass(),
         )
         "blockquote" -> addTextItem(
             spineIndex = spineIndex,
@@ -199,6 +209,8 @@ private fun addPlainTextItem(
     items: MutableList<EpubReaderItem>,
     text: String,
     kind: EpubTextKind,
+    isCodeBlock: Boolean = false,
+    language: String = "",
 ) {
     val trimmed = text.trim()
     if (trimmed.isEmpty()) return
@@ -206,6 +218,8 @@ private fun addPlainTextItem(
         locator = EpubItemLocator(spineIndex, items.size),
         text = trimmed,
         kind = kind,
+        isCodeBlock = isCodeBlock,
+        language = language,
     )
 }
 
@@ -488,3 +502,10 @@ internal fun epubParasFromReaderItems(items: List<EpubReaderItem>): List<EpubPar
     val plan = epubParagraphPlan(items)
     return epubParasFromParagraphPlan(plan)
 }
+
+private fun Element.languageClass(): String =
+    attr("class")
+        .split(" ")
+        .firstOrNull { it.startsWith("language-") }
+        ?.removePrefix("language-")
+        ?: ""

@@ -34,9 +34,11 @@ internal fun readerTapZoneForTap(
 internal fun readerTapZoneForKey(keyCode: Int, shiftPressed: Boolean = false): ReaderTapZone? = when (keyCode) {
     KeyEvent.KEYCODE_DPAD_LEFT,
     KeyEvent.KEYCODE_PAGE_UP,
+    KeyEvent.KEYCODE_VOLUME_UP,
     -> ReaderTapZone.PreviousPage
     KeyEvent.KEYCODE_DPAD_RIGHT,
     KeyEvent.KEYCODE_PAGE_DOWN,
+    KeyEvent.KEYCODE_VOLUME_DOWN,
     -> ReaderTapZone.NextPage
     KeyEvent.KEYCODE_SPACE -> if (shiftPressed) ReaderTapZone.PreviousPage else ReaderTapZone.NextPage
     KeyEvent.KEYCODE_DPAD_CENTER,
