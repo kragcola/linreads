@@ -6,6 +6,14 @@
 
 ## 2026-06-27
 
+### MoonReader vs LinReads S3 low-vision AVD follow-up
+- 范围：继续推进“静读天下 vs LinReads 功能层模拟对比”的 S3 低视力排版场景。当前仍只有 `emulator-5554` / `sdk_gphone64_arm64` 在线，Android 16 / API 36，tablet-like override `1600x2560` density `320`，不声明真实平板。证据根：`/tmp/readflow-s3-low-vision-20260627/`
+- LinReads release：安装 `Dev build #125` APK `/tmp/readflow-s3-low-vision-20260627/apk/app-ota.apk`，SHA-256 `660704e0b976b45d2479d93a9e8f8c964751c8144545f38e6290d38057a5b4d0`。同源 EPUB 位于 `/sdcard/Download/rfmr-s3/`，MediaStore URI `content://media/external/file/507`。默认冷启动 `TotalTime=1099ms`；设置面板从 `18sp/1.75x` 调到 `32sp/2.20x/分页`，强停重开后 `TotalTime=1102ms`
+- LinReads S3 采样：pages `0..25` XML/screenshot 采样记录 `sampled_pages=26`、`positive_pages=24`、`one_marker_pages=7`、`min_positive_markers=1`、`max_positive_markers=9`；CJK 低视力页 packed `9/9/9/9/9/3`，后续混合样式到 `RFMR-MIX-046`，没有采到空白页。采样后 PSS `56391KB`，gfx p90/p95 `105/117ms`，jank `86.03%`；filtered logcat 没有 `dev.readflow` fatal/ANR/OOM/recycled-bitmap。结论边界：可读性和 XML 可验证性通过，但帧耗时仍差，不声明顺滑
+- MoonReader S3：本地 `moonreader-pro.apk` / `com.flyersoft.moonreaderp` / versionName `9.7`。同一 URI `507` 启动先进入 `ActivityTxt`，但拉起 `ClickTip` 时复现 `FATAL EXCEPTION: GoldenBoot` / `NullPointerException: println needs a message`，系统回到 LinReads task；作为入口风险留证。随后 fallback 到同源 EPUB URI `content://media/external/file/460`，通过 overflow `Visual Options` 设置字号 `32.0` 和 lineSpace `12`（反编译 `A.setLineSpace()` 映射约 `2.2x`），强停重开 `TotalTime=1179ms`
+- MoonReader S3 采样：XML 不暴露正文 text nodes，本机 `tesseract` 只有 `eng/osd/snum` 且对可视 `RFMR-CJK` marker OCR 不可靠，因此 marker 统计不冒充机器证据。截图/contact sheet 人工可视确认 pages `0..25` 从 `RFMR-CJK-001..048` 推进到 `RFMR-MIX-037`，非空白，但 CJK 低视力页明显更稀疏，常见约 1-3 个 marker/页；采样后 PSS `57260KB`，gfx p90/p95 窗口为 `133/200ms` 与 `65/200ms`，logcat 仍有 `WindowLeaked` 噪声但 post-sampling 未见 MoonReader fatal
+- 文档回填：更新 `docs/research/moonreader-linreads-extreme-reading-comparison.md`、`docs/tracking/ACTIVE.md`。边界：S3 已有 AVD 阶段性对比，但 S4/S5/S7/S8、物理平板低视力阅读、真实 TalkBack speech/focus、真实 DocumentsUI/OEM picker、真实 Calibre LAN/认证和真实性能 benchmark 仍待补；goal 不标 complete
+
 ### MoonReader vs LinReads Dev build #124 shared-corpus release rerun + staged simulation
 - 范围：继续推进“静读天下 vs LinReads 功能层模拟对比”目标，并补用户要求的 VERIFY/PARTIAL 当前可模拟项。当前仍只有 `emulator-5554` / `sdk_gphone64_arm64` 在线，Android 16 / API 36，tablet-like override `1600x2560` density `320`，不声明真实平板。证据根：`/tmp/readflow-dev124-release-compare-20260627/`
 - LinReads release artifact：`dev-latest` / `Dev build #124` / commit `6fa6d2b`，下载 APK `/tmp/readflow-dev124-release-compare-20260627/apk/app-ota.apk`，大小约 `9.3M`，SHA-256 `29fa2db2e576e0ed98b0a25d989d9263f78bbc6758f5b43e20f18d4dbdfb6cd7`。新推同源语料到 `/sdcard/Download/rfmr-dev124/`，MediaStore URI 为 EPUB `content://media/external/file/466`、TXT `467`、PDF `468`
