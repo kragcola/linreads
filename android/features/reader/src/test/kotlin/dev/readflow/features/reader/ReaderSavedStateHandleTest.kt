@@ -50,6 +50,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.decodeFromString
@@ -340,15 +341,18 @@ class ReaderSavedStateHandleTest {
         val engine = FakeReaderEngine(
             initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10)),
         )
+        val progressDao = FakeProgressDao()
         val viewModel = readerViewModel(
             handle = SavedStateHandle(),
             engine = engine,
+            progressDao = progressDao,
         )
 
         viewModel.onIntent(ReaderIntent.OpenById("book-1"))
         advanceUntilIdle()
         viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.ANNOTATIONS))
         advanceUntilIdle()
+        progressDao.clear()
 
         viewModel.onIntent(
             ReaderIntent.GoToAnnotation(
@@ -363,12 +367,99 @@ class ReaderSavedStateHandleTest {
                 ),
             ),
         )
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(target, engine.currentLocator.value)
         assertEquals(listOf(target), engine.goToLocators)
         assertNull(viewModel.uiState.value.activePanel)
         assertEquals(false, viewModel.uiState.value.isUiVisible)
+        assertSavedProgress(progressDao, target)
+    }
+
+    @Test
+    fun `go to bookmark persists Room progress without waiting for debounce`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val target = Locator(
+            LocatorStrategy.Section(spineIndex = 0, elementIndex = 12, charOffset = 6),
+            totalProgression = 0.41f,
+        )
+        val progressDao = FakeProgressDao()
+        val engine = FakeReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.BOOKMARKS))
+        advanceUntilIdle()
+        progressDao.clear()
+
+        viewModel.onIntent(
+            ReaderIntent.GoToBookmark(
+                ReaderBookmarkItem(
+                    id = "bookmark-1",
+                    locator = target,
+                    label = "书签 41%",
+                    totalProgression = 0.41f,
+                    createdAt = 123L,
+                ),
+            ),
+        )
+        runCurrent()
+
+        assertEquals(target, engine.currentLocator.value)
+        assertEquals(listOf(target), engine.goToLocators)
+        assertNull(viewModel.uiState.value.activePanel)
+        assertEquals(false, viewModel.uiState.value.isUiVisible)
+        assertSavedProgress(progressDao, target)
+    }
+
+    @Test
+    fun `go to search result persists Room progress without waiting for debounce`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val target = Locator(
+            LocatorStrategy.Section(spineIndex = 0, elementIndex = 18, charOffset = 32),
+            totalProgression = 0.58f,
+        )
+        val progressDao = FakeProgressDao()
+        val engine = FakeReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        progressDao.clear()
+
+        viewModel.onIntent(
+            ReaderIntent.GoToSearchResult(
+                ReaderSearchResult(index = 0, locator = target),
+            ),
+        )
+        runCurrent()
+
+        val saved = progressDao.savedProgress("book-1")
+        assertNotNull(saved)
+        assertEquals(target, Json.decodeFromString<Locator>(saved!!.locatorJson))
+        assertEquals(0.58f, saved.totalProgression)
+        assertEquals("device-id", saved.deviceId)
+    }
+
+    private fun assertSavedProgress(progressDao: FakeProgressDao, target: Locator) {
+        val saved = progressDao.savedProgress("book-1")
+        assertNotNull(saved)
+        assertEquals(target, Json.decodeFromString<Locator>(saved!!.locatorJson))
+        assertEquals(target.totalProgression ?: 0f, saved.totalProgression)
+        assertEquals("device-id", saved.deviceId)
     }
 
     private fun readerViewModel(
@@ -554,6 +645,9 @@ class ReaderSavedStateHandleTest {
             this.progress[progress.bookId] = progress
         }
         fun savedProgress(bookId: String): ReadingProgressEntity? = progress[bookId]
+        fun clear() {
+            progress.clear()
+        }
     }
 
     private class FakeSyncBackend(

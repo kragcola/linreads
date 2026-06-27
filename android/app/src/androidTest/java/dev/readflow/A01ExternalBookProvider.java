@@ -139,6 +139,10 @@ public final class A01ExternalBookProvider extends ContentProvider {
     private byte[] bytesFor(Uri uri) {
         switch (extensionFor(uri)) {
             case "txt":
+                String fileName = fileNameFor(uri);
+                if (fileName.startsWith("s7-offline-")) {
+                    return s7TxtBytes(fileName);
+                }
                 return (TXT_SENTINEL + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8);
             case "md":
             case "markdown":
@@ -151,6 +155,34 @@ public final class A01ExternalBookProvider extends ContentProvider {
             default:
                 return new byte[0];
         }
+    }
+
+    private byte[] s7TxtBytes(String fileName) {
+        String title = fileName;
+        int dot = title.lastIndexOf('.');
+        if (dot >= 0) {
+            title = title.substring(0, dot);
+        }
+        String selectedText = "S7SelectedText" + title.replace("-", "");
+        StringBuilder builder = new StringBuilder();
+        for (int index = 0; index < 32; index++) {
+            if (index > 0) {
+                builder.append("\n\n");
+            }
+            String padded = String.format(Locale.US, "%03d", index);
+            if (index == 18) {
+                builder.append("S7 paragraph ")
+                    .append(padded)
+                    .append(" centers ")
+                    .append(selectedText)
+                    .append(" proof.");
+            } else {
+                builder.append("S7 paragraph ")
+                    .append(padded)
+                    .append(" keeps offline search bookmark annotation evidence stable.");
+            }
+        }
+        return builder.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
     }
 
     private byte[] epubBytes() {

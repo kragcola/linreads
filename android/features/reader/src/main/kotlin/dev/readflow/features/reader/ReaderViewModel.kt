@@ -284,7 +284,7 @@ class ReaderViewModel(
         val engine = _uiState.value.engine ?: return
         viewModelScope.launch {
             engine.goTo(locator)
-            currentBookId?.let { persistReaderState(bookId = it, locator = locator) }
+            persistExplicitNavigation(engine, locator)
         }
         updateUiStateAndPersist { it.copy(activePanel = null) }
     }
@@ -293,7 +293,7 @@ class ReaderViewModel(
         val engine = _uiState.value.engine ?: return
         viewModelScope.launch {
             engine.goToTocEntry(entry)
-            currentBookId?.let { persistReaderState(bookId = it, locator = engine.currentLocator.value) }
+            persistExplicitNavigation(engine, engine.currentLocator.value)
         }
         updateUiStateAndPersist { it.copy(activePanel = null, isUiVisible = false) }
     }
@@ -327,7 +327,7 @@ class ReaderViewModel(
         val engine = _uiState.value.engine ?: return
         viewModelScope.launch {
             engine.goTo(bookmark.locator)
-            currentBookId?.let { persistReaderState(bookId = it, locator = bookmark.locator) }
+            persistExplicitNavigation(engine, bookmark.locator)
         }
         updateUiStateAndPersist { it.copy(activePanel = null, isUiVisible = false) }
     }
@@ -367,7 +367,7 @@ class ReaderViewModel(
         val engine = _uiState.value.engine ?: return
         viewModelScope.launch {
             engine.goTo(annotation.start)
-            currentBookId?.let { persistReaderState(bookId = it, locator = annotation.start) }
+            persistExplicitNavigation(engine, annotation.start)
         }
         updateUiStateAndPersist { it.copy(activePanel = null, isUiVisible = false) }
     }
@@ -438,7 +438,7 @@ class ReaderViewModel(
         val engine = _uiState.value.engine ?: return
         viewModelScope.launch {
             engine.goTo(result.locator)
-            currentBookId?.let { persistReaderState(bookId = it, locator = result.locator) }
+            persistExplicitNavigation(engine, result.locator)
         }
         updateUiStateAndPersist {
             it.copy(
@@ -447,6 +447,13 @@ class ReaderViewModel(
                 isUiVisible = false,
             )
         }
+    }
+
+    private suspend fun persistExplicitNavigation(engine: ReaderEngine, locator: Locator) {
+        val bookId = currentBookId ?: return
+        persistProgress(bookId, locator, settings.deviceId.first())
+        persistReaderState(bookId = bookId, locator = locator)
+        saveEngineStateIfPresent(bookId, engine)
     }
 
     private fun clearSearch() {

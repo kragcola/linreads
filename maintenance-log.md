@@ -6,6 +6,17 @@
 
 ## 2026-06-27
 
+### LinReads TXT offline S7 deep proof and locator race fix
+- 范围：继续按当前目标路线执行，在线内容/Calibre 暂不管理，真实设备验收后置；本轮只打磨离线 reader S7 搜索/书签/标注链路，并用 JVM/Robolectric/AVD 模拟机证据回填。没有声明静读天下两端完整 S7 终局，也没有做真机/TalkBack/性能结论
+- 失败复现：`TxtS7SearchBookmarkAnnotationRuntimeSmokeTest#txtSearchBookmarkAndAnnotationPersistAcrossReopenRuntime` 先前在 `readflow_test(AVD) - 16` 失败于 `bookmark.totalProgression > 0.15f`，说明搜索跳转已可见/进度已落库，但新建书签仍可能锚到旧的书首 locator
+- 根因：Reader 显式跳转原先只同步 `SavedStateHandle`，Room `reading_progress` 要等 `watchProgress()` 2 秒 debounce；已补 `persistExplicitNavigation()` 让搜索结果、TOC、书签、标注跳转立即写 Room progress、reader state 和 engine state。进一步定位到 TXT engine：`goTo()` 设置目标 locator 后，RecyclerView 可能用旧 first-visible 位置触发 `onScrolled()`，把 `currentLocator` 短暂写回旧位置；用户马上添加书签时会读取这个旧 locator
+- 修复：`TxtVirtualPagerEngine` 增加 `PendingProgrammaticScroll`，程序化 `goTo()` 后按跳转方向忽略目标之前/之后的 stale scroll report，直到目标位置或新的真实位置出现再恢复正常 progress report；`openBook()` / `close()` 清理 pending 状态，避免跨书残留
+- S7 smoke 加固：`A01ExternalBookProvider` 对 `s7-offline-*.txt` 生成 32 段确定性 TXT 语料，第 18 段含唯一 `S7SelectedText...` marker；`TxtS7SearchBookmarkAnnotationRuntimeSmokeTest` 改走 repo-owned test ContentProvider，覆盖 ACTION_VIEW TXT 导入/打开、搜索唯一 marker、点击结果跳转、添加书签、长按保存笔记、重开书库、书签/标注存在和标注跳回；reset 改为 Room `clearAllTables()`，避免直接删 DB 文件与 Room 连接竞争
+- RED/GREEN：RED `./gradlew -Preadflow.phase=2 :render:txt:testDebugUnitTest --tests "dev.readflow.render.txt.TxtVirtualPagerEngineTest.goTo ignores stale pre-scroll position reports while target scroll settles"` 先失败为跳到 paragraph 18 后 locator 又回到 page/index 0；GREEN 后 `./gradlew -Preadflow.phase=2 :render:txt:testDebugUnitTest --tests "dev.readflow.render.txt.TxtVirtualPagerEngineTest" :features:reader:testDebugUnitTest --tests "dev.readflow.features.reader.ReaderSavedStateHandleTest"` 通过
+- AVD 验证：`PATH="/Volumes/OmubotDisk/Applications/sdk/platform-tools:$PATH" ./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.readflow.s7.TxtS7SearchBookmarkAnnotationRuntimeSmokeTest#txtSearchBookmarkAndAnnotationPersistAcrossReopenRuntime` 通过；JUnit XML `android/app/build/outputs/androidTest-results/connected/debug/TEST-readflow_test(AVD) - 16-_app-.xml` 记录 `tests=1 failures=0 errors=0 skipped=0`、device `readflow_test(AVD) - 16`、timestamp `2026-06-27T11:22:56`、testcase time `31.306s`
+- 文档回填：更新 `docs/research/moonreader-linreads-extreme-reading-comparison.md` 和 `docs/tracking/ACTIVE.md`，把 S7 状态调整为“LinReads TXT offline proxy 已绿，但同源两端 S7 仍未最终完成”；下一步仍是当前 `dev-latest` 复跑同源 S4，并扩展 S7 到 MoonReader/EPUB/MD/PDF
+- 边界：本轮是 debug/test APK + AVD instrumentation + JVM/Robolectric 证据；设备上 app external evidence 目录未能在测试后拉取，最终以 Gradle 输出、JUnit XML、HTML report 与 logcat finished 作为权威通过证据。仍不是真实平板、真实 DocumentsUI/OEM picker、真人 TalkBack speech/focus、真实性能 benchmark 或 MoonReader 同源 S7 persistence 证据；goal 继续 active
+
 ### Offline local import stable ID polish
 - 范围：按新的目标路线执行，在线内容/Calibre 暂不管理，真实设备验收后置；当前全部精力投入离线模块，并用 JVM/Robolectric/AVD 模拟机证据推进。对比文档里的 LinReads S4 同文件强停重开回书首被拆为离线外部文件导入稳定性问题处理
 - 根因：`LocalFileBookSource.import()` 每次导入外部 URI 都用 `UUID.randomUUID()` 生成新的 `bookId` 和私有文件名；因此同一 `ACTION_VIEW` 文件再次打开会被当作新书，进度、书签、标注都会落在旧 `bookId`，表现为同入口重开回书首

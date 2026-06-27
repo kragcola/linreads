@@ -141,6 +141,40 @@ class TxtVirtualPagerEngineTest {
         assertEquals(expectedAnchor, engine.pageIndexForLocator(engine.currentLocator.value))
     }
 
+    @Test
+    fun `goTo ignores stale pre-scroll position reports while target scroll settles`() = runTest {
+        val context = RuntimeEnvironment.getApplication()
+        val lines = (0 until 40).map { index ->
+            "Readflow explicit navigation paragraph %03d keeps bookmark anchors stable.".format(index)
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-engine-goto-", suffix = ".txt").toFile()
+        file.writeText(lines.joinToString("\n\n"), charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(1080, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(2400, android.view.View.MeasureSpec.EXACTLY),
+        )
+        view.layout(0, 0, 1080, 2400)
+        val layoutManager = view.layoutManager as LinearLayoutManager
+        assertEquals(0, layoutManager.findFirstVisibleItemPosition())
+
+        engine.goTo(Locator(LocatorStrategy.Section(spineIndex = 0, elementIndex = 18, charOffset = 0)))
+        assertEquals(18, engine.pageIndexForLocator(engine.currentLocator.value))
+
+        layoutManager.scrollToPositionWithOffset(0, 0)
+        view.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(1080, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(2400, android.view.View.MeasureSpec.EXACTLY),
+        )
+        view.layout(0, 0, 1080, 2400)
+        engine.reportProgressionForTest(view)
+
+        assertEquals(18, engine.pageIndexForLocator(engine.currentLocator.value))
+    }
+
     private fun TxtVirtualPagerEngine.forceCurrentLocatorForTest(locator: Locator) {
         @Suppress("UNCHECKED_CAST")
         val currentLocator = TxtVirtualPagerEngine::class.java
@@ -148,6 +182,13 @@ class TxtVirtualPagerEngineTest {
             .apply { isAccessible = true }
             .get(this) as MutableStateFlow<Locator>
         currentLocator.value = locator
+    }
+
+    private fun TxtVirtualPagerEngine.reportProgressionForTest(view: RecyclerView) {
+        TxtVirtualPagerEngine::class.java
+            .getDeclaredMethod("reportProgression", RecyclerView::class.java)
+            .apply { isAccessible = true }
+            .invoke(this, view)
     }
 
     private fun RecyclerView.centeredAdapterPosition(layoutManager: LinearLayoutManager): Int {

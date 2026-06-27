@@ -24,9 +24,9 @@ online hardware evidence is still only `emulator-5554`
 | S4 mode anchor | Explicit-component AVD route tested scroll-to-mid-book, mode switch, forced-stop, and reopen. | MoonReader preserved sampled position better after restart. LinReads kept near-anchor on immediate `滚动 -> 分页`, but the same shell `ACTION_VIEW` reopen returned to the book start, so this route blocks a strong S4 pass claim. |
 | S5 gestures | AVD taps/swipes/toolbar toggle sampled for both apps. | LinReads has marker-level XML proof for left/right swipes, tap zones, and chrome show/hide. MoonReader has status/screenshot proof for basic page gestures and toolbar toggle. Pinch is not claimed from shell automation. |
 | S6 PDF | LinReads release opened generated PDF and swiped from page 1 to page 4; MoonReader crashed on same PDF. | LinReads wins this corpus PDF route. MoonReader PDF must be rechecked on real device and broader PDFs before making a product-wide PDF claim. |
-| S7 search / TOC / bookmark / annotation | LinReads proved TOC and bookmark UI/add/list reachability; MoonReader proved search dialog reachability. | S7 remains the thinnest comparison: neither app has a same-corpus black-box proof for search-result jump plus selection/highlight/note persistence. |
+| S7 search / TOC / bookmark / annotation | LinReads proved TOC and bookmark UI/add/list reachability in the shared-corpus AVD pass, then a focused LinReads TXT offline S7 AVD instrumentation proof passed on debug/test APK. MoonReader proved search dialog reachability only. | LinReads now has a same-app offline TXT proxy for search-result jump, bookmark, note/annotation, reopen, and annotation jump persistence. This is not yet a same-corpus two-app S7 verdict; MoonReader bookmark/highlight persistence and LinReads EPUB/MD/PDF variants still need follow-up evidence. |
 | S8 accessibility proxy | AVD TalkBack settings toggled for both apps; XML snapshots captured reader/chrome/panel nodes. | LinReads exposes body text nodes and reader controls better in XML. MoonReader exposes mostly status/resource IDs. Neither result is human TalkBack speech/focus traversal. |
-| Offline polish from comparison | LinReads local import now uses stable content-derived IDs instead of random UUIDs, and repeated stable local upserts preserve existing shelf state; focused JVM test and AVD A01 repeated `ACTION_VIEW` smoke pass. | This directly addresses the likely root cause of same-file external reopen losing the prior `bookId`; physical-device proof is intentionally deferred. |
+| Offline polish from comparison | LinReads local import now uses stable content-derived IDs instead of random UUIDs, repeated stable local upserts preserve existing shelf state, explicit reader jumps persist Room progress immediately, and TXT programmatic `goTo()` ignores stale pre-scroll position reports. Focused JVM/Robolectric tests and AVD A01/S7 smokes pass. | This directly addresses the likely root causes of same-file external reopen losing the prior `bookId` and S7 bookmark/annotation anchors landing at the old position; physical-device proof is intentionally deferred. |
 | Simulated VERIFY/PARTIAL items | LinReads A-02/A-03/SAF staged smokes ran on debug/test APK with ActivityMonitor and AVD instrumentation. | Useful regression proxy only. Online/Calibre content is intentionally out of scope for the current offline polish pass. |
 
 ## Improvement And Follow-up Backlog
@@ -37,7 +37,7 @@ real-device quality verdict rather than an AVD-stage report.
 | Priority | Item | Needed evidence | Current owner/risk |
 | --- | --- | --- | --- |
 | P0 | Real tablet rerun for S1-S6/S8 | Physical tablet screenshots/video notes, logcat, real touch route, and same corpus through system file manager / DocumentsUI. | Missing because no physical tablet was connected during these runs. |
-| P0 | S7 deep proof | For both apps: search a known RFMR marker, tap a concrete result row, prove marker jump, add bookmark, force-stop/reopen, prove bookmark persists, create highlight/note if supported, reopen and prove persistence. | Current ADB run only proved UI reachability. LinReads likely needs result-row tapping after `执行搜索`; MoonReader body XML exposure may force screenshot/video evidence. |
+| P0 | S7 deep proof | For both apps: search a known RFMR marker, tap a concrete result row, prove marker jump, add bookmark, force-stop/reopen, prove bookmark persists, create highlight/note if supported, reopen and prove persistence. | LinReads TXT offline proxy is now green on AVD instrumentation, but the same-corpus two-app proof is still incomplete. MoonReader body XML exposure may force screenshot/video evidence, and LinReads EPUB/MD/PDF S7 variants remain unproven. |
 | P0 | LinReads same-file reopen anchor | Re-run S4 on current `dev-latest` after stable local import IDs, then later repeat on physical tablet through library open and file-manager open. | Root cause candidate fixed: local imports no longer create a new random `bookId` for the same bytes. Evidence: `LocalFileBookSourceTest` and AVD `A01IncomingBookRuntimeSmokeTest#repeatedActionViewOfSameExternalFileReusesStableOfflineBookRow`. |
 | P1 | Human TalkBack traversal | Record actual spoken/focused order for library card, reader surface, chrome, TOC/search/bookmark/annotation panels, and body reading. | XML proxy favors LinReads, but speech/focus remains unverified. |
 | P1 | Real performance benchmark | Release APK on physical tablet/phone with stable thermal state: cold open, PSS, frame pacing for EPUB/TXT/PDF, and low-vision page turns. | Current A-02 values are noisy AVD instrumentation proxies and cannot be used as user-facing performance verdicts. |
@@ -70,6 +70,26 @@ Validation:
 - GREEN after fix: `./gradlew :extensions:api:testDebugUnitTest` passes.
 - Repository guard: `./gradlew -Preadflow.phase=2 :core:database:testDebugUnitTest --tests "dev.readflow.core.database.DownloadedBookCacheTest.repositoryPreservesLocalShelfStateWhenStableImportIsUpsertedAgain"` passes after failing against plain `REPLACE` semantics.
 - AVD focused smoke: `./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.readflow.a01.A01IncomingBookRuntimeSmokeTest#repeatedActionViewOfSameExternalFileReusesStableOfflineBookRow` passes on `readflow_test(AVD) - 16`.
+
+The second offline polish item from the comparison route is complete at code
+level for LinReads TXT: explicit navigation from search/bookmark/annotation now
+persists Room progress immediately instead of waiting for the 2-second progress
+debounce, and TXT programmatic `goTo()` no longer lets stale RecyclerView
+pre-scroll callbacks overwrite the target locator before the target scroll has
+settled. This fixes the S7 failure mode where search visibly jumped to the
+target paragraph but the newly created bookmark could still be anchored near
+the old top-of-book locator.
+
+Validation:
+
+- RED before fix: `:render:txt:testDebugUnitTest --tests "dev.readflow.render.txt.TxtVirtualPagerEngineTest.goTo ignores stale pre-scroll position reports while target scroll settles"` failed with locator page index `0` after a programmatic jump to paragraph `18`.
+- GREEN after fix: `./gradlew -Preadflow.phase=2 :render:txt:testDebugUnitTest --tests "dev.readflow.render.txt.TxtVirtualPagerEngineTest" :features:reader:testDebugUnitTest --tests "dev.readflow.features.reader.ReaderSavedStateHandleTest"` passes.
+- AVD S7 focused smoke: `./gradlew -Preadflow.phase=2 :app:installDebug :app:installDebugAndroidTest :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=dev.readflow.s7.TxtS7SearchBookmarkAnnotationRuntimeSmokeTest#txtSearchBookmarkAndAnnotationPersistAcrossReopenRuntime` passes on `readflow_test(AVD) - 16`; JUnit XML records `tests=1 failures=0 errors=0`, timestamp `2026-06-27T11:22:56`, test time `31.306s`.
+
+Boundary: this is a LinReads debug/test APK AVD instrumentation proxy using a
+TXT offline corpus from the repo-owned test ContentProvider. It is not Moon+
+Reader evidence, not EPUB/MD/PDF S7 coverage, not physical-tablet evidence, and
+not human TalkBack speech/focus traversal.
 
 ## Current Evidence State
 
@@ -340,7 +360,7 @@ Fill this only with evidence from the exact shared corpus.
 | S4 mode anchor | Dev build #126 explicit component AVD: scroll-mode mid-book markers `RFMR-LATIN-064..090`; `滚动 -> 分页` landed near `RFMR-LATIN-061..080`, so immediate anchor drift was small. However forced-stop + explicit same-file `ACTION_VIEW` reopen exposed only the chapter heading, and switching back to `滚动` returned to `RFMR-CJK-001..027`; persisted mid-book progress was not proven on this shell entry route. | 1 | Local Moon+ Reader Pro explicit component AVD: status-bar/screenshot evidence moved from `RFMR Invisible Spacer Stress (2/7)` / `2.7%` to `RFMR Mixed Safe Styles (3/5)` / `27.3%`; forced-stop + reopen returned to the same `27.3%` status. Body text still not exposed in XML. | 2 | Moon+ wins this AVD S4 sample on persisted position. LinReads kept the immediate mode-switch anchor but failed the process-restart part of the scenario in this route. |
 | S5 gestures | Dev build #126 explicit component AVD: in `分页`, left swipes advanced CJK pages `001..020 -> 021..040 -> 041..048`, right swipe returned to `021..040`; right-zone tap advanced and left-zone tap returned; center tap showed/hidden chrome without changing markers. Pinch not covered by shell pass. | 2 | Local Moon+ Reader Pro: center tap toggled toolbar; swipe status moved `RFMR Mixed Safe Styles (3/4)` / `27.3%` to `(4/4)` / `31.9%`, then back to `(3/4)` / `27.3%`. Tap-zone evidence is weaker because XML exposes only status/progress. | 2 | Partial tie on AVD. LinReads has stronger marker-level XML evidence; Moon+ shows mature basic gesture behavior through status/screenshot evidence. |
 | S6 PDF page-turn | Dev build #124 release: three left swipes advanced from page 1 to page 4; XML exposed `第 4 页，共 20 页`, after-page PSS `96976KB`, gfx p90/p95 `133/150ms`, no app-fatal grep hit. | 2 | Cannot complete because S1 PDF crashes. | 0 | LinReads wins on this corpus. |
-| S7 search/annotation | Dev build #126 explicit component AVD: TOC listed expected RFMR chapters; top bookmark action changed `添加书签` to `移除书签`, and bookmark panel exposed `书签 0%` / jump / delete actions. Annotation panel showed `暂无标注`. Search UI accepted `RFMR-LATIN-080` and exposed `执行搜索` / `清空搜索`, but Enter/search/button attempts did not prove a jump away from chapter 1. | 1 | Local Moon+ Reader Pro: toolbar reachable and Android search key opened a `Search` dialog with `keyEdit` / history / options nodes. Bookmark add/list and annotation/highlight were not proven by automation. | 1 | No clear winner. LinReads has stronger TOC/bookmark XML; both lack a proven search hit jump or selection/highlight persistence in this black-box pass. |
+| S7 search/annotation | Dev build #126 explicit component shared-corpus AVD: TOC listed expected RFMR chapters; top bookmark action changed `添加书签` to `移除书签`, and bookmark panel exposed `书签 0%` / jump / delete actions. Search UI accepted `RFMR-LATIN-080`, but this black-box pass did not prove a jump away from chapter 1. Follow-up LinReads TXT offline AVD instrumentation now passes search-result jump, bookmark persistence, note/annotation persistence, reopen from library, and annotation jump persistence on debug/test APK. | 1 | Local Moon+ Reader Pro: toolbar reachable and Android search key opened a `Search` dialog with `keyEdit` / history / options nodes. Bookmark add/list and annotation/highlight were not proven by automation. | 1 | No clear winner for the same-corpus two-app S7 comparison. LinReads has a green TXT offline proxy after fixing explicit navigation/TXT goTo locator races, but MoonReader S7 persistence and cross-format LinReads S7 remain open. |
 | S8 TalkBack | Dev build #126 AVD TalkBack settings-on proxy: `enabled_accessibility_services=TalkBack`, `accessibility_enabled=1`, `touch_exploration_enabled=1`, then restored to `null/0/0`. XML exposed reader label, CJK body text nodes, progress/chrome, TOC/search/bookmark/annotation/font/theme labels. Not human speech/focus-order evidence. | 2 | Local Moon+ Reader Pro AVD TalkBack proxy: settings toggled/restored, but XML exposed mostly status/progress/resource IDs; body text was still not exposed as standard text nodes. No human speech/focus-order evidence. | 1 | LinReads wins the proxy pass on machine-readable text and labels, but real TalkBack speech traversal is still required. |
 
 ## Next Execution Steps
@@ -349,9 +369,9 @@ Fill this only with evidence from the exact shared corpus.
    connected.
 2. Run real TalkBack speech/focus traversal and real DocumentsUI/OEM file
    manager entry on physical devices; keep XML/action proxy evidence separate.
-3. Re-run S7 manually enough to prove search hit jump and text
-   selection/highlight/note persistence for both apps, because the AVD shell run
-   only proved UI reachability.
+3. Extend S7 beyond the current LinReads TXT offline proxy: repeat on EPUB/MD/PDF
+   where applicable, and run MoonReader with screenshot/video evidence if XML
+   still does not expose body text.
 4. Keep AVD, physical tablet, TalkBack speech, and performance claims separate
    in the result table.
 
@@ -361,8 +381,10 @@ This document is the comparison protocol and current evidence map. It is not yet
 the final comparison result because the shared-corpus run is still only an AVD
 partial pass: S3/S4/S5/S7/S8 now have AVD follow-up evidence but still lack
 physical-tablet confirmation, real file-manager/DocumentsUI entry, and human
-TalkBack speech/focus traversal. S7 is still weak because search hit jumping and
-selection/highlight/note persistence were not proven. Moon+ PDF crashes before
-page-turn testing, the staged LinReads A-02/A-03/SAF/Calibre checks are
-debug/test APK simulations rather than release or real-device proof, and no
-physical tablet or real TalkBack speech run is recorded.
+TalkBack speech/focus traversal. S7 is stronger for LinReads TXT after the
+focused offline AVD smoke, but it is still incomplete as a same-corpus two-app
+comparison because MoonReader search/bookmark/highlight persistence and LinReads
+EPUB/MD/PDF variants were not proven. Moon+ PDF crashes before page-turn
+testing, the staged LinReads A-02/A-03/SAF/Calibre checks are debug/test APK
+simulations rather than release or real-device proof, and no physical tablet or
+real TalkBack speech run is recorded.

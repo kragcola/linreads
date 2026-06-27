@@ -80,6 +80,7 @@ class TxtVirtualPagerEngine(
     private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
     private var recyclerView: RecyclerView? = null
     private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
+    private var pendingProgrammaticScroll: PendingProgrammaticScroll? = null
     private val activePageTextViews = Collections.newSetFromMap(WeakHashMap<TextView, Boolean>())
     private val activePageContainers = Collections.newSetFromMap(WeakHashMap<FrameLayout, Boolean>())
 
@@ -87,6 +88,7 @@ class TxtVirtualPagerEngine(
 
     override suspend fun openBook(uri: Uri): Locator = withContext(Dispatchers.IO) {
         txtDocument?.close()
+        pendingProgrammaticScroll = null
         val requiresFingerprint = pendingEngineState != null
         val copied = resolveReadableFile(uri, requiresFingerprint)
         val document = TxtDocument.index(
@@ -197,6 +199,13 @@ class TxtVirtualPagerEngine(
         if (total == 0) return
         val lm = rv.layoutManager as? LinearLayoutManager ?: return
         val first = lm.findFirstVisibleItemPosition().coerceAtLeast(0)
+        val pending = pendingProgrammaticScroll
+        if (pending != null) {
+            if (pending.isStaleReport(first)) {
+                return
+            }
+            pendingProgrammaticScroll = null
+        }
         _currentLocator.value = locatorForIndex(first, total)
     }
 
@@ -212,6 +221,10 @@ class TxtVirtualPagerEngine(
         }.coerceIn(0, total - 1)
         val target = locatorForIndex(index, total)
         recyclerView?.let { rv ->
+            pendingProgrammaticScroll = PendingProgrammaticScroll(
+                fromIndex = currentVisibleParagraphIndex() ?: currentParagraphIndex(),
+                targetIndex = index,
+            )
             (rv.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(index, 0)
         }
         _currentLocator.value = target
@@ -273,6 +286,7 @@ class TxtVirtualPagerEngine(
     override suspend fun close() {
         recyclerView = null
         pageRequestCallback = null
+        pendingProgrammaticScroll = null
         activePageTextViews.clear()
         activePageContainers.clear()
         _currentTextSelection.value = null
@@ -474,3 +488,15 @@ private data class CopiedTxtFile(
     val fingerprint: TxtDocumentFingerprint?,
     val deleteOnClose: Boolean,
 )
+
+private data class PendingProgrammaticScroll(
+    val fromIndex: Int,
+    val targetIndex: Int,
+) {
+    fun isStaleReport(reportedIndex: Int): Boolean =
+        when {
+            fromIndex < targetIndex -> reportedIndex < targetIndex
+            fromIndex > targetIndex -> reportedIndex > targetIndex
+            else -> false
+        }
+}
