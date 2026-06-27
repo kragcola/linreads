@@ -11,10 +11,10 @@ claiming a quality or performance difference.
 
 | Area | LinReads | Moon+ Reader Pro |
 | --- | --- | --- |
-| App artifact | S1/S2/S6 shared-corpus release rerun uses `Dev build #124` / commit `6fa6d2b` / APK SHA-256 `29fa2db2e576e0ed98b0a25d989d9263f78bbc6758f5b43e20f18d4dbdfb6cd7`. The S3 low-vision follow-up uses `Dev build #125` / APK SHA-256 `660704e0b976b45d2479d93a9e8f8c964751c8144545f38e6290d38057a5b4d0`. | Local artifact exists as `moonreader-pro.apk`; manifest package is `com.flyersoft.moonreaderp`, versionName `9.7`, versionCode `907005`. |
+| App artifact | S1/S2/S6 shared-corpus release rerun uses `Dev build #124` / commit `6fa6d2b` / APK SHA-256 `29fa2db2e576e0ed98b0a25d989d9263f78bbc6758f5b43e20f18d4dbdfb6cd7`. The S3 low-vision follow-up uses `Dev build #125` / APK SHA-256 `660704e0b976b45d2479d93a9e8f8c964751c8144545f38e6290d38057a5b4d0`. The S4/S5/S7/S8 follow-up installed `dev-latest` / `Dev build #126` APK SHA-256 `b38c0b145a6b1a2239b47aec45996bef3b170d5d2dbb9df8f9f9957ce694659c`. | Local artifact exists as `moonreader-pro.apk`; manifest package is `com.flyersoft.moonreaderp`, versionName `9.7`, versionCode `907005`. |
 | Shared file entry | LinReads `ACTION_VIEW` / `ACTION_SEND` is implemented and has repo-owned AVD ContentProvider smoke evidence, but real file-manager/share-sheet evidence is still missing. | `moonreader-unpacked/AndroidManifest.xml` exposes `ActivityMain` with `ACTION_VIEW` for `text/*`, `application/pdf`, `application/epub+zip`, `application/x-mobipocket-ebook`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `application/x-chm`, `application/x-cbz`, and broad `file` / `content` path patterns. |
 | Reader engine reference | LinReads current high-risk evidence is `PAGE-05` EPUB paged mode, `A-02` performance proxy, `A-03` accessibility proxy, SAF, and Calibre fake-server smoke. | Decompiled reference shows `ActivityTxt` is the reader activity, `MRTextView` is the custom text layout surface, `A.setLineSpace()` maps global line spacing into `MRTextView.setLineSpacing()`, and `PDFReader` is a separate `FrameLayout` path. |
-| Black-box status | Shared-corpus AVD shell `ACTION_VIEW` release rerun exists on `Dev build #124`, covering EPUB/TXT/PDF cold open, LinReads EPUB paged sampling, and PDF page-turn. S3 low-vision AVD follow-up exists on `Dev build #125`. A separate debug/test APK instrumentation rerun covers A-02/A-03/SAF/Calibre simulation only. | Shared-corpus AVD shell `ACTION_VIEW` partial run exists on local `moonreader-pro.apk`, covering EPUB/TXT open, EPUB page taps, S3 low-vision visual sampling, and a PDF crash. |
+| Black-box status | Shared-corpus AVD shell `ACTION_VIEW` release rerun exists on `Dev build #124`, covering EPUB/TXT/PDF cold open, LinReads EPUB paged sampling, and PDF page-turn. S3 low-vision AVD follow-up exists on `Dev build #125`. S4/S5/S7/S8 AVD follow-up exists on `Dev build #126`, using explicit component launch after the system resolver showed multiple handlers. A separate debug/test APK instrumentation rerun covers A-02/A-03/SAF/Calibre simulation only. | Shared-corpus AVD shell `ACTION_VIEW` partial run exists on local `moonreader-pro.apk`, covering EPUB/TXT open, EPUB page taps, S3 low-vision visual sampling, S4/S5/S7/S8 weak evidence, and a PDF crash. |
 
 Evidence anchors already inspected:
 
@@ -26,6 +26,7 @@ Evidence anchors already inspected:
 - `/tmp/readflow-moonreader-linreads-compare-20260627/`: shared-corpus AVD partial comparison evidence from `emulator-5554`.
 - `/tmp/readflow-dev124-release-compare-20260627/`: LinReads `Dev build #124` shared-corpus AVD release rerun plus debug/test APK staged simulation evidence.
 - `/tmp/readflow-s3-low-vision-20260627/`: S3 low-vision typography AVD follow-up for LinReads `Dev build #125` and local Moon+ Reader Pro.
+- `/tmp/readflow-s4-s8-compare-20260627/`: S4/S5/S7/S8 AVD follow-up for LinReads `Dev build #126` and local Moon+ Reader Pro.
 
 ## Shared Corpus
 
@@ -215,6 +216,39 @@ weaker because they are based on saved screenshots/contact sheets, while body
 text was not exposed through accessibility XML and local OCR did not reliably
 extract the visible Latin markers.
 
+## S4/S5/S7/S8 AVD Follow-up
+
+Run date: 2026-06-27. Device: only `emulator-5554`
+(`sdk_gphone64_arm64`) was online, Android 16 / API 36, tablet-like override
+`1600x2560` and density `320`. Evidence root:
+`/tmp/readflow-s4-s8-compare-20260627/`.
+
+`ACTION_VIEW` without a component resolved to the Android Resolver because both
+apps can handle the same EPUB MIME type. The first LinReads S4 attempt therefore
+fell into Moon+ Reader and is treated as invalid mixed-app evidence. Valid
+LinReads follow-up runs explicitly launched `dev.readflow/.MainActivity`; valid
+Moon+ runs explicitly launched `com.flyersoft.moonreaderp/.ActivityMain`.
+
+LinReads used `dev-latest` / `Dev build #126`; the downloaded APK at
+`/tmp/readflow-s4-s8-compare-20260627/apk/app-ota.apk` has SHA-256
+`b38c0b145a6b1a2239b47aec45996bef3b170d5d2dbb9df8f9f9957ce694659c`.
+The same EPUB URI `content://media/external/file/460` was reused.
+
+| Scenario | LinReads evidence | Moon+ Reader Pro evidence |
+| --- | --- | --- |
+| S4 mode anchor | Explicit cold open `TotalTime=1145ms`. After 10 scroll swipes, XML markers were `RFMR-LATIN-064..090`. Switching `滚动 -> 分页` via the visible `排版` panel landed near the same region, `RFMR-LATIN-061..080`, so short-term mode-switch drift was small. Forced-stop and explicit `ACTION_VIEW` reopen `TotalTime=1073ms` exposed only the chapter heading, and returning to `滚动` showed `RFMR-CJK-001..027`; this route did not prove persisted mid-book progress and is recorded as a regression/risk for same-file shell entry. No `dev.readflow` fatal/ANR/OOM/recycled-bitmap hit. | XML does not expose body text nodes, so this is status-bar/screenshot evidence. After overlay dismissal, initial status was `RFMR Invisible Spacer Stress (2/7)` at `2.7%`. Eight right-zone taps reached `RFMR Mixed Safe Styles (3/5)` at `27.3%`. Forced-stop and explicit reopen returned to the same `RFMR Mixed Safe Styles (3/5)` / `27.3%`, so Moon+ preserved this reader position in the sampled AVD route. |
+| S5 gestures | After switching to `分页`, page 0 was a chapter-title page. Three left swipes advanced through CJK pages `001..020`, `021..040`, and `041..048`; one right swipe returned to `021..040`. Right-zone tap advanced to `041..048`; left-zone tap returned to `021..040`. Center tap showed/hidden chrome while markers stayed on `021..040`. Pinch was not claimed in this shell-only pass. | Status-bar/screenshot evidence shows center tap toggled chrome, left swipe advanced `RFMR Mixed Safe Styles (3/4)` / `27.3%` to `(4/4)` / `31.9%`, right swipe returned to `(3/4)` / `27.3%`. Tap-zone evidence is weaker than LinReads because XML exposes only status/progress, not body markers. |
+| S7 search / TOC / bookmark / annotation | Chrome exposed `目录` / `搜索` / `书签` / `标注` / `排版` / `主题`. TOC panel listed `RFMR Invisible Spacer Stress`, `RFMR Mixed Safe Styles`, `RFMR Long Unspaced CJK`, `RFMR Latin Table Stress`, and later short spines. Tapping the top bookmark action changed `添加书签` to `移除书签`; bookmark panel exposed `书签 0%`, `跳转到书签 0%`, and `删除书签 0%`. Annotation panel exposed `暂无标注`. Search panel exposed an `EditText`, `执行搜索`, and `清空搜索`; entering `RFMR-LATIN-080` kept the query visible, but Enter/search/button attempts did not prove a jump away from chapter 1, so search hit/jump remains unproven in this black-box run. | Toolbar was reachable and Search opened via Android search key, exposing a search dialog with `Search`, `keyEdit`, history, and options nodes. The sampled bookmark tap did not produce stable XML evidence of a bookmark add/list. Moon+ annotation/highlight was not proven because text selection was not automated. |
+| S8 accessibility proxy | AVD TalkBack settings were temporarily set to `enabled_accessibility_services=com.google.android.marvin.talkback/...`, `accessibility_enabled=1`, and `touch_exploration_enabled=1`, then restored to `null/0/0`. Reader XML exposed `阅读内容，捏合调整字号`, visible text nodes `RFMR-CJK-001..029`, progress labels, chrome actions, TOC/search/bookmark/annotation/font/theme labels. This is XML/settings proxy evidence only, not human TalkBack speech or full focus-order traversal. | AVD TalkBack settings were also toggled and restored. XML exposed status/progress such as `RFMR Mixed Safe Styles (3/4)` / `27.3%`, resource IDs, and after key traversal status moved to `RFMR Latin Table Stress (2/5)` / `60.7%`. Body text still was not exposed as standard text nodes, so TalkBack readability risk remains higher and unverified by speech. |
+
+Boundary: this follow-up is still AVD automation, explicit component shell
+launch, screenshots, UIAutomator XML, and logcat. It is not a physical-tablet
+reading pass, not real file-manager/DocumentsUI evidence, not human TalkBack
+speech, not real Calibre LAN/auth, and not a production performance benchmark.
+The LinReads S4 persisted-progress issue above is scoped to the explicit
+same-file shell `ACTION_VIEW` route tested here; it does not by itself disprove
+the separate Room locator tests, but it does block a strong S4 pass claim.
+
 ## Moon+ Reader Expected Strengths And Risks To Measure
 
 These are hypotheses derived from local decompiled evidence, not black-box
@@ -239,20 +273,21 @@ Fill this only with evidence from the exact shared corpus.
 | S1 PDF cold open | Dev build #124 release: `TotalTime=1223ms`; XML exposes `第 1 页，共 20 页`; PSS `90979KB`; no app-fatal grep hit. | 2 | `TotalTime=1883ms` then app crashes to launcher with `FATAL EXCEPTION: GoldenBoot` / `NullPointerException: println needs a message`; no process left. | 0 | LinReads wins this corpus PDF. |
 | S2 EPUB stress paging | Dev build #124 release: visible `排版 -> 分页`; sampled pages 0-25. CJK micro paragraphs packed as `20/20/8`; mixed-style pages reached `RFMR-MIX-053`; no sampled CJK one-sentence-page regression. Some `pre` blocks remain isolated by style. | 2 | Ten page taps sampled `RFMR-CJK-001..048` then `RFMR-MIX-001..068`; clean follow-up reached `RFMR-TAIL-001..023`; no blank/one-line sampled page. | 2 | Partial tie on AVD. Moon+ reached tail markers sooner in its tap window; LinReads release now closes the prior same-corpus paged sampling gap. |
 | S3 low-vision typography | Dev build #125 release: `32sp` / `2.20x` / `分页` persisted after forced-stop. Reopen `TotalTime=1102ms`; pages `0..25` XML sampling found 24 positive pages, 7 one-marker pages, CJK pages packed as `9/9/9/9/9/3`, and mixed-style pages reached `RFMR-MIX-046`. PSS `56391KB`, gfx p90/p95 `105/117ms`, no app-fatal grep hit. | 2 | Local Moon+ Reader Pro: Visual Options set font `32.0` and line spacing value `12` (about `2.2x` by `A.setLineSpace()`); forced-stop/reopen `TotalTime=1179ms`. XML did not expose body text and OCR was unreliable, but contact sheets visually show `RFMR-CJK-001..048` then mixed styles to `RFMR-MIX-037`; CJK pages are not blank but are much sparser, commonly about 1-3 visible markers per page. URI `507` also reproduced a `GoldenBoot`/`println needs a message` crash while showing `ClickTip`, so S3 uses fallback URI `460`. | 1 | LinReads wins this AVD S3 pass on machine-verifiable text exposure and page packing. Moon+ remains readable, but lower-density and weaker for accessibility/XML verification under the same 32sp/2.2x target. |
-| S4 mode anchor | pending shared-corpus run | - | pending | - | pending |
-| S5 gestures | pending shared-corpus run | - | pending | - | pending |
+| S4 mode anchor | Dev build #126 explicit component AVD: scroll-mode mid-book markers `RFMR-LATIN-064..090`; `滚动 -> 分页` landed near `RFMR-LATIN-061..080`, so immediate anchor drift was small. However forced-stop + explicit same-file `ACTION_VIEW` reopen exposed only the chapter heading, and switching back to `滚动` returned to `RFMR-CJK-001..027`; persisted mid-book progress was not proven on this shell entry route. | 1 | Local Moon+ Reader Pro explicit component AVD: status-bar/screenshot evidence moved from `RFMR Invisible Spacer Stress (2/7)` / `2.7%` to `RFMR Mixed Safe Styles (3/5)` / `27.3%`; forced-stop + reopen returned to the same `27.3%` status. Body text still not exposed in XML. | 2 | Moon+ wins this AVD S4 sample on persisted position. LinReads kept the immediate mode-switch anchor but failed the process-restart part of the scenario in this route. |
+| S5 gestures | Dev build #126 explicit component AVD: in `分页`, left swipes advanced CJK pages `001..020 -> 021..040 -> 041..048`, right swipe returned to `021..040`; right-zone tap advanced and left-zone tap returned; center tap showed/hidden chrome without changing markers. Pinch not covered by shell pass. | 2 | Local Moon+ Reader Pro: center tap toggled toolbar; swipe status moved `RFMR Mixed Safe Styles (3/4)` / `27.3%` to `(4/4)` / `31.9%`, then back to `(3/4)` / `27.3%`. Tap-zone evidence is weaker because XML exposes only status/progress. | 2 | Partial tie on AVD. LinReads has stronger marker-level XML evidence; Moon+ shows mature basic gesture behavior through status/screenshot evidence. |
 | S6 PDF page-turn | Dev build #124 release: three left swipes advanced from page 1 to page 4; XML exposed `第 4 页，共 20 页`, after-page PSS `96976KB`, gfx p90/p95 `133/150ms`, no app-fatal grep hit. | 2 | Cannot complete because S1 PDF crashes. | 0 | LinReads wins on this corpus. |
-| S7 search/annotation | pending shared-corpus run | - | pending | - | pending |
-| S8 TalkBack | Not run in this shared-corpus pass. XML proxy is strong for text/PDF page label, but this is not TalkBack speech evidence. | - | Not run in this shared-corpus pass. EPUB/TXT text is visible in screenshots but not exposed as standard text nodes in XML, so TalkBack risk remains unverified. | - | Requires real TalkBack traversal. |
+| S7 search/annotation | Dev build #126 explicit component AVD: TOC listed expected RFMR chapters; top bookmark action changed `添加书签` to `移除书签`, and bookmark panel exposed `书签 0%` / jump / delete actions. Annotation panel showed `暂无标注`. Search UI accepted `RFMR-LATIN-080` and exposed `执行搜索` / `清空搜索`, but Enter/search/button attempts did not prove a jump away from chapter 1. | 1 | Local Moon+ Reader Pro: toolbar reachable and Android search key opened a `Search` dialog with `keyEdit` / history / options nodes. Bookmark add/list and annotation/highlight were not proven by automation. | 1 | No clear winner. LinReads has stronger TOC/bookmark XML; both lack a proven search hit jump or selection/highlight persistence in this black-box pass. |
+| S8 TalkBack | Dev build #126 AVD TalkBack settings-on proxy: `enabled_accessibility_services=TalkBack`, `accessibility_enabled=1`, `touch_exploration_enabled=1`, then restored to `null/0/0`. XML exposed reader label, CJK body text nodes, progress/chrome, TOC/search/bookmark/annotation/font/theme labels. Not human speech/focus-order evidence. | 2 | Local Moon+ Reader Pro AVD TalkBack proxy: settings toggled/restored, but XML exposed mostly status/progress/resource IDs; body text was still not exposed as standard text nodes. No human speech/focus-order evidence. | 1 | LinReads wins the proxy pass on machine-readable text and labels, but real TalkBack speech traversal is still required. |
 
 ## Next Execution Steps
 
-1. Complete same-corpus S4/S5/S7/S8 for both apps on AVD where feasible,
-   keeping debug/test APK instrumentation separate from release black-box data.
-2. Repeat the subset S1/S2/S3/S5/S6/S8 on the physical tablet after it is
+1. Repeat the subset S1/S2/S3/S4/S5/S6/S8 on the physical tablet after it is
    connected.
-3. Run real TalkBack speech/focus traversal and real DocumentsUI/OEM file
+2. Run real TalkBack speech/focus traversal and real DocumentsUI/OEM file
    manager entry on physical devices; keep XML/action proxy evidence separate.
+3. Re-run S7 manually enough to prove search hit jump and text
+   selection/highlight/note persistence for both apps, because the AVD shell run
+   only proved UI reachability.
 4. Keep AVD, physical tablet, TalkBack speech, and performance claims separate
    in the result table.
 
@@ -260,8 +295,10 @@ Fill this only with evidence from the exact shared corpus.
 
 This document is the comparison protocol and current evidence map. It is not yet
 the final comparison result because the shared-corpus run is still only an AVD
-partial pass: S3 now has AVD follow-up evidence but still lacks physical-tablet
-confirmation; S4/S5/S7/S8 remain unrun as same-corpus cross-app scenarios,
-Moon+ PDF crashes before page-turn testing, the staged LinReads A-02/A-03/SAF/
-Calibre checks are debug/test APK simulations rather than release or real-device
-proof, and no physical tablet or real TalkBack speech run is recorded.
+partial pass: S3/S4/S5/S7/S8 now have AVD follow-up evidence but still lack
+physical-tablet confirmation, real file-manager/DocumentsUI entry, and human
+TalkBack speech/focus traversal. S7 is still weak because search hit jumping and
+selection/highlight/note persistence were not proven. Moon+ PDF crashes before
+page-turn testing, the staged LinReads A-02/A-03/SAF/Calibre checks are
+debug/test APK simulations rather than release or real-device proof, and no
+physical tablet or real TalkBack speech run is recorded.

@@ -6,6 +6,14 @@
 
 ## 2026-06-27
 
+### MoonReader vs LinReads S4/S5/S7/S8 AVD follow-up
+- 范围：继续推进“静读天下 vs LinReads 功能层模拟对比”的 S4/S5/S7/S8。当前仍只有 `emulator-5554` / `sdk_gphone64_arm64` 在线，Android 16 / API 36，tablet-like override `1600x2560` density `320`，不声明真实平板。证据根：`/tmp/readflow-s4-s8-compare-20260627/`
+- 路由修正：未指定 component 的同源 EPUB `ACTION_VIEW` 会进入 Android Resolver，首轮 LinReads S4 自动化误落到 MoonReader，已作为无效混入证据废弃。有效对比均使用显式 component：LinReads `dev.readflow/.MainActivity`、MoonReader `com.flyersoft.moonreaderp/.ActivityMain`。LinReads 安装 `dev-latest` / `Dev build #126`，APK SHA-256 `b38c0b145a6b1a2239b47aec45996bef3b170d5d2dbb9df8f9f9957ce694659c`
+- S4 mode anchor：LinReads 显式冷启动 `TotalTime=1145ms`，滚动中段 XML 为 `RFMR-LATIN-064..090`，切 `滚动 -> 分页` 后为 `RFMR-LATIN-061..080`，即时锚点漂移小；但强停后显式同文件 `ACTION_VIEW` 重开 `TotalTime=1073ms` 只见章节标题，回切滚动回到 `RFMR-CJK-001..027`，不能证明该入口下中段进度持久化。MoonReader XML 不暴露正文，基于状态栏/截图从 `RFMR Invisible Spacer Stress (2/7)` / `2.7%` 前进到 `RFMR Mixed Safe Styles (3/5)` / `27.3%`，强停重开仍为 `27.3%`
+- S5 gestures：LinReads 分页模式下左滑推进 `RFMR-CJK-001..020 -> 021..040 -> 041..048`，右滑返回 `021..040`，右点击区前进、左点击区后退，中央 tap 显隐 chrome 且 marker 不变。MoonReader 状态栏/截图证明中心 tap 显隐工具栏，左滑从 `RFMR Mixed Safe Styles (3/4)` / `27.3%` 到 `(4/4)` / `31.9%`，右滑返回 `27.3%`。ADB shell 本轮不声明双指 pinch
+- S7/S8：LinReads TOC 列出 RFMR 章节；顶部书签按钮从 `添加书签` 变 `移除书签`，书签面板暴露 `书签 0%` / 跳转 / 删除，标注面板为 `暂无标注`。搜索面板可输入 `RFMR-LATIN-080`，但 Enter/search/button 未证明跳到 LATIN 段，因此搜索命中/跳转保持未证。MoonReader search key 能打开 `Search` / `keyEdit` 对话框，但书签/标注未稳定证明。TalkBack 只做 AVD settings-on XML proxy：LinReads 暴露 reader label、正文 text nodes、进度和各面板标签；MoonReader 主要暴露状态/资源 id，正文仍不暴露为标准 text nodes。两者 TalkBack 设置均恢复 `null/0/0`
+- 文档回填：更新 `docs/research/moonreader-linreads-extreme-reading-comparison.md`、`docs/tracking/ACTIVE.md`。边界：S4/S5/S7/S8 已有 AVD 阶段性对比，但真实平板、真实文件管理器/DocumentsUI、真人 TalkBack speech/focus、真实性能 benchmark、真实 Calibre LAN/认证，以及 S7 搜索跳转/选区高亮/笔记持久化仍待补；goal 不标 complete
+
 ### MoonReader vs LinReads S3 low-vision AVD follow-up
 - 范围：继续推进“静读天下 vs LinReads 功能层模拟对比”的 S3 低视力排版场景。当前仍只有 `emulator-5554` / `sdk_gphone64_arm64` 在线，Android 16 / API 36，tablet-like override `1600x2560` density `320`，不声明真实平板。证据根：`/tmp/readflow-s3-low-vision-20260627/`
 - LinReads release：安装 `Dev build #125` APK `/tmp/readflow-s3-low-vision-20260627/apk/app-ota.apk`，SHA-256 `660704e0b976b45d2479d93a9e8f8c964751c8144545f38e6290d38057a5b4d0`。同源 EPUB 位于 `/sdcard/Download/rfmr-s3/`，MediaStore URI `content://media/external/file/507`。默认冷启动 `TotalTime=1099ms`；设置面板从 `18sp/1.75x` 调到 `32sp/2.20x/分页`，强停重开后 `TotalTime=1102ms`
