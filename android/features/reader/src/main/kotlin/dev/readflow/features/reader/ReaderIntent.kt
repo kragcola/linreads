@@ -9,6 +9,7 @@ import dev.readflow.render.api.ReadingMode
 sealed interface ReaderIntent {
     data class OpenBook(val uri: Uri) : ReaderIntent
     data class OpenById(val bookId: String) : ReaderIntent
+    data object Retry : ReaderIntent
     data object CloseBook : ReaderIntent
     data class GoTo(val locator: Locator) : ReaderIntent
     data class SeekToProgress(val fraction: Float) : ReaderIntent

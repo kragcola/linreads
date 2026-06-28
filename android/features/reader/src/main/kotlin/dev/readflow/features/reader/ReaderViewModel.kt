@@ -96,10 +96,13 @@ class ReaderViewModel(
     private var settingsFontJob: Job? = null
     private var settingsLineSpacingJob: Job? = null
     private var sessionStartedAt: Long? = null
+    // 记录最近一次打开请求，供错误页「重试」复用。
+    private var lastOpenRequest: OpenRequest? = null
 
     fun onIntent(intent: ReaderIntent) = when (intent) {
         is ReaderIntent.OpenById -> openById(intent.bookId)
         is ReaderIntent.OpenBook -> openByUri(null, intent.uri)
+        ReaderIntent.Retry -> retry()
         ReaderIntent.CloseBook -> close()
         is ReaderIntent.GoTo -> goTo(intent.locator)
         is ReaderIntent.SeekToProgress -> seekToProgress(intent.fraction)
@@ -133,7 +136,22 @@ class ReaderViewModel(
         viewModelScope.launch { settings.setReaderGuideShown(true) }
     }
 
+    /** 错误页「重试」：复用最近一次打开请求重新加载。 */
+    private fun retry() {
+        when (val request = lastOpenRequest) {
+            is OpenRequest.ById -> openById(request.bookId)
+            is OpenRequest.ByUri -> openByUri(null, request.uri)
+            null -> Unit
+        }
+    }
+
+    private sealed interface OpenRequest {
+        data class ById(val bookId: String) : OpenRequest
+        data class ByUri(val uri: Uri) : OpenRequest
+    }
+
     private fun openById(bookId: String) {
+        lastOpenRequest = OpenRequest.ById(bookId)
         val restoredForBook = restoredReaderState?.takeIf { it.bookId == bookId }
         _uiState.update { it.copy(loadingState = LoadingState.Loading) }
         currentBookId = bookId
@@ -163,6 +181,10 @@ class ReaderViewModel(
         title: String = "",
         restoredForBook: ReaderState? = restoredReaderState?.takeIf { it.bookId == bookId },
     ) {
+        // openById 已记录 ById 请求；这里只记录直接以 Uri 打开的路径。
+        if (bookId == null) {
+            lastOpenRequest = OpenRequest.ByUri(uri)
+        }
         viewModelScope.launch {
             val engine = runCatching { engineRegistry.resolve(uri) }.getOrElse { error ->
                 val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
@@ -723,8 +745,8 @@ class ReaderViewModel(
         (locator.totalProgression ?: progressPercent).coerceIn(0f, 1f)
 
     private companion object {
-        const val MIN_FONT_SP = 12f
-        const val MAX_FONT_SP = 32f
+        const val MIN_FONT_SP = dev.readflow.core.prefs.ReaderTypography.MIN_FONT_SP
+        const val MAX_FONT_SP = dev.readflow.core.prefs.ReaderTypography.MAX_FONT_SP
         const val MIN_ZOOM_SCALE = 1f
         const val MAX_ZOOM_SCALE = 4f
         const val FONT_PREVIEW_COMMIT_DELAY_MS = 350L

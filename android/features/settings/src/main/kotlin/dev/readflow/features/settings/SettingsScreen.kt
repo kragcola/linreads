@@ -26,6 +26,7 @@ import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
+import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.ui.FontProvider
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -233,14 +234,24 @@ fun SettingsScreen(
             }
 
             Text("字号：${fontSize}sp", style = MaterialTheme.typography.bodyMedium)
-            Slider(value = fontSize.toFloat(), onValueChange = { vm.setFontSize(it.toInt()) },
-                valueRange = 12f..28f, steps = 7, modifier = Modifier.fillMaxWidth())
+            Slider(
+                value = ReaderTypography.clampFontSp(fontSize.toFloat()),
+                onValueChange = { vm.setFontSize(it.toInt()) },
+                valueRange = ReaderTypography.MIN_FONT_SP..ReaderTypography.MAX_FONT_SP,
+                steps = ReaderTypography.FONT_SLIDER_STEPS,
+                modifier = Modifier.fillMaxWidth(),
+            )
             Text("这是 ${fontSize}sp 的正文效果。The quick brown fox.",
                 fontSize = fontSize.sp, color = MaterialTheme.colorScheme.onBackground)
 
             Text("行距：${"%.2f".format(lineSpacing)}x", style = MaterialTheme.typography.bodyMedium)
-            Slider(value = lineSpacing, onValueChange = { vm.setLineSpacing(it) },
-                valueRange = 1.2f..2.2f, steps = 4, modifier = Modifier.fillMaxWidth())
+            Slider(
+                value = ReaderTypography.clampLineSpacing(lineSpacing),
+                onValueChange = { vm.setLineSpacing(it) },
+                valueRange = ReaderTypography.MIN_LINE_SPACING..ReaderTypography.MAX_LINE_SPACING,
+                steps = ReaderTypography.LINE_SPACING_SLIDER_STEPS,
+                modifier = Modifier.fillMaxWidth(),
+            )
 
             Text("阅读模式", style = MaterialTheme.typography.bodyMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

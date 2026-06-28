@@ -18,9 +18,9 @@
 | **首次手势引导** | 进书零引导 → 一次性 coach-marks | P1 | ✅ 已修 | 新增 `SettingsRepository.readerGuideShown` 持久化标志 + `ReaderGestureGuideOverlay`（三区 上翻/呼出菜单/下翻 + 捏合/划选/拖进度条提示）。首开展示、点击关闭、再开不重现，真机验证，3 单测覆盖 |
 | **R2** | FontPanel "阅读正文预览" 标签随阅读字号缩放成巨字 | P3 | ✅ 已修 | 拆成固定字号标签「正文预览」+ 真正按字号缩放的样张「海上生明月…」。真机 30sp 下标签恒 36px、样张 62→102px |
 | **R1** | 顶栏 chrome 与系统状态栏叠字 | P1 | ✅ 已修（上一轮） | document AndroidView 加 `windowInsetsPadding(WindowInsets.systemBars)` |
-| 字号/行距口径不一 | reader 上限 32sp，Settings 28sp；行距下限不一 | P2 | 🔴 待排 | 建议都 12–32sp/1sp、行距下限统一 1.4 |
-| 章节箭头触摸目标 | 裸 `Text("←")` < 48dp | P2 | 🔴 待排 | 升级为 ≥48dp IconButton |
-| reader 错误页 | 直接显示原始异常文本，无重试/返回 | P2 | 🔴 待排 | 加重试+返回按钮，隐藏堆栈 |
+| 字号/行距口径不一 | reader 上限 32sp，Settings 28sp；行距下限不一 | P2 | ✅ 已修 | 抽 `core:prefs/ReaderTypography` 单一真源（12–32sp/1sp、行距 1.4–2.2/0.1），reader VM、clamp、reader FontPanel、Settings 四处全部引用。真机 Settings 字号拖到 32sp、ticks 细化坐实 |
+| 章节箭头触摸目标 | 裸 `Text("←")` < 48dp | P2 | ✅ 已修 | 换 `IconButton` + `KeyboardArrowLeft/Right`，真机实测 上一章/下一章 bounds=96×96px=48×48dp |
+| reader 错误页 | 直接显示原始异常文本，无重试/返回 | P2 | ✅ 已修 | `ReaderErrorContent`：友好文案（隐藏堆栈）+ 重试 + 返回书库；`ReaderIntent.Retry` 复用最近一次 ById/ByUri 打开请求重载。2 单测覆盖。**注：错误页视觉未真机验证**（需缺失文件触发，未在设备复现） |
 | 全书页码缺失 | 底部仅章节%，无 X/Y 页码 | P3 | 🔴 待排 | 底部补全书% + 绝对页码（C4） |
 | 菜单图标复用 | 书签/标注/排版共用铅笔图标 | P3 | 🔴 待排 | 各用区分图标 |
 | 亮度/暖光叠层 | 无阅读内亮度/蓝光过滤 | P3 | 🔴 待排 | 补叠层滑块 |

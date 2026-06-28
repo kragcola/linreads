@@ -367,6 +367,64 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `retry replays the last open-by-id request`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        // 未知 bookId → 打开失败进错误页；getById 被调用一次。
+        val bookDao = FakeBookDao(
+            BookEntity(
+                id = "other",
+                title = "Other",
+                author = "A",
+                format = BookFormat.TXT.name,
+                downloadStatus = "DOWNLOADED",
+                localUri = "file:///tmp/other.txt",
+            ),
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            bookDao = bookDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("missing"))
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.loadingState is LoadingState.Error)
+        assertEquals(1, bookDao.getByIdCalls)
+
+        viewModel.onIntent(ReaderIntent.Retry)
+        advanceUntilIdle()
+        // 重试复用上次 ById 请求 → getById 再被调用一次。
+        assertEquals(2, bookDao.getByIdCalls)
+    }
+
+    @Test
+    fun `retry is a no-op when nothing was opened`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val bookDao = FakeBookDao(
+            BookEntity(
+                id = "book-1",
+                title = "B",
+                author = "A",
+                format = BookFormat.TXT.name,
+                downloadStatus = "DOWNLOADED",
+                localUri = "file:///tmp/saved-book.txt",
+            ),
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            bookDao = bookDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.Retry)
+        advanceUntilIdle()
+
+        assertEquals(0, bookDao.getByIdCalls)
+    }
+
+    @Test
     fun `applies remote sync winner to engine and local progress`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val localLocator = Locator(LocatorStrategy.Page(index = 1, total = 10), totalProgression = 0.1f)
@@ -585,6 +643,16 @@ class ReaderSavedStateHandleTest {
         textAnnotationDao: TextAnnotationDao = FakeTextAnnotationDao(),
         settings: FakeSettingsRepository = FakeSettingsRepository(),
         sessionDao: FakeReadingSessionDao = FakeReadingSessionDao(),
+        bookDao: FakeBookDao = FakeBookDao(
+            BookEntity(
+                id = "book-1",
+                title = "Saved Book",
+                author = "Author",
+                format = BookFormat.TXT.name,
+                downloadStatus = "DOWNLOADED",
+                localUri = "file:///tmp/saved-book.txt",
+            ),
+        ),
         clock: () -> Long = System::currentTimeMillis,
     ): ReaderViewModel =
         ReaderViewModel(
@@ -602,16 +670,7 @@ class ReaderSavedStateHandleTest {
                 userOverrides = MutableStateFlow(emptyMap()),
             ),
             hostFactory = FakeHostFactory,
-            bookDao = FakeBookDao(
-                BookEntity(
-                    id = "book-1",
-                    title = "Saved Book",
-                    author = "Author",
-                    format = BookFormat.TXT.name,
-                    downloadStatus = "DOWNLOADED",
-                    localUri = "file:///tmp/saved-book.txt",
-                ),
-            ),
+            bookDao = bookDao,
             progressDao = progressDao,
             bookmarkDao = FakeBookmarkDao(),
             textAnnotationDao = textAnnotationDao,
@@ -737,6 +796,8 @@ class ReaderSavedStateHandleTest {
 
     private class FakeBookDao(book: BookEntity) : BookDao {
         private val books = mutableMapOf(book.id to book)
+        var getByIdCalls = 0
+            private set
         override fun observeAll(): Flow<List<BookEntity>> = MutableStateFlow(books.values.toList())
         override fun observeShelf(): Flow<List<BookWithProgress>> = MutableStateFlow(emptyList())
         override suspend fun count(): Int = books.size
@@ -746,7 +807,10 @@ class ReaderSavedStateHandleTest {
         override suspend fun upsertAll(books: List<BookEntity>) {
             books.forEach { this.books[it.id] = it }
         }
-        override suspend fun getById(id: String): BookEntity? = books[id]
+        override suspend fun getById(id: String): BookEntity? {
+            getByIdCalls += 1
+            return books[id]
+        }
         override suspend fun updateLastReadAt(id: String, ts: Long) = Unit
         override suspend fun downloadedRemoteCacheBooks(
             remotePrefix: String,

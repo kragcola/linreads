@@ -23,6 +23,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Menu
@@ -55,6 +57,7 @@ import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.TransitionType
+import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ZoomableReaderEngine
@@ -92,11 +95,14 @@ fun ReaderScreen(
             .background(MaterialTheme.colorScheme.background),
         contentAlignment = Alignment.Center,
     ) {
-        when (val loading = state.loadingState) {
+        when (state.loadingState) {
             is LoadingState.Loading, LoadingState.Idle ->
                 CircularProgressIndicator(color = MaterialTheme.colorScheme.onBackground)
             is LoadingState.Error ->
-                Text("打开失败：${loading.error.message}", color = MaterialTheme.colorScheme.onBackground)
+                ReaderErrorContent(
+                    onRetry = { viewModel.onIntent(ReaderIntent.Retry) },
+                    onBack = onBack,
+                )
             LoadingState.Loaded -> {
                 val engine = state.engine
                 if (engine == null) {
@@ -268,19 +274,20 @@ fun ReaderScreen(
                                         .padding(vertical = 6.dp, horizontal = 12.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    Text(
-                                        "←",
-                                        modifier = Modifier
-                                            .semantics { contentDescription = "上一章" }
-                                            .clickable(enabled = chapter.currentIndex > 0) {
-                                                scope.launch { engine.goToAdjacentChapter(-1) }
-                                            }
-                                            .padding(8.dp),
-                                        style = MaterialTheme.typography.titleMedium,
-                                        color = if (chapter.currentIndex > 0)
-                                            MaterialTheme.colorScheme.onBackground
-                                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
-                                    )
+                                    val prevEnabled = chapter.currentIndex > 0
+                                    IconButton(
+                                        onClick = { scope.launch { engine.goToAdjacentChapter(-1) } },
+                                        enabled = prevEnabled,
+                                        modifier = Modifier.semantics { contentDescription = "上一章" },
+                                    ) {
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                                            contentDescription = null,
+                                            tint = if (prevEnabled)
+                                                MaterialTheme.colorScheme.onBackground
+                                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                        )
+                                    }
                                     Column(
                                         modifier = Modifier
                                             .weight(1f)
@@ -301,19 +308,20 @@ fun ReaderScreen(
                                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                                         )
                                     }
-                                    Text(
-                                        "→",
-                                        modifier = Modifier
-                                            .semantics { contentDescription = "下一章" }
-                                            .clickable(enabled = chapter.currentIndex < chapter.totalChapters - 1) {
-                                                scope.launch { engine.goToAdjacentChapter(+1) }
-                                            }
-                                            .padding(8.dp),
-                                        style = MaterialTheme.typography.titleMedium,
-                                        color = if (chapter.currentIndex < chapter.totalChapters - 1)
-                                            MaterialTheme.colorScheme.onBackground
-                                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
-                                    )
+                                    val nextEnabled = chapter.currentIndex < chapter.totalChapters - 1
+                                    IconButton(
+                                        onClick = { scope.launch { engine.goToAdjacentChapter(+1) } },
+                                        enabled = nextEnabled,
+                                        modifier = Modifier.semantics { contentDescription = "下一章" },
+                                    ) {
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                            contentDescription = null,
+                                            tint = if (nextEnabled)
+                                                MaterialTheme.colorScheme.onBackground
+                                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                        )
+                                    }
                                 }
                             }
                             // ── 分隔线 ──
@@ -774,10 +782,10 @@ private fun FontPanel(
             Text("${fontSizeSp.toInt()}sp", style = MaterialTheme.typography.labelLarge)
         }
         Slider(
-            value = fontSizeSp.coerceIn(12f, 32f),
+            value = ReaderTypography.clampFontSp(fontSizeSp),
             onValueChange = onFontSizeChange,
-            valueRange = 12f..32f,
-            steps = 19,
+            valueRange = ReaderTypography.MIN_FONT_SP..ReaderTypography.MAX_FONT_SP,
+            steps = ReaderTypography.FONT_SLIDER_STEPS,
             modifier = Modifier
                 .fillMaxWidth()
                 .semantics {
@@ -793,8 +801,8 @@ private fun FontPanel(
         )
         Text(
             text = "海上生明月，天涯共此时。",
-            fontSize = fontSizeSp.coerceIn(12f, 32f).sp,
-            lineHeight = (fontSizeSp.coerceIn(12f, 32f) * 1.7f).sp,
+            fontSize = ReaderTypography.clampFontSp(fontSizeSp).sp,
+            lineHeight = (ReaderTypography.clampFontSp(fontSizeSp) * 1.7f).sp,
             color = MaterialTheme.colorScheme.onBackground,
             maxLines = 2,
         )
@@ -807,10 +815,10 @@ private fun FontPanel(
             Text("${"%.2f".format(lineSpacing)}x", style = MaterialTheme.typography.labelLarge)
         }
         Slider(
-            value = lineSpacing.coerceIn(1.4f, 2.2f),
+            value = ReaderTypography.clampLineSpacing(lineSpacing),
             onValueChange = onLineSpacingChange,
-            valueRange = 1.4f..2.2f,
-            steps = 7,
+            valueRange = ReaderTypography.MIN_LINE_SPACING..ReaderTypography.MAX_LINE_SPACING,
+            steps = ReaderTypography.LINE_SPACING_SLIDER_STEPS,
             modifier = Modifier
                 .fillMaxWidth()
                 .semantics {
@@ -1108,6 +1116,39 @@ private fun View.consumeReaderInteractiveTapReport(): Boolean {
         }
     }
     return false
+}
+
+@Composable
+private fun ReaderErrorContent(
+    onRetry: () -> Unit,
+    onBack: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Text(
+            text = "无法打开这本书",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onBackground,
+        )
+        Text(
+            text = "文件可能已被移动、删除或格式不受支持。",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            OutlinedButton(onClick = onBack) {
+                Text("返回书库")
+            }
+            Button(onClick = onRetry) {
+                Text("重试")
+            }
+        }
+    }
 }
 
 @Composable
