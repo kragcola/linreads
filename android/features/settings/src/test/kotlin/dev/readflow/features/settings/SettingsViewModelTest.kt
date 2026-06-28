@@ -410,6 +410,7 @@ class SettingsViewModelTest {
         override val useSourceHanFont = MutableStateFlow(true)
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
+        override val readerGuideShown = MutableStateFlow(false)
         var savedCalibreUrl: String? = null
 
         override suspend fun setCalibreBaseUrl(url: String) {
@@ -451,6 +452,10 @@ class SettingsViewModelTest {
 
         override suspend fun setFontChoice(choice: FontChoice) {
             fontChoice.value = choice
+        }
+
+        override suspend fun setReaderGuideShown(shown: Boolean) {
+            readerGuideShown.value = shown
         }
     }
 

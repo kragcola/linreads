@@ -11,6 +11,7 @@ sealed interface ReaderIntent {
     data class OpenById(val bookId: String) : ReaderIntent
     data object CloseBook : ReaderIntent
     data class GoTo(val locator: Locator) : ReaderIntent
+    data class SeekToProgress(val fraction: Float) : ReaderIntent
     data class SetFontSize(val sp: Float) : ReaderIntent
     data class PreviewFontSize(val sp: Float) : ReaderIntent
     data class PreviewZoom(val scale: Float) : ReaderIntent
@@ -33,6 +34,7 @@ sealed interface ReaderIntent {
     data object ToggleChrome : ReaderIntent
     data object FontPanel : ReaderIntent
     data object ThemePanel : ReaderIntent
+    data object DismissGuide : ReaderIntent
 }
 
 enum class ReaderPanel { TOC, SEARCH, BOOKMARKS, ANNOTATIONS, FONT, THEME }

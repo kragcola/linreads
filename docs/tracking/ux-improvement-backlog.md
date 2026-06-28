@@ -7,6 +7,29 @@
 
 ---
 
+## 真机 UX 体验缺陷台账（来源：`docs/testing/ux-simulation-and-reading-test.md`）
+
+> 真机模拟器 emulator-5554 实测 + 认知走查发现的缺陷与体验项，按优先级排期。
+> 最后更新：2026-06-27（本轮修复三项并真机复验）
+
+| ID | 缺陷/项目 | 优先级 | 状态 | 处置 |
+|----|-----------|--------|------|------|
+| **可拖动进度条** | 2dp 只读 `LinearProgressIndicator` → 可 scrub seek 条 | P1 | ✅ 已修 | 新增 `ReaderEngine.seekToProgress(fraction)` 默认实现（EPUB/TXT/MD 走 progression-only Locator，PDF override 映射页码）+ `ReaderProgressSeekBar`（拖动跟手、松手提交、显示%）。真机 0%→33%→67% 验证，3 单测覆盖 |
+| **首次手势引导** | 进书零引导 → 一次性 coach-marks | P1 | ✅ 已修 | 新增 `SettingsRepository.readerGuideShown` 持久化标志 + `ReaderGestureGuideOverlay`（三区 上翻/呼出菜单/下翻 + 捏合/划选/拖进度条提示）。首开展示、点击关闭、再开不重现，真机验证，3 单测覆盖 |
+| **R2** | FontPanel "阅读正文预览" 标签随阅读字号缩放成巨字 | P3 | ✅ 已修 | 拆成固定字号标签「正文预览」+ 真正按字号缩放的样张「海上生明月…」。真机 30sp 下标签恒 36px、样张 62→102px |
+| **R1** | 顶栏 chrome 与系统状态栏叠字 | P1 | ✅ 已修（上一轮） | document AndroidView 加 `windowInsetsPadding(WindowInsets.systemBars)` |
+| 字号/行距口径不一 | reader 上限 32sp，Settings 28sp；行距下限不一 | P2 | 🔴 待排 | 建议都 12–32sp/1sp、行距下限统一 1.4 |
+| 章节箭头触摸目标 | 裸 `Text("←")` < 48dp | P2 | 🔴 待排 | 升级为 ≥48dp IconButton |
+| reader 错误页 | 直接显示原始异常文本，无重试/返回 | P2 | 🔴 待排 | 加重试+返回按钮，隐藏堆栈 |
+| 全书页码缺失 | 底部仅章节%，无 X/Y 页码 | P3 | 🔴 待排 | 底部补全书% + 绝对页码（C4） |
+| 菜单图标复用 | 书签/标注/排版共用铅笔图标 | P3 | 🔴 待排 | 各用区分图标 |
+| 亮度/暖光叠层 | 无阅读内亮度/蓝光过滤 | P3 | 🔴 待排 | 补叠层滑块 |
+| C1 跨端进度同步 | NoOpSyncBackend（占位） | 计划内 | 🔴 待排 | 接真实后端，行业第一痛点 |
+
+**下一步建议排期**：P2 三项（字号口径 / 章节箭头触摸目标 / 错误页）是低成本合规修复，可一并处理；P3 为锦上添花；C1 跨端同步需单独架构排期。
+
+---
+
 ## P0 - 阻塞离线体验 (必须完成才能发布)
 
 ### P0-UX-1: 验证点击区域逻辑

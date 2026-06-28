@@ -64,6 +64,9 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
             FontChoice.parse(it[KEY_FONT_CHOICE])
         }
 
+    override val readerGuideShown: Flow<Boolean> =
+        context.dataStore.data.map { it[KEY_READER_GUIDE_SHOWN] ?: false }
+
     override suspend fun setCalibreBaseUrl(url: String) {
         context.dataStore.edit { it[KEY_CALIBRE_URL] = url }
     }
@@ -100,6 +103,10 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         context.dataStore.edit { it[KEY_FONT_CHOICE] = choice.serialize() }
     }
 
+    override suspend fun setReaderGuideShown(shown: Boolean) {
+        context.dataStore.edit { it[KEY_READER_GUIDE_SHOWN] = shown }
+    }
+
     private suspend fun readOrCreateDeviceId(): String {
         var value: String? = null
         context.dataStore.edit { preferences ->
@@ -122,5 +129,6 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_USE_SOURCE_HAN = booleanPreferencesKey("use_source_han_font")
         val KEY_TXT_ENCODING = stringPreferencesKey("txt_encoding")
         val KEY_FONT_CHOICE = stringPreferencesKey("font_choice")
+        val KEY_READER_GUIDE_SHOWN = booleanPreferencesKey("reader_guide_shown")
     }
 }

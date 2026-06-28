@@ -45,6 +45,17 @@ interface ReaderEngine {
 
     // Navigation
     suspend fun goTo(locator: Locator)
+
+    /**
+     * Seek to a whole-book progress fraction [0,1] (draggable progress bar).
+     * Default builds a progression-only [Locator] that reflow/scroll engines resolve
+     * via totalProgression. Fixed-page engines (PDF) override to map onto a page index.
+     */
+    suspend fun seekToProgress(fraction: Float) {
+        val clamped = fraction.coerceIn(0f, 1f)
+        goTo(Locator(strategy = LocatorStrategy.Unknown, totalProgression = clamped))
+    }
+
     val currentLocator: StateFlow<Locator>
     val pageCount: StateFlow<Int>
 

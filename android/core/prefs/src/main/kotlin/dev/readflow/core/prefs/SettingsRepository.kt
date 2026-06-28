@@ -25,6 +25,8 @@ interface SettingsRepository {
     val useSourceHanFont: Flow<Boolean>
     val txtEncoding: Flow<TxtEncoding>
     val fontChoice: Flow<FontChoice>
+    /** 阅读器首次手势引导是否已展示过（一次性）。 */
+    val readerGuideShown: Flow<Boolean>
 
     suspend fun setCalibreBaseUrl(url: String)
     suspend fun setFontSize(size: Int)
@@ -35,4 +37,5 @@ interface SettingsRepository {
     suspend fun setUseSourceHanFont(enabled: Boolean)
     suspend fun setTxtEncoding(encoding: TxtEncoding)
     suspend fun setFontChoice(choice: FontChoice)
+    suspend fun setReaderGuideShown(shown: Boolean)
 }

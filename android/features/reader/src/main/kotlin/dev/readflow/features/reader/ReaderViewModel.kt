@@ -63,6 +63,7 @@ data class ReaderUiState(
     val annotations: ReaderAnnotationState = ReaderAnnotationState(),
     val canBookmark: Boolean = false,
     val textSelection: ReaderTextSelection? = null,
+    val showGuide: Boolean = false,
 )
 
 class ReaderViewModel(
@@ -101,6 +102,7 @@ class ReaderViewModel(
         is ReaderIntent.OpenBook -> openByUri(null, intent.uri)
         ReaderIntent.CloseBook -> close()
         is ReaderIntent.GoTo -> goTo(intent.locator)
+        is ReaderIntent.SeekToProgress -> seekToProgress(intent.fraction)
         is ReaderIntent.GoToTocEntry -> goToTocEntry(intent.entry)
         is ReaderIntent.SetFontSize -> setFontSize(intent.sp)
         is ReaderIntent.PreviewFontSize -> previewFontSize(intent.sp)
@@ -123,6 +125,12 @@ class ReaderViewModel(
         ReaderIntent.ToggleChrome -> updateUiStateAndPersist { it.copy(isUiVisible = !it.isUiVisible, activePanel = null) }
         ReaderIntent.FontPanel -> updateUiStateAndPersist { it.copy(activePanel = ReaderPanel.FONT, isUiVisible = true) }
         ReaderIntent.ThemePanel -> updateUiStateAndPersist { it.copy(activePanel = ReaderPanel.THEME, isUiVisible = true) }
+        ReaderIntent.DismissGuide -> dismissGuide()
+    }
+
+    private fun dismissGuide() {
+        _uiState.update { it.copy(showGuide = false) }
+        viewModelScope.launch { settings.setReaderGuideShown(true) }
     }
 
     private fun openById(bookId: String) {
@@ -224,6 +232,9 @@ class ReaderViewModel(
             watchTextSelection(engine)
             watchAnnotations(engine, bookId)
             watchSettings(engine)
+            if (!settings.readerGuideShown.first()) {
+                _uiState.update { it.copy(showGuide = true) }
+            }
             sessionStartedAt = clock()
             bookId?.let {
                 persistReaderState(bookId = it, locator = engine.currentLocator.value, loadingState = LoadingState.Loaded)
@@ -319,6 +330,14 @@ class ReaderViewModel(
             persistExplicitNavigation(engine, locator)
         }
         updateUiStateAndPersist { it.copy(activePanel = null) }
+    }
+
+    private fun seekToProgress(fraction: Float) {
+        val engine = _uiState.value.engine ?: return
+        viewModelScope.launch {
+            engine.seekToProgress(fraction)
+            persistExplicitNavigation(engine, engine.currentLocator.value)
+        }
     }
 
     private fun goToTocEntry(entry: TocEntry) {

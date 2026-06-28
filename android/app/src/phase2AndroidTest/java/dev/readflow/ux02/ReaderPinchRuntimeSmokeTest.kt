@@ -231,7 +231,7 @@ class ReaderPinchRuntimeSmokeTest {
     private fun openFontPanel(readerDescription: String) {
         waitForObject(By.desc(readerDescription)).click()
         waitForObject(By.text("排版")).click()
-        waitForObject(By.text("阅读正文预览"))
+        waitForObject(By.text("正文预览"))
     }
 
     private fun currentFontSizeLabel(): String =

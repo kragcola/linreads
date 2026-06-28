@@ -193,6 +193,12 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         }
     }
 
+    override suspend fun seekToProgress(fraction: Float) {
+        val total = _pageCount.value.coerceAtLeast(1)
+        val idx = (fraction.coerceIn(0f, 1f) * total).toInt().coerceIn(0, total - 1)
+        goTo(Locator(strategy = LocatorStrategy.Page(idx, total)))
+    }
+
     override suspend fun close() {
         (recyclerView?.adapter as? PdfPageAdapter)?.recycle()
         recyclePageCacheOnMain()

@@ -306,6 +306,67 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `seekToProgress drives engine to the requested whole-book fraction`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val progressDao = FakeProgressDao()
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.SeekToProgress(0.42f))
+        advanceUntilIdle()
+
+        val seeked = engine.goToLocators.last()
+        assertEquals(0.42f, seeked.totalProgression)
+        assertEquals(LocatorStrategy.Unknown, seeked.strategy)
+        // Seek is an explicit navigation → persisted.
+        assertNotNull(progressDao.savedProgress("book-1"))
+    }
+
+    @Test
+    fun `shows gesture guide on first open then dismiss persists the flag`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val settings = FakeSettingsRepository().apply { readerGuideShown.value = false }
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.showGuide)
+
+        viewModel.onIntent(ReaderIntent.DismissGuide)
+        advanceUntilIdle()
+        assertTrue(!viewModel.uiState.value.showGuide)
+        assertTrue(settings.readerGuideShown.value)
+    }
+
+    @Test
+    fun `does not show gesture guide when already seen`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val settings = FakeSettingsRepository().apply { readerGuideShown.value = true }
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        assertTrue(!viewModel.uiState.value.showGuide)
+    }
+
+    @Test
     fun `applies remote sync winner to engine and local progress`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val localLocator = Locator(LocatorStrategy.Page(index = 1, total = 10), totalProgression = 0.1f)
@@ -788,6 +849,7 @@ class ReaderSavedStateHandleTest {
         override val useSourceHanFont = MutableStateFlow(true)
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
+        override val readerGuideShown = MutableStateFlow(true)
 
         override suspend fun setCalibreBaseUrl(url: String) {
             calibreBaseUrl.value = url
@@ -822,6 +884,10 @@ class ReaderSavedStateHandleTest {
 
         override suspend fun setFontChoice(choice: FontChoice) {
             fontChoice.value = choice
+        }
+
+        override suspend fun setReaderGuideShown(shown: Boolean) {
+            readerGuideShown.value = shown
         }
     }
 }

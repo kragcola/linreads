@@ -1909,14 +1909,14 @@ class EpubPagedRuntimeSmokeTest {
     }
 
     private fun switchReaderToPagedMode() {
-        openBottomPanel(buttonText = "排版", expectedText = "阅读正文预览")
+        openBottomPanel(buttonText = "排版", expectedText = "正文预览")
         waitForObject(By.text("分页")).click()
         waitForObject(By.text("滚动"))
     }
 
     private fun dragLineSpacingSliderToMax() {
         if (device.wait(Until.findObject(By.desc("行距")), 750) == null) {
-            openBottomPanel(buttonText = "排版", expectedText = "阅读正文预览")
+            openBottomPanel(buttonText = "排版", expectedText = "正文预览")
         }
         val slider = waitForObject(By.desc("行距"))
         val bounds = slider.visibleBounds

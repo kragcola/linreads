@@ -252,18 +252,11 @@ fun ReaderScreen(
                             progressInChapter = chapter.progressInChapter,
                         )
                         Column(modifier = Modifier.fillMaxWidth()) {
-                            // 全书总进度细条
-                            LinearProgressIndicator(
-                                progress = { (locator.totalProgression ?: 0f).coerceIn(0f, 1f) },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(2.dp)
-                                    .semantics {
-                                        contentDescription = "全书进度"
-                                        stateDescription = overallProgressDescription
-                                    },
-                                color = MaterialTheme.colorScheme.primary,
-                                trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                            // 全书总进度条（可拖动跳转）
+                            ReaderProgressSeekBar(
+                                progress = (locator.totalProgression ?: 0f).coerceIn(0f, 1f),
+                                progressDescription = overallProgressDescription,
+                                onSeek = { viewModel.onIntent(ReaderIntent.SeekToProgress(it)) },
                             )
                             // ── 章节导航栏（独立一行）──
                             Surface(
@@ -392,6 +385,14 @@ fun ReaderScreen(
                                 }
                             }
                         }
+                    }
+
+                    // ── 首次手势引导浮层 ──
+                    if (state.showGuide) {
+                        ReaderGestureGuideOverlay(
+                            pagedMode = pagingKind == PagingKind.PAGED,
+                            onDismiss = { viewModel.onIntent(ReaderIntent.DismissGuide) },
+                        )
                     }
                 }
             }
@@ -784,11 +785,18 @@ private fun FontPanel(
                     stateDescription = "${fontSizeSp.toInt()}sp"
                 },
         )
+        // 固定字号的说明标签（不随阅读字号缩放），下方才是真正按字号缩放的正文样张
         Text(
-            text = "阅读正文预览",
+            text = "正文预览",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = "海上生明月，天涯共此时。",
             fontSize = fontSizeSp.coerceIn(12f, 32f).sp,
             lineHeight = (fontSizeSp.coerceIn(12f, 32f) * 1.7f).sp,
             color = MaterialTheme.colorScheme.onBackground,
+            maxLines = 2,
         )
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1100,6 +1108,136 @@ private fun View.consumeReaderInteractiveTapReport(): Boolean {
         }
     }
     return false
+}
+
+@Composable
+private fun ReaderGestureGuideOverlay(
+    pagedMode: Boolean,
+    onDismiss: () -> Unit,
+) {
+    // 半透明遮罩 + 三区说明；点任意处关闭，仅首次展示
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.72f))
+            .clickable(onClick = onDismiss)
+            .semantics(mergeDescendants = true) {
+                contentDescription = "阅读手势引导，点击关闭"
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(modifier = Modifier.fillMaxSize()) {
+            GestureGuideZone(
+                weight = 1f,
+                title = "←",
+                desc = if (pagedMode) "上一页" else "上翻",
+            )
+            GestureGuideZone(
+                weight = 1f,
+                title = "☰",
+                desc = "呼出菜单",
+                emphasized = true,
+            )
+            GestureGuideZone(
+                weight = 1f,
+                title = "→",
+                desc = if (pagedMode) "下一页" else "下翻",
+            )
+        }
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 48.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                "捏合调字号 · 长按划选标注 · 拖底部进度条跳转",
+                style = MaterialTheme.typography.bodyMedium,
+                color = androidx.compose.ui.graphics.Color.White,
+            )
+            Text(
+                "点击任意处开始阅读",
+                style = MaterialTheme.typography.labelMedium,
+                color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.7f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun RowScope.GestureGuideZone(
+    weight: Float,
+    title: String,
+    desc: String,
+    emphasized: Boolean = false,
+) {
+    Column(
+        modifier = Modifier
+            .weight(weight)
+            .fillMaxHeight(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = title,
+            fontSize = if (emphasized) 40.sp else 48.sp,
+            color = androidx.compose.ui.graphics.Color.White,
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = desc,
+            style = MaterialTheme.typography.titleMedium,
+            color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.85f),
+        )
+    }
+}
+
+@Composable
+private fun ReaderProgressSeekBar(
+    progress: Float,
+    progressDescription: String,
+    onSeek: (Float) -> Unit,
+) {
+    // 拖动期间用本地值跟手，松手才提交跳转，避免每帧都触发引擎重排
+    var dragValue by remember { mutableStateOf<Float?>(null) }
+    val displayValue = dragValue ?: progress
+    Surface(color = MaterialTheme.colorScheme.background.copy(alpha = 0.92f)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Slider(
+                value = displayValue,
+                onValueChange = { dragValue = it.coerceIn(0f, 1f) },
+                onValueChangeFinished = {
+                    dragValue?.let { onSeek(it) }
+                    dragValue = null
+                },
+                valueRange = 0f..1f,
+                modifier = Modifier
+                    .weight(1f)
+                    .semantics {
+                        contentDescription = "全书进度，拖动跳转"
+                        stateDescription = if (dragValue != null) {
+                            readerProgressPercentText(displayValue)
+                        } else {
+                            progressDescription
+                        }
+                    },
+            )
+            Text(
+                text = readerProgressPercentText(displayValue),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .widthIn(min = 40.dp)
+                    .padding(start = 8.dp),
+            )
+        }
+    }
 }
 
 @Composable

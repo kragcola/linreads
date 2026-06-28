@@ -137,7 +137,7 @@ class A03AccessibilityRuntimeSmokeTest {
             takeScreenshot("panel-annotations.png")
             dumpHierarchy("panel-annotations.xml")
 
-            openBottomPanel("排版", "阅读正文预览")
+            openBottomPanel("排版", "正文预览")
             val fontSliderDescription = waitForObject(By.desc("字号")).contentDescription.orEmpty()
             val lineSpacingSliderDescription = waitForObject(By.desc("行距")).contentDescription.orEmpty()
             val fontSizeLabel = waitForObject(By.text("16sp")).text.orEmpty()
