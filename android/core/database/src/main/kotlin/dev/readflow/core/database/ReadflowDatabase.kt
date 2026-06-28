@@ -12,11 +12,13 @@ import androidx.room.RoomDatabase
         TextAnnotationEntity::class,
         InkStrokeEntity::class,
         BookmarkEntity::class,
+        ReadingSessionEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 2, to = 3),
+        AutoMigration(from = 3, to = 4),
     ],
 )
 abstract class ReadflowDatabase : RoomDatabase() {
@@ -25,4 +27,5 @@ abstract class ReadflowDatabase : RoomDatabase() {
     abstract fun textAnnotationDao(): TextAnnotationDao
     abstract fun inkStrokeDao(): InkStrokeDao
     abstract fun bookmarkDao(): BookmarkDao
+    abstract fun readingSessionDao(): ReadingSessionDao
 }

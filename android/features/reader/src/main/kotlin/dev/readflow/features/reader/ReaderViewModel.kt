@@ -8,6 +8,7 @@ import dev.readflow.core.database.BookDao
 import dev.readflow.core.database.BookmarkDao
 import dev.readflow.core.database.ReadingProgressDao
 import dev.readflow.core.database.ReadingProgressEntity
+import dev.readflow.core.database.ReadingSessionDao
 import dev.readflow.core.database.TextAnnotationDao
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.Locator
@@ -75,6 +76,7 @@ class ReaderViewModel(
     private val syncManager: SyncManager,
     private val settings: SettingsRepository,
     private val engineStateStore: EngineStateStore,
+    private val readingSessionDao: dev.readflow.core.database.ReadingSessionDao,
 ) : ViewModel() {
 
     private var restoredReaderState: ReaderState? = savedStateHandle.readerStateOrNull()
@@ -91,6 +93,7 @@ class ReaderViewModel(
     private var annotationJob: Job? = null
     private var settingsFontJob: Job? = null
     private var settingsLineSpacingJob: Job? = null
+    private var sessionStartedAt: Long? = null
 
     fun onIntent(intent: ReaderIntent) = when (intent) {
         is ReaderIntent.OpenById -> openById(intent.bookId)
@@ -220,6 +223,7 @@ class ReaderViewModel(
             watchTextSelection(engine)
             watchAnnotations(engine, bookId)
             watchSettings(engine)
+            sessionStartedAt = System.currentTimeMillis()
             bookId?.let {
                 persistReaderState(bookId = it, locator = engine.currentLocator.value, loadingState = LoadingState.Loaded)
             }
@@ -574,6 +578,25 @@ class ReaderViewModel(
         settingsLineSpacingJob?.cancel()
         val engine = _uiState.value.engine
         viewModelScope.launch {
+            // Write reading session before close (threshold > 1s to filter noise)
+            val sessionStart = sessionStartedAt
+            sessionStartedAt = null
+            if (bookId != null && sessionStart != null) {
+                val duration = System.currentTimeMillis() - sessionStart
+                if (duration > 1_000L) {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        readingSessionDao.insert(
+                            dev.readflow.core.database.ReadingSessionEntity(
+                                id = java.util.UUID.randomUUID().toString(),
+                                bookId = bookId,
+                                startedAt = sessionStart,
+                                durationMs = duration,
+                                deviceId = settings.deviceId.first(),
+                            )
+                        )
+                    }
+                }
+            }
             // Force-save progress before close so debounce doesn't swallow it.
             if (bookId != null && locator != null) {
                 persistProgress(bookId, locator, settings.deviceId.first())

@@ -54,6 +54,9 @@ fun SettingsScreen(
     val syncStatus by vm.syncStatus.collectAsStateWithLifecycle()
     val backupExportState by vm.backupExportState.collectAsStateWithLifecycle()
     val backupRestoreState by vm.backupRestoreState.collectAsStateWithLifecycle()
+    val notesExportState by vm.notesExportState.collectAsStateWithLifecycle()
+    val themeExportState by vm.themeExportState.collectAsStateWithLifecycle()
+    val themeImportState by vm.themeImportState.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     var urlDraft by remember(url) { mutableStateOf(url ?: "") }
@@ -79,6 +82,37 @@ fun SettingsScreen(
             vm.backupRestoreFailed("恢复失败：无法读取选择的文件")
         } else {
             vm.restoreBackup(input)
+        }
+    }
+    val notesExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/markdown"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val output = context.contentResolver.openOutputStream(uri)
+        if (output == null) {
+            vm.backupExportFailed("笔记导出失败：无法写入选择的位置")
+        } else {
+            vm.exportNotes(output)
+        }
+    }
+    val themeExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val output = context.contentResolver.openOutputStream(uri)
+        if (output == null) {
+            vm.backupExportFailed("主题导出失败：无法写入选择的位置")
+        } else {
+            vm.exportTheme(output)
+        }
+    }
+    val themeImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val input = context.contentResolver.openInputStream(uri)
+        if (input == null) {
+            vm.backupRestoreFailed("主题导入失败：无法读取选择的文件")
+        } else {
+            vm.importTheme(input)
         }
     }
     val fontImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -336,6 +370,103 @@ fun SettingsScreen(
                 is BackupRestoreUiState.Failure -> ConnectionResultText(
                     title = state.message,
                     detail = "请选择 LinReads Backup ZIP 文件。",
+                    isError = true,
+                )
+            }
+
+            HorizontalDivider()
+
+            Text("导出笔记", style = MaterialTheme.typography.bodyMedium)
+            OutlinedButton(
+                onClick = { notesExportLauncher.launch("LinReads 笔记.md") },
+                enabled = notesExportState !is BackupExportUiState.Exporting,
+            ) {
+                Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("导出阅读笔记")
+            }
+            when (val state = notesExportState) {
+                BackupExportUiState.Idle -> Unit
+                BackupExportUiState.Exporting -> Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Text("正在导出笔记", style = MaterialTheme.typography.bodyMedium)
+                }
+                is BackupExportUiState.Success -> ConnectionResultText(
+                    title = state.message,
+                    detail = "Markdown 格式，含书签与标注。",
+                    isError = false,
+                )
+                is BackupExportUiState.Failure -> ConnectionResultText(
+                    title = state.message,
+                    detail = "请重新选择可写入的位置。",
+                    isError = true,
+                )
+            }
+
+            HorizontalDivider()
+
+            Text("主题导入导出", style = MaterialTheme.typography.bodyMedium)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { themeExportLauncher.launch("LinReads 主题.json") },
+                    enabled = themeExportState !is BackupExportUiState.Exporting,
+                ) {
+                    Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("导出主题")
+                }
+                OutlinedButton(
+                    onClick = { themeImportLauncher.launch(arrayOf("application/json")) },
+                    enabled = themeImportState !is BackupRestoreUiState.Restoring,
+                ) {
+                    Icon(Icons.Outlined.FileUpload, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("导入主题")
+                }
+            }
+            when (val state = themeExportState) {
+                BackupExportUiState.Idle -> Unit
+                BackupExportUiState.Exporting -> Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Text("正在导出主题", style = MaterialTheme.typography.bodyMedium)
+                }
+                is BackupExportUiState.Success -> ConnectionResultText(
+                    title = state.message,
+                    detail = "可在其他设备导入此 JSON 恢复排版设置。",
+                    isError = false,
+                )
+                is BackupExportUiState.Failure -> ConnectionResultText(
+                    title = state.message,
+                    detail = "请重新选择可写入的位置。",
+                    isError = true,
+                )
+            }
+            when (val state = themeImportState) {
+                BackupRestoreUiState.Idle -> Unit
+                BackupRestoreUiState.Restoring -> Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    Text("正在导入主题", style = MaterialTheme.typography.bodyMedium)
+                }
+                is BackupRestoreUiState.Success -> ConnectionResultText(
+                    title = state.message,
+                    detail = "排版设置已更新。",
+                    isError = false,
+                )
+                is BackupRestoreUiState.Failure -> ConnectionResultText(
+                    title = state.message,
+                    detail = "请选择有效的主题 JSON 文件。",
                     isError = true,
                 )
             }

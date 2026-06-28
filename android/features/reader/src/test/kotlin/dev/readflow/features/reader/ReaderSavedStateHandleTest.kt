@@ -11,6 +11,8 @@ import dev.readflow.core.database.BookmarkEntity
 import dev.readflow.core.database.DownloadedCacheBook
 import dev.readflow.core.database.ReadingProgressDao
 import dev.readflow.core.database.ReadingProgressEntity
+import dev.readflow.core.database.ReadingSessionEntity
+import dev.readflow.core.database.ReadingSessionDao
 import dev.readflow.core.database.TextAnnotationDao
 import dev.readflow.core.database.TextAnnotationEntity
 import dev.readflow.core.model.BookFormat
@@ -504,7 +506,16 @@ class ReaderSavedStateHandleTest {
             syncManager = syncManager,
             settings = settings,
             engineStateStore = engineStateStore,
+            readingSessionDao = FakeReadingSessionDao(),
         )
+
+    private class FakeReadingSessionDao : ReadingSessionDao {
+        val sessions = mutableListOf<ReadingSessionEntity>()
+        override suspend fun insert(session: ReadingSessionEntity) { sessions.add(session) }
+        override suspend fun totalDurationSince(sinceMillis: Long) = sessions.filter { it.startedAt >= sinceMillis }.sumOf { it.durationMs }
+        override suspend fun totalDurationForBook(bookId: String) = sessions.filter { it.bookId == bookId }.sumOf { it.durationMs }
+        override suspend fun allForBackup() = sessions.toList()
+    }
 
     private class FakeReaderEngine(
         initialLocator: Locator,

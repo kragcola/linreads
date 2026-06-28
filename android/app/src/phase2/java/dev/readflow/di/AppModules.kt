@@ -14,6 +14,8 @@ import dev.readflow.core.database.LinReadsBackupExportStore
 import dev.readflow.core.database.LinReadsBackupExporter
 import dev.readflow.core.database.LinReadsBackupRestoreStore
 import dev.readflow.core.database.LinReadsBackupRestorer
+import dev.readflow.core.database.NotesMarkdownExportStore
+import dev.readflow.core.database.NotesMarkdownFileExporter
 import dev.readflow.core.database.ReadflowDatabase
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.sync.NoOpSyncBackend
@@ -66,10 +68,12 @@ val databaseModule = module {
     single { get<ReadflowDatabase>().textAnnotationDao() }
     single { get<ReadflowDatabase>().inkStrokeDao() }
     single { get<ReadflowDatabase>().bookmarkDao() }
+    single { get<ReadflowDatabase>().readingSessionDao() }
     single { LibraryRepository(get()) }
     single<LibraryStore> { get<LibraryRepository>() }
     single<LinReadsBackupExportStore> { LinReadsBackupExporter(get(), get(), get()) }
     single<LinReadsBackupRestoreStore> { LinReadsBackupRestorer(get(), get(), get()) }
+    single<NotesMarkdownExportStore> { NotesMarkdownFileExporter(get(), get(), get()) }
 }
 
 val extensionsModule = module {
@@ -158,8 +162,8 @@ val settingsModule = module {
 
 val featureModule = module {
     viewModel { LibraryViewModel(get(), get(), get(), get()) }
-    viewModel { SettingsViewModel(get(), get(), get(), get(), get(), get()) }
-    viewModel { ReaderViewModel(get(), get(), get(), get(), get(), get(), get(), get(), get(), get()) }
+    viewModel { SettingsViewModel(get(), get(), get(), get(), get(), get(), get()) }
+    viewModel { ReaderViewModel(get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get()) }
 }
 
 val appModules = listOf(coreModule, databaseModule, extensionsModule, renderModule, settingsModule, featureModule)

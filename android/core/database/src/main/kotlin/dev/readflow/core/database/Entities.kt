@@ -92,3 +92,15 @@ data class BookmarkEntity(
     val deviceId: String,
     val isDeleted: Boolean = false,
 )
+
+@Entity(
+    tableName = "reading_sessions",
+    indices = [Index("bookId"), Index("startedAt")],
+)
+data class ReadingSessionEntity(
+    @PrimaryKey val id: String,
+    val bookId: String,
+    val startedAt: Long,
+    val durationMs: Long,
+    val deviceId: String,
+)

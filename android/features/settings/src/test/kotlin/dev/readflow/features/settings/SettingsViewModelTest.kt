@@ -12,6 +12,7 @@ import dev.readflow.core.database.LinReadsBackupExportResult
 import dev.readflow.core.database.LinReadsBackupExportStore
 import dev.readflow.core.database.LinReadsBackupRestoreResult
 import dev.readflow.core.database.LinReadsBackupRestoreStore
+import dev.readflow.core.database.NotesMarkdownExportStore
 import dev.readflow.core.model.Bookmark
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
@@ -31,6 +32,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.InputStream
 import java.io.OutputStream
@@ -296,6 +298,87 @@ class SettingsViewModelTest {
         )
     }
 
+    @Test
+    fun exportNotesSuccessReportsBookCount() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val viewModel = createViewModel(
+            settings = FakeSettingsRepository(),
+            notesExporter = FakeNotesExporter(count = 3),
+        )
+
+        viewModel.exportNotes(FakeOutputStream())
+        advanceUntilIdle()
+
+        assertEquals(
+            BackupExportUiState.Success("已导出 3 本书的阅读笔记"),
+            viewModel.notesExportState.value,
+        )
+    }
+
+    @Test
+    fun exportNotesFailureShowsReadableError() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val viewModel = createViewModel(
+            settings = FakeSettingsRepository(),
+            notesExporter = FakeNotesExporter(error = IllegalStateException("磁盘已满")),
+        )
+
+        viewModel.exportNotes(FakeOutputStream())
+        advanceUntilIdle()
+
+        assertEquals(
+            BackupExportUiState.Failure("笔记导出失败：磁盘已满"),
+            viewModel.notesExportState.value,
+        )
+    }
+
+    @Test
+    fun exportThemeWritesCurrentSettingsAsJson() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            fontSize.value = 22
+            themeMode.value = ThemeMode.DARK
+        }
+        val viewModel = createViewModel(settings = settings)
+        val output = java.io.ByteArrayOutputStream()
+
+        viewModel.exportTheme(output)
+        advanceUntilIdle()
+
+        assertTrue(viewModel.themeExportState.value is BackupExportUiState.Success)
+        val json = output.toString("UTF-8")
+        assertTrue(json.contains("\"fontSize\":22"))
+        assertTrue(json.contains("\"themeMode\":\"DARK\""))
+    }
+
+    @Test
+    fun importThemeAppliesValidatedSettings() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val viewModel = createViewModel(settings = settings)
+        // fontSize 999 is out of range → validated to 32; DARK applies as-is.
+        val json = """{"fontSize":999,"lineSpacing":1.8,"themeMode":"DARK","fontChoice":"system","txtEncoding":"AUTO","readingMode":"PAGED"}"""
+
+        viewModel.importTheme(java.io.ByteArrayInputStream(json.toByteArray(Charsets.UTF_8)))
+        advanceUntilIdle()
+
+        assertEquals(BackupRestoreUiState.Success("主题已导入"), viewModel.themeImportState.value)
+        assertEquals(32, settings.fontSize.value)
+        assertEquals(ThemeMode.DARK, settings.themeMode.value)
+        assertEquals(ReaderReadingMode.PAGED, settings.readingMode.value)
+    }
+
+    @Test
+    fun importThemeRejectsDirtyJson() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val viewModel = createViewModel(settings = FakeSettingsRepository())
+
+        viewModel.importTheme(java.io.ByteArrayInputStream("not json".toByteArray(Charsets.UTF_8)))
+        advanceUntilIdle()
+
+        assertTrue(viewModel.themeImportState.value is BackupRestoreUiState.Failure)
+    }
+
     private fun createViewModel(
         settings: SettingsRepository,
         connectionTester: CalibreConnectionTester = FakeCalibreConnectionTester(),
@@ -303,6 +386,7 @@ class SettingsViewModelTest {
         syncBackend: SyncBackend = FakeSyncBackend(),
         backupExporter: LinReadsBackupExportStore = FakeBackupExporter(),
         backupRestorer: LinReadsBackupRestoreStore = FakeBackupRestorer(),
+        notesExporter: NotesMarkdownExportStore = FakeNotesExporter(),
     ): SettingsViewModel =
         SettingsViewModel(
             settings,
@@ -311,6 +395,7 @@ class SettingsViewModelTest {
             syncBackend,
             backupExporter,
             backupRestorer,
+            notesExporter,
             dispatcher,
         )
 
@@ -454,5 +539,18 @@ class SettingsViewModelTest {
 
     private class FakeInputStream : InputStream() {
         override fun read(): Int = -1
+    }
+
+    private class FakeNotesExporter(
+        private val count: Int = 0,
+        private val error: Throwable? = null,
+    ) : NotesMarkdownExportStore {
+        var exportCalls = 0
+
+        override suspend fun export(output: OutputStream): Int {
+            exportCalls += 1
+            error?.let { throw it }
+            return count
+        }
     }
 }

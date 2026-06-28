@@ -9,6 +9,8 @@ import dev.readflow.core.calibre.CalibreProbeResult
 import dev.readflow.core.calibre.validateCalibreBaseUrl
 import dev.readflow.core.database.LinReadsBackupExportStore
 import dev.readflow.core.database.LinReadsBackupRestoreStore
+import dev.readflow.core.database.NotesMarkdownExportStore
+import dev.readflow.core.model.ThemeProfile
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
@@ -24,6 +26,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -62,6 +65,7 @@ class SettingsViewModel(
     syncBackend: SyncBackend,
     private val backupExporter: LinReadsBackupExportStore,
     private val backupRestorer: LinReadsBackupRestoreStore,
+    private val notesExporter: NotesMarkdownExportStore,
     private val backupDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) : ViewModel() {
 
@@ -104,6 +108,15 @@ class SettingsViewModel(
 
     private val _backupRestoreState = MutableStateFlow<BackupRestoreUiState>(BackupRestoreUiState.Idle)
     val backupRestoreState: StateFlow<BackupRestoreUiState> = _backupRestoreState.asStateFlow()
+
+    private val _notesExportState = MutableStateFlow<BackupExportUiState>(BackupExportUiState.Idle)
+    val notesExportState: StateFlow<BackupExportUiState> = _notesExportState.asStateFlow()
+
+    private val _themeExportState = MutableStateFlow<BackupExportUiState>(BackupExportUiState.Idle)
+    val themeExportState: StateFlow<BackupExportUiState> = _themeExportState.asStateFlow()
+
+    private val _themeImportState = MutableStateFlow<BackupRestoreUiState>(BackupRestoreUiState.Idle)
+    val themeImportState: StateFlow<BackupRestoreUiState> = _themeImportState.asStateFlow()
 
     fun setCalibreUrl(url: String) {
         val validation = validateCalibreBaseUrl(url)
@@ -193,6 +206,75 @@ class SettingsViewModel(
 
     fun backupExportFailed(message: String) {
         _backupExportState.value = BackupExportUiState.Failure(message)
+    }
+
+    fun exportNotes(output: OutputStream) {
+        _notesExportState.value = BackupExportUiState.Exporting
+        viewModelScope.launch {
+            runCatching {
+                withContext(backupDispatcher) {
+                    notesExporter.export(output)
+                }
+            }.onSuccess { count ->
+                _notesExportState.value = BackupExportUiState.Success(
+                    if (count > 0) "已导出 $count 本书的阅读笔记" else "已导出阅读笔记（暂无书签或标注）",
+                )
+            }.onFailure { error ->
+                _notesExportState.value = BackupExportUiState.Failure(
+                    "笔记导出失败：${error.message ?: "请稍后重试"}",
+                )
+            }
+        }
+    }
+
+    fun exportTheme(output: OutputStream) {
+        _themeExportState.value = BackupExportUiState.Exporting
+        viewModelScope.launch {
+            runCatching {
+                withContext(backupDispatcher) {
+                    val profile = ThemeProfile(
+                        fontSize = settings.fontSize.first(),
+                        lineSpacing = settings.lineSpacing.first(),
+                        themeMode = settings.themeMode.first().name,
+                        fontChoice = settings.fontChoice.first().serialize(),
+                        txtEncoding = settings.txtEncoding.first().name,
+                        readingMode = settings.readingMode.first().name,
+                    )
+                    output.use { it.write(profile.encode().toByteArray(Charsets.UTF_8)) }
+                }
+            }.onSuccess {
+                _themeExportState.value = BackupExportUiState.Success("主题已导出")
+            }.onFailure { error ->
+                _themeExportState.value = BackupExportUiState.Failure(
+                    "主题导出失败：${error.message ?: "请稍后重试"}",
+                )
+            }
+        }
+    }
+
+    fun importTheme(input: InputStream) {
+        _themeImportState.value = BackupRestoreUiState.Restoring
+        viewModelScope.launch {
+            runCatching {
+                withContext(backupDispatcher) {
+                    val raw = input.use { it.readBytes().toString(Charsets.UTF_8) }
+                    val profile = ThemeProfile.decode(raw) ?: throw IllegalStateException("无法解析主题文件")
+                    ThemeProfile.validated(profile)
+                }
+            }.onSuccess { profile ->
+                settings.setFontSize(profile.fontSize)
+                settings.setLineSpacing(profile.lineSpacing)
+                runCatching { ThemeMode.valueOf(profile.themeMode) }.getOrNull()?.let { settings.setThemeMode(it) }
+                settings.setFontChoice(FontChoice.parse(profile.fontChoice))
+                runCatching { TxtEncoding.valueOf(profile.txtEncoding) }.getOrNull()?.let { settings.setTxtEncoding(it) }
+                runCatching { ReaderReadingMode.valueOf(profile.readingMode) }.getOrNull()?.let { settings.setReadingMode(it) }
+                _themeImportState.value = BackupRestoreUiState.Success("主题已导入")
+            }.onFailure { error ->
+                _themeImportState.value = BackupRestoreUiState.Failure(
+                    "主题导入失败：${error.message ?: "请稍后重试"}",
+                )
+            }
+        }
     }
 
     fun restoreBackup(input: InputStream) {

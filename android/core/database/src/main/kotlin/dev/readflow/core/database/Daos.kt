@@ -125,3 +125,18 @@ interface BookmarkDao {
     @Query("UPDATE bookmarks SET isDeleted = 1, updatedAt = :updatedAt, deviceId = :deviceId WHERE id = :id")
     suspend fun markDeleted(id: String, updatedAt: Long, deviceId: String)
 }
+
+@Dao
+interface ReadingSessionDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insert(session: ReadingSessionEntity)
+
+    @Query("SELECT COALESCE(SUM(durationMs),0) FROM reading_sessions WHERE startedAt >= :sinceMillis")
+    suspend fun totalDurationSince(sinceMillis: Long): Long
+
+    @Query("SELECT COALESCE(SUM(durationMs),0) FROM reading_sessions WHERE bookId = :bookId")
+    suspend fun totalDurationForBook(bookId: String): Long
+
+    @Query("SELECT * FROM reading_sessions ORDER BY startedAt DESC")
+    suspend fun allForBackup(): List<ReadingSessionEntity>
+}

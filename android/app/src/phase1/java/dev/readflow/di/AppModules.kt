@@ -53,6 +53,7 @@ val databaseModule = module {
     single { get<ReadflowDatabase>().textAnnotationDao() }
     single { get<ReadflowDatabase>().inkStrokeDao() }
     single { get<ReadflowDatabase>().bookmarkDao() }
+    single { get<ReadflowDatabase>().readingSessionDao() }
     single { LibraryRepository(get()) }
     single<LibraryStore> { get<LibraryRepository>() }
 }
