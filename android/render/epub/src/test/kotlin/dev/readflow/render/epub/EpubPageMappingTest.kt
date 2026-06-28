@@ -412,6 +412,78 @@ class EpubPageMappingTest {
     }
 
     @Test
+    fun `block paged layout keeps a heading on the same page as its following body`() {
+        val heading = "内容简介"
+        val body = "正文第一段。"
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(heading, body)))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(heading, headingLevel = 1, paragraphIndex = 0),
+                    EpubDisplayBlock.Text(body, headingLevel = null, paragraphIndex = 1),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        // The heading is no longer isolated: it shares the page with the body that follows it,
+        // and the packed page begins at the heading paragraph.
+        assertEquals(1, pages.size)
+        assertEquals(0, pages.single().paragraphIndex)
+        assertEquals(1, pages.single().endParagraphIndex)
+        assertEquals(1, pages.single().textSegments.first().textStyle.headingLevel)
+        assertEquals(null, pages.single().textSegments.last().textStyle.headingLevel)
+    }
+
+    @Test
+    fun `block paged layout does not pack a heading with the body that precedes it`() {
+        val body = "上一节结尾。"
+        val heading = "下一节标题"
+        val nextBody = "下一节正文。"
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(body, heading, nextBody)))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(body, headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Text(heading, headingLevel = 1, paragraphIndex = 1),
+                    EpubDisplayBlock.Text(nextBody, headingLevel = null, paragraphIndex = 2),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        // Preceding body flushes before the heading; the heading then leads the next page.
+        assertEquals(2, pages.size)
+        assertEquals(0, pages[0].paragraphIndex)
+        assertEquals(0, pages[0].endParagraphIndex)
+        assertEquals(1, pages[1].paragraphIndex)
+        assertEquals(2, pages[1].endParagraphIndex)
+        assertEquals(1, pages[1].textSegments.first().textStyle.headingLevel)
+    }
+
+    @Test
     fun `block paged layout packs adjacent short text blocks onto one page`() {
         val paras = epubParasWithCharacterOffsets(
             listOf(

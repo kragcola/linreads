@@ -84,6 +84,20 @@ internal enum class EpubImagePlacement {
     Inline,
 }
 
+internal data class EpubComposeSegmentStyleSpan(
+    val start: Int,
+    val end: Int,
+    val style: SpanStyle,
+)
+
+internal fun epubHeadingBoost(headingLevel: Int?): Float =
+    when (headingLevel) {
+        1 -> 5f
+        2 -> 3f
+        3 -> 1.5f
+        else -> 0f
+    }
+
 /**
  * EPUB native reflow engine (v4 §12.3 ADR-EPUB-Engine).
  * ZipFile + jsoup → typed ReaderItem model → TextView paragraph stream.
@@ -191,6 +205,7 @@ class EpubReflowEngine private constructor(
     private val activePageContainers = Collections.newSetFromMap(WeakHashMap<View, Boolean>())
     private val activePagedTextPages = WeakHashMap<ComposeView, EpubPagedTextPageState>()
     private val activePagedImagePages = WeakHashMap<View, EpubPagedImagePageState>()
+    private val imageBoundsCache = mutableMapOf<String, EpubImageBoundsCacheEntry>()
 
     /** Start index (inclusive) and end index (exclusive) of each chapter in paras. */
     private data class ChapterBoundary(
@@ -222,6 +237,10 @@ class EpubReflowEngine private constructor(
         val segments: List<PagedTextRenderSegment>,
     )
 
+    // Caches the intrinsic-bounds decode per image href (value may be null when undecodable, which
+    // is itself worth caching to avoid re-opening the zip on every repagination).
+    private data class EpubImageBoundsCacheEntry(val value: EpubImageBounds?)
+
     private data class PagedTextSelectionPart(
         val paragraphIndex: Int,
         val paragraphStart: Int,
@@ -247,6 +266,7 @@ class EpubReflowEngine private constructor(
                 }
             }
             epubFile = tmp
+            imageBoundsCache.clear()
             cacheJob?.cancel()
             cacheJob = SupervisorJob()
             cacheScope = CoroutineScope(cacheJob!! + Dispatchers.IO)
@@ -391,7 +411,27 @@ class EpubReflowEngine private constructor(
         }.also { trackImagePageView(it, pageIndex, slice) }
     }
 
+    // Size-driven placement (replaces the old pageIndex==0 gate that forced every illustration
+    // past page 1 to render small). Light-novel EPUBs carry two distinct image classes:
+    //   - full-page illustrations / 彩插 / covers — large intrinsic pixels (~800px+ on the long side)
+    //   - inline markers: chat avatars (~142px), character icons (~300-400px), footnote glyphs
+    // Intrinsic pixels are the only book-agnostic signal: the sizing CSS lives in external
+    // stylesheets the parser does not resolve. Large image -> FullPage; small -> Inline.
+    // When bounds are undecodable, fall back to the structural rule (an image that is the sole
+    // content of its spine is a full-page cover; an image flanked by text is inline).
     private fun epubImagePlacementFor(slice: EpubPageSlice, pageIndex: Int): EpubImagePlacement {
+        val href = (slice.kind as? EpubPageSliceKind.Image)?.href
+        val bounds = href?.let { epubImageBoundsFor(it) }
+        if (bounds != null) {
+            val longestSidePx = maxOf(bounds.width, bounds.height)
+            return if (longestSidePx >= FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX) {
+                EpubImagePlacement.FullPage
+            } else {
+                EpubImagePlacement.Inline
+            }
+        }
+        // Undecodable bounds: fall back to the original structural rule. Only an image that is the
+        // sole content of the first page of its spine is treated as a full-page cover.
         if (pageIndex != 0) return EpubImagePlacement.Inline
         val para = paras.getOrNull(slice.paragraphIndex) ?: return EpubImagePlacement.Inline
         val sameSpineHasTextBeforeOrAtImage = paras
@@ -402,6 +442,14 @@ class EpubReflowEngine private constructor(
         } else {
             EpubImagePlacement.FullPage
         }
+    }
+
+    private fun epubImageBoundsFor(href: String): EpubImageBounds? {
+        imageBoundsCache[href]?.let { return it.value }
+        val file = epubFile ?: return null
+        val bounds = decodeEpubImageBounds(file, href)
+        imageBoundsCache[href] = EpubImageBoundsCacheEntry(bounds)
+        return bounds
     }
 
     override fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?) {
@@ -942,12 +990,7 @@ class EpubReflowEngine private constructor(
     }
 
     private fun currentComposeTextStyle(style: EpubPageTextStyle): TextStyle {
-        val headingBoost = when (style.headingLevel) {
-            1 -> 5f
-            2 -> 3f
-            3 -> 1.5f
-            else -> 0f
-        }
+        val headingBoost = epubHeadingBoost(style.headingLevel)
         return TextStyle(
             fontSize = (fontSizeSp + headingBoost).sp,
             lineHeight = (fontSizeSp * lineSpacingMultiplier).sp,
@@ -957,6 +1000,35 @@ class EpubReflowEngine private constructor(
             },
             fontWeight = if (style.headingLevel != null) FontWeight.Bold else FontWeight.Normal,
         )
+    }
+
+    // Base style for the whole compose page surface. A packed page may mix a heading segment
+    // with following body segments; we render the page at body size and restore the heading's
+    // larger/bold appearance per-segment (see segmentStyleSpansFor), so body text packed under
+    // a heading is not blown up to heading size.
+    private fun composePageBaseStyle(slice: EpubPageSlice): EpubPageTextStyle =
+        if (slice.textSegments.size > 1) {
+            slice.textStyle.copy(headingLevel = null)
+        } else {
+            slice.textStyle
+        }
+
+    // Per-segment heading overrides applied over composePageBaseStyle. Only heading segments on a
+    // multi-segment (packed) page need a span; single-segment pages already carry the right base.
+    private fun segmentStyleSpansFor(slice: EpubPageSlice): List<EpubComposeSegmentStyleSpan> {
+        if (slice.textSegments.size <= 1) return emptyList()
+        val content = pageTextRenderContent(slice)
+        return content.segments.mapNotNull { segment ->
+            val level = segment.source.textStyle.headingLevel ?: return@mapNotNull null
+            EpubComposeSegmentStyleSpan(
+                start = segment.renderStart,
+                end = segment.renderEnd,
+                style = SpanStyle(
+                    fontSize = (fontSizeSp + epubHeadingBoost(level)).sp,
+                    fontWeight = FontWeight.Bold,
+                ),
+            )
+        }
     }
 
     private fun currentComposeTextLayout(style: EpubPageTextStyle): EpubComposeTextLayout {
@@ -1000,12 +1072,7 @@ class EpubReflowEngine private constructor(
 
     private fun currentPageTextPaint(style: EpubPageTextStyle = EpubPageTextStyle()): TextPaint {
         val metrics = context.resources.displayMetrics
-        val headingBoost = when (style.headingLevel) {
-            1 -> 5f
-            2 -> 3f
-            3 -> 1.5f
-            else -> 0f
-        }
+        val headingBoost = epubHeadingBoost(style.headingLevel)
         return TextPaint().apply {
             textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp + headingBoost, metrics)
             typeface = when {
@@ -1294,12 +1361,15 @@ class EpubReflowEngine private constructor(
     ) {
         val textLayout = currentComposeTextLayout(slice.textStyle)
         val pageLinks = pageLinksFor(slice)
+        val baseStyle = composePageBaseStyle(slice)
+        val segmentStyleSpans = segmentStyleSpansFor(slice)
         val annotatedText = epubComposeAnnotatedText(
             text = pageText,
             highlightRanges = highlightRanges,
             links = pageLinks,
             selectionHighlightRange = selectionHighlightState.value,
             linkClickHandler = composeLinkClickHandler(this, slice),
+            segmentStyleSpans = segmentStyleSpans,
         )
         setTag(R.id.epub_compose_text_surface, pageText)
         setTag(R.id.epub_compose_text_annotated_string, annotatedText)
@@ -1334,13 +1404,14 @@ class EpubReflowEngine private constructor(
         setContent {
             EpubComposeTextPage(
                 text = pageText,
-                textStyle = currentComposeTextStyle(slice.textStyle).copy(color = ComposeColor(palette.ink)),
+                textStyle = currentComposeTextStyle(baseStyle).copy(color = ComposeColor(palette.ink)),
                 textLayout = textLayout,
                 highlightRanges = highlightRanges,
                 links = pageLinks,
                 selectionHighlightRange = selectionHighlightState.value,
                 onComposeSelectionRange = composeSelectionCallback,
                 onComposeLinkClick = composeLinkClickCallback,
+                segmentStyleSpans = segmentStyleSpans,
             )
         }
     }
@@ -1394,6 +1465,9 @@ class EpubReflowEngine private constructor(
         const val PAGE_HORIZONTAL_PADDING_DP = 28
         const val PAGE_VERTICAL_PADDING_DP = 24
         const val INLINE_IMAGE_MAX_HEIGHT_DP = 360
+        // Intrinsic-pixel gate for full-page placement. Light-novel illustrations/彩插/covers run
+        // ~800px+ on the long side; inline avatars (~142px) and icons (~300-400px) sit well below.
+        const val FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX = 600
         const val AVERAGE_PAGE_CHARACTER_SAMPLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz一二三四五六七八九十"
         val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
         val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
@@ -1454,6 +1528,7 @@ private fun EpubComposeTextPage(
     selectionHighlightRange: ReaderTextHighlightRange?,
     onComposeSelectionRange: (start: Int, end: Int) -> Unit,
     onComposeLinkClick: (EpubTextLink) -> Unit,
+    segmentStyleSpans: List<EpubComposeSegmentStyleSpan> = emptyList(),
 ) {
     val horizontalScrollState = rememberScrollState()
     val scrollModifier = if (textLayout.horizontalScroll) {
@@ -1517,6 +1592,7 @@ private fun EpubComposeTextPage(
                     links,
                     selectionHighlightRange,
                     linkClickHandler = onComposeLinkClick,
+                    segmentStyleSpans = segmentStyleSpans,
                 ),
                 style = textStyle,
                 onTextLayout = { layoutResult ->
@@ -1544,8 +1620,16 @@ private fun epubComposeAnnotatedText(
     links: List<EpubTextLink>,
     selectionHighlightRange: ReaderTextHighlightRange? = null,
     linkClickHandler: ((EpubTextLink) -> Unit)? = null,
+    segmentStyleSpans: List<EpubComposeSegmentStyleSpan> = emptyList(),
 ): AnnotatedString {
     val builder = AnnotatedString.Builder(text)
+    segmentStyleSpans.forEach { span ->
+        val start = span.start.coerceIn(0, text.length)
+        val end = span.end.coerceIn(0, text.length)
+        if (start < end) {
+            builder.addStyle(style = span.style, start = start, end = end)
+        }
+    }
     links.forEach { link ->
         val start = link.start.coerceIn(0, text.length)
         val end = link.end.coerceIn(0, text.length)

@@ -9,6 +9,32 @@ internal const val EPUB_MAX_IMAGE_SIDE = 1600
 internal const val EPUB_MAX_IMAGE_PIXELS = 4_000_000
 internal const val EPUB_MAX_ENCODED_IMAGE_BYTES = 20L * 1024L * 1024L
 
+internal data class EpubImageBounds(val width: Int, val height: Int)
+
+// Decode only the intrinsic pixel dimensions (no pixel data) so placement can classify an image
+// as a full-page illustration vs a small inline marker/avatar without loading the full bitmap.
+internal fun decodeEpubImageBounds(
+    epubFile: File,
+    entryPath: String,
+): EpubImageBounds? = try {
+    ZipFile(epubFile).use { zip ->
+        val entry = zip.getEntry(entryPath) ?: return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        zip.getInputStream(entry).use { input ->
+            BitmapFactory.decodeStream(input, null, bounds)
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            null
+        } else {
+            EpubImageBounds(bounds.outWidth, bounds.outHeight)
+        }
+    }
+} catch (_: OutOfMemoryError) {
+    null
+} catch (_: Exception) {
+    null
+}
+
 internal fun decodeEpubImage(
     epubFile: File,
     entryPath: String,

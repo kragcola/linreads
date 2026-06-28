@@ -327,9 +327,13 @@ private fun EpubPageSlice.canPackWithAdjacentText(): Boolean =
     kind == EpubPageSliceKind.Text &&
         textStyle.isSafeToPackWithAdjacentText()
 
+// Headings are packable so they keep-with-next (a heading never sits alone at the
+// bottom/top of a page; it shares the page with the text that follows it). The block
+// loop pre-flushes pending text before a heading, so a heading only ever starts a pack
+// group — body text is never packed *before* it. Per-segment styling at render time keeps
+// the heading visually large while packed body renders at body size.
 private fun EpubPageTextStyle.isSafeToPackWithAdjacentText(): Boolean =
-    headingLevel == null &&
-        kind in setOf(EpubTextKind.Body, EpubTextKind.ListItem, EpubTextKind.Blockquote)
+    kind in setOf(EpubTextKind.Body, EpubTextKind.ListItem, EpubTextKind.Blockquote)
 
 private fun EpubPageSlice.canPackAcrossSpineWith(next: EpubPageSlice, paras: List<EpubPara>): Boolean {
     val currentSpine = paras.getOrNull(endParagraphIndex)?.spineIndex ?: return false

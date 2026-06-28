@@ -99,6 +99,57 @@ class EpubReaderItemParserTest {
     }
 
     @Test
+    fun `image wrapped in a paragraph is emitted as a block image`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <p><img alt="image" src="../Images/image.jpeg"/><br/></p>
+                </body></html>
+            """.trimIndent(),
+            resourceBaseDir = "OEBPS/Text",
+        )
+
+        val image = assertInstanceOf(EpubReaderItem.Image::class.java, items.single())
+        assertEquals("OEBPS/Images/image.jpeg", image.href)
+        assertEquals("image", image.altText)
+    }
+
+    @Test
+    fun `paragraph mixing text and image preserves document order`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <p>Lead text<img alt="mid" src="../Images/mid.png"/>tail text</p>
+                </body></html>
+            """.trimIndent(),
+            resourceBaseDir = "OEBPS/Text",
+        )
+
+        assertEquals(3, items.size)
+        assertEquals("Lead text", assertInstanceOf(EpubReaderItem.Text::class.java, items[0]).text)
+        assertEquals("OEBPS/Images/mid.png", assertInstanceOf(EpubReaderItem.Image::class.java, items[1]).href)
+        assertEquals("tail text", assertInstanceOf(EpubReaderItem.Text::class.java, items[2]).text)
+    }
+
+    @Test
+    fun `footnote marker image nested in a link stays inline text not a block image`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <p>胆小鬼<a class="duokan-footnote" href="#note1"><sup><img alt="note" src="../Images/note.png"/></sup></a>？</p>
+                </body></html>
+            """.trimIndent(),
+            resourceBaseDir = "OEBPS/Text",
+        )
+
+        val text = assertInstanceOf(EpubReaderItem.Text::class.java, items.single())
+        assertEquals("胆小鬼？", text.text)
+    }
+
+    @Test
     fun `table pre blockquote nested lists and unknown blocks degrade to readable text`() {
         val items = parseReaderItemsFromHtml(
             spineIndex = 0,

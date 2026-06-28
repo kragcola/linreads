@@ -81,7 +81,7 @@ private fun collectReaderItems(
                 )
             }
         }
-        "p" -> addTextItem(spineIndex, items, extractTextWithLinks(element, resourceBaseDir, documentPath, maxDomDepth), element.fragmentIds())
+        "p" -> addParagraphWithImages(spineIndex, items, element, resourceBaseDir, documentPath, maxDomDepth)
         "img" -> addImageItem(spineIndex, items, element, resourceBaseDir)
         "br", "hr" -> items += EpubReaderItem.Break(EpubItemLocator(spineIndex, items.size))
         "table" -> addPlainTextItem(
@@ -202,6 +202,60 @@ private fun addTextItem(
         indentLevel = indentLevel,
         fragmentIds = fragmentIds,
     )
+}
+
+private fun extractTextWithLinksFromNodes(
+    nodes: List<Node>,
+    resourceBaseDir: String,
+    documentPath: String?,
+    maxDomDepth: Int,
+): TextWithLinks {
+    val builder = StringBuilder()
+    val links = mutableListOf<EpubTextLink>()
+    val styleSpans = mutableListOf<EpubTextStyleSpan>()
+    nodes.forEach { node ->
+        appendInlineNode(node, builder, links, styleSpans, resourceBaseDir, documentPath, depth = 0, maxDomDepth = maxDomDepth)
+    }
+    return trimTextWithRanges(builder.toString(), links, styleSpans)
+}
+
+// A <p> can wrap a block image, e.g. <p><img .../><br/></p> (common in scanned light novels).
+// Walk the direct children in document order: accumulate inline runs into text items and emit
+// each direct-child <img> as its own image item. Images nested deeper (footnote markers inside
+// <a><sup><img/></sup></a>) are NOT direct children, so they stay inline and never become block
+// images. A <p> with no direct-child <img> degrades to the original single text item.
+private fun addParagraphWithImages(
+    spineIndex: Int,
+    items: MutableList<EpubReaderItem>,
+    element: Element,
+    resourceBaseDir: String,
+    documentPath: String?,
+    maxDomDepth: Int,
+) {
+    val hasDirectImage = element.children().any { it.tagName().equals("img", ignoreCase = true) }
+    if (!hasDirectImage) {
+        addTextItem(spineIndex, items, extractTextWithLinks(element, resourceBaseDir, documentPath, maxDomDepth), element.fragmentIds())
+        return
+    }
+    val pendingNodes = mutableListOf<Node>()
+    fun flushPendingText() {
+        if (pendingNodes.isEmpty()) return
+        addTextItem(
+            spineIndex,
+            items,
+            extractTextWithLinksFromNodes(pendingNodes, resourceBaseDir, documentPath, maxDomDepth),
+        )
+        pendingNodes.clear()
+    }
+    element.childNodes().forEach { node ->
+        if (node is Element && node.tagName().equals("img", ignoreCase = true)) {
+            flushPendingText()
+            addImageItem(spineIndex, items, node, resourceBaseDir)
+        } else {
+            pendingNodes += node
+        }
+    }
+    flushPendingText()
 }
 
 private fun addPlainTextItem(
