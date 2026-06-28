@@ -19,8 +19,8 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -345,31 +345,34 @@ class EpubReflowEngine private constructor(
                     EpubImagePlacement.FullPage -> FrameLayout.LayoutParams.MATCH_PARENT
                     EpubImagePlacement.Inline -> FrameLayout.LayoutParams.WRAP_CONTENT
                 },
-                FrameLayout.LayoutParams.WRAP_CONTENT,
+                when (placement) {
+                    EpubImagePlacement.FullPage -> FrameLayout.LayoutParams.MATCH_PARENT
+                    EpubImagePlacement.Inline -> FrameLayout.LayoutParams.WRAP_CONTENT
+                },
                 Gravity.CENTER,
             ).apply {
-                maxWidth = (MAX_LINE_WIDTH_DP * density).toInt()
+                // Cap inline images for readability; full-page (cover) fills the page.
+                if (placement == EpubImagePlacement.Inline) {
+                    maxWidth = (MAX_LINE_WIDTH_DP * density).toInt()
+                }
             }
-            adjustViewBounds = true
-            maxHeight = (
-                when (placement) {
-                    EpubImagePlacement.FullPage -> FULL_PAGE_IMAGE_MAX_HEIGHT_DP
-                    EpubImagePlacement.Inline -> INLINE_IMAGE_MAX_HEIGHT_DP
-                } * density
-                ).toInt()
+            adjustViewBounds = placement == EpubImagePlacement.Inline
+            if (placement == EpubImagePlacement.Inline) {
+                maxHeight = (INLINE_IMAGE_MAX_HEIGHT_DP * density).toInt()
+            }
             minimumHeight = (48 * density).toInt()
-            val horizontalPadding = when (placement) {
-                EpubImagePlacement.FullPage -> 16
+            val edgePadding = when (placement) {
+                EpubImagePlacement.FullPage -> 0
                 EpubImagePlacement.Inline -> 28
             }
             val verticalPadding = when (placement) {
-                EpubImagePlacement.FullPage -> 12
+                EpubImagePlacement.FullPage -> 0
                 EpubImagePlacement.Inline -> 24
             }
             setPadding(
-                (horizontalPadding * density).toInt(),
+                (edgePadding * density).toInt(),
                 (verticalPadding * density).toInt(),
-                (horizontalPadding * density).toInt(),
+                (edgePadding * density).toInt(),
                 (verticalPadding * density).toInt(),
             )
             scaleType = ImageView.ScaleType.FIT_CENTER
@@ -1390,12 +1393,12 @@ class EpubReflowEngine private constructor(
         const val MAX_LINE_WIDTH_DP = 680
         const val PAGE_HORIZONTAL_PADDING_DP = 28
         const val PAGE_VERTICAL_PADDING_DP = 24
-        const val FULL_PAGE_IMAGE_MAX_HEIGHT_DP = 760
         const val INLINE_IMAGE_MAX_HEIGHT_DP = 360
         const val AVERAGE_PAGE_CHARACTER_SAMPLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz一二三四五六七八九十"
         val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
         val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
-        val PAPER_LIGHT = Color.rgb(0xFA, 0xFA, 0xF8)
+        // 日间纸白：暖白，非纯白，降低长读刺眼感（参考 Kindle/静读天下 day 预设）
+        val PAPER_LIGHT = Color.rgb(0xF7, 0xF3, 0xE9)
         val PAPER_SEPIA = Color.rgb(0xF5, 0xF0, 0xE8)
 
         private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {
@@ -1520,7 +1523,7 @@ private fun EpubComposeTextPage(
                     textLayoutResultState.value = layoutResult
                 },
                 modifier = Modifier
-                    .widthIn(max = 680.dp)
+                    .fillMaxWidth()
                     .padding(
                         start = textLayout.paddingStartDp.dp,
                         end = textLayout.paddingEndDp.dp,

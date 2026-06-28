@@ -325,8 +325,7 @@ private fun packAdjacentShortTextPages(
 
 private fun EpubPageSlice.canPackWithAdjacentText(): Boolean =
     kind == EpubPageSliceKind.Text &&
-        textStyle.isSafeToPackWithAdjacentText() &&
-        links.isEmpty()
+        textStyle.isSafeToPackWithAdjacentText()
 
 private fun EpubPageTextStyle.isSafeToPackWithAdjacentText(): Boolean =
     headingLevel == null &&

@@ -13,14 +13,18 @@ import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
@@ -328,7 +332,6 @@ fun ReaderScreen(
                             HorizontalDivider(thickness = 0.5.dp, color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
                             ReaderControlPanel(
                                 panel = state.activePanel,
-                                tocEntries = engine.tableOfContents.collectAsState().value,
                                 fontSizeSp = state.fontSizeSp,
                                 lineSpacing = state.lineSpacing,
                                 readingMode = state.readingMode,
@@ -337,7 +340,6 @@ fun ReaderScreen(
                                 searchState = state.search,
                                 bookmarkState = state.bookmarks,
                                 annotationState = state.annotations,
-                                onTocClick = { viewModel.onIntent(ReaderIntent.GoToTocEntry(it)) },
                                 onBookmarkClick = { viewModel.onIntent(ReaderIntent.GoToBookmark(it)) },
                                 onBookmarkRemove = { viewModel.onIntent(ReaderIntent.RemoveBookmark(it)) },
                                 onAnnotationClick = { viewModel.onIntent(ReaderIntent.GoToAnnotation(it)) },
@@ -395,6 +397,16 @@ fun ReaderScreen(
                         }
                     }
 
+                    // ── 目录左半屏抽屉（覆盖在内容上，独立于底部 chrome）──
+                    val tocLocator by engine.currentLocator.collectAsState()
+                    TocDrawer(
+                        visible = state.activePanel == ReaderPanel.TOC,
+                        tocEntries = engine.tableOfContents.collectAsState().value,
+                        currentProgression = tocLocator.totalProgression,
+                        onTocClick = { viewModel.onIntent(ReaderIntent.GoToTocEntry(it)) },
+                        onDismiss = { viewModel.onIntent(ReaderIntent.ClosePanel) },
+                    )
+
                     // ── 首次手势引导浮层 ──
                     if (state.showGuide) {
                         ReaderGestureGuideOverlay(
@@ -411,7 +423,6 @@ fun ReaderScreen(
 @Composable
 private fun ReaderControlPanel(
     panel: ReaderPanel?,
-    tocEntries: List<TocEntry>,
     fontSizeSp: Float,
     lineSpacing: Float,
     readingMode: ReadingMode,
@@ -420,7 +431,6 @@ private fun ReaderControlPanel(
     searchState: ReaderSearchState,
     bookmarkState: ReaderBookmarkState,
     annotationState: ReaderAnnotationState,
-    onTocClick: (TocEntry) -> Unit,
     onBookmarkClick: (ReaderBookmarkItem) -> Unit,
     onBookmarkRemove: (ReaderBookmarkItem) -> Unit,
     onAnnotationClick: (ReaderAnnotationItem) -> Unit,
@@ -433,13 +443,14 @@ private fun ReaderControlPanel(
     onModeChange: (ReadingMode) -> Unit,
     onThemeChange: (ThemeMode) -> Unit,
 ) {
-    AnimatedVisibility(visible = panel != null) {
+    // 目录改为左半屏抽屉（见 TocDrawer），底部面板不再承载 TOC。
+    AnimatedVisibility(visible = panel != null && panel != ReaderPanel.TOC) {
         Surface(
             modifier = Modifier.fillMaxWidth(),
             color = MaterialTheme.colorScheme.background.copy(alpha = 0.96f),
         ) {
             when (panel) {
-                ReaderPanel.TOC -> TocPanel(tocEntries, onTocClick)
+                ReaderPanel.TOC -> Unit
                 ReaderPanel.BOOKMARKS -> BookmarkPanel(
                     bookmarkState = bookmarkState,
                     onBookmarkClick = onBookmarkClick,
@@ -710,42 +721,126 @@ private fun SearchPanel(
 }
 
 @Composable
-private fun TocPanel(
+private fun TocDrawer(
+    visible: Boolean,
     tocEntries: List<TocEntry>,
+    currentProgression: Float?,
+    onTocClick: (TocEntry) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    // 高亮当前所在章节：取 progression 不超过当前位置的最后一条目录项
+    val currentIndex = remember(tocEntries, currentProgression) {
+        readerCurrentTocIndex(tocEntries, currentProgression)
+    }
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(),
+        exit = fadeOut(),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                // 点击右侧遮罩关闭
+                .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.32f))
+                .clickable(
+                    indication = null,
+                    interactionSource = remember { MutableInteractionSource() },
+                    onClick = onDismiss,
+                ),
+        ) {
+            AnimatedVisibility(
+                visible = visible,
+                enter = slideInHorizontally { -it } + fadeIn(),
+                exit = slideOutHorizontally { -it } + fadeOut(),
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth(0.5f)
+                        .fillMaxHeight()
+                        // 吞掉抽屉内部点击，避免穿透到遮罩
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() },
+                            onClick = {},
+                        ),
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 2.dp,
+                    shadowElevation = 8.dp,
+                ) {
+                    TocDrawerContent(
+                        tocEntries = tocEntries,
+                        currentIndex = currentIndex,
+                        onTocClick = onTocClick,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TocDrawerContent(
+    tocEntries: List<TocEntry>,
+    currentIndex: Int,
     onTocClick: (TocEntry) -> Unit,
 ) {
+    val listState = rememberLazyListState()
+    // 打开时滚动到当前章节
+    LaunchedEffect(currentIndex, tocEntries.size) {
+        if (currentIndex in tocEntries.indices) {
+            listState.scrollToItem(currentIndex.coerceAtLeast(0))
+        }
+    }
     Column(
         modifier = Modifier
-            .fillMaxWidth()
-            .heightIn(max = 320.dp)
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.systemBars)
+            .padding(horizontal = 8.dp, vertical = 12.dp),
     ) {
-        Text("目录", style = MaterialTheme.typography.titleSmall)
+        Text(
+            "目录",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(start = 12.dp, bottom = 8.dp),
+        )
         if (tocEntries.isEmpty()) {
             Text(
                 "暂无目录",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(vertical = 12.dp),
+                modifier = Modifier.padding(start = 12.dp, top = 12.dp),
             )
         } else {
-            LazyColumn {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                 items(tocEntries) { entry ->
+                    val isCurrent = tocEntries.indexOf(entry) == currentIndex
                     Text(
                         text = entry.title,
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onBackground,
-                        maxLines = 1,
+                        color = if (isCurrent) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        },
+                        maxLines = 2,
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
+                            .then(
+                                if (isCurrent) {
+                                    Modifier.background(
+                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
+                                    )
+                                } else {
+                                    Modifier
+                                },
+                            )
                             .semantics {
                                 contentDescription = readerTocAccessibilityLabel(entry)
                             }
                             .clickable { onTocClick(entry) }
                             .padding(
-                                start = (entry.level.coerceIn(0, 4) * 16).dp,
+                                start = (12 + entry.level.coerceIn(0, 4) * 16).dp,
                                 top = 14.dp,
                                 end = 8.dp,
                                 bottom = 14.dp,
@@ -755,6 +850,18 @@ private fun TocPanel(
             }
         }
     }
+}
+
+/** 当前阅读位置对应的目录项下标；取 progression 不超过当前位置的最后一条。 */
+internal fun readerCurrentTocIndex(tocEntries: List<TocEntry>, currentProgression: Float?): Int {
+    if (tocEntries.isEmpty()) return -1
+    val progress = currentProgression ?: return 0
+    var index = 0
+    tocEntries.forEachIndexed { i, entry ->
+        val entryProgress = entry.locator.totalProgression ?: return@forEachIndexed
+        if (entryProgress <= progress + 1e-4f) index = i
+    }
+    return index
 }
 
 @Composable

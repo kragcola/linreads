@@ -450,7 +450,8 @@ class TxtVirtualPagerEngine(
     private companion object {
         val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
         val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
-        val PAPER_LIGHT = Color.rgb(0xFA, 0xFA, 0xF8)
+        // 日间纸白：暖白，非纯白，降低长读刺眼感
+        val PAPER_LIGHT = Color.rgb(0xF7, 0xF3, 0xE9)
         val PAPER_SEPIA = Color.rgb(0xF5, 0xF0, 0xE8)
         private val TXT_HEADING = Regex("""^(第.{1,12}[章节回卷部篇集].*|Chapter\s+\d+.*|CHAPTER\s+\d+.*)$""")
 

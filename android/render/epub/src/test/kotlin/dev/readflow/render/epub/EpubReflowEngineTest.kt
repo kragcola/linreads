@@ -329,9 +329,9 @@ class EpubReflowEngineTest {
     }
 
     @Test
-    fun `paged runtime keeps linked text isolated while packing following plain paragraphs`() = runTest(dispatcher) {
+    fun `paged runtime packs linked text with following plain paragraphs and keeps links`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
-        val epub = tempDir.newFile("linked-paragraph-isolated-from-packed-plain-text.epub")
+        val epub = tempDir.newFile("linked-paragraph-packs-with-plain-text.epub")
         writeEpub(
             epub,
             "OEBPS/ch1.xhtml" to """
@@ -352,15 +352,16 @@ class EpubReflowEngineTest {
 
         engine.openBook(Uri.fromFile(epub))
         engine.setMode(ReadingMode.PAGED)
-        val linkedPage = engine.createPageView(0)
-        val plainPage = engine.createPageView(1)
+        val page = engine.createPageView(0)
         @Suppress("UNCHECKED_CAST")
-        val links = linkedPage.getTag(R.id.epub_compose_text_links) as? List<EpubTextLink>
+        val links = page.getTag(R.id.epub_compose_text_links) as? List<EpubTextLink>
 
-        assertEquals(2, engine.pageCount.value)
-        assertEquals("Tap note", linkedPage.getTag(R.id.epub_compose_text_surface))
+        // 链接段落不再独占一页，与后续正文合并（非必要不分页），链接元数据保留并重映射。
+        assertEquals(1, engine.pageCount.value)
+        assertEquals("Tap note\n\nPlain follow.\n\nPlain tail.", page.getTag(R.id.epub_compose_text_surface))
         assertTrue(links.orEmpty().isNotEmpty())
-        assertEquals("Plain follow.\n\nPlain tail.", plainPage.getTag(R.id.epub_compose_text_surface))
+        assertEquals(0, links!!.first().start)
+        assertEquals("Tap note".length, links.first().end)
     }
 
     @Test
