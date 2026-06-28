@@ -137,8 +137,11 @@ class TxtVirtualPagerEngineTest {
         shadowOf(Looper.getMainLooper()).idle()
 
         assertEquals(PagingKind.PAGED, engine.pagingKind.value)
-        assertEquals(expectedAnchor, requestedPages.single())
-        assertEquals(expectedAnchor, engine.pageIndexForLocator(engine.currentLocator.value))
+        // 段落贪心装箱后 页号≠段落号；验证“锚定到可见段落而非陈旧 page-0 locator”：
+        // 请求页 == 当前 locator 映射页，且都对应可见的居中段落（非陈旧首页）。
+        val expectedPage = engine.pageIndexForLocator(engine.currentLocator.value)
+        assertEquals(expectedPage, requestedPages.single())
+        assertEquals(expectedAnchor, engine.currentParagraphIndexForTest())
     }
 
     @Test
@@ -183,6 +186,12 @@ class TxtVirtualPagerEngineTest {
             .get(this) as MutableStateFlow<Locator>
         currentLocator.value = locator
     }
+
+    private fun TxtVirtualPagerEngine.currentParagraphIndexForTest(): Int =
+        TxtVirtualPagerEngine::class.java
+            .getDeclaredMethod("currentParagraphIndex")
+            .apply { isAccessible = true }
+            .invoke(this) as Int
 
     private fun TxtVirtualPagerEngine.reportProgressionForTest(view: RecyclerView) {
         TxtVirtualPagerEngine::class.java

@@ -5,11 +5,14 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
+import android.text.StaticLayout
+import android.text.TextPaint
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -85,6 +88,11 @@ class TxtVirtualPagerEngine(
     private var recyclerView: RecyclerView? = null
     private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
     private var pendingProgrammaticScroll: PendingProgrammaticScroll? = null
+    /**
+     * PAGED 模式下的页→段落区间映射（贪心装箱：把多段落填进一页直到页高用尽，非必要不分页）。
+     * 每个元素是该页起始段落下标（含），区间到下一元素前一段（含）。空表示尚未构建/SCROLL 模式。
+     */
+    private var pagedParagraphStarts: List<Int> = emptyList()
     private val activePageTextViews = Collections.newSetFromMap(WeakHashMap<TextView, Boolean>())
     private val activePageContainers = Collections.newSetFromMap(WeakHashMap<FrameLayout, Boolean>())
 
@@ -115,6 +123,7 @@ class TxtVirtualPagerEngine(
         pendingEngineState = null
         txtDocument = document
         txtFingerprint = copied.fingerprint
+        pagedParagraphStarts = emptyList()
         _pageCount.value = document.paragraphCount
         _tableOfContents.value = buildToc(document)
         _currentLocator.value = locatorForIndex(0, document.paragraphCount)
@@ -152,34 +161,117 @@ class TxtVirtualPagerEngine(
 
     override fun createPageView(pageIndex: Int): View {
         val total = paragraphCount().coerceAtLeast(1)
-        val safeIndex = pageIndex.coerceIn(0, total - 1)
+        val starts = pagedParagraphStarts.ifEmpty { buildPagedParagraphStarts().also { pagedParagraphStarts = it } }
+        val pageCount = starts.size.coerceAtLeast(1)
+        val safePageIndex = pageIndex.coerceIn(0, pageCount - 1)
+        val startParagraph = starts.getOrNull(safePageIndex) ?: 0
+        val endParagraphExclusive = starts.getOrNull(safePageIndex + 1) ?: total
         val palette = paletteFor(themeMode, context.resources.configuration)
         val density = context.resources.displayMetrics.density
         val maxLineWidthPx = (TxtParagraphAdapter.MAX_LINE_WIDTH_DP * density).toInt()
-        val textView = SelectionAwareTextView(context).apply {
+        val pageTextViews = mutableListOf<TextView>()
+
+        // 一页内按段落顺序竖直堆叠（顶对齐），每个 TextView 仍对应单一段落 →
+        // 选择/高亮/标注沿用既有“按段落下标”逻辑，无需偏移重映射。
+        val column = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER,
-            ).apply { maxWidth = maxLineWidthPx }
-            setPadding((28 * density).toInt(), (24 * density).toInt(), (28 * density).toInt(), (24 * density).toInt())
-            gravity = Gravity.START
-            typeface = Typeface.SERIF
-            tag = safeIndex
-            text = paragraphAt(safeIndex).withTextHighlightSpans(highlightRangesForParagraph(safeIndex))
-            contentDescription = "第 ${safeIndex + 1} 页，共 $total 页"
-            setTextIsSelectable(true)
-            onSelectionRangeChanged = { start, end -> updateTextSelection(safeIndex, start, end) }
-            applyTextStyle(palette.ink)
+                Gravity.TOP,
+            )
         }
-        return FrameLayout(context).apply {
+        for (paragraphIndex in startParagraph until endParagraphExclusive.coerceAtMost(total)) {
+            val textView = SelectionAwareTextView(context).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER_HORIZONTAL.toFloat(),
+                ).apply { gravity = Gravity.CENTER_HORIZONTAL }
+                maxWidth = maxLineWidthPx
+                setPadding((28 * density).toInt(), (10 * density).toInt(), (28 * density).toInt(), (10 * density).toInt())
+                gravity = Gravity.START
+                typeface = resolveTypeface()
+                tag = paragraphIndex
+                text = paragraphAt(paragraphIndex).withTextHighlightSpans(highlightRangesForParagraph(paragraphIndex))
+                setTextIsSelectable(true)
+                onSelectionRangeChanged = { start, end -> updateTextSelection(paragraphIndex, start, end) }
+                applyTextStyle(palette.ink)
+            }
+            column.addView(textView)
+            pageTextViews += textView
+        }
+        val container = FrameLayout(context).apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
             setBackgroundColor(palette.paper)
-            addView(textView)
-        }.also { trackPageView(it, textView) }
+            val padV = (24 * density).toInt()
+            setPadding(0, padV, 0, padV)
+            contentDescription = "第 ${safePageIndex + 1} 页，共 $pageCount 页"
+            addView(column)
+        }
+        return container.also { trackPageView(it, pageTextViews) }
+    }
+
+    /**
+     * 贪心把段落装进页：逐段测量视觉行数，累加到接近页可容纳行数时换页。
+     * 段落本身超过一页则独占（不会无限循环）。返回各页起始段落下标。
+     */
+    private fun buildPagedParagraphStarts(): List<Int> {
+        val total = paragraphCount()
+        if (total <= 0) return listOf(0)
+        val metrics = context.resources.displayMetrics
+        val density = metrics.density
+        val contentWidthPx = ((TxtParagraphAdapter.MAX_LINE_WIDTH_DP * density)
+            .coerceAtMost((metrics.widthPixels - 56 * density)))
+            .toInt().coerceAtLeast(1)
+        val textSizePx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, metrics)
+        val lineHeightPx = (textSizePx * lineSpacingMultiplier).coerceAtLeast(1f)
+        // 页内容高度：视口高 - 上下纸边(24dp×2) - 每段竖直 padding(10dp×2) 的安全余量。
+        val contentHeightPx = (metrics.heightPixels - 48 * density).coerceAtLeast(1f)
+        val linesPerPage = (contentHeightPx / lineHeightPx).toInt().coerceAtLeast(1)
+        val paint = TextPaint().apply {
+            textSize = textSizePx
+            typeface = resolveTypeface()
+        }
+        val starts = mutableListOf(0)
+        var usedLines = 0
+        for (index in 0 until total) {
+            val lines = paragraphLineCount(paragraphAt(index), contentWidthPx, paint)
+            val paragraphGap = if (index == starts.last()) 0 else 1 // 段间一行视觉间隔
+            if (usedLines > 0 && usedLines + paragraphGap + lines > linesPerPage) {
+                starts += index
+                usedLines = lines
+            } else {
+                usedLines += paragraphGap + lines
+            }
+        }
+        return starts
+    }
+
+    private fun paragraphLineCount(text: String, contentWidthPx: Int, paint: TextPaint): Int {
+        if (text.isEmpty()) return 1
+        return StaticLayout.Builder
+            .obtain(text, 0, text.length, paint, contentWidthPx)
+            .setLineSpacing(0f, lineSpacingMultiplier.coerceAtLeast(0.1f))
+            .setIncludePad(false)
+            .build()
+            .lineCount
+            .coerceAtLeast(1)
+    }
+
+    /** 段落下标 → 所在页下标（PAGED 装箱映射）。 */
+    private fun pageForParagraph(paragraphIndex: Int): Int {
+        val starts = pagedParagraphStarts
+        if (starts.isEmpty()) return paragraphIndex
+        // starts 升序，找最后一个 <= paragraphIndex 的页。
+        var page = 0
+        for (i in starts.indices) {
+            if (starts[i] <= paragraphIndex) page = i else break
+        }
+        return page
     }
 
     override fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?) {
@@ -328,6 +420,7 @@ class TxtVirtualPagerEngine(
         fontSizeSp = sp
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateFontSize(sp)
         activePageTextViews.forEach { it.applyTextStyle() }
+        rebuildPagedRangesAfterTypographyChange()
     }
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {
@@ -335,6 +428,7 @@ class TxtVirtualPagerEngine(
         currentFontId = if (useSourceHan) "source_han" else "system"
         withContext(Dispatchers.Main) {
             (recyclerView?.adapter as? TxtParagraphAdapter)?.updateTypeface(resolveTypeface())
+            rebuildPagedRangesAfterTypographyChange()
         }
     }
 
@@ -343,11 +437,21 @@ class TxtVirtualPagerEngine(
         useSourceHan = fontId == "source_han"
         withContext(Dispatchers.Main) {
             (recyclerView?.adapter as? TxtParagraphAdapter)?.updateTypeface(resolveTypeface())
+            rebuildPagedRangesAfterTypographyChange()
         }
     }
 
     private fun resolveTypeface(): Typeface =
         dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
+
+    /** PAGED 模式下排版参数变化后重算装箱，并把当前段落对应的新页号回调给宿主。 */
+    private fun rebuildPagedRangesAfterTypographyChange() {
+        if (_pagingKind.value != PagingKind.PAGED) return
+        val paragraphIndex = currentParagraphIndex()
+        pagedParagraphStarts = buildPagedParagraphStarts()
+        _pageCount.value = pagedParagraphStarts.size
+        pageRequestCallback?.invoke(pageForParagraph(paragraphIndex))
+    }
 
     override suspend fun setTxtEncodingOverride(charsetName: String?) {
         encodingOverride = charsetName
@@ -365,6 +469,7 @@ class TxtVirtualPagerEngine(
         lineSpacingMultiplier = multiplier
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateLineSpacing(multiplier)
         activePageTextViews.forEach { it.applyTextStyle() }
+        rebuildPagedRangesAfterTypographyChange()
     }
 
     override suspend fun setTheme(mode: ThemeMode) {
@@ -390,9 +495,28 @@ class TxtVirtualPagerEngine(
             _currentLocator.value = locatorForIndex(paragraphIndex)
             _pagingKind.value = targetKind
             if (targetKind == PagingKind.PAGED) {
-                pageRequestCallback?.invoke(paragraphIndex)
+                pagedParagraphStarts = buildPagedParagraphStarts()
+                _pageCount.value = pagedParagraphStarts.size
+                pageRequestCallback?.invoke(pageForParagraph(paragraphIndex))
+            } else {
+                pagedParagraphStarts = emptyList()
+                _pageCount.value = paragraphCount()
             }
         }
+    }
+
+    override fun pageIndexForLocator(locator: Locator): Int {
+        if (_pagingKind.value != PagingKind.PAGED || pagedParagraphStarts.isEmpty()) {
+            return super.pageIndexForLocator(locator)
+        }
+        val total = paragraphCount().coerceAtLeast(1)
+        val paragraphIndex = when (val s = locator.strategy) {
+            is LocatorStrategy.Section -> s.elementIndex
+            is LocatorStrategy.Page -> return s.index.coerceIn(0, pagedParagraphStarts.lastIndex)
+            is LocatorStrategy.ByteOffset -> txtDocument?.indexForOffset(s.offset) ?: 0
+            LocatorStrategy.Unknown -> locator.totalProgression?.let { (it * total).toInt() } ?: 0
+        }.coerceIn(0, total - 1)
+        return pageForParagraph(paragraphIndex)
     }
 
     private fun currentVisibleParagraphIndex(): Int? {
@@ -410,15 +534,15 @@ class TxtVirtualPagerEngine(
             ?.coerceIn(0, total - 1)
     }
 
-    private fun trackPageView(container: FrameLayout, textView: TextView) {
+    private fun trackPageView(container: FrameLayout, textViews: List<TextView>) {
         activePageContainers.add(container)
-        activePageTextViews.add(textView)
+        activePageTextViews.addAll(textViews)
         container.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
             override fun onViewAttachedToWindow(view: View) = Unit
 
             override fun onViewDetachedFromWindow(view: View) {
                 activePageContainers.remove(container)
-                activePageTextViews.remove(textView)
+                activePageTextViews.removeAll(textViews.toSet())
             }
         })
     }
