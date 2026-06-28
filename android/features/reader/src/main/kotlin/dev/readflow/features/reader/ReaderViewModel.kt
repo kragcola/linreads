@@ -77,6 +77,7 @@ class ReaderViewModel(
     private val settings: SettingsRepository,
     private val engineStateStore: EngineStateStore,
     private val readingSessionDao: dev.readflow.core.database.ReadingSessionDao,
+    private val clock: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
 
     private var restoredReaderState: ReaderState? = savedStateHandle.readerStateOrNull()
@@ -223,7 +224,7 @@ class ReaderViewModel(
             watchTextSelection(engine)
             watchAnnotations(engine, bookId)
             watchSettings(engine)
-            sessionStartedAt = System.currentTimeMillis()
+            sessionStartedAt = clock()
             bookId?.let {
                 persistReaderState(bookId = it, locator = engine.currentLocator.value, loadingState = LoadingState.Loaded)
             }
@@ -582,19 +583,18 @@ class ReaderViewModel(
             val sessionStart = sessionStartedAt
             sessionStartedAt = null
             if (bookId != null && sessionStart != null) {
-                val duration = System.currentTimeMillis() - sessionStart
+                val duration = clock() - sessionStart
                 if (duration > 1_000L) {
-                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                        readingSessionDao.insert(
-                            dev.readflow.core.database.ReadingSessionEntity(
-                                id = java.util.UUID.randomUUID().toString(),
-                                bookId = bookId,
-                                startedAt = sessionStart,
-                                durationMs = duration,
-                                deviceId = settings.deviceId.first(),
-                            )
+                    // Room suspend DAOs run on Room's own executor; no manual withContext needed.
+                    readingSessionDao.insert(
+                        dev.readflow.core.database.ReadingSessionEntity(
+                            id = java.util.UUID.randomUUID().toString(),
+                            bookId = bookId,
+                            startedAt = sessionStart,
+                            durationMs = duration,
+                            deviceId = settings.deviceId.first(),
                         )
-                    }
+                    )
                 }
             }
             // Force-save progress before close so debounce doesn't swallow it.

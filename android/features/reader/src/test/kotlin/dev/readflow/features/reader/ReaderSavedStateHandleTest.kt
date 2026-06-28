@@ -65,6 +65,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -254,6 +255,54 @@ class ReaderSavedStateHandleTest {
         advanceUntilIdle()
 
         assertNull(store.savedStates["book-1"])
+    }
+
+    @Test
+    fun `writes reading session on close when duration exceeds threshold`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val sessionDao = FakeReadingSessionDao()
+        // Clock: open() reads 1_000, close() reads 4_000 → duration 3_000ms > 1s threshold.
+        val ticks = mutableListOf(1_000L, 4_000L)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            sessionDao = sessionDao,
+            clock = { if (ticks.size > 1) ticks.removeAt(0) else ticks.first() },
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.CloseBook)
+        advanceUntilIdle()
+
+        assertEquals(1, sessionDao.sessions.size)
+        val session = sessionDao.sessions.first()
+        assertEquals("book-1", session.bookId)
+        assertEquals(1_000L, session.startedAt)
+        assertEquals(3_000L, session.durationMs)
+    }
+
+    @Test
+    fun `does not write reading session when duration below threshold`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val sessionDao = FakeReadingSessionDao()
+        // Clock barely advances (open 1_000, close 1_500 → 500ms ≤ 1s) so the session is noise.
+        val ticks = mutableListOf(1_000L, 1_500L)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            sessionDao = sessionDao,
+            clock = { if (ticks.size > 1) ticks.removeAt(0) else ticks.first() },
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.CloseBook)
+        advanceUntilIdle()
+
+        assertTrue(sessionDao.sessions.isEmpty())
     }
 
     @Test
@@ -474,6 +523,8 @@ class ReaderSavedStateHandleTest {
         syncManager: SyncManager = SyncManager(NoOpSyncBackend()),
         textAnnotationDao: TextAnnotationDao = FakeTextAnnotationDao(),
         settings: FakeSettingsRepository = FakeSettingsRepository(),
+        sessionDao: FakeReadingSessionDao = FakeReadingSessionDao(),
+        clock: () -> Long = System::currentTimeMillis,
     ): ReaderViewModel =
         ReaderViewModel(
             savedStateHandle = handle,
@@ -506,7 +557,8 @@ class ReaderSavedStateHandleTest {
             syncManager = syncManager,
             settings = settings,
             engineStateStore = engineStateStore,
-            readingSessionDao = FakeReadingSessionDao(),
+            readingSessionDao = sessionDao,
+            clock = clock,
         )
 
     private class FakeReadingSessionDao : ReadingSessionDao {
