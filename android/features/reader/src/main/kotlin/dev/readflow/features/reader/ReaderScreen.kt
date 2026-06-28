@@ -141,6 +141,7 @@ fun ReaderScreen(
                         AndroidView(
                             modifier = Modifier
                                 .fillMaxSize()
+                                .windowInsetsPadding(WindowInsets.systemBars)
                                 .onPreviewKeyEvent { handleReaderKey(it.nativeKeyEvent) }
                                 .focusRequester(readerFocusRequester)
                                 .focusable(),
