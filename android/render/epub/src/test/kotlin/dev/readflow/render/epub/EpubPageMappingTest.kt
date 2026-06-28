@@ -1193,4 +1193,68 @@ class EpubPageMappingTest {
             pages.map { it.textStyle },
         )
     }
+
+    @Test
+    fun `heading keeps with following body even when that body fills a page at large font`() {
+        // Regression for 86 Section0002: a short heading ("内容简介") followed by an 82-CJK-char body.
+        // On a tablet at a comfortable (large) reading font the body wraps past one page, so without
+        // a reserved first-page budget the packer flushed the heading ALONE (device-reported bug).
+        // Robolectric's own measurer returns ~1 line/para, so this only reproduces via an explicit
+        // CJK breaker with a small lines-per-page budget.
+        val heading = "内容简介"
+        val body1 = "圣".repeat(82)
+        val body2 = "是".repeat(12)
+        val body3 = "实".repeat(85)
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(heading, body1, body2, body3)))
+        val charsPerLine = 14
+        val linesPerPage = 6 // body1 (82/14 = 6 lines) fills a whole page on its own.
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(heading, headingLevel = 1, paragraphIndex = 0),
+                    EpubDisplayBlock.Text(body1, headingLevel = null, paragraphIndex = 1),
+                    EpubDisplayBlock.Text(body2, headingLevel = null, paragraphIndex = 2),
+                    EpubDisplayBlock.Text(body3, headingLevel = null, paragraphIndex = 3),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = charsPerLine * 10,
+                viewportHeightPx = linesPerPage * 24,
+                horizontalPaddingPx = 0,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ ->
+                buildList {
+                    var start = 0
+                    while (start < text.length) {
+                        val end = minOf(start + charsPerLine, text.length)
+                        add(start to end)
+                        start = end
+                    }
+                    if (isEmpty()) add(0 to 0)
+                }
+            },
+        )
+
+        // The heading page is multi-segment: heading + the first lines of body1, not heading-only.
+        val headingPage = pages.first { it.paragraphIndex == 0 }
+        assertTrue(
+            "heading must share a page with the following body, not sit alone",
+            headingPage.textSegments.size > 1 && headingPage.endParagraphIndex > 0,
+        )
+        assertEquals(1, headingPage.textSegments.first().textStyle.headingLevel)
+        assertEquals(null, headingPage.textSegments[1].textStyle.headingLevel)
+        // The packed heading page must still respect the line budget (no clipping on device).
+        assertTrue(
+            "packed heading page exceeds line budget (${headingPage.visualLineCount} > $linesPerPage)",
+            headingPage.visualLineCount <= linesPerPage,
+        )
+        // body1 is not lost: its remaining lines continue on the next page.
+        assertTrue("body1 must continue past the heading page", pages.any { it.paragraphIndex == 1 })
+    }
 }

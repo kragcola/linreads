@@ -190,6 +190,10 @@ internal fun epubMeasuredPagedLayout(
     textStyleProvider: (Int) -> EpubPageTextStyle = { EpubPageTextStyle() },
     linkProvider: (Int) -> List<EpubTextLink> = { emptyList() },
     measurement: EpubPageMeasurement = EpubPageMeasurement.StaticLayout,
+    // Per-paragraph override for the FIRST page window's line budget. Returns null to use the
+    // default linesPerPage. Used to reserve room above a body paragraph that follows a heading so
+    // the heading can keep-with-next on the same page instead of being flushed alone.
+    firstPageLineBudget: (Int) -> Int? = { null },
 ): List<EpubPageSlice> {
     val contentWidth = (metrics.viewportWidthPx - metrics.horizontalPaddingPx).coerceAtLeast(1)
     val contentHeight = (metrics.viewportHeightPx - metrics.verticalPaddingPx).coerceAtLeast(1)
@@ -247,8 +251,13 @@ internal fun epubMeasuredPagedLayout(
                 return@forEach
             }
             var lineStart = 0
+            val firstBudget = firstPageLineBudget(paragraphIndex)
+                ?.coerceIn(1, linesPerPage)
+                ?: linesPerPage
+            var isFirstWindow = true
             while (lineStart < lines.size) {
-                val lineEnd = (lineStart + linesPerPage - 1).coerceAtMost(lines.lastIndex)
+                val windowBudget = if (isFirstWindow) firstBudget else linesPerPage
+                val lineEnd = (lineStart + windowBudget - 1).coerceAtMost(lines.lastIndex)
                 val startOffset = lines[lineStart].first
                 val endOffset = lines[lineEnd].second
                 add(
@@ -263,6 +272,7 @@ internal fun epubMeasuredPagedLayout(
                     ),
                 )
                 lineStart = lineEnd + 1
+                isFirstWindow = false
             }
         }
     }
@@ -426,6 +436,16 @@ internal fun epubPagedLayoutWithBlocks(
     val textLinksByParagraph = blocks
         .filterIsInstance<EpubDisplayBlock.Text>()
         .associate { block -> block.paragraphIndex to block.links }
+    // Keep-with-next: when a body paragraph immediately follows a heading, shrink its FIRST page so
+    // the heading can sit on the same page instead of being flushed alone. Without this, a body that
+    // wraps to a full page at large fonts pushes the heading past the line budget and it isolates.
+    val firstPageBudgetByParagraph = headingFollowerFirstPageBudgets(
+        blocks = blocks,
+        metrics = metrics,
+        textProvider = textProvider,
+        textStylesByParagraph = textStylesByParagraph,
+        lineBreaker = lineBreaker,
+    )
     val textPages = epubMeasuredPagedLayout(
         paras = paras,
         textProvider = textProvider,
@@ -440,6 +460,7 @@ internal fun epubPagedLayoutWithBlocks(
             textLinksByParagraph[paragraphIndex].orEmpty()
         },
         measurement = measurement,
+        firstPageLineBudget = { paragraphIndex -> firstPageBudgetByParagraph[paragraphIndex] },
     )
     if (blocks.isEmpty()) return textPages
 
@@ -505,6 +526,53 @@ private fun EpubDisplayBlock.Text.toPageTextStyle(): EpubPageTextStyle =
         kind = kind,
         indentLevel = indentLevel,
     )
+
+// For each body paragraph that directly follows a heading (in block order), compute a reduced
+// FIRST-page line budget = linesPerPage - headingLines - separator. This reserves room so the
+// heading keeps-with-next on the same page rather than being flushed alone when the body's first
+// page would otherwise fill the viewport. Only the immediately-following packable text block is
+// adjusted; if a heading is followed by an image/break, nothing is reserved (no body to share with).
+private fun headingFollowerFirstPageBudgets(
+    blocks: List<EpubDisplayBlock>,
+    metrics: EpubPageMetrics,
+    textProvider: (Int) -> String,
+    textStylesByParagraph: Map<Int, EpubPageTextStyle>,
+    lineBreaker: (text: String, contentWidthPx: Int, textStyle: EpubPageTextStyle) -> List<Pair<Int, Int>>,
+): Map<Int, Int> {
+    val contentWidth = (metrics.viewportWidthPx - metrics.horizontalPaddingPx).coerceAtLeast(1)
+    val contentHeight = (metrics.viewportHeightPx - metrics.verticalPaddingPx).coerceAtLeast(1)
+    val linesPerPage = (contentHeight / metrics.lineHeightPx.coerceAtLeast(1f)).toInt().coerceAtLeast(1)
+    val budgets = mutableMapOf<Int, Int>()
+    var reserveForNextBody: Int? = null
+    blocks.forEach { block ->
+        when (block) {
+            is EpubDisplayBlock.Text -> {
+                if (block.headingLevel != null) {
+                    // Measure via textProvider (the same source the body is paginated from) so cold
+                    // blocks with no loaded text are not measured — matching epubMeasuredPagedLayout's
+                    // empty-text branch. An empty heading has nothing to keep-with: drop the reserve.
+                    val headingText = textProvider(block.paragraphIndex)
+                    if (headingText.isEmpty()) {
+                        reserveForNextBody = null
+                    } else {
+                        val style = textStylesByParagraph[block.paragraphIndex] ?: block.toPageTextStyle()
+                        val headingLines = lineBreaker(headingText, contentWidth, style).size.coerceAtLeast(1)
+                        // heading lines + 1 separator line between heading and body segments.
+                        reserveForNextBody = (headingLines + 1).coerceAtMost(linesPerPage - 1)
+                    }
+                } else {
+                    reserveForNextBody?.let { reserve ->
+                        budgets[block.paragraphIndex] = (linesPerPage - reserve).coerceAtLeast(1)
+                    }
+                    reserveForNextBody = null
+                }
+            }
+            // A heading followed by a non-text block has no body to keep-with; drop the reserve.
+            is EpubDisplayBlock.Image, is EpubDisplayBlock.Break -> reserveForNextBody = null
+        }
+    }
+    return budgets
+}
 
 private fun List<EpubTextLink>.pageLocalLinks(startOffset: Int, endOffset: Int): List<EpubTextLink> =
     mapNotNull { link ->
