@@ -30,6 +30,7 @@ dependencies {
     implementation(libs.coroutines.core)
     implementation(libs.jsoup)
     implementation(libs.recyclerview)
+    implementation(libs.markwon.image) // Apache-2.0: AsyncDrawable/AsyncDrawableSpan/Scheduler for inline images
 
     testImplementation(libs.junit5)
     testImplementation(libs.junit4)

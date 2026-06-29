@@ -1556,7 +1556,7 @@ class EpubReflowEngineTest {
             """.trimIndent(),
         )
         val context = RuntimeEnvironment.getApplication() as Application
-        val engine = EpubReflowEngine(context)
+        val engine = EpubReflowEngine(context, flowEngineEnabled = false)
 
         engine.openBook(Uri.fromFile(epub))
         engine.setMode(ReadingMode.PAGED)
@@ -1855,7 +1855,7 @@ class EpubReflowEngineTest {
             "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
         )
         val context = RuntimeEnvironment.getApplication() as Application
-        val engine = EpubReflowEngine(context)
+        val engine = EpubReflowEngine(context, flowEngineEnabled = false)
 
         engine.openBook(Uri.fromFile(epub))
         engine.setMode(ReadingMode.PAGED)
@@ -1883,7 +1883,7 @@ class EpubReflowEngineTest {
             "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
         )
         val context = RuntimeEnvironment.getApplication() as Application
-        val engine = EpubReflowEngine(context)
+        val engine = EpubReflowEngine(context, flowEngineEnabled = false)
 
         engine.openBook(Uri.fromFile(epub))
         engine.setMode(ReadingMode.PAGED)
@@ -1909,7 +1909,7 @@ class EpubReflowEngineTest {
             "OEBPS/ch1.xhtml" to "<html><body><p>Compose page progress should retire with paged text.</p></body></html>",
         )
         val context = RuntimeEnvironment.getApplication() as Application
-        val engine = EpubReflowEngine(context)
+        val engine = EpubReflowEngine(context, flowEngineEnabled = false)
 
         engine.openBook(Uri.fromFile(epub))
         engine.setMode(ReadingMode.PAGED)
@@ -1938,7 +1938,7 @@ class EpubReflowEngineTest {
             "OEBPS/ch1.xhtml" to "<html><body><p>$text</p></body></html>",
         )
         val context = RuntimeEnvironment.getApplication() as Application
-        val engine = EpubReflowEngine(context)
+        val engine = EpubReflowEngine(context, flowEngineEnabled = false)
 
         engine.openBook(Uri.fromFile(epub))
         engine.setMode(ReadingMode.PAGED)
@@ -1973,7 +1973,7 @@ class EpubReflowEngineTest {
             "OEBPS/ch1.xhtml" to "<html><body><p>Text before the image.</p><img src=\"cover.png\" alt=\"Cover art\"/></body></html>",
         )
         val context = RuntimeEnvironment.getApplication() as Application
-        val engine = EpubReflowEngine(context)
+        val engine = EpubReflowEngine(context, flowEngineEnabled = false)
 
         engine.openBook(Uri.fromFile(epub))
         engine.setMode(ReadingMode.PAGED)
@@ -1999,7 +1999,7 @@ class EpubReflowEngineTest {
             "OEBPS/ch1.xhtml" to "<html><body><p>Text before the image.</p><img src=\"cover.png\" alt=\"Cover art\"/></body></html>",
         )
         val context = RuntimeEnvironment.getApplication() as Application
-        val engine = EpubReflowEngine(context)
+        val engine = EpubReflowEngine(context, flowEngineEnabled = false)
 
         engine.openBook(Uri.fromFile(epub))
         engine.setMode(ReadingMode.PAGED)

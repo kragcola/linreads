@@ -66,8 +66,13 @@ import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightRange
 import dev.readflow.render.api.ReaderTextSelection
+import dev.readflow.render.api.SelfPagingReaderEngine
 import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.TextSelectableReaderEngine
+import io.noties.markwon.core.MarkwonTheme
+import io.noties.markwon.image.AsyncDrawableScheduler
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -152,15 +157,25 @@ internal sealed interface EpubPageLineMeasurer {
 class EpubReflowEngine private constructor(
     private val context: Context,
     private val pageLineMeasurer: EpubPageLineMeasurer?,
+    // Continuous-flow path toggle (方案 C). Defaults to the production const; the internal test
+    // constructor can force the legacy slice-pack path for legacy-behavior tests.
+    private val flowEngineEnabled: Boolean,
     @Suppress("UNUSED_PARAMETER") private val constructorMarker: Unit?,
-) : PagedReaderEngine, TextSelectableReaderEngine, TextAnnotatableReaderEngine {
+) : PagedReaderEngine, SelfPagingReaderEngine, TextSelectableReaderEngine, TextAnnotatableReaderEngine {
 
-    constructor(context: Context) : this(context, pageLineMeasurer = null, constructorMarker = null)
+    constructor(context: Context) : this(context, pageLineMeasurer = null, flowEngineEnabled = EPUB_FLOW_ENGINE_ENABLED, constructorMarker = null)
 
     internal constructor(
         context: Context,
         pageLineMeasurer: EpubPageLineMeasurer,
-    ) : this(context, pageLineMeasurer = pageLineMeasurer, constructorMarker = null)
+        flowEngineEnabled: Boolean = false,
+    ) : this(context, pageLineMeasurer = pageLineMeasurer, flowEngineEnabled = flowEngineEnabled, constructorMarker = null)
+
+    /** Test-only: exercise the legacy slice-pack path (or force flow) without a custom measurer. */
+    internal constructor(
+        context: Context,
+        flowEngineEnabled: Boolean,
+    ) : this(context, pageLineMeasurer = null, flowEngineEnabled = flowEngineEnabled, constructorMarker = null)
 
     override val id = "epub-reflow"
     override val format = BookFormat.EPUB
@@ -202,6 +217,13 @@ class EpubReflowEngine private constructor(
     private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
     private var recyclerView: RecyclerView? = null
     private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
+
+    // ---- Continuous-flow path (方案 C). Active when EPUB_FLOW_ENGINE_ENABLED; legacy slice-pack
+    // path below is retained as a fallback (flip the flag to roll back). ----
+    private var flowView: EpubFlowView? = null
+    private var flowSpineIndex: Int = -1
+    private val flowExecutor: ExecutorService by lazy { Executors.newFixedThreadPool(2) }
+    override val selfPagingActive: Boolean get() = flowEngineEnabled
     private var cacheJob: Job? = null
     private var cacheScope: CoroutineScope? = null
     private val activePageContainers = Collections.newSetFromMap(WeakHashMap<View, Boolean>())
@@ -294,6 +316,7 @@ class EpubReflowEngine private constructor(
     }
 
     override fun createView(): View {
+        if (flowEngineEnabled) return createFlowView()
         return RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
             val palette = paletteFor(themeMode, resources.configuration)
@@ -317,6 +340,180 @@ class EpubReflowEngine private constructor(
                 override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) = reportProgression(rv)
             })
         }.also { recyclerView = it }
+    }
+
+    // ---- Continuous-flow rendering (方案 C) ----------------------------------------------------
+
+    private fun createFlowView(): View {
+        val palette = paletteFor(themeMode, context.resources.configuration)
+        val view = EpubFlowView(
+            context = context,
+            onTapZone = ::handleFlowTapZone,
+            onTopOffsetChanged = ::handleFlowTopOffsetChanged,
+            onSelectionRange = { start, end -> updateFlowSelection(start, end) },
+        ).apply {
+            mode = if (_pagingKind.value == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
+            setBackgroundColor(palette.paper)
+            textView.setTextColor(palette.ink)
+            val padH = (PAGE_HORIZONTAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
+            val padV = (PAGE_VERTICAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
+            textView.setPadding(padH, padV, padH, padV)
+            textView.typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
+            textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
+            textView.setLineSpacing(0f, lineSpacingMultiplier)
+        }
+        flowView = view
+        val startIdx = epubIndexFromLocator(_currentLocator.value, paras.size)
+        loadFlowChapter(spineIndexForParagraph(startIdx), restoreToParagraph = startIdx)
+        return view
+    }
+
+    private fun spineIndexForParagraph(paragraphIndex: Int): Int =
+        paras.getOrNull(paragraphIndex.coerceIn(0, (paras.size - 1).coerceAtLeast(0)))?.spineIndex ?: 0
+
+    private fun flowColumnWidthPx(): Int {
+        val metrics = context.resources.displayMetrics
+        val padH = (PAGE_HORIZONTAL_PADDING_DP * metrics.density * 2).toInt()
+        return (metrics.widthPixels - padH).coerceAtLeast(1)
+    }
+
+    private fun flowPageHeightPx(): Int {
+        val metrics = context.resources.displayMetrics
+        val padV = (PAGE_VERTICAL_PADDING_DP * metrics.density * 2).toInt()
+        return (metrics.heightPixels - padV).coerceAtLeast(1)
+    }
+
+    /** Builds and installs the chapter [spineIndex] into the flow view, optionally restoring a paragraph. */
+    private fun loadFlowChapter(spineIndex: Int, restoreToParagraph: Int? = null, landOnLast: Boolean = false) {
+        val view = flowView ?: return
+        val book = lazyBook ?: return
+        book.prefetchAroundParagraph(paras.indexOfFirst { it.spineIndex == spineIndex }.coerceAtLeast(0))
+        val blocks = book.layoutBlocks().filter {
+            paras.getOrNull(it.paragraphIndex)?.spineIndex == spineIndex
+        }
+        val flow = epubBuildChapterFlow(spineIndex, blocks)
+        flowSpineIndex = spineIndex
+        val density = context.resources.displayMetrics.density
+        val palette = paletteFor(themeMode, context.resources.configuration)
+        val style = EpubFlowStyle(
+            fontSizeSp = fontSizeSp,
+            lineSpacingMultiplier = lineSpacingMultiplier,
+            inkColor = palette.ink,
+            typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId),
+            columnWidthPx = flowColumnWidthPx(),
+            imageMaxHeightPx = flowPageHeightPx(),
+            density = density,
+        )
+        val theme = MarkwonTheme.create(context)
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epubFile },
+            executor = flowExecutor,
+            columnWidthPx = flowColumnWidthPx(),
+        )
+        val resolver = EpubFlowImageSizeResolver(flowColumnWidthPx(), flowPageHeightPx())
+        val spannable = epubBuildFlowSpannable(
+            context = context,
+            flow = flow,
+            style = style,
+            markwonTheme = theme,
+            imageLoader = loader,
+            imageSizeResolver = resolver,
+            onLinkClick = ::handleLinkClick,
+            highlightRanges = flowHighlightRanges(flow),
+        )
+        view.setChapter(flow, spannable, flowPageHeightPx())
+        // Trigger async image scheduling + restore position after the layout pass.
+        view.textView.post {
+            AsyncDrawableScheduler.schedule(view.textView)
+            if (landOnLast) {
+                view.goToLastPage()
+            } else if (restoreToParagraph != null) {
+                val offset = flow.offsetForParagraph(restoreToParagraph, 0)
+                view.goToOffset(offset)
+            }
+        }
+        flowCurrentFlow = flow
+    }
+
+    private var flowCurrentFlow: EpubChapterFlow? = null
+
+    private fun flowHighlightRanges(flow: EpubChapterFlow): List<ReaderTextHighlightRange> {
+        if (textAnnotations.isEmpty()) return emptyList()
+        val result = ArrayList<ReaderTextHighlightRange>()
+        flow.segments.forEach { seg ->
+            if (seg.block !is EpubDisplayBlock.Text) return@forEach
+            epubHighlightRanges(paras, seg.paragraphIndex, textAnnotations).forEach { r ->
+                result += ReaderTextHighlightRange(seg.layoutStart + r.start, seg.layoutStart + r.end, r.color)
+            }
+        }
+        return result
+    }
+
+    private fun handleFlowTapZone(zone: EpubFlowTapZone) {
+        when (zone) {
+            EpubFlowTapZone.PREV -> advanceFlowPage(-1)
+            EpubFlowTapZone.NEXT -> advanceFlowPage(1)
+            EpubFlowTapZone.MENU -> pageRequestCallback?.invoke(-1) // -1 = toggle controls (host convention)
+        }
+    }
+
+    /** The spine indices that actually carry layout content, in reading order. */
+    private fun flowSpineOrder(): List<Int> =
+        paras.map { it.spineIndex }.distinct().sorted()
+
+    /** Spine adjacent to [spineIndex] in [delta] direction, or null past the book boundary. */
+    private fun adjacentSpine(spineIndex: Int, delta: Int): Int? {
+        val order = flowSpineOrder()
+        val pos = order.indexOf(spineIndex)
+        if (pos < 0) return null
+        val next = pos + delta
+        return order.getOrNull(next)
+    }
+
+    private fun firstParagraphOfSpine(spineIndex: Int): Int =
+        paras.indexOfFirst { it.spineIndex == spineIndex }.coerceAtLeast(0)
+
+    /**
+     * Turns one page in [delta] direction. Within a chapter the flow view scrolls; at a chapter
+     * boundary it loads the adjacent spine — forward lands on its first page, backward on its last
+     * (Phase 4 cross-chapter continuity).
+     */
+    private fun advanceFlowPage(delta: Int) {
+        val view = flowView ?: return
+        if (view.goToAdjacentPage(delta)) return
+        val target = adjacentSpine(flowSpineIndex, delta) ?: return
+        if (delta > 0) {
+            loadFlowChapter(target, restoreToParagraph = firstParagraphOfSpine(target))
+        } else {
+            loadFlowChapter(target, landOnLast = true)
+        }
+    }
+
+    private fun handleFlowTopOffsetChanged(layoutOffset: Int) {
+        val flow = flowCurrentFlow ?: return
+        val (paragraphIndex, paraOffset) = flow.paragraphAtOffset(layoutOffset) ?: return
+        warmCacheAround(paragraphIndex)
+        _currentLocator.value = epubLocatorForOffset(paras, paragraphIndex, paraOffset)
+        updateChapterInfo(paragraphIndex)
+        _pageCount.value = flowView?.pageCount() ?: _pageCount.value
+    }
+
+    private fun updateFlowSelection(start: Int, end: Int) {
+        val flow = flowCurrentFlow ?: return
+        if (start == end) { _currentTextSelection.value = null; return }
+        val (sPara, sOff) = flow.paragraphAtOffset(minOf(start, end)) ?: return
+        val (ePara, eOff) = flow.paragraphAtOffset(maxOf(start, end)) ?: return
+        val startLoc = epubLocatorForOffset(paras, sPara, sOff)
+        val endLoc = epubLocatorForOffset(paras, ePara, eOff)
+        val selectedText = flow.text.substring(
+            minOf(start, end).coerceIn(0, flow.text.length),
+            maxOf(start, end).coerceIn(0, flow.text.length),
+        )
+        _currentTextSelection.value = ReaderTextSelection(startLoc, endLoc, selectedText)
+    }
+
+    override suspend fun goToAdjacentPage(delta: Int) {
+        withContext(Dispatchers.Main) { advanceFlowPage(delta) }
     }
 
     override fun createPageView(pageIndex: Int): View {
@@ -695,7 +892,34 @@ class EpubReflowEngine private constructor(
                 )
     }
 
+    private suspend fun goToFlow(locator: Locator) {
+        val idx = epubIndexFromLocator(locator, paras.size).coerceIn(0, (paras.size - 1).coerceAtLeast(0))
+        val paraOffset = when (val s = locator.strategy) {
+            is LocatorStrategy.Section -> (s.charOffset - (paras.getOrNull(idx)?.spineCharStart ?: 0)).coerceAtLeast(0)
+            else -> 0
+        }
+        val targetSpine = spineIndexForParagraph(idx)
+        withContext(Dispatchers.IO) { lazyBook?.prefetchAroundParagraph(idx) }
+        withContext(Dispatchers.Main) {
+            val view = flowView
+            if (view == null) {
+                _currentLocator.value = epubLocatorForOffset(paras, idx, paraOffset)
+                updateChapterInfo(idx)
+                return@withContext
+            }
+            if (targetSpine != flowSpineIndex) {
+                loadFlowChapter(targetSpine, restoreToParagraph = idx)
+            } else {
+                val offset = flowCurrentFlow?.offsetForParagraph(idx, paraOffset) ?: 0
+                view.goToOffset(offset)
+            }
+            _currentLocator.value = epubLocatorForOffset(paras, idx, paraOffset)
+            updateChapterInfo(idx)
+        }
+    }
+
     override suspend fun goTo(locator: Locator) {
+        if (flowEngineEnabled) { goToFlow(locator); return }
         val previousPageIndex = if (_pagingKind.value == PagingKind.PAGED) {
             epubPageIndexFromLocator(_currentLocator.value, pagedSlices, paras)
         } else {
@@ -748,6 +972,9 @@ class EpubReflowEngine private constructor(
 
     override fun setTextAnnotations(annotations: List<ReaderTextAnnotation>) {
         textAnnotations = annotations
+        // Flow mode owns its own single-Spannable surface; refresh its highlight spans in place
+        // (no reload, no repagination) so newly added annotations paint immediately.
+        flowView?.let { view -> flowCurrentFlow?.let { flow -> view.refreshHighlights(flowHighlightRanges(flow)) } }
         (recyclerView?.adapter as? EpubParaAdapter)?.updateTextAnnotations()
         activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
     }
@@ -934,6 +1161,10 @@ class EpubReflowEngine private constructor(
         cacheJob?.cancel()
         cacheJob = null
         cacheScope = null
+        flowView?.textView?.let { runCatching { AsyncDrawableScheduler.unschedule(it) } }
+        flowView = null
+        flowCurrentFlow = null
+        flowSpineIndex = -1
         activePagedTextPages.keys.toList().forEach { composeView ->
             composeView.clearEpubComposeTextPageForBookReset()
         }
@@ -968,6 +1199,10 @@ class EpubReflowEngine private constructor(
     override suspend fun close() {
         recyclerView = null
         pageRequestCallback = null
+        flowView?.textView?.let { runCatching { AsyncDrawableScheduler.unschedule(it) } }
+        flowView = null
+        flowCurrentFlow = null
+        flowSpineIndex = -1
         cacheJob?.cancel()
         cacheJob = null
         cacheScope = null
@@ -1000,6 +1235,7 @@ class EpubReflowEngine private constructor(
 
     override suspend fun setFontSize(sp: Float) {
         fontSizeSp = sp
+        if (flowEngineEnabled) { rebuildFlowChapter(); return }
         rebuildPagedSlices()
         clearTextSelection()
         (recyclerView?.adapter as? EpubParaAdapter)?.updateFontSize(sp)
@@ -1010,6 +1246,7 @@ class EpubReflowEngine private constructor(
 
     override suspend fun setLineSpacing(multiplier: Float) {
         lineSpacingMultiplier = multiplier
+        if (flowEngineEnabled) { rebuildFlowChapter(); return }
         rebuildPagedSlices()
         clearTextSelection()
         (recyclerView?.adapter as? EpubParaAdapter)?.updateLineSpacing(multiplier)
@@ -1021,6 +1258,7 @@ class EpubReflowEngine private constructor(
     override suspend fun setSerifFont(useSourceHan: Boolean) {
         this.useSourceHan = useSourceHan
         currentFontId = if (useSourceHan) "source_han" else "system"
+        if (flowEngineEnabled) { rebuildFlowChapter(); return }
         // Rebind active Compose text pages to pick up new fontFamily
         withContext(Dispatchers.Main) {
             activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
@@ -1032,6 +1270,7 @@ class EpubReflowEngine private constructor(
     override suspend fun setFont(fontId: String) {
         currentFontId = fontId
         useSourceHan = fontId == "source_han"
+        if (flowEngineEnabled) { rebuildFlowChapter(); return }
         withContext(Dispatchers.Main) {
             activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
             activePagedCompositePages.keys.toList().forEach(::rebindActiveCompositePage)
@@ -1042,6 +1281,14 @@ class EpubReflowEngine private constructor(
     override suspend fun setTheme(mode: ThemeMode) {
         themeMode = mode
         val palette = paletteFor(mode, context.resources.configuration)
+        if (flowEngineEnabled) {
+            withContext(Dispatchers.Main) {
+                flowView?.setBackgroundColor(palette.paper)
+                flowView?.textView?.setTextColor(palette.ink)
+                rebuildFlowChapter()
+            }
+            return
+        }
         recyclerView?.setBackgroundColor(palette.paper)
         (recyclerView?.adapter as? EpubParaAdapter)?.updateInkColor(palette.ink)
         (recyclerView?.adapter as? EpubParaAdapter)?.updateCodeBlockBgColor(codeBlockBgFor(mode, context.resources.configuration))
@@ -1050,10 +1297,35 @@ class EpubReflowEngine private constructor(
         activePagedCompositePages.keys.toList().forEach { rebindActiveCompositePage(it, palette) }
     }
 
+    /** Rebuilds the current flow chapter's Spannable in place, preserving reading position. */
+    private suspend fun rebuildFlowChapter() {
+        withContext(Dispatchers.Main) {
+            val view = flowView ?: return@withContext
+            val anchorParagraph = epubIndexFromLocator(_currentLocator.value, paras.size)
+            view.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
+            view.textView.setLineSpacing(0f, lineSpacingMultiplier)
+            view.textView.typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
+            if (flowSpineIndex >= 0) loadFlowChapter(flowSpineIndex, restoreToParagraph = anchorParagraph)
+        }
+    }
+
     override suspend fun setMode(mode: ReadingMode) {
         val targetKind = when (mode) {
             ReadingMode.SCROLL -> PagingKind.CONTINUOUS
             ReadingMode.PAGED -> PagingKind.PAGED
+        }
+        if (flowEngineEnabled) {
+            withContext(Dispatchers.Main) {
+                _pagingKind.value = targetKind
+                flowView?.let { view ->
+                    val anchor = epubIndexFromLocator(_currentLocator.value, paras.size)
+                    view.mode = if (targetKind == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
+                    val offset = flowCurrentFlow?.offsetForParagraph(anchor, 0) ?: 0
+                    view.post { view.goToOffset(offset) }
+                    _pageCount.value = view.pageCount()
+                }
+            }
+            return
         }
         withContext(Dispatchers.Main) {
             val paragraphIndex = currentParagraphIndex()
@@ -1665,6 +1937,9 @@ class EpubReflowEngine private constructor(
     }
 
     private companion object {
+        // 方案 C continuous-flow engine. Flip to false to roll back to the legacy slice-pack PAGED
+        // path (both code paths are retained). The host honors this via SelfPagingReaderEngine.
+        const val EPUB_FLOW_ENGINE_ENABLED = true
         const val MAX_LINE_WIDTH_DP = 680
         const val PAGE_HORIZONTAL_PADDING_DP = 28
         const val PAGE_VERTICAL_PADDING_DP = 24

@@ -12,6 +12,7 @@ import dev.readflow.core.model.TransitionType
 import dev.readflow.render.api.PageTransitionHost
 import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.ReaderEngine
+import dev.readflow.render.api.SelfPagingReaderEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,12 +36,18 @@ class ViewPagerTransitionHost(
     }
     private var engine: ReaderEngine? = null
     private var pagedEngine: PagedReaderEngine? = null
+    private var selfPagingEngine: SelfPagingReaderEngine? = null
     private var pageCountJob: Job? = null
     private var onPageSettled: ((pageIndex: Int) -> Unit)? = null
     private var transitionType: TransitionType = transition
 
     private val pageCallback = object : ViewPager2.OnPageChangeCallback() {
         override fun onPageSelected(position: Int) {
+            // Self-paging engines own their paging + locator inside one static view; the ViewPager is
+            // just a single-slot container with input disabled. ViewPager2 still fires onPageSelected(0)
+            // on adapter attach, so without this guard we'd clobber the restored position with
+            // goTo(Page(0, total)). Let the engine drive its own locator instead.
+            if (selfPagingEngine != null) return
             val activeEngine = engine ?: return
             val total = activeEngine.pageCount.value
             if (total <= 0) return
@@ -71,6 +78,17 @@ class ViewPagerTransitionHost(
             scope = viewPagerHostScope()
         }
         this.engine = engine
+        // Self-paging engines (continuous-flow EPUB) own their own paging/gestures inside a single
+        // view — attach once, no per-page ViewPager2 slots, and delegate page turns to the engine.
+        val selfPaging = (engine as? SelfPagingReaderEngine)?.takeIf { it.selfPagingActive }
+        selfPagingEngine = selfPaging
+        if (selfPaging != null) {
+            pagedEngine = null
+            pager.isUserInputEnabled = false
+            pager.adapter = SingleViewAdapter(engine.createView())
+            return
+        }
+        pager.isUserInputEnabled = true
         val fixedPageEngine = engine as? PagedReaderEngine
         pagedEngine = fixedPageEngine
         if (fixedPageEngine == null) {
@@ -121,6 +139,7 @@ class ViewPagerTransitionHost(
     }
 
     override suspend fun next() {
+        selfPagingEngine?.let { it.goToAdjacentPage(1); return }
         val lastIndex = (pager.adapter?.itemCount ?: 0) - 1
         if (lastIndex < 0) return
         val target = (pager.currentItem + 1).coerceAtMost(lastIndex)
@@ -130,6 +149,7 @@ class ViewPagerTransitionHost(
     }
 
     override suspend fun previous() {
+        selfPagingEngine?.let { it.goToAdjacentPage(-1); return }
         val target = (pager.currentItem - 1).coerceAtLeast(0)
         if (target != pager.currentItem) {
             pager.setCurrentItem(target, transitionType != TransitionType.NONE)
@@ -144,8 +164,10 @@ class ViewPagerTransitionHost(
         pageCountJob?.cancel()
         pageCountJob = null
         pagedEngine?.setPageRequestCallback(null)
+        pager.isUserInputEnabled = true
         pager.adapter = null
         pagedEngine = null
+        selfPagingEngine = null
         engine = null
         scope.cancel()
     }

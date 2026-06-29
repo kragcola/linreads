@@ -123,3 +123,25 @@ interface ZoomableReaderEngine : ReaderEngine {
     val zoomScale: StateFlow<Float>
     suspend fun setZoom(scale: Float)
 }
+
+/**
+ * Optional capability for engines that paginate INTERNALLY inside a single self-managed scroll/flow
+ * view (continuous-flow EPUB, Moon+ Reader style). The host attaches the engine's [createView] once
+ * (no per-page ViewPager2 slots) and delegates page turns to [goToAdjacentPage], because the engine
+ * owns its own touch gestures (free middle-zone scroll, slide flip) which a pager would otherwise
+ * intercept. Page count / current position are still reported via [pageCount] / [currentLocator].
+ *
+ * NOTE (render-api-default-method-stale-build): adding this interface requires a clean full rebuild
+ * of dependents, otherwise the engine crashes at runtime with AbstractMethodError.
+ */
+interface SelfPagingReaderEngine : ReaderEngine {
+    /**
+     * Whether self-paging is currently active. When false, a host should fall back to this engine's
+     * other capabilities (e.g. [PagedReaderEngine]) — letting an engine ship both a new self-paging
+     * path and a legacy paged path behind a flag for safe rollback.
+     */
+    val selfPagingActive: Boolean
+
+    /** Turn [delta] pages within the current self-managed view (+1 next, -1 previous). */
+    suspend fun goToAdjacentPage(delta: Int)
+}
