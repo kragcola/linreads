@@ -447,6 +447,43 @@ class EpubPageMappingTest {
     }
 
     @Test
+    fun `block paged layout keeps a heading on the same page as its following image`() {
+        val heading = "八奈见小剧场"
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(heading, "")))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(heading, headingLevel = 1, paragraphIndex = 0),
+                    EpubDisplayBlock.Image("images/4koma.png", altText = "4koma", paragraphIndex = 1),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        // The heading must not be isolated on its own page: it belongs with the image it labels.
+        val headingPage = pages.first { page ->
+            page.textStyle.headingLevel != null ||
+                page.textSegments.any { it.textStyle.headingLevel != null }
+        }
+        assertEquals(
+            "heading should ride on the image page, not a standalone text page",
+            EpubPageSliceKind.Image::class,
+            headingPage.kind::class,
+        )
+    }
+
+    @Test
     fun `block paged layout does not pack a heading with the body that precedes it`() {
         val body = "上一节结尾。"
         val heading = "下一节标题"

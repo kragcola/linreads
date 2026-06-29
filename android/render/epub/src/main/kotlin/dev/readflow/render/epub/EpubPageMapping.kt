@@ -491,6 +491,20 @@ internal fun epubPagedLayoutWithBlocks(
                     }
                 }
                 is EpubDisplayBlock.Image -> {
+                    // Keep-with-next for images: a heading immediately preceding an image (4-koma
+                    // section title → manga panel, colophon line → publisher logo) must not isolate
+                    // on its own page. Ride the orphan heading onto the image page as a caption
+                    // instead of flushing it alone. Only pure heading pages are captured — if the
+                    // pending pages include body text, the heading already keeps-with that body.
+                    val headingCaption = if (
+                        pendingTextPages.isNotEmpty() &&
+                        pendingTextPages.all { it.textStyle.headingLevel != null }
+                    ) {
+                        pendingTextPages.map { it.toTextSegment(textProvider) }
+                            .also { pendingTextPages.clear() }
+                    } else {
+                        emptyList()
+                    }
                     flushPendingTextPages()
                     emittedParagraphs += block.paragraphIndex
                     val imageAnchorOffset = nextImageAnchorOffsets.nextImageAnchorOffsetForParagraph(
@@ -504,6 +518,7 @@ internal fun epubPagedLayoutWithBlocks(
                             startOffset = imageAnchorOffset,
                             endOffset = imageAnchorOffset,
                             kind = EpubPageSliceKind.Image(block.href, block.altText),
+                            textSegments = headingCaption,
                         ),
                     )
                 }

@@ -14,6 +14,8 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
@@ -407,8 +409,53 @@ class EpubReflowEngine private constructor(
             )
             setBackgroundColor(palette.paper)
             tag = slice
-            addView(imageView)
+            addView(imagePageContent(slice, imageView, palette, density))
         }.also { trackImagePageView(it, pageIndex, slice) }
+    }
+
+    // When a heading immediately precedes an image (4-koma section title → panel, colophon →
+    // publisher logo) the layout rides the orphan heading onto the image page as a caption
+    // (EpubPageMapping Image branch). Render it as a heading line stacked above the image so the
+    // heading is never isolated on a single-line page. No caption → return the image view as-is.
+    private fun imagePageContent(
+        slice: EpubPageSlice,
+        imageView: ImageView,
+        palette: ReaderPalette,
+        density: Float,
+    ): View {
+        val captionSegment = slice.textSegments.firstOrNull { it.textStyle.headingLevel != null }
+            ?: return imageView
+        // The caption text is captured at pagination time, when the heading's spine may not yet be
+        // in the lazy cache (then textProvider returned ""). Resolve it live here so the heading
+        // renders even when it was paginated before its spine loaded; fall back to the captured text.
+        val captionText = captionSegment.text.takeIf { it.isNotBlank() }
+            ?: lazyBook?.paragraphAt(captionSegment.paragraphIndex)?.text.orEmpty()
+        if (captionText.isBlank()) return imageView
+        return LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            )
+            val paint = currentPageTextPaint(captionSegment.textStyle)
+            addView(
+                TextView(context).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { bottomMargin = (16 * density).toInt() }
+                    text = captionText
+                    setTextColor(palette.ink)
+                    textSize = paint.textSize / density
+                    typeface = paint.typeface
+                    gravity = Gravity.CENTER
+                    val sidePadding = (28 * density).toInt()
+                    setPadding(sidePadding, 0, sidePadding, 0)
+                },
+            )
+            addView(imageView)
+        }
     }
 
     // Size-driven placement (replaces the old pageIndex==0 gate that forced every illustration
