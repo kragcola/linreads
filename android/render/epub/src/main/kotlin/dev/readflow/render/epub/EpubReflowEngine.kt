@@ -405,12 +405,22 @@ class EpubReflowEngine private constructor(
             density = density,
         )
         val theme = MarkwonTheme.create(context)
+        val fullPageHrefs = flowFullPageImageHrefs(flow)
+        val inlineMaxHeightPx = (INLINE_IMAGE_MAX_HEIGHT_DP * density).toInt()
         val loader = EpubFlowImageLoader(
             epubFileProvider = { epubFile },
             executor = flowExecutor,
             columnWidthPx = flowColumnWidthPx(),
+            pageHeightPx = flowPageHeightPx(),
+            inlineMaxHeightPx = inlineMaxHeightPx,
+            fullPageHrefs = fullPageHrefs,
         )
-        val resolver = EpubFlowImageSizeResolver(flowColumnWidthPx(), flowPageHeightPx())
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = flowColumnWidthPx(),
+            pageHeightPx = flowPageHeightPx(),
+            inlineMaxHeightPx = inlineMaxHeightPx,
+            fullPageHrefs = fullPageHrefs,
+        )
         val spannable = epubBuildFlowSpannable(
             context = context,
             flow = flow,
@@ -436,6 +446,26 @@ class EpubReflowEngine private constructor(
     }
 
     private var flowCurrentFlow: EpubChapterFlow? = null
+
+    /**
+     * Hrefs of the chapter's full-page illustrations (covers/彩插), by the same intrinsic-pixel gate
+     * the legacy paged path uses ([FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX]). The flow image loader/resolver
+     * fit these to the whole viewport (upscaling allowed) so a cover fills the page; everything else
+     * stays inline and column-capped. Bounds come from the cache (decoded once, no pixel data).
+     */
+    private fun flowFullPageImageHrefs(flow: EpubChapterFlow): Set<String> {
+        val result = HashSet<String>()
+        flow.segments.forEach { seg ->
+            val block = seg.block
+            if (block is EpubDisplayBlock.Image) {
+                val bounds = epubImageBoundsFor(block.href) ?: return@forEach
+                if (maxOf(bounds.width, bounds.height) >= FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX) {
+                    result += block.href
+                }
+            }
+        }
+        return result
+    }
 
     private fun flowHighlightRanges(flow: EpubChapterFlow): List<ReaderTextHighlightRange> {
         if (textAnnotations.isEmpty()) return emptyList()

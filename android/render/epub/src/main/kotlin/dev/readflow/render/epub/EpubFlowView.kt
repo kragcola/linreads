@@ -1,12 +1,19 @@
 package dev.readflow.render.epub
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.drawable.BitmapDrawable
 import android.text.Layout
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.ScrollView
 import dev.readflow.render.api.SelectionAwareTextView
@@ -19,9 +26,9 @@ import kotlin.math.abs
  *
  * Touch is owned end-to-end (审计 H4/H5), mirroring Moon+ Reader / FBReader: a [GestureDetector]
  * classifies tap / long-press / scroll; selection is gated behind long-press so it never fights
- * page turns. PAGED: edge tap or horizontal/non-middle drag flips a page (instant scrollTo); a
- * vertical drag STARTING in the centre 1/3×1/3 zone becomes a free native scroll that stays where
- * released (no snap). SCROLL: free scroll throughout.
+ * page turns. PAGED: edge tap or horizontal/non-middle drag flips a page (animated slide); a
+ * vertical drag STARTING in the centre column (middle 1/3 of width, full height) becomes a free
+ * native scroll that stays where released (no snap). SCROLL: free scroll throughout.
  *
  * The resume anchor is always the char offset of the top-visible line (font-size stable), never a
  * page index.
@@ -68,6 +75,12 @@ internal class EpubFlowView(
     private var flipped = false
     private var stealing = false
 
+    /** Page-flip slide animation: a snapshot of the outgoing page slides off as the new page shows. */
+    var pageTurnAnimated = true
+    private var flipAnimator: ValueAnimator? = null
+    private var flipDrawable: BitmapDrawable? = null
+    private val flipDurationMs = 220L
+
     private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onLongPress(e: MotionEvent) {
             // Long-press anywhere = native text selection. We stop owning the stream so the child
@@ -92,6 +105,8 @@ internal class EpubFlowView(
 
     /** Installs the chapter Spannable and paginates over the TextView's measured layout. */
     fun setChapter(flow: EpubChapterFlow, spannable: CharSequence, pageHeightPx: Int) {
+        flipAnimator?.cancel()
+        clearFlipOverlay()
         this.flow = flow
         this.pageHeightPx = pageHeightPx.coerceAtLeast(1)
         currentPage = 0
@@ -194,7 +209,7 @@ internal class EpubFlowView(
             currentPage = anchor
             val target = anchor + delta
             if (target < 0 || target > paged.lastIndex) return false
-            goToPage(target)
+            goToPageAnimated(target, forward = delta > 0)
             return true
         }
         // SCROLL: page by viewport; boundary only at the true scroll extremes.
@@ -211,6 +226,75 @@ internal class EpubFlowView(
         currentPage = index.coerceIn(0, paged.lastIndex)
         scrollTo(0, paged[currentPage].topPx)
         reportTopOffset()
+    }
+
+    /**
+     * Page turn with a Moon+/FBReader-style horizontal slide: snapshot the current page, jump the
+     * real content to the target, then slide the snapshot of the OUTGOING page off-screen while the
+     * incoming page is revealed beneath it (平移滞留 — a translation, not a visible scroll). Falls back
+     * to an instant [goToPage] when animation is off or a snapshot can't be taken.
+     */
+    private fun goToPageAnimated(index: Int, forward: Boolean) {
+        val target = index.coerceIn(0, paged.lastIndex)
+        if (!pageTurnAnimated || mode != Mode.PAGED || width == 0 || height == 0) {
+            goToPage(target)
+            return
+        }
+        val outgoing = snapshotViewport()
+        if (outgoing == null) {
+            goToPage(target)
+            return
+        }
+        // Reveal the incoming page underneath, then slide the outgoing snapshot away over the top.
+        goToPage(target)
+        startFlip(outgoing, forward)
+    }
+
+    private fun snapshotViewport(): Bitmap? = try {
+        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
+        val canvas = Canvas(bmp)
+        // ScrollView draws its children at -scrollY; replicate so the snapshot is exactly what's
+        // on screen now (the current page), independent of the upcoming scroll.
+        canvas.translate(0f, -scrollY.toFloat())
+        background?.let { bg ->
+            bg.setBounds(0, scrollY, width, scrollY + height)
+            bg.draw(canvas)
+        }
+        container.draw(canvas)
+        bmp
+    } catch (_: OutOfMemoryError) {
+        null
+    }
+
+    private fun startFlip(outgoing: Bitmap, forward: Boolean) {
+        flipAnimator?.cancel()
+        clearFlipOverlay()
+        val drawable = BitmapDrawable(resources, outgoing)
+        drawable.setBounds(0, 0, width, height)
+        overlay.add(drawable)
+        flipDrawable = drawable
+        val endX = if (forward) -width else width
+        flipAnimator = ValueAnimator.ofFloat(0f, endX.toFloat()).apply {
+            duration = flipDurationMs
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { a ->
+                val dx = (a.animatedValue as Float).toInt()
+                drawable.setBounds(dx, 0, dx + width, height)
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) = clearFlipOverlay()
+                override fun onAnimationCancel(animation: Animator) = clearFlipOverlay()
+            })
+            start()
+        }
+    }
+
+    private fun clearFlipOverlay() {
+        flipDrawable?.let {
+            overlay.remove(it)
+            it.bitmap?.recycle()
+        }
+        flipDrawable = null
     }
 
     /** Jumps to the final page (PAGED) or the bottom of the chapter (SCROLL) — back-into-prev-spine. */
@@ -248,8 +332,14 @@ internal class EpubFlowView(
 
     // ---- Touch FSM (owned end-to-end; selection gated behind long-press) ----------------------
 
-    private fun inMiddleZone(x: Float, y: Float): Boolean =
-        x > width / 3f && x < width * 2f / 3f && y > height / 3f && y < height * 2f / 3f
+    /**
+     * Moon+ Reader's temporary-scroll trigger: the centre vertical COLUMN (middle 1/3 of the width),
+     * spanning the FULL height — not a small centre box. A vertical drag anywhere down this column
+     * becomes a free scroll; the left/right columns stay reserved for page flips. Widening the old
+     * 1/3×1/3 box to a full-height column makes the gesture far easier to land (审计: trigger zone).
+     */
+    private fun inMiddleColumn(x: Float): Boolean =
+        x > width / 3f && x < width * 2f / 3f
 
     /**
      * The [GestureDetector] sees the whole stream here (intercept runs before any child consumes),
@@ -279,7 +369,7 @@ internal class EpubFlowView(
                 if (!classified && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
                     classified = true
                     val verticalDominant = abs(dy) >= abs(dx)
-                    freeScrolling = mode == Mode.SCROLL || (verticalDominant && inMiddleZone(downX, downY))
+                    freeScrolling = mode == Mode.SCROLL || (verticalDominant && inMiddleColumn(downX))
                     lastY = ev.y
                     stealing = true // own the rest of this gesture
                     return true
@@ -311,7 +401,7 @@ internal class EpubFlowView(
                 if (!classified && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
                     classified = true
                     val verticalDominant = abs(dy) >= abs(dx)
-                    freeScrolling = mode == Mode.SCROLL || (verticalDominant && inMiddleZone(downX, downY))
+                    freeScrolling = mode == Mode.SCROLL || (verticalDominant && inMiddleColumn(downX))
                     lastY = ev.y
                 }
                 if (classified && freeScrolling) {
