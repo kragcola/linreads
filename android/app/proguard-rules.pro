@@ -50,6 +50,12 @@
 
 # Keep Markwon
 -keep class io.noties.markwon.** { *; }
+# markwon-image bundles Svg/GifMediaDecoder, which reference the OPTIONAL androidsvg
+# and android-gif-drawable dependencies. We only use AsyncDrawable/AsyncDrawableSpan/
+# Scheduler (no SVG/GIF), so those classes are absent at runtime — tell R8 not to fail
+# on the missing references.
+-dontwarn com.caverock.androidsvg.**
+-dontwarn pl.droidsonroids.gif.**
 
 # Keep jsoup
 -keep class org.jsoup.** { *; }
