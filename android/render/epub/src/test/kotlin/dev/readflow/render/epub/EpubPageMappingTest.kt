@@ -1294,4 +1294,113 @@ class EpubPageMappingTest {
         // body1 is not lost: its remaining lines continue on the next page.
         assertTrue("body1 must continue past the heading page", pages.any { it.paragraphIndex == 1 })
     }
+
+    @Test
+    fun `small inline image packs onto one composite page with surrounding text`() {
+        val before = "对话上一句。"
+        val after = "对话下一句。"
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(before, "", after)))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(before, headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Image("images/avatar.png", altText = "头像", paragraphIndex = 1),
+                    EpubDisplayBlock.Text(after, headingLevel = null, paragraphIndex = 2),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 480,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+            // Small image → packable into the text stream (costs 2 lines).
+            inlineImageLineCost = { 2 },
+        )
+
+        // The whole run collapses to a single COMPOSITE page: text + image + text.
+        assertEquals(1, pages.size)
+        val page = pages.single()
+        assertEquals(3, page.elements.size)
+        assertTrue(page.elements[0] is EpubPageElement.Text)
+        assertTrue(page.elements[1] is EpubPageElement.Image)
+        assertTrue(page.elements[2] is EpubPageElement.Text)
+        // textSegments mirrors only the text runs so selection/highlight code keeps working.
+        assertEquals(2, page.textSegments.size)
+    }
+
+    @Test
+    fun `large image stays on its own standalone page even when inline cost callback present`() {
+        val before = "正文一。"
+        val after = "正文二。"
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(before, "", after)))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(before, headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Image("images/illus.png", altText = "插图", paragraphIndex = 1),
+                    EpubDisplayBlock.Text(after, headingLevel = null, paragraphIndex = 2),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 480,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+            // Large (full-page) image → null cost → standalone page, no composite.
+            inlineImageLineCost = { null },
+        )
+
+        val imagePage = pages.single { it.kind is EpubPageSliceKind.Image }
+        assertTrue("large image must not become a composite element", imagePage.elements.isEmpty())
+        assertTrue("no composite pages should be produced", pages.none { it.elements.isNotEmpty() })
+    }
+
+    @Test
+    fun `locator round trips to an inline image inside a composite page`() {
+        val before = "前句。"
+        val after = "后句。"
+        val paras = epubParasWithCharacterOffsets(listOf(listOf(before, "", after)))
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(before, headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Image("images/avatar.png", altText = "头像", paragraphIndex = 1),
+                    EpubDisplayBlock.Text(after, headingLevel = null, paragraphIndex = 2),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 480,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+            inlineImageLineCost = { 2 },
+        )
+
+        val composite = pages.single { it.elements.isNotEmpty() }
+        val compositeIndex = pages.indexOf(composite)
+        val imageElement = composite.elements.filterIsInstance<EpubPageElement.Image>().single()
+        val locator = epubLocatorForOffset(paras, imageElement.paragraphIndex, imageElement.charOffset)
+        assertEquals(compositeIndex, epubPageIndexFromLocator(locator, pages, paras))
+    }
 }

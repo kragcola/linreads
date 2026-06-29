@@ -207,6 +207,7 @@ class EpubReflowEngine private constructor(
     private val activePageContainers = Collections.newSetFromMap(WeakHashMap<View, Boolean>())
     private val activePagedTextPages = WeakHashMap<ComposeView, EpubPagedTextPageState>()
     private val activePagedImagePages = WeakHashMap<View, EpubPagedImagePageState>()
+    private val activePagedCompositePages = WeakHashMap<View, EpubPagedImagePageState>()
     private val imageBoundsCache = mutableMapOf<String, EpubImageBoundsCacheEntry>()
 
     /** Start index (inclusive) and end index (exclusive) of each chapter in paras. */
@@ -323,6 +324,9 @@ class EpubReflowEngine private constructor(
         val total = pages.size.coerceAtLeast(1)
         val safePageIndex = pageIndex.coerceIn(0, total - 1)
         val slice = pages.getOrNull(safePageIndex) ?: EpubPageSlice(paragraphIndex = 0, startOffset = 0, endOffset = 0)
+        if (slice.elements.isNotEmpty()) {
+            return createCompositePageView(slice, safePageIndex, total)
+        }
         if (slice.kind is EpubPageSliceKind.Image) {
             return createImagePageView(slice, safePageIndex, total)
         }
@@ -458,7 +462,129 @@ class EpubReflowEngine private constructor(
         }
     }
 
-    // Size-driven placement (replaces the old pageIndex==0 gate that forced every illustration
+    // "非必要不分页": a COMPOSITE page stacks a packed run of text runs + small inline images in one
+    // scrollable column so short text and avatars/logos no longer isolate onto their own pages. Text
+    // runs render as selectable TextViews (links/cross-run selection are not wired here — these are
+    // sparse illustration/colophon regions; the full Compose selection path stays on pure-text pages).
+    private fun createCompositePageView(slice: EpubPageSlice, pageIndex: Int, total: Int): View {
+        val palette = paletteFor(themeMode, context.resources.configuration)
+        val column = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER,
+            )
+        }
+        populateCompositeColumn(column, slice, pageIndex, total, palette)
+        return FrameLayout(context).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            setBackgroundColor(palette.paper)
+            tag = slice
+            addView(column)
+        }.also { trackCompositePageView(it, pageIndex, slice) }
+    }
+
+    private fun populateCompositeColumn(
+        column: LinearLayout,
+        slice: EpubPageSlice,
+        pageIndex: Int,
+        total: Int,
+        palette: ReaderPalette,
+    ) {
+        column.removeAllViews()
+        val density = context.resources.displayMetrics.density
+        val sidePadding = (PAGE_HORIZONTAL_PADDING_DP * density).toInt()
+        slice.elements.forEachIndexed { index, element ->
+            when (element) {
+                is EpubPageElement.Text -> {
+                    val segment = element.segment
+                    val fullText = lazyBook?.paragraphAt(segment.paragraphIndex)?.text ?: segment.text
+                    val start = segment.startOffset.coerceIn(0, fullText.length)
+                    val end = segment.endOffset.coerceIn(0, fullText.length).coerceAtLeast(start)
+                    val paint = currentPageTextPaint(segment.textStyle)
+                    column.addView(
+                        TextView(context).apply {
+                            layoutParams = LinearLayout.LayoutParams(
+                                LinearLayout.LayoutParams.MATCH_PARENT,
+                                LinearLayout.LayoutParams.WRAP_CONTENT,
+                            ).apply { if (index > 0) topMargin = (8 * density).toInt() }
+                            text = fullText.substring(start, end)
+                            setTextColor(palette.ink)
+                            textSize = paint.textSize / density
+                            typeface = paint.typeface
+                            setLineSpacing(0f, lineSpacingMultiplier)
+                            gravity = if (segment.textStyle.headingLevel != null) Gravity.CENTER else Gravity.START
+                            setPadding(sidePadding, 0, sidePadding, 0)
+                            setTextIsSelectable(true)
+                        },
+                    )
+                }
+                is EpubPageElement.Image -> {
+                    column.addView(
+                        ImageView(context).apply {
+                            layoutParams = LinearLayout.LayoutParams(
+                                LinearLayout.LayoutParams.WRAP_CONTENT,
+                                LinearLayout.LayoutParams.WRAP_CONTENT,
+                                Gravity.CENTER_HORIZONTAL.toFloat(),
+                            ).apply {
+                                gravity = Gravity.CENTER_HORIZONTAL
+                                topMargin = (INLINE_IMAGE_VERTICAL_PADDING_DP * density).toInt()
+                                bottomMargin = (INLINE_IMAGE_VERTICAL_PADDING_DP * density).toInt()
+                            }
+                            adjustViewBounds = true
+                            maxWidth = (MAX_LINE_WIDTH_DP * density).toInt()
+                            maxHeight = (INLINE_IMAGE_MAX_HEIGHT_DP * density).toInt()
+                            minimumHeight = (48 * density).toInt()
+                            scaleType = ImageView.ScaleType.FIT_CENTER
+                            contentDescription = element.altText
+                                ?.takeIf { it.isNotBlank() }
+                                ?: "图片"
+                            setImageBitmap(epubFile?.let { decodeEpubImage(it, element.href) })
+                        },
+                    )
+                }
+            }
+        }
+        column.contentDescription = "第 ${pageIndex + 1} 页，共 $total 页"
+    }
+
+    private fun trackCompositePageView(container: View, pageIndex: Int, slice: EpubPageSlice) {
+        trackPageContainer(container) {
+            activePagedCompositePages.remove(container)
+        }
+        activePagedCompositePages[container] = EpubPagedImagePageState(slice, pageIndex)
+    }
+
+    private fun rebindActiveCompositePage(
+        container: View,
+        palette: ReaderPalette = paletteFor(themeMode, context.resources.configuration),
+    ) {
+        val pageState = activePagedCompositePages[container] ?: return
+        val total = pagedSlices.size.coerceAtLeast(1)
+        val pageIndex = pageState.pageIndex.coerceIn(0, total - 1)
+        val slice = pagedSlices.getOrNull(pageIndex) ?: pageState.slice
+        if (slice.elements.isEmpty()) {
+            // Pagination changed under us (font/spacing): this page is no longer composite. Drop it;
+            // the host rebinds the holder via createPageView on the next bind.
+            activePagedCompositePages.remove(container)
+            container.setBackgroundColor(palette.paper)
+            return
+        }
+        if (slice != pageState.slice || pageIndex != pageState.pageIndex) {
+            activePagedCompositePages[container] = pageState.copy(slice = slice, pageIndex = pageIndex)
+            container.tag = slice
+        }
+        container.setBackgroundColor(palette.paper)
+        val column = (container as? FrameLayout)?.getChildAt(0) as? LinearLayout ?: return
+        populateCompositeColumn(column, slice, pageIndex, total, palette)
+    }
+
+
     // past page 1 to render small). Light-novel EPUBs carry two distinct image classes:
     //   - full-page illustrations / 彩插 / covers — large intrinsic pixels (~800px+ on the long side)
     //   - inline markers: chat avatars (~142px), character icons (~300-400px), footnote glyphs
@@ -817,6 +943,7 @@ class EpubReflowEngine private constructor(
         activePageContainers.clear()
         activePagedTextPages.clear()
         activePagedImagePages.clear()
+        activePagedCompositePages.clear()
         lazyBook?.close()
         lazyBook = null
         recyclerView = null
@@ -853,6 +980,7 @@ class EpubReflowEngine private constructor(
         activePageContainers.clear()
         activePagedTextPages.clear()
         activePagedImagePages.clear()
+        activePagedCompositePages.clear()
         lazyBook?.close()
         lazyBook = null
         paras = emptyList()
@@ -877,6 +1005,7 @@ class EpubReflowEngine private constructor(
         (recyclerView?.adapter as? EpubParaAdapter)?.updateFontSize(sp)
         activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
         activePagedImagePages.keys.toList().forEach(::rebindActiveImagePage)
+        activePagedCompositePages.keys.toList().forEach(::rebindActiveCompositePage)
     }
 
     override suspend fun setLineSpacing(multiplier: Float) {
@@ -886,6 +1015,7 @@ class EpubReflowEngine private constructor(
         (recyclerView?.adapter as? EpubParaAdapter)?.updateLineSpacing(multiplier)
         activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
         activePagedImagePages.keys.toList().forEach(::rebindActiveImagePage)
+        activePagedCompositePages.keys.toList().forEach(::rebindActiveCompositePage)
     }
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {
@@ -894,6 +1024,7 @@ class EpubReflowEngine private constructor(
         // Rebind active Compose text pages to pick up new fontFamily
         withContext(Dispatchers.Main) {
             activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
+            activePagedCompositePages.keys.toList().forEach(::rebindActiveCompositePage)
         }
         (recyclerView?.adapter as? EpubParaAdapter)?.notifyDataSetChanged()
     }
@@ -903,6 +1034,7 @@ class EpubReflowEngine private constructor(
         useSourceHan = fontId == "source_han"
         withContext(Dispatchers.Main) {
             activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
+            activePagedCompositePages.keys.toList().forEach(::rebindActiveCompositePage)
         }
         (recyclerView?.adapter as? EpubParaAdapter)?.notifyDataSetChanged()
     }
@@ -915,6 +1047,7 @@ class EpubReflowEngine private constructor(
         (recyclerView?.adapter as? EpubParaAdapter)?.updateCodeBlockBgColor(codeBlockBgFor(mode, context.resources.configuration))
         activePageContainers.forEach { it.setBackgroundColor(palette.paper) }
         activePagedTextPages.keys.toList().forEach { rebindActiveComposeTextPage(it, palette) }
+        activePagedCompositePages.keys.toList().forEach { rebindActiveCompositePage(it, palette) }
     }
 
     override suspend fun setMode(mode: ReadingMode) {
@@ -937,6 +1070,7 @@ class EpubReflowEngine private constructor(
                     activePagedTextPages.clear()
                     activePageContainers.clear()
                     activePagedImagePages.clear()
+                    activePagedCompositePages.clear()
                 }
             }
             _pagingKind.value = targetKind
@@ -992,17 +1126,40 @@ class EpubReflowEngine private constructor(
 
     private fun buildPagedSlices(): List<EpubPageSlice> =
         currentPageLineMeasurer().let { measurer ->
+            val metrics = currentPageMetrics()
             epubPagedLayoutWithBlocks(
                 paras = paras,
                 textProvider = { index -> lazyBook?.cachedParagraphAt(index)?.text.orEmpty() },
                 blockProvider = { lazyBook?.layoutBlocks().orEmpty() },
-                metrics = currentPageMetrics(),
+                metrics = metrics,
                 lineBreaker = { text, contentWidth, textStyle ->
                     measurer.measure(text, contentWidth, textStyle)
                 },
                 measurement = measurer.measurement,
+                inlineImageLineCost = { href -> inlineImageLineCost(href, metrics) },
             )
         }
+
+    // "非必要不分页": small (inline-class) images flow with text on a shared page. Return the image's
+    // estimated rendered height as a count of text-line units so the packer can budget it; return
+    // null for large (full-page) images, which keep their own standalone page. Undecodable bounds →
+    // null (treated full-page) to preserve the safe legacy behavior.
+    private fun inlineImageLineCost(href: String, metrics: EpubPageMetrics): Int? {
+        val bounds = epubImageBoundsFor(href) ?: return null
+        if (maxOf(bounds.width, bounds.height) >= FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX) return null
+        val density = context.resources.displayMetrics.density
+        val contentWidthPx = (metrics.viewportWidthPx - metrics.horizontalPaddingPx).coerceAtLeast(1)
+        // Mirror the inline ImageView constraints: width capped at MAX_LINE_WIDTH_DP and the content
+        // width, height capped at INLINE_IMAGE_MAX_HEIGHT_DP, FIT_CENTER preserving aspect ratio.
+        val maxWidthPx = minOf((MAX_LINE_WIDTH_DP * density), contentWidthPx.toFloat()).coerceAtLeast(1f)
+        val maxHeightPx = (INLINE_IMAGE_MAX_HEIGHT_DP * density).coerceAtLeast(1f)
+        val aspect = bounds.height.toFloat() / bounds.width.toFloat().coerceAtLeast(1f)
+        val drawnHeightPx = minOf(maxWidthPx * aspect, maxHeightPx)
+        // Inline image vertical padding (24dp top + 24dp bottom in createImagePageView).
+        val totalHeightPx = drawnHeightPx + (2 * INLINE_IMAGE_VERTICAL_PADDING_DP * density)
+        val lineHeightPx = metrics.lineHeightPx.coerceAtLeast(1f)
+        return (totalHeightPx / lineHeightPx).toInt().coerceAtLeast(1)
+    }
 
     private fun currentPageLineMeasurer(): EpubPageLineMeasurer =
         pageLineMeasurer ?: EpubPageLineMeasurer.ComposeTextLayoutResult { text, contentWidth, textStyle ->
@@ -1512,6 +1669,7 @@ class EpubReflowEngine private constructor(
         const val PAGE_HORIZONTAL_PADDING_DP = 28
         const val PAGE_VERTICAL_PADDING_DP = 24
         const val INLINE_IMAGE_MAX_HEIGHT_DP = 360
+        const val INLINE_IMAGE_VERTICAL_PADDING_DP = 24
         // Intrinsic-pixel gate for full-page placement. Light-novel illustrations/彩插/covers run
         // ~800px+ on the long side; inline avatars (~142px) and icons (~300-400px) sit well below.
         const val FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX = 600

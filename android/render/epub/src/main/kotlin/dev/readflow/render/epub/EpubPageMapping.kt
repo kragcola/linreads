@@ -17,7 +17,25 @@ internal data class EpubPageSlice(
     val textSegments: List<EpubPageTextSegment> = emptyList(),
     val endParagraphIndex: Int = paragraphIndex,
     val visualLineCount: Int = 1,
+    // Non-empty only for COMPOSITE pages: an ordered vertical stack of text runs and small inline
+    // images packed onto one page ("非必要不分页" / Moon+ Reader style). textSegments is also populated
+    // (text runs only) so locator/selection/highlight code keeps working without an Image branch.
+    val elements: List<EpubPageElement> = emptyList(),
 )
+
+// A single laid-out element inside a COMPOSITE page (elements non-empty). The composite renderer
+// stacks these vertically; the packer guarantees their combined line cost fits the page budget.
+internal sealed interface EpubPageElement {
+    data class Text(val segment: EpubPageTextSegment) : EpubPageElement
+
+    data class Image(
+        val href: String,
+        val altText: String?,
+        val paragraphIndex: Int,
+        val charOffset: Int,
+        val lineCost: Int,
+    ) : EpubPageElement
+}
 
 internal data class EpubPageTextSegment(
     val paragraphIndex: Int,
@@ -296,6 +314,9 @@ private fun packAdjacentShortTextPages(
         if (pendingPages.isEmpty()) return
         packed += if (pendingPages.size == 1) {
             pendingPages.single()
+        } else if (pendingPages.any { it.kind is EpubPageSliceKind.Image }) {
+            // Mixed run (text + small inline images) → one COMPOSITE page that stacks them.
+            pageSliceForElements(pendingPages.toList(), measurement, textProvider)
         } else {
             pageSliceForSegments(
                 pendingPages.map { page ->
@@ -334,8 +355,10 @@ private fun packAdjacentShortTextPages(
 }
 
 private fun EpubPageSlice.canPackWithAdjacentText(): Boolean =
-    kind == EpubPageSliceKind.Text &&
-        textStyle.isSafeToPackWithAdjacentText()
+    // Small inline images (only those reach the packer — large ones are emitted standalone) pack
+    // with text so they ride a shared page instead of isolating.
+    kind is EpubPageSliceKind.Image ||
+        (kind == EpubPageSliceKind.Text && textStyle.isSafeToPackWithAdjacentText())
 
 // Headings are packable so they keep-with-next (a heading never sits alone at the
 // bottom/top of a page; it shares the page with the text that follows it). The block
@@ -385,6 +408,43 @@ private fun pageSliceForSegments(
     )
 }
 
+// Build a COMPOSITE page from a packed run of text pages and small inline-image slices. Elements
+// preserve source order for the vertical-stack renderer; textSegments mirrors the text runs only so
+// locator/selection/highlight code (which reads textSegments) keeps working with no Image awareness.
+private fun pageSliceForElements(
+    pages: List<EpubPageSlice>,
+    measurement: EpubPageMeasurement,
+    textProvider: (Int) -> String,
+): EpubPageSlice {
+    val elements = pages.map { page ->
+        when (val kind = page.kind) {
+            is EpubPageSliceKind.Image -> EpubPageElement.Image(
+                href = kind.href,
+                altText = kind.altText,
+                paragraphIndex = page.paragraphIndex,
+                charOffset = page.startOffset,
+                lineCost = page.lineCount(),
+            )
+            EpubPageSliceKind.Text -> EpubPageElement.Text(page.toTextSegment(textProvider))
+        }
+    }
+    val textSegments = elements.filterIsInstance<EpubPageElement.Text>().map { it.segment }
+    val anchor = pages.first()
+    val last = pages.last()
+    return EpubPageSlice(
+        paragraphIndex = anchor.paragraphIndex,
+        startOffset = anchor.startOffset,
+        endOffset = if (anchor.paragraphIndex == last.paragraphIndex) last.endOffset else anchor.endOffset,
+        textStyle = textSegments.firstOrNull()?.textStyle ?: anchor.textStyle,
+        measurement = measurement,
+        links = textSegments.firstOrNull()?.links.orEmpty(),
+        textSegments = textSegments,
+        endParagraphIndex = last.endParagraphIndex.coerceAtLeast(last.paragraphIndex),
+        visualLineCount = (pages.sumOf { it.lineCount() } + (pages.size - 1)).coerceAtLeast(1),
+        elements = elements,
+    )
+}
+
 private fun EpubPageSlice.lineCount(): Int =
     if (textSegments.isEmpty()) {
         visualLineCount.coerceAtLeast(1)
@@ -428,6 +488,10 @@ internal fun epubPagedLayoutWithBlocks(
     metrics: EpubPageMetrics,
     lineBreaker: (text: String, contentWidthPx: Int, textStyle: EpubPageTextStyle) -> List<Pair<Int, Int>>,
     measurement: EpubPageMeasurement = EpubPageMeasurement.StaticLayout,
+    // "非必要不分页": for a small (inline-class) image return its line cost so it packs onto a shared
+    // page with adjacent text instead of isolating. Return null for a large (full-page) image, which
+    // keeps the standalone-page behavior. Default null preserves the legacy "every image = a page".
+    inlineImageLineCost: (href: String) -> Int? = { null },
 ): List<EpubPageSlice> {
     val blocks = blockProvider()
     val textStylesByParagraph = blocks
@@ -491,11 +555,32 @@ internal fun epubPagedLayoutWithBlocks(
                     }
                 }
                 is EpubDisplayBlock.Image -> {
-                    // Keep-with-next for images: a heading immediately preceding an image (4-koma
-                    // section title → manga panel, colophon line → publisher logo) must not isolate
-                    // on its own page. Ride the orphan heading onto the image page as a caption
-                    // instead of flushing it alone. Only pure heading pages are captured — if the
-                    // pending pages include body text, the heading already keeps-with that body.
+                    val imageAnchorOffset = nextImageAnchorOffsets.nextImageAnchorOffsetForParagraph(
+                        paras = paras,
+                        textProvider = textProvider,
+                        paragraphIndex = block.paragraphIndex,
+                    )
+                    val inlineCost = inlineImageLineCost(block.href)
+                    if (inlineCost != null) {
+                        // Small image (avatar/logo/icon): flow it into the text stream so the packer
+                        // can place it on a shared page with surrounding text ("非必要不分页"). It is a
+                        // packable Image slice carrying its line cost in visualLineCount.
+                        emittedParagraphs += block.paragraphIndex
+                        pendingTextPages += EpubPageSlice(
+                            paragraphIndex = block.paragraphIndex,
+                            startOffset = imageAnchorOffset,
+                            endOffset = imageAnchorOffset,
+                            kind = EpubPageSliceKind.Image(block.href, block.altText),
+                            endParagraphIndex = block.paragraphIndex,
+                            visualLineCount = inlineCost.coerceAtLeast(1),
+                        )
+                        return@forEach
+                    }
+                    // Large image (full-page illustration/cover): keep-with-next for a heading that
+                    // immediately precedes it (4-koma section title → panel, colophon line → publisher
+                    // logo) — ride the orphan heading onto the image page as a caption instead of
+                    // flushing it alone. Only pure heading pages are captured; body text already
+                    // keeps-with via the heading-follower budget.
                     val headingCaption = if (
                         pendingTextPages.isNotEmpty() &&
                         pendingTextPages.all { it.textStyle.headingLevel != null }
@@ -507,11 +592,6 @@ internal fun epubPagedLayoutWithBlocks(
                     }
                     flushPendingTextPages()
                     emittedParagraphs += block.paragraphIndex
-                    val imageAnchorOffset = nextImageAnchorOffsets.nextImageAnchorOffsetForParagraph(
-                        paras = paras,
-                        textProvider = textProvider,
-                        paragraphIndex = block.paragraphIndex,
-                    )
                     add(
                         EpubPageSlice(
                             paragraphIndex = block.paragraphIndex,
@@ -666,9 +746,17 @@ internal fun epubPageIndexFromLocator(
         else -> 0
     }
     val imageIndex = pages.indexOfFirst { page ->
-        page.kind is EpubPageSliceKind.Image &&
-            page.paragraphIndex == paragraphIndex &&
-            charOffsetInParagraph == page.startOffset
+        (
+            page.kind is EpubPageSliceKind.Image &&
+                page.paragraphIndex == paragraphIndex &&
+                charOffsetInParagraph == page.startOffset
+        ) ||
+            // Inline image living inside a COMPOSITE page.
+            page.elements.any { element ->
+                element is EpubPageElement.Image &&
+                    element.paragraphIndex == paragraphIndex &&
+                    charOffsetInParagraph == element.charOffset
+            }
     }
     if (imageIndex >= 0) return imageIndex
     val index = pages.indexOfFirst { page ->
