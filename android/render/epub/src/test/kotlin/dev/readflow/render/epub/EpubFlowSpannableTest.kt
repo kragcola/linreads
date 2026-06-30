@@ -35,7 +35,11 @@ class EpubFlowSpannableTest {
     private fun image(p: Int, href: String, alt: String? = null) =
         EpubDisplayBlock.Image(href = href, altText = alt, paragraphIndex = p)
 
-    private fun build(flow: EpubChapterFlow, decode: (String) -> android.graphics.Bitmap?): CharSequence {
+    private fun build(
+        flow: EpubChapterFlow,
+        style: EpubFlowStyle = style(),
+        decode: (String) -> android.graphics.Bitmap?,
+    ): CharSequence {
         val ctx = RuntimeEnvironment.getApplication()
         val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
         val loader = EpubFlowImageLoader(
@@ -55,7 +59,7 @@ class EpubFlowSpannableTest {
         return epubBuildFlowSpannable(
             context = ctx,
             flow = flow,
-            style = style(),
+            style = style,
             markwonTheme = io.noties.markwon.core.MarkwonTheme.create(ctx),
             imageLoader = loader,
             imageSizeResolver = resolver,
@@ -86,5 +90,34 @@ class EpubFlowSpannableTest {
         val flow = epubBuildChapterFlow(0, listOf(text(0, "前文"), image(1, "missing.png", alt = null)))
         val sb = build(flow) { null }
         assertEquals(flow.text, sb.toString())
+    }
+
+    @Test
+    fun `first-line indent applies to body paragraph but not heading`() {
+        val flow = epubBuildChapterFlow(0, listOf(heading(0, "标题"), text(1, "正文内容")))
+        val sb = build(flow, style().copy(firstLineIndentPx = 72)) { null } as android.text.Spanned
+
+        val bodySeg = flow.segments.first { it.paragraphIndex == 1 }
+        val bodyMargins = sb.getSpans(
+            bodySeg.layoutStart, bodySeg.layoutEnd, android.text.style.LeadingMarginSpan.Standard::class.java,
+        )
+        assertEquals(1, bodyMargins.size)
+        // First line indented 72px, wrapped lines flush (0) — Moon+ 首行缩进.
+        assertEquals(72, bodyMargins[0].getLeadingMargin(true))
+        assertEquals(0, bodyMargins[0].getLeadingMargin(false))
+
+        val headSeg = flow.segments.first { it.paragraphIndex == 0 }
+        val headMargins = sb.getSpans(
+            headSeg.layoutStart, headSeg.layoutEnd, android.text.style.LeadingMarginSpan.Standard::class.java,
+        )
+        assertEquals(0, headMargins.size)
+    }
+
+    @Test
+    fun `first-line indent disabled when zero`() {
+        val flow = epubBuildChapterFlow(0, listOf(text(0, "正文内容")))
+        val sb = build(flow, style().copy(firstLineIndentPx = 0)) { null } as android.text.Spanned
+        val margins = sb.getSpans(0, sb.length, android.text.style.LeadingMarginSpan.Standard::class.java)
+        assertEquals(0, margins.size)
     }
 }

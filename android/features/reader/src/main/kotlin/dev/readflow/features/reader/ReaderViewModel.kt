@@ -13,6 +13,7 @@ import dev.readflow.core.database.TextAnnotationDao
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.ReaderState
+import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.model.ReadflowError
@@ -55,6 +56,7 @@ data class ReaderUiState(
     val lineSpacing: Float = 1.75f,
     val readingMode: ReadingMode = ReadingMode.SCROLL,
     val supportedModes: Set<ReadingMode> = setOf(ReadingMode.SCROLL),
+    val pageFlipStyle: PageFlipStyle = PageFlipStyle.SLIDE,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val isUiVisible: Boolean = false,  // 默认隐藏，点中间呼出
     val activePanel: ReaderPanel? = null,
@@ -112,6 +114,7 @@ class ReaderViewModel(
         is ReaderIntent.PreviewZoom -> previewZoom(intent.scale)
         is ReaderIntent.SetLineSpacing -> setLineSpacing(intent.multiplier)
         is ReaderIntent.SetMode -> setMode(intent.mode)
+        is ReaderIntent.SetPageFlipStyle -> setPageFlipStyle(intent.style)
         is ReaderIntent.SetTheme -> setTheme(intent.theme)
         is ReaderIntent.OpenPanel -> updateUiStateAndPersist { it.copy(activePanel = intent.panel, isUiVisible = true) }
         ReaderIntent.ClosePanel -> updateUiStateAndPersist { it.copy(activePanel = null) }
@@ -211,6 +214,8 @@ class ReaderViewModel(
             engine.setTheme(savedTheme)
             engine.setSerifFont(settings.useSourceHanFont.first())
             engine.setFont(settings.fontChoice.first().serialize())
+            val savedFlipStyle = settings.pageFlipStyle.first()
+            engine.setPageFlipStyle(savedFlipStyle)
             val txtEnc = settings.txtEncoding.first()
             if (txtEnc.charsetName != null) {
                 engine.setTxtEncodingOverride(txtEnc.charsetName)
@@ -239,6 +244,7 @@ class ReaderViewModel(
                     lineSpacing = savedLineSpacing,
                     readingMode = engine.pagingKind.value.toReadingMode(),
                     supportedModes = engine.supportedModes,
+                    pageFlipStyle = savedFlipStyle,
                     themeMode = savedTheme,
                     isUiVisible = restoredForBook?.isUiVisible ?: it.isUiVisible,
                     activePanel = null,
@@ -588,6 +594,15 @@ class ReaderViewModel(
         viewModelScope.launch {
             settings.setThemeMode(theme)
             engine?.setTheme(theme)
+        }
+    }
+
+    private fun setPageFlipStyle(style: PageFlipStyle) {
+        val engine = _uiState.value.engine
+        _uiState.update { it.copy(pageFlipStyle = style) }
+        viewModelScope.launch {
+            settings.setPageFlipStyle(style)
+            engine?.setPageFlipStyle(style)
         }
     }
 

@@ -1,6 +1,7 @@
 package dev.readflow.core.prefs
 
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TxtEncoding
@@ -27,6 +28,8 @@ interface SettingsRepository {
     val fontChoice: Flow<FontChoice>
     /** 阅读器首次手势引导是否已展示过（一次性）。 */
     val readerGuideShown: Flow<Boolean>
+    /** 分页模式翻页动画风格（滑动/仿真/无）。 */
+    val pageFlipStyle: Flow<PageFlipStyle>
 
     suspend fun setCalibreBaseUrl(url: String)
     suspend fun setFontSize(size: Int)
@@ -38,4 +41,5 @@ interface SettingsRepository {
     suspend fun setTxtEncoding(encoding: TxtEncoding)
     suspend fun setFontChoice(choice: FontChoice)
     suspend fun setReaderGuideShown(shown: Boolean)
+    suspend fun setPageFlipStyle(style: PageFlipStyle)
 }

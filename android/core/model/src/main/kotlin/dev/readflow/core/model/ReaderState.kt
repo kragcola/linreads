@@ -9,6 +9,18 @@ enum class ReaderReadingMode {
 }
 
 /**
+ * 分页模式下的翻页动画风格（静读天下「翻页方式」对应项）。仅在 PAGED 阅读模式生效。
+ * - [SLIDE]      硬件加速覆盖滑动（默认，GPU 合成，任意分辨率 60fps）
+ * - [SIMULATION] 仿真书页翻动（Canvas 网格卷曲，开销更高，按需开启）
+ * - [NONE]       无动画，瞬时切页
+ */
+enum class PageFlipStyle {
+    SLIDE,
+    SIMULATION,
+    NONE,
+}
+
+/**
  * Fully serializable reader UI/session state (§7.2, P0-A). Holds NO View reference.
  * Transits SavedStateHandle as a JSON String (F4); engine accelerator caches live
  * elsewhere (EngineStateStore, §7.2 F5).

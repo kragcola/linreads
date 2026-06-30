@@ -343,6 +343,7 @@ fun ReaderScreen(
                                 lineSpacing = state.lineSpacing,
                                 readingMode = state.readingMode,
                                 supportedModes = state.supportedModes,
+                                pageFlipStyle = state.pageFlipStyle,
                                 themeMode = state.themeMode,
                                 searchState = state.search,
                                 bookmarkState = state.bookmarks,
@@ -357,6 +358,7 @@ fun ReaderScreen(
                                 onFontSizeChange = { viewModel.onIntent(ReaderIntent.SetFontSize(it)) },
                                 onLineSpacingChange = { viewModel.onIntent(ReaderIntent.SetLineSpacing(it)) },
                                 onModeChange = { viewModel.onIntent(ReaderIntent.SetMode(it)) },
+                                onPageFlipStyleChange = { viewModel.onIntent(ReaderIntent.SetPageFlipStyle(it)) },
                                 onThemeChange = { viewModel.onIntent(ReaderIntent.SetTheme(it)) },
                             )
                             // ── 快捷功能按钮 ──
@@ -434,6 +436,7 @@ private fun ReaderControlPanel(
     lineSpacing: Float,
     readingMode: ReadingMode,
     supportedModes: Set<ReadingMode>,
+    pageFlipStyle: dev.readflow.core.model.PageFlipStyle,
     themeMode: ThemeMode,
     searchState: ReaderSearchState,
     bookmarkState: ReaderBookmarkState,
@@ -448,6 +451,7 @@ private fun ReaderControlPanel(
     onFontSizeChange: (Float) -> Unit,
     onLineSpacingChange: (Float) -> Unit,
     onModeChange: (ReadingMode) -> Unit,
+    onPageFlipStyleChange: (dev.readflow.core.model.PageFlipStyle) -> Unit,
     onThemeChange: (ThemeMode) -> Unit,
 ) {
     // 目录改为左半屏抽屉（见 TocDrawer），底部面板不再承载 TOC。
@@ -479,9 +483,11 @@ private fun ReaderControlPanel(
                     lineSpacing = lineSpacing,
                     readingMode = readingMode,
                     supportedModes = supportedModes,
+                    pageFlipStyle = pageFlipStyle,
                     onFontSizeChange = onFontSizeChange,
                     onLineSpacingChange = onLineSpacingChange,
                     onModeChange = onModeChange,
+                    onPageFlipStyleChange = onPageFlipStyleChange,
                 )
                 ReaderPanel.THEME -> ThemePanel(themeMode, onThemeChange)
                 null -> Unit
@@ -877,9 +883,11 @@ private fun FontPanel(
     lineSpacing: Float,
     readingMode: ReadingMode,
     supportedModes: Set<ReadingMode>,
+    pageFlipStyle: dev.readflow.core.model.PageFlipStyle,
     onFontSizeChange: (Float) -> Unit,
     onLineSpacingChange: (Float) -> Unit,
     onModeChange: (ReadingMode) -> Unit,
+    onPageFlipStyleChange: (dev.readflow.core.model.PageFlipStyle) -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -954,7 +962,33 @@ private fun FontPanel(
                 )
             }
         }
+        // 翻页动画（仅分页模式生效，静读天下「翻页方式」）
+        if (readingMode == ReadingMode.PAGED) {
+            Text(
+                text = "翻页动画",
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                dev.readflow.core.model.PageFlipStyle.entries.forEach { style ->
+                    FilterChip(
+                        selected = pageFlipStyle == style,
+                        onClick = { onPageFlipStyleChange(style) },
+                        label = { Text(style.readerLabel(), maxLines = 1) },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
     }
+}
+
+private fun dev.readflow.core.model.PageFlipStyle.readerLabel() = when (this) {
+    dev.readflow.core.model.PageFlipStyle.SLIDE -> "滑动"
+    dev.readflow.core.model.PageFlipStyle.SIMULATION -> "仿真"
+    dev.readflow.core.model.PageFlipStyle.NONE -> "无"
 }
 
 private fun ReadingMode.readerLabel() = when (this) {

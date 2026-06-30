@@ -6,6 +6,7 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -88,6 +89,8 @@ interface ReaderEngine {
     suspend fun setTxtEncodingOverride(charsetName: String?) {}
     suspend fun setTheme(mode: ThemeMode) {}
     suspend fun setMode(mode: ReadingMode)
+    /** Page-turn animation style for PAGED mode (滑动/仿真/无). No-op for engines without self-paging. */
+    suspend fun setPageFlipStyle(style: PageFlipStyle) {}
 
     // View lifecycle / acceleration cache (semantic position lives in ReaderState.currentLocator)
     fun onViewAttached(view: View) {}

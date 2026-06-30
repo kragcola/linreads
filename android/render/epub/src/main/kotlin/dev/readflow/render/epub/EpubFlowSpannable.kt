@@ -34,6 +34,8 @@ internal data class EpubFlowStyle(
     val columnWidthPx: Int,
     val imageMaxHeightPx: Int,
     val density: Float,
+    /** First-line indent for body paragraphs (Moon+ 首行缩进, ~2 CJK char widths). 0 disables. */
+    val firstLineIndentPx: Int = 0,
 )
 
 /**
@@ -103,11 +105,23 @@ private fun applyTextSpans(
         )
     }
 
-    // Indent / blockquote leading margin.
-    val indentPx = block.indentLevel * (24 * style.density).toInt() +
+    // Indent / blockquote leading margin (uniform, all lines) + body first-line indent (Moon+ 首行缩进).
+    val blockIndentPx = block.indentLevel * (24 * style.density).toInt() +
         if (block.kind == EpubTextKind.Blockquote) (18 * style.density).toInt() else 0
-    if (indentPx > 0) {
-        sb.setSpan(LeadingMarginSpan.Standard(indentPx), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+    // First-line indent applies only to plain body paragraphs: not headings (centered), not lists/
+    // blockquotes/preformatted (own indent), not already block-indented. Matches Moon+ where the indent
+    // IS the paragraph delimiter — headings & special blocks stay flush.
+    val firstLineIndentPx = if (
+        headingBoost == null &&
+        block.kind == EpubTextKind.Body &&
+        block.indentLevel == 0 &&
+        style.firstLineIndentPx > 0
+    ) style.firstLineIndentPx else 0
+    if (blockIndentPx > 0 || firstLineIndentPx > 0) {
+        sb.setSpan(
+            LeadingMarginSpan.Standard(blockIndentPx + firstLineIndentPx, blockIndentPx),
+            start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
     }
 
     if (block.kind == EpubTextKind.Preformatted || block.kind == EpubTextKind.Table || block.isCodeBlock) {

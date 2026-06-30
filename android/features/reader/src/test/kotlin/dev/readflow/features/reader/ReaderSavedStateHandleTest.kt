@@ -914,6 +914,7 @@ class ReaderSavedStateHandleTest {
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
         override val readerGuideShown = MutableStateFlow(true)
+        override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
 
         override suspend fun setCalibreBaseUrl(url: String) {
             calibreBaseUrl.value = url
@@ -952,6 +953,10 @@ class ReaderSavedStateHandleTest {
 
         override suspend fun setReaderGuideShown(shown: Boolean) {
             readerGuideShown.value = shown
+        }
+
+        override suspend fun setPageFlipStyle(style: dev.readflow.core.model.PageFlipStyle) {
+            pageFlipStyle.value = style
         }
     }
 }

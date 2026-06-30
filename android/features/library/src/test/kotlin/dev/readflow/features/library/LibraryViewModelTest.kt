@@ -193,6 +193,7 @@ class LibraryViewModelTest {
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
         override val readerGuideShown = MutableStateFlow(true)
+        override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
         override suspend fun setCalibreBaseUrl(url: String) {
             calibreBaseUrl.value = url
         }
@@ -205,6 +206,7 @@ class LibraryViewModelTest {
         override suspend fun setTxtEncoding(encoding: TxtEncoding) = Unit
         override suspend fun setFontChoice(choice: FontChoice) = Unit
         override suspend fun setReaderGuideShown(shown: Boolean) = Unit
+        override suspend fun setPageFlipStyle(style: dev.readflow.core.model.PageFlipStyle) = Unit
     }
 
     private class FakeCalibreRepository(

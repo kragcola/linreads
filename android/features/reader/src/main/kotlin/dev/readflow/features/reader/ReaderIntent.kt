@@ -18,6 +18,7 @@ sealed interface ReaderIntent {
     data class PreviewZoom(val scale: Float) : ReaderIntent
     data class SetLineSpacing(val multiplier: Float) : ReaderIntent
     data class SetMode(val mode: ReadingMode) : ReaderIntent
+    data class SetPageFlipStyle(val style: dev.readflow.core.model.PageFlipStyle) : ReaderIntent
     data class SetTheme(val theme: ThemeMode) : ReaderIntent
     data class OpenPanel(val panel: ReaderPanel) : ReaderIntent
     data class GoToTocEntry(val entry: TocEntry) : ReaderIntent

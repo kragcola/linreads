@@ -213,6 +213,7 @@ class EpubReflowEngine private constructor(
     private var chapterBoundaries: List<ChapterBoundary> = emptyList()
     private var fontSizeSp: Float = 18f
     private var lineSpacingMultiplier: Float = 1.75f
+    private var flipStyle: dev.readflow.core.model.PageFlipStyle = dev.readflow.core.model.PageFlipStyle.SLIDE
     private var useSourceHan: Boolean = true
     private var currentFontId: String = "source_han"
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
@@ -355,6 +356,7 @@ class EpubReflowEngine private constructor(
             onSelectionRange = { start, end -> updateFlowSelection(start, end) },
         ).apply {
             mode = if (_pagingKind.value == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
+            flipStyle = this@EpubReflowEngine.flipStyle
             background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
             textView.setTextColor(palette.ink)
             val padH = (PAGE_HORIZONTAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
@@ -384,6 +386,14 @@ class EpubReflowEngine private constructor(
         val padV = (PAGE_VERTICAL_PADDING_DP * metrics.density * 2).toInt()
         return (metrics.heightPixels - padV).coerceAtLeast(1)
     }
+
+    /**
+     * First-line indent for body paragraphs (Moon+ 首行缩进 = 2 CJK char widths). A CJK glyph's advance
+     * ≈ the font size, so 2 chars ≈ 2 × fontSizePx. Scales with the user's font size so the indent stays
+     * proportional. Used by the flow Spannable for plain body paragraphs only (see applyTextSpans).
+     */
+    private fun flowFirstLineIndentPx(density: Float): Int =
+        (fontSizeSp * density * 2f).toInt().coerceAtLeast(0)
 
     /**
      * Applies the flow TextView's line spacing as ADDITIVE leading (spacingAdd, mult = 1) rather than a
@@ -422,6 +432,7 @@ class EpubReflowEngine private constructor(
             columnWidthPx = flowColumnWidthPx(),
             imageMaxHeightPx = flowPageHeightPx(),
             density = density,
+            firstLineIndentPx = flowFirstLineIndentPx(density),
         )
         val theme = MarkwonTheme.create(context)
         val fullPageHrefs = flowFullPageImageHrefs(flow)
@@ -1304,6 +1315,11 @@ class EpubReflowEngine private constructor(
         activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
         activePagedImagePages.keys.toList().forEach(::rebindActiveImagePage)
         activePagedCompositePages.keys.toList().forEach(::rebindActiveCompositePage)
+    }
+
+    override suspend fun setPageFlipStyle(style: dev.readflow.core.model.PageFlipStyle) {
+        flipStyle = style
+        flowView?.flipStyle = style
     }
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {

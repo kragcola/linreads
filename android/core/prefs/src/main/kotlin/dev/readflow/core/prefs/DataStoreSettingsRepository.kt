@@ -10,6 +10,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TxtEncoding
@@ -67,6 +68,12 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     override val readerGuideShown: Flow<Boolean> =
         context.dataStore.data.map { it[KEY_READER_GUIDE_SHOWN] ?: false }
 
+    override val pageFlipStyle: Flow<PageFlipStyle> =
+        context.dataStore.data.map {
+            runCatching { PageFlipStyle.valueOf(it[KEY_PAGE_FLIP_STYLE] ?: "") }
+                .getOrDefault(PageFlipStyle.SLIDE)
+        }
+
     override suspend fun setCalibreBaseUrl(url: String) {
         context.dataStore.edit { it[KEY_CALIBRE_URL] = url }
     }
@@ -107,6 +114,10 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         context.dataStore.edit { it[KEY_READER_GUIDE_SHOWN] = shown }
     }
 
+    override suspend fun setPageFlipStyle(style: PageFlipStyle) {
+        context.dataStore.edit { it[KEY_PAGE_FLIP_STYLE] = style.name }
+    }
+
     private suspend fun readOrCreateDeviceId(): String {
         var value: String? = null
         context.dataStore.edit { preferences ->
@@ -130,5 +141,6 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_TXT_ENCODING = stringPreferencesKey("txt_encoding")
         val KEY_FONT_CHOICE = stringPreferencesKey("font_choice")
         val KEY_READER_GUIDE_SHOWN = booleanPreferencesKey("reader_guide_shown")
+        val KEY_PAGE_FLIP_STYLE = stringPreferencesKey("page_flip_style")
     }
 }
