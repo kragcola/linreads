@@ -42,13 +42,13 @@ class EpubFlowSpannableTest {
             epubFileProvider = { java.io.File("/tmp/unused.epub") },
             executor = executor,
             columnWidthPx = 800,
-            pageHeightPx = 1200,
+            pageHeightProvider = { 1200 },
             inlineMaxHeightPx = 720,
             fullPageHrefs = emptySet(),
         )
         val resolver = EpubFlowImageSizeResolver(
             columnWidthPx = 800,
-            pageHeightPx = 1200,
+            pageHeightProvider = { 1200 },
             inlineMaxHeightPx = 720,
             fullPageHrefs = emptySet(),
         )

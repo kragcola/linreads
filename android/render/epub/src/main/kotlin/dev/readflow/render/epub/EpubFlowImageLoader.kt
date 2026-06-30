@@ -67,7 +67,7 @@ internal class EpubFlowImageLoader(
     private val epubFileProvider: () -> File?,
     private val executor: ExecutorService,
     private val columnWidthPx: Int,
-    private val pageHeightPx: Int,
+    private val pageHeightProvider: () -> Int,
     private val inlineMaxHeightPx: Int,
     private val fullPageHrefs: Set<String>,
 ) : AsyncDrawableLoader() {
@@ -78,6 +78,7 @@ internal class EpubFlowImageLoader(
     override fun load(drawable: AsyncDrawable) {
         val file = epubFileProvider() ?: return
         val href = drawable.destination
+        val pageHeightPx = pageHeightProvider().coerceAtLeast(1)
         // Full-page images may be upscaled to fill the viewport, so decode them at the larger of the
         // two viewport dimensions to avoid blur; inline images never exceed the column width.
         val maxSide = if (href in fullPageHrefs) {
@@ -123,7 +124,7 @@ internal class EpubFlowImageLoader(
  */
 internal class EpubFlowImageSizeResolver(
     private val columnWidthPx: Int,
-    private val pageHeightPx: Int,
+    private val pageHeightProvider: () -> Int,
     private val inlineMaxHeightPx: Int,
     private val fullPageHrefs: Set<String>,
 ) : ImageSizeResolver() {
@@ -135,7 +136,7 @@ internal class EpubFlowImageSizeResolver(
             intrinsicWidth = result.intrinsicWidth,
             intrinsicHeight = result.intrinsicHeight,
             columnWidthPx = columnWidthPx,
-            pageHeightPx = pageHeightPx,
+            pageHeightPx = pageHeightProvider().coerceAtLeast(1),
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
         )

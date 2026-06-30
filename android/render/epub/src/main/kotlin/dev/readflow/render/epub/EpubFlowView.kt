@@ -7,7 +7,6 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.drawable.BitmapDrawable
 import android.text.Layout
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -26,7 +25,7 @@ import kotlin.math.abs
  *
  * Touch is owned end-to-end (审计 H4/H5), mirroring Moon+ Reader / FBReader: a [GestureDetector]
  * classifies tap / long-press / scroll; selection is gated behind long-press so it never fights
- * page turns. PAGED: edge tap or horizontal/non-middle drag flips a page (animated slide); a
+ * page turns. PAGED: edge tap or horizontal/non-middle drag flips a page (animated curl); a
  * vertical drag STARTING in the centre column (middle 1/3 of width, full height) becomes a free
  * native scroll that stays where released (no snap). SCROLL: free scroll throughout.
  *
@@ -78,11 +77,11 @@ internal class EpubFlowView(
     private var flipped = false
     private var stealing = false
 
-    /** Page-flip slide animation: a snapshot of the outgoing page slides off as the new page shows. */
+    /** Page-flip curl animation: a snapshot of the outgoing page curls off as the new page shows. */
     var pageTurnAnimated = true
     private var flipAnimator: ValueAnimator? = null
-    private var flipDrawable: BitmapDrawable? = null
-    private val flipDurationMs = 220L
+    private var curlDrawable: PageCurlDrawable? = null
+    private val flipDurationMs = 320L
 
     /**
      * When true (PAGED, parked on a page), drawing is clipped to the current page's bottom so the
@@ -117,18 +116,38 @@ internal class EpubFlowView(
         // windows + resting scrollY are then stale → the parked page lands mid-line (half-line/half-image
         // at the edges). Re-paginate + re-anchor by content offset whenever the layout height changes, so
         // the parked page snaps back to a line top (mirrors [onSizeChanged] for the view-height case).
+        //
+        // Images decode in a burst (the scheduler attaches all visible ones at once), so a per-event
+        // repaginate fires 3–4 times in a few frames — each a paginate + scrollTo, the visible flicker.
+        // Coalesce the burst: every layout change reschedules ONE debounced pass that runs after the
+        // decodes settle, doing a single paginate + single re-anchor.
         textView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             val layout = textView.layout ?: return@addOnLayoutChangeListener
             if (flow == null || layout.height <= 0) return@addOnLayoutChangeListener
             // Only react to a genuine content reflow (height delta from a decoded image), not our own
             // re-layout after repaginate (which records the new height) or a no-op pass.
             if (layout.height == paginatedLayoutHeight) return@addOnLayoutChangeListener
-            val anchorOffset = if (paged.isNotEmpty()) topLayoutOffset() else -1
-            post {
-                repaginate()
-                if (anchorOffset >= 0) goToOffset(anchorOffset)
-            }
+            removeCallbacks(reflowRunnable)
+            postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
         }
+    }
+
+    /**
+     * Single coalesced reaction to an async-image reflow: re-paginate against the grown layout and
+     * re-anchor the parked page to the same content line. Deferred while a page-flip curl is running
+     * (a mid-flip scrollTo would tear the animation); it re-arms itself for after the flip ends.
+     */
+    private val reflowRunnable: Runnable = Runnable {
+        val layout = textView.layout ?: return@Runnable
+        if (flow == null || layout.height <= 0) return@Runnable
+        if (layout.height == paginatedLayoutHeight) return@Runnable
+        if (flipAnimator?.isRunning == true) {
+            postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
+            return@Runnable
+        }
+        val anchorOffset = if (paged.isNotEmpty()) topLayoutOffset() else -1
+        repaginate(reposition = false)
+        if (anchorOffset >= 0) goToOffset(anchorOffset)
     }
 
     /**
@@ -216,15 +235,29 @@ internal class EpubFlowView(
         if (h == oldh || h <= 0 || flow == null) return
         val anchorOffset = if (paged.isNotEmpty()) topLayoutOffset() else -1
         textView.post {
-            repaginate()
+            // Re-anchor by offset does the only scroll; skip repaginate's own scrollTo (no double jump).
+            repaginate(reposition = anchorOffset < 0)
             if (anchorOffset >= 0) goToOffset(anchorOffset)
         }
+    }
+
+    /**
+     * The usable height (px) for a full-page image so its laid-out line fits within ONE page. Derived
+     * from the MEASURED viewport (not the engine's screen estimate, which is ~100px taller because it
+     * ignores the system bars the reader avoids — a screen-sized cover overflowed onto a blank 2nd
+     * page). Drops the TextView's own vertical padding (the image line is inset by it on the first/last
+     * page of a chapter) so the image never spills past the viewport. 0 before the first measure pass.
+     */
+    fun usablePageImageHeightPx(): Int {
+        if (height <= 0) return 0
+        return (height - textView.paddingTop - textView.paddingBottom).coerceAtLeast(1)
     }
 
     /** Installs the chapter Spannable and paginates over the TextView's measured layout. */
     fun setChapter(flow: EpubChapterFlow, spannable: CharSequence, pageHeightPx: Int) {
         flipAnimator?.cancel()
         clearFlipOverlay()
+        removeCallbacks(reflowRunnable)
         this.flow = flow
         this.pageHeightPx = pageHeightPx.coerceAtLeast(1)
         currentPage = 0
@@ -257,7 +290,13 @@ internal class EpubFlowView(
         textView.invalidate()
     }
 
-    private fun repaginate() {
+    /**
+     * Recomputes the page windows over the TextView's current StaticLayout. When [reposition] is true
+     * (cold open, mode switch) it also snaps [scrollY] to the current page's top; callers that re-anchor
+     * by content offset right after (reflow / size change) pass false, so the page only scrolls ONCE
+     * (a [scrollTo] here followed by [goToOffset] is the visible flicker on every image decode).
+     */
+    private fun repaginate(reposition: Boolean = true) {
         val layout = textView.layout ?: return
         val f = flow ?: return
         paginatedLayoutHeight = layout.height
@@ -279,7 +318,7 @@ internal class EpubFlowView(
         } else {
             emptyList()
         }
-        if (mode == Mode.PAGED && paged.isNotEmpty()) {
+        if (reposition && mode == Mode.PAGED && paged.isNotEmpty()) {
             currentPage = currentPage.coerceIn(0, paged.lastIndex)
             pageClipActive = true
             scrollTo(0, paged[currentPage].topPx)
@@ -357,10 +396,10 @@ internal class EpubFlowView(
     }
 
     /**
-     * Page turn with a Moon+/FBReader-style horizontal slide: snapshot the current page, jump the
-     * real content to the target, then slide the snapshot of the OUTGOING page off-screen while the
-     * incoming page is revealed beneath it (平移滞留 — a translation, not a visible scroll). Falls back
-     * to an instant [goToPage] when animation is off or a snapshot can't be taken.
+     * Page turn with a Canvas page-curl (仿真书页翻动): snapshot the current page, jump the real
+     * content to the target, then curl the snapshot of the OUTGOING page around a cylinder and sweep
+     * it off-screen while the incoming page is revealed beneath it (see [PageCurlDrawable]). Falls
+     * back to an instant [goToPage] when animation is off or a snapshot can't be taken.
      */
     private fun goToPageAnimated(index: Int, forward: Boolean) {
         val target = index.coerceIn(0, paged.lastIndex)
@@ -368,12 +407,15 @@ internal class EpubFlowView(
             goToPage(target)
             return
         }
-        val outgoing = snapshotViewport()
-        if (outgoing == null) {
+        // A single tap can dispatch through both intercept and touch paths, firing the flip twice a
+        // few ms apart; the second cancels the first at progress 0 (invisible) AND skips a page. Ignore
+        // any new turn while one is already animating — also debounces an over-eager double-tap.
+        if (flipAnimator?.isRunning == true) return
+        val outgoing = snapshotViewport() ?: run {
             goToPage(target)
             return
         }
-        // Reveal the incoming page underneath, then slide the outgoing snapshot away over the top.
+        // Reveal the incoming page underneath, then curl the outgoing snapshot away over the top.
         goToPage(target)
         startFlip(outgoing, forward)
     }
@@ -407,18 +449,20 @@ internal class EpubFlowView(
     private fun startFlip(outgoing: Bitmap, forward: Boolean) {
         flipAnimator?.cancel()
         clearFlipOverlay()
-        val drawable = BitmapDrawable(resources, outgoing)
-        drawable.setBounds(0, 0, width, height)
+        // Cylinder radius ~22% of width: a tube fat enough to read as a turning page, slim enough
+        // that the crease sweeps the whole width within the viewport.
+        val radius = (width * 0.22f).coerceAtLeast(1f)
+        val drawable = PageCurlDrawable(outgoing, width, height, forward, radius, density)
+        // The overlay draws in content coords (canvas translated by scrollY). After [goToPage] the
+        // content is parked on the incoming page, so scrollY is the new viewport top — place the curl
+        // there so it covers exactly what's on screen (the drawable translates to bounds internally).
+        drawable.setBounds(0, scrollY, width, scrollY + height)
         overlay.add(drawable)
-        flipDrawable = drawable
-        val endX = if (forward) -width else width
-        flipAnimator = ValueAnimator.ofFloat(0f, endX.toFloat()).apply {
+        curlDrawable = drawable
+        flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = flipDurationMs
-            interpolator = DecelerateInterpolator()
-            addUpdateListener { a ->
-                val dx = (a.animatedValue as Float).toInt()
-                drawable.setBounds(dx, 0, dx + width, height)
-            }
+            interpolator = DecelerateInterpolator(1.6f)
+            addUpdateListener { a -> drawable.progress = a.animatedValue as Float }
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) = clearFlipOverlay()
                 override fun onAnimationCancel(animation: Animator) = clearFlipOverlay()
@@ -428,11 +472,11 @@ internal class EpubFlowView(
     }
 
     private fun clearFlipOverlay() {
-        flipDrawable?.let {
+        curlDrawable?.let {
             overlay.remove(it)
-            it.bitmap?.recycle()
+            it.recycle()
         }
-        flipDrawable = null
+        curlDrawable = null
     }
 
     /** Jumps to the final page (PAGED) or the bottom of the chapter (SCROLL) — back-into-prev-spine. */
@@ -597,6 +641,9 @@ internal class EpubFlowView(
     }
 
     private companion object {
+        /** Coalesce window for async-image reflows: collapses a decode burst into ONE paginate+anchor. */
+        const val REFLOW_DEBOUNCE_MS = 80L
+
         /**
          * Top strip dropped on a mid-paragraph page (as a fraction of the start line's height) to hide the
          * previous line's descender bleed (审计: 半截的文字). Must exceed the typical descender overflow

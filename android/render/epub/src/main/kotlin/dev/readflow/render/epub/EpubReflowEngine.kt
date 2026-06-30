@@ -360,7 +360,7 @@ class EpubReflowEngine private constructor(
             textView.setPadding(padH, padV, padH, padV)
             textView.typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
             textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
-            textView.setLineSpacing(0f, lineSpacingMultiplier)
+            applyFlowLineSpacing(textView)
         }
         flowView = view
         val startIdx = epubIndexFromLocator(_currentLocator.value, paras.size)
@@ -381,6 +381,23 @@ class EpubReflowEngine private constructor(
         val metrics = context.resources.displayMetrics
         val padV = (PAGE_VERTICAL_PADDING_DP * metrics.density * 2).toInt()
         return (metrics.heightPixels - padV).coerceAtLeast(1)
+    }
+
+    /**
+     * Applies the flow TextView's line spacing as ADDITIVE leading (spacingAdd, mult = 1) rather than a
+     * multiplier. For a text line the resulting height is identical — spacingAdd = (mult − 1) × fontH,
+     * so `fontH + spacingAdd == fontH × mult` — leaving pagination geometry and the descender-bleed
+     * guard unchanged. But an image line is no longer scaled to `imageH × mult`: a multiplier inflated a
+     * full-page image's line box ~1.75×, pushing it past one viewport and (with ALIGN_CENTER) padding
+     * ~0.37×imageH of blank above/below the image, so parking at the line top showed blank + the image's
+     * top half cut off ("插图一翻就是后半段"). Additive leading makes the box `imageH + spacingAdd`,
+     * which fits one page. Must run AFTER textSize + typeface are set (fontMetrics depend on both).
+     */
+    private fun applyFlowLineSpacing(tv: TextView) {
+        val fm = tv.paint.fontMetricsInt
+        val fontHeight = (fm.descent - fm.ascent).coerceAtLeast(1)
+        val spacingAdd = ((lineSpacingMultiplier - 1f) * fontHeight).coerceAtLeast(0f)
+        tv.setLineSpacing(spacingAdd, 1f)
     }
 
     /** Builds and installs the chapter [spineIndex] into the flow view, optionally restoring a paragraph. */
@@ -407,17 +424,23 @@ class EpubReflowEngine private constructor(
         val theme = MarkwonTheme.create(context)
         val fullPageHrefs = flowFullPageImageHrefs(flow)
         val inlineMaxHeightPx = (INLINE_IMAGE_MAX_HEIGHT_DP * density).toInt()
+        // Full-page images must fit one MEASURED page; the view knows its real viewport (screen minus
+        // system bars + padding), the engine's screen estimate is ~100px too tall → cover spilled onto
+        // a blank 2nd page. Read it lazily at decode time, falling back to the estimate pre-measure.
+        val pageHeightProvider = {
+            (flowView?.usablePageImageHeightPx() ?: 0).takeIf { it > 0 } ?: flowPageHeightPx()
+        }
         val loader = EpubFlowImageLoader(
             epubFileProvider = { epubFile },
             executor = flowExecutor,
             columnWidthPx = flowColumnWidthPx(),
-            pageHeightPx = flowPageHeightPx(),
+            pageHeightProvider = pageHeightProvider,
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
         )
         val resolver = EpubFlowImageSizeResolver(
             columnWidthPx = flowColumnWidthPx(),
-            pageHeightPx = flowPageHeightPx(),
+            pageHeightProvider = pageHeightProvider,
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
         )
@@ -1333,8 +1356,8 @@ class EpubReflowEngine private constructor(
             val view = flowView ?: return@withContext
             val anchorParagraph = epubIndexFromLocator(_currentLocator.value, paras.size)
             view.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
-            view.textView.setLineSpacing(0f, lineSpacingMultiplier)
             view.textView.typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
+            applyFlowLineSpacing(view.textView)
             if (flowSpineIndex >= 0) loadFlowChapter(flowSpineIndex, restoreToParagraph = anchorParagraph)
         }
     }
