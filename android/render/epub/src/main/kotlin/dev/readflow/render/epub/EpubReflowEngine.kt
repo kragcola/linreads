@@ -369,25 +369,22 @@ class EpubReflowEngine private constructor(
         flowView = view
         val startIdx = epubIndexFromLocator(_currentLocator.value, paras.size)
         loadFlowChapter(spineIndexForParagraph(startIdx), restoreToParagraph = startIdx)
-        // Host the reader + a transient GL curl overlay (harism) in one FrameLayout so SIMULATION turns
-        // can render the realistic page-curl on top of the live reading view, then remove it.
+        // Host the reader + a (lazily created) GL curl overlay in one FrameLayout. The overlay is built
+        // ONLY on the first SIMULATION turn (SLIDE/NONE readers never allocate a GL context), and any GL
+        // construction failure leaves it null so SIMULATION degrades to the slide path — never crashes.
         val host = android.widget.FrameLayout(context)
-        host.addView(
-            view,
+        val matchParent = {
             android.widget.FrameLayout.LayoutParams(
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-        val overlay = EpubCurlOverlay(context)
-        host.addView(
-            overlay,
-            android.widget.FrameLayout.LayoutParams(
-                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-            ),
-        )
-        view.curlOverlay = overlay
+            )
+        }
+        host.addView(view, matchParent())
+        view.curlOverlayFactory = factory@{
+            val overlay = runCatching { EpubCurlOverlay(context) }.getOrNull() ?: return@factory null
+            host.addView(overlay, matchParent())
+            overlay
+        }
         return host
     }
 

@@ -92,13 +92,24 @@ internal class EpubFlowView(
      */
     var flipStyle: dev.readflow.core.model.PageFlipStyle = dev.readflow.core.model.PageFlipStyle.SLIDE
     /**
-     * GL curl overlay used when [flipStyle] == SIMULATION. Set by the engine after constructing the
-     * host wrapper. Null → SIMULATION falls back to the slide path.
+     * GL curl overlay used when [flipStyle] == SIMULATION. Created lazily by [curlOverlayFactory] on the
+     * first SIMULATION turn (so SLIDE/NONE readers never allocate a GL context), then cached here. A null
+     * factory or a factory that fails → SIMULATION degrades to the slide path (never crashes the reader).
      */
     var curlOverlay: EpubCurlOverlay? = null
+    var curlOverlayFactory: (() -> EpubCurlOverlay?)? = null
     private val pageTurnAnimated: Boolean get() = flipStyle != dev.readflow.core.model.PageFlipStyle.NONE
     private val useGlCurl: Boolean
-        get() = flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION && curlOverlay != null
+        get() = flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION &&
+            (curlOverlay != null || curlOverlayFactory != null)
+
+    /** Lazily creates (once) + returns the GL overlay, or null if unavailable / creation failed. */
+    private fun obtainCurlOverlay(): EpubCurlOverlay? {
+        curlOverlay?.let { return it }
+        val created = runCatching { curlOverlayFactory?.invoke() }.getOrNull()
+        curlOverlay = created
+        return created
+    }
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
@@ -547,22 +558,24 @@ internal class EpubFlowView(
      * falls back to slide) if a snapshot can't be taken or the overlay is unavailable.
      */
     private fun startGlCurlTurn(fromPage: Int, target: Int, forward: Boolean): Boolean {
-        val overlay = curlOverlay ?: return false
+        val overlay = obtainCurlOverlay() ?: return false
         if (overlay.active) return false
-        val fromTop = pageTopPxAt(fromPage) ?: return false
-        val targetTop = pageTopPxAt(target) ?: return false
-        val front = snapshotPageAt(fromTop) ?: return false
-        val revealed = snapshotPageAt(targetTop) ?: run { front.recycle(); return false }
-        overlay.start(front, revealed, forward) { committed ->
-            if (committed) {
-                goToPage(target)
-            } else {
-                scrollToPage(fromPage, report = false)
+        return runCatching {
+            val fromTop = pageTopPxAt(fromPage) ?: return@runCatching false
+            val targetTop = pageTopPxAt(target) ?: return@runCatching false
+            val front = snapshotPageAt(fromTop) ?: return@runCatching false
+            val revealed = snapshotPageAt(targetTop) ?: run { front.recycle(); return@runCatching false }
+            overlay.start(front, revealed, forward) { committed ->
+                if (committed) {
+                    goToPage(target)
+                } else {
+                    scrollToPage(fromPage, report = false)
+                }
+                overlay.dismiss()
             }
-            overlay.dismiss()
-        }
-        overlay.animateTurn()
-        return true
+            overlay.animateTurn()
+            true
+        }.getOrDefault(false)
     }
 
     private fun snapshotViewport(): Bitmap? = try {

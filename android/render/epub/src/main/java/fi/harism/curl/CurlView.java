@@ -126,6 +126,13 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 	 */
 	private void init(Context ctx) {
 		mRenderer = new CurlRenderer(this);
+		// LinReads addition (Apache-2.0; see NOTICE.txt): a translucent overlay config so the curl
+		// composites OVER the live reading view beneath. setEGLConfigChooser / setZOrderMediaOverlay
+		// MUST be called BEFORE setRenderer (GLSurfaceView contract) — doing this here, not from the
+		// caller, avoids the IllegalStateException a post-construction call would throw.
+		setEGLConfigChooser(8, 8, 8, 8, 0, 0);
+		getHolder().setFormat(android.graphics.PixelFormat.TRANSLUCENT);
+		setZOrderMediaOverlay(true);
 		setRenderer(mRenderer);
 		setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
 		setOnTouchListener(this);

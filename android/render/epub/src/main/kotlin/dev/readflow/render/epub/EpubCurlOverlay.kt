@@ -72,12 +72,8 @@ internal class EpubCurlOverlay(
         setAllowLastPageCurl(true)
         setEnableTouchPressure(false)
         setMargins(0f, 0f, 0f, 0f)
-        // Composite above the reader's window surface (not behind it) so the curl shows over the live
-        // page; translucent EGL config + a page-matching clear color keep the non-curling area seamless.
-        // NOTE: z-order/translucency behaviour is device-dependent — verify on the tablet.
-        setZOrderMediaOverlay(true)
-        setEGLConfigChooser(8, 8, 8, 8, 0, 0)
-        holder.setFormat(android.graphics.PixelFormat.TRANSLUCENT)
+        // EGL/z-order/translucency are configured INSIDE CurlView.init() before setRenderer (required by
+        // GLSurfaceView); only the clear color is safe to set post-construction.
         setBackgroundColor(android.graphics.Color.TRANSPARENT)
         setPageProvider(provider)
     }
