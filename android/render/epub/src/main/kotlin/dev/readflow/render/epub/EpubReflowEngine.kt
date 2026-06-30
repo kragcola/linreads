@@ -58,6 +58,7 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagedReaderEngine
@@ -454,16 +455,12 @@ class EpubReflowEngine private constructor(
             onLinkClick = ::handleLinkClick,
             highlightRanges = flowHighlightRanges(flow),
         )
-        view.setChapter(flow, spannable, flowPageHeightPx())
-        // Trigger async image scheduling + restore position after the layout pass.
+        val restoreOffset = restoreToParagraph?.let { flow.offsetForParagraph(it, 0) }
+        view.setChapter(flow, spannable, flowPageHeightPx(), restoreOffset = restoreOffset, landOnLast = landOnLast)
+        // Schedule async images after the layout pass; positioning is now done inside setChapter's own
+        // post (single pre-paint placement — no chapter-top→resume jump on entry).
         view.textView.post {
             AsyncDrawableScheduler.schedule(view.textView)
-            if (landOnLast) {
-                view.goToLastPage()
-            } else if (restoreToParagraph != null) {
-                val offset = flow.offsetForParagraph(restoreToParagraph, 0)
-                view.goToOffset(offset)
-            }
         }
         flowCurrentFlow = flow
     }
@@ -2002,38 +1999,21 @@ class EpubReflowEngine private constructor(
         // ~800px+ on the long side; inline avatars (~142px) and icons (~300-400px) sit well below.
         const val FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX = 600
         const val AVERAGE_PAGE_CHARACTER_SAMPLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz一二三四五六七八九十"
-        val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
-        val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
-        // 日间纸白：暖白，非纯白，降低长读刺眼感（参考 Kindle/静读天下 day 预设）
-        val PAPER_LIGHT = Color.rgb(0xF7, 0xF3, 0xE9)
-        val PAPER_SEPIA = Color.rgb(0xF5, 0xF0, 0xE8)
 
         private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
-            return when (mode) {
-                ThemeMode.LIGHT -> ReaderPalette(PAPER_LIGHT, EpubParaAdapter.INK_DAY)
-                ThemeMode.DARK -> ReaderPalette(PAPER_NIGHT, EpubParaAdapter.INK_NIGHT)
-                ThemeMode.SEPIA -> ReaderPalette(PAPER_SEPIA, EpubParaAdapter.INK_DAY)
-                ThemeMode.SYSTEM -> if (systemNight) {
-                    ReaderPalette(PAPER_NIGHT, EpubParaAdapter.INK_NIGHT)
-                } else {
-                    ReaderPalette(PAPER_DAY, EpubParaAdapter.INK_DAY)
-                }
-            }
+            val p = readerPaletteFor(mode, systemNight)
+            return ReaderPalette(p.paper, p.ink)
         }
 
         private fun codeBlockBgFor(mode: ThemeMode, configuration: Configuration): Int {
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
-            return when (mode) {
-                ThemeMode.DARK -> EpubParaAdapter.CODE_BLOCK_BG_NIGHT
-                ThemeMode.SYSTEM -> if (systemNight) {
-                    EpubParaAdapter.CODE_BLOCK_BG_NIGHT
-                } else {
-                    EpubParaAdapter.CODE_BLOCK_BG_DAY
-                }
-                else -> EpubParaAdapter.CODE_BLOCK_BG_DAY
+            return if (readerPaletteFor(mode, systemNight).isNight) {
+                EpubParaAdapter.CODE_BLOCK_BG_NIGHT
+            } else {
+                EpubParaAdapter.CODE_BLOCK_BG_DAY
             }
         }
     }

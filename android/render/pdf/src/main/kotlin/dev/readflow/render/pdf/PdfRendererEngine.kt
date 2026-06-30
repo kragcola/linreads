@@ -3,7 +3,6 @@ package dev.readflow.render.pdf
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Bitmap
-import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
@@ -18,6 +17,7 @@ import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagingKind
@@ -341,21 +341,10 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         const val MIN_ZOOM_SCALE = 1f
         const val MAX_ZOOM_SCALE = 4f
 
-        val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
-        val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
-        // 日间纸白：暖白，非纯白，降低长读刺眼感
-        val PAPER_LIGHT = Color.rgb(0xF7, 0xF3, 0xE9)
-        val PAPER_SEPIA = Color.rgb(0xF5, 0xF0, 0xE8)
-
         private fun paperColor(mode: ThemeMode, configuration: Configuration): Int {
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
-            return when (mode) {
-                ThemeMode.LIGHT -> PAPER_LIGHT
-                ThemeMode.DARK -> PAPER_NIGHT
-                ThemeMode.SEPIA -> PAPER_SEPIA
-                ThemeMode.SYSTEM -> if (systemNight) PAPER_NIGHT else PAPER_DAY
-            }
+            return readerPaletteFor(mode, systemNight).paper
         }
     }
 }

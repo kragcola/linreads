@@ -18,9 +18,11 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -47,8 +49,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.stateDescription
@@ -56,11 +60,14 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.shape.CircleShape
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.TransitionType
+import dev.readflow.core.model.readerPaletteFor
+import dev.readflow.core.model.readerThemeLabel
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
@@ -977,7 +984,8 @@ private fun ThemePanel(
                         FilterChip(
                             selected = themeMode == mode,
                             onClick = { onThemeChange(mode) },
-                            label = { Text(mode.readerLabel(), maxLines = 1) },
+                            label = { Text(mode.readerThemeLabel(), maxLines = 1) },
+                            leadingIcon = { ThemeSwatch(mode) },
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -990,11 +998,18 @@ private fun ThemePanel(
     }
 }
 
-private fun ThemeMode.readerLabel() = when (this) {
-    ThemeMode.SYSTEM -> "跟随系统"
-    ThemeMode.LIGHT -> "日间"
-    ThemeMode.DARK -> "夜间"
-    ThemeMode.SEPIA -> "护眼"
+/** A small filled circle showing the preset's page colour, so 10 presets stay distinguishable. */
+@Composable
+private fun ThemeSwatch(mode: ThemeMode) {
+    val systemNight = isSystemInDarkTheme()
+    val palette = remember(mode, systemNight) { readerPaletteFor(mode, systemNight) }
+    Box(
+        modifier = Modifier
+            .size(16.dp)
+            .clip(CircleShape)
+            .background(Color(palette.paper))
+            .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f), CircleShape),
+    )
 }
 
 private class ReaderTapContainer(

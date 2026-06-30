@@ -10,6 +10,7 @@ import android.graphics.Canvas
 import android.text.Layout
 import android.view.GestureDetector
 import android.view.MotionEvent
+import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.animation.DecelerateInterpolator
@@ -60,6 +61,12 @@ internal class EpubFlowView(
     private var currentPage: Int = 0
     private var flow: EpubChapterFlow? = null
 
+    /** Resume target for the in-flight [setChapter], applied once layout is ready (before the reveal). */
+    private var pendingRestoreOffset: Int? = null
+    private var pendingLandOnLast = false
+    /** True between [setChapter] and the first positioned frame: content is alpha-hidden until then. */
+    private var awaitingReveal = false
+
     /** Layout height we last paginated against; a change means the content reflowed (async image load). */
     private var paginatedLayoutHeight: Int = -1
 
@@ -82,6 +89,20 @@ internal class EpubFlowView(
     private var flipAnimator: ValueAnimator? = null
     private var curlDrawable: PageCurlDrawable? = null
     private val flipDurationMs = 320L
+
+    // ---- Finger-tracking (跟手) interactive curl ------------------------------------------------
+    // A horizontal drag drives the curl progress directly off finger displacement (Moon+/iBooks feel),
+    // instead of the old behaviour where crossing a 20dp threshold fired a fixed 320ms animation while
+    // the finger was still down (机械、未松手就强制翻页). On release we settle by position+velocity:
+    // past half the width OR a fling over [flingThresholdPx]/s commits the turn, else it springs back.
+    private var interactiveCurl = false
+    /** The page we curl FROM (restore target on cancel); the incoming page is already parked beneath. */
+    private var curlFromPage = 0
+    private var curlForward = true
+    /** Finger x where the interactive curl began (drag displacement is measured from here). */
+    private var curlAnchorX = 0f
+    private var velocityTracker: VelocityTracker? = null
+    private val flipFlingThresholdPxPerSec = 700 * density
 
     /**
      * When true (PAGED, parked on a page), drawing is clipped to the current page's bottom so the
@@ -179,7 +200,18 @@ internal class EpubFlowView(
         // Canvas is in the ScrollView's own coords here (already translated by scrollY for children),
         // so the viewport spans [scrollY, scrollY + height]. Clip the top past the previous line's ink
         // overflow (drop the half-line bleed) and the bottom to this page's last complete line.
-        val bottom = if (clipBottom != null) scrollY + clipBottom else scrollY + height
+        //
+        // The paginator works in pure StaticLayout coords (line 0 at y=0), but the child TextView paints
+        // its layout shifted DOWN by its own [TextView.paddingTop] — a line at layout-y L lands at
+        // canvas-y L + padTop. [pageClipBottomInViewport] returns the bottom in layout space, so without
+        // the offset the clip falls padTop px too high and slices ~padTop off the last line's painted
+        // glyphs (审计: 底部半截文字). Add padTop so the clip meets the line's PAINTED bottom; cap at the
+        // viewport bottom (a near-full page then relies on the viewport edge, off by ≤padTop, invisible).
+        val bottom = if (clipBottom != null) {
+            minOf(scrollY + clipBottom + textView.paddingTop, scrollY + height)
+        } else {
+            scrollY + height
+        }
         canvas.clipRect(0, topClip, width, bottom)
         super.dispatchDraw(canvas)
         canvas.restoreToCount(save)
@@ -233,6 +265,17 @@ internal class EpubFlowView(
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         if (h == oldh || h <= 0 || flow == null) return
+        // Cold open: settleInitialPosition ran at height 0 (fallback) and deferred the reveal. Re-anchor
+        // to the EXACT pending resume target (more accurate than the fallback-paginated top line), then
+        // reveal — so the content fades in already at the resume page, with no visible scroll.
+        if (awaitingReveal) {
+            textView.post {
+                repaginate(reposition = false)
+                if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
+                revealContent()
+            }
+            return
+        }
         val anchorOffset = if (paged.isNotEmpty()) topLayoutOffset() else -1
         textView.post {
             // Re-anchor by offset does the only scroll; skip repaginate's own scrollTo (no double jump).
@@ -253,8 +296,20 @@ internal class EpubFlowView(
         return (height - textView.paddingTop - textView.paddingBottom).coerceAtLeast(1)
     }
 
-    /** Installs the chapter Spannable and paginates over the TextView's measured layout. */
-    fun setChapter(flow: EpubChapterFlow, spannable: CharSequence, pageHeightPx: Int) {
+    /**
+     * Installs the chapter Spannable and paginates over the TextView's measured layout, then positions
+     * to the resume target ([restoreOffset], or the last page when [landOnLast]) in the SAME post — so
+     * the first painted frame is already at the resume point, never the chapter top jumping to it
+     * (静读天下: positioned before paint). Content is held hidden until that position settles at a real
+     * measured height, so even the one transient pre-post frame can't show a scroll.
+     */
+    fun setChapter(
+        flow: EpubChapterFlow,
+        spannable: CharSequence,
+        pageHeightPx: Int,
+        restoreOffset: Int? = null,
+        landOnLast: Boolean = false,
+    ) {
         flipAnimator?.cancel()
         clearFlipOverlay()
         removeCallbacks(reflowRunnable)
@@ -262,9 +317,32 @@ internal class EpubFlowView(
         this.pageHeightPx = pageHeightPx.coerceAtLeast(1)
         currentPage = 0
         paginatedLayoutHeight = -1
+        pendingRestoreOffset = restoreOffset
+        pendingLandOnLast = landOnLast
+        awaitingReveal = true
+        container.alpha = 0f
         textView.text = spannable
-        // Layout is available after the next measure/layout pass; paginate then.
-        textView.post { repaginate() }
+        // Layout is available after the next measure/layout pass; paginate + position then.
+        textView.post { settleInitialPosition() }
+    }
+
+    /**
+     * Paginates against the current layout and snaps to the pending resume target without reporting an
+     * intermediate position. Reveals the content once positioned with a real (measured) height; on a
+     * cold open the first pass runs at height 0 (fallback page height), so the reveal is deferred to
+     * [onSizeChanged] when the true viewport arrives.
+     */
+    private fun settleInitialPosition() {
+        if (textView.layout == null || flow == null) return
+        repaginate(reposition = false)
+        if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
+        if (height > 0) revealContent()
+    }
+
+    private fun revealContent() {
+        if (!awaitingReveal) return
+        awaitingReveal = false
+        container.animate().alpha(1f).setDuration(REVEAL_FADE_MS).start()
     }
 
     /**
@@ -387,12 +465,19 @@ internal class EpubFlowView(
         return true
     }
 
-    fun goToPage(index: Int) {
+    fun goToPage(index: Int) = scrollToPage(index, report = true)
+
+    /**
+     * Snaps to page [index]'s top. [report] gates the locator callback: the interactive curl parks the
+     * incoming page (and snaps the outgoing one clean for the snapshot) BEFORE the turn is committed, so
+     * those intermediate moves must stay silent — only the committed page reports its offset.
+     */
+    private fun scrollToPage(index: Int, report: Boolean) {
         if (mode != Mode.PAGED || paged.isEmpty()) return
         currentPage = index.coerceIn(0, paged.lastIndex)
         pageClipActive = true
         scrollTo(0, paged[currentPage].topPx)
-        reportTopOffset()
+        if (report) reportTopOffset()
     }
 
     /**
@@ -411,6 +496,11 @@ internal class EpubFlowView(
         // few ms apart; the second cancels the first at progress 0 (invisible) AND skips a page. Ignore
         // any new turn while one is already animating — also debounces an over-eager double-tap.
         if (flipAnimator?.isRunning == true) return
+        // Snap the outgoing page to its own top with the clip re-armed BEFORE snapshotting: after a
+        // middle-column free scroll scrollY sits mid-page with pageClipActive off, so an un-snapped
+        // snapshot would carry the next/prev page's half-line at top & bottom and curl it away (审计:
+        // 滚动转分页的上下半截文字). currentPage was just re-anchored by goToAdjacentPage.
+        scrollToPage(currentPage, report = false)
         val outgoing = snapshotViewport() ?: run {
             goToPage(target)
             return
@@ -479,6 +569,84 @@ internal class EpubFlowView(
         curlDrawable = null
     }
 
+    // ---- Finger-tracking interactive curl ------------------------------------------------------
+
+    /**
+     * Begins a finger-driven curl toward the adjacent page [curlFromPage] + (forward ? +1 : −1), if
+     * that page exists in THIS chapter. Parks the real content on the incoming page beneath, snapshots
+     * the OUTGOING page (snapped clean to its own top — drops any residual half-line from a prior free
+     * scroll), and lays the curl flat (progress 0) over the viewport. Returns false at a chapter
+     * boundary (no in-chapter incoming page to preview) so the caller defers to a discrete page turn.
+     */
+    private fun beginInteractiveCurl(forward: Boolean, anchorX: Float): Boolean {
+        if (!pageTurnAnimated || mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
+        if (flipAnimator?.isRunning == true) return false
+        val maxScroll = (container.height - height).coerceAtLeast(0)
+        val from = if (scrollY >= maxScroll) paged.lastIndex
+            else paged.indexOfLast { it.topPx <= scrollY }.coerceAtLeast(0)
+        val target = from + if (forward) 1 else -1
+        if (target < 0 || target > paged.lastIndex) return false
+        // Snap the outgoing page to its own top so the snapshot is the clean page (a mid-page free
+        // scroll leaves scrollY between two page tops → the snapshot would carry top/bottom half-lines).
+        scrollToPage(from, report = false)
+        val outgoing = snapshotViewport() ?: return false
+        // Park content on the incoming page beneath the curl; stays silent until the turn commits.
+        scrollToPage(target, report = false)
+        flipAnimator?.cancel()
+        clearFlipOverlay()
+        val radius = (width * 0.22f).coerceAtLeast(1f)
+        val drawable = PageCurlDrawable(outgoing, width, height, forward, radius, density)
+        drawable.setBounds(0, scrollY, width, scrollY + height)
+        drawable.progress = 0f
+        overlay.add(drawable)
+        curlDrawable = drawable
+        interactiveCurl = true
+        curlFromPage = from
+        curlForward = forward
+        curlAnchorX = anchorX
+        return true
+    }
+
+    /** Drives curl progress from finger displacement since [curlAnchorX] (full sweep ≈ one page width). */
+    private fun updateInteractiveCurl(x: Float) {
+        val drawable = curlDrawable ?: return
+        val travel = if (curlForward) curlAnchorX - x else x - curlAnchorX
+        drawable.progress = (travel / width.toFloat()).coerceIn(0f, 1f)
+    }
+
+    /**
+     * Settles the interactive curl on release: commit (animate to fully turned, keep the incoming page)
+     * when the drag passed half the width OR flung hard enough in the turn direction; otherwise spring
+     * back (animate to flat, restore the outgoing page). Only a committed turn reports the new offset.
+     */
+    private fun endInteractiveCurl(velocityX: Float) {
+        val drawable = curlDrawable ?: run { interactiveCurl = false; return }
+        interactiveCurl = false
+        val flung = if (curlForward) velocityX < -flipFlingThresholdPxPerSec
+            else velocityX > flipFlingThresholdPxPerSec
+        val commit = drawable.progress >= 0.5f || flung
+        val start = drawable.progress
+        val end = if (commit) 1f else 0f
+        if (!commit) {
+            // Cancelled: the real content goes back to the outgoing page beneath as the curl flattens.
+            scrollToPage(curlFromPage, report = false)
+            drawable.setBounds(0, scrollY, width, scrollY + height)
+        }
+        flipAnimator = ValueAnimator.ofFloat(start, end).apply {
+            duration = (flipDurationMs * kotlin.math.abs(end - start)).toLong().coerceIn(80L, flipDurationMs)
+            interpolator = DecelerateInterpolator(1.6f)
+            addUpdateListener { a -> drawable.progress = a.animatedValue as Float }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    clearFlipOverlay()
+                    if (commit) reportTopOffset()
+                }
+                override fun onAnimationCancel(animation: Animator) = clearFlipOverlay()
+            })
+            start()
+        }
+    }
+
     /** Jumps to the final page (PAGED) or the bottom of the chapter (SCROLL) — back-into-prev-spine. */
     fun goToLastPage() {
         if (mode == Mode.PAGED && paged.isNotEmpty()) {
@@ -534,6 +702,7 @@ internal class EpubFlowView(
     @SuppressLint("ClickableViewAccessibility")
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
         gestureDetector.onTouchEvent(ev)
+        trackVelocity(ev)
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downX = ev.x
@@ -571,6 +740,7 @@ internal class EpubFlowView(
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(ev: MotionEvent): Boolean {
         gestureDetector.onTouchEvent(ev)
+        trackVelocity(ev)
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 // Reaches here only when no child claimed DOWN (e.g. tap on blank margin).
@@ -604,31 +774,72 @@ internal class EpubFlowView(
                     val target = (scrollY + deltaY).coerceIn(0, maxScroll)
                     if (target != scrollY) scrollTo(0, target)
                     lastY = ev.y
-                } else if (classified && !flipped) {
-                    maybeFlip(dx, dy)
+                } else if (classified && !freeScrolling) {
+                    driveFlip(dx, dy, ev.x)
                 }
                 return true
             }
             MotionEvent.ACTION_UP -> {
-                if (freeScrolling) reportTopOffset()
+                if (interactiveCurl) {
+                    val vx = computeVelocityX()
+                    endInteractiveCurl(vx)
+                } else if (freeScrolling) {
+                    reportTopOffset()
+                }
+                recycleTracker()
                 return true
             }
-            MotionEvent.ACTION_CANCEL -> return true
+            MotionEvent.ACTION_CANCEL -> {
+                if (interactiveCurl) endInteractiveCurl(0f)
+                recycleTracker()
+                return true
+            }
         }
         return true
     }
 
-    private fun maybeFlip(dx: Float, dy: Float) {
-        val horizontalDominant = abs(dx) >= abs(dy)
-        val passes = if (horizontalDominant) {
-            abs(dx) > flipDominanceThresholdPx && abs(dy) < flipCrossAxisLimitPx
-        } else {
-            abs(dy) > flipDominanceThresholdPx && abs(dx) < flipCrossAxisLimitPx
+    /**
+     * Routes a classified non-scroll drag. A horizontal drag becomes a finger-tracking interactive
+     * curl (跟手) toward the adjacent page; once started, later moves just drive its progress. A
+     * vertical drag in a side column, or a horizontal drag at a chapter boundary (no in-chapter page
+     * to preview), falls back to a single discrete page turn through [onTapZone].
+     */
+    private fun driveFlip(dx: Float, dy: Float, curX: Float) {
+        if (interactiveCurl) {
+            updateInteractiveCurl(curX)
+            return
         }
-        if (!passes) return
-        flipped = true
-        val forward = if (horizontalDominant) dx < 0 else dy < 0
-        onTapZone(if (forward) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
+        if (flipped) return
+        val horizontalDominant = abs(dx) >= abs(dy)
+        if (horizontalDominant) {
+            if (abs(dx) <= flipDominanceThresholdPx || abs(dy) >= flipCrossAxisLimitPx) return
+            val forward = dx < 0
+            if (!beginInteractiveCurl(forward, curX)) {
+                flipped = true
+                onTapZone(if (forward) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
+            }
+        } else {
+            if (abs(dy) <= flipDominanceThresholdPx || abs(dx) >= flipCrossAxisLimitPx) return
+            flipped = true
+            onTapZone(if (dy < 0) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
+        }
+    }
+
+    private fun trackVelocity(ev: MotionEvent) {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) recycleTracker()
+        val vt = velocityTracker ?: VelocityTracker.obtain().also { velocityTracker = it }
+        vt.addMovement(ev)
+    }
+
+    private fun computeVelocityX(): Float {
+        val vt = velocityTracker ?: return 0f
+        vt.computeCurrentVelocity(1000) // px per second
+        return vt.xVelocity
+    }
+
+    private fun recycleTracker() {
+        velocityTracker?.recycle()
+        velocityTracker = null
     }
 
     private fun handleTap(x: Float) {
@@ -651,6 +862,9 @@ internal class EpubFlowView(
          * inside the 1.75× leading), so the page's first line is never clipped.
          */
         const val TOP_BLEED_GUARD_FRACTION = 0.15f
+
+        /** Fade-in for the chapter's first positioned frame — long enough to hide a one-frame settle. */
+        const val REVEAL_FADE_MS = 120L
     }
 }
 

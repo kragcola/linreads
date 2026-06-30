@@ -2,7 +2,6 @@ package dev.readflow.render.md
 
 import android.content.Context
 import android.content.res.Configuration
-import android.graphics.Color
 import android.net.Uri
 import android.view.View
 import android.widget.ScrollView
@@ -10,6 +9,7 @@ import android.widget.TextView
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagingKind
@@ -232,27 +232,11 @@ class MarkdownEngine(private val context: Context) : ReaderEngine, TextSelectabl
     override suspend fun setMode(mode: ReadingMode) = Unit
 
     private companion object {
-        val PAPER_DAY = Color.rgb(0xED, 0xE6, 0xD6)
-        val PAPER_NIGHT = Color.rgb(0x2A, 0x26, 0x20)
-        // 日间纸白：暖白，非纯白，降低长读刺眼感
-        val PAPER_LIGHT = Color.rgb(0xF7, 0xF3, 0xE9)
-        val PAPER_SEPIA = Color.rgb(0xF5, 0xF0, 0xE8)
-        val INK_DAY = Color.rgb(0x2A, 0x26, 0x20)
-        val INK_NIGHT = Color.rgb(0xD8, 0xCF, 0xBC)
-
         private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
-            return when (mode) {
-                ThemeMode.LIGHT -> ReaderPalette(PAPER_LIGHT, INK_DAY)
-                ThemeMode.DARK -> ReaderPalette(PAPER_NIGHT, INK_NIGHT)
-                ThemeMode.SEPIA -> ReaderPalette(PAPER_SEPIA, INK_DAY)
-                ThemeMode.SYSTEM -> if (systemNight) {
-                    ReaderPalette(PAPER_NIGHT, INK_NIGHT)
-                } else {
-                    ReaderPalette(PAPER_DAY, INK_DAY)
-                }
-            }
+            val p = readerPaletteFor(mode, systemNight)
+            return ReaderPalette(p.paper, p.ink)
         }
     }
 }

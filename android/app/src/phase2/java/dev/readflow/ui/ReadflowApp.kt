@@ -19,6 +19,7 @@ import androidx.navigation.compose.rememberNavController
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.ui.ReadflowTheme
 import dev.readflow.extensions.api.LocalFileBookSource
 import dev.readflow.features.library.LibraryScreen
@@ -43,8 +44,10 @@ fun ReadflowApp(
     val themeVm = koinViewModel<SettingsViewModel>()
     val themeMode by themeVm.themeMode.collectAsStateWithLifecycle()
     val systemDark = isSystemInDarkTheme()
-    val darkTheme = themeMode == ThemeMode.DARK || (themeMode == ThemeMode.SYSTEM && systemDark)
+    // The reading presets (see ReaderPalette) decide the app chrome too: any night preset → dark
+    // chrome, SEPIA keeps its dedicated parchment chrome, the rest → light chrome.
     val sepiaTheme = themeMode == ThemeMode.SEPIA
+    val darkTheme = !sepiaTheme && readerPaletteFor(themeMode, systemDark).isNight
 
     ReadflowTheme(darkTheme = darkTheme, sepiaTheme = sepiaTheme) {
         val navController = rememberNavController()

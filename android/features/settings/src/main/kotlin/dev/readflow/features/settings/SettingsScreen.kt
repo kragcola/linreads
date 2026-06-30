@@ -7,6 +7,7 @@ import android.net.Uri
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
@@ -23,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.readerThemeLabel
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
@@ -296,10 +298,13 @@ fun SettingsScreen(
             }
 
             Text("主题", style = MaterialTheme.typography.bodyMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+            ) {
                 ThemeMode.entries.forEach { mode ->
                     FilterChip(selected = theme == mode, onClick = { vm.setTheme(mode) },
-                        label = { Text(mode.label()) })
+                        label = { Text(mode.readerThemeLabel()) })
                 }
             }
 
@@ -672,13 +677,6 @@ private sealed interface UpdateState {
     data class Downloading(val progress: Float, val dlId: Long) : UpdateState
     data class ReadyToInstall(val uri: Uri) : UpdateState
     data class Error(val msg: String) : UpdateState
-}
-
-private fun ThemeMode.label() = when (this) {
-    ThemeMode.SYSTEM -> "跟随系统"
-    ThemeMode.LIGHT  -> "日间"
-    ThemeMode.DARK   -> "夜间"
-    ThemeMode.SEPIA  -> "护眼"
 }
 
 private fun ReaderReadingMode.label() = when (this) {

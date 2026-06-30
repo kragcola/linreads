@@ -25,8 +25,14 @@ enum class BookFormat {
 /** Download / availability state of a book's local asset. */
 enum class DownloadStatus { NOT_DOWNLOADED, DOWNLOADING, DOWNLOADED, FAILED }
 
-/** UI theme preference. */
-enum class ThemeMode { SYSTEM, LIGHT, DARK, SEPIA }
+/**
+ * Reading theme preference. SYSTEM follows the OS day/night; the rest are flat reading-colour
+ * presets ported from 静读天下 (Moon+ Reader)'s built-in themes (see [ReaderPalette]). LIGHT/DARK/SEPIA
+ * are the historical day/night/eye-care defaults; WHITE/GREEN/GREY/BLACK/SLATE/NAVY are additional
+ * Moon+ swatches. Enum names are persisted (DataStore + ThemeProfile), so existing values must never
+ * be renamed or reordered — only appended.
+ */
+enum class ThemeMode { SYSTEM, LIGHT, DARK, SEPIA, WHITE, GREEN, GREY, BLACK, SLATE, NAVY }
 
 /**
  * Catalog-level book metadata (Layer 0, pure data).
