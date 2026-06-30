@@ -70,6 +70,7 @@ internal class EpubFlowImageLoader(
     private val pageHeightProvider: () -> Int,
     private val inlineMaxHeightPx: Int,
     private val fullPageHrefs: Set<String>,
+    private val intrinsicBoundsProvider: (href: String) -> EpubImageBounds?,
 ) : AsyncDrawableLoader() {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -115,7 +116,40 @@ internal class EpubFlowImageLoader(
         inFlight.remove(drawable)?.cancel(true)
     }
 
-    override fun placeholder(drawable: AsyncDrawable): Drawable? = null
+    /**
+     * A zero-alpha drawable pre-sized to the image's FINAL on-screen box, so the StaticLayout reserves
+     * the full image height immediately — before the bitmap decodes off-thread (审计 regression: with a
+     * null placeholder the image line was laid out at ~0 height, the page paginated around a sliver, and
+     * the decode 2–3 s later grew the layout, forcing a reflow + scroll that showed the image popping in
+     * from a top sliver). Intrinsic pixel size comes from the bounds cache (no pixel decode), run through
+     * the same [epubFlowImageTargetSize] the loader/resolver use, so the placeholder box matches the final
+     * image exactly and the decoded bitmap drops in with no reflow. Null only when bounds are unavailable.
+     */
+    override fun placeholder(drawable: AsyncDrawable): Drawable? {
+        val bounds = intrinsicBoundsProvider(drawable.destination) ?: return null
+        val target = epubFlowImageTargetSize(
+            href = drawable.destination,
+            intrinsicWidth = bounds.width,
+            intrinsicHeight = bounds.height,
+            columnWidthPx = columnWidthPx,
+            pageHeightPx = pageHeightProvider().coerceAtLeast(1),
+            inlineMaxHeightPx = inlineMaxHeightPx,
+            fullPageHrefs = fullPageHrefs,
+        )
+        return TransparentBoxDrawable(target.width(), target.height())
+    }
+}
+
+/** A non-drawing drawable that only occupies space — reserves an image's final box pre-decode. */
+private class TransparentBoxDrawable(width: Int, height: Int) : Drawable() {
+    init {
+        setBounds(0, 0, width.coerceAtLeast(1), height.coerceAtLeast(1))
+    }
+    override fun draw(canvas: android.graphics.Canvas) {}
+    override fun setAlpha(alpha: Int) {}
+    override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
+    @Deprecated("Deprecated in Drawable", ReplaceWith("android.graphics.PixelFormat.TRANSPARENT"))
+    override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSPARENT
 }
 
 /**

@@ -84,22 +84,23 @@ internal class EpubFlowView(
     private var flipped = false
     private var stealing = false
 
-    /** Page-flip curl animation: a snapshot of the outgoing page curls off as the new page shows. */
+    /** Page-flip slide animation: a snapshot of the outgoing page slides off as the new page slides in. */
     var pageTurnAnimated = true
     private var flipAnimator: ValueAnimator? = null
-    private var curlDrawable: PageCurlDrawable? = null
-    private val flipDurationMs = 320L
+    private var slideDrawable: PageSlideDrawable? = null
+    private val flipDurationMs = 280L
 
-    // ---- Finger-tracking (跟手) interactive curl ------------------------------------------------
-    // A horizontal drag drives the curl progress directly off finger displacement (Moon+/iBooks feel),
-    // instead of the old behaviour where crossing a 20dp threshold fired a fixed 320ms animation while
-    // the finger was still down (机械、未松手就强制翻页). On release we settle by position+velocity:
-    // past half the width OR a fling over [flingThresholdPx]/s commits the turn, else it springs back.
+    // ---- Finger-tracking (跟手) interactive slide ----------------------------------------------
+    // A horizontal drag drives the slide progress directly off finger displacement (静读天下「滑动」),
+    // instead of crossing a threshold to fire a fixed animation while the finger is still down. On
+    // release we settle by position+velocity: past half the width OR a fling over the threshold/s
+    // commits the turn, else it springs back. Both layers move via GPU transforms (overlay snapshot
+    // + container translationX), so it stays smooth at tablet resolution.
     private var interactiveCurl = false
-    /** The page we curl FROM (restore target on cancel); the incoming page is already parked beneath. */
+    /** The page we slide FROM (restore target on cancel); the incoming page is already parked beneath. */
     private var curlFromPage = 0
     private var curlForward = true
-    /** Finger x where the interactive curl began (drag displacement is measured from here). */
+    /** Finger x where the interactive slide began (drag displacement is measured from here). */
     private var curlAnchorX = 0f
     private var velocityTracker: VelocityTracker? = null
     private val flipFlingThresholdPxPerSec = 700 * density
@@ -218,28 +219,25 @@ internal class EpubFlowView(
     }
 
     /**
-     * Content-y at which to START drawing this page (>= [scrollY]). Page turns snap [scrollY] to an exact
-     * line top, so the line ABOVE the page (its box bottom == [scrollY]) sits entirely off-screen — yet
-     * because [includeFontPadding] is false the line box is tightened to the font's ascent/descent, and a
-     * larger-font (span-sized) line paints a few px of glyph ink BELOW its tight box bottom. That overflow
-     * lands just inside the viewport top and shows as a faint half-line (审计: 半截的文字). Unlike a
-     * per-line canvas draw (Moon+ never paints the off-page line), our [super.dispatchDraw] paints the whole
-     * layout, so we clip it off: drop a thin strip = a fraction of the previous line's height (scales with
-     * font size). Measured bleed is ≤4px while the page's own first line ink begins ≥0.6× a line-height
-     * below the top, so the strip removes the overflow and never clips real text. Blank leading on a clean
-     * page, so nothing visible is lost there.
+     * Content-y at which to START drawing this page (>= [scrollY]). The paginator works in pure
+     * StaticLayout coords (line 0 at y=0) and page tops are line tops in that space, but the child
+     * TextView paints its layout shifted DOWN by its own [TextView.paddingTop]: a line at layout-y L
+     * lands at canvas-y L + padTop. When parked on a page, [scrollY] equals the page's first line top
+     * in LAYOUT space, so that line actually PAINTS at scrollY + padTop — and the strip [scrollY,
+     * scrollY+padTop] is occupied entirely by the PREVIOUS line's box (its layout bottom == this page's
+     * line top, painted +padTop down), i.e. the half-line bleed (审计: 半截的文字; the earlier fraction
+     * guard dropped only ~12px, far short of padTop). Clip the top at scrollY + padTop so the previous
+     * line is fully removed and this page's first line sits flush below the clip with a padTop top margin
+     * — the exact mirror of [pageClipBottomInViewport]'s +padTop, one consistent content-space boundary.
      */
     private fun pageClipTopInViewport(): Int {
         if (mode != Mode.PAGED || !pageClipActive || paged.isEmpty()) return scrollY
-        val layout = textView.layout ?: return scrollY
-        val startLine = layout.getLineForVertical(scrollY)
-        if (startLine <= 0) return scrollY
-        val prevLineHeight = layout.getLineBottom(startLine - 1) - layout.getLineTop(startLine - 1)
-        if (prevLineHeight <= 0) return scrollY
-        // Bound by the viewport height (never the page's bottomPx: [currentPage] can be transiently stale
-        // mid-transition, giving an absolute bottomPx below scrollY → an empty coerce range → draw crash).
-        val guard = Math.round(prevLineHeight * TOP_BLEED_GUARD_FRACTION).coerceIn(0, height)
-        return scrollY + guard
+        // The clamped final page rests below its own topPx (a short remainder ScrollView can't scroll to
+        // fully); its viewport top is mid-content (continuation of the prior page), not a line top, so a
+        // padTop clip there would shave real text. Only clip when actually parked at the page's line top.
+        val pageTop = paged.getOrNull(currentPage)?.topPx ?: return scrollY
+        if (scrollY < pageTop) return scrollY
+        return (scrollY + textView.paddingTop).coerceAtMost(scrollY + height)
     }
 
     /**
@@ -481,9 +479,9 @@ internal class EpubFlowView(
     }
 
     /**
-     * Page turn with a Canvas page-curl (仿真书页翻动): snapshot the current page, jump the real
-     * content to the target, then curl the snapshot of the OUTGOING page around a cylinder and sweep
-     * it off-screen while the incoming page is revealed beneath it (see [PageCurlDrawable]). Falls
+     * Page turn with a hardware slide (滑动翻页): snapshot the current page, jump the real content to
+     * the target, then slide the snapshot of the OUTGOING page off-screen while the incoming page (the
+     * real content) slides in beside it (see [PageSlideDrawable]). Falls
      * back to an instant [goToPage] when animation is off or a snapshot can't be taken.
      */
     private fun goToPageAnimated(index: Int, forward: Boolean) {
@@ -498,14 +496,14 @@ internal class EpubFlowView(
         if (flipAnimator?.isRunning == true) return
         // Snap the outgoing page to its own top with the clip re-armed BEFORE snapshotting: after a
         // middle-column free scroll scrollY sits mid-page with pageClipActive off, so an un-snapped
-        // snapshot would carry the next/prev page's half-line at top & bottom and curl it away (审计:
+        // snapshot would carry the next/prev page's half-line at top & bottom and slide it away (审计:
         // 滚动转分页的上下半截文字). currentPage was just re-anchored by goToAdjacentPage.
         scrollToPage(currentPage, report = false)
         val outgoing = snapshotViewport() ?: run {
             goToPage(target)
             return
         }
-        // Reveal the incoming page underneath, then curl the outgoing snapshot away over the top.
+        // Park the incoming page beneath, then slide both: snapshot off + incoming in.
         goToPage(target)
         startFlip(outgoing, forward)
     }
@@ -536,23 +534,32 @@ internal class EpubFlowView(
         null
     }
 
+    /**
+     * Positions the two slide layers for [progress] (0 = outgoing covers viewport, 1 = turn complete).
+     * The outgoing snapshot moves inside [PageSlideDrawable]; the incoming page is the real [container],
+     * slid in from the off-screen side via GPU [View.setTranslationX] — at progress p its inner edge sits
+     * flush against the outgoing page's trailing edge, so the two move as one 2-page strip.
+     */
+    private fun applySlideProgress(progress: Float, forward: Boolean) {
+        slideDrawable?.progress = progress
+        container.translationX = if (forward) (1f - progress) * width else -(1f - progress) * width
+    }
+
     private fun startFlip(outgoing: Bitmap, forward: Boolean) {
         flipAnimator?.cancel()
         clearFlipOverlay()
-        // Cylinder radius ~22% of width: a tube fat enough to read as a turning page, slim enough
-        // that the crease sweeps the whole width within the viewport.
-        val radius = (width * 0.22f).coerceAtLeast(1f)
-        val drawable = PageCurlDrawable(outgoing, width, height, forward, radius, density)
+        val drawable = PageSlideDrawable(outgoing, width, height, forward, density)
         // The overlay draws in content coords (canvas translated by scrollY). After [goToPage] the
-        // content is parked on the incoming page, so scrollY is the new viewport top — place the curl
+        // content is parked on the incoming page, so scrollY is the new viewport top — place the slide
         // there so it covers exactly what's on screen (the drawable translates to bounds internally).
         drawable.setBounds(0, scrollY, width, scrollY + height)
         overlay.add(drawable)
-        curlDrawable = drawable
+        slideDrawable = drawable
+        applySlideProgress(0f, forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = flipDurationMs
             interpolator = DecelerateInterpolator(1.6f)
-            addUpdateListener { a -> drawable.progress = a.animatedValue as Float }
+            addUpdateListener { a -> applySlideProgress(a.animatedValue as Float, forward) }
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) = clearFlipOverlay()
                 override fun onAnimationCancel(animation: Animator) = clearFlipOverlay()
@@ -562,21 +569,24 @@ internal class EpubFlowView(
     }
 
     private fun clearFlipOverlay() {
-        curlDrawable?.let {
+        slideDrawable?.let {
             overlay.remove(it)
             it.recycle()
         }
-        curlDrawable = null
+        slideDrawable = null
+        // Re-centre the parked incoming page (it was slid in via translationX during the turn).
+        container.translationX = 0f
     }
 
-    // ---- Finger-tracking interactive curl ------------------------------------------------------
+    // ---- Finger-tracking interactive slide -----------------------------------------------------
 
     /**
-     * Begins a finger-driven curl toward the adjacent page [curlFromPage] + (forward ? +1 : −1), if
+     * Begins a finger-driven slide toward the adjacent page [curlFromPage] + (forward ? +1 : −1), if
      * that page exists in THIS chapter. Parks the real content on the incoming page beneath, snapshots
      * the OUTGOING page (snapped clean to its own top — drops any residual half-line from a prior free
-     * scroll), and lays the curl flat (progress 0) over the viewport. Returns false at a chapter
-     * boundary (no in-chapter incoming page to preview) so the caller defers to a discrete page turn.
+     * scroll), and lays the outgoing flat (progress 0) over the viewport with the incoming parked just
+     * off-screen. Returns false at a chapter boundary (no in-chapter incoming page to preview) so the
+     * caller defers to a discrete page turn.
      */
     private fun beginInteractiveCurl(forward: Boolean, anchorX: Float): Boolean {
         if (!pageTurnAnimated || mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
@@ -590,37 +600,36 @@ internal class EpubFlowView(
         // scroll leaves scrollY between two page tops → the snapshot would carry top/bottom half-lines).
         scrollToPage(from, report = false)
         val outgoing = snapshotViewport() ?: return false
-        // Park content on the incoming page beneath the curl; stays silent until the turn commits.
+        // Park content on the incoming page beneath the slide; stays silent until the turn commits.
         scrollToPage(target, report = false)
         flipAnimator?.cancel()
         clearFlipOverlay()
-        val radius = (width * 0.22f).coerceAtLeast(1f)
-        val drawable = PageCurlDrawable(outgoing, width, height, forward, radius, density)
+        val drawable = PageSlideDrawable(outgoing, width, height, forward, density)
         drawable.setBounds(0, scrollY, width, scrollY + height)
-        drawable.progress = 0f
         overlay.add(drawable)
-        curlDrawable = drawable
+        slideDrawable = drawable
         interactiveCurl = true
         curlFromPage = from
         curlForward = forward
         curlAnchorX = anchorX
+        applySlideProgress(0f, forward)
         return true
     }
 
-    /** Drives curl progress from finger displacement since [curlAnchorX] (full sweep ≈ one page width). */
+    /** Drives slide progress from finger displacement since [curlAnchorX] (full sweep ≈ one page width). */
     private fun updateInteractiveCurl(x: Float) {
-        val drawable = curlDrawable ?: return
+        if (slideDrawable == null) return
         val travel = if (curlForward) curlAnchorX - x else x - curlAnchorX
-        drawable.progress = (travel / width.toFloat()).coerceIn(0f, 1f)
+        applySlideProgress((travel / width.toFloat()).coerceIn(0f, 1f), curlForward)
     }
 
     /**
-     * Settles the interactive curl on release: commit (animate to fully turned, keep the incoming page)
+     * Settles the interactive slide on release: commit (animate to fully turned, keep the incoming page)
      * when the drag passed half the width OR flung hard enough in the turn direction; otherwise spring
      * back (animate to flat, restore the outgoing page). Only a committed turn reports the new offset.
      */
     private fun endInteractiveCurl(velocityX: Float) {
-        val drawable = curlDrawable ?: run { interactiveCurl = false; return }
+        val drawable = slideDrawable ?: run { interactiveCurl = false; return }
         interactiveCurl = false
         val flung = if (curlForward) velocityX < -flipFlingThresholdPxPerSec
             else velocityX > flipFlingThresholdPxPerSec
@@ -628,14 +637,15 @@ internal class EpubFlowView(
         val start = drawable.progress
         val end = if (commit) 1f else 0f
         if (!commit) {
-            // Cancelled: the real content goes back to the outgoing page beneath as the curl flattens.
+            // Cancelled: the real content goes back to the outgoing page beneath as the slide retreats.
             scrollToPage(curlFromPage, report = false)
             drawable.setBounds(0, scrollY, width, scrollY + height)
         }
+        val forward = curlForward
         flipAnimator = ValueAnimator.ofFloat(start, end).apply {
             duration = (flipDurationMs * kotlin.math.abs(end - start)).toLong().coerceIn(80L, flipDurationMs)
             interpolator = DecelerateInterpolator(1.6f)
-            addUpdateListener { a -> drawable.progress = a.animatedValue as Float }
+            addUpdateListener { a -> applySlideProgress(a.animatedValue as Float, forward) }
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) {
                     clearFlipOverlay()
@@ -854,14 +864,6 @@ internal class EpubFlowView(
     private companion object {
         /** Coalesce window for async-image reflows: collapses a decode burst into ONE paginate+anchor. */
         const val REFLOW_DEBOUNCE_MS = 80L
-
-        /**
-         * Top strip dropped on a mid-paragraph page (as a fraction of the start line's height) to hide the
-         * previous line's descender bleed (审计: 半截的文字). Must exceed the typical descender overflow
-         * (~6–10% of line height) yet stay well under the first line's own ink offset (~0.85× line height,
-         * inside the 1.75× leading), so the page's first line is never clipped.
-         */
-        const val TOP_BLEED_GUARD_FRACTION = 0.15f
 
         /** Fade-in for the chapter's first positioned frame — long enough to hide a one-frame settle. */
         const val REVEAL_FADE_MS = 120L

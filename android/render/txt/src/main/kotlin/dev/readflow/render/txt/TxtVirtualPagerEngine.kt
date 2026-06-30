@@ -19,6 +19,7 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.readerPaletteFor
+import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagedReaderEngine
@@ -144,7 +145,7 @@ class TxtVirtualPagerEngine(
                 onSelectionChanged = ::updateTextSelection,
                 typeface = resolveTypeface(),
             )
-            setBackgroundColor(palette.paper)
+            background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
             clipToPadding = false
             val padV = (24 * resources.displayMetrics.density).toInt()
             setPadding(0, padV, 0, padV)
@@ -206,7 +207,7 @@ class TxtVirtualPagerEngine(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
-            setBackgroundColor(palette.paper)
+            background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
             val padV = (24 * density).toInt()
             setPadding(0, padV, 0, padV)
             contentDescription = "第 ${safePageIndex + 1} 页，共 $pageCount 页"
@@ -475,9 +476,11 @@ class TxtVirtualPagerEngine(
     override suspend fun setTheme(mode: ThemeMode) {
         themeMode = mode
         val palette = paletteFor(mode, context.resources.configuration)
-        recyclerView?.setBackgroundColor(palette.paper)
+        recyclerView?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateInkColor(palette.ink)
-        activePageContainers.forEach { it.setBackgroundColor(palette.paper) }
+        activePageContainers.forEach {
+            it.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
+        }
         activePageTextViews.forEach { it.applyTextStyle(palette.ink) }
     }
 
@@ -581,7 +584,7 @@ class TxtVirtualPagerEngine(
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
             val p = readerPaletteFor(mode, systemNight)
-            return ReaderPalette(p.paper, p.ink)
+            return ReaderPalette(p.paper, p.ink, p.isNight)
         }
     }
 
@@ -641,7 +644,7 @@ class TxtVirtualPagerEngine(
     }
 }
 
-private data class ReaderPalette(val paper: Int, val ink: Int)
+private data class ReaderPalette(val paper: Int, val ink: Int, val isNight: Boolean)
 private data class CopiedTxtFile(
     val file: File,
     val fingerprint: TxtDocumentFingerprint?,

@@ -11,6 +11,7 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderEngine
@@ -101,7 +102,7 @@ class MarkdownEngine(private val context: Context) : ReaderEngine, TextSelectabl
         textView = tv
 
         val sv = ScrollView(context).apply {
-            setBackgroundColor(palette.paper)
+            background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
             addView(tv)
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
                 if (suppressLocatorUpdates) return@setOnScrollChangeListener
@@ -225,7 +226,7 @@ class MarkdownEngine(private val context: Context) : ReaderEngine, TextSelectabl
     override suspend fun setTheme(mode: ThemeMode) {
         themeMode = mode
         val palette = paletteFor(mode, context.resources.configuration)
-        scrollView?.setBackgroundColor(palette.paper)
+        scrollView?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
         textView?.setTextColor(palette.ink)
     }
 
@@ -236,7 +237,7 @@ class MarkdownEngine(private val context: Context) : ReaderEngine, TextSelectabl
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
             val p = readerPaletteFor(mode, systemNight)
-            return ReaderPalette(p.paper, p.ink)
+            return ReaderPalette(p.paper, p.ink, p.isNight)
         }
     }
 }
@@ -255,4 +256,4 @@ private fun TextView.scrollYForCharacterOffset(offset: Int): Int {
     return layout.getLineTop(visualLine) + totalPaddingTop
 }
 
-private data class ReaderPalette(val paper: Int, val ink: Int)
+private data class ReaderPalette(val paper: Int, val ink: Int, val isNight: Boolean)

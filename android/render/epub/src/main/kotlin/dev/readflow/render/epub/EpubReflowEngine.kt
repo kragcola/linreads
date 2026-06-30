@@ -60,6 +60,7 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.PagingKind
@@ -333,7 +334,7 @@ class EpubReflowEngine private constructor(
                 inkColor = palette.ink,
                 codeBlockBgColor = codeBlockBgFor(themeMode, resources.configuration),
             )
-            setBackgroundColor(palette.paper)
+            background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
             clipToPadding = false
             val padV = (24 * resources.displayMetrics.density).toInt()
             setPadding(0, padV, 0, padV)
@@ -354,7 +355,7 @@ class EpubReflowEngine private constructor(
             onSelectionRange = { start, end -> updateFlowSelection(start, end) },
         ).apply {
             mode = if (_pagingKind.value == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
-            setBackgroundColor(palette.paper)
+            background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
             textView.setTextColor(palette.ink)
             val padH = (PAGE_HORIZONTAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
             val padV = (PAGE_VERTICAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
@@ -438,6 +439,7 @@ class EpubReflowEngine private constructor(
             pageHeightProvider = pageHeightProvider,
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
+            intrinsicBoundsProvider = ::epubImageBoundsFor,
         )
         val resolver = EpubFlowImageSizeResolver(
             columnWidthPx = flowColumnWidthPx(),
@@ -1333,13 +1335,13 @@ class EpubReflowEngine private constructor(
         val palette = paletteFor(mode, context.resources.configuration)
         if (flowEngineEnabled) {
             withContext(Dispatchers.Main) {
-                flowView?.setBackgroundColor(palette.paper)
+                flowView?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
                 flowView?.textView?.setTextColor(palette.ink)
                 rebuildFlowChapter()
             }
             return
         }
-        recyclerView?.setBackgroundColor(palette.paper)
+        recyclerView?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
         (recyclerView?.adapter as? EpubParaAdapter)?.updateInkColor(palette.ink)
         (recyclerView?.adapter as? EpubParaAdapter)?.updateCodeBlockBgColor(codeBlockBgFor(mode, context.resources.configuration))
         activePageContainers.forEach { it.setBackgroundColor(palette.paper) }
@@ -2004,7 +2006,7 @@ class EpubReflowEngine private constructor(
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
                 Configuration.UI_MODE_NIGHT_YES
             val p = readerPaletteFor(mode, systemNight)
-            return ReaderPalette(p.paper, p.ink)
+            return ReaderPalette(p.paper, p.ink, p.isNight)
         }
 
         private fun codeBlockBgFor(mode: ThemeMode, configuration: Configuration): Int {
@@ -2019,7 +2021,7 @@ class EpubReflowEngine private constructor(
     }
 }
 
-private data class ReaderPalette(val paper: Int, val ink: Int)
+private data class ReaderPalette(val paper: Int, val ink: Int, val isNight: Boolean)
 
 internal const val EpubComposeSelectionHighlightColor: Int = 0x663B82F6
 

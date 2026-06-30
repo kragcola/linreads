@@ -19,6 +19,7 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.PagedReaderEngine
@@ -123,7 +124,7 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         return RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
             adapter = PdfPageAdapter(renderer, context)
-            setBackgroundColor(paperColor(themeMode, resources.configuration))
+            background = paperBackground(context, themeMode, resources.configuration)
             addOnScrollListener(object : RecyclerView.OnScrollListener() {
                 override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) = reportProgression(rv)
             })
@@ -141,7 +142,7 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
             )
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
-            setBackgroundColor(paperColor(themeMode, resources.configuration))
+            background = paperBackground(context, themeMode, resources.configuration)
             contentDescription = "第 ${safeIndex + 1} 页，共 $total 页"
             pageStore.cached(safeIndex)?.let(::setImageBitmap)
             pageStore.load(safeIndex) { bitmap ->
@@ -219,9 +220,10 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
 
     override suspend fun setTheme(mode: ThemeMode) {
         themeMode = mode
-        val paper = paperColor(mode, context.resources.configuration)
-        recyclerView?.setBackgroundColor(paper)
-        activePageViews.forEach { it.setBackgroundColor(paper) }
+        recyclerView?.background = paperBackground(context, mode, context.resources.configuration)
+        activePageViews.forEach {
+            it.background = paperBackground(context, mode, context.resources.configuration)
+        }
     }
     override suspend fun setMode(mode: ReadingMode) {
         _pagingKind.value = PagingKind.PAGED
@@ -341,11 +343,14 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         const val MIN_ZOOM_SCALE = 1f
         const val MAX_ZOOM_SCALE = 4f
 
-        private fun paperColor(mode: ThemeMode, configuration: Configuration): Int {
-            val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
-                Configuration.UI_MODE_NIGHT_YES
-            return readerPaletteFor(mode, systemNight).paper
-        }
+        /** A fresh paper-texture background drawable (审计: drawables can't be shared across views). */
+        fun paperBackground(context: Context, mode: ThemeMode, configuration: Configuration) =
+            run {
+                val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                    Configuration.UI_MODE_NIGHT_YES
+                val p = readerPaletteFor(mode, systemNight)
+                readerPaperBackground(context, p.paper, p.ink, p.isNight)
+            }
     }
 }
 

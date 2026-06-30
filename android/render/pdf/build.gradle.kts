@@ -14,6 +14,7 @@ android {
 
 dependencies {
     implementation(project(":core:model"))
+    implementation(project(":core:ui"))   // readerPaperBackground (纸质质感背景)
     implementation(project(":render:api"))
     implementation(libs.coroutines.core)
     implementation(libs.recyclerview)
