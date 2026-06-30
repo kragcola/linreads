@@ -45,7 +45,6 @@ class EpubFlowSpannableTest {
             pageHeightProvider = { 1200 },
             inlineMaxHeightPx = 720,
             fullPageHrefs = emptySet(),
-            intrinsicBoundsProvider = { null },
         )
         val resolver = EpubFlowImageSizeResolver(
             columnWidthPx = 800,
