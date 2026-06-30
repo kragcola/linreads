@@ -8,7 +8,7 @@ import kotlinx.serialization.json.Json
 data class ThemeProfile(
     val name: String = "我的主题",
     val fontSize: Int = 18,
-    val lineSpacing: Float = 1.75f,
+    val lineSpacing: Float = 1.3f,
     val themeMode: String = "SYSTEM",
     val fontChoice: String = "source_han",
     val txtEncoding: String = "AUTO",

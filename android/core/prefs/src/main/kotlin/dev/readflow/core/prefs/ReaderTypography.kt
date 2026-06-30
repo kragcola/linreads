@@ -11,11 +11,11 @@ object ReaderTypography {
     const val FONT_SLIDER_STEPS = 19
     const val DEFAULT_FONT_SP = 18
 
-    const val MIN_LINE_SPACING = 1.4f
+    const val MIN_LINE_SPACING = 1.0f
     const val MAX_LINE_SPACING = 2.2f
-    const val DEFAULT_LINE_SPACING = 1.75f
-    /** 1.4..2.2，0.1 步进 → Slider steps（不含两端）。 */
-    const val LINE_SPACING_SLIDER_STEPS = 7
+    const val DEFAULT_LINE_SPACING = 1.3f
+    /** 1.0..2.2，0.1 步进 → Slider steps（不含两端）。 */
+    const val LINE_SPACING_SLIDER_STEPS = 11
 
     fun clampFontSp(sp: Float): Float =
         if (!sp.isFinite()) DEFAULT_FONT_SP.toFloat() else sp.coerceIn(MIN_FONT_SP, MAX_FONT_SP)

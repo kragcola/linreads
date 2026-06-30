@@ -53,7 +53,7 @@ data class ReaderUiState(
     val engine: ReaderEngine? = null,
     val bookTitle: String = "",
     val fontSizeSp: Float = 16f,
-    val lineSpacing: Float = 1.75f,
+    val lineSpacing: Float = 1.3f,
     val readingMode: ReadingMode = ReadingMode.SCROLL,
     val supportedModes: Set<ReadingMode> = setOf(ReadingMode.SCROLL),
     val pageFlipStyle: PageFlipStyle = PageFlipStyle.SLIDE,

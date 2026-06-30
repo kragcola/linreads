@@ -79,7 +79,7 @@ class TxtVirtualPagerEngine(
     private var txtFingerprint: TxtDocumentFingerprint? = null
     private var pendingEngineState: ByteArray? = null
     private var fontSizeSp: Float = 18f
-    private var lineSpacingMultiplier: Float = 1.75f
+    private var lineSpacingMultiplier: Float = 1.3f
     private var useSourceHan: Boolean = true
     private var currentFontId: String = "source_han"
     private var themeMode: ThemeMode = ThemeMode.SYSTEM

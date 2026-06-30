@@ -1,5 +1,6 @@
 package dev.readflow.features.reader
 
+import dev.readflow.core.prefs.ReaderTypography
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 
@@ -7,8 +8,9 @@ class ReaderLineSpacingTest {
 
     @Test
     fun `line spacing is clamped to readable range`() {
-        assertEquals(1.4f, clampedReaderLineSpacing(0.8f), 0.001f)
-        assertEquals(2.2f, clampedReaderLineSpacing(3f), 0.001f)
+        // Floor lowered to 1.0 to reach Moon+ 静读天下's 1.3 default (and tighter).
+        assertEquals(ReaderTypography.MIN_LINE_SPACING, clampedReaderLineSpacing(0.5f), 0.001f)
+        assertEquals(ReaderTypography.MAX_LINE_SPACING, clampedReaderLineSpacing(3f), 0.001f)
     }
 
     @Test
@@ -19,7 +21,11 @@ class ReaderLineSpacingTest {
 
     @Test
     fun `invalid line spacing falls back to default reading rhythm`() {
-        assertEquals(1.75f, clampedReaderLineSpacing(Float.NaN), 0.001f)
-        assertEquals(1.75f, clampedReaderLineSpacing(Float.POSITIVE_INFINITY), 0.001f)
+        assertEquals(ReaderTypography.DEFAULT_LINE_SPACING, clampedReaderLineSpacing(Float.NaN), 0.001f)
+        assertEquals(
+            ReaderTypography.DEFAULT_LINE_SPACING,
+            clampedReaderLineSpacing(Float.POSITIVE_INFINITY),
+            0.001f,
+        )
     }
 }

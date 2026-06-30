@@ -57,7 +57,7 @@ class MarkdownEngine(private val context: Context) : ReaderEngine, TextSelectabl
 
     private var document: MarkdownDocument = MarkdownDocument.parse("")
     private var fontSizeSp: Float = 18f
-    private var lineSpacingMultiplier: Float = 1.75f
+    private var lineSpacingMultiplier: Float = 1.3f
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
     private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
     private var scrollView: ScrollView? = null

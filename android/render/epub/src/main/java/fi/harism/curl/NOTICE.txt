@@ -1,0 +1,14 @@
+LinReads bundles the following third-party source under fi/harism/curl/:
+
+  android-pagecurl
+  Copyright 2012 Harri Smatt
+  https://github.com/harism/android_page_curl
+  Licensed under the Apache License, Version 2.0.
+
+A copy of the Apache License 2.0 is provided alongside this file (LICENSE-apache-2.0.txt).
+The page-curl OpenGL implementation (CurlView / CurlRenderer / CurlMesh / CurlPage) is
+used as the engine behind PageFlipStyle.SIMULATION (仿真翻页). Only the demo Activity was
+omitted. Files are kept verbatim with their original Apache headers, with ONE modification:
+CurlView adds a `CurlAnimationObserver` hook (a callback fired when a curl animation settles)
+so the EPUB engine can commit/clean up the page turn. The change is marked inline with
+"LinReads addition" comments. The Apache License 2.0 permits modification under §4.

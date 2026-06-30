@@ -79,7 +79,7 @@ class SettingsViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ThemeMode.SYSTEM)
 
     val lineSpacing = settings.lineSpacing
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 1.75f)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 1.3f)
 
     val readingMode = settings.readingMode
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ReaderReadingMode.SCROLL)

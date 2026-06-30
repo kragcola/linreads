@@ -212,7 +212,7 @@ class EpubReflowEngine private constructor(
     private var pagedSlices: List<EpubPageSlice> = emptyList()
     private var chapterBoundaries: List<ChapterBoundary> = emptyList()
     private var fontSizeSp: Float = 18f
-    private var lineSpacingMultiplier: Float = 1.75f
+    private var lineSpacingMultiplier: Float = 1.3f
     private var flipStyle: dev.readflow.core.model.PageFlipStyle = dev.readflow.core.model.PageFlipStyle.SLIDE
     private var useSourceHan: Boolean = true
     private var currentFontId: String = "source_han"
@@ -369,7 +369,26 @@ class EpubReflowEngine private constructor(
         flowView = view
         val startIdx = epubIndexFromLocator(_currentLocator.value, paras.size)
         loadFlowChapter(spineIndexForParagraph(startIdx), restoreToParagraph = startIdx)
-        return view
+        // Host the reader + a transient GL curl overlay (harism) in one FrameLayout so SIMULATION turns
+        // can render the realistic page-curl on top of the live reading view, then remove it.
+        val host = android.widget.FrameLayout(context)
+        host.addView(
+            view,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        val overlay = EpubCurlOverlay(context)
+        host.addView(
+            overlay,
+            android.widget.FrameLayout.LayoutParams(
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        view.curlOverlay = overlay
+        return host
     }
 
     private fun spineIndexForParagraph(paragraphIndex: Int): Int =

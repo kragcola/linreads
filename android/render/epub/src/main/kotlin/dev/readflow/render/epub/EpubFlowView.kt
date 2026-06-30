@@ -86,11 +86,19 @@ internal class EpubFlowView(
 
     /**
      * Page-turn animation style (PAGED only). SLIDE = hardware overlay slide (default, GPU-composited);
-     * SIMULATION = Canvas mesh page-curl (仿真书页翻动, heavier — software-warped snapshot per frame);
-     * NONE = instant cut. Switched live from settings; the next turn uses the new style.
+     * SIMULATION = OpenGL realistic page-curl (仿真书页翻动, harism engine via [curlOverlay] — finger
+     * tracking + see-through reverse text); NONE = instant cut. Switched live from settings; the next
+     * turn uses the new style.
      */
     var flipStyle: dev.readflow.core.model.PageFlipStyle = dev.readflow.core.model.PageFlipStyle.SLIDE
+    /**
+     * GL curl overlay used when [flipStyle] == SIMULATION. Set by the engine after constructing the
+     * host wrapper. Null → SIMULATION falls back to the slide path.
+     */
+    var curlOverlay: EpubCurlOverlay? = null
     private val pageTurnAnimated: Boolean get() = flipStyle != dev.readflow.core.model.PageFlipStyle.NONE
+    private val useGlCurl: Boolean
+        get() = flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION && curlOverlay != null
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
@@ -520,6 +528,9 @@ internal class EpubFlowView(
         // snapshot would carry the next/prev page's half-line at top & bottom and slide it away (审计:
         // 滚动转分页的上下半截文字). currentPage was just re-anchored by goToAdjacentPage.
         scrollToPage(currentPage, report = false)
+        // SIMULATION → OpenGL realistic curl (harism). Snapshot front (current) + revealed (target),
+        // hand them to the GL overlay, and commit the page only when the curl settles committed.
+        if (useGlCurl && startGlCurlTurn(currentPage, target, forward)) return
         val outgoing = snapshotViewport() ?: run {
             goToPage(target)
             return
@@ -527,6 +538,31 @@ internal class EpubFlowView(
         // Park the incoming page beneath, then slide both: snapshot off + incoming in.
         goToPage(target)
         startFlip(outgoing, forward)
+    }
+
+    /**
+     * Drives a discrete (tap/key) turn through the GL curl overlay: snapshots the current page (front)
+     * and the [target] page (revealed beneath), starts the overlay, and runs harism's settle animation.
+     * On settle, commits the page in the real view and dismisses the overlay. Returns false (caller
+     * falls back to slide) if a snapshot can't be taken or the overlay is unavailable.
+     */
+    private fun startGlCurlTurn(fromPage: Int, target: Int, forward: Boolean): Boolean {
+        val overlay = curlOverlay ?: return false
+        if (overlay.active) return false
+        val fromTop = pageTopPxAt(fromPage) ?: return false
+        val targetTop = pageTopPxAt(target) ?: return false
+        val front = snapshotPageAt(fromTop) ?: return false
+        val revealed = snapshotPageAt(targetTop) ?: run { front.recycle(); return false }
+        overlay.start(front, revealed, forward) { committed ->
+            if (committed) {
+                goToPage(target)
+            } else {
+                scrollToPage(fromPage, report = false)
+            }
+            overlay.dismiss()
+        }
+        overlay.animateTurn()
+        return true
     }
 
     private fun snapshotViewport(): Bitmap? = try {
@@ -556,6 +592,52 @@ internal class EpubFlowView(
     }
 
     /**
+     * Renders the PAGED page whose content top is [topPx] into a fresh bitmap (theme bg + that page's
+     * lines, clipped to the page's last fully-fitting line). Used to build the GL curl's front/back
+     * textures for an arbitrary page without moving the live scroll position. Null on OOM or if the
+     * view isn't measured / not paged.
+     */
+    fun snapshotPageAt(topPx: Int): Bitmap? {
+        if (width == 0 || height == 0) return null
+        return try {
+            val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
+            val canvas = Canvas(bmp)
+            canvas.translate(0f, -topPx.toFloat())
+            background?.let { bg ->
+                bg.setBounds(0, topPx, width, topPx + height)
+                bg.draw(canvas)
+            }
+            val layout = textView.layout
+            val clipBottom = if (layout != null) {
+                val pageBottom = topPx + height
+                var line = layout.getLineForVertical(pageBottom - 1)
+                if (line > 0 && layout.getLineBottom(line) > pageBottom) line--
+                (layout.getLineBottom(line) - topPx).coerceIn(0, height)
+            } else height
+            val save = canvas.save()
+            canvas.clipRect(0, topPx, width, topPx + clipBottom)
+            container.draw(canvas)
+            canvas.restoreToCount(save)
+            bmp
+        } catch (_: OutOfMemoryError) {
+            null
+        }
+    }
+
+    /** Content-top px of paged index [index], or null if out of range / not paged. */
+    fun pageTopPxAt(index: Int): Int? =
+        if (mode == Mode.PAGED && index in paged.indices) paged[index].topPx else null
+
+    /** The paged index currently parked at the top of the viewport (Moon+ anchor). */
+    fun currentPagedIndex(): Int {
+        if (mode != Mode.PAGED || paged.isEmpty()) return 0
+        val maxScroll = (container.height - height).coerceAtLeast(0)
+        return if (scrollY >= maxScroll) paged.lastIndex
+        else paged.indexOfLast { it.topPx <= scrollY }.coerceAtLeast(0)
+    }
+
+
+    /**
      * Drives the active page-turn animation to [progress] (0 = outgoing covers viewport, 1 = complete).
      * SLIDE: the outgoing snapshot moves inside [PageSlideDrawable] AND the incoming page (the real
      * [container]) is slid in from the off-screen side via GPU [View.setTranslationX], so the two move
@@ -578,10 +660,8 @@ internal class EpubFlowView(
         // there so it covers exactly what's on screen (each drawable translates to its bounds internally).
         val bounds = intArrayOf(0, scrollY, width, scrollY + height)
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
-            // Cylinder radius ~22% of width: a tube fat enough to read as a turning page, slim enough
-            // that the crease sweeps the whole width within the viewport.
-            val radius = (width * 0.22f).coerceAtLeast(1f)
-            val drawable = PageCurlDrawable(outgoing, width, height, forward, radius, density)
+            // Lightweight GPU 3D-hinge fold (see PageCurlDrawable) — no software mesh warp.
+            val drawable = PageCurlDrawable(outgoing, width, height, forward, density)
             drawable.setBounds(bounds[0], bounds[1], bounds[2], bounds[3])
             overlay.add(drawable)
             curlDrawable = drawable
@@ -631,6 +711,10 @@ internal class EpubFlowView(
      */
     private fun beginInteractiveCurl(forward: Boolean, anchorX: Float): Boolean {
         if (!pageTurnAnimated || mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
+        // GL realistic curl runs as a discrete turn for now (finger-tracking handoff is a later
+        // refinement); return false so the drag falls through to onTapZone → a discrete GL curl turn,
+        // keeping taps and drags visually consistent under SIMULATION.
+        if (useGlCurl) return false
         if (flipAnimator?.isRunning == true) return false
         val maxScroll = (container.height - height).coerceAtLeast(0)
         val from = if (scrollY >= maxScroll) paged.lastIndex
@@ -646,8 +730,7 @@ internal class EpubFlowView(
         flipAnimator?.cancel()
         clearFlipOverlay()
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
-            val radius = (width * 0.22f).coerceAtLeast(1f)
-            val drawable = PageCurlDrawable(outgoing, width, height, forward, radius, density)
+            val drawable = PageCurlDrawable(outgoing, width, height, forward, density)
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
             curlDrawable = drawable

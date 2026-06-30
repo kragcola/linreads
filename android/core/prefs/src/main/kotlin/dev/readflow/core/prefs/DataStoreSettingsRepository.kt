@@ -32,7 +32,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         context.dataStore.data.map { it[KEY_FONT_SIZE] ?: 18 }
 
     override val lineSpacing: Flow<Float> =
-        context.dataStore.data.map { it[KEY_LINE_SPACING] ?: 1.75f }
+        context.dataStore.data.map { it[KEY_LINE_SPACING] ?: ReaderTypography.DEFAULT_LINE_SPACING }
 
     override val readingMode: Flow<ReaderReadingMode> =
         context.dataStore.data.map {
