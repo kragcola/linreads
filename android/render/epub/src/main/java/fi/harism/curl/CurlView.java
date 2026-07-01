@@ -122,6 +122,55 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 	}
 
 	/**
+	 * LinReads addition (Apache-2.0 permits modification; see NOTICE.txt). Programmatically drives a
+	 * FULL-sweep page turn for discrete inputs (edge tap / arrow / volume key) where there is no drag to
+	 * track. The stock way to trigger a turn without a finger is to synthesize a DOWN→MOVE→UP burst, but
+	 * that curls the page across during the synthetic MOVE and then releases at the far edge — leaving
+	 * harism's settle animation with ~0px to travel, so the turn only flashes for a single frame. Instead
+	 * we set the curl state at the grab edge and animate the pointer the WHOLE way across to the far edge,
+	 * committing the index — the complete, visible curl a tap deserves.
+	 *
+	 * @param forward    true = advance (curl right→left, ++index); false = go back (curl left→right, --index).
+	 * @param durationMs sweep duration; <=0 keeps the current default.
+	 */
+	public void animatePageTurn(boolean forward, long durationMs) {
+		if (mPageProvider == null || mAnimate) {
+			return;
+		}
+		RectF rightRect = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT);
+		RectF leftRect = mRenderer.getPageRect(CurlRenderer.PAGE_LEFT);
+		if (rightRect == null || rightRect.width() == 0) {
+			return;
+		}
+		float midY = (rightRect.top + rightRect.bottom) / 2f;
+		if (forward) {
+			if (mCurrentIndex >= mPageProvider.getPageCount()) {
+				return;
+			}
+			mDragStartPos.set(rightRect.right, midY);
+			startCurl(CURL_RIGHT);
+			mAnimationSource.set(rightRect.right, midY);
+			mAnimationTarget.set(rightRect.left, midY);
+			mAnimationTargetEvent = SET_CURL_TO_LEFT;
+		} else {
+			if (mCurrentIndex <= 0) {
+				return;
+			}
+			mDragStartPos.set(leftRect.left, midY);
+			startCurl(CURL_LEFT);
+			mAnimationSource.set(leftRect.left, midY);
+			mAnimationTarget.set(rightRect.right, midY);
+			mAnimationTargetEvent = SET_CURL_TO_RIGHT;
+		}
+		if (durationMs > 0) {
+			mAnimationDurationTime = durationMs;
+		}
+		mAnimationStartTime = System.currentTimeMillis();
+		mAnimate = true;
+		requestRender();
+	}
+
+	/**
 	 * Initialize method.
 	 */
 	private void init(Context ctx) {

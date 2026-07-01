@@ -114,6 +114,16 @@ internal class EpubFlowView(
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
     private val flipDurationMs = 280L
+    /** Discrete GL curl sweep — a touch longer than the slide so the realistic curl reads fully. */
+    private val glCurlDurationMs = 420L
+
+    /**
+     * True while a live finger drag is being handed to the GL curl overlay (SIMULATION 跟手). The host
+     * keeps ownership of the touch stream (it consumed DOWN before classifying) and re-dispatches each
+     * MOVE/UP into the overlay via [EpubCurlOverlay.forwardTouch]; the overlay's harism engine tracks the
+     * finger and runs its own release settle. While set, the host must not also drive its slide/scroll.
+     */
+    private var glInteractive = false
 
     // ---- Finger-tracking (跟手) interactive slide ----------------------------------------------
     // A horizontal drag drives the slide progress directly off finger displacement (静读天下「滑动」),
@@ -573,7 +583,39 @@ internal class EpubFlowView(
                 }
                 overlay.dismiss()
             }
-            overlay.animateTurn()
+            overlay.animateTurn(glCurlDurationMs)
+            true
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Starts a FINGER-TRACKED GL curl (SIMULATION 跟手): snapshots the current page (front) and the
+     * adjacent [forward] page (revealed beneath), starts the overlay, and enters harism's interactive
+     * curl at the grab edge (via [EpubCurlOverlay.beginInteractive]). The host then forwards the live
+     * MOVE/UP stream. On settle harism decides commit vs spring-back; the settle callback commits/restores
+     * the real page and dismisses the overlay. Returns false (caller falls back to a discrete turn) at a
+     * chapter boundary, when a snapshot can't be taken, or if the overlay is unavailable.
+     */
+    private fun beginGlInteractiveCurl(forward: Boolean, atY: Float): Boolean {
+        if (mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
+        val overlay = obtainCurlOverlay() ?: return false
+        if (overlay.active) return false
+        val maxScroll = (container.height - height).coerceAtLeast(0)
+        val from = if (scrollY >= maxScroll) paged.lastIndex
+            else paged.indexOfLast { it.topPx <= scrollY }.coerceAtLeast(0)
+        val target = from + if (forward) 1 else -1
+        if (target < 0 || target > paged.lastIndex) return false
+        return runCatching {
+            val fromTop = pageTopPxAt(from) ?: return@runCatching false
+            val targetTop = pageTopPxAt(target) ?: return@runCatching false
+            val front = snapshotPageAt(fromTop) ?: return@runCatching false
+            val revealed = snapshotPageAt(targetTop) ?: run { front.recycle(); return@runCatching false }
+            overlay.start(front, revealed, forward) { committed ->
+                if (committed) goToPage(target) else scrollToPage(from, report = false)
+                overlay.dismiss()
+            }
+            overlay.beginInteractive(atY)
+            glInteractive = true
             true
         }.getOrDefault(false)
     }
@@ -724,10 +766,6 @@ internal class EpubFlowView(
      */
     private fun beginInteractiveCurl(forward: Boolean, anchorX: Float): Boolean {
         if (!pageTurnAnimated || mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
-        // GL realistic curl runs as a discrete turn for now (finger-tracking handoff is a later
-        // refinement); return false so the drag falls through to onTapZone → a discrete GL curl turn,
-        // keeping taps and drags visually consistent under SIMULATION.
-        if (useGlCurl) return false
         if (flipAnimator?.isRunning == true) return false
         val maxScroll = (container.height - height).coerceAtLeast(0)
         val from = if (scrollY >= maxScroll) paged.lastIndex
@@ -894,6 +932,7 @@ internal class EpubFlowView(
                 flipped = false
                 inSelectionMode = false
                 stealing = false
+                glInteractive = false
             }
             MotionEvent.ACTION_MOVE -> {
                 if (inSelectionMode) return false
@@ -932,6 +971,7 @@ internal class EpubFlowView(
                 freeScrolling = false
                 flipped = false
                 inSelectionMode = false
+                glInteractive = false
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
@@ -956,12 +996,17 @@ internal class EpubFlowView(
                     if (target != scrollY) scrollTo(0, target)
                     lastY = ev.y
                 } else if (classified && !freeScrolling) {
-                    driveFlip(dx, dy, ev.x)
+                    driveFlip(dx, dy, ev)
                 }
                 return true
             }
             MotionEvent.ACTION_UP -> {
-                if (interactiveCurl) {
+                if (glInteractive) {
+                    // Hand the release to harism; it decides commit vs spring-back and fires the settle
+                    // callback (which commits/restores the page + dismisses the overlay).
+                    curlOverlay?.forwardTouch(ev)
+                    glInteractive = false
+                } else if (interactiveCurl) {
                     val vx = computeVelocityX()
                     endInteractiveCurl(vx)
                 } else if (freeScrolling) {
@@ -976,7 +1021,12 @@ internal class EpubFlowView(
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
-                if (interactiveCurl) endInteractiveCurl(0f)
+                if (glInteractive) {
+                    curlOverlay?.forwardTouch(ev)
+                    glInteractive = false
+                } else if (interactiveCurl) {
+                    endInteractiveCurl(0f)
+                }
                 recycleTracker()
                 return true
             }
@@ -985,14 +1035,19 @@ internal class EpubFlowView(
     }
 
     /**
-     * Routes a classified non-scroll drag. A horizontal drag becomes a finger-tracking interactive
-     * curl (跟手) toward the adjacent page; once started, later moves just drive its progress. A
-     * vertical drag in a side column, or a horizontal drag at a chapter boundary (no in-chapter page
-     * to preview), falls back to a single discrete page turn through [onTapZone].
+     * Routes a classified non-scroll drag. A horizontal drag becomes a finger-tracking curl (跟手)
+     * toward the adjacent page — the GL realistic curl ([beginGlInteractiveCurl], forwarding the live
+     * stream to harism) under SIMULATION, or the GPU slide ([beginInteractiveCurl]) otherwise. Once
+     * started, later moves just feed progress. A vertical drag in a side column, or a horizontal drag at
+     * a chapter boundary (no in-chapter page to preview), falls back to a discrete turn via [onTapZone].
      */
-    private fun driveFlip(dx: Float, dy: Float, curX: Float) {
+    private fun driveFlip(dx: Float, dy: Float, ev: MotionEvent) {
+        if (glInteractive) {
+            curlOverlay?.forwardTouch(ev)
+            return
+        }
         if (interactiveCurl) {
-            updateInteractiveCurl(curX)
+            updateInteractiveCurl(ev.x)
             return
         }
         if (flipped) return
@@ -1000,7 +1055,18 @@ internal class EpubFlowView(
         if (horizontalDominant) {
             if (abs(dx) <= flipDominanceThresholdPx || abs(dy) >= flipCrossAxisLimitPx) return
             val forward = dx < 0
-            if (!beginInteractiveCurl(forward, curX)) {
+            if (useGlCurl) {
+                if (beginGlInteractiveCurl(forward, ev.y)) {
+                    // Immediately track to the current finger position (harism has only the grab-edge DOWN).
+                    curlOverlay?.forwardTouch(ev)
+                } else {
+                    // GL unavailable / at a chapter boundary → discrete turn.
+                    flipped = true
+                    onTapZone(if (forward) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
+                }
+                return
+            }
+            if (!beginInteractiveCurl(forward, ev.x)) {
                 flipped = true
                 onTapZone(if (forward) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
             }

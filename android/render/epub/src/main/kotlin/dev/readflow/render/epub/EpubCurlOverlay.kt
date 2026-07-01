@@ -26,8 +26,13 @@ internal class EpubCurlOverlay(
     context: Context,
 ) : FrameLayout(context) {
 
-    /** Back-face dim (Moon+ 反字: same page content shown ~55% on the curled underside). */
-    private val backFaceBlend = Color.argb(0xFF, 0x8C, 0x8C, 0x8C)
+    /**
+     * Back-face tint (Moon+ 反字: the curled underside shows this page's own content, mirrored by the
+     * mesh geometry, tinted down so it reads as "ink seen through paper"). Stock harism dimmed to ~55%
+     * (0x8C) which looked muddy-dark on a light theme (审计: 颜色过黑); 0xCC ≈ 80% keeps the reverse text
+     * legible-but-faint like real paper.
+     */
+    private val backFaceBlend = Color.argb(0xFF, 0xCC, 0xCC, 0xCC)
 
     private var frontBitmap: Bitmap? = null
     private var revealedBitmap: Bitmap? = null
@@ -39,31 +44,35 @@ internal class EpubCurlOverlay(
         private set
 
     /**
-     * Two-page book for one turn: index 0 = the page being turned (front), index 1 = the page revealed
-     * beneath. Forward turn curls 0→1; the host maps "revealed" to the next page. Backward turn passes
-     * the previous page as the front and the current page as revealed, then starts the curl from the
-     * left edge (handled by CurlView's drag classification).
+     * Two-page book for one turn. The turning page (book index 0 for a forward turn, book index 1 for a
+     * backward one) is two-sided: front = its own content, back = the same content tinted for the Moon+
+     * 反字 see-through effect (harism's mesh mirrors it). The other slot is the page revealed beneath,
+     * drawn flat (SIDE_BOTH). [bmp0]/[bmp1] resolve which snapshot sits at which harism index per
+     * direction, so a forward curl advances 0→1 and a backward curl retreats 1→0.
      */
     private val provider = object : CurlView.PageProvider {
         override fun getPageCount(): Int = 2
         override fun updatePage(page: CurlPage, width: Int, height: Int, index: Int) {
-            when (index) {
-                0 -> {
-                    val front = frontBitmap ?: return
-                    val cfg = front.config ?: Bitmap.Config.RGB_565
-                    page.setTexture(front.copy(cfg, false), CurlPage.SIDE_FRONT)
-                    // Back face = same page content, dimmed → Moon+ 纸背透字.
-                    page.setTexture(front.copy(cfg, false), CurlPage.SIDE_BACK)
-                    page.setColor(backFaceBlend, CurlPage.SIDE_BACK)
-                }
-                else -> {
-                    val revealed = revealedBitmap ?: return
-                    val cfg = revealed.config ?: Bitmap.Config.RGB_565
-                    page.setTexture(revealed.copy(cfg, false), CurlPage.SIDE_BOTH)
-                }
+            // The page that physically curls (and thus needs a back face) is index 0 forward, index 1 back.
+            val curlingIndex = if (forward) 0 else 1
+            val bmp = if (index == 0) bmp0() else bmp1()
+            val src = bmp ?: return
+            val cfg = src.config ?: Bitmap.Config.RGB_565
+            if (index == curlingIndex) {
+                page.setTexture(src.copy(cfg, false), CurlPage.SIDE_FRONT)
+                page.setTexture(src.copy(cfg, false), CurlPage.SIDE_BACK)
+                page.setColor(backFaceBlend, CurlPage.SIDE_BACK)
+            } else {
+                page.setTexture(src.copy(cfg, false), CurlPage.SIDE_BOTH)
             }
         }
     }
+
+    /** Snapshot at harism book index 0 (forward: current/turning page; backward: previous/revealed). */
+    private fun bmp0(): Bitmap? = if (forward) frontBitmap else revealedBitmap
+
+    /** Snapshot at harism book index 1 (forward: next/revealed; backward: current/stationary page). */
+    private fun bmp1(): Bitmap? = if (forward) revealedBitmap else frontBitmap
 
     private val curlView = CurlView(context).apply {
         setViewMode(CurlView.SHOW_ONE_PAGE)
@@ -81,8 +90,10 @@ internal class EpubCurlOverlay(
     init {
         addView(curlView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         curlView.setCurlAnimationObserver { idx ->
-            // idx is CurlView's resulting page index: 0 = stayed on front, 1 = advanced to revealed.
-            val committed = idx >= 1
+            // Direction-aware commit: a forward turn starts at index 0 and commits once it reaches 1; a
+            // backward turn starts at index 1 and commits once it reaches 0. A spring-back leaves the
+            // index unchanged, so it reports not-committed.
+            val committed = if (forward) idx >= 1 else idx <= 0
             active = false
             val cb = onTurnSettled
             onTurnSettled = null
@@ -92,10 +103,10 @@ internal class EpubCurlOverlay(
     }
 
     /**
-     * Begins a SIMULATION turn. [front] is the page being turned, [revealed] the page beneath. [forward]
-     * picks the curl direction (true = next page). [settled] fires once the curl animation finishes.
-     * The overlay becomes visible; the caller forwards the in-flight drag via [forwardTouch], or calls
-     * [animateTurn] for a discrete (tap) turn.
+     * Begins a SIMULATION turn. [front] is the current (turning) page, [revealed] the adjacent page
+     * beneath. [forward] picks the curl direction (true = next page). [settled] fires once the curl
+     * animation finishes. The overlay becomes visible; the caller then either drives a discrete tap turn
+     * via [animateTurn], or hands off a live finger drag via [beginInteractive] + [forwardTouch].
      */
     fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, settled: (committed: Boolean) -> Unit) {
         recycleBitmaps()
@@ -105,28 +116,38 @@ internal class EpubCurlOverlay(
         onTurnSettled = settled
         active = true
         visibility = VISIBLE
-        curlView.setCurrentIndex(0)
+        // Forward curls the page at index 0 over to reveal 1; backward starts parked on 1 and curls the
+        // index-0 page back in from the left. setCurrentIndex re-runs the provider for the new anchor.
+        curlView.setCurrentIndex(if (forward) 0 else 1)
         bringToFront()
     }
 
     /**
-     * Drives a discrete (non-finger) turn by synthesizing a DOWN at the free edge and an UP past the
-     * half-way point, so harism's own settle animation curls the page fully over. Used for edge taps /
-     * volume-key / arrow turns where there's no drag to track.
+     * Drives a discrete (tap / key) turn: harism animates the pointer the whole way across at [durationMs]
+     * and commits the index — a complete, visible curl (not the one-frame flash the old synthetic-event
+     * burst produced, whose settle had ~0px left to travel; 审计: 翻页一闪而过).
      */
-    fun animateTurn() {
+    fun animateTurn(durationMs: Long) {
+        if (!active) return
+        if (width == 0 || height == 0) return
+        curlView.animatePageTurn(forward, durationMs)
+    }
+
+    /**
+     * Hands a live finger drag to harism for true 跟手 tracking. The real DOWN was already consumed by
+     * the host [EpubFlowView] before the drag was classified, so we synthesize the grab-edge DOWN harism
+     * needs to enter its curl state (right edge for a forward turn, left edge for a backward one); the
+     * host then streams the subsequent MOVE/UP through [forwardTouch] and harism tracks + settles them.
+     */
+    fun beginInteractive(atY: Float) {
         if (!active) return
         val w = width.toFloat()
         val h = height.toFloat()
         if (w == 0f || h == 0f) return
-        val midY = h / 2f
-        // Forward: grab the right edge, drag to the left edge → curl reveals next page. Backward mirror.
-        val startX = if (forward) w - 1f else 1f
-        val endX = if (forward) 1f else w - 1f
+        val edgeX = if (forward) w - 1f else 1f
+        val y = atY.coerceIn(1f, h - 1f)
         val now = android.os.SystemClock.uptimeMillis()
-        dispatchSynthetic(MotionEvent.ACTION_DOWN, startX, midY, now, now)
-        dispatchSynthetic(MotionEvent.ACTION_MOVE, (startX + endX) / 2f, midY, now, now + 8)
-        dispatchSynthetic(MotionEvent.ACTION_UP, endX, midY, now, now + 16)
+        dispatchSynthetic(MotionEvent.ACTION_DOWN, edgeX, y, now, now)
     }
 
     private fun dispatchSynthetic(action: Int, x: Float, y: Float, downTime: Long, eventTime: Long) {
