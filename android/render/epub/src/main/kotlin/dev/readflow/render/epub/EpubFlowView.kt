@@ -78,6 +78,8 @@ internal class EpubFlowView(
     private var downX = 0f
     private var downY = 0f
     private var lastY = 0f
+    /** Real DOWN event saved for replay to GL curl overlay (Moon+ model: no synthetic events). */
+    private var savedDownEvent: MotionEvent? = null
     private var inSelectionMode = false
     private var classified = false
     private var freeScrolling = false
@@ -135,6 +137,39 @@ internal class EpubFlowView(
      * finger and runs its own release settle. While set, the host must not also drive its slide/scroll.
      */
     private var glInteractive = false
+
+    // ---- Pre-cache page textures (Moon+ Reader model) ------------------------------------------
+    // After every page settle, pre-render the current + next page bitmaps so the next curl doesn't
+    // snapshot live (avoids OOM mid-turn and image-text page rendering glitches).
+    private var cachedFrontBitmap: Bitmap? = null
+    private var cachedRevealedBitmap: Bitmap? = null
+    private var cachedFromPage: Int = -1
+    private var cachedTargetPage: Int = -1
+
+    private fun preCachePageTextures() {
+        if (mode != Mode.PAGED || paged.isEmpty() || width == 0) return
+        val idx = currentPage
+        val nextIdx = (idx + 1).coerceAtMost(paged.lastIndex)
+        if (idx == cachedFromPage && nextIdx == cachedTargetPage) return
+        recycleCachedTextures()
+        post {
+            val fromTop = pageTopPxAt(idx) ?: return@post
+            val targetTop = pageTopPxAt(nextIdx) ?: return@post
+            cachedFrontBitmap = snapshotPageAt(fromTop)
+            cachedRevealedBitmap = snapshotPageAt(targetTop)
+            cachedFromPage = idx
+            cachedTargetPage = nextIdx
+        }
+    }
+
+    private fun recycleCachedTextures() {
+        cachedFrontBitmap?.let { if (!it.isRecycled) it.recycle() }
+        cachedRevealedBitmap?.let { if (!it.isRecycled) it.recycle() }
+        cachedFrontBitmap = null
+        cachedRevealedBitmap = null
+        cachedFromPage = -1
+        cachedTargetPage = -1
+    }
 
     // ---- Finger-tracking (跟手) interactive slide ----------------------------------------------
     // A horizontal drag drives the slide progress directly off finger displacement (静读天下「滑动」),
@@ -334,6 +369,7 @@ internal class EpubFlowView(
                 repaginate(reposition = false)
                 if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
                 revealContent()
+                preCachePageTextures()
             }
             return
         }
@@ -342,6 +378,7 @@ internal class EpubFlowView(
             // Re-anchor by offset does the only scroll; skip repaginate's own scrollTo (no double jump).
             repaginate(reposition = anchorOffset < 0)
             if (anchorOffset >= 0) goToOffset(anchorOffset)
+            preCachePageTextures()
         }
     }
 
@@ -374,6 +411,9 @@ internal class EpubFlowView(
         flipAnimator?.cancel()
         clearFlipOverlay()
         removeCallbacks(reflowRunnable)
+        savedDownEvent?.recycle()
+        savedDownEvent = null
+        recycleCachedTextures()
         this.flow = flow
         this.pageHeightPx = pageHeightPx.coerceAtLeast(1)
         currentPage = 0
@@ -398,6 +438,7 @@ internal class EpubFlowView(
         repaginate(reposition = false)
         if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
         if (height > 0) revealContent()
+        preCachePageTextures()
     }
 
     private fun revealContent() {
@@ -551,6 +592,7 @@ internal class EpubFlowView(
         val target = index.coerceIn(0, paged.lastIndex)
         if (!pageTurnAnimated || mode != Mode.PAGED || width == 0 || height == 0) {
             goToPage(target)
+            preCachePageTextures()
             return
         }
         // Debounce: prevent a second turn from starting while an animation is still in flight
@@ -590,17 +632,27 @@ internal class EpubFlowView(
         val overlay = obtainCurlOverlay() ?: return false
         if (overlay.active) return false
         return runCatching {
-            val fromTop = pageTopPxAt(fromPage) ?: return@runCatching false
-            val targetTop = pageTopPxAt(target) ?: return@runCatching false
-            val front = snapshotPageAt(fromTop) ?: return@runCatching false
-            val revealed = snapshotPageAt(targetTop) ?: run { front.recycle(); return@runCatching false }
-            overlay.start(front, revealed, forward, forInteractive = false) { committed ->
+            // Use pre-cached textures when available (avoids live snapshot on image-text pages).
+            val front = if (fromPage == cachedFromPage && cachedFrontBitmap != null) {
+                cachedFrontBitmap?.copy(Bitmap.Config.RGB_565, false)
+            } else {
+                val fromTop = pageTopPxAt(fromPage) ?: return@runCatching false
+                snapshotPageAt(fromTop)
+            } ?: return@runCatching false
+            val revealed = if (target == cachedTargetPage && cachedRevealedBitmap != null) {
+                cachedRevealedBitmap?.copy(Bitmap.Config.RGB_565, false)
+            } else {
+                val targetTop = pageTopPxAt(target) ?: run { front.recycle(); return@runCatching false }
+                snapshotPageAt(targetTop)
+            } ?: run { front.recycle(); return@runCatching false }
+            overlay.start(front, revealed, forward) { committed ->
                 if (committed) {
                     goToPage(target)
                 } else {
                     scrollToPage(fromPage, report = false)
                 }
                 overlay.dismiss()
+                preCachePageTextures()
             }
             overlay.animateTurn(glCurlDurationMs)
             true
@@ -608,12 +660,10 @@ internal class EpubFlowView(
     }
 
     /**
-     * Starts a FINGER-TRACKED GL curl (SIMULATION 跟手): snapshots the current page (front) and the
-     * adjacent [forward] page (revealed beneath), starts the overlay, and enters harism's interactive
-     * curl at the grab edge (via [EpubCurlOverlay.beginInteractive]). The host then forwards the live
-     * MOVE/UP stream. On settle harism decides commit vs spring-back; the settle callback commits/restores
-     * the real page and dismisses the overlay. Returns false (caller falls back to a discrete turn) at a
-     * chapter boundary, when a snapshot can't be taken, or if the overlay is unavailable.
+     * Starts a FINGER-TRACKED GL curl (SIMULATION 跟手, Moon+ Reader model). Uses pre-cached page
+     * textures when available (avoids live snapshot under the finger), then replays the REAL saved
+     * DOWN event to harism (no synthetic edge-DOWN — the CurlView sees the actual finger position).
+     * Subsequent MOVE/UP events are forwarded via [EpubCurlOverlay.forwardTouch].
      */
     private fun beginGlInteractiveCurl(forward: Boolean, atY: Float): Boolean {
         if (mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
@@ -625,15 +675,31 @@ internal class EpubFlowView(
         val target = from + if (forward) 1 else -1
         if (target < 0 || target > paged.lastIndex) return false
         return runCatching {
-            val fromTop = pageTopPxAt(from) ?: return@runCatching false
-            val targetTop = pageTopPxAt(target) ?: return@runCatching false
-            val front = snapshotPageAt(fromTop) ?: return@runCatching false
-            val revealed = snapshotPageAt(targetTop) ?: run { front.recycle(); return@runCatching false }
-            overlay.start(front, revealed, forward, forInteractive = true) { committed ->
+            // Use pre-cached textures when available (Moon+ model: no live snapshot under finger).
+            val front = if (from == cachedFromPage && cachedFrontBitmap != null) {
+                cachedFrontBitmap?.copy(Bitmap.Config.RGB_565, false)
+            } else {
+                val fromTop = pageTopPxAt(from) ?: return@runCatching false
+                snapshotPageAt(fromTop)
+            } ?: return@runCatching false
+            val revealed = if (target == cachedTargetPage && cachedRevealedBitmap != null) {
+                cachedRevealedBitmap?.copy(Bitmap.Config.RGB_565, false)
+            } else {
+                val targetTop = pageTopPxAt(target) ?: run { front.recycle(); return@runCatching false }
+                snapshotPageAt(targetTop)
+            } ?: run { front.recycle(); return@runCatching false }
+            overlay.start(front, revealed, forward) { committed ->
                 if (committed) goToPage(target) else scrollToPage(from, report = false)
                 overlay.dismiss()
+                preCachePageTextures()
             }
-            overlay.beginInteractive(atY)
+            // Replay the REAL saved DOWN event to harism (Moon+ model: no synthetic events).
+            // The CurlView sees the actual finger position → curl starts where the finger is,
+            // not at the extreme edge → no premature observer fire.
+            val realDown = savedDownEvent
+            if (realDown != null) {
+                overlay.forwardTouch(realDown)
+            }
             glInteractive = true
             true
         }.getOrDefault(false)
@@ -751,7 +817,10 @@ internal class EpubFlowView(
             interpolator = DecelerateInterpolator(1.6f)
             addUpdateListener { a -> applyFlipProgress(a.animatedValue as Float, forward) }
             addListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: Animator) = clearFlipOverlay()
+                override fun onAnimationEnd(animation: Animator) {
+                    clearFlipOverlay()
+                    preCachePageTextures()
+                }
                 override fun onAnimationCancel(animation: Animator) = clearFlipOverlay()
             })
             start()
@@ -855,6 +924,7 @@ internal class EpubFlowView(
                 override fun onAnimationEnd(animation: Animator) {
                     clearFlipOverlay()
                     if (commit) reportTopOffset()
+                    preCachePageTextures()
                 }
                 override fun onAnimationCancel(animation: Animator) = clearFlipOverlay()
             })
@@ -952,6 +1022,8 @@ internal class EpubFlowView(
                 inSelectionMode = false
                 stealing = false
                 glInteractive = false
+                savedDownEvent?.recycle()
+                savedDownEvent = MotionEvent.obtain(ev)
             }
             MotionEvent.ACTION_MOVE -> {
                 if (inSelectionMode) return false
@@ -991,6 +1063,8 @@ internal class EpubFlowView(
                 flipped = false
                 inSelectionMode = false
                 glInteractive = false
+                savedDownEvent?.recycle()
+                savedDownEvent = MotionEvent.obtain(ev)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
@@ -1025,7 +1099,6 @@ internal class EpubFlowView(
                     // callback (which commits/restores the page + dismisses the overlay).
                     curlOverlay?.forwardTouch(ev)
                     glInteractive = false
-                    curlOverlay?.endInteractive()
                 } else if (interactiveCurl) {
                     val vx = computeVelocityX()
                     endInteractiveCurl(vx)
@@ -1044,7 +1117,6 @@ internal class EpubFlowView(
                 if (glInteractive) {
                     curlOverlay?.forwardTouch(ev)
                     glInteractive = false
-                    curlOverlay?.endInteractive()
                 } else if (interactiveCurl) {
                     endInteractiveCurl(0f)
                 }

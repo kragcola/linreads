@@ -43,34 +43,13 @@ internal class EpubCurlOverlay(
     var active = false
         private set
 
-    /**
-     * True when this is a finger-tracking (跟手) interactive curl. While interactive, harism's
-     * setCurlAnimationObserver fires are ignored — the real settle happens on finger UP via
-     * [endInteractive]. A 500ms fallback guards against harism not re-firing after UP.
-     */
-    private var interactive = false
-
     /** Safety dismiss: if harism never fires setCurlAnimationObserver, force-clean after 5s. */
     private val safetyDismissRunnable = Runnable {
         if (active) {
-            interactive = false
-            removeCallbacks(settleFallbackRunnable)
             active = false
             visibility = GONE
             onTurnSettled?.invoke(false)
             onTurnSettled = null
-            recycleBitmaps()
-        }
-    }
-
-    /** Fallback settle for interactive mode: if harism doesn't re-fire observer after UP. */
-    private val settleFallbackRunnable = Runnable {
-        if (active) {
-            active = false
-            visibility = GONE
-            val cb = onTurnSettled
-            onTurnSettled = null
-            cb?.invoke(false)  // force spring-back
             recycleBitmaps()
         }
     }
@@ -123,16 +102,10 @@ internal class EpubCurlOverlay(
         addView(curlView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         curlView.setCurlAnimationObserver { idx ->
             removeCallbacks(safetyDismissRunnable)
-            removeCallbacks(settleFallbackRunnable)
             // Direction-aware commit: a forward turn starts at index 0 and commits once it reaches 1; a
             // backward turn starts at index 1 and commits once it reaches 0. A spring-back leaves the
             // index unchanged, so it reports not-committed.
             val committed = if (forward) idx >= 1 else idx <= 0
-            if (interactive) {
-                // Harism may fire the observer during finger tracking when the curl reaches 0% or 100%.
-                // Ignore; the real settle happens after finger UP when harism re-fires the observer.
-                return@setCurlAnimationObserver
-            }
             active = false
             val cb = onTurnSettled
             onTurnSettled = null
@@ -145,21 +118,19 @@ internal class EpubCurlOverlay(
      * Begins a SIMULATION turn. [front] is the current (turning) page, [revealed] the adjacent page
      * beneath. [forward] picks the curl direction (true = next page). [settled] fires once the curl
      * animation finishes. The overlay becomes visible; the caller then either drives a discrete tap turn
-     * via [animateTurn], or hands off a live finger drag via [beginInteractive] + [forwardTouch].
+     * via [animateTurn], or hands off a live finger drag via [forwardTouch] (real touch events replayed).
      */
-    fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, forInteractive: Boolean = false, settled: (committed: Boolean) -> Unit) {
+    fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, settled: (committed: Boolean) -> Unit) {
         recycleBitmaps()
         frontBitmap = front
         revealedBitmap = revealed
         this.forward = forward
-        this.interactive = forInteractive
         onTurnSettled = settled
         active = true
         visibility = VISIBLE
         // Safety timeout: if the curl never settles (GL error, synthetic DOWN not triggering harism state),
         // force-dismiss after 5s so turnInFlight doesn't stay stuck forever (审计: active 卡死 → 所有翻页失效).
         removeCallbacks(safetyDismissRunnable)
-        removeCallbacks(settleFallbackRunnable)
         postDelayed(safetyDismissRunnable, SAFETY_DISMISS_MS)
         // Forward curls the page at index 0 over to reveal 1; backward starts parked on 1 and curls the
         // index-0 page back in from the left. setCurrentIndex re-runs the provider for the new anchor.
@@ -178,29 +149,6 @@ internal class EpubCurlOverlay(
         curlView.animatePageTurn(forward, durationMs)
     }
 
-    /**
-     * Hands a live finger drag to harism for true 跟手 tracking. The real DOWN was already consumed by
-     * the host [EpubFlowView] before the drag was classified, so we synthesize the grab-edge DOWN harism
-     * needs to enter its curl state (right edge for a forward turn, left edge for a backward one); the
-     * host then streams the subsequent MOVE/UP through [forwardTouch] and harism tracks + settles them.
-     */
-    fun beginInteractive(atY: Float) {
-        if (!active) return
-        val w = width.toFloat()
-        val h = height.toFloat()
-        if (w == 0f || h == 0f) return
-        val edgeX = if (forward) w - 1f else 1f
-        val y = atY.coerceIn(1f, h - 1f)
-        val now = android.os.SystemClock.uptimeMillis()
-        dispatchSynthetic(MotionEvent.ACTION_DOWN, edgeX, y, now, now)
-    }
-
-    private fun dispatchSynthetic(action: Int, x: Float, y: Float, downTime: Long, eventTime: Long) {
-        val ev = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
-        curlView.dispatchTouchEvent(ev)
-        ev.recycle()
-    }
-
     /** Re-dispatches a host touch event into the GL curl view (finger-tracking). */
     @SuppressLint("ClickableViewAccessibility")
     fun forwardTouch(ev: MotionEvent) {
@@ -208,22 +156,9 @@ internal class EpubCurlOverlay(
         curlView.dispatchTouchEvent(ev)
     }
 
-    /**
-     * Called by the host when the finger is lifted (ACTION_UP) during an interactive curl.
-     * Sets interactive=false so the next observer fire (from harism settling after UP)
-     * processes normally. A 500ms fallback guards against harism not re-firing.
-     */
-    fun endInteractive() {
-        if (!interactive) return
-        interactive = false
-        postDelayed(settleFallbackRunnable, SETTLE_FALLBACK_MS)
-    }
-
     /** Hides + frees the overlay after a turn settles (or to abort). */
     fun dismiss() {
         removeCallbacks(safetyDismissRunnable)
-        removeCallbacks(settleFallbackRunnable)
-        interactive = false
         active = false
         visibility = GONE
         recycleBitmaps()
@@ -242,7 +177,5 @@ internal class EpubCurlOverlay(
     private companion object {
         /** Timeout before auto-dismissing a curl that never settles (GL error / synthetic DOWN missed). */
         const val SAFETY_DISMISS_MS = 5_000L
-        /** After finger UP in interactive mode, wait this long for harism to re-fire the observer. */
-        const val SETTLE_FALLBACK_MS = 500L
     }
 }
