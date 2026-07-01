@@ -43,9 +43,21 @@ internal class EpubCurlOverlay(
     var active = false
         private set
 
+    /**
+     * True when this is a finger-tracking (跟手) interactive curl rather than a discrete tap turn.
+     * The harism observer may fire prematurely at 0% or 100% curl during tracking; while interactive,
+     * the result is saved to [pendingSettleResult] and deferred until [endInteractive] is called.
+     */
+    private var interactive = false
+
+    /** Saved settle result from a premature observer fire during finger tracking. */
+    private var pendingSettleResult: Boolean? = null
+
     /** Safety dismiss: if harism never fires setCurlAnimationObserver, force-clean after 5s. */
     private val safetyDismissRunnable = Runnable {
         if (active) {
+            interactive = false
+            pendingSettleResult = null
             active = false
             visibility = GONE
             onTurnSettled?.invoke(false)
@@ -106,6 +118,13 @@ internal class EpubCurlOverlay(
             // backward turn starts at index 1 and commits once it reaches 0. A spring-back leaves the
             // index unchanged, so it reports not-committed.
             val committed = if (forward) idx >= 1 else idx <= 0
+            if (interactive) {
+                // Harism may fire the observer during finger tracking when the curl reaches 0% or 100%.
+                // Defer processing until endInteractive() is called (finger lifted).
+                pendingSettleResult = committed
+                return@setCurlAnimationObserver
+            }
+            pendingSettleResult = null
             active = false
             val cb = onTurnSettled
             onTurnSettled = null
@@ -120,11 +139,13 @@ internal class EpubCurlOverlay(
      * animation finishes. The overlay becomes visible; the caller then either drives a discrete tap turn
      * via [animateTurn], or hands off a live finger drag via [beginInteractive] + [forwardTouch].
      */
-    fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, settled: (committed: Boolean) -> Unit) {
+    fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, forInteractive: Boolean = false, settled: (committed: Boolean) -> Unit) {
         recycleBitmaps()
         frontBitmap = front
         revealedBitmap = revealed
         this.forward = forward
+        this.interactive = forInteractive
+        pendingSettleResult = null
         onTurnSettled = settled
         active = true
         visibility = VISIBLE
@@ -179,9 +200,35 @@ internal class EpubCurlOverlay(
         curlView.dispatchTouchEvent(ev)
     }
 
+    /**
+     * Called by the host when the finger is lifted (ACTION_UP) during an interactive curl.
+     * If the observer already fired during tracking, process the deferred result immediately.
+     * If not, let the observer fire naturally (harism will settle after receiving the UP
+     * forwarded via [forwardTouch]).
+     */
+    fun endInteractive() {
+        if (!interactive) return
+        interactive = false
+        val committed = pendingSettleResult
+        pendingSettleResult = null
+        if (committed != null) {
+            // Observer already fired during tracking — process the deferred result now.
+            active = false
+            visibility = GONE
+            val cb = onTurnSettled
+            onTurnSettled = null
+            cb?.invoke(committed)
+            recycleBitmaps()
+        }
+        // If committed is null (observer hasn't fired yet), harism will settle after
+        // the UP forwarded via forwardTouch and fire the observer normally.
+    }
+
     /** Hides + frees the overlay after a turn settles (or to abort). */
     fun dismiss() {
         removeCallbacks(safetyDismissRunnable)
+        interactive = false
+        pendingSettleResult = null
         active = false
         visibility = GONE
         recycleBitmaps()

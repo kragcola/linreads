@@ -594,7 +594,7 @@ internal class EpubFlowView(
             val targetTop = pageTopPxAt(target) ?: return@runCatching false
             val front = snapshotPageAt(fromTop) ?: return@runCatching false
             val revealed = snapshotPageAt(targetTop) ?: run { front.recycle(); return@runCatching false }
-            overlay.start(front, revealed, forward) { committed ->
+            overlay.start(front, revealed, forward, forInteractive = false) { committed ->
                 if (committed) {
                     goToPage(target)
                 } else {
@@ -629,7 +629,7 @@ internal class EpubFlowView(
             val targetTop = pageTopPxAt(target) ?: return@runCatching false
             val front = snapshotPageAt(fromTop) ?: return@runCatching false
             val revealed = snapshotPageAt(targetTop) ?: run { front.recycle(); return@runCatching false }
-            overlay.start(front, revealed, forward) { committed ->
+            overlay.start(front, revealed, forward, forInteractive = true) { committed ->
                 if (committed) goToPage(target) else scrollToPage(from, report = false)
                 overlay.dismiss()
             }
@@ -1025,6 +1025,7 @@ internal class EpubFlowView(
                     // callback (which commits/restores the page + dismisses the overlay).
                     curlOverlay?.forwardTouch(ev)
                     glInteractive = false
+                    curlOverlay?.endInteractive()
                 } else if (interactiveCurl) {
                     val vx = computeVelocityX()
                     endInteractiveCurl(vx)
@@ -1043,6 +1044,7 @@ internal class EpubFlowView(
                 if (glInteractive) {
                     curlOverlay?.forwardTouch(ev)
                     glInteractive = false
+                    curlOverlay?.endInteractive()
                 } else if (interactiveCurl) {
                     endInteractiveCurl(0f)
                 }
