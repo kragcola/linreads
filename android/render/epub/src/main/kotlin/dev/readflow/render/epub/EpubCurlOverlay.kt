@@ -43,6 +43,17 @@ internal class EpubCurlOverlay(
     var active = false
         private set
 
+    /** Safety dismiss: if harism never fires setCurlAnimationObserver, force-clean after 5s. */
+    private val safetyDismissRunnable = Runnable {
+        if (active) {
+            active = false
+            visibility = GONE
+            onTurnSettled?.invoke(false)
+            onTurnSettled = null
+            recycleBitmaps()
+        }
+    }
+
     /**
      * Two-page book for one turn. The turning page (book index 0 for a forward turn, book index 1 for a
      * backward one) is two-sided: front = its own content, back = the same content tinted for the Moon+
@@ -90,6 +101,7 @@ internal class EpubCurlOverlay(
     init {
         addView(curlView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         curlView.setCurlAnimationObserver { idx ->
+            removeCallbacks(safetyDismissRunnable)
             // Direction-aware commit: a forward turn starts at index 0 and commits once it reaches 1; a
             // backward turn starts at index 1 and commits once it reaches 0. A spring-back leaves the
             // index unchanged, so it reports not-committed.
@@ -116,6 +128,10 @@ internal class EpubCurlOverlay(
         onTurnSettled = settled
         active = true
         visibility = VISIBLE
+        // Safety timeout: if the curl never settles (GL error, synthetic DOWN not triggering harism state),
+        // force-dismiss after 5s so turnInFlight doesn't stay stuck forever (审计: active 卡死 → 所有翻页失效).
+        removeCallbacks(safetyDismissRunnable)
+        postDelayed(safetyDismissRunnable, SAFETY_DISMISS_MS)
         // Forward curls the page at index 0 over to reveal 1; backward starts parked on 1 and curls the
         // index-0 page back in from the left. setCurrentIndex re-runs the provider for the new anchor.
         curlView.setCurrentIndex(if (forward) 0 else 1)
@@ -165,6 +181,7 @@ internal class EpubCurlOverlay(
 
     /** Hides + frees the overlay after a turn settles (or to abort). */
     fun dismiss() {
+        removeCallbacks(safetyDismissRunnable)
         active = false
         visibility = GONE
         recycleBitmaps()
@@ -178,5 +195,10 @@ internal class EpubCurlOverlay(
         revealedBitmap?.let { if (!it.isRecycled) it.recycle() }
         frontBitmap = null
         revealedBitmap = null
+    }
+
+    private companion object {
+        /** Timeout before auto-dismissing a curl that never settles (GL error / synthetic DOWN missed). */
+        const val SAFETY_DISMISS_MS = 5_000L
     }
 }
