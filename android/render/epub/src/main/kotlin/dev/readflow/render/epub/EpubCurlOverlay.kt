@@ -44,24 +44,33 @@ internal class EpubCurlOverlay(
         private set
 
     /**
-     * True when this is a finger-tracking (跟手) interactive curl rather than a discrete tap turn.
-     * The harism observer may fire prematurely at 0% or 100% curl during tracking; while interactive,
-     * the result is saved to [pendingSettleResult] and deferred until [endInteractive] is called.
+     * True when this is a finger-tracking (跟手) interactive curl. While interactive, harism's
+     * setCurlAnimationObserver fires are ignored — the real settle happens on finger UP via
+     * [endInteractive]. A 500ms fallback guards against harism not re-firing after UP.
      */
     private var interactive = false
-
-    /** Saved settle result from a premature observer fire during finger tracking. */
-    private var pendingSettleResult: Boolean? = null
 
     /** Safety dismiss: if harism never fires setCurlAnimationObserver, force-clean after 5s. */
     private val safetyDismissRunnable = Runnable {
         if (active) {
             interactive = false
-            pendingSettleResult = null
+            removeCallbacks(settleFallbackRunnable)
             active = false
             visibility = GONE
             onTurnSettled?.invoke(false)
             onTurnSettled = null
+            recycleBitmaps()
+        }
+    }
+
+    /** Fallback settle for interactive mode: if harism doesn't re-fire observer after UP. */
+    private val settleFallbackRunnable = Runnable {
+        if (active) {
+            active = false
+            visibility = GONE
+            val cb = onTurnSettled
+            onTurnSettled = null
+            cb?.invoke(false)  // force spring-back
             recycleBitmaps()
         }
     }
@@ -114,17 +123,16 @@ internal class EpubCurlOverlay(
         addView(curlView, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         curlView.setCurlAnimationObserver { idx ->
             removeCallbacks(safetyDismissRunnable)
+            removeCallbacks(settleFallbackRunnable)
             // Direction-aware commit: a forward turn starts at index 0 and commits once it reaches 1; a
             // backward turn starts at index 1 and commits once it reaches 0. A spring-back leaves the
             // index unchanged, so it reports not-committed.
             val committed = if (forward) idx >= 1 else idx <= 0
             if (interactive) {
                 // Harism may fire the observer during finger tracking when the curl reaches 0% or 100%.
-                // Defer processing until endInteractive() is called (finger lifted).
-                pendingSettleResult = committed
+                // Ignore; the real settle happens after finger UP when harism re-fires the observer.
                 return@setCurlAnimationObserver
             }
-            pendingSettleResult = null
             active = false
             val cb = onTurnSettled
             onTurnSettled = null
@@ -145,13 +153,13 @@ internal class EpubCurlOverlay(
         revealedBitmap = revealed
         this.forward = forward
         this.interactive = forInteractive
-        pendingSettleResult = null
         onTurnSettled = settled
         active = true
         visibility = VISIBLE
         // Safety timeout: if the curl never settles (GL error, synthetic DOWN not triggering harism state),
         // force-dismiss after 5s so turnInFlight doesn't stay stuck forever (审计: active 卡死 → 所有翻页失效).
         removeCallbacks(safetyDismissRunnable)
+        removeCallbacks(settleFallbackRunnable)
         postDelayed(safetyDismissRunnable, SAFETY_DISMISS_MS)
         // Forward curls the page at index 0 over to reveal 1; backward starts parked on 1 and curls the
         // index-0 page back in from the left. setCurrentIndex re-runs the provider for the new anchor.
@@ -202,33 +210,20 @@ internal class EpubCurlOverlay(
 
     /**
      * Called by the host when the finger is lifted (ACTION_UP) during an interactive curl.
-     * If the observer already fired during tracking, process the deferred result immediately.
-     * If not, let the observer fire naturally (harism will settle after receiving the UP
-     * forwarded via [forwardTouch]).
+     * Sets interactive=false so the next observer fire (from harism settling after UP)
+     * processes normally. A 500ms fallback guards against harism not re-firing.
      */
     fun endInteractive() {
         if (!interactive) return
         interactive = false
-        val committed = pendingSettleResult
-        pendingSettleResult = null
-        if (committed != null) {
-            // Observer already fired during tracking — process the deferred result now.
-            active = false
-            visibility = GONE
-            val cb = onTurnSettled
-            onTurnSettled = null
-            cb?.invoke(committed)
-            recycleBitmaps()
-        }
-        // If committed is null (observer hasn't fired yet), harism will settle after
-        // the UP forwarded via forwardTouch and fire the observer normally.
+        postDelayed(settleFallbackRunnable, SETTLE_FALLBACK_MS)
     }
 
     /** Hides + frees the overlay after a turn settles (or to abort). */
     fun dismiss() {
         removeCallbacks(safetyDismissRunnable)
+        removeCallbacks(settleFallbackRunnable)
         interactive = false
-        pendingSettleResult = null
         active = false
         visibility = GONE
         recycleBitmaps()
@@ -247,5 +242,7 @@ internal class EpubCurlOverlay(
     private companion object {
         /** Timeout before auto-dismissing a curl that never settles (GL error / synthetic DOWN missed). */
         const val SAFETY_DISMISS_MS = 5_000L
+        /** After finger UP in interactive mode, wait this long for harism to re-fire the observer. */
+        const val SETTLE_FALLBACK_MS = 500L
     }
 }
