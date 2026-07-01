@@ -661,7 +661,7 @@ internal class EpubFlowView(
             container.draw(canvas)
         }
         bmp
-    } catch (_: OutOfMemoryError) {
+    } catch (_: Exception) {
         null
     }
 
@@ -693,7 +693,7 @@ internal class EpubFlowView(
             container.draw(canvas)
             canvas.restoreToCount(save)
             bmp
-        } catch (_: OutOfMemoryError) {
+        } catch (_: Exception) {
             null
         }
     }
