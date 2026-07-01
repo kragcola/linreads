@@ -727,7 +727,10 @@ internal class EpubFlowView(
             container.draw(canvas)
         }
         bmp
-    } catch (_: Exception) {
+    } catch (_: Throwable) {
+        // Throwable, not Exception: Bitmap.createBitmap on a large tablet page can throw
+        // OutOfMemoryError (an Error, not an Exception) — catching only Exception would let it crash
+        // instead of falling back to a plain goToPage. Also covers draw-time runtime exceptions.
         null
     }
 
@@ -759,7 +762,9 @@ internal class EpubFlowView(
             container.draw(canvas)
             canvas.restoreToCount(save)
             bmp
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
+            // Throwable, not Exception: Bitmap.createBitmap can OOM (an Error) on a large tablet page;
+            // catching only Exception would crash instead of returning null → caller falls back cleanly.
             null
         }
     }
