@@ -110,6 +110,17 @@ internal class EpubFlowView(
         curlOverlay = created
         return created
     }
+    /**
+     * True while ANY page-turn animation is in flight — the GPU slide/curl [ValueAnimator], a
+     * finger-tracked GL curl ([glInteractive]), or a discrete GL curl still settling in the overlay
+     * ([EpubCurlOverlay.active]). A new turn requested while this holds must be dropped: the slide guard
+     * alone missed the GL cases, so a tap mid-curl fell through to the slide path and double-committed
+     * (审计: 图文页乱翻 — 一次翻好几页 / 几次都在一页). Reflows also defer on this so the paged array can't
+     * be rebuilt out from under a pending GL settle.
+     */
+    private val turnInFlight: Boolean
+        get() = flipAnimator?.isRunning == true || glInteractive || curlOverlay?.active == true
+
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
@@ -191,14 +202,16 @@ internal class EpubFlowView(
 
     /**
      * Single coalesced reaction to an async-image reflow: re-paginate against the grown layout and
-     * re-anchor the parked page to the same content line. Deferred while a page-flip curl is running
-     * (a mid-flip scrollTo would tear the animation); it re-arms itself for after the flip ends.
+     * re-anchor the parked page to the same content line. Deferred while ANY page turn is in flight —
+     * a slide/curl animation, a finger curl, or a GL curl still settling: a mid-turn repaginate would
+     * rebuild the page array under a pending GL settle (→ lands on the wrong page) or tear the animation.
+     * It re-arms itself for after the turn ends.
      */
     private val reflowRunnable: Runnable = Runnable {
         val layout = textView.layout ?: return@Runnable
         if (flow == null || layout.height <= 0) return@Runnable
         if (layout.height == paginatedLayoutHeight) return@Runnable
-        if (flipAnimator?.isRunning == true) {
+        if (turnInFlight) {
             postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
             return@Runnable
         }
@@ -542,8 +555,9 @@ internal class EpubFlowView(
         }
         // A single tap can dispatch through both intercept and touch paths, firing the flip twice a
         // few ms apart; the second cancels the first at progress 0 (invisible) AND skips a page. Ignore
-        // any new turn while one is already animating — also debounces an over-eager double-tap.
-        if (flipAnimator?.isRunning == true) return
+        // any new turn while one is already animating — slide, finger curl, OR a GL curl still settling
+        // (审计: 图文页乱翻). Also debounces an over-eager double-tap.
+        if (turnInFlight) return
         // Snap the outgoing page to its own top with the clip re-armed BEFORE snapshotting: after a
         // middle-column free scroll scrollY sits mid-page with pageClipActive off, so an un-snapped
         // snapshot would carry the next/prev page's half-line at top & bottom and slide it away (审计:
