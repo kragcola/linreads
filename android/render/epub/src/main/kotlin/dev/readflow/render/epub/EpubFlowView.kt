@@ -495,7 +495,6 @@ internal class EpubFlowView(
      * false at a chapter boundary (caller loads the adjacent spine — Phase 4 cross-chapter advance).
      */
     fun goToAdjacentPage(delta: Int): Boolean {
-        if (turnInFlight) abortInFlightTurn()
         if (mode == Mode.PAGED) {
             if (paged.isEmpty()) return false
             // Re-anchor to the page currently visible: after a middle-zone free-scroll the user may
@@ -543,21 +542,6 @@ internal class EpubFlowView(
     }
 
     /**
-     * Aborts any in-flight turn (slide animator, finger curl, or GL curl overlay) so the next turn
-     * starts from a clean slate instead of being silently dropped (审计: 乱翻 — turnInFlight 静默丢弃导致
-     * 位置脱节后积压的翻页突然执行; 翻页动画失效 — rapid double-tap 第二下无反应).
-     */
-    private fun abortInFlightTurn() {
-        flipAnimator?.cancel()
-        clearFlipOverlay()
-        if (glInteractive || curlOverlay?.active == true) {
-            curlOverlay?.dismiss()
-            glInteractive = false
-        }
-        interactiveCurl = false
-    }
-
-    /**
      * Page turn with a hardware slide (滑动翻页): snapshot the current page, jump the real content to
      * the target, then slide the snapshot of the OUTGOING page off-screen while the incoming page (the
      * real content) slides in beside it (see [PageSlideDrawable]). Falls
@@ -569,6 +553,11 @@ internal class EpubFlowView(
             goToPage(target)
             return
         }
+        // Debounce: prevent a second turn from starting while an animation is still in flight
+        // (rapid double-tap). The turn is silently dropped to avoid double-committing — the user
+        // can tap again once the current animation settles. Combined with EpubCurlOverlay's
+        // 5s safety timeout, this also prevents turns when a GL curl is stuck active.
+        if (turnInFlight) return
         // Snap the outgoing page to its own top with the clip re-armed BEFORE snapshotting: after a
         // middle-column free scroll scrollY sits mid-page with pageClipActive off, so an un-snapped
         // snapshot would carry the next/prev page's half-line at top & bottom and slide it away (审计:
