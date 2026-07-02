@@ -17,6 +17,7 @@ import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
 import android.widget.ScrollView
 import dev.readflow.render.api.SelectionAwareTextView
+import dev.readflow.render.api.R as RenderApiR
 import kotlin.math.abs
 
 /**
@@ -26,9 +27,9 @@ import kotlin.math.abs
  *
  * Touch is owned end-to-end (审计 H4/H5), mirroring Moon+ Reader / FBReader: a [GestureDetector]
  * classifies tap / long-press / scroll; selection is gated behind long-press so it never fights
- * page turns. PAGED: edge tap or horizontal/non-middle drag flips a page (animated curl); a
- * vertical drag STARTING in the centre column (middle 1/3 of width, full height) becomes a free
- * native scroll that stays where released (no snap). SCROLL: free scroll throughout.
+ * page turns. PAGED: edge tap or non-center drag can flip a page (animated curl); the center
+ * 1/3 x 1/3 box is a no-curl dead zone, and only its inner 1/5 x 1/5 box can become temporary
+ * scroll on vertical drag. SCROLL: free scroll throughout.
  *
  * The resume anchor is always the char offset of the top-visible line (font-size stable), never a
  * page index.
@@ -52,6 +53,7 @@ internal class EpubFlowView(
 
     var mode: Mode = Mode.PAGED
         set(value) {
+            if (field != value) recycleCachedTextures()
             field = value
             repaginate()
         }
@@ -83,8 +85,10 @@ internal class EpubFlowView(
     private var inSelectionMode = false
     private var classified = false
     private var freeScrolling = false
+    private var centerDeadGesture = false
     private var flipped = false
     private var stealing = false
+    private var pendingCleanTapX: Float? = null
 
     /**
      * Page-turn animation style (PAGED only). SLIDE = hardware overlay slide (default, GPU-composited);
@@ -98,15 +102,15 @@ internal class EpubFlowView(
      * first SIMULATION turn (so SLIDE/NONE readers never allocate a GL context), then cached here. A null
      * factory or a factory that fails → SIMULATION degrades to the slide path (never crashes the reader).
      */
-    var curlOverlay: EpubCurlOverlay? = null
-    var curlOverlayFactory: (() -> EpubCurlOverlay?)? = null
+    var curlOverlay: EpubCurlTurnOverlay? = null
+    var curlOverlayFactory: (() -> EpubCurlTurnOverlay?)? = null
     private val pageTurnAnimated: Boolean get() = flipStyle != dev.readflow.core.model.PageFlipStyle.NONE
     private val useGlCurl: Boolean
         get() = flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION &&
             (curlOverlay != null || curlOverlayFactory != null)
 
     /** Lazily creates (once) + returns the GL overlay, or null if unavailable / creation failed. */
-    private fun obtainCurlOverlay(): EpubCurlOverlay? {
+    private fun obtainCurlOverlay(): EpubCurlTurnOverlay? {
         curlOverlay?.let { return it }
         val created = runCatching { curlOverlayFactory?.invoke() }.getOrNull()
         curlOverlay = created
@@ -145,20 +149,54 @@ internal class EpubFlowView(
     private var cachedRevealedBitmap: Bitmap? = null
     private var cachedFromPage: Int = -1
     private var cachedTargetPage: Int = -1
+    private var cachedFromTopPx: Int = -1
+    private var cachedTargetTopPx: Int = -1
 
     private fun preCachePageTextures() {
         if (mode != Mode.PAGED || paged.isEmpty() || width == 0) return
+        if (turnInFlight) return
         val idx = currentPage
         val nextIdx = (idx + 1).coerceAtMost(paged.lastIndex)
-        if (idx == cachedFromPage && nextIdx == cachedTargetPage) return
+        val parkedTop = canonicalScrollTopForPage(idx) ?: return
+        val fromTop = textureTopPxForPage(idx) ?: return
+        val targetTop = textureTopPxForPage(nextIdx) ?: return
+        if (scrollY != parkedTop) {
+            recycleCachedTextures()
+            return
+        }
+        val cacheBitmapsAlive =
+            cachedFrontBitmap?.isRecycled == false &&
+                cachedRevealedBitmap?.isRecycled == false
+        if (
+            cacheBitmapsAlive &&
+            idx == cachedFromPage &&
+            nextIdx == cachedTargetPage &&
+            fromTop == cachedFromTopPx &&
+            targetTop == cachedTargetTopPx
+        ) return
         recycleCachedTextures()
         post {
-            val fromTop = pageTopPxAt(idx) ?: return@post
-            val targetTop = pageTopPxAt(nextIdx) ?: return@post
-            cachedFrontBitmap = snapshotPageAt(fromTop)
-            cachedRevealedBitmap = snapshotPageAt(targetTop)
+            if (
+                turnInFlight ||
+                scrollY != parkedTop ||
+                currentPage != idx ||
+                textureTopPxForPage(idx) != fromTop ||
+                textureTopPxForPage(nextIdx) != targetTop
+            ) return@post
+            val front = snapshotPageAt(fromTop)
+            val revealed = if (front != null) snapshotPageAt(targetTop) else null
+            if (front == null || revealed == null) {
+                front?.recycle()
+                revealed?.recycle()
+                recycleCachedTextures()
+                return@post
+            }
+            cachedFrontBitmap = front
+            cachedRevealedBitmap = revealed
             cachedFromPage = idx
             cachedTargetPage = nextIdx
+            cachedFromTopPx = fromTop
+            cachedTargetTopPx = targetTop
         }
     }
 
@@ -169,6 +207,26 @@ internal class EpubFlowView(
         cachedRevealedBitmap = null
         cachedFromPage = -1
         cachedTargetPage = -1
+        cachedFromTopPx = -1
+        cachedTargetTopPx = -1
+    }
+
+    private fun recycleCachedTexturesIfStaleForTurn(
+        fromPage: Int,
+        fromTop: Int,
+        targetPage: Int,
+        targetTop: Int,
+    ) {
+        if (cachedFrontBitmap == null && cachedRevealedBitmap == null) return
+        val cacheBitmapsAlive =
+            cachedFrontBitmap?.isRecycled == false &&
+                cachedRevealedBitmap?.isRecycled == false
+        val cacheMatchesCurrentAnchors =
+            fromPage == cachedFromPage &&
+                targetPage == cachedTargetPage &&
+                fromTop == cachedFromTopPx &&
+                targetTop == cachedTargetTopPx
+        if (!cacheBitmapsAlive || !cacheMatchesCurrentAnchors) recycleCachedTextures()
     }
 
     // ---- Finger-tracking (跟手) interactive slide ----------------------------------------------
@@ -202,8 +260,10 @@ internal class EpubFlowView(
         }
 
         override fun onSingleTapUp(e: MotionEvent): Boolean {
-            // Only a clean tap (no drag, no long-press) turns a page / toggles chrome.
-            if (!classified && !inSelectionMode) handleTap(e.x)
+            // Only a clean tap (no drag, no long-press) turns a page / toggles chrome. Defer the
+            // action until dispatch finishes so child ClickableSpan taps can report that they consumed
+            // the same UP first.
+            if (!classified && !inSelectionMode) pendingCleanTapX = e.x
             return false
         }
     })
@@ -251,6 +311,7 @@ internal class EpubFlowView(
             return@Runnable
         }
         val anchorOffset = if (paged.isNotEmpty()) topLayoutOffset() else -1
+        recycleCachedTextures()
         repaginate(reposition = false)
         if (anchorOffset >= 0) goToOffset(anchorOffset)
     }
@@ -538,21 +599,7 @@ internal class EpubFlowView(
     fun goToAdjacentPage(delta: Int): Boolean {
         if (mode == Mode.PAGED) {
             if (paged.isEmpty()) return false
-            // Re-anchor to the page currently visible: after a middle-zone free-scroll the user may
-            // be parked between page tops, so resume paged turns from where they actually are
-            // (统一两种模式 — PAGED and free-scroll share one scroll position).
-            // The final page is a short remainder whose topPx exceeds maxScroll, so ScrollView clamps
-            // goToPage(lastIndex) to maxScroll; deriving the anchor purely from the clamped scrollY can
-            // never resolve to lastIndex, which would trap paging one page before the chapter end and
-            // never report the boundary (no cross-spine advance). Snap the anchor to lastIndex once we
-            // are parked at the scroll extreme.
-            val maxScroll = (container.height - height).coerceAtLeast(0)
-            val anchor = if (scrollY >= maxScroll) {
-                paged.lastIndex
-            } else {
-                paged.indexOfLast { it.topPx <= scrollY }.coerceAtLeast(0)
-            }
-            currentPage = anchor
+            val anchor = snapToNearestCanonicalPageAnchor(report = false)
             val target = anchor + delta
             if (target < 0 || target > paged.lastIndex) return false
             goToPageAnimated(target, forward = delta > 0)
@@ -569,6 +616,45 @@ internal class EpubFlowView(
 
     fun goToPage(index: Int) = scrollToPage(index, report = true)
 
+    private fun canonicalScrollTopForPage(index: Int): Int? {
+        if (mode != Mode.PAGED || paged.isEmpty() || index !in paged.indices) return null
+        val maxScroll = (container.height - height).coerceAtLeast(0)
+        return paged[index].topPx.coerceIn(0, maxScroll)
+    }
+
+    private fun textureTopPxForPage(index: Int): Int? =
+        canonicalScrollTopForPage(index)
+
+    private fun nearestCanonicalPageIndexForScrollY(y: Int): Int {
+        if (paged.isEmpty()) return 0
+        val maxScroll = (container.height - height).coerceAtLeast(0)
+        val clamped = y.coerceIn(0, maxScroll)
+        var bestIndex = 0
+        var bestDistance = Int.MAX_VALUE
+        paged.forEachIndexed { index, page ->
+            val top = page.topPx.coerceIn(0, maxScroll)
+            val distance = abs(top - clamped)
+            if (distance < bestDistance || (distance == bestDistance && top <= clamped)) {
+                bestIndex = index
+                bestDistance = distance
+            }
+        }
+        return bestIndex
+    }
+
+    private fun snapToNearestCanonicalPageAnchor(report: Boolean): Int {
+        if (mode != Mode.PAGED || paged.isEmpty()) return currentPage
+        val targetPage = nearestCanonicalPageIndexForScrollY(scrollY)
+        val targetTop = canonicalScrollTopForPage(targetPage) ?: return currentPage
+        if (currentPage != targetPage || scrollY != targetTop) recycleCachedTextures()
+        currentPage = targetPage
+        pageClipActive = true
+        if (scrollY != targetTop) scrollTo(0, targetTop)
+        if (report) reportTopOffset()
+        invalidate()
+        return currentPage
+    }
+
     /**
      * Snaps to page [index]'s top. [report] gates the locator callback: the interactive curl parks the
      * incoming page (and snaps the outgoing one clean for the snapshot) BEFORE the turn is committed, so
@@ -578,7 +664,7 @@ internal class EpubFlowView(
         if (mode != Mode.PAGED || paged.isEmpty()) return
         currentPage = index.coerceIn(0, paged.lastIndex)
         pageClipActive = true
-        scrollTo(0, paged[currentPage].topPx)
+        scrollTo(0, canonicalScrollTopForPage(currentPage) ?: paged[currentPage].topPx)
         if (report) reportTopOffset()
     }
 
@@ -633,16 +719,25 @@ internal class EpubFlowView(
         if (overlay.active) return false
         return runCatching {
             // Use pre-cached textures when available (avoids live snapshot on image-text pages).
-            val front = if (fromPage == cachedFromPage && cachedFrontBitmap != null) {
+            val fromTop = textureTopPxForPage(fromPage) ?: return@runCatching false
+            val targetTop = textureTopPxForPage(target) ?: return@runCatching false
+            recycleCachedTexturesIfStaleForTurn(fromPage, fromTop, target, targetTop)
+            val front = if (
+                fromPage == cachedFromPage &&
+                fromTop == cachedFromTopPx &&
+                cachedFrontBitmap != null
+            ) {
                 cachedFrontBitmap?.copy(Bitmap.Config.RGB_565, false)
             } else {
-                val fromTop = pageTopPxAt(fromPage) ?: return@runCatching false
                 snapshotPageAt(fromTop)
             } ?: return@runCatching false
-            val revealed = if (target == cachedTargetPage && cachedRevealedBitmap != null) {
+            val revealed = if (
+                target == cachedTargetPage &&
+                targetTop == cachedTargetTopPx &&
+                cachedRevealedBitmap != null
+            ) {
                 cachedRevealedBitmap?.copy(Bitmap.Config.RGB_565, false)
             } else {
-                val targetTop = pageTopPxAt(target) ?: run { front.recycle(); return@runCatching false }
                 snapshotPageAt(targetTop)
             } ?: run { front.recycle(); return@runCatching false }
             overlay.start(front, revealed, forward) { committed ->
@@ -669,23 +764,30 @@ internal class EpubFlowView(
         if (mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
         val overlay = obtainCurlOverlay() ?: return false
         if (overlay.active) return false
-        val maxScroll = (container.height - height).coerceAtLeast(0)
-        val from = if (scrollY >= maxScroll) paged.lastIndex
-            else paged.indexOfLast { it.topPx <= scrollY }.coerceAtLeast(0)
+        val from = snapToNearestCanonicalPageAnchor(report = false)
         val target = from + if (forward) 1 else -1
         if (target < 0 || target > paged.lastIndex) return false
         return runCatching {
             // Use pre-cached textures when available (Moon+ model: no live snapshot under finger).
-            val front = if (from == cachedFromPage && cachedFrontBitmap != null) {
+            val fromTop = textureTopPxForPage(from) ?: return@runCatching false
+            val targetTop = textureTopPxForPage(target) ?: return@runCatching false
+            recycleCachedTexturesIfStaleForTurn(from, fromTop, target, targetTop)
+            val front = if (
+                from == cachedFromPage &&
+                fromTop == cachedFromTopPx &&
+                cachedFrontBitmap != null
+            ) {
                 cachedFrontBitmap?.copy(Bitmap.Config.RGB_565, false)
             } else {
-                val fromTop = pageTopPxAt(from) ?: return@runCatching false
                 snapshotPageAt(fromTop)
             } ?: return@runCatching false
-            val revealed = if (target == cachedTargetPage && cachedRevealedBitmap != null) {
+            val revealed = if (
+                target == cachedTargetPage &&
+                targetTop == cachedTargetTopPx &&
+                cachedRevealedBitmap != null
+            ) {
                 cachedRevealedBitmap?.copy(Bitmap.Config.RGB_565, false)
             } else {
-                val targetTop = pageTopPxAt(target) ?: run { front.recycle(); return@runCatching false }
                 snapshotPageAt(targetTop)
             } ?: run { front.recycle(); return@runCatching false }
             overlay.start(front, revealed, forward) { committed ->
@@ -860,9 +962,7 @@ internal class EpubFlowView(
     private fun beginInteractiveCurl(forward: Boolean, anchorX: Float): Boolean {
         if (!pageTurnAnimated || mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
         if (flipAnimator?.isRunning == true) return false
-        val maxScroll = (container.height - height).coerceAtLeast(0)
-        val from = if (scrollY >= maxScroll) paged.lastIndex
-            else paged.indexOfLast { it.topPx <= scrollY }.coerceAtLeast(0)
+        val from = snapToNearestCanonicalPageAnchor(report = false)
         val target = from + if (forward) 1 else -1
         if (target < 0 || target > paged.lastIndex) return false
         // Snap the outgoing page to its own top so the snapshot is the clean page (a mid-page free
@@ -949,9 +1049,9 @@ internal class EpubFlowView(
 
     /**
      * Snaps [scrollY] to the nearest line top and re-arms the page clip — turning a middle-column free
-     * scroll's resting position into a clean, half-line-free page (静读天下: 滚动无缝变成翻页). Re-anchors
-     * [currentPage] to the page whose top is at/above the snapped position so paged navigation resumes
-     * from where the reader actually is.
+     * scroll's resting position into a clean, half-line-free page (静读天下: 滚动无缝变成翻页). Tracks the
+     * nearest canonical page anchor and clears turn textures; the next turn must snap to that anchor
+     * before preview/curl starts.
      */
     private fun snapToNearestLineTop() {
         val layout = textView.layout ?: return
@@ -965,7 +1065,8 @@ internal class EpubFlowView(
         pageClipActive = true
         if (target != scrollY) scrollTo(0, target)
         if (paged.isNotEmpty()) {
-            currentPage = paged.indexOfLast { it.topPx <= target }.coerceAtLeast(0)
+            currentPage = nearestCanonicalPageIndexForScrollY(target)
+            recycleCachedTextures()
         }
         invalidate()
     }
@@ -997,13 +1098,12 @@ internal class EpubFlowView(
     // ---- Touch FSM (owned end-to-end; selection gated behind long-press) ----------------------
 
     /**
-     * Moon+ Reader's temporary-scroll trigger: the centre vertical COLUMN (middle 1/3 of the width),
-     * spanning the FULL height — not a small centre box. A vertical drag anywhere down this column
-     * becomes a free scroll; the left/right columns stay reserved for page flips. Widening the old
-     * 1/3×1/3 box to a full-height column makes the gesture far easier to land (审计: trigger zone).
+     * MoonReader-inspired PAGED routing: center 1/3 x 1/3 is a no-curl dead zone, and only the
+     * inner 1/5 x 1/5 box can become temporary scroll. Everything outside that center square stays
+     * available for the existing page-turn gesture path.
      */
-    private fun inMiddleColumn(x: Float): Boolean =
-        x > width / 3f && x < width * 2f / 3f
+    private fun pagedTouchZoneAtDown(): EpubPagedTouchZone =
+        EpubPagedTouchZones.classify(width, height, downX, downY)
 
     /**
      * The [GestureDetector] sees the whole stream here (intercept runs before any child consumes),
@@ -1012,6 +1112,28 @@ internal class EpubFlowView(
      * keeps the events it needs for native long-press selection (the bug a prior always-intercept
      * version introduced). SCROLL mode steals every drag.
      */
+    @SuppressLint("ClickableViewAccessibility")
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            pendingCleanTapX = null
+        }
+        val handled = super.dispatchTouchEvent(ev)
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_UP -> {
+                val tapX = pendingCleanTapX
+                pendingCleanTapX = null
+                if (tapX != null && !classified && !inSelectionMode && !textInteractiveTapWasConsumed()) {
+                    handleTap(tapX)
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> pendingCleanTapX = null
+        }
+        return handled
+    }
+
+    private fun textInteractiveTapWasConsumed(): Boolean =
+        textView.getTag(RenderApiR.id.selection_aware_interactive_tap_consumed) == true
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
         gestureDetector.onTouchEvent(ev)
@@ -1023,6 +1145,7 @@ internal class EpubFlowView(
                 lastY = ev.y
                 classified = false
                 freeScrolling = false
+                centerDeadGesture = false
                 flipped = false
                 inSelectionMode = false
                 stealing = false
@@ -1037,9 +1160,14 @@ internal class EpubFlowView(
                 if (!classified && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
                     classified = true
                     val verticalDominant = abs(dy) >= abs(dx)
-                    freeScrolling = mode == Mode.SCROLL || (verticalDominant && inMiddleColumn(downX))
-                    // A centre-column free scroll is continuous (Moon+ temporary-scroll) — drop the
-                    // page clip so the reader can peek across the boundary; the next flip restores it.
+                    val pagedZone = if (mode == Mode.PAGED) pagedTouchZoneAtDown() else null
+                    freeScrolling = mode == Mode.SCROLL ||
+                        (verticalDominant && pagedZone == EpubPagedTouchZone.TemporaryScroll)
+                    centerDeadGesture = mode == Mode.PAGED &&
+                        !freeScrolling &&
+                        pagedZone != EpubPagedTouchZone.PageTurn
+                    // Inner-center temporary scroll is continuous; drop the page clip so the reader can
+                    // peek across the boundary. The next flip restores it through the canonical anchor gate.
                     if (freeScrolling && mode == Mode.PAGED) {
                         pageClipActive = false
                         invalidate()
@@ -1065,6 +1193,7 @@ internal class EpubFlowView(
                 lastY = ev.y
                 classified = false
                 freeScrolling = false
+                centerDeadGesture = false
                 flipped = false
                 inSelectionMode = false
                 glInteractive = false
@@ -1079,7 +1208,12 @@ internal class EpubFlowView(
                 if (!classified && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
                     classified = true
                     val verticalDominant = abs(dy) >= abs(dx)
-                    freeScrolling = mode == Mode.SCROLL || (verticalDominant && inMiddleColumn(downX))
+                    val pagedZone = if (mode == Mode.PAGED) pagedTouchZoneAtDown() else null
+                    freeScrolling = mode == Mode.SCROLL ||
+                        (verticalDominant && pagedZone == EpubPagedTouchZone.TemporaryScroll)
+                    centerDeadGesture = mode == Mode.PAGED &&
+                        !freeScrolling &&
+                        pagedZone != EpubPagedTouchZone.PageTurn
                     if (freeScrolling && mode == Mode.PAGED) {
                         pageClipActive = false
                         invalidate()
@@ -1087,12 +1221,14 @@ internal class EpubFlowView(
                     lastY = ev.y
                 }
                 if (classified && freeScrolling) {
-                    // Drive the scroll ourselves: stays exactly where released (no snap, no fling).
+                    // Drive the temporary scroll ourselves; release snaps to a clean line top below.
                     val deltaY = (lastY - ev.y).toInt()
                     val maxScroll = (container.height - height).coerceAtLeast(0)
                     val target = (scrollY + deltaY).coerceIn(0, maxScroll)
                     if (target != scrollY) scrollTo(0, target)
                     lastY = ev.y
+                } else if (classified && centerDeadGesture) {
+                    // Consume the center ring without turning a page or moving content.
                 } else if (classified && !freeScrolling) {
                     driveFlip(dx, dy, ev)
                 }
@@ -1108,10 +1244,8 @@ internal class EpubFlowView(
                     val vx = computeVelocityX()
                     endInteractiveCurl(vx)
                 } else if (freeScrolling) {
-                    // A middle-column free scroll (Moon+ temporary-scroll) leaves scrollY mid-grid with
-                    // the page clip off → top/bottom show half-lines. On release, snap to the nearest line
-                    // top and re-arm the clip so the scroll seamlessly resolves into a clean page (静读天下:
-                    // 滚动无缝变成翻页). This overrides Moon+'s accept-half-line-while-scrolling on purpose.
+                    // Temporary scroll may leave scrollY mid-grid with the page clip off, exposing
+                    // boundary content. On release, snap to the nearest line top and re-arm the clip.
                     if (mode == Mode.PAGED) snapToNearestLineTop()
                     reportTopOffset()
                 }
@@ -1124,7 +1258,15 @@ internal class EpubFlowView(
                     glInteractive = false
                 } else if (interactiveCurl) {
                     endInteractiveCurl(0f)
+                } else if (freeScrolling && mode == Mode.PAGED) {
+                    snapToNearestLineTop()
+                    reportTopOffset()
                 }
+                classified = false
+                freeScrolling = false
+                centerDeadGesture = false
+                inSelectionMode = false
+                stealing = false
                 recycleTracker()
                 return true
             }

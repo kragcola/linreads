@@ -10,6 +10,18 @@ import android.widget.FrameLayout
 import fi.harism.curl.CurlPage
 import fi.harism.curl.CurlView
 
+internal interface EpubCurlTurnOverlay {
+    val active: Boolean
+
+    fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, settled: (committed: Boolean) -> Unit)
+
+    fun animateTurn(durationMs: Long)
+
+    fun forwardTouch(ev: MotionEvent)
+
+    fun dismiss()
+}
+
 /**
  * Transient OpenGL page-curl overlay (仿真翻页, harism android-pagecurl Apache-2.0 engine). Shown only
  * during a SIMULATION page turn over the reading area, then removed. It holds exactly TWO pages — the
@@ -24,7 +36,7 @@ import fi.harism.curl.CurlView
  */
 internal class EpubCurlOverlay(
     context: Context,
-) : FrameLayout(context) {
+) : FrameLayout(context), EpubCurlTurnOverlay {
 
     /**
      * Back-face tint (Moon+ 反字: the curled underside shows this page's own content, mirrored by the
@@ -40,14 +52,17 @@ internal class EpubCurlOverlay(
     /** Per-turn settle callback (committed = whether the turn advanced to the revealed page). */
     private var onTurnSettled: ((committed: Boolean) -> Unit)? = null
     /** True between start() and the settle callback — gates touch forwarding + double-starts. */
-    var active = false
+    override var active = false
         private set
+    private var pendingDiscreteTurnDurationMs: Long? = null
+    private var pendingDiscreteTurnPosted = false
 
     /** Safety dismiss: if harism never fires setCurlAnimationObserver, force-clean after 5s. */
     private val safetyDismissRunnable = Runnable {
         if (active) {
             active = false
             visibility = GONE
+            clearPendingDiscreteTurn()
             onTurnSettled?.invoke(false)
             onTurnSettled = null
             recycleBitmaps()
@@ -107,6 +122,7 @@ internal class EpubCurlOverlay(
             // index unchanged, so it reports not-committed.
             val committed = if (forward) idx >= 1 else idx <= 0
             active = false
+            clearPendingDiscreteTurn()
             val cb = onTurnSettled
             onTurnSettled = null
             cb?.invoke(committed)
@@ -120,13 +136,14 @@ internal class EpubCurlOverlay(
      * animation finishes. The overlay becomes visible; the caller then either drives a discrete tap turn
      * via [animateTurn], or hands off a live finger drag via [forwardTouch] (real touch events replayed).
      */
-    fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, settled: (committed: Boolean) -> Unit) {
+    override fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, settled: (committed: Boolean) -> Unit) {
         recycleBitmaps()
         frontBitmap = front
         revealedBitmap = revealed
         this.forward = forward
         onTurnSettled = settled
         active = true
+        clearPendingDiscreteTurn()
         visibility = VISIBLE
         // Safety timeout: if the curl never settles (GL error, synthetic DOWN not triggering harism state),
         // force-dismiss after 5s so turnInFlight doesn't stay stuck forever (审计: active 卡死 → 所有翻页失效).
@@ -143,23 +160,51 @@ internal class EpubCurlOverlay(
      * and commits the index — a complete, visible curl (not the one-frame flash the old synthetic-event
      * burst produced, whose settle had ~0px left to travel; 审计: 翻页一闪而过).
      */
-    fun animateTurn(durationMs: Long) {
+    override fun animateTurn(durationMs: Long) {
         if (!active) return
-        if (width == 0 || height == 0) return
-        curlView.animatePageTurn(forward, durationMs)
+        pendingDiscreteTurnDurationMs = durationMs
+        schedulePendingDiscreteTurn()
+    }
+
+    private fun schedulePendingDiscreteTurn() {
+        if (pendingDiscreteTurnPosted || pendingDiscreteTurnDurationMs == null) return
+        pendingDiscreteTurnPosted = true
+        postOnAnimation {
+            pendingDiscreteTurnPosted = false
+            runPendingDiscreteTurn()
+        }
+    }
+
+    private fun runPendingDiscreteTurn() {
+        val durationMs = pendingDiscreteTurnDurationMs ?: return
+        if (!active) {
+            clearPendingDiscreteTurn()
+            return
+        }
+        if (width == 0 || height == 0 || curlView.width == 0 || curlView.height == 0) {
+            requestLayout()
+            schedulePendingDiscreteTurn()
+            return
+        }
+        if (curlView.animatePageTurn(forward, durationMs)) {
+            clearPendingDiscreteTurn()
+        } else {
+            schedulePendingDiscreteTurn()
+        }
     }
 
     /** Re-dispatches a host touch event into the GL curl view (finger-tracking). */
     @SuppressLint("ClickableViewAccessibility")
-    fun forwardTouch(ev: MotionEvent) {
+    override fun forwardTouch(ev: MotionEvent) {
         if (!active) return
         curlView.dispatchTouchEvent(ev)
     }
 
     /** Hides + frees the overlay after a turn settles (or to abort). */
-    fun dismiss() {
+    override fun dismiss() {
         removeCallbacks(safetyDismissRunnable)
         active = false
+        clearPendingDiscreteTurn()
         visibility = GONE
         recycleBitmaps()
     }
@@ -172,6 +217,11 @@ internal class EpubCurlOverlay(
         revealedBitmap?.let { if (!it.isRecycled) it.recycle() }
         frontBitmap = null
         revealedBitmap = null
+    }
+
+    private fun clearPendingDiscreteTurn() {
+        pendingDiscreteTurnDurationMs = null
+        pendingDiscreteTurnPosted = false
     }
 
     private companion object {

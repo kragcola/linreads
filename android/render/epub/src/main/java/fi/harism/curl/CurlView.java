@@ -133,19 +133,19 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 	 * @param forward    true = advance (curl right→left, ++index); false = go back (curl left→right, --index).
 	 * @param durationMs sweep duration; <=0 keeps the current default.
 	 */
-	public void animatePageTurn(boolean forward, long durationMs) {
+	public boolean animatePageTurn(boolean forward, long durationMs) {
 		if (mPageProvider == null || mAnimate) {
-			return;
+			return false;
 		}
 		RectF rightRect = mRenderer.getPageRect(CurlRenderer.PAGE_RIGHT);
 		RectF leftRect = mRenderer.getPageRect(CurlRenderer.PAGE_LEFT);
 		if (rightRect == null || rightRect.width() == 0) {
-			return;
+			return false;
 		}
 		float midY = (rightRect.top + rightRect.bottom) / 2f;
 		if (forward) {
 			if (mCurrentIndex >= mPageProvider.getPageCount()) {
-				return;
+				return false;
 			}
 			mDragStartPos.set(rightRect.right, midY);
 			startCurl(CURL_RIGHT);
@@ -154,7 +154,7 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 			mAnimationTargetEvent = SET_CURL_TO_LEFT;
 		} else {
 			if (mCurrentIndex <= 0) {
-				return;
+				return false;
 			}
 			mDragStartPos.set(leftRect.left, midY);
 			startCurl(CURL_LEFT);
@@ -168,6 +168,7 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 		mAnimationStartTime = System.currentTimeMillis();
 		mAnimate = true;
 		requestRender();
+		return true;
 	}
 
 	/**
