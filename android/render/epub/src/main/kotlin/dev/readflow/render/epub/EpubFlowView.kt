@@ -820,9 +820,15 @@ internal class EpubFlowView(
         // Clip the content to the outgoing page's bottom so the sliding snapshot shows blank
         // background below the last line — never the next page's bleed (matches on-screen render).
         val clipBottom = pageClipBottomInViewport()
-        if (clipBottom != null) {
+        val top = snapshotClipTopFor(scrollY)
+        if (clipBottom != null || top > scrollY) {
             val save = canvas.save()
-            canvas.clipRect(0, scrollY, width, scrollY + clipBottom)
+            val bottom = if (clipBottom != null) {
+                snapshotClipBottomFor(scrollY, clipBottom)
+            } else {
+                scrollY + height
+            }
+            canvas.clipRect(0, top, width, bottom)
             container.draw(canvas)
             canvas.restoreToCount(save)
         } else {
@@ -852,15 +858,10 @@ internal class EpubFlowView(
                 bg.setBounds(0, topPx, width, topPx + height)
                 bg.draw(canvas)
             }
-            val layout = textView.layout
-            val clipBottom = if (layout != null) {
-                val pageBottom = topPx + height
-                var line = layout.getLineForVertical(pageBottom - 1)
-                if (line > 0 && layout.getLineBottom(line) > pageBottom) line--
-                (layout.getLineBottom(line) - topPx).coerceIn(0, height)
-            } else height
+            val clipTop = snapshotClipTopFor(topPx)
+            val clipBottom = snapshotClipBottomFor(topPx)
             val save = canvas.save()
-            canvas.clipRect(0, topPx, width, topPx + clipBottom)
+            canvas.clipRect(0, clipTop, width, clipBottom)
             container.draw(canvas)
             canvas.restoreToCount(save)
             bmp
@@ -870,6 +871,28 @@ internal class EpubFlowView(
             null
         }
     }
+
+    private fun snapshotClipTopFor(topPx: Int): Int {
+        val layout = textView.layout ?: return topPx
+        val line = layout.getLineForVertical(topPx)
+        return if (layout.getLineTop(line) == topPx) {
+            (topPx + textView.paddingTop).coerceAtMost(topPx + height)
+        } else {
+            topPx
+        }
+    }
+
+    private fun snapshotClipBottomFor(topPx: Int): Int {
+        val layout = textView.layout ?: return topPx + height
+        val pageBottom = topPx + height
+        var line = layout.getLineForVertical(pageBottom - 1)
+        if (line > 0 && layout.getLineBottom(line) > pageBottom) line--
+        val clipBottom = (layout.getLineBottom(line) - topPx).coerceIn(0, height)
+        return snapshotClipBottomFor(topPx, clipBottom)
+    }
+
+    private fun snapshotClipBottomFor(topPx: Int, clipBottom: Int): Int =
+        minOf(topPx + clipBottom + textView.paddingTop, topPx + height)
 
     /** Content-top px of paged index [index], or null if out of range / not paged. */
     fun pageTopPxAt(index: Int): Int? =

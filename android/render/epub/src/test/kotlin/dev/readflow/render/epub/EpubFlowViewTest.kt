@@ -210,6 +210,32 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `page turn snapshots use the same padding clip as paged rendering`() {
+        val view = pagedFlowView(textPaddingTop = 12)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val layout = requireNotNull(view.textView.layout)
+        val topLine = layout.getLineForVertical(pageOneTop)
+        assertEquals("test must use a canonical line-top page", pageOneTop, layout.getLineTop(topLine))
+
+        val pageBottom = pageOneTop + view.height
+        var bottomLine = layout.getLineForVertical(pageBottom - 1)
+        if (bottomLine > 0 && layout.getLineBottom(bottomLine) > pageBottom) bottomLine--
+        val unpaddedClipBottom = (layout.getLineBottom(bottomLine) - pageOneTop).coerceIn(0, view.height)
+
+        assertEquals(
+            "snapshot top clip must drop the same padding strip as dispatchDraw",
+            pageOneTop + view.textView.paddingTop,
+            view.snapshotClipTopForTest(pageOneTop),
+        )
+        assertEquals(
+            "snapshot bottom clip must include TextView padding just like dispatchDraw",
+            minOf(pageOneTop + unpaddedClipBottom + view.textView.paddingTop, pageOneTop + view.height),
+            view.snapshotClipBottomForTest(pageOneTop),
+        )
+    }
+
+    @Test
     fun `next page from clamped final page reports chapter boundary`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -779,6 +805,7 @@ class EpubFlowViewTest {
         onTapZone: (EpubFlowTapZone) -> Unit = {},
         spannable: CharSequence? = null,
         text: String? = null,
+        textPaddingTop: Int = 0,
     ): EpubFlowView {
         val context = RuntimeEnvironment.getApplication() as Application
         val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
@@ -791,6 +818,7 @@ class EpubFlowViewTest {
         activity.addContentView(view, ViewGroup.LayoutParams(360, 120))
         view.flipStyle = flipStyle
         view.textView.textSize = 18f
+        view.textView.setPadding(0, textPaddingTop, 0, 0)
         val chapterText = text ?: (1..80).joinToString("\n") { "Line $it marker text." }
         val block = EpubDisplayBlock.Text(chapterText, headingLevel = null, paragraphIndex = 0)
         val flow = epubBuildChapterFlow(spineIndex = 0, blocks = listOf(block))
@@ -866,6 +894,16 @@ class EpubFlowViewTest {
             .invoke(this)
         if (idlePostedWork) shadowOf(Looper.getMainLooper()).idle()
     }
+
+    private fun EpubFlowView.snapshotClipTopForTest(topPx: Int): Int =
+        javaClass.getDeclaredMethod("snapshotClipTopFor", Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+            .invoke(this, topPx) as Int
+
+    private fun EpubFlowView.snapshotClipBottomForTest(topPx: Int): Int =
+        javaClass.getDeclaredMethod("snapshotClipBottomFor", Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+            .invoke(this, topPx) as Int
 
     private fun EpubFlowView.privateInt(name: String): Int =
         privateField(name) as Int
