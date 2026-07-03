@@ -69,8 +69,16 @@ internal class EpubFlowView(
         }
 
     fun setModeAnchored(value: Mode, layoutOffset: Int) {
+        val hidePagedConversion = modeValue == Mode.SCROLL && value == Mode.PAGED && flow != null
+        if (hidePagedConversion) {
+            removeCallbacks(initialRevealRunnable)
+            container.animate().cancel()
+            awaitingReveal = true
+            container.alpha = 0f
+        }
         applyMode(value, reposition = false)
         goToOffset(layoutOffset, pagedAnchor = PagedAnchor.NEAREST, forceReport = true)
+        if (hidePagedConversion) scheduleInitialReveal()
     }
 
     private fun applyMode(value: Mode, reposition: Boolean) {
@@ -337,7 +345,7 @@ internal class EpubFlowView(
     override fun getBackground(): Drawable? = viewportBackground
 
     override fun draw(canvas: Canvas) {
-        drawViewportBackground(canvas)
+        drawLiveViewportBackground(canvas)
         super.draw(canvas)
     }
 
@@ -565,6 +573,7 @@ internal class EpubFlowView(
         if (height <= 0) return true
         pendingInitialPageTurnDelta = null
         if (mode != Mode.PAGED || paged.isEmpty()) return false
+        finishInitialRevealForTurn()
         if (goToAdjacentPage(delta)) return true
         onTapZone(if (delta > 0) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
         return true
@@ -693,7 +702,7 @@ internal class EpubFlowView(
     fun goToAdjacentPage(delta: Int): Boolean {
         if (delta == 0) return false
         if (mode == Mode.PAGED) {
-            if (awaitingReveal && flow != null) {
+            if (awaitingReveal && flow != null && (height <= 0 || paged.isEmpty())) {
                 pendingInitialPageTurnDelta = delta.coerceIn(-1, 1)
                 if (height > 0) scheduleInitialReveal()
                 return true
@@ -996,10 +1005,17 @@ internal class EpubFlowView(
     }
 
     private fun drawSnapshotBackground(canvas: Canvas) {
-        drawViewportBackground(canvas)
+        drawViewportBackgroundAtOrigin(canvas)
     }
 
-    private fun drawViewportBackground(canvas: Canvas) {
+    private fun drawLiveViewportBackground(canvas: Canvas) {
+        val save = canvas.save()
+        canvas.translate(scrollX.toFloat(), scrollY.toFloat())
+        drawViewportBackgroundAtOrigin(canvas)
+        canvas.restoreToCount(save)
+    }
+
+    private fun drawViewportBackgroundAtOrigin(canvas: Canvas) {
         viewportBackground?.let { bg ->
             bg.setBounds(0, 0, width, height)
             bg.draw(canvas)

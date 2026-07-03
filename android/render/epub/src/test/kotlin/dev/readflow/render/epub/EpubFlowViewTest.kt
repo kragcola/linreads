@@ -4,6 +4,7 @@ import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.ColorFilter
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.drawable.Drawable
 import android.os.Looper
@@ -273,6 +274,29 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `first slide frame preserves scrolled paper texture under the finger`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.background = StripedPaperDrawable()
+        view.goToPage(1)
+        val staticFrame = view.drawAsScrolledChildToBitmapForTest()
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        val fingerDownFrame = view.drawAsScrolledChildToBitmapForTest()
+        val x = view.width - 4
+        val y = 4
+
+        assertEquals(
+            "pressing into the turn layer must not shift the paper-grain phase from the static page",
+            staticFrame.getPixel(x, y),
+            fingerDownFrame.getPixel(x, y),
+        )
+
+        staticFrame.recycle()
+        fingerDownFrame.recycle()
+    }
+
+    @Test
     fun `live paged draw keeps paper background anchored to viewport while scrolled`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -369,21 +393,15 @@ class EpubFlowViewTest {
         view.layout(0, 0, 360, 120)
         shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
 
-        assertEquals(
-            "the queued first tap should wait until the first positioned frame is revealed",
-            null,
-            view.privateField("flipAnimator"),
-        )
-
-        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
-
-        assertNotNull("the queued first tap should start the normal slide animation once reveal is ready", view.privateField("flipAnimator"))
+        assertEquals("the queued first tap should finish reveal once the first measured frame is positioned", false, view.privateBool("awaitingReveal"))
+        assertEquals(1f, view.getChildAt(0).alpha)
+        assertNotNull("the queued first tap should start the normal slide animation once measured", view.privateField("flipAnimator"))
         assertEquals(1, view.currentPageIndex())
         assertEquals(view.pageTopPxAt(1), view.scrollY)
     }
 
     @Test
-    fun `first turn requested after zero-height initial settle waits for measured viewport animation`() {
+    fun `first turn requested after zero-height initial settle replays when measured`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.layout(0, 0, 360, 0)
@@ -400,21 +418,15 @@ class EpubFlowViewTest {
 
         view.layout(0, 0, 360, 120)
         shadowOf(Looper.getMainLooper()).idle()
-        assertEquals(
-            "the queued first turn should not animate until the first measured frame is visible",
-            null,
-            view.privateField("flipAnimator"),
-        )
-
-        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
-
+        assertEquals("the queued first turn should finish reveal once the measured viewport is available", false, view.privateBool("awaitingReveal"))
+        assertEquals(1f, view.getChildAt(0).alpha)
         assertNotNull("the queued first turn should animate once the measured viewport is available", view.privateField("flipAnimator"))
         assertEquals(1, view.currentPageIndex())
         assertEquals(view.pageTopPxAt(1), view.scrollY)
     }
 
     @Test
-    fun `first turn during initial reveal waits for the revealed frame before animating`() {
+    fun `first turn during initial reveal finishes reveal and animates immediately`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.setPrivateField("awaitingReveal", true)
@@ -423,14 +435,15 @@ class EpubFlowViewTest {
 
         val accepted = view.goToAdjacentPage(1)
 
-        assertEquals("the first turn should be queued while initial content is still hidden", true, accepted)
-        assertEquals("initial reveal first turn must not cut to the next page before a visible frame", 0, view.currentPageIndex())
-        assertEquals(1, view.privateInt("pendingInitialPageTurnDelta"))
-        assertEquals(null, view.privateField("slideDrawable"))
-
-        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
-
-        assertNotNull("the queued first turn should animate after the initial reveal settles", view.privateField("flipAnimator"))
+        assertEquals("the first turn should be accepted while initial content is still hidden", true, accepted)
+        assertEquals(
+            "a ready paged surface should finish reveal instead of swallowing the first turn",
+            false,
+            view.privateBool("awaitingReveal"),
+        )
+        assertEquals(1f, view.getChildAt(0).alpha)
+        assertNull("ready first turn should not be left queued", view.privateField("pendingInitialPageTurnDelta"))
+        assertNotNull("ready first turn should start the normal slide animation immediately", view.privateField("flipAnimator"))
         assertEquals(1, view.currentPageIndex())
         assertEquals(view.pageTopPxAt(1), view.scrollY)
     }
@@ -453,14 +466,8 @@ class EpubFlowViewTest {
 
         view.layout(0, 0, 360, 120)
         shadowOf(Looper.getMainLooper()).idle()
-        assertEquals(
-            "boundary turn must wait for the restored final page to be revealed",
-            emptyList<EpubFlowTapZone>(),
-            tapZones,
-        )
-
-        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
-
+        assertEquals("boundary turn should finish reveal once the measured final page is positioned", false, view.privateBool("awaitingReveal"))
+        assertEquals(1f, view.getChildAt(0).alpha)
         assertEquals("after settling on the final page, NEXT must be forwarded for cross-spine advance", listOf(EpubFlowTapZone.NEXT), tapZones)
         assertEquals(finalPage, view.currentPageIndex())
         assertEquals(view.textureTopPxForPageForTest(finalPage), view.scrollY)
@@ -900,6 +907,38 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `scroll to paged anchored switch hides conversion until canonical page is parked`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val nearNextPageLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (midpoint + 1) until pageTwoTop }
+
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.getChildAt(0).alpha = 1f
+
+        view.setModeAnchored(EpubFlowView.Mode.PAGED, layout.getLineStart(layout.getLineForVertical(nearNextPageLineTop)))
+
+        assertEquals("SCROLL->PAGED should park immediately on the target canonical page", pageTwoTop, view.scrollY)
+        assertEquals(
+            "SCROLL->PAGED conversion should be hidden so the user never sees scroll geometry becoming pages",
+            0f,
+            view.getChildAt(0).alpha,
+        )
+        assertEquals(true, view.privateBool("awaitingReveal"))
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        assertEquals(false, view.privateBool("awaitingReveal"))
+        assertEquals(1f, view.getChildAt(0).alpha)
+        assertEquals(pageTwoTop, view.scrollY)
+    }
+
+    @Test
     fun `temporary scroll cancel re-arms paged clip without tap zone`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val view = pagedFlowView(onTapZone = tapZones::add)
@@ -1257,6 +1296,13 @@ class EpubFlowViewTest {
     private fun EpubFlowView.drawToBitmapForTest(): Bitmap =
         Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { draw(Canvas(it)) }
 
+    private fun EpubFlowView.drawAsScrolledChildToBitmapForTest(): Bitmap =
+        Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
+            val canvas = Canvas(bitmap)
+            canvas.translate(-scrollX.toFloat(), -scrollY.toFloat())
+            draw(canvas)
+        }
+
     private fun EpubFlowView.textureTopPxForPageForTest(index: Int): Int? =
         javaClass.getDeclaredMethod("textureTopPxForPage", Int::class.javaPrimitiveType)
             .apply { isAccessible = true }
@@ -1339,6 +1385,33 @@ class EpubFlowViewTest {
 
         @Deprecated("Deprecated in Java")
         override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
+    private class StripedPaperDrawable : Drawable() {
+        private val paint = Paint()
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            var y = b.top
+            while (y < b.bottom) {
+                paint.color = if ((y / 6) % 2 == 0) 0xFFEDE6D6.toInt() else 0xFFE3D9C6.toInt()
+                canvas.drawRect(
+                    b.left.toFloat(),
+                    y.toFloat(),
+                    b.right.toFloat(),
+                    minOf(y + 6, b.bottom).toFloat(),
+                    paint,
+                )
+                y += 6
+            }
+        }
+
+        override fun setAlpha(alpha: Int) = Unit
+
+        override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.OPAQUE
     }
 
     private class FakeCurlOverlay : EpubCurlTurnOverlay {
