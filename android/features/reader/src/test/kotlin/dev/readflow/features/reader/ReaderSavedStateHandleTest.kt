@@ -161,6 +161,30 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `selecting current reading mode does not ask engine to re-anchor`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            readingMode.value = ReaderReadingMode.PAGED
+        }
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        engine.modeChanges.clear()
+
+        viewModel.onIntent(ReaderIntent.SetMode(ReadingMode.PAGED))
+        advanceUntilIdle()
+
+        assertEquals("same-mode chip taps must not repaginate or re-anchor the reader", emptyList<ReadingMode>(), engine.modeChanges)
+        assertEquals(ReaderReadingMode.PAGED, settings.readingMode.value)
+    }
+
+    @Test
     fun `direct uri open immediately hides the previous reader surface`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
@@ -784,6 +808,7 @@ class ReaderSavedStateHandleTest {
         val goToLocators = mutableListOf<Locator>()
         val fontSizes = mutableListOf<Float>()
         val themes = mutableListOf<ThemeMode>()
+        val modeChanges = mutableListOf<ReadingMode>()
         val restoredStates = mutableListOf<ByteArray>()
         var clearTextSelectionCalls = 0
         var latestAnnotations: List<ReaderTextAnnotation> = emptyList()
@@ -814,6 +839,7 @@ class ReaderSavedStateHandleTest {
             themes += mode
         }
         override suspend fun setMode(mode: ReadingMode) {
+            modeChanges += mode
             pagingKind.value = when (mode) {
                 ReadingMode.SCROLL -> PagingKind.CONTINUOUS
                 ReadingMode.PAGED -> PagingKind.PAGED

@@ -1441,6 +1441,7 @@ class EpubReflowEngine private constructor(
             ReadingMode.SCROLL -> PagingKind.CONTINUOUS
             ReadingMode.PAGED -> PagingKind.PAGED
         }
+        if (targetKind == _pagingKind.value) return
         if (flowEngineEnabled) {
             withContext(Dispatchers.Main) {
                 _pagingKind.value = targetKind

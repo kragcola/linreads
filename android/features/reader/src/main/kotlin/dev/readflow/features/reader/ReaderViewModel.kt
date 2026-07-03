@@ -674,6 +674,7 @@ class ReaderViewModel(
     private fun setMode(mode: ReadingMode) {
         val engine = _uiState.value.engine ?: return
         if (mode !in engine.supportedModes) return
+        if (mode == _uiState.value.readingMode) return
         viewModelScope.launch {
             engine.setMode(mode)
             settings.setReadingMode(mode.toReaderReadingMode())

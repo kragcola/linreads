@@ -316,6 +316,51 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `flow same mode update does not re-anchor visible paged scroll`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val paragraphs = List(4) { paragraphIndex ->
+            (1..220).joinToString(separator = " ") { token -> "p${paragraphIndex}w$token" }
+        }
+        val epub = tempDir.newFile("flow-same-mode-no-reanchor.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to paragraphs.joinToString(
+                separator = "",
+                prefix = "<html><body>",
+                postfix = "</body></html>",
+            ) { paragraph -> "<p>${paragraph.replace(" ", "<br/>")}</p>" },
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setFontSize(32f)
+        engine.setLineSpacing(1.8f)
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 80))
+        host.measure(exactly(360), exactly(80))
+        host.layout(0, 0, 360, 80)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        engine.setMode(ReadingMode.PAGED)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue("test document must have multiple pages", flowView.pageCount() > 3)
+        val canonicalTop = flowView.pageTopPxAt(1) ?: error("missing page top")
+        val nonCanonicalTop = canonicalTop + 17
+        flowView.scrollTo(0, nonCanonicalTop)
+        assertEquals("test must start from a visible temporary scroll offset", nonCanonicalTop, flowView.scrollY)
+
+        engine.setMode(ReadingMode.PAGED)
+
+        assertEquals(
+            "re-selecting the current PAGED mode must not make the page look like it converted from scroll again",
+            nonCanonicalTop,
+            flowView.scrollY,
+        )
+    }
+
+    @Test
     fun `flow same typography setting updates do not hide visible content`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("flow-same-line-spacing.epub")
