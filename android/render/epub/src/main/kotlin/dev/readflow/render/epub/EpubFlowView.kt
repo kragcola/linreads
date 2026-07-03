@@ -94,6 +94,7 @@ internal class EpubFlowView(
     private val initialRevealRunnable = Runnable { revealContent() }
     /** First page turn requested before the initial layout exists; replayed once pagination is ready. */
     private var pendingInitialPageTurnDelta: Int? = null
+    private val pageShotConfig = Bitmap.Config.ARGB_8888
 
     /** Layout height we last paginated against; a change means the content reflowed (async image load). */
     private var paginatedLayoutHeight: Int = -1
@@ -477,6 +478,7 @@ internal class EpubFlowView(
             textView.post {
                 repaginate(reposition = false)
                 if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
+                if (consumePendingInitialPageTurn()) return@post
                 scheduleInitialReveal()
                 preCachePageTextures()
             }
@@ -556,9 +558,12 @@ internal class EpubFlowView(
 
     private fun consumePendingInitialPageTurn(): Boolean {
         val delta = pendingInitialPageTurnDelta ?: return false
+        if (height <= 0) return true
         pendingInitialPageTurnDelta = null
         if (mode != Mode.PAGED || paged.isEmpty()) return false
-        return goToAdjacentPage(delta)
+        if (goToAdjacentPage(delta)) return true
+        onTapZone(if (delta > 0) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
+        return true
     }
 
     private fun scheduleInitialReveal() {
@@ -680,6 +685,10 @@ internal class EpubFlowView(
     fun goToAdjacentPage(delta: Int): Boolean {
         if (delta == 0) return false
         if (mode == Mode.PAGED) {
+            if (awaitingReveal && flow != null && height <= 0) {
+                pendingInitialPageTurnDelta = delta.coerceIn(-1, 1)
+                return true
+            }
             if (paged.isEmpty()) {
                 if (awaitingReveal && flow != null) {
                     pendingInitialPageTurnDelta = delta.coerceIn(-1, 1)
@@ -816,7 +825,7 @@ internal class EpubFlowView(
                 fromTop == cachedFromTopPx &&
                 cachedFrontBitmap != null
             ) {
-                cachedFrontBitmap?.copy(Bitmap.Config.RGB_565, false)
+                cachedFrontBitmap?.copy(pageShotConfig, false)
             } else {
                 snapshotPageAt(fromTop)
             } ?: return@runCatching false
@@ -825,7 +834,7 @@ internal class EpubFlowView(
                 targetTop == cachedTargetTopPx &&
                 cachedRevealedBitmap != null
             ) {
-                cachedRevealedBitmap?.copy(Bitmap.Config.RGB_565, false)
+                cachedRevealedBitmap?.copy(pageShotConfig, false)
             } else {
                 snapshotPageAt(targetTop)
             } ?: run { front.recycle(); return@runCatching false }
@@ -867,7 +876,7 @@ internal class EpubFlowView(
                 fromTop == cachedFromTopPx &&
                 cachedFrontBitmap != null
             ) {
-                cachedFrontBitmap?.copy(Bitmap.Config.RGB_565, false)
+                cachedFrontBitmap?.copy(pageShotConfig, false)
             } else {
                 snapshotPageAt(fromTop)
             } ?: return@runCatching false
@@ -876,7 +885,7 @@ internal class EpubFlowView(
                 targetTop == cachedTargetTopPx &&
                 cachedRevealedBitmap != null
             ) {
-                cachedRevealedBitmap?.copy(Bitmap.Config.RGB_565, false)
+                cachedRevealedBitmap?.copy(pageShotConfig, false)
             } else {
                 snapshotPageAt(targetTop)
             } ?: run { front.recycle(); return@runCatching false }
@@ -898,7 +907,7 @@ internal class EpubFlowView(
     }
 
     private fun snapshotViewport(): Bitmap? = try {
-        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
+        val bmp = Bitmap.createBitmap(width, height, pageShotConfig)
         val canvas = Canvas(bmp)
         drawSnapshotBackground(canvas)
         // ScrollView draws its children at -scrollY; replicate so the snapshot is exactly what's
@@ -938,7 +947,7 @@ internal class EpubFlowView(
     fun snapshotPageAt(topPx: Int): Bitmap? {
         if (width == 0 || height == 0) return null
         return try {
-            val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
+            val bmp = Bitmap.createBitmap(width, height, pageShotConfig)
             val canvas = Canvas(bmp)
             drawSnapshotBackground(canvas)
             canvas.translate(0f, -topPx.toFloat())

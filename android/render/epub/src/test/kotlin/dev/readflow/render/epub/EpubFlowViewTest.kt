@@ -245,6 +245,34 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `page turn snapshot preserves exact paper colour under the finger`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.background = android.graphics.drawable.ColorDrawable(0xFFEDE6D6.toInt())
+        view.goToPage(1)
+        val staticFrame = view.drawToBitmapForTest()
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        val fingerDownFrame = view.drawToBitmapForTest()
+        val snapshot = requireNotNull(view.snapshotViewportForTest())
+
+        assertEquals(
+            "MoonReader high-quality page shots keep textured paper from changing when a turn layer appears",
+            Bitmap.Config.ARGB_8888,
+            snapshot.config,
+        )
+        assertEquals(
+            "the first interactive turn frame must not quantize the static paper colour",
+            staticFrame.getPixel(4, 4),
+            fingerDownFrame.getPixel(4, 4),
+        )
+
+        staticFrame.recycle()
+        fingerDownFrame.recycle()
+        snapshot.recycle()
+    }
+
+    @Test
     fun `live paged draw keeps paper background anchored to viewport while scrolled`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -344,6 +372,54 @@ class EpubFlowViewTest {
         assertNotNull("the queued first tap should start the normal slide animation once layout is ready", view.privateField("flipAnimator"))
         assertEquals(1, view.currentPageIndex())
         assertEquals(view.pageTopPxAt(1), view.scrollY)
+    }
+
+    @Test
+    fun `first turn requested after zero-height initial settle waits for measured viewport animation`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.layout(0, 0, 360, 0)
+        view.setPrivateField("awaitingReveal", true)
+        view.setPrivateField("pendingInitialPageTurnDelta", null)
+        view.getChildAt(0).alpha = 0f
+
+        val accepted = view.goToAdjacentPage(1)
+
+        assertEquals("the first turn should be queued while the real viewport height is still zero", true, accepted)
+        assertEquals("zero-height first turn must not silently cut to the next page", 0, view.currentPageIndex())
+        assertEquals(1, view.privateInt("pendingInitialPageTurnDelta"))
+        assertEquals(null, view.privateField("slideDrawable"))
+
+        view.layout(0, 0, 360, 120)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertNotNull("the queued first turn should animate once the measured viewport is available", view.privateField("flipAnimator"))
+        assertEquals(1, view.currentPageIndex())
+        assertEquals(view.pageTopPxAt(1), view.scrollY)
+    }
+
+    @Test
+    fun `queued first turn at chapter boundary is forwarded after measured viewport`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE, onTapZone = tapZones::add)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val finalPage = view.pageCount() - 1
+        view.layout(0, 0, 360, 0)
+        view.setPrivateField("awaitingReveal", true)
+        view.setPrivateField("pendingLandOnLast", true)
+        view.setPrivateField("pendingInitialPageTurnDelta", null)
+
+        val accepted = view.goToAdjacentPage(1)
+
+        assertEquals("the boundary first turn should still be queued during zero-height settle", true, accepted)
+        assertEquals("boundary turn must not be forwarded before the measured viewport exists", emptyList<EpubFlowTapZone>(), tapZones)
+
+        view.layout(0, 0, 360, 120)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("after settling on the final page, NEXT must be forwarded for cross-spine advance", listOf(EpubFlowTapZone.NEXT), tapZones)
+        assertEquals(finalPage, view.currentPageIndex())
+        assertEquals(view.textureTopPxForPageForTest(finalPage), view.scrollY)
     }
 
     @Test
@@ -1095,6 +1171,9 @@ class EpubFlowViewTest {
         javaClass.getDeclaredMethod("snapshotViewport")
             .apply { isAccessible = true }
             .invoke(this) as Bitmap?
+
+    private fun EpubFlowView.drawToBitmapForTest(): Bitmap =
+        Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { draw(Canvas(it)) }
 
     private fun EpubFlowView.textureTopPxForPageForTest(index: Int): Int? =
         javaClass.getDeclaredMethod("textureTopPxForPage", Int::class.javaPrimitiveType)
