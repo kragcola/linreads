@@ -292,6 +292,39 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `initial restore stays hidden until the first layout settle window`() {
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val view = EpubFlowView(
+            context = context,
+            onTapZone = {},
+            onTopOffsetChanged = {},
+            onSelectionRange = { _, _ -> },
+        )
+        activity.addContentView(view, ViewGroup.LayoutParams(360, 120))
+        view.textView.textSize = 18f
+        val chapterText = (1..80).joinToString("\n") { "Line $it marker text." }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(EpubDisplayBlock.Text(chapterText, headingLevel = null, paragraphIndex = 0)),
+        )
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        val restoreOffset = flow.offsetForParagraph(0, chapterText.indexOf("Line 30").coerceAtLeast(0))
+
+        view.setChapter(flow, flow.text, pageHeightPx = 120, restoreOffset = restoreOffset)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("restored content must stay hidden until the settle debounce fires", 0f, view.getChildAt(0).alpha)
+        assertEquals("initial reveal should still be pending after the first positioning pass", true, view.privateBool("awaitingReveal"))
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        assertEquals("restored content should reveal after the settle window", false, view.privateBool("awaitingReveal"))
+        assertEquals(1f, view.getChildAt(0).alpha)
+    }
+
+    @Test
     fun `rapid discrete gl turn while overlay is active does not restart or double advance`() {
         val overlay = FakeCurlOverlay()
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
@@ -585,7 +618,33 @@ class EpubFlowViewTest {
         )
 
         assertEquals("temporary-scroll UP must not be treated as a clean tap", emptyList<EpubFlowTapZone>(), tapZones)
-        assertTrue("temporary scroll should have moved or snapped forward", view.scrollY > 0)
+        val canonicalTops = (0 until view.pageCount()).mapNotNull { view.textureTopPxForPageForTest(it) }.toSet()
+        assertTrue(
+            "temporary-scroll UP should settle on a canonical paged anchor, scrollY=${view.scrollY}, pages=$canonicalTops",
+            view.scrollY in canonicalTops,
+        )
+    }
+
+    @Test
+    fun `temporary scroll release normalizes to canonical page anchor`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midLineTop = (layout.getLineForVertical(pageOneTop + 1) + 1 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (pageOneTop + 1) until pageTwoTop }
+        view.scrollTo(0, midLineTop)
+
+        view.settleTemporaryScrollAnchorForTest()
+
+        val canonicalTops = (0 until view.pageCount()).mapNotNull { view.textureTopPxForPageForTest(it) }.toSet()
+        assertTrue(
+            "temporary scroll release must land on a real paged anchor, scrollY=${view.scrollY}, pages=$canonicalTops",
+            view.scrollY in canonicalTops,
+        )
+        assertEquals("current page should describe the parked canonical anchor", view.pageTopPxAt(view.currentPageIndex()), view.scrollY)
     }
 
     @Test
@@ -873,6 +932,7 @@ class EpubFlowViewTest {
         view.measure(exactly(360), exactly(120))
         view.layout(0, 0, 360, 120)
         shadowOf(Looper.getMainLooper()).idle()
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
         return view
     }
 
@@ -955,6 +1015,12 @@ class EpubFlowViewTest {
         javaClass.getDeclaredMethod("snapshotClipBottomFor", Int::class.javaPrimitiveType)
             .apply { isAccessible = true }
             .invoke(this, topPx) as Int
+
+    private fun EpubFlowView.settleTemporaryScrollAnchorForTest() {
+        javaClass.getDeclaredMethod("settleTemporaryScrollAnchor")
+            .apply { isAccessible = true }
+            .invoke(this)
+    }
 
     private fun EpubFlowView.privateInt(name: String): Int =
         privateField(name) as Int

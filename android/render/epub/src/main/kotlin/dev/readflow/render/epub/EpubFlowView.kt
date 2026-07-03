@@ -68,6 +68,7 @@ internal class EpubFlowView(
     private var pendingLandOnLast = false
     /** True between [setChapter] and the first positioned frame: content is alpha-hidden until then. */
     private var awaitingReveal = false
+    private val initialRevealRunnable = Runnable { revealContent() }
 
     /** Layout height we last paginated against; a change means the content reflowed (async image load). */
     private var paginatedLayoutHeight: Int = -1
@@ -273,6 +274,8 @@ internal class EpubFlowView(
         isSmoothScrollingEnabled = false
         isFillViewport = true
         overScrollMode = OVER_SCROLL_NEVER
+        isVerticalScrollBarEnabled = false
+        isHorizontalScrollBarEnabled = false
         addView(container)
         textView.onSelectionRangeChanged = { s, e -> onSelectionRange(s, e) }
         // A chapter's images load async with no placeholder height (审计: zero-height until decoded), so
@@ -291,6 +294,7 @@ internal class EpubFlowView(
             // Only react to a genuine content reflow (height delta from a decoded image), not our own
             // re-layout after repaginate (which records the new height) or a no-op pass.
             if (layout.height == paginatedLayoutHeight) return@addOnLayoutChangeListener
+            if (awaitingReveal) removeCallbacks(initialRevealRunnable)
             removeCallbacks(reflowRunnable)
             postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
         }
@@ -311,10 +315,15 @@ internal class EpubFlowView(
             postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
             return@Runnable
         }
-        val anchorOffset = if (paged.isNotEmpty()) topLayoutOffset() else -1
+        val anchorOffset = if (awaitingReveal) {
+            pendingRestoreOffset ?: if (paged.isNotEmpty()) topLayoutOffset() else -1
+        } else {
+            if (paged.isNotEmpty()) topLayoutOffset() else -1
+        }
         recycleCachedTextures()
         repaginate(reposition = false)
         if (anchorOffset >= 0) goToOffset(anchorOffset)
+        if (awaitingReveal) scheduleInitialReveal()
     }
 
     /**
@@ -430,7 +439,7 @@ internal class EpubFlowView(
             textView.post {
                 repaginate(reposition = false)
                 if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
-                revealContent()
+                scheduleInitialReveal()
                 preCachePageTextures()
             }
             return
@@ -483,6 +492,8 @@ internal class EpubFlowView(
         pendingRestoreOffset = restoreOffset
         pendingLandOnLast = landOnLast
         awaitingReveal = true
+        removeCallbacks(initialRevealRunnable)
+        container.animate().cancel()
         container.alpha = 0f
         textView.text = spannable
         // Layout is available after the next measure/layout pass; paginate + position then.
@@ -499,12 +510,19 @@ internal class EpubFlowView(
         if (textView.layout == null || flow == null) return
         repaginate(reposition = false)
         if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
-        if (height > 0) revealContent()
+        if (height > 0) scheduleInitialReveal()
         preCachePageTextures()
+    }
+
+    private fun scheduleInitialReveal() {
+        if (!awaitingReveal || height <= 0) return
+        removeCallbacks(initialRevealRunnable)
+        postDelayed(initialRevealRunnable, INITIAL_REVEAL_SETTLE_MS)
     }
 
     private fun revealContent() {
         if (!awaitingReveal) return
+        removeCallbacks(initialRevealRunnable)
         awaitingReveal = false
         container.animate()
             .alpha(1f)
@@ -518,6 +536,7 @@ internal class EpubFlowView(
 
     private fun finishInitialRevealForTurn() {
         if (!initialRevealActive()) return
+        removeCallbacks(initialRevealRunnable)
         container.animate().cancel()
         awaitingReveal = false
         container.alpha = 1f
@@ -1090,12 +1109,16 @@ internal class EpubFlowView(
     }
 
     /**
-     * Snaps [scrollY] to the nearest line top and re-arms the page clip — turning a middle-column free
-     * scroll's resting position into a clean, half-line-free page (静读天下: 滚动无缝变成翻页). Tracks the
-     * nearest canonical page anchor and clears turn textures; the next turn must snap to that anchor
-     * before preview/curl starts.
+     * Turns a temporary middle-column scroll back into a real PAGED resting state. In PAGED mode the
+     * release lands on the nearest paginator-produced page anchor, not on an arbitrary scroll line, so
+     * complex text/image pages keep the same fragmentation rules as tap/keyboard page turns. SCROLL
+     * mode still falls back to a nearest line top.
      */
-    private fun snapToNearestLineTop() {
+    private fun settleTemporaryScrollAnchor() {
+        if (mode == Mode.PAGED && paged.isNotEmpty()) {
+            snapToNearestCanonicalPageAnchor(report = false)
+            return
+        }
         val layout = textView.layout ?: return
         val maxScroll = (container.height - height).coerceAtLeast(0)
         val line = layout.getLineForVertical(scrollY)
@@ -1287,8 +1310,8 @@ internal class EpubFlowView(
                     endInteractiveCurl(vx)
                 } else if (freeScrolling) {
                     // Temporary scroll may leave scrollY mid-grid with the page clip off, exposing
-                    // boundary content. On release, snap to the nearest line top and re-arm the clip.
-                    if (mode == Mode.PAGED) snapToNearestLineTop()
+                    // boundary content. On release, return to a real paged anchor and re-arm the clip.
+                    if (mode == Mode.PAGED) settleTemporaryScrollAnchor()
                     reportTopOffset()
                 }
                 recycleTracker()
@@ -1301,7 +1324,7 @@ internal class EpubFlowView(
                 } else if (interactiveCurl) {
                     endInteractiveCurl(0f)
                 } else if (freeScrolling && mode == Mode.PAGED) {
-                    snapToNearestLineTop()
+                    settleTemporaryScrollAnchor()
                     reportTopOffset()
                 }
                 classified = false
@@ -1391,6 +1414,7 @@ internal class EpubFlowView(
 
         /** Fade-in for the chapter's first positioned frame — long enough to hide a one-frame settle. */
         const val REVEAL_FADE_MS = 120L
+        const val INITIAL_REVEAL_SETTLE_MS = REFLOW_DEBOUNCE_MS
     }
 }
 
