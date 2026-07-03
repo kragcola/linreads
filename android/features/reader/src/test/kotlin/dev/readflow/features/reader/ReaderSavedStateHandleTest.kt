@@ -51,6 +51,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -482,6 +483,58 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `remote sync winner is applied before reader surface is loaded`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val events = mutableListOf<String>()
+        val localLocator = Locator(LocatorStrategy.Page(index = 1, total = 10), totalProgression = 0.1f)
+        val remoteLocator = Locator(LocatorStrategy.Page(index = 8, total = 10), totalProgression = 0.8f)
+        val remoteProgress = ReadingProgress(
+            bookId = "book-1",
+            locator = remoteLocator,
+            progressPercent = 0.8f,
+            updatedAt = Long.MAX_VALUE / 2,
+            deviceId = "tablet",
+        )
+        val progressDao = FakeProgressDao().apply {
+            upsert(
+                ReadingProgressEntity(
+                    bookId = "book-1",
+                    locatorJson = Json.encodeToString(localLocator),
+                    totalProgression = 0.1f,
+                    progressPercent = 0.1f,
+                    updatedAt = 100L,
+                    deviceId = "phone",
+                ),
+            )
+        }
+        val engine = FakeReaderEngine(localLocator, events)
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+            syncManager = SyncManager(FakeSyncBackend(remoteProgress)),
+        )
+        val stateJob = launch {
+            viewModel.uiState.collect { state ->
+                if (state.loadingState == LoadingState.Loaded) {
+                    events += "loaded:${state.engine?.currentLocator?.value?.totalProgression}"
+                }
+            }
+        }
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        stateJob.cancel()
+        assertTrue(
+            "remote winner should be applied before Loaded is exposed, events=$events",
+            events.indexOf("goTo:0.8") in 0 until events.indexOf("loaded:0.8"),
+        )
+        assertEquals("remote locator should be applied only once during open", listOf(remoteLocator), engine.goToLocators)
+        assertEquals(remoteLocator, Json.decodeFromString<Locator>(progressDao.savedProgress("book-1")!!.locatorJson))
+    }
+
+    @Test
     fun `saves note annotation clears selection and exposes note in annotation state`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val selection = ReaderTextSelection(
@@ -744,6 +797,7 @@ class ReaderSavedStateHandleTest {
         }
         override suspend fun goTo(locator: Locator) {
             goToLocators += locator
+            events += "goTo:${locator.totalProgression}"
             currentLocator.value = locator
         }
         override suspend fun saveState(): ByteArray {

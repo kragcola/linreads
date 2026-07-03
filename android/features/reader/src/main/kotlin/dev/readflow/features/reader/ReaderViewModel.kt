@@ -237,12 +237,21 @@ class ReaderViewModel(
                 runCatching { engine.setMode(mode) }
             }
             val restoredLocator = restoredForBook?.currentLocator
-            val persistedLocator = bookId?.let { id ->
-                progressDao.get(id)?.let { saved ->
-                    runCatching { Json.decodeFromString<Locator>(saved.locatorJson) }.getOrNull()
-                }
+            val persistedProgress = bookId?.let { id -> progressDao.get(id) }
+            val persistedLocator = persistedProgress?.let { saved ->
+                runCatching { Json.decodeFromString<Locator>(saved.locatorJson) }.getOrNull()
             }
-            (restoredLocator ?: persistedLocator)?.let { locator ->
+            val initialLocator = restoredLocator ?: persistedLocator
+            val displayLocator = if (bookId != null) {
+                syncInitialProgressBeforeLoad(
+                    bookId = bookId,
+                    locator = initialLocator ?: engine.currentLocator.value,
+                    persistedProgress = persistedProgress,
+                ) ?: initialLocator
+            } else {
+                initialLocator
+            }
+            displayLocator?.let { locator ->
                 runCatching { engine.goTo(locator) }
             }
             currentBookId = bookId
@@ -279,6 +288,51 @@ class ReaderViewModel(
                 persistReaderState(bookId = it, locator = engine.currentLocator.value, loadingState = LoadingState.Loaded)
             }
         }
+    }
+
+    private suspend fun syncInitialProgressBeforeLoad(
+        bookId: String,
+        locator: Locator,
+        persistedProgress: ReadingProgressEntity?,
+    ): Locator? {
+        val local = initialProgressForSync(
+            bookId = bookId,
+            locator = locator,
+            persistedProgress = persistedProgress,
+            deviceId = settings.deviceId.first(),
+        )
+        val remoteWinner = syncManager.syncProgress(bookId, local) ?: return null
+        persistRemoteProgress(bookId, remoteWinner)
+        persistReaderState(bookId = bookId, locator = remoteWinner.locator)
+        return remoteWinner.locator
+    }
+
+    private fun initialProgressForSync(
+        bookId: String,
+        locator: Locator,
+        persistedProgress: ReadingProgressEntity?,
+        deviceId: String,
+    ): ReadingProgress {
+        val persistedLocator = persistedProgress?.let {
+            runCatching { Json.decodeFromString<Locator>(it.locatorJson) }.getOrNull()
+        }
+        if (persistedProgress != null && persistedLocator == locator) {
+            return ReadingProgress(
+                bookId = bookId,
+                locator = locator,
+                progressPercent = persistedProgress.progressPercent,
+                updatedAt = persistedProgress.updatedAt,
+                deviceId = persistedProgress.deviceId,
+            )
+        }
+        val progression = locator.totalProgression ?: 0f
+        return ReadingProgress(
+            bookId = bookId,
+            locator = locator,
+            progressPercent = progression,
+            updatedAt = 0L,
+            deviceId = deviceId,
+        )
     }
 
     private fun watchProgress(engine: ReaderEngine, bookId: String?) {
@@ -749,6 +803,17 @@ class ReaderViewModel(
         progress: ReadingProgress,
         engine: ReaderEngine,
     ) {
+        persistRemoteProgress(bookId, progress)
+        if (engine.currentLocator.value != progress.locator) {
+            engine.goTo(progress.locator)
+        }
+        persistReaderState(bookId = bookId, locator = progress.locator)
+    }
+
+    private suspend fun persistRemoteProgress(
+        bookId: String,
+        progress: ReadingProgress,
+    ) {
         val progression = progress.totalProgression()
         progressDao.upsert(
             ReadingProgressEntity(
@@ -761,10 +826,6 @@ class ReaderViewModel(
             ),
         )
         bookDao.updateLastReadAt(bookId, progress.updatedAt)
-        if (engine.currentLocator.value != progress.locator) {
-            engine.goTo(progress.locator)
-        }
-        persistReaderState(bookId = bookId, locator = progress.locator)
     }
 
     private fun ReadingProgress.totalProgression(): Float =

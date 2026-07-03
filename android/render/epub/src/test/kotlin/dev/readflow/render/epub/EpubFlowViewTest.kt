@@ -245,6 +245,24 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `live paged draw keeps paper background anchored to viewport while scrolled`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        assertTrue("test needs a non-zero page top", pageOneTop > 0)
+        val background = RecordingBoundsTopDrawable()
+        view.background = background
+
+        view.goToPage(1)
+        view.draw(Canvas(Bitmap.createBitmap(view.width, view.height, Bitmap.Config.RGB_565)))
+
+        assertTrue(
+            "static reader draw must paint paper in the same viewport coordinates as page-turn snapshots, recorded=${background.boundsTops}",
+            background.boundsTops.isNotEmpty() && background.boundsTops.all { it == 0 },
+        )
+    }
+
+    @Test
     fun `next page from clamped final page reports chapter boundary`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -292,6 +310,43 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `first paged turn requested before initial layout settles is replayed with animation`() {
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val view = EpubFlowView(
+            context = context,
+            onTapZone = {},
+            onTopOffsetChanged = {},
+            onSelectionRange = { _, _ -> },
+        ).apply {
+            flipStyle = PageFlipStyle.SLIDE
+            textView.textSize = 18f
+        }
+        activity.addContentView(view, ViewGroup.LayoutParams(360, 120))
+        val chapterText = (1..80).joinToString("\n") { "Line $it marker text." }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(EpubDisplayBlock.Text(chapterText, headingLevel = null, paragraphIndex = 0)),
+        )
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+
+        view.setChapter(flow, flow.text, pageHeightPx = 120)
+        val accepted = view.goToAdjacentPage(1)
+
+        assertEquals("the first tap should be queued instead of falling through as a boundary turn", true, accepted)
+        assertEquals("the early tap should not create an instant cut before layout exists", null, view.privateField("slideDrawable"))
+
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
+
+        assertNotNull("the queued first tap should start the normal slide animation once layout is ready", view.privateField("flipAnimator"))
+        assertEquals(1, view.currentPageIndex())
+        assertEquals(view.pageTopPxAt(1), view.scrollY)
+    }
+
+    @Test
     fun `initial restore stays hidden until the first layout settle window`() {
         val context = RuntimeEnvironment.getApplication() as Application
         val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
@@ -322,6 +377,23 @@ class EpubFlowViewTest {
 
         assertEquals("restored content should reveal after the settle window", false, view.privateBool("awaitingReveal"))
         assertEquals(1f, view.getChildAt(0).alpha)
+    }
+
+    @Test
+    fun `snapshotting another page restores the static parked page`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+
+        view.goToPage(1)
+
+        val snapshot = view.snapshotPageAt(pageTwoTop)
+
+        assertNotNull(snapshot)
+        snapshot?.recycle()
+        assertEquals("MoonReader-style temporary screenshot scroll must restore the visible page", 1, view.currentPageIndex())
+        assertEquals("snapshotting a target page must not leave the live paper/content shifted", pageOneTop, view.scrollY)
     }
 
     @Test

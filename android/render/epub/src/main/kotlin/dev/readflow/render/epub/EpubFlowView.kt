@@ -7,6 +7,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.drawable.Drawable
 import android.text.Layout
 import android.view.GestureDetector
 import android.view.MotionEvent
@@ -82,6 +83,8 @@ internal class EpubFlowView(
     private var pageHeightPx: Int = 0
     private var currentPage: Int = 0
     private var flow: EpubChapterFlow? = null
+    /** Paper background painted in viewport coordinates; avoids ScrollView's scroll-translated background. */
+    private var viewportBackground: Drawable? = null
 
     /** Resume target for the in-flight [setChapter], applied once layout is ready (before the reveal). */
     private var pendingRestoreOffset: Int? = null
@@ -89,6 +92,8 @@ internal class EpubFlowView(
     /** True between [setChapter] and the first positioned frame: content is alpha-hidden until then. */
     private var awaitingReveal = false
     private val initialRevealRunnable = Runnable { revealContent() }
+    /** First page turn requested before the initial layout exists; replayed once pagination is ready. */
+    private var pendingInitialPageTurnDelta: Int? = null
 
     /** Layout height we last paginated against; a change means the content reflowed (async image load). */
     private var paginatedLayoutHeight: Int = -1
@@ -320,6 +325,19 @@ internal class EpubFlowView(
         }
     }
 
+    override fun setBackground(background: Drawable?) {
+        viewportBackground = background
+        super.setBackground(null)
+        invalidate()
+    }
+
+    override fun getBackground(): Drawable? = viewportBackground
+
+    override fun draw(canvas: Canvas) {
+        drawViewportBackground(canvas)
+        super.draw(canvas)
+    }
+
     /**
      * Single coalesced reaction to an async-image reflow: re-paginate against the grown layout and
      * re-anchor the parked page to the same content line. Deferred while ANY page turn is in flight —
@@ -511,6 +529,7 @@ internal class EpubFlowView(
         paginatedLayoutHeight = -1
         pendingRestoreOffset = restoreOffset
         pendingLandOnLast = landOnLast
+        pendingInitialPageTurnDelta = null
         awaitingReveal = true
         removeCallbacks(initialRevealRunnable)
         container.animate().cancel()
@@ -530,8 +549,16 @@ internal class EpubFlowView(
         if (textView.layout == null || flow == null) return
         repaginate(reposition = false)
         if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
+        if (consumePendingInitialPageTurn()) return
         if (height > 0) scheduleInitialReveal()
         preCachePageTextures()
+    }
+
+    private fun consumePendingInitialPageTurn(): Boolean {
+        val delta = pendingInitialPageTurnDelta ?: return false
+        pendingInitialPageTurnDelta = null
+        if (mode != Mode.PAGED || paged.isEmpty()) return false
+        return goToAdjacentPage(delta)
     }
 
     private fun scheduleInitialReveal() {
@@ -651,8 +678,15 @@ internal class EpubFlowView(
      * false at a chapter boundary (caller loads the adjacent spine — Phase 4 cross-chapter advance).
      */
     fun goToAdjacentPage(delta: Int): Boolean {
+        if (delta == 0) return false
         if (mode == Mode.PAGED) {
-            if (paged.isEmpty()) return false
+            if (paged.isEmpty()) {
+                if (awaitingReveal && flow != null) {
+                    pendingInitialPageTurnDelta = delta.coerceIn(-1, 1)
+                    return true
+                }
+                return false
+            }
             val anchor = snapToNearestCanonicalPageAnchor(report = false)
             val target = anchor + delta
             if (target < 0 || target > paged.lastIndex) return false
@@ -923,7 +957,11 @@ internal class EpubFlowView(
     }
 
     private fun drawSnapshotBackground(canvas: Canvas) {
-        background?.let { bg ->
+        drawViewportBackground(canvas)
+    }
+
+    private fun drawViewportBackground(canvas: Canvas) {
+        viewportBackground?.let { bg ->
             bg.setBounds(0, 0, width, height)
             bg.draw(canvas)
         }
