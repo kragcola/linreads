@@ -37,6 +37,7 @@ import dev.readflow.core.sync.SyncBackend
 import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.EngineDescriptor
 import dev.readflow.render.api.EngineStateStore
+import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PageTransitionHost
 import dev.readflow.render.api.PageTransitionHostFactory
 import dev.readflow.render.api.PagingKind
@@ -559,6 +560,102 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `initial locator aware engine receives final restore locator before opening book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val events = mutableListOf<String>()
+        val localLocator = Locator(LocatorStrategy.Page(index = 1, total = 10), totalProgression = 0.1f)
+        val remoteLocator = Locator(LocatorStrategy.Page(index = 8, total = 10), totalProgression = 0.8f)
+        val progressDao = FakeProgressDao().apply {
+            upsert(
+                ReadingProgressEntity(
+                    bookId = "book-1",
+                    locatorJson = Json.encodeToString(localLocator),
+                    totalProgression = 0.1f,
+                    progressPercent = 0.1f,
+                    updatedAt = 100L,
+                    deviceId = "phone",
+                ),
+            )
+        }
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = events,
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+            syncManager = SyncManager(
+                FakeSyncBackend(
+                    ReadingProgress(
+                        bookId = "book-1",
+                        locator = remoteLocator,
+                        progressPercent = 0.8f,
+                        updatedAt = Long.MAX_VALUE / 2,
+                        deviceId = "tablet",
+                    ),
+                ),
+            ),
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        assertEquals(
+            "engine should be primed with the final remote/local winner before openBook publishes a start locator",
+            listOf(remoteLocator),
+            engine.initialLocators,
+        )
+        assertTrue(
+            "initial locator must be set before openBook, events=$events",
+            events.indexOf("setInitial:0.8") in 0 until events.indexOf("open:0.8"),
+        )
+        assertEquals("open should already start at the final locator", remoteLocator, engine.openLocators.single())
+        assertEquals("no post-open goTo needed when the engine opened at the final locator", emptyList<Locator>(), engine.goToLocators)
+        assertEquals(remoteLocator, engine.currentLocator.value)
+    }
+
+    @Test
+    fun `initial locator aware engine does not receive duplicate goTo when it normalizes restored locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val restoredLocator = Locator(
+            LocatorStrategy.Section(spineIndex = 1, elementIndex = 4, charOffset = 12),
+            totalProgression = 0.8f,
+        )
+        val normalizedLocator = restoredLocator.copy(totalProgression = 0.42f)
+        val progressDao = FakeProgressDao().apply {
+            upsert(
+                ReadingProgressEntity(
+                    bookId = "book-1",
+                    locatorJson = Json.encodeToString(restoredLocator),
+                    totalProgression = 0.8f,
+                    progressPercent = 0.8f,
+                    updatedAt = 100L,
+                    deviceId = "phone",
+                ),
+            )
+        }
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = mutableListOf(),
+        ).apply {
+            openNormalizer = { normalizedLocator }
+        }
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        assertEquals(listOf(restoredLocator), engine.initialLocators)
+        assertEquals(normalizedLocator, engine.currentLocator.value)
+        assertEquals("same Section payload should not cause a second post-open goTo", emptyList<Locator>(), engine.goToLocators)
+    }
+
+    @Test
     fun `saves note annotation clears selection and exposes note in annotation state`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val selection = ReaderTextSelection(
@@ -790,9 +887,9 @@ class ReaderSavedStateHandleTest {
         override suspend fun allForBackup() = sessions.toList()
     }
 
-    private class FakeReaderEngine(
+    private open class FakeReaderEngine(
         initialLocator: Locator,
-        private val events: MutableList<String> = mutableListOf(),
+        protected val events: MutableList<String> = mutableListOf(),
     ) : ReaderEngine, TextSelectableReaderEngine, TextAnnotatableReaderEngine {
         override val id: String = "fake-txt"
         override val format: BookFormat = BookFormat.TXT
@@ -857,6 +954,29 @@ class ReaderSavedStateHandleTest {
 
         fun emitSelection(selection: ReaderTextSelection?) {
             currentTextSelection.value = selection
+        }
+    }
+
+    private class FakeInitialLocatorAwareReaderEngine(
+        initialLocator: Locator,
+        events: MutableList<String>,
+    ) : FakeReaderEngine(initialLocator, events), InitialLocatorAwareReaderEngine {
+        val initialLocators = mutableListOf<Locator>()
+        val openLocators = mutableListOf<Locator>()
+        var openNormalizer: ((Locator) -> Locator)? = null
+        private var primedLocator: Locator? = null
+
+        override fun setInitialLocator(locator: Locator?) {
+            primedLocator = locator
+            locator?.let(initialLocators::add)
+            events += "setInitial:${locator?.totalProgression}"
+        }
+
+        override suspend fun openBook(uri: Uri): Locator {
+            primedLocator?.let { currentLocator.value = openNormalizer?.invoke(it) ?: it }
+            openLocators += currentLocator.value
+            events += "open:${currentLocator.value.totalProgression}"
+            return currentLocator.value
         }
     }
 

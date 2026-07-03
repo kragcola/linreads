@@ -12,6 +12,7 @@ import dev.readflow.core.database.ReadingSessionDao
 import dev.readflow.core.database.TextAnnotationDao
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.Locator
+import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.ReaderState
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ReaderReadingMode
@@ -23,6 +24,7 @@ import dev.readflow.core.model.FontChoice
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.EngineStateStore
+import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PageTransitionHostFactory
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ReaderEngine
@@ -209,6 +211,22 @@ class ReaderViewModel(
                 return@launch
             }
             restoreEngineStateIfPresent(bookId, engine)
+            val restoredLocator = restoredForBook?.currentLocator
+            val persistedProgress = bookId?.let { id -> progressDao.get(id) }
+            val persistedLocator = persistedProgress?.let { saved ->
+                runCatching { Json.decodeFromString<Locator>(saved.locatorJson) }.getOrNull()
+            }
+            val requestedInitialLocator = restoredLocator ?: persistedLocator
+            var displayLocator = if (bookId != null && requestedInitialLocator != null) {
+                syncInitialProgressBeforeLoad(
+                    bookId = bookId,
+                    locator = requestedInitialLocator,
+                    persistedProgress = persistedProgress,
+                ) ?: requestedInitialLocator
+            } else {
+                requestedInitialLocator
+            }
+            (engine as? InitialLocatorAwareReaderEngine)?.setInitialLocator(displayLocator)
             runCatching { engine.openBook(uri) }.onFailure { error ->
                 val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
                 _uiState.update { it.copy(loadingState = LoadingState.Error(readflowError), bookTitle = title) }
@@ -236,23 +254,17 @@ class ReaderViewModel(
             savedReadingMode?.let { mode ->
                 runCatching { engine.setMode(mode) }
             }
-            val restoredLocator = restoredForBook?.currentLocator
-            val persistedProgress = bookId?.let { id -> progressDao.get(id) }
-            val persistedLocator = persistedProgress?.let { saved ->
-                runCatching { Json.decodeFromString<Locator>(saved.locatorJson) }.getOrNull()
-            }
-            val initialLocator = restoredLocator ?: persistedLocator
-            val displayLocator = if (bookId != null) {
+            if (bookId != null && displayLocator == null) {
                 syncInitialProgressBeforeLoad(
                     bookId = bookId,
-                    locator = initialLocator ?: engine.currentLocator.value,
+                    locator = engine.currentLocator.value,
                     persistedProgress = persistedProgress,
-                ) ?: initialLocator
-            } else {
-                initialLocator
+                )?.let { displayLocator = it }
             }
             displayLocator?.let { locator ->
-                runCatching { engine.goTo(locator) }
+                if (!engine.currentLocator.value.sameDisplayPositionAs(locator)) {
+                    runCatching { engine.goTo(locator) }
+                }
             }
             currentBookId = bookId
             _uiState.update {
@@ -831,6 +843,12 @@ class ReaderViewModel(
 
     private fun ReadingProgress.totalProgression(): Float =
         (locator.totalProgression ?: progressPercent).coerceIn(0f, 1f)
+
+    private fun Locator.sameDisplayPositionAs(other: Locator): Boolean {
+        if (strategy != other.strategy) return false
+        if (strategy != LocatorStrategy.Unknown) return true
+        return progression == other.progression && totalProgression == other.totalProgression
+    }
 
     private companion object {
         const val MIN_FONT_SP = dev.readflow.core.prefs.ReaderTypography.MIN_FONT_SP

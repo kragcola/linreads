@@ -62,6 +62,7 @@ import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.TocEntry
+import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
@@ -163,7 +164,11 @@ class EpubReflowEngine private constructor(
     // constructor can force the legacy slice-pack path for legacy-behavior tests.
     private val flowEngineEnabled: Boolean,
     @Suppress("UNUSED_PARAMETER") private val constructorMarker: Unit?,
-) : PagedReaderEngine, SelfPagingReaderEngine, TextSelectableReaderEngine, TextAnnotatableReaderEngine {
+) : PagedReaderEngine,
+    SelfPagingReaderEngine,
+    TextSelectableReaderEngine,
+    TextAnnotatableReaderEngine,
+    InitialLocatorAwareReaderEngine {
 
     constructor(context: Context) : this(context, pageLineMeasurer = null, flowEngineEnabled = EPUB_FLOW_ENGINE_ENABLED, constructorMarker = null)
 
@@ -236,6 +241,7 @@ class EpubReflowEngine private constructor(
     private val activePagedImagePages = WeakHashMap<View, EpubPagedImagePageState>()
     private val activePagedCompositePages = WeakHashMap<View, EpubPagedImagePageState>()
     private val imageBoundsCache = mutableMapOf<String, EpubImageBoundsCacheEntry>()
+    private var pendingInitialLocator: Locator? = null
 
     /** Start index (inclusive) and end index (exclusive) of each chapter in paras. */
     private data class ChapterBoundary(
@@ -284,9 +290,15 @@ class EpubReflowEngine private constructor(
         val highlightRange: ReaderTextHighlightRange,
     )
 
+    override fun setInitialLocator(locator: Locator?) {
+        pendingInitialLocator = locator
+    }
+
     override suspend fun supports(uri: Uri): Boolean = true
 
     override suspend fun openBook(uri: Uri): Locator {
+        val requestedInitialLocator = pendingInitialLocator
+        pendingInitialLocator = null
         resetBookStateForOpen()
         return withContext(Dispatchers.IO) {
             val tmp = File(context.cacheDir, "epub_${uri.hashCode()}.epub")
@@ -302,17 +314,27 @@ class EpubReflowEngine private constructor(
             cacheScope = CoroutineScope(cacheJob!! + Dispatchers.IO)
             val book = EpubParser().parseLazyBook(tmp)
             lazyBook = book
-            book.prefetchAroundParagraph(0)
             paras = book.paras
             internalLinkTargetIndexes = epubInternalLinkTargetIndexes(book.spinePaths, paras, book.fragmentTargetIndexes)
             spineCharCounts = epubSpineCharCounts(paras)
+            val initialIndex = if (paras.isEmpty()) {
+                0
+            } else {
+                requestedInitialLocator?.let { epubIndexFromLocator(it, paras.size) } ?: 0
+            }
+            book.prefetchAroundParagraph(initialIndex)
             pagedSlices = buildPagedSlices()
             chapterBoundaries = buildChapterBoundaries(paras)
             displayBlockCount = book.blockCount
-            val initial = epubLocatorForIndex(paras, index = 0)
+            val initialOffset = when (val strategy = requestedInitialLocator?.strategy) {
+                is LocatorStrategy.Section ->
+                    (strategy.charOffset - (paras.getOrNull(initialIndex)?.spineCharStart ?: 0)).coerceAtLeast(0)
+                else -> 0
+            }
+            val initial = epubLocatorForOffset(paras, initialIndex, initialOffset)
             withContext(Dispatchers.Main) {
                 updatePageCount()
-                _chapterInfo.value = ChapterInfo(0, chapterBoundaries.size, chapterBoundaries.firstOrNull()?.title ?: "", 0f)
+                updateChapterInfo(initialIndex)
                 _tableOfContents.value = book.tableOfContents.ifEmpty { buildToc(chapterBoundaries, paras.size) }
                 _currentLocator.value = initial
             }
@@ -1303,6 +1325,7 @@ class EpubReflowEngine private constructor(
     override suspend fun close() {
         recyclerView = null
         pageRequestCallback = null
+        pendingInitialLocator = null
         flowView?.textView?.let { runCatching { AsyncDrawableScheduler.unschedule(it) } }
         flowView = null
         flowHost = null

@@ -16,9 +16,11 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ThemeMode
+import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightRange
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -145,6 +147,46 @@ class EpubReflowEngineTest {
         assertEquals("theme change must keep the host transparent so press/turn layers reveal the same paper", null, host.background)
         assertNotNull("theme change must keep flow paper background", flowView.background)
         assertTrue("flow background should refresh with theme", flowView.background !== initialFlowBackground)
+    }
+
+    @Test
+    fun `open book can publish restored locator as the first resolved epub position`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("open-restored-locator.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one paragraph.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two target paragraph.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val restored = Locator(
+            LocatorStrategy.Section(
+                spineIndex = 1,
+                elementIndex = 1,
+                charOffset = 8,
+            ),
+            totalProgression = 0.5f,
+        )
+        val emittedSections = mutableListOf<LocatorStrategy.Section>()
+        val locatorJob = launch {
+            engine.currentLocator.collect { locator ->
+                (locator.strategy as? LocatorStrategy.Section)?.let(emittedSections::add)
+            }
+        }
+
+        (engine as InitialLocatorAwareReaderEngine).setInitialLocator(restored)
+        val opened = engine.openBook(Uri.fromFile(epub))
+        locatorJob.cancel()
+        val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+
+        assertEquals("openBook should return the resolved restored locator", 1, (opened.strategy as? LocatorStrategy.Section)?.elementIndex)
+        assertTrue(
+            "openBook must not publish the book-start locator before the restored locator: $emittedSections",
+            emittedSections.none { it.spineIndex == 0 && it.elementIndex == 0 },
+        )
+        assertEquals("currentLocator must not briefly publish the first spine", 1, strategy?.elementIndex)
+        assertEquals("restored spine charOffset should be preserved", 8, strategy?.charOffset)
     }
 
     @Test

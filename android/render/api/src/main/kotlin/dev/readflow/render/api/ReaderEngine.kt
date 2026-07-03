@@ -100,6 +100,15 @@ interface ReaderEngine {
 }
 
 /**
+ * Optional capability for engines that can make [openBook] publish the restored display locator as
+ * their first resolved position. This keeps cold-open restore transactional without forcing every
+ * engine to grow a broader openBook signature.
+ */
+interface InitialLocatorAwareReaderEngine : ReaderEngine {
+    fun setInitialLocator(locator: Locator?)
+}
+
+/**
  * Optional capability for fixed-page engines that can provide one independent
  * page view at a time. ViewPager2 hosts use this without forcing reflow engines
  * into page rendering before they are ready.
