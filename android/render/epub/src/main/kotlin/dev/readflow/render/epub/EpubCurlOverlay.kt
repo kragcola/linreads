@@ -205,6 +205,7 @@ internal class EpubCurlOverlay(
         removeCallbacks(safetyDismissRunnable)
         active = false
         clearPendingDiscreteTurn()
+        onTurnSettled = null
         visibility = GONE
         recycleBitmaps()
     }

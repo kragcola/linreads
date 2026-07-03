@@ -154,16 +154,17 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
             val innerResult = scenario.withActivity {
                 view.scrollTo(0, 0)
-                val startY = view.scrollY
                 val down = PointF(view.width * 0.50f, view.height * 0.50f)
-                val up = PointF(down.x, view.height * 0.05f)
-                dispatchDrag(view, down, up)
-                FlowZoneResult(startY = startY, endY = view.scrollY)
+                dispatchTemporaryScrollAndRelease(view, down)
             }
             assertTrue(
-                "inner center should temporary-scroll: start=${innerResult.startY} end=${innerResult.endY}",
-                innerResult.endY > innerResult.startY,
+                "inner center should temporary-scroll while dragging: " +
+                    "start=${innerResult.startY} during=${innerResult.duringDragY}",
+                innerResult.duringDragY > innerResult.startY,
             )
+            assertEquals("inner center temporary-scroll should disable clip while dragging", false, innerResult.duringDragClip)
+            assertEquals("inner center temporary-scroll should re-settle to page 0", 0, innerResult.currentPage)
+            assertEquals("inner center temporary-scroll release should normalize to the page anchor", 0, innerResult.afterReleaseY)
 
             val cancelResult = scenario.withActivity {
                 view.scrollTo(0, 0)
@@ -194,16 +195,24 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
             val innerBoundaryResult = scenario.withActivity {
                 view.scrollTo(0, 0)
-                val startY = view.scrollY
                 val down = PointF(view.width * 0.40f, view.height * 0.50f)
-                val up = PointF(down.x, view.height * 0.05f)
-                dispatchDrag(view, down, up)
-                FlowZoneResult(startY = startY, endY = view.scrollY)
+                dispatchTemporaryScrollAndRelease(view, down)
             }
             assertTrue(
-                "inner center boundary should stay in temporary-scroll: " +
-                    "start=${innerBoundaryResult.startY} end=${innerBoundaryResult.endY}",
-                innerBoundaryResult.endY > innerBoundaryResult.startY,
+                "inner center boundary should temporary-scroll while dragging: " +
+                    "start=${innerBoundaryResult.startY} during=${innerBoundaryResult.duringDragY}",
+                innerBoundaryResult.duringDragY > innerBoundaryResult.startY,
+            )
+            assertEquals(
+                "inner center boundary temporary-scroll should disable clip while dragging",
+                false,
+                innerBoundaryResult.duringDragClip,
+            )
+            assertEquals("inner center boundary should re-settle to page 0", 0, innerBoundaryResult.currentPage)
+            assertEquals(
+                "inner center boundary release should normalize to the page anchor",
+                0,
+                innerBoundaryResult.afterReleaseY,
             )
 
             val innerHorizontalResult = scenario.withActivity {
@@ -918,6 +927,29 @@ class EpubFlowAnchorRuntimeSmokeTest {
         dispatchTouchEvent(target, motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_UP, point))
     }
 
+    private fun dispatchTemporaryScrollAndRelease(target: View, down: PointF): FlowTemporaryScrollResult {
+        val startY = target.scrollY
+        val armMove = PointF(down.x, target.height * 0.30f)
+        val scrolledMove = PointF(down.x, target.height * 0.10f)
+        val downTime = SystemClock.uptimeMillis()
+        dispatchTouchEvent(target, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down))
+        dispatchTouchEvent(target, motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, armMove))
+        dispatchTouchEvent(
+            target,
+            motionEvent(downTime, downTime + EVENT_STEP_MS * 2, MotionEvent.ACTION_MOVE, scrolledMove),
+        )
+        val duringDragY = target.scrollY
+        val duringDragClip = target.reflectPrivateBoolean("pageClipActive")
+        dispatchTouchEvent(target, motionEvent(downTime, downTime + EVENT_STEP_MS * 3, MotionEvent.ACTION_UP, scrolledMove))
+        return FlowTemporaryScrollResult(
+            startY = startY,
+            duringDragY = duringDragY,
+            afterReleaseY = target.scrollY,
+            duringDragClip = duringDragClip,
+            currentPage = target.reflectInt("currentPageIndex"),
+        )
+    }
+
     private fun dispatchDrag(target: View, start: PointF, end: PointF, steps: Int = 6) {
         val downTime = SystemClock.uptimeMillis()
         var eventTime = downTime
@@ -1016,6 +1048,14 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private data class FlowZonePageResult(
         val startY: Int,
         val endY: Int,
+        val currentPage: Int,
+    )
+
+    private data class FlowTemporaryScrollResult(
+        val startY: Int,
+        val duringDragY: Int,
+        val afterReleaseY: Int,
+        val duringDragClip: Boolean,
         val currentPage: Int,
     )
 

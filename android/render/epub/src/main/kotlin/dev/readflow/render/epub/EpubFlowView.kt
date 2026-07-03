@@ -70,7 +70,7 @@ internal class EpubFlowView(
 
     fun setModeAnchored(value: Mode, layoutOffset: Int) {
         applyMode(value, reposition = false)
-        goToOffset(layoutOffset, pagedAnchor = PagedAnchor.NEAREST)
+        goToOffset(layoutOffset, pagedAnchor = PagedAnchor.NEAREST, forceReport = true)
     }
 
     private fun applyMode(value: Mode, reposition: Boolean) {
@@ -91,6 +91,7 @@ internal class EpubFlowView(
     private var pendingLandOnLast = false
     /** True between [setChapter] and the first positioned frame: content is alpha-hidden until then. */
     private var awaitingReveal = false
+    private var lastReportedTopOffset: Int? = null
     private val initialRevealRunnable = Runnable { revealContent() }
     /** First page turn requested before the initial layout exists; replayed once pagination is ready. */
     private var pendingInitialPageTurnDelta: Int? = null
@@ -168,6 +169,7 @@ internal class EpubFlowView(
      * finger and runs its own release settle. While set, the host must not also drive its slide/scroll.
      */
     private var glInteractive = false
+    private var glDiscreteTurnGeneration = 0
 
     // ---- Pre-cache page textures (Moon+ Reader model) ------------------------------------------
     // After every page settle, pre-render the current + next page bitmaps so the next curl doesn't
@@ -361,7 +363,7 @@ internal class EpubFlowView(
         }
         recycleCachedTextures()
         repaginate(reposition = false)
-        if (anchorOffset >= 0) goToOffset(anchorOffset)
+        if (anchorOffset >= 0) goToOffset(anchorOffset, forceReport = true)
         if (awaitingReveal) scheduleInitialReveal()
     }
 
@@ -477,7 +479,7 @@ internal class EpubFlowView(
         if (awaitingReveal) {
             textView.post {
                 repaginate(reposition = false)
-                if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
+                if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0, forceReport = true)
                 if (consumePendingInitialPageTurn()) return@post
                 scheduleInitialReveal()
                 preCachePageTextures()
@@ -488,7 +490,7 @@ internal class EpubFlowView(
         textView.post {
             // Re-anchor by offset does the only scroll; skip repaginate's own scrollTo (no double jump).
             repaginate(reposition = anchorOffset < 0)
-            if (anchorOffset >= 0) goToOffset(anchorOffset)
+            if (anchorOffset >= 0) goToOffset(anchorOffset, forceReport = true)
             preCachePageTextures()
         }
     }
@@ -521,6 +523,7 @@ internal class EpubFlowView(
     ) {
         flipAnimator?.cancel()
         clearFlipOverlay()
+        cancelPendingGlDiscreteSettle()
         removeCallbacks(reflowRunnable)
         savedDownEvent?.recycle()
         savedDownEvent = null
@@ -533,6 +536,7 @@ internal class EpubFlowView(
         pendingLandOnLast = landOnLast
         pendingInitialPageTurnDelta = null
         awaitingReveal = true
+        lastReportedTopOffset = null
         removeCallbacks(initialRevealRunnable)
         container.animate().cancel()
         container.alpha = 0f
@@ -550,7 +554,7 @@ internal class EpubFlowView(
     private fun settleInitialPosition() {
         if (textView.layout == null || flow == null) return
         repaginate(reposition = false)
-        if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0)
+        if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0, forceReport = true)
         if (consumePendingInitialPageTurn()) return
         if (height > 0) scheduleInitialReveal()
         preCachePageTextures()
@@ -801,6 +805,7 @@ internal class EpubFlowView(
         if (curlOverlay?.active == true) {
             curlOverlay?.dismiss()
             glInteractive = false
+            cancelPendingGlDiscreteSettle()
         }
         val outgoing = snapshotViewport() ?: run {
             goToPage(target)
@@ -844,6 +849,7 @@ internal class EpubFlowView(
                 snapshotPageAt(targetTop)
             } ?: run { front.recycle(); return@runCatching false }
             overlay.start(front, revealed, forward) { committed ->
+                cancelPendingGlDiscreteSettle()
                 if (committed) {
                     goToPage(target)
                 } else {
@@ -852,9 +858,28 @@ internal class EpubFlowView(
                 overlay.dismiss()
                 preCachePageTextures()
             }
+            scheduleGlDiscreteSettleFallback(overlay, target)
             overlay.animateTurn(glCurlDurationMs)
             true
         }.getOrDefault(false)
+    }
+
+    private fun scheduleGlDiscreteSettleFallback(overlay: EpubCurlTurnOverlay, target: Int) {
+        val generation = ++glDiscreteTurnGeneration
+        postDelayed(
+            {
+                if (generation != glDiscreteTurnGeneration || !overlay.active) return@postDelayed
+                cancelPendingGlDiscreteSettle()
+                goToPage(target)
+                overlay.dismiss()
+                preCachePageTextures()
+            },
+            glCurlDurationMs + GL_DISCRETE_SETTLE_GRACE_MS,
+        )
+    }
+
+    private fun cancelPendingGlDiscreteSettle() {
+        glDiscreteTurnGeneration++
     }
 
     /**
@@ -1215,7 +1240,11 @@ internal class EpubFlowView(
         goToOffset(layoutOffset, pagedAnchor = PagedAnchor.FLOOR)
     }
 
-    private fun goToOffset(layoutOffset: Int, pagedAnchor: PagedAnchor) {
+    private fun goToOffset(
+        layoutOffset: Int,
+        pagedAnchor: PagedAnchor = PagedAnchor.FLOOR,
+        forceReport: Boolean = false,
+    ) {
         val layout = textView.layout ?: return
         val y = layout.getLineTop(layout.getLineForOffset(layoutOffset.coerceAtLeast(0)))
         if (mode == Mode.PAGED && paged.isNotEmpty()) {
@@ -1228,7 +1257,7 @@ internal class EpubFlowView(
         } else {
             scrollTo(0, y)
         }
-        reportTopOffset()
+        reportTopOffset(force = forceReport)
     }
 
     /** Char offset of the line at the top of the viewport — the locator-stable resume anchor. */
@@ -1237,8 +1266,11 @@ internal class EpubFlowView(
         return layout.getLineStart(layout.getLineForVertical(scrollY))
     }
 
-    private fun reportTopOffset() {
-        onTopOffsetChanged(topLayoutOffset())
+    private fun reportTopOffset(force: Boolean = false) {
+        val offset = topLayoutOffset()
+        if (!force && lastReportedTopOffset == offset) return
+        lastReportedTopOffset = offset
+        onTopOffsetChanged(offset)
     }
 
     // ---- Touch FSM (owned end-to-end; selection gated behind long-press) ----------------------
@@ -1497,6 +1529,7 @@ internal class EpubFlowView(
         /** Fade-in for the chapter's first positioned frame — long enough to hide a one-frame settle. */
         const val REVEAL_FADE_MS = 120L
         const val INITIAL_REVEAL_SETTLE_MS = REFLOW_DEBOUNCE_MS
+        const val GL_DISCRETE_SETTLE_GRACE_MS = 480L
     }
 }
 

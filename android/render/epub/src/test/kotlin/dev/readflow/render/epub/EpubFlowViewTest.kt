@@ -539,6 +539,23 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `discrete gl turn falls back to target page if harism never settles`() {
+        val overlay = FakeCurlOverlay()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+
+        assertTrue(view.goToAdjacentPage(1))
+        shadowOf(Looper.getMainLooper()).idleFor(1_000L, TimeUnit.MILLISECONDS)
+
+        assertEquals(1, view.currentPageIndex())
+        assertEquals(pageOneTop, view.scrollY)
+        assertEquals(false, overlay.active)
+    }
+
+    @Test
     fun `async reflow recycles stale turn texture cache before rebuilding pagination`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -840,6 +857,26 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `reapplying the current flow anchor does not report duplicate progress`() {
+        val reports = mutableListOf<Int>()
+        val view = pagedFlowView(onTopOffsetChanged = reports::add)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        val parkedScrollY = view.scrollY
+        val parkedOffset = view.topLayoutOffset()
+        reports.clear()
+
+        view.goToOffset(parkedOffset)
+
+        assertEquals(
+            "same-anchor goTo should not feed a duplicate locator/progress loop back into the reader",
+            emptyList<Int>(),
+            reports,
+        )
+        assertEquals("same-anchor goTo should leave the visible page stable", parkedScrollY, view.scrollY)
+    }
+
+    @Test
     fun `anchored switch to paged snaps to nearest canonical page anchor`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -1118,6 +1155,7 @@ class EpubFlowViewTest {
     private fun pagedFlowView(
         flipStyle: PageFlipStyle = PageFlipStyle.NONE,
         onTapZone: (EpubFlowTapZone) -> Unit = {},
+        onTopOffsetChanged: (Int) -> Unit = {},
         spannable: CharSequence? = null,
         text: String? = null,
         textPaddingTop: Int = 0,
@@ -1127,7 +1165,7 @@ class EpubFlowViewTest {
         val view = EpubFlowView(
             context = context,
             onTapZone = onTapZone,
-            onTopOffsetChanged = {},
+            onTopOffsetChanged = onTopOffsetChanged,
             onSelectionRange = { _, _ -> },
         )
         activity.addContentView(view, ViewGroup.LayoutParams(360, 120))
