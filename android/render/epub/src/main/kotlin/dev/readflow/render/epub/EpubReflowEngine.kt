@@ -226,6 +226,7 @@ class EpubReflowEngine private constructor(
     private var flowView: EpubFlowView? = null
     private var flowHost: android.widget.FrameLayout? = null
     private var flowSpineIndex: Int = -1
+    private var flowAppliedPalette: ReaderPalette? = null
     private val flowExecutor: ExecutorService by lazy { Executors.newFixedThreadPool(2) }
     override val selfPagingActive: Boolean get() = flowEngineEnabled
     private var cacheJob: Job? = null
@@ -367,6 +368,7 @@ class EpubReflowEngine private constructor(
             textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
             applyFlowLineSpacing(textView)
         }
+        flowAppliedPalette = palette
         flowView = view
         val startAnchor = flowAnchorFromLocator(_currentLocator.value)
         loadFlowChapter(
@@ -1266,6 +1268,7 @@ class EpubReflowEngine private constructor(
         flowHost = null
         flowCurrentFlow = null
         flowSpineIndex = -1
+        flowAppliedPalette = null
         activePagedTextPages.keys.toList().forEach { composeView ->
             composeView.clearEpubComposeTextPageForBookReset()
         }
@@ -1305,6 +1308,7 @@ class EpubReflowEngine private constructor(
         flowHost = null
         flowCurrentFlow = null
         flowSpineIndex = -1
+        flowAppliedPalette = null
         cacheJob?.cancel()
         cacheJob = null
         cacheScope = null
@@ -1392,17 +1396,20 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun setTheme(mode: ThemeMode) {
-        themeMode = mode
         val palette = paletteFor(mode, context.resources.configuration)
         if (flowEngineEnabled) {
+            if (themeMode == mode && flowAppliedPalette == palette) return
+            themeMode = mode
             withContext(Dispatchers.Main) {
                 flowHost?.background = null
                 flowView?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
                 flowView?.textView?.setTextColor(palette.ink)
+                flowAppliedPalette = palette
                 rebuildFlowChapter()
             }
             return
         }
+        themeMode = mode
         recyclerView?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
         (recyclerView?.adapter as? EpubParaAdapter)?.updateInkColor(palette.ink)
         (recyclerView?.adapter as? EpubParaAdapter)?.updateCodeBlockBgColor(codeBlockBgFor(mode, context.resources.configuration))

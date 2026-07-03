@@ -361,6 +361,10 @@ class EpubReflowEngineTest {
             "watchSettings can replay the current line spacing after the page is visible; that no-op must not restart reveal",
         )
 
+        engine.setTheme(ThemeMode.SYSTEM)
+
+        assertStillVisible("current theme replay must not rebuild and reveal visible EPUB flow content")
+
         engine.setPageFlipStyle(PageFlipStyle.SLIDE)
 
         assertStillVisible("current page flip style replay must not disturb visible EPUB flow content")
