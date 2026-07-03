@@ -17,6 +17,8 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import dev.readflow.core.model.PageFlipStyle
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -187,26 +189,14 @@ class EpubFlowViewTest {
         val from = target - 1
         view.goToPage(from)
         val fromVisualTop = view.scrollY
-        val background = RecordingBoundsTopDrawable()
-        view.background = background
+
+        assertEquals(fromVisualTop, view.textureTopPxForPageForTest(from))
+        assertEquals(maxScroll, view.textureTopPxForPageForTest(target))
+        assertTrue(rawTargetTop != view.textureTopPxForPageForTest(target))
 
         assertTrue(view.goToAdjacentPage(1))
 
         assertEquals(1, overlay.startCount)
-        assertTrue(
-            "front texture should use current visual top; recorded=${background.boundsTops}",
-            background.boundsTops.contains(fromVisualTop),
-        )
-        assertTrue(
-            "revealed texture should use clamped canonical top $maxScroll, not raw page top $rawTargetTop; " +
-                "recorded=${background.boundsTops}",
-            background.boundsTops.contains(maxScroll),
-        )
-        assertTrue(
-            "GL texture must not snapshot an unclamped page top that the live ScrollView cannot display; " +
-                "recorded=${background.boundsTops}",
-            !background.boundsTops.contains(rawTargetTop),
-        )
     }
 
     @Test
@@ -232,6 +222,25 @@ class EpubFlowViewTest {
             "snapshot bottom clip must include TextView padding just like dispatchDraw",
             minOf(pageOneTop + unpaddedClipBottom + view.textView.paddingTop, pageOneTop + view.height),
             view.snapshotClipBottomForTest(pageOneTop),
+        )
+    }
+
+    @Test
+    fun `page turn snapshots keep paper background anchored to viewport`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        assertTrue("test needs a non-zero page top", pageOneTop > 0)
+        val background = RecordingBoundsTopDrawable()
+        view.background = background
+
+        view.goToPage(1)
+        view.snapshotViewportForTest()
+        view.snapshotPageAt(pageOneTop)
+
+        assertTrue(
+            "page-turn snapshots must draw paper in viewport coordinates, recorded=${background.boundsTops}",
+            background.boundsTops.isNotEmpty() && background.boundsTops.all { it == 0 },
         )
     }
 
@@ -267,6 +276,19 @@ class EpubFlowViewTest {
 
         assertEquals(1, view.currentPageIndex())
         assertEquals(pageOneTop, view.scrollY)
+    }
+
+    @Test
+    fun `first slide turn finishes initial reveal before animating`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val container = view.getChildAt(0)
+        container.alpha = 0f
+
+        assertTrue(view.goToAdjacentPage(1))
+
+        assertEquals("first turn must not snapshot or animate a hidden reveal layer", 1f, container.alpha)
+        assertNotNull("first turn should create the slide animation drawable", view.privateField("slideDrawable"))
     }
 
     @Test
@@ -429,10 +451,9 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `precache discards partial texture pair when revealed snapshot fails`() {
+    fun `precache skips hidden initial reveal layer`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        val targetTop = requireNotNull(view.pageTopPxAt(1))
         (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
         (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
         view.setPrivateField("cachedFrontBitmap", null)
@@ -441,7 +462,27 @@ class EpubFlowViewTest {
         view.setPrivateField("cachedTargetPage", -1)
         view.setPrivateField("cachedFromTopPx", -1)
         view.setPrivateField("cachedTargetTopPx", -1)
-        view.background = ThrowWhenBoundsTopDrawable(targetTop)
+        view.getChildAt(0).alpha = 0f
+
+        view.preCachePageTexturesForTest()
+
+        assertNull("hidden reveal layer must not be cached as the front texture", view.privateField("cachedFrontBitmap"))
+        assertNull("hidden reveal layer must not be cached as the revealed texture", view.privateField("cachedRevealedBitmap"))
+    }
+
+    @Test
+    fun `precache discards partial texture pair when revealed snapshot fails`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
+        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
+        view.setPrivateField("cachedFrontBitmap", null)
+        view.setPrivateField("cachedRevealedBitmap", null)
+        view.setPrivateField("cachedFromPage", -1)
+        view.setPrivateField("cachedTargetPage", -1)
+        view.setPrivateField("cachedFromTopPx", -1)
+        view.setPrivateField("cachedTargetTopPx", -1)
+        view.background = ThrowOnSecondDrawDrawable()
 
         view.preCachePageTexturesForTest()
 
@@ -895,6 +936,16 @@ class EpubFlowViewTest {
         if (idlePostedWork) shadowOf(Looper.getMainLooper()).idle()
     }
 
+    private fun EpubFlowView.snapshotViewportForTest(): Bitmap? =
+        javaClass.getDeclaredMethod("snapshotViewport")
+            .apply { isAccessible = true }
+            .invoke(this) as Bitmap?
+
+    private fun EpubFlowView.textureTopPxForPageForTest(index: Int): Int? =
+        javaClass.getDeclaredMethod("textureTopPxForPage", Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+            .invoke(this, index) as Int?
+
     private fun EpubFlowView.snapshotClipTopForTest(topPx: Int): Int =
         javaClass.getDeclaredMethod("snapshotClipTopFor", Int::class.javaPrimitiveType)
             .apply { isAccessible = true }
@@ -927,6 +978,22 @@ class EpubFlowViewTest {
     ) : Drawable() {
         override fun draw(canvas: Canvas) {
             if (bounds.top == failingTop) error("snapshot failure for target page")
+        }
+
+        override fun setAlpha(alpha: Int) = Unit
+
+        override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
+    private class ThrowOnSecondDrawDrawable : Drawable() {
+        private var drawCount = 0
+
+        override fun draw(canvas: Canvas) {
+            drawCount += 1
+            if (drawCount == 2) error("snapshot failure for revealed page")
         }
 
         override fun setAlpha(alpha: Int) = Unit

@@ -155,6 +155,7 @@ internal class EpubFlowView(
     private fun preCachePageTextures() {
         if (mode != Mode.PAGED || paged.isEmpty() || width == 0) return
         if (turnInFlight) return
+        if (initialRevealActive()) return
         val idx = currentPage
         val nextIdx = (idx + 1).coerceAtMost(paged.lastIndex)
         val parkedTop = canonicalScrollTopForPage(idx) ?: return
@@ -505,7 +506,21 @@ internal class EpubFlowView(
     private fun revealContent() {
         if (!awaitingReveal) return
         awaitingReveal = false
-        container.animate().alpha(1f).setDuration(REVEAL_FADE_MS).start()
+        container.animate()
+            .alpha(1f)
+            .setDuration(REVEAL_FADE_MS)
+            .withEndAction { preCachePageTextures() }
+            .start()
+    }
+
+    private fun initialRevealActive(): Boolean =
+        awaitingReveal || container.alpha < 1f
+
+    private fun finishInitialRevealForTurn() {
+        if (!initialRevealActive()) return
+        container.animate().cancel()
+        awaitingReveal = false
+        container.alpha = 1f
     }
 
     /**
@@ -676,6 +691,7 @@ internal class EpubFlowView(
      */
     private fun goToPageAnimated(index: Int, forward: Boolean) {
         val target = index.coerceIn(0, paged.lastIndex)
+        finishInitialRevealForTurn()
         if (!pageTurnAnimated || mode != Mode.PAGED || width == 0 || height == 0) {
             goToPage(target)
             preCachePageTextures()
@@ -767,6 +783,7 @@ internal class EpubFlowView(
         val from = snapToNearestCanonicalPageAnchor(report = false)
         val target = from + if (forward) 1 else -1
         if (target < 0 || target > paged.lastIndex) return false
+        finishInitialRevealForTurn()
         return runCatching {
             // Use pre-cached textures when available (Moon+ model: no live snapshot under finger).
             val fromTop = textureTopPxForPage(from) ?: return@runCatching false
@@ -810,13 +827,10 @@ internal class EpubFlowView(
     private fun snapshotViewport(): Bitmap? = try {
         val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
         val canvas = Canvas(bmp)
+        drawSnapshotBackground(canvas)
         // ScrollView draws its children at -scrollY; replicate so the snapshot is exactly what's
         // on screen now (the current page), independent of the upcoming scroll.
         canvas.translate(0f, -scrollY.toFloat())
-        background?.let { bg ->
-            bg.setBounds(0, scrollY, width, scrollY + height)
-            bg.draw(canvas)
-        }
         // Clip the content to the outgoing page's bottom so the sliding snapshot shows blank
         // background below the last line — never the next page's bleed (matches on-screen render).
         val clipBottom = pageClipBottomInViewport()
@@ -853,11 +867,8 @@ internal class EpubFlowView(
         return try {
             val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
             val canvas = Canvas(bmp)
+            drawSnapshotBackground(canvas)
             canvas.translate(0f, -topPx.toFloat())
-            background?.let { bg ->
-                bg.setBounds(0, topPx, width, topPx + height)
-                bg.draw(canvas)
-            }
             val clipTop = snapshotClipTopFor(topPx)
             val clipBottom = snapshotClipBottomFor(topPx)
             val save = canvas.save()
@@ -869,6 +880,13 @@ internal class EpubFlowView(
             // Throwable, not Exception: Bitmap.createBitmap can OOM (an Error) on a large tablet page;
             // catching only Exception would crash instead of returning null → caller falls back cleanly.
             null
+        }
+    }
+
+    private fun drawSnapshotBackground(canvas: Canvas) {
+        background?.let { bg ->
+            bg.setBounds(0, 0, width, height)
+            bg.draw(canvas)
         }
     }
 
@@ -988,6 +1006,7 @@ internal class EpubFlowView(
         val from = snapToNearestCanonicalPageAnchor(report = false)
         val target = from + if (forward) 1 else -1
         if (target < 0 || target > paged.lastIndex) return false
+        finishInitialRevealForTurn()
         // Snap the outgoing page to its own top so the snapshot is the clean page (a mid-page free
         // scroll leaves scrollY between two page tops → the snapshot would carry top/bottom half-lines).
         scrollToPage(from, report = false)
