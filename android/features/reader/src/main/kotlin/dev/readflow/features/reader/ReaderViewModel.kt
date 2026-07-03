@@ -155,6 +155,17 @@ class ReaderViewModel(
         data class ByUri(val uri: Uri) : OpenRequest
     }
 
+    private data class ReaderOpenSettings(
+        val fontSize: Float,
+        val lineSpacing: Float,
+        val theme: ThemeMode,
+        val useSourceHanFont: Boolean,
+        val fontId: String,
+        val flipStyle: PageFlipStyle,
+        val txtEncodingCharsetName: String?,
+        val readingMode: ReadingMode?,
+    )
+
     private fun openById(bookId: String) {
         lastOpenRequest = OpenRequest.ById(bookId)
         val restoredForBook = restoredReaderState?.takeIf { it.bookId == bookId }
@@ -226,7 +237,11 @@ class ReaderViewModel(
             } else {
                 requestedInitialLocator
             }
+            val openSettings = readerOpenSettings(restoredForBook, engine)
             val initialLocatorAwareEngine = engine as? InitialLocatorAwareReaderEngine
+            if (initialLocatorAwareEngine != null) {
+                applyReaderOpenSettings(engine, openSettings)
+            }
             initialLocatorAwareEngine?.setInitialLocator(displayLocator)
             val openedLocator = runCatching { engine.openBook(uri) }.getOrElse { error ->
                 val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
@@ -239,24 +254,8 @@ class ReaderViewModel(
             if (initialLocatorAwareEngine != null && displayLocator != null) {
                 displayLocator = openedLocator
             }
-            val savedFontSize = restoredForBook?.fontSize?.toFloat() ?: settings.fontSize.first().toFloat()
-            val savedLineSpacing = clampedReaderLineSpacing(settings.lineSpacing.first())
-            val savedTheme = restoredForBook?.theme ?: settings.themeMode.first()
-            engine.setFontSize(savedFontSize)
-            engine.setLineSpacing(savedLineSpacing)
-            engine.setTheme(savedTheme)
-            engine.setSerifFont(settings.useSourceHanFont.first())
-            engine.setFont(settings.fontChoice.first().serialize())
-            val savedFlipStyle = settings.pageFlipStyle.first()
-            engine.setPageFlipStyle(savedFlipStyle)
-            val txtEnc = settings.txtEncoding.first()
-            if (txtEnc.charsetName != null) {
-                engine.setTxtEncodingOverride(txtEnc.charsetName)
-            }
-            val savedReadingMode = (restoredForBook?.readingMode ?: settings.readingMode.first()).toReadingMode()
-                ?.takeIf { it in engine.supportedModes }
-            savedReadingMode?.let { mode ->
-                runCatching { engine.setMode(mode) }
+            if (initialLocatorAwareEngine == null) {
+                applyReaderOpenSettings(engine, openSettings)
             }
             if (bookId != null && displayLocator == null) {
                 syncInitialProgressBeforeLoad(
@@ -276,12 +275,12 @@ class ReaderViewModel(
                     loadingState = LoadingState.Loaded,
                     engine = engine,
                     bookTitle = title,
-                    fontSizeSp = savedFontSize,
-                    lineSpacing = savedLineSpacing,
+                    fontSizeSp = openSettings.fontSize,
+                    lineSpacing = openSettings.lineSpacing,
                     readingMode = engine.pagingKind.value.toReadingMode(),
                     supportedModes = engine.supportedModes,
-                    pageFlipStyle = savedFlipStyle,
-                    themeMode = savedTheme,
+                    pageFlipStyle = openSettings.flipStyle,
+                    themeMode = openSettings.theme,
                     isUiVisible = restoredForBook?.isUiVisible ?: it.isUiVisible,
                     activePanel = null,
                     search = ReaderSearchState(),
@@ -303,6 +302,43 @@ class ReaderViewModel(
             bookId?.let {
                 persistReaderState(bookId = it, locator = engine.currentLocator.value, loadingState = LoadingState.Loaded)
             }
+        }
+    }
+
+    private suspend fun readerOpenSettings(
+        restoredForBook: ReaderState?,
+        engine: ReaderEngine,
+    ): ReaderOpenSettings {
+        val requestedMode = (restoredForBook?.readingMode ?: settings.readingMode.first())
+            .toReadingMode()
+            ?.takeIf { it in engine.supportedModes }
+        return ReaderOpenSettings(
+            fontSize = restoredForBook?.fontSize?.toFloat() ?: settings.fontSize.first().toFloat(),
+            lineSpacing = clampedReaderLineSpacing(settings.lineSpacing.first()),
+            theme = restoredForBook?.theme ?: settings.themeMode.first(),
+            useSourceHanFont = settings.useSourceHanFont.first(),
+            fontId = settings.fontChoice.first().serialize(),
+            flipStyle = settings.pageFlipStyle.first(),
+            txtEncodingCharsetName = settings.txtEncoding.first().charsetName,
+            readingMode = requestedMode,
+        )
+    }
+
+    private suspend fun applyReaderOpenSettings(
+        engine: ReaderEngine,
+        openSettings: ReaderOpenSettings,
+    ) {
+        engine.setFontSize(openSettings.fontSize)
+        engine.setLineSpacing(openSettings.lineSpacing)
+        engine.setTheme(openSettings.theme)
+        engine.setSerifFont(openSettings.useSourceHanFont)
+        engine.setFont(openSettings.fontId)
+        engine.setPageFlipStyle(openSettings.flipStyle)
+        if (openSettings.txtEncodingCharsetName != null) {
+            engine.setTxtEncodingOverride(openSettings.txtEncodingCharsetName)
+        }
+        openSettings.readingMode?.let { mode ->
+            runCatching { engine.setMode(mode) }
         }
     }
 

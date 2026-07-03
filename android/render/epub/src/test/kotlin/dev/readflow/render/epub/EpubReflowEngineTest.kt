@@ -190,6 +190,40 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `open book honors pre-applied paged typography before publishing restored position`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstParagraph = (1..120).joinToString(separator = "") { "a" }
+        val secondParagraph = "second paragraph"
+        val epub = tempDir.newFile("open-preconfigured-paged.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$firstParagraph</p><p>$secondParagraph</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+            flowEngineEnabled = false,
+        )
+
+        engine.setFontSize(32f)
+        engine.setLineSpacing(1.8f)
+        engine.setTheme(ThemeMode.DARK)
+        engine.setMode(ReadingMode.PAGED)
+        engine.setInitialLocator(Locator(LocatorStrategy.Page(index = 1, total = 20)))
+        val opened = engine.openBook(Uri.fromFile(epub))
+
+        val strategy = opened.strategy as? LocatorStrategy.Section
+        assertEquals("pre-open PAGED mode must survive openBook", dev.readflow.render.api.PagingKind.PAGED, engine.pagingKind.value)
+        assertTrue(
+            "pre-open typography should be used for pagination before the first locator is published",
+            engine.pageCount.value > 2,
+        )
+        assertEquals(0, strategy?.elementIndex)
+        assertTrue("restored page should land inside the first paragraph after pre-open pagination", (strategy?.charOffset ?: 0) > 0)
+    }
+
+    @Test
     fun `open book translates restored page locator through pagination instead of paragraph index`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val firstParagraph = (1..360).joinToString(separator = "") { "a" }

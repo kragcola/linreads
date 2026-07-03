@@ -20,6 +20,7 @@ import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ReaderState
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
@@ -616,6 +617,65 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `initial locator aware engine receives layout settings before opening book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val events = mutableListOf<String>()
+        val restoredLocator = Locator(LocatorStrategy.Page(index = 4, total = 10), totalProgression = 0.4f)
+        val settings = FakeSettingsRepository().apply {
+            fontSize.value = 24
+            lineSpacing.value = 2.0f
+            themeMode.value = ThemeMode.DARK
+            useSourceHanFont.value = false
+            fontChoice.value = FontChoice.System
+            pageFlipStyle.value = PageFlipStyle.SIMULATION
+            readingMode.value = ReaderReadingMode.PAGED
+        }
+        val progressDao = FakeProgressDao().apply {
+            upsert(
+                ReadingProgressEntity(
+                    bookId = "book-1",
+                    locatorJson = Json.encodeToString(restoredLocator),
+                    totalProgression = 0.4f,
+                    progressPercent = 0.4f,
+                    updatedAt = 100L,
+                    deviceId = "phone",
+                ),
+            )
+        }
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = events,
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        val openIndex = events.indexOf("open:0.4")
+        assertTrue(
+            "layout-affecting settings must be applied before openBook publishes the restored locator, events=$events",
+            openIndex > 0 &&
+                listOf(
+                    "setFontSize:24.0",
+                    "setLineSpacing:2.0",
+                    "setTheme:DARK",
+                    "setSerifFont:false",
+                    "setFont:system",
+                    "setPageFlipStyle:SIMULATION",
+                    "setMode:PAGED",
+                ).all { events.indexOf(it) in 0 until openIndex },
+        )
+        assertEquals(ReadingMode.PAGED, viewModel.uiState.value.readingMode)
+        assertEquals(PagingKind.PAGED, engine.pagingKind.value)
+        assertEquals(emptyList<Locator>(), engine.goToLocators)
+    }
+
+    @Test
     fun `initial locator aware engine does not receive duplicate goTo when it normalizes restored locator`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val restoredLocator = Locator(
@@ -1020,12 +1080,27 @@ class ReaderSavedStateHandleTest {
         }
         override suspend fun setFontSize(sp: Float) {
             fontSizes += sp
+            events += "setFontSize:$sp"
+        }
+        override suspend fun setLineSpacing(multiplier: Float) {
+            events += "setLineSpacing:$multiplier"
+        }
+        override suspend fun setSerifFont(useSourceHan: Boolean) {
+            events += "setSerifFont:$useSourceHan"
+        }
+        override suspend fun setFont(fontId: String) {
+            events += "setFont:$fontId"
+        }
+        override suspend fun setPageFlipStyle(style: PageFlipStyle) {
+            events += "setPageFlipStyle:$style"
         }
         override suspend fun setTheme(mode: ThemeMode) {
             themes += mode
+            events += "setTheme:$mode"
         }
         override suspend fun setMode(mode: ReadingMode) {
             modeChanges += mode
+            events += "setMode:$mode"
             pagingKind.value = when (mode) {
                 ReadingMode.SCROLL -> PagingKind.CONTINUOUS
                 ReadingMode.PAGED -> PagingKind.PAGED
