@@ -1434,9 +1434,11 @@ class EpubReflowEngine private constructor(
                 _pagingKind.value = targetKind
                 flowView?.let { view ->
                     val (anchor, anchorOffset) = flowAnchorFromLocator(_currentLocator.value)
-                    view.mode = if (targetKind == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
                     val offset = flowCurrentFlow?.offsetForParagraph(anchor, anchorOffset) ?: 0
-                    view.post { view.goToOffset(offset) }
+                    view.setModeAnchored(
+                        if (targetKind == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL,
+                        offset,
+                    )
                     _pageCount.value = view.pageCount()
                 }
             }

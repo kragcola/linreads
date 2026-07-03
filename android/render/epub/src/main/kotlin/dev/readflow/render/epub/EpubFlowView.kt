@@ -59,12 +59,24 @@ internal class EpubFlowView(
         )
     }
 
-    var mode: Mode = Mode.PAGED
+    private var modeValue: Mode = Mode.PAGED
+
+    var mode: Mode
+        get() = modeValue
         set(value) {
-            if (field != value) recycleCachedTextures()
-            field = value
-            repaginate()
+            applyMode(value, reposition = true)
         }
+
+    fun setModeAnchored(value: Mode, layoutOffset: Int) {
+        applyMode(value, reposition = false)
+        goToOffset(layoutOffset)
+    }
+
+    private fun applyMode(value: Mode, reposition: Boolean) {
+        if (modeValue != value) recycleCachedTextures()
+        modeValue = value
+        repaginate(reposition = reposition)
+    }
 
     private var paged: List<EpubFlowPage> = emptyList()
     private var pageHeightPx: Int = 0

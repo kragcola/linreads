@@ -204,6 +204,65 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `flow mode switch to paged lands on target anchor without posted correction jump`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val paragraphs = List(5) { paragraphIndex ->
+            (1..220).joinToString(separator = " ") { token -> "p${paragraphIndex}w$token" }
+        }
+        val targetParagraph = 3
+        val targetLocalOffset = paragraphs[targetParagraph].indexOf("p${targetParagraph}w180")
+        val targetSpineOffset = paragraphs.take(targetParagraph).sumOf { it.length } + targetLocalOffset
+        val epub = tempDir.newFile("flow-mode-no-posted-jump.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to paragraphs.joinToString(
+                separator = "",
+                prefix = "<html><body>",
+                postfix = "</body></html>",
+            ) { paragraph -> "<p>${paragraph.replace(" ", "<br/>")}</p>" },
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setFontSize(32f)
+        engine.setLineSpacing(1.8f)
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 80))
+        host.measure(exactly(360), exactly(80))
+        host.layout(0, 0, 360, 80)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        engine.setMode(ReadingMode.SCROLL)
+        shadowOf(Looper.getMainLooper()).idle()
+        engine.goTo(
+            Locator(
+                LocatorStrategy.Section(
+                    spineIndex = 0,
+                    elementIndex = targetParagraph,
+                    charOffset = targetSpineOffset,
+                ),
+            ),
+        )
+        assertTrue("test must start from a deep continuous-scroll position", flowView.scrollY > 0)
+
+        engine.setMode(ReadingMode.PAGED)
+        val immediateScrollY = flowView.scrollY
+
+        assertTrue(
+            "SCROLL->PAGED must not synchronously jump back to the old paged anchor before a posted correction",
+            immediateScrollY > 0,
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(
+            "SCROLL->PAGED should not need a later posted correction to reach the target anchor",
+            immediateScrollY,
+            flowView.scrollY,
+        )
+    }
+
+    @Test
     fun `paged runtime returns compose view as text page root`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("compose-page-root.epub")
