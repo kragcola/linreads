@@ -73,12 +73,17 @@ internal class EpubFlowView(
         if (hidePagedConversion) {
             removeCallbacks(initialRevealRunnable)
             container.animate().cancel()
+            pendingRestoreOffset = layoutOffset
+            pendingLandOnLast = false
             awaitingReveal = true
             container.alpha = 0f
         }
         applyMode(value, reposition = false)
         goToOffset(layoutOffset, pagedAnchor = PagedAnchor.NEAREST, forceReport = true)
-        if (hidePagedConversion) scheduleInitialReveal()
+        if (hidePagedConversion) {
+            if (textView.layout != null) pendingRestoreOffset = topLayoutOffset()
+            scheduleInitialReveal()
+        }
     }
 
     private fun applyMode(value: Mode, reposition: Boolean) {

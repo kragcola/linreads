@@ -939,6 +939,36 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `scroll to paged reflow during hidden conversion keeps the conversion anchor`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val nearNextPageLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (midpoint + 1) until pageTwoTop }
+        val staleOpenRestoreOffset = layout.getLineStart(layout.getLineForVertical(pageOneTop))
+        val conversionOffset = layout.getLineStart(layout.getLineForVertical(nearNextPageLineTop))
+
+        view.setPrivateField("pendingRestoreOffset", staleOpenRestoreOffset)
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.setModeAnchored(EpubFlowView.Mode.PAGED, conversionOffset)
+        assertEquals(pageTwoTop, view.scrollY)
+
+        val currentLayoutHeight = layout.height
+        view.setPrivateField("paginatedLayoutHeight", currentLayoutHeight - 1)
+        view.runReflowRunnable()
+
+        assertEquals(
+            "a reflow during hidden SCROLL->PAGED conversion must preserve the user's conversion anchor, not an old open restore anchor",
+            pageTwoTop,
+            view.scrollY,
+        )
+    }
+
+    @Test
     fun `temporary scroll cancel re-arms paged clip without tap zone`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val view = pagedFlowView(onTapZone = tapZones::add)
