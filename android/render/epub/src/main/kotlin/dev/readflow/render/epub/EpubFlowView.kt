@@ -1315,6 +1315,7 @@ internal class EpubFlowView(
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             pendingCleanTapX = null
+            setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, false)
             textView.setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, false)
         }
         val handled = super.dispatchTouchEvent(ev)
@@ -1323,7 +1324,10 @@ internal class EpubFlowView(
                 val tapX = pendingCleanTapX
                 pendingCleanTapX = null
                 if (tapX != null && !classified && !inSelectionMode && !textInteractiveTapWasConsumed()) {
-                    handleTap(tapX)
+                    val zone = handleTap(tapX)
+                    if (zone != EpubFlowTapZone.MENU) {
+                        setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, true)
+                    }
                 }
             }
             MotionEvent.ACTION_CANCEL -> pendingCleanTapX = null
@@ -1534,13 +1538,14 @@ internal class EpubFlowView(
         velocityTracker = null
     }
 
-    private fun handleTap(x: Float) {
+    private fun handleTap(x: Float): EpubFlowTapZone {
         val zone = when {
             x < width / 3f -> EpubFlowTapZone.PREV
             x > width * 2f / 3f -> EpubFlowTapZone.NEXT
             else -> EpubFlowTapZone.MENU
         }
         onTapZone(zone)
+        return zone
     }
 
     private companion object {

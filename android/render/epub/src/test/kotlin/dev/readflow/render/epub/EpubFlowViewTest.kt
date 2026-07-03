@@ -17,6 +17,7 @@ import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import dev.readflow.core.model.PageFlipStyle
+import dev.readflow.core.ui.readerPaperBackground
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -297,6 +298,35 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `first slide frame preserves real paper texture under the finger`() {
+        val context = RuntimeEnvironment.getApplication() as Application
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.background = readerPaperBackground(
+            context = context,
+            paperColor = 0xFFEDE6D6.toInt(),
+            inkColor = 0xFF2A2620.toInt(),
+            isNight = false,
+        )
+        view.goToPage(1)
+        val staticFrame = view.drawAsScrolledChildToBitmapForTest()
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        val fingerDownFrame = view.drawAsScrolledChildToBitmapForTest()
+        val x = view.width - 4
+        val y = 4
+
+        assertEquals(
+            "the real paper-grain drawable should not change when the first turn layer appears",
+            staticFrame.getPixel(x, y),
+            fingerDownFrame.getPixel(x, y),
+        )
+
+        staticFrame.recycle()
+        fingerDownFrame.recycle()
+    }
+
+    @Test
     fun `live paged draw keeps paper background anchored to viewport while scrolled`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -446,6 +476,76 @@ class EpubFlowViewTest {
         assertNotNull("ready first turn should start the normal slide animation immediately", view.privateField("flipAnimator"))
         assertEquals(1, view.currentPageIndex())
         assertEquals(view.pageTopPxAt(1), view.scrollY)
+    }
+
+    @Test
+    fun `self paging clean tap reports consumed to the outer reader host`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE, onTapZone = tapZones::add)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val downTime = SystemClock.uptimeMillis()
+        val x = view.width * 0.85f
+        val y = view.height * 0.50f
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, y))
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_UP, x, y))
+
+        assertEquals(
+            "a self-paging EPUB tap must suppress the outer ReaderTapContainer from handling the same UP again",
+            true,
+            view.getTag(dev.readflow.render.api.R.id.selection_aware_interactive_tap_consumed),
+        )
+        assertEquals("the same tap should still report the self-paging NEXT action", listOf(EpubFlowTapZone.NEXT), tapZones)
+    }
+
+    @Test
+    fun `self paging center tap leaves outer reader host available for chrome toggle`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE, onTapZone = tapZones::add)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val downTime = SystemClock.uptimeMillis()
+        val x = view.width * 0.50f
+        val y = view.height * 0.50f
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, y))
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_UP, x, y))
+
+        assertEquals(
+            "center MENU taps must not suppress the outer ReaderTapContainer chrome toggle",
+            false,
+            view.getTag(dev.readflow.render.api.R.id.selection_aware_interactive_tap_consumed),
+        )
+        assertEquals("the inner EPUB surface should still report MENU for its engine callback", listOf(EpubFlowTapZone.MENU), tapZones)
+    }
+
+    @Test
+    fun `first clean tap during initial reveal reports consumed and starts animation`() {
+        lateinit var view: EpubFlowView
+        view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTapZone = { zone ->
+                if (zone == EpubFlowTapZone.NEXT) view.goToAdjacentPage(1)
+            },
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.setPrivateField("awaitingReveal", true)
+        view.setPrivateField("pendingInitialPageTurnDelta", null)
+        view.getChildAt(0).alpha = 0f
+        val downTime = SystemClock.uptimeMillis()
+        val x = view.width * 0.85f
+        val y = view.height * 0.50f
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, y))
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_UP, x, y))
+
+        assertEquals(
+            "the first real tap path should suppress the outer host from replaying the same UP",
+            true,
+            view.getTag(dev.readflow.render.api.R.id.selection_aware_interactive_tap_consumed),
+        )
+        assertEquals("first tap should finish the reveal before snapshotting", false, view.privateBool("awaitingReveal"))
+        assertEquals(1f, view.getChildAt(0).alpha)
+        assertNotNull("first tap should start the normal slide animation", view.privateField("flipAnimator"))
     }
 
     @Test

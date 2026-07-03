@@ -274,7 +274,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
         ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
             dismissBlockingDialogs()
-            waitForObject(By.descStartsWith("阅读内容"))
+            val readerSurface = waitForObject(By.descStartsWith("阅读内容"))
 
             val target = waitForConditionResult("expected flow view to paginate") {
                 scenario.withActivity { activity ->
@@ -287,10 +287,9 @@ class EpubFlowAnchorRuntimeSmokeTest {
             }
 
             scenario.withActivity { target.view.scrollTo(0, 0) }
-            dispatchTap(
-                target.view,
-                PointF(target.view.width * 0.85f, target.view.height * 0.50f),
-            )
+            val bounds = readerSurface.visibleBounds
+            device.click(bounds.left + (bounds.width() * 0.85f).toInt(), bounds.centerY())
+            device.waitForIdle()
 
             val result = scenario.withActivity {
                 FlowCleanTapResult(
