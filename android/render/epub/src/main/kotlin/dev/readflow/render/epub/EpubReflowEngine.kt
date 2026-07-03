@@ -317,21 +317,14 @@ class EpubReflowEngine private constructor(
             paras = book.paras
             internalLinkTargetIndexes = epubInternalLinkTargetIndexes(book.spinePaths, paras, book.fragmentTargetIndexes)
             spineCharCounts = epubSpineCharCounts(paras)
-            val initialIndex = if (paras.isEmpty()) {
-                0
-            } else {
-                requestedInitialLocator?.let { epubIndexFromLocator(it, paras.size) } ?: 0
-            }
-            book.prefetchAroundParagraph(initialIndex)
+            val initialGuessIndex = initialPrefetchIndex(requestedInitialLocator)
+            book.prefetchAroundParagraph(initialGuessIndex)
             pagedSlices = buildPagedSlices()
             chapterBoundaries = buildChapterBoundaries(paras)
             displayBlockCount = book.blockCount
-            val initialOffset = when (val strategy = requestedInitialLocator?.strategy) {
-                is LocatorStrategy.Section ->
-                    (strategy.charOffset - (paras.getOrNull(initialIndex)?.spineCharStart ?: 0)).coerceAtLeast(0)
-                else -> 0
-            }
-            val initial = epubLocatorForOffset(paras, initialIndex, initialOffset)
+            val initial = resolveInitialOpenLocator(requestedInitialLocator)
+            val initialIndex = epubIndexFromLocator(initial, paras.size)
+            book.prefetchAroundParagraph(initialIndex)
             withContext(Dispatchers.Main) {
                 updatePageCount()
                 updateChapterInfo(initialIndex)
@@ -340,6 +333,57 @@ class EpubReflowEngine private constructor(
             }
             initial
         }
+    }
+
+    private fun resolveInitialOpenLocator(locator: Locator?): Locator {
+        if (paras.isEmpty()) return Locator(LocatorStrategy.Unknown)
+        return when (val strategy = locator?.strategy) {
+            is LocatorStrategy.Page -> resolveLegacyPageLocator(locator)
+            is LocatorStrategy.Section -> {
+                val paragraphIndex = epubIndexFromLocator(locator, paras.size)
+                val paragraphOffset =
+                    (strategy.charOffset - (paras.getOrNull(paragraphIndex)?.spineCharStart ?: 0)).coerceAtLeast(0)
+                epubLocatorForOffset(paras, paragraphIndex, paragraphOffset)
+            }
+            null -> epubLocatorForIndex(paras, 0)
+            else -> epubLocatorForIndex(paras, epubIndexFromLocator(locator, paras.size))
+        }
+    }
+
+    private fun resolveLegacyPageLocator(locator: Locator): Locator {
+        val page = locator.strategy as? LocatorStrategy.Page ?: return locator
+        legacyPageIndexFromLocator(locator)?.let { index ->
+            pagedSlices.getOrNull(index)?.let { return epubLocatorForPageSlice(paras, it) }
+        }
+        return pagedSlices
+            .getOrNull(page.index.coerceIn(0, (pagedSlices.size - 1).coerceAtLeast(0)))
+            ?.let { epubLocatorForPageSlice(paras, it) }
+            ?: epubLocatorForIndex(paras, epubIndexFromLocator(locator, paras.size))
+    }
+
+    private fun initialPrefetchIndex(locator: Locator?): Int {
+        if (paras.isEmpty()) return 0
+        val page = locator?.strategy as? LocatorStrategy.Page
+        if (page != null) {
+            val total = page.total.coerceAtLeast(1)
+            val progression = locator.totalProgression
+                ?: locator.progression
+                ?: (page.index.toFloat() / total)
+            val targetDocumentOffset = (progression.coerceIn(0f, 1f) * epubTotalChars(paras)).toInt()
+            return paras.indexOfLast { para -> para.documentCharStart <= targetDocumentOffset }
+                .takeIf { it >= 0 }
+                ?: 0
+        }
+        return locator?.let { epubIndexFromLocator(it, paras.size) } ?: 0
+    }
+
+    private fun legacyPageIndexFromLocator(locator: Locator): Int? {
+        val page = locator.strategy as? LocatorStrategy.Page ?: return null
+        val progression = locator.totalProgression ?: locator.progression ?: return null
+        val estimatedIndex = (progression.coerceIn(0f, 1f) * pagedSlices.size).toInt()
+        return estimatedIndex.coerceIn(0, pagedSlices.lastIndex.coerceAtLeast(0))
+            .takeIf { pagedSlices.isNotEmpty() }
+            ?: page.index.coerceIn(0, (pagedSlices.size - 1).coerceAtLeast(0))
     }
 
     override fun createView(): View {
@@ -552,8 +596,9 @@ class EpubReflowEngine private constructor(
     }
 
     private fun flowAnchorFromLocator(locator: Locator): Pair<Int, Int> {
-        val paragraphIndex = epubIndexFromLocator(locator, paras.size)
-        val paragraphOffset = when (val strategy = locator.strategy) {
+        val resolved = resolveLegacyPageLocator(locator)
+        val paragraphIndex = epubIndexFromLocator(resolved, paras.size)
+        val paragraphOffset = when (val strategy = resolved.strategy) {
             is LocatorStrategy.Section ->
                 (strategy.charOffset - (paras.getOrNull(paragraphIndex)?.spineCharStart ?: 0)).coerceAtLeast(0)
             else -> 0
@@ -1017,8 +1062,9 @@ class EpubReflowEngine private constructor(
     }
 
     private suspend fun goToFlow(locator: Locator) {
-        val idx = epubIndexFromLocator(locator, paras.size).coerceIn(0, (paras.size - 1).coerceAtLeast(0))
-        val paraOffset = when (val s = locator.strategy) {
+        val resolved = resolveLegacyPageLocator(locator)
+        val idx = epubIndexFromLocator(resolved, paras.size).coerceIn(0, (paras.size - 1).coerceAtLeast(0))
+        val paraOffset = when (val s = resolved.strategy) {
             is LocatorStrategy.Section -> (s.charOffset - (paras.getOrNull(idx)?.spineCharStart ?: 0)).coerceAtLeast(0)
             else -> 0
         }

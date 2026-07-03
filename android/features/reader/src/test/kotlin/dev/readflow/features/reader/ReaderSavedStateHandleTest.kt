@@ -656,6 +656,53 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `initial locator aware engine does not receive duplicate goTo when it normalizes page locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val restoredLocator = Locator(
+            LocatorStrategy.Page(index = 2, total = 20),
+            totalProgression = 0.12f,
+        )
+        val normalizedLocator = Locator(
+            LocatorStrategy.Section(spineIndex = 0, elementIndex = 0, charOffset = 140),
+            totalProgression = 0.12f,
+        )
+        val progressDao = FakeProgressDao().apply {
+            upsert(
+                ReadingProgressEntity(
+                    bookId = "book-1",
+                    locatorJson = Json.encodeToString(restoredLocator),
+                    totalProgression = 0.12f,
+                    progressPercent = 0.12f,
+                    updatedAt = 100L,
+                    deviceId = "phone",
+                ),
+            )
+        }
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 20), totalProgression = 0f),
+            events = mutableListOf(),
+        ).apply {
+            openNormalizer = { normalizedLocator }
+        }
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        assertEquals(listOf(restoredLocator), engine.initialLocators)
+        assertEquals(normalizedLocator, engine.currentLocator.value)
+        assertEquals(
+            "a Page locator normalized during open must not be replayed as a second visible goTo",
+            emptyList<Locator>(),
+            engine.goToLocators,
+        )
+    }
+
+    @Test
     fun `remote sync replay does not goTo again for same display section`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val normalizedLocator = Locator(

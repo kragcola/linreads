@@ -226,14 +226,18 @@ class ReaderViewModel(
             } else {
                 requestedInitialLocator
             }
-            (engine as? InitialLocatorAwareReaderEngine)?.setInitialLocator(displayLocator)
-            runCatching { engine.openBook(uri) }.onFailure { error ->
+            val initialLocatorAwareEngine = engine as? InitialLocatorAwareReaderEngine
+            initialLocatorAwareEngine?.setInitialLocator(displayLocator)
+            val openedLocator = runCatching { engine.openBook(uri) }.getOrElse { error ->
                 val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
                 _uiState.update { it.copy(loadingState = LoadingState.Error(readflowError), bookTitle = title) }
                 bookId?.let {
                     persistReaderState(bookId = it, loadingState = LoadingState.Error(readflowError), error = readflowError)
                 }
                 return@launch
+            }
+            if (initialLocatorAwareEngine != null && displayLocator != null) {
+                displayLocator = openedLocator
             }
             val savedFontSize = restoredForBook?.fontSize?.toFloat() ?: settings.fontSize.first().toFloat()
             val savedLineSpacing = clampedReaderLineSpacing(settings.lineSpacing.first())

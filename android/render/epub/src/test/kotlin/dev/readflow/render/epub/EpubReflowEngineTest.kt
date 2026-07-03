@@ -190,6 +190,132 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `open book translates restored page locator through pagination instead of paragraph index`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstParagraph = (1..360).joinToString(separator = "") { "a" }
+        val secondParagraph = "second paragraph should not be the page restore target"
+        val epub = tempDir.newFile("open-restored-page-locator.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$firstParagraph</p><p>$secondParagraph</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+            flowEngineEnabled = true,
+        )
+        engine.setInitialLocator(Locator(LocatorStrategy.Page(index = 2, total = 20)))
+
+        val opened = engine.openBook(Uri.fromFile(epub))
+
+        val strategy = opened.strategy as? LocatorStrategy.Section
+        assertEquals(
+            "restored Page locators from older paged engines must be translated through page slices, not treated as paragraph indexes",
+            0,
+            strategy?.elementIndex,
+        )
+        assertTrue(
+            "page 2 should restore inside the first long paragraph, not at its head: $strategy",
+            (strategy?.charOffset ?: 0) > 0,
+        )
+    }
+
+    @Test
+    fun `open book translates restored page locator by progression across spines`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val paragraph = (1..200).joinToString(separator = "") { "a" }
+        val epub = tempDir.newFile("open-restored-page-progression.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$paragraph</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>$paragraph</p></body></html>",
+            "OEBPS/ch3.xhtml" to "<html><body><p>$paragraph</p></body></html>",
+            "OEBPS/ch4.xhtml" to "<html><body><p>$paragraph</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+            flowEngineEnabled = true,
+        )
+        engine.setInitialLocator(
+            Locator(
+                LocatorStrategy.Page(index = 1, total = 2),
+                totalProgression = 0.5f,
+            ),
+        )
+
+        val opened = engine.openBook(Uri.fromFile(epub))
+
+        val strategy = opened.strategy as? LocatorStrategy.Section
+        assertEquals(
+            "restored Page locators with whole-book progression must land by progress, not by raw page index",
+            2,
+            strategy?.elementIndex,
+        )
+        assertTrue(
+            "progression-based restore should prefetch and measure the target spine before resolving: $strategy",
+            (strategy?.charOffset ?: 0) > 0,
+        )
+    }
+
+    @Test
+    fun `open book builds page slices from cached text without loading cold spines`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("open-cached-page-slices.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two.</p></body></html>",
+            "OEBPS/ch3.xhtml" to "<html><body><p>Chapter three must stay cold.</p></body></html>",
+            "OEBPS/ch4.xhtml" to "<html><body><p>Chapter four must stay cold.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.openBook(Uri.fromFile(epub))
+
+        val book = engine.lazyBookForTest()
+        assertEquals("initial prefetch should load the opened spine", 1, book?.loadCount(0))
+        assertEquals("initial prefetch may warm the next spine", 1, book?.loadCount(1))
+        assertEquals("building page slices must not parse cold spine 3", 0, book?.loadCount(2))
+        assertEquals("building page slices must not parse cold spine 4", 0, book?.loadCount(3))
+    }
+
+    @Test
+    fun `flow goTo translates page locator through pagination instead of paragraph index`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstParagraph = (1..360).joinToString(separator = "") { "a" }
+        val secondParagraph = "second paragraph should not be the page goTo target"
+        val epub = tempDir.newFile("flow-goto-page-locator.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>$firstParagraph</p><p>$secondParagraph</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = oneCharacterPerLineMeasurer(),
+            flowEngineEnabled = true,
+        )
+        engine.openBook(Uri.fromFile(epub))
+
+        engine.goTo(Locator(LocatorStrategy.Page(index = 2, total = 20)))
+
+        val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertEquals(
+            "flow goTo(Page) must use page slices, not paragraph indexes, for old remote/local progress",
+            0,
+            strategy?.elementIndex,
+        )
+        assertTrue(
+            "page 2 should land inside the first long paragraph: $strategy",
+            (strategy?.charOffset ?: 0) > 0,
+        )
+    }
+
+    @Test
     fun `flow mode switch to paged preserves paragraph offset anchor`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val paragraphs = List(4) { paragraphIndex ->
@@ -2426,6 +2552,12 @@ class EpubReflowEngineTest {
         EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
             text.indices.map { index -> EpubTextLayoutLineRange(index, index + 1) }
         }
+
+    private fun EpubReflowEngine.lazyBookForTest(): EpubLazyBook? {
+        val field = EpubReflowEngine::class.java.getDeclaredField("lazyBook")
+        field.isAccessible = true
+        return field.get(this) as? EpubLazyBook
+    }
 
     private fun writeEpub(file: File, vararg spineEntries: Pair<String, String>) {
         ZipOutputStream(file.outputStream()).use { zip ->
