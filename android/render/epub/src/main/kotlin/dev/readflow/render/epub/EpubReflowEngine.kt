@@ -224,6 +224,7 @@ class EpubReflowEngine private constructor(
     // ---- Continuous-flow path (方案 C). Active when EPUB_FLOW_ENGINE_ENABLED; legacy slice-pack
     // path below is retained as a fallback (flip the flag to roll back). ----
     private var flowView: EpubFlowView? = null
+    private var flowHost: android.widget.FrameLayout? = null
     private var flowSpineIndex: Int = -1
     private val flowExecutor: ExecutorService by lazy { Executors.newFixedThreadPool(2) }
     override val selfPagingActive: Boolean get() = flowEngineEnabled
@@ -372,7 +373,10 @@ class EpubReflowEngine private constructor(
         // Host the reader + a (lazily created) GL curl overlay in one FrameLayout. The overlay is built
         // ONLY on the first SIMULATION turn (SLIDE/NONE readers never allocate a GL context), and any GL
         // construction failure leaves it null so SIMULATION degrades to the slide path — never crashes.
-        val host = android.widget.FrameLayout(context)
+        val host = android.widget.FrameLayout(context).apply {
+            background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
+        }
+        flowHost = host
         val matchParent = {
             android.widget.FrameLayout.LayoutParams(
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
@@ -1241,6 +1245,7 @@ class EpubReflowEngine private constructor(
         cacheScope = null
         flowView?.textView?.let { runCatching { AsyncDrawableScheduler.unschedule(it) } }
         flowView = null
+        flowHost = null
         flowCurrentFlow = null
         flowSpineIndex = -1
         activePagedTextPages.keys.toList().forEach { composeView ->
@@ -1279,6 +1284,7 @@ class EpubReflowEngine private constructor(
         pageRequestCallback = null
         flowView?.textView?.let { runCatching { AsyncDrawableScheduler.unschedule(it) } }
         flowView = null
+        flowHost = null
         flowCurrentFlow = null
         flowSpineIndex = -1
         cacheJob?.cancel()
@@ -1366,6 +1372,7 @@ class EpubReflowEngine private constructor(
         val palette = paletteFor(mode, context.resources.configuration)
         if (flowEngineEnabled) {
             withContext(Dispatchers.Main) {
+                flowHost?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
                 flowView?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
                 flowView?.textView?.setTextColor(palette.ink)
                 rebuildFlowChapter()

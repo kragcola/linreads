@@ -59,4 +59,10 @@ class ThemeProfileTest {
         assertEquals("SEPIA", safe.themeMode)
         assertEquals("UTF_8", safe.txtEncoding)
     }
+
+    @Test
+    fun `validated clamps line spacing to reader typography range`() {
+        assertEquals(1.0f, ThemeProfile.validated(ThemeProfile(lineSpacing = 0.8f)).lineSpacing)
+        assertEquals(2.2f, ThemeProfile.validated(ThemeProfile(lineSpacing = 3.0f)).lineSpacing)
+    }
 }

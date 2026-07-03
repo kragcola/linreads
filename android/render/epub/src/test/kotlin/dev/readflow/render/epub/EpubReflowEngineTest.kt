@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.widget.ImageView
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.text.AnnotatedString
@@ -12,6 +13,7 @@ import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.style.TextDecoration
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.ThemeMode
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightRange
@@ -112,6 +114,35 @@ class EpubReflowEngineTest {
         val page = engine.createPageView(0)
 
         assertNotNull(findView(page, ComposeView::class.java))
+    }
+
+    @Test
+    fun `flow view host keeps paper background behind page turn layers`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-host-paper.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Flow host paper background.</p><p>Next page text.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        val initialHostBackground = host.background
+        val initialFlowBackground = flowView.background
+
+        assertNotNull("flow host must paint paper behind transparent turn layers", initialHostBackground)
+        assertNotNull("flow view must paint the live paper texture", initialFlowBackground)
+
+        engine.setTheme(ThemeMode.DARK)
+
+        assertNotNull("theme change must keep host paper background", host.background)
+        assertNotNull("theme change must keep flow paper background", flowView.background)
+        assertTrue("host background should refresh with theme", host.background !== initialHostBackground)
+        assertTrue("flow background should refresh with theme", flowView.background !== initialFlowBackground)
     }
 
     @Test

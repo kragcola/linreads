@@ -69,6 +69,7 @@ import dev.readflow.core.model.TransitionType
 import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.readerThemeLabel
 import dev.readflow.core.prefs.ReaderTypography
+import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ZoomableReaderEngine
@@ -136,6 +137,7 @@ fun ReaderScreen(
                         zoomableEngine?.zoomScale ?: MutableStateFlow(1f)
                     }
                     val zoomScale by zoomScaleFlow.collectAsState()
+                    val systemNight = isSystemInDarkTheme()
                     val readerFocusRequester = remember { FocusRequester() }
                     fun handleReaderKey(nativeEvent: KeyEvent): Boolean {
                         if (state.activePanel != null) return false
@@ -179,11 +181,13 @@ fun ReaderScreen(
                                         viewModel.onIntent(ReaderIntent.PreviewZoom(it))
                                     },
                                 ).apply {
+                                    setReaderPaperBackground(state.themeMode, systemNight)
                                     setDocumentView(host.hostView())
                                     requestFocus()
                                 }
                             },
                             update = { view ->
+                                view.setReaderPaperBackground(state.themeMode, systemNight)
                                 view.setDocumentView(host.hostView())
                                 view.currentFontSizeSp = state.fontSizeSp
                                 view.currentZoomScale = zoomScale
@@ -1053,6 +1057,7 @@ private class ReaderTapContainer(
     private val onZoomPreview: (Float) -> Unit,
 ) : FrameLayout(context) {
     private var documentView: View? = null
+    private var paperBackgroundKey: Pair<ThemeMode, Boolean>? = null
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private val maxTapDurationMs = ViewConfiguration.getLongPressTimeout()
     private val scaleDetector = ScaleGestureDetector(
@@ -1125,6 +1130,14 @@ private class ReaderTapContainer(
             isFontPinchEnabled -> "阅读内容，捏合调整字号"
             else -> "阅读内容"
         }
+    }
+
+    fun setReaderPaperBackground(themeMode: ThemeMode, systemNight: Boolean) {
+        val key = themeMode to systemNight
+        if (paperBackgroundKey == key) return
+        val palette = readerPaletteFor(themeMode, systemNight)
+        background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
+        paperBackgroundKey = key
     }
 
     fun setDocumentView(view: View) {
