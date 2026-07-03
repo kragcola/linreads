@@ -369,7 +369,15 @@ class EpubFlowViewTest {
         view.layout(0, 0, 360, 120)
         shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
 
-        assertNotNull("the queued first tap should start the normal slide animation once layout is ready", view.privateField("flipAnimator"))
+        assertEquals(
+            "the queued first tap should wait until the first positioned frame is revealed",
+            null,
+            view.privateField("flipAnimator"),
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        assertNotNull("the queued first tap should start the normal slide animation once reveal is ready", view.privateField("flipAnimator"))
         assertEquals(1, view.currentPageIndex())
         assertEquals(view.pageTopPxAt(1), view.scrollY)
     }
@@ -392,8 +400,37 @@ class EpubFlowViewTest {
 
         view.layout(0, 0, 360, 120)
         shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(
+            "the queued first turn should not animate until the first measured frame is visible",
+            null,
+            view.privateField("flipAnimator"),
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
 
         assertNotNull("the queued first turn should animate once the measured viewport is available", view.privateField("flipAnimator"))
+        assertEquals(1, view.currentPageIndex())
+        assertEquals(view.pageTopPxAt(1), view.scrollY)
+    }
+
+    @Test
+    fun `first turn during initial reveal waits for the revealed frame before animating`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.setPrivateField("awaitingReveal", true)
+        view.setPrivateField("pendingInitialPageTurnDelta", null)
+        view.getChildAt(0).alpha = 0f
+
+        val accepted = view.goToAdjacentPage(1)
+
+        assertEquals("the first turn should be queued while initial content is still hidden", true, accepted)
+        assertEquals("initial reveal first turn must not cut to the next page before a visible frame", 0, view.currentPageIndex())
+        assertEquals(1, view.privateInt("pendingInitialPageTurnDelta"))
+        assertEquals(null, view.privateField("slideDrawable"))
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        assertNotNull("the queued first turn should animate after the initial reveal settles", view.privateField("flipAnimator"))
         assertEquals(1, view.currentPageIndex())
         assertEquals(view.pageTopPxAt(1), view.scrollY)
     }
@@ -416,6 +453,13 @@ class EpubFlowViewTest {
 
         view.layout(0, 0, 360, 120)
         shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(
+            "boundary turn must wait for the restored final page to be revealed",
+            emptyList<EpubFlowTapZone>(),
+            tapZones,
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
 
         assertEquals("after settling on the final page, NEXT must be forwarded for cross-spine advance", listOf(EpubFlowTapZone.NEXT), tapZones)
         assertEquals(finalPage, view.currentPageIndex())

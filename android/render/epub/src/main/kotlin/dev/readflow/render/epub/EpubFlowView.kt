@@ -579,7 +579,11 @@ internal class EpubFlowView(
         container.animate()
             .alpha(1f)
             .setDuration(REVEAL_FADE_MS)
-            .withEndAction { preCachePageTextures() }
+            .withEndAction {
+                if (!consumePendingInitialPageTurn()) {
+                    preCachePageTextures()
+                }
+            }
             .start()
     }
 
@@ -685,8 +689,9 @@ internal class EpubFlowView(
     fun goToAdjacentPage(delta: Int): Boolean {
         if (delta == 0) return false
         if (mode == Mode.PAGED) {
-            if (awaitingReveal && flow != null && height <= 0) {
+            if (awaitingReveal && flow != null) {
                 pendingInitialPageTurnDelta = delta.coerceIn(-1, 1)
+                if (height > 0) scheduleInitialReveal()
                 return true
             }
             if (paged.isEmpty()) {

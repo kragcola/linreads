@@ -121,7 +121,7 @@ class EpubReflowEngineTest {
     }
 
     @Test
-    fun `flow view host keeps paper background behind page turn layers`() = runTest(dispatcher) {
+    fun `flow view host leaves paper texture owned by the flow surface`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("flow-host-paper.epub")
         writeEpub(
@@ -135,17 +135,15 @@ class EpubReflowEngineTest {
         engine.setMode(ReadingMode.PAGED)
         val host = engine.createView() as FrameLayout
         val flowView = host.getChildAt(0) as EpubFlowView
-        val initialHostBackground = host.background
         val initialFlowBackground = flowView.background
 
-        assertNotNull("flow host must paint paper behind transparent turn layers", initialHostBackground)
+        assertEquals("flow host must not paint a second, differently tiled paper texture", null, host.background)
         assertNotNull("flow view must paint the live paper texture", initialFlowBackground)
 
         engine.setTheme(ThemeMode.DARK)
 
-        assertNotNull("theme change must keep host paper background", host.background)
+        assertEquals("theme change must keep the host transparent so press/turn layers reveal the same paper", null, host.background)
         assertNotNull("theme change must keep flow paper background", flowView.background)
-        assertTrue("host background should refresh with theme", host.background !== initialHostBackground)
         assertTrue("flow background should refresh with theme", flowView.background !== initialFlowBackground)
     }
 
@@ -260,6 +258,60 @@ class EpubReflowEngineTest {
             "SCROLL->PAGED should not need a later posted correction to reach the target anchor",
             immediateScrollY,
             flowView.scrollY,
+        )
+    }
+
+    @Test
+    fun `flow mode switch to paged samples live scroll anchor when locator lags`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val paragraphs = List(5) { paragraphIndex ->
+            (1..220).joinToString(separator = " ") { token -> "p${paragraphIndex}w$token" }
+        }
+        val epub = tempDir.newFile("flow-mode-live-anchor.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to paragraphs.joinToString(
+                separator = "",
+                prefix = "<html><body>",
+                postfix = "</body></html>",
+            ) { paragraph -> "<p>${paragraph.replace(" ", "<br/>")}</p>" },
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setFontSize(32f)
+        engine.setLineSpacing(1.8f)
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 80))
+        host.measure(exactly(360), exactly(80))
+        host.layout(0, 0, 360, 80)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        engine.setMode(ReadingMode.SCROLL)
+        shadowOf(Looper.getMainLooper()).idle()
+        val layout = requireNotNull(flowView.textView.layout)
+        val maxScroll = (flowView.getChildAt(0).height - flowView.height).coerceAtLeast(0)
+        assertTrue("test document must be scrollable enough to expose stale-locator drift", maxScroll > 300)
+        val liveLine = layout.getLineForVertical(maxScroll / 2)
+        val liveTop = layout.getLineTop(liveLine)
+        val liveOffset = layout.getLineStart(liveLine)
+        assertTrue("test must sample a deep live offset", liveOffset > 500)
+        flowView.scrollTo(0, liveTop)
+        assertTrue(
+            "test must leave the engine locator stale at book start",
+            (engine.currentLocator.value.totalProgression ?: 0f) < 0.05f,
+        )
+
+        engine.setMode(ReadingMode.PAGED)
+
+        val expectedPageTop = flowView.pageTopPxAt(flowView.currentPageIndex())
+        val currentTopOffset = flowView.topLayoutOffset()
+        assertEquals("SCROLL->PAGED should park on the live viewport's nearest page", expectedPageTop, flowView.scrollY)
+        assertTrue(
+            "mode switch should sample live top offset instead of stale locator: live=$liveOffset actual=$currentTopOffset",
+            currentTopOffset >= liveOffset - 120,
         )
     }
 

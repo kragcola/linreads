@@ -377,9 +377,7 @@ class EpubReflowEngine private constructor(
         // Host the reader + a (lazily created) GL curl overlay in one FrameLayout. The overlay is built
         // ONLY on the first SIMULATION turn (SLIDE/NONE readers never allocate a GL context), and any GL
         // construction failure leaves it null so SIMULATION degrades to the slide path — never crashes.
-        val host = android.widget.FrameLayout(context).apply {
-            background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
-        }
+        val host = android.widget.FrameLayout(context)
         flowHost = host
         val matchParent = {
             android.widget.FrameLayout.LayoutParams(
@@ -1398,7 +1396,7 @@ class EpubReflowEngine private constructor(
         val palette = paletteFor(mode, context.resources.configuration)
         if (flowEngineEnabled) {
             withContext(Dispatchers.Main) {
-                flowHost?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
+                flowHost?.background = null
                 flowView?.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
                 flowView?.textView?.setTextColor(palette.ink)
                 rebuildFlowChapter()
@@ -1440,8 +1438,12 @@ class EpubReflowEngine private constructor(
             withContext(Dispatchers.Main) {
                 _pagingKind.value = targetKind
                 flowView?.let { view ->
-                    val (anchor, anchorOffset) = flowAnchorFromLocator(_currentLocator.value)
-                    val offset = flowCurrentFlow?.offsetForParagraph(anchor, anchorOffset) ?: 0
+                    val offset = flowCurrentFlow?.let { flow ->
+                        view.topLayoutOffset().coerceIn(0, flow.text.length)
+                    } ?: run {
+                        val (anchor, anchorOffset) = flowAnchorFromLocator(_currentLocator.value)
+                        flowCurrentFlow?.offsetForParagraph(anchor, anchorOffset) ?: 0
+                    }
                     view.setModeAnchored(
                         if (targetKind == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL,
                         offset,
