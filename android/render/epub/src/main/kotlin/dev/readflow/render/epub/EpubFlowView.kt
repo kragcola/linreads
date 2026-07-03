@@ -69,7 +69,7 @@ internal class EpubFlowView(
 
     fun setModeAnchored(value: Mode, layoutOffset: Int) {
         applyMode(value, reposition = false)
-        goToOffset(layoutOffset)
+        goToOffset(layoutOffset, pagedAnchor = PagedAnchor.NEAREST)
     }
 
     private fun applyMode(value: Mode, reposition: Boolean) {
@@ -1156,14 +1156,23 @@ internal class EpubFlowView(
         invalidate()
     }
 
+    private enum class PagedAnchor { FLOOR, NEAREST }
+
     /** Scrolls to show [layoutOffset] (its page in PAGED, or that offset at top in SCROLL). */
     fun goToOffset(layoutOffset: Int) {
+        goToOffset(layoutOffset, pagedAnchor = PagedAnchor.FLOOR)
+    }
+
+    private fun goToOffset(layoutOffset: Int, pagedAnchor: PagedAnchor) {
         val layout = textView.layout ?: return
         val y = layout.getLineTop(layout.getLineForOffset(layoutOffset.coerceAtLeast(0)))
         if (mode == Mode.PAGED && paged.isNotEmpty()) {
-            currentPage = paged.indexOfLast { it.topPx <= y }.coerceAtLeast(0)
+            currentPage = when (pagedAnchor) {
+                PagedAnchor.FLOOR -> paged.indexOfLast { it.topPx <= y }.coerceAtLeast(0)
+                PagedAnchor.NEAREST -> nearestCanonicalPageIndexForScrollY(y)
+            }
             pageClipActive = true
-            scrollTo(0, paged[currentPage].topPx)
+            scrollTo(0, canonicalScrollTopForPage(currentPage) ?: paged[currentPage].topPx)
         } else {
             scrollTo(0, y)
         }

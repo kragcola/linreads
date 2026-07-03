@@ -160,6 +160,30 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `direct uri open immediately hides the previous reader surface`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        assertEquals(LoadingState.Loaded, viewModel.uiState.value.loadingState)
+        assertEquals(engine, viewModel.uiState.value.engine)
+
+        viewModel.onIntent(ReaderIntent.OpenBook(Uri.parse("file:///tmp/direct-open.epub")))
+
+        assertEquals(
+            "direct URI open must show the loading surface immediately instead of leaving the previous reader visible",
+            LoadingState.Loading,
+            viewModel.uiState.value.loadingState,
+        )
+        assertNull(viewModel.uiState.value.engine)
+    }
+
+    @Test
     fun `restores json state snapshot and applies semantic locator on reopen`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val restoredLocator = Locator(

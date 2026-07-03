@@ -188,6 +188,17 @@ class ReaderViewModel(
         if (bookId == null) {
             lastOpenRequest = OpenRequest.ByUri(uri)
         }
+        _uiState.update {
+            it.copy(
+                loadingState = LoadingState.Loading,
+                engine = null,
+                activePanel = null,
+                search = ReaderSearchState(),
+                bookmarks = ReaderBookmarkState(),
+                annotations = ReaderAnnotationState(),
+                textSelection = null,
+            )
+        }
         viewModelScope.launch {
             val engine = runCatching { engineRegistry.resolve(uri) }.getOrElse { error ->
                 val readflowError = ReadflowError.io(error.message ?: "无法打开文件")

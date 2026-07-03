@@ -648,6 +648,29 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `anchored switch to paged snaps to nearest canonical page anchor`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val nearNextPageLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (midpoint + 1) until pageTwoTop }
+
+        view.mode = EpubFlowView.Mode.SCROLL
+
+        view.setModeAnchored(EpubFlowView.Mode.PAGED, layout.getLineStart(layout.getLineForVertical(nearNextPageLineTop)))
+
+        assertEquals(
+            "SCROLL->PAGED should settle to the nearest canonical page anchor, not floor back to the previous page",
+            pageTwoTop,
+            view.scrollY,
+        )
+    }
+
+    @Test
     fun `temporary scroll cancel re-arms paged clip without tap zone`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val view = pagedFlowView(onTapZone = tapZones::add)
