@@ -2,6 +2,7 @@ package dev.readflow.render.epub
 
 import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Handler
 import android.os.Looper
@@ -70,6 +71,9 @@ internal class EpubFlowImageLoader(
     private val pageHeightProvider: () -> Int,
     private val inlineMaxHeightPx: Int,
     private val fullPageHrefs: Set<String>,
+    private val imageBoundsProvider: (String) -> EpubImageBounds? = { href ->
+        epubFileProvider()?.let { decodeEpubImageBounds(it, href) }
+    },
 ) : AsyncDrawableLoader() {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -86,13 +90,14 @@ internal class EpubFlowImageLoader(
         } else {
             columnWidthPx.coerceAtLeast(64)
         }
+        val reservedBounds = drawable.bounds.takeUnless { it.isEmpty }?.let { Rect(it) }
         val future = executor.submit {
             val bitmap = decodeEpubImage(file, href, maxSide = maxSide)
             if (bitmap == null) {
                 handler.post { inFlight.remove(drawable) }
                 return@submit
             }
-            val target = epubFlowImageTargetSize(
+            val target = reservedBounds ?: epubFlowImageTargetSize(
                 href = href,
                 intrinsicWidth = bitmap.width,
                 intrinsicHeight = bitmap.height,
@@ -115,13 +120,25 @@ internal class EpubFlowImageLoader(
         inFlight.remove(drawable)?.cancel(true)
     }
 
-    // No placeholder: Markwon only reserves an image line's height once the drawable HAS a result
-    // (AsyncDrawableSpan.getSize measures the U+FFFC char = one text line until then), and a sized
-    // placeholder can't safely reserve it — setPlaceholderResult's non-empty-bounds branch leaves
-    // canvasWidth == 0, so the real decoded bitmap's setResult re-resolves to a 1×1 noDimensionsBounds
-    // and the image renders invisible (regression: 86 全图不显示 / baiquan 仅封面). The image instead
-    // lays out at text height until decode, then the OnLayoutChangeListener re-paginates + re-anchors.
-    override fun placeholder(drawable: AsyncDrawable): Drawable? = null
+    // Reserve the final image box before pixel decode. Markwon treats a non-empty-bounds placeholder
+    // as a result for ReplacementSpan measurement, but still calls load(...) after attach because the
+    // current result is the placeholder. This keeps first pagination close to the final image geometry.
+    override fun placeholder(drawable: AsyncDrawable): Drawable? {
+        val bounds = imageBoundsProvider(drawable.destination) ?: return null
+        val pageHeightPx = pageHeightProvider().coerceAtLeast(1)
+        val target = epubFlowImageTargetSize(
+            href = drawable.destination,
+            intrinsicWidth = bounds.width,
+            intrinsicHeight = bounds.height,
+            columnWidthPx = columnWidthPx,
+            pageHeightPx = pageHeightPx,
+            inlineMaxHeightPx = inlineMaxHeightPx,
+            fullPageHrefs = fullPageHrefs,
+        )
+        return ColorDrawable(android.graphics.Color.TRANSPARENT).apply {
+            setBounds(0, 0, target.width(), target.height())
+        }
+    }
 }
 
 /**
@@ -137,6 +154,7 @@ internal class EpubFlowImageSizeResolver(
 
     override fun resolveImageSize(drawable: AsyncDrawable): Rect {
         val result = drawable.result ?: return Rect(0, 0, 1, 1)
+        result.bounds.takeUnless { it.isEmpty }?.let { return Rect(it) }
         return epubFlowImageTargetSize(
             href = drawable.destination,
             intrinsicWidth = result.intrinsicWidth,
