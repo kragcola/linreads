@@ -71,7 +71,9 @@ import dev.readflow.core.model.readerThemeLabel
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.render.api.PagingKind
+import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.SelfPagingReaderEngine
 import dev.readflow.render.api.ZoomableReaderEngine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -89,6 +91,18 @@ enum class ReaderFeature(val label: String) {
     FONT("排版"),
     THEME("主题"),
 }
+
+internal enum class ReaderHostKind { CONTINUOUS, PAGED }
+
+internal fun readerHostKindFor(engine: ReaderEngine, pagingKind: PagingKind): ReaderHostKind =
+    if ((engine as? SelfPagingReaderEngine)?.selfPagingActive == true) {
+        ReaderHostKind.PAGED
+    } else {
+        when (pagingKind) {
+            PagingKind.CONTINUOUS -> ReaderHostKind.CONTINUOUS
+            PagingKind.PAGED -> ReaderHostKind.PAGED
+        }
+    }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -121,10 +135,11 @@ fun ReaderScreen(
                     Text("无内容", color = MaterialTheme.colorScheme.onBackground)
                 } else {
                     val pagingKind by engine.pagingKind.collectAsState()
-                    val host = remember(engine, pagingKind) {
-                        when (pagingKind) {
-                            PagingKind.CONTINUOUS -> viewModel.hostFactory.continuous()
-                            PagingKind.PAGED -> viewModel.hostFactory.paged(TransitionType.CURL)
+                    val hostKind = readerHostKindFor(engine, pagingKind)
+                    val host = remember(engine, hostKind) {
+                        when (hostKind) {
+                            ReaderHostKind.CONTINUOUS -> viewModel.hostFactory.continuous()
+                            ReaderHostKind.PAGED -> viewModel.hostFactory.paged(TransitionType.CURL)
                         }.also { it.bind(engine) }
                     }
                     DisposableEffect(host) {

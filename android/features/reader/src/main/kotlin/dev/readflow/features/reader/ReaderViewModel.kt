@@ -817,7 +817,7 @@ class ReaderViewModel(
         engine: ReaderEngine,
     ) {
         persistRemoteProgress(bookId, progress)
-        if (engine.currentLocator.value != progress.locator) {
+        if (!engine.currentLocator.value.sameDisplayPositionAs(progress.locator)) {
             engine.goTo(progress.locator)
         }
         persistReaderState(bookId = bookId, locator = progress.locator)

@@ -656,6 +656,48 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `remote sync replay does not goTo again for same display section`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val normalizedLocator = Locator(
+            LocatorStrategy.Section(spineIndex = 1, elementIndex = 4, charOffset = 12),
+            totalProgression = 0.42f,
+        )
+        val remoteLocator = normalizedLocator.copy(totalProgression = 0.8f)
+        val progressDao = FakeProgressDao()
+        val engine = FakeReaderEngine(normalizedLocator)
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+            syncManager = SyncManager(
+                SequencedProgressSyncBackend(
+                    pulls = listOf(
+                        null,
+                        ReadingProgress(
+                            bookId = "book-1",
+                            locator = remoteLocator,
+                            progressPercent = 0.8f,
+                            updatedAt = Long.MAX_VALUE / 2,
+                            deviceId = "tablet",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        assertEquals(
+            "same Section payload with normalized progression should update saved progress without a visible engine jump",
+            emptyList<Locator>(),
+            engine.goToLocators,
+        )
+        assertEquals(normalizedLocator, engine.currentLocator.value)
+        assertEquals(remoteLocator, Json.decodeFromString<Locator>(progressDao.savedProgress("book-1")!!.locatorJson))
+    }
+
+    @Test
     fun `saves note annotation clears selection and exposes note in annotation state`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val selection = ReaderTextSelection(
@@ -1075,6 +1117,26 @@ class ReaderSavedStateHandleTest {
 
         override suspend fun pullProgress(bookId: String): ReadflowResult<ReadingProgress?> =
             ReadflowResult.Success(remoteProgress)
+
+        override suspend fun pushBookmark(bookmark: Bookmark): ReadflowResult<Unit> =
+            ReadflowResult.Success(Unit)
+
+        override suspend fun pullBookmarks(bookId: String): ReadflowResult<List<Bookmark>> =
+            ReadflowResult.Success(emptyList())
+    }
+
+    private class SequencedProgressSyncBackend(
+        pulls: List<ReadingProgress?>,
+    ) : SyncBackend {
+        override val backendId = "fake-sequence"
+        override val isAvailable = true
+        private val pendingPulls = ArrayDeque(pulls)
+
+        override suspend fun pushProgress(bookId: String, progress: ReadingProgress): ReadflowResult<Unit> =
+            ReadflowResult.Success(Unit)
+
+        override suspend fun pullProgress(bookId: String): ReadflowResult<ReadingProgress?> =
+            ReadflowResult.Success(if (pendingPulls.isEmpty()) null else pendingPulls.removeFirst())
 
         override suspend fun pushBookmark(bookmark: Bookmark): ReadflowResult<Unit> =
             ReadflowResult.Success(Unit)
