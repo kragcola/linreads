@@ -1337,6 +1337,7 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun setFontSize(sp: Float) {
+        if (fontSizeSp == sp) return
         fontSizeSp = sp
         if (flowEngineEnabled) { rebuildFlowChapter(); return }
         rebuildPagedSlices()
@@ -1348,6 +1349,7 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun setLineSpacing(multiplier: Float) {
+        if (lineSpacingMultiplier == multiplier) return
         lineSpacingMultiplier = multiplier
         if (flowEngineEnabled) { rebuildFlowChapter(); return }
         rebuildPagedSlices()
@@ -1359,13 +1361,16 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun setPageFlipStyle(style: dev.readflow.core.model.PageFlipStyle) {
+        if (flipStyle == style) return
         flipStyle = style
         flowView?.flipStyle = style
     }
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {
+        val targetFontId = if (useSourceHan) "source_han" else "system"
+        if (this.useSourceHan == useSourceHan && currentFontId == targetFontId) return
         this.useSourceHan = useSourceHan
-        currentFontId = if (useSourceHan) "source_han" else "system"
+        currentFontId = targetFontId
         if (flowEngineEnabled) { rebuildFlowChapter(); return }
         // Rebind active Compose text pages to pick up new fontFamily
         withContext(Dispatchers.Main) {
@@ -1376,6 +1381,7 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun setFont(fontId: String) {
+        if (currentFontId == fontId) return
         currentFontId = fontId
         useSourceHan = fontId == "source_han"
         if (flowEngineEnabled) { rebuildFlowChapter(); return }

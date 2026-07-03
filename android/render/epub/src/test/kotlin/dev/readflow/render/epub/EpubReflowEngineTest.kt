@@ -14,6 +14,7 @@ import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.style.TextDecoration
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ReaderTextAnnotation
@@ -259,6 +260,67 @@ class EpubReflowEngineTest {
             "SCROLL->PAGED should not need a later posted correction to reach the target anchor",
             immediateScrollY,
             flowView.scrollY,
+        )
+    }
+
+    @Test
+    fun `flow same typography setting updates do not hide visible content`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-same-line-spacing.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                    <p>${(1..160).joinToString(" ") { "line$it" }}</p>
+                    <p>${(1..160).joinToString(" ") { "tail$it" }}</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setFontSize(28f)
+        engine.setLineSpacing(1.8f)
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        val contentLayer = flowView.getChildAt(0) as FrameLayout
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 220))
+        host.measure(exactly(360), exactly(220))
+        host.layout(0, 0, 360, 220)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        assertEquals(1f, contentLayer.alpha)
+        val visibleScrollY = flowView.scrollY
+        fun assertStillVisible(reason: String) {
+            assertEquals(reason, 1f, contentLayer.alpha)
+            assertEquals(visibleScrollY, flowView.scrollY)
+        }
+
+        engine.setFontSize(28f)
+
+        assertStillVisible(
+            "watchSettings can replay the current font size after the page is visible; that no-op must not restart reveal",
+        )
+
+        engine.setLineSpacing(1.8f)
+
+        assertStillVisible(
+            "watchSettings can replay the current line spacing after the page is visible; that no-op must not restart reveal",
+        )
+
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+
+        assertStillVisible("current page flip style replay must not disturb visible EPUB flow content")
+
+        engine.setSerifFont(true)
+
+        assertStillVisible("current legacy serif font replay must not disturb visible EPUB flow content")
+
+        engine.setFont("source_han")
+
+        assertStillVisible(
+            "watchSettings can also replay the current font choice after the page is visible",
         )
     }
 
