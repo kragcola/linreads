@@ -327,6 +327,73 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `action down alone preserves real paper texture`() {
+        val context = RuntimeEnvironment.getApplication() as Application
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.background = readerPaperBackground(
+            context = context,
+            paperColor = 0xFFEDE6D6.toInt(),
+            inkColor = 0xFF2A2620.toInt(),
+            isNight = false,
+        )
+        view.textView.setTextColor(0x00000000)
+        view.goToPage(1)
+        val staticFrame = view.drawAsScrolledChildToBitmapForTest()
+        val downTime = SystemClock.uptimeMillis()
+        val x = view.width * 0.85f
+        val y = view.height * 0.50f
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, y))
+        val pressedFrame = view.drawAsScrolledChildToBitmapForTest()
+
+        assertSampledPixelsEqual(
+            "ACTION_DOWN must not tint or shift the reader paper before any turn is committed",
+            staticFrame,
+            pressedFrame,
+        )
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_CANCEL, x, y))
+        staticFrame.recycle()
+        pressedFrame.recycle()
+    }
+
+    @Test
+    fun `interactive slide moves incoming paper as a page shot`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.background = XRampPaperDrawable()
+        view.textView.setTextColor(0x00000000)
+        view.goToPage(1)
+        val staticFrame = view.drawAsScrolledChildToBitmapForTest()
+        val sampleX = view.width * 3 / 4
+        val sampleY = 4
+        val expectedSourceX = sampleX - view.width / 2
+        assertTrue(
+            "test requires paper columns with different colours",
+            staticFrame.getPixel(sampleX, sampleY) != staticFrame.getPixel(expectedSourceX, sampleY),
+        )
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        view.updateInteractiveCurl(x = view.width / 2f)
+        val slide = view.privateField("slideDrawable") as PageSlideDrawable
+        assertEquals("test must sample a half-complete slide", 0.5f, slide.progress, 0.001f)
+        val revealedBitmap = slide.privateBitmap("revealedBitmap")
+        assertEquals(
+            "revealed page shot should preserve the paper column at the source x",
+            staticFrame.getPixel(expectedSourceX, sampleY),
+            revealedBitmap.getPixel(expectedSourceX, sampleY),
+        )
+        assertEquals(
+            "the incoming half-page should carry its captured paper texture, not reveal the static host background",
+            expectedSourceX,
+            slide.incomingSourceXForViewportX(sampleX),
+        )
+
+        staticFrame.recycle()
+    }
+
+    @Test
     fun `live paged draw keeps paper background anchored to viewport while scrolled`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -1069,6 +1136,36 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `scroll to paged reflow during reveal fade re-hides conversion until reparked`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val nearNextPageLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (midpoint + 1) until pageTwoTop }
+        val conversionOffset = layout.getLineStart(layout.getLineForVertical(nearNextPageLineTop))
+
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.setModeAnchored(EpubFlowView.Mode.PAGED, conversionOffset)
+        view.setPrivateField("awaitingReveal", false)
+        view.getChildAt(0).alpha = 0.5f
+        view.setPrivateField("paginatedLayoutHeight", layout.height - 1)
+
+        view.runReflowRunnable()
+
+        assertEquals(
+            "late reflow during fade must not expose the scroll-to-page conversion",
+            0f,
+            view.getChildAt(0).alpha,
+        )
+        assertEquals(true, view.privateBool("awaitingReveal"))
+        assertEquals(pageTwoTop, view.scrollY)
+    }
+
+    @Test
     fun `temporary scroll cancel re-arms paged clip without tap zone`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val view = pagedFlowView(onTapZone = tapZones::add)
@@ -1433,6 +1530,26 @@ class EpubFlowViewTest {
             draw(canvas)
         }
 
+    private fun assertSampledPixelsEqual(message: String, expected: Bitmap, actual: Bitmap) {
+        assertEquals("$message: width", expected.width, actual.width)
+        assertEquals("$message: height", expected.height, actual.height)
+        val stepX = (expected.width / 6).coerceAtLeast(1)
+        val stepY = (expected.height / 6).coerceAtLeast(1)
+        var y = 0
+        while (y < expected.height) {
+            var x = 0
+            while (x < expected.width) {
+                assertEquals(
+                    "$message at ($x,$y)",
+                    expected.getPixel(x, y),
+                    actual.getPixel(x, y),
+                )
+                x += stepX
+            }
+            y += stepY
+        }
+    }
+
     private fun EpubFlowView.textureTopPxForPageForTest(index: Int): Int? =
         javaClass.getDeclaredMethod("textureTopPxForPage", Int::class.javaPrimitiveType)
             .apply { isAccessible = true }
@@ -1470,6 +1587,11 @@ class EpubFlowViewTest {
         javaClass.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this)
+
+    private fun Any.privateBitmap(name: String): Bitmap =
+        javaClass.getDeclaredField(name)
+            .apply { isAccessible = true }
+            .get(this) as Bitmap
 
     private class ThrowWhenBoundsTopDrawable(
         private val failingTop: Int,
@@ -1533,6 +1655,32 @@ class EpubFlowViewTest {
                     paint,
                 )
                 y += 6
+            }
+        }
+
+        override fun setAlpha(alpha: Int) = Unit
+
+        override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.OPAQUE
+    }
+
+    private class XRampPaperDrawable : Drawable() {
+        private val paint = Paint()
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            for (x in b.left until b.right) {
+                val level = (x and 0xFF)
+                paint.color = 0xFF000000.toInt() or (level shl 16) or (0xD0 shl 8) or 0xA0
+                canvas.drawRect(
+                    x.toFloat(),
+                    b.top.toFloat(),
+                    (x + 1).toFloat(),
+                    b.bottom.toFloat(),
+                    paint,
+                )
             }
         }
 

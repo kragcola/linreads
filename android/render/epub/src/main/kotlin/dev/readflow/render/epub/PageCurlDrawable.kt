@@ -28,7 +28,8 @@ import android.graphics.drawable.Drawable
  * the revealed page just past the spine.
  */
 internal class PageCurlDrawable(
-    private val bitmap: Bitmap,
+    private val frontBitmap: Bitmap,
+    private val revealedBitmap: Bitmap,
     private val viewportW: Int,
     private val viewportH: Int,
     private val forward: Boolean,
@@ -61,8 +62,9 @@ internal class PageCurlDrawable(
         canvas.translate(bounds.left.toFloat(), bounds.top.toFloat())
         val w = viewportW.toFloat()
         val h = viewportH.toFloat()
+        canvas.drawBitmap(revealedBitmap, 0f, 0f, paint)
         if (progress <= 0f) {
-            canvas.drawBitmap(bitmap, 0f, 0f, paint)
+            canvas.drawBitmap(frontBitmap, 0f, 0f, paint)
             canvas.restoreToCount(save)
             return
         }
@@ -83,7 +85,7 @@ internal class PageCurlDrawable(
 
         val mSave = canvas.save()
         canvas.concat(matrix)
-        canvas.drawBitmap(bitmap, 0f, 0f, paint)
+        canvas.drawBitmap(frontBitmap, 0f, 0f, paint)
         // The tilting surface catches less light → darken proportionally to the fold angle.
         shadePaint.shader = null
         shadePaint.color = 0xFF000000.toInt()
@@ -114,7 +116,8 @@ internal class PageCurlDrawable(
     }
 
     fun recycle() {
-        if (!bitmap.isRecycled) bitmap.recycle()
+        if (!frontBitmap.isRecycled) frontBitmap.recycle()
+        if (!revealedBitmap.isRecycled) revealedBitmap.recycle()
     }
 
     override fun setAlpha(alpha: Int) {}

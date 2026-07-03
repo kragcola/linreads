@@ -369,6 +369,12 @@ internal class EpubFlowView(
             postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
             return@Runnable
         }
+        if (initialRevealActive()) {
+            removeCallbacks(initialRevealRunnable)
+            container.animate().cancel()
+            awaitingReveal = true
+            container.alpha = 0f
+        }
         val anchorOffset = if (awaitingReveal) {
             pendingRestoreOffset ?: if (paged.isNotEmpty()) topLayoutOffset() else -1
         } else {
@@ -789,9 +795,8 @@ internal class EpubFlowView(
     }
 
     /**
-     * Page turn with a hardware slide (滑动翻页): snapshot the current page, jump the real content to
-     * the target, then slide the snapshot of the OUTGOING page off-screen while the incoming page (the
-     * real content) slides in beside it (see [PageSlideDrawable]). Falls
+     * Page turn with a hardware slide (滑动翻页): snapshot the current and target pages, jump the real
+     * content to the target, then animate the two page shots as one strip (see [PageSlideDrawable]). Falls
      * back to an instant [goToPage] when animation is off or a snapshot can't be taken.
      */
     private fun goToPageAnimated(index: Int, forward: Boolean) {
@@ -821,13 +826,22 @@ internal class EpubFlowView(
             glInteractive = false
             cancelPendingGlDiscreteSettle()
         }
+        val targetTop = textureTopPxForPage(target) ?: run {
+            goToPage(target)
+            return
+        }
         val outgoing = snapshotViewport() ?: run {
+            goToPage(target)
+            return
+        }
+        val revealed = snapshotPageAt(targetTop) ?: run {
+            outgoing.recycle()
             goToPage(target)
             return
         }
         // Park the incoming page beneath, then slide both: snapshot off + incoming in.
         goToPage(target)
-        startFlip(outgoing, forward)
+        startFlip(outgoing, revealed, forward)
     }
 
     /**
@@ -1065,19 +1079,19 @@ internal class EpubFlowView(
     /**
      * Drives the active page-turn animation to [progress] (0 = outgoing covers viewport, 1 = complete).
      * SLIDE: the outgoing snapshot moves inside [PageSlideDrawable] AND the incoming page (the real
-     * [container]) is slid in from the off-screen side via GPU [View.setTranslationX], so the two move
-     * as one 2-page strip. SIMULATION: only the outgoing snapshot warps (in [PageCurlDrawable]) — the
-     * incoming page is the real content sitting flat beneath, so the container must NOT translate.
+     * [container]) is already parked on the target page but stays still beneath a two-shot overlay, so
+     * paper texture and clipped content move as one captured strip. SIMULATION: the revealed shot is drawn
+     * flat inside [PageCurlDrawable], and only the outgoing shot warps over it.
      */
     private fun applyFlipProgress(progress: Float, forward: Boolean) {
         slideDrawable?.let {
             it.progress = progress
-            container.translationX = if (forward) (1f - progress) * width else -(1f - progress) * width
+            container.translationX = 0f
         }
         curlDrawable?.progress = progress
     }
 
-    private fun startFlip(outgoing: Bitmap, forward: Boolean) {
+    private fun startFlip(outgoing: Bitmap, revealed: Bitmap, forward: Boolean) {
         flipAnimator?.cancel()
         clearFlipOverlay()
         // The overlay draws in content coords (canvas translated by scrollY). After [goToPage] the
@@ -1086,12 +1100,12 @@ internal class EpubFlowView(
         val bounds = intArrayOf(0, scrollY, width, scrollY + height)
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
             // Lightweight GPU 3D-hinge fold (see PageCurlDrawable) — no software mesh warp.
-            val drawable = PageCurlDrawable(outgoing, width, height, forward, density)
+            val drawable = PageCurlDrawable(outgoing, revealed, width, height, forward, density)
             drawable.setBounds(bounds[0], bounds[1], bounds[2], bounds[3])
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            val drawable = PageSlideDrawable(outgoing, width, height, forward, density)
+            val drawable = PageSlideDrawable(outgoing, revealed, width, height, forward, density)
             drawable.setBounds(bounds[0], bounds[1], bounds[2], bounds[3])
             overlay.add(drawable)
             slideDrawable = drawable
@@ -1123,7 +1137,7 @@ internal class EpubFlowView(
             it.recycle()
         }
         curlDrawable = null
-        // Re-centre the parked incoming page (SLIDE slid it in via translationX during the turn).
+        // Re-centre the parked live content after any previous turn path.
         container.translationX = 0f
     }
 
@@ -1131,11 +1145,10 @@ internal class EpubFlowView(
 
     /**
      * Begins a finger-driven slide toward the adjacent page [curlFromPage] + (forward ? +1 : −1), if
-     * that page exists in THIS chapter. Parks the real content on the incoming page beneath, snapshots
-     * the OUTGOING page (snapped clean to its own top — drops any residual half-line from a prior free
-     * scroll), and lays the outgoing flat (progress 0) over the viewport with the incoming parked just
-     * off-screen. Returns false at a chapter boundary (no in-chapter incoming page to preview) so the
-     * caller defers to a discrete page turn.
+     * that page exists in THIS chapter. Snapshots the outgoing page (snapped clean to its own top) and
+     * the incoming page, then parks the live content on the incoming page beneath a two-shot overlay.
+     * Returns false at a chapter boundary (no in-chapter incoming page to preview) so the caller defers
+     * to a discrete page turn.
      */
     private fun beginInteractiveCurl(forward: Boolean, anchorX: Float): Boolean {
         if (!pageTurnAnimated || mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) return false
@@ -1147,18 +1160,23 @@ internal class EpubFlowView(
         // Snap the outgoing page to its own top so the snapshot is the clean page (a mid-page free
         // scroll leaves scrollY between two page tops → the snapshot would carry top/bottom half-lines).
         scrollToPage(from, report = false)
+        val targetTop = textureTopPxForPage(target) ?: return false
         val outgoing = snapshotViewport() ?: return false
+        val revealed = snapshotPageAt(targetTop) ?: run {
+            outgoing.recycle()
+            return false
+        }
         // Park content on the incoming page beneath the overlay; stays silent until the turn commits.
         scrollToPage(target, report = false)
         flipAnimator?.cancel()
         clearFlipOverlay()
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
-            val drawable = PageCurlDrawable(outgoing, width, height, forward, density)
+            val drawable = PageCurlDrawable(outgoing, revealed, width, height, forward, density)
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            val drawable = PageSlideDrawable(outgoing, width, height, forward, density)
+            val drawable = PageSlideDrawable(outgoing, revealed, width, height, forward, density)
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
             slideDrawable = drawable
