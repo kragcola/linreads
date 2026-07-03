@@ -49,7 +49,15 @@ internal class EpubFlowView(
         includeFontPadding = false
     }
 
-    private val container = FrameLayout(context).apply { addView(textView) }
+    private val container = FrameLayout(context).apply {
+        addView(
+            textView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+    }
 
     var mode: Mode = Mode.PAGED
         set(value) {
@@ -1181,6 +1189,7 @@ internal class EpubFlowView(
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             pendingCleanTapX = null
+            textView.setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, false)
         }
         val handled = super.dispatchTouchEvent(ev)
         when (ev.actionMasked) {

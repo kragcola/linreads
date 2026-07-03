@@ -368,8 +368,12 @@ class EpubReflowEngine private constructor(
             applyFlowLineSpacing(textView)
         }
         flowView = view
-        val startIdx = epubIndexFromLocator(_currentLocator.value, paras.size)
-        loadFlowChapter(spineIndexForParagraph(startIdx), restoreToParagraph = startIdx)
+        val startAnchor = flowAnchorFromLocator(_currentLocator.value)
+        loadFlowChapter(
+            spineIndexForParagraph(startAnchor.first),
+            restoreToParagraph = startAnchor.first,
+            restoreToParagraphOffset = startAnchor.second,
+        )
         // Host the reader + a (lazily created) GL curl overlay in one FrameLayout. The overlay is built
         // ONLY on the first SIMULATION turn (SLIDE/NONE readers never allocate a GL context), and any GL
         // construction failure leaves it null so SIMULATION degrades to the slide path — never crashes.
@@ -433,7 +437,12 @@ class EpubReflowEngine private constructor(
     }
 
     /** Builds and installs the chapter [spineIndex] into the flow view, optionally restoring a paragraph. */
-    private fun loadFlowChapter(spineIndex: Int, restoreToParagraph: Int? = null, landOnLast: Boolean = false) {
+    private fun loadFlowChapter(
+        spineIndex: Int,
+        restoreToParagraph: Int? = null,
+        restoreToParagraphOffset: Int = 0,
+        landOnLast: Boolean = false,
+    ) {
         val view = flowView ?: return
         val book = lazyBook ?: return
         book.prefetchAroundParagraph(paras.indexOfFirst { it.spineIndex == spineIndex }.coerceAtLeast(0))
@@ -487,7 +496,7 @@ class EpubReflowEngine private constructor(
             onLinkClick = ::handleLinkClick,
             highlightRanges = flowHighlightRanges(flow),
         )
-        val restoreOffset = restoreToParagraph?.let { flow.offsetForParagraph(it, 0) }
+        val restoreOffset = restoreToParagraph?.let { flow.offsetForParagraph(it, restoreToParagraphOffset) }
         view.setChapter(flow, spannable, flowPageHeightPx(), restoreOffset = restoreOffset, landOnLast = landOnLast)
         // Schedule async images after the layout pass; positioning is now done inside setChapter's own
         // post (single pre-paint placement — no chapter-top→resume jump on entry).
@@ -517,6 +526,16 @@ class EpubReflowEngine private constructor(
             }
         }
         return result
+    }
+
+    private fun flowAnchorFromLocator(locator: Locator): Pair<Int, Int> {
+        val paragraphIndex = epubIndexFromLocator(locator, paras.size)
+        val paragraphOffset = when (val strategy = locator.strategy) {
+            is LocatorStrategy.Section ->
+                (strategy.charOffset - (paras.getOrNull(paragraphIndex)?.spineCharStart ?: 0)).coerceAtLeast(0)
+            else -> 0
+        }
+        return paragraphIndex to paragraphOffset
     }
 
     private fun flowHighlightRanges(flow: EpubChapterFlow): List<ReaderTextHighlightRange> {
@@ -990,7 +1009,7 @@ class EpubReflowEngine private constructor(
                 return@withContext
             }
             if (targetSpine != flowSpineIndex) {
-                loadFlowChapter(targetSpine, restoreToParagraph = idx)
+                loadFlowChapter(targetSpine, restoreToParagraph = idx, restoreToParagraphOffset = paraOffset)
             } else {
                 val offset = flowCurrentFlow?.offsetForParagraph(idx, paraOffset) ?: 0
                 view.goToOffset(offset)
@@ -1391,11 +1410,17 @@ class EpubReflowEngine private constructor(
     private suspend fun rebuildFlowChapter() {
         withContext(Dispatchers.Main) {
             val view = flowView ?: return@withContext
-            val anchorParagraph = epubIndexFromLocator(_currentLocator.value, paras.size)
+            val (anchorParagraph, anchorOffset) = flowAnchorFromLocator(_currentLocator.value)
             view.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
             view.textView.typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
             applyFlowLineSpacing(view.textView)
-            if (flowSpineIndex >= 0) loadFlowChapter(flowSpineIndex, restoreToParagraph = anchorParagraph)
+            if (flowSpineIndex >= 0) {
+                loadFlowChapter(
+                    flowSpineIndex,
+                    restoreToParagraph = anchorParagraph,
+                    restoreToParagraphOffset = anchorOffset,
+                )
+            }
         }
     }
 
@@ -1408,9 +1433,9 @@ class EpubReflowEngine private constructor(
             withContext(Dispatchers.Main) {
                 _pagingKind.value = targetKind
                 flowView?.let { view ->
-                    val anchor = epubIndexFromLocator(_currentLocator.value, paras.size)
+                    val (anchor, anchorOffset) = flowAnchorFromLocator(_currentLocator.value)
                     view.mode = if (targetKind == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
-                    val offset = flowCurrentFlow?.offsetForParagraph(anchor, 0) ?: 0
+                    val offset = flowCurrentFlow?.offsetForParagraph(anchor, anchorOffset) ?: 0
                     view.post { view.goToOffset(offset) }
                     _pageCount.value = view.pageCount()
                 }

@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Intent
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
+import android.os.Looper
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -32,11 +33,13 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.rules.TemporaryFolder
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import java.io.File
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -143,6 +146,61 @@ class EpubReflowEngineTest {
         assertNotNull("theme change must keep flow paper background", flowView.background)
         assertTrue("host background should refresh with theme", host.background !== initialHostBackground)
         assertTrue("flow background should refresh with theme", flowView.background !== initialFlowBackground)
+    }
+
+    @Test
+    fun `flow mode switch to paged preserves paragraph offset anchor`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val paragraphs = List(4) { paragraphIndex ->
+            (1..180).joinToString(separator = " ") { token -> "p${paragraphIndex}w$token" }
+        }
+        val targetParagraph = 2
+        val targetLocalOffset = paragraphs[targetParagraph].indexOf("p${targetParagraph}w150")
+        val targetSpineOffset = paragraphs.take(targetParagraph).sumOf { it.length } + targetLocalOffset
+        val targetParagraphHead = paragraphs.take(targetParagraph).sumOf { it.length }
+        val epub = tempDir.newFile("flow-mode-offset-anchor.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to paragraphs.joinToString(
+                separator = "",
+                prefix = "<html><body>",
+                postfix = "</body></html>",
+            ) { paragraph -> "<p>${paragraph.replace(" ", "<br/>")}</p>" },
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setFontSize(32f)
+        engine.setLineSpacing(1.8f)
+        val host = engine.createView() as FrameLayout
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 80))
+        host.measure(exactly(360), exactly(80))
+        host.layout(0, 0, 360, 80)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        engine.goTo(
+            Locator(
+                LocatorStrategy.Section(
+                    spineIndex = 0,
+                    elementIndex = targetParagraph,
+                    charOffset = targetSpineOffset,
+                ),
+            ),
+        )
+        val before = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertTrue("test must start inside the target paragraph", (before?.charOffset ?: 0) > targetParagraphHead)
+        val beforeCharOffset = before?.charOffset ?: 0
+
+        engine.setMode(ReadingMode.PAGED)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val after = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        val afterCharOffset = after?.charOffset ?: 0
+        assertTrue(
+            "switching SCROLL->PAGED must not throw the flow anchor back to the paragraph head: before=$before after=$after",
+            afterCharOffset > targetParagraphHead && afterCharOffset >= beforeCharOffset - 100,
+        )
     }
 
     @Test
@@ -2087,6 +2145,9 @@ class EpubReflowEngineTest {
         }
         return null
     }
+
+    private fun exactly(size: Int): Int =
+        android.view.View.MeasureSpec.makeMeasureSpec(size, android.view.View.MeasureSpec.EXACTLY)
 
     private fun <T : android.view.View> findView(view: android.view.View, type: Class<T>): T? {
         if (type.isInstance(view)) return type.cast(view)
