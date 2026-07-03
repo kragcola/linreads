@@ -34,6 +34,12 @@ class ViewPagerTransitionHost(
             ViewGroup.LayoutParams.MATCH_PARENT,
         )
     }
+    private val selfPagingContainer = FrameLayout(context).apply {
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+    }
     private var engine: ReaderEngine? = null
     private var pagedEngine: PagedReaderEngine? = null
     private var selfPagingEngine: SelfPagingReaderEngine? = null
@@ -43,10 +49,8 @@ class ViewPagerTransitionHost(
 
     private val pageCallback = object : ViewPager2.OnPageChangeCallback() {
         override fun onPageSelected(position: Int) {
-            // Self-paging engines own their paging + locator inside one static view; the ViewPager is
-            // just a single-slot container with input disabled. ViewPager2 still fires onPageSelected(0)
-            // on adapter attach, so without this guard we'd clobber the restored position with
-            // goTo(Page(0, total)). Let the engine drive its own locator instead.
+            // Self-paging engines own their paging + locator inside one static view. Let the engine
+            // drive its own locator instead of reacting to stale ViewPager2 callbacks.
             if (selfPagingEngine != null) return
             val activeEngine = engine ?: return
             val total = activeEngine.pageCount.value
@@ -68,12 +72,15 @@ class ViewPagerTransitionHost(
         setTransition(transition)
     }
 
-    override fun hostView(): View = pager
+    override fun hostView(): View =
+        if (selfPagingEngine != null) selfPagingContainer else pager
 
     override fun bind(engine: ReaderEngine) {
         pageCountJob?.cancel()
         pageCountJob = null
         pagedEngine?.setPageRequestCallback(null)
+        pager.adapter = null
+        selfPagingContainer.removeAllViews()
         if (!scope.isActive) {
             scope = viewPagerHostScope()
         }
@@ -84,8 +91,9 @@ class ViewPagerTransitionHost(
         selfPagingEngine = selfPaging
         if (selfPaging != null) {
             pagedEngine = null
-            pager.isUserInputEnabled = false
-            pager.adapter = SingleViewAdapter(engine.createView())
+            val view = engine.createView()
+            (view.parent as? ViewGroup)?.removeView(view)
+            selfPagingContainer.addView(view, matchParentLayoutParams())
             return
         }
         pager.isUserInputEnabled = true
@@ -166,6 +174,7 @@ class ViewPagerTransitionHost(
         pagedEngine?.setPageRequestCallback(null)
         pager.isUserInputEnabled = true
         pager.adapter = null
+        selfPagingContainer.removeAllViews()
         pagedEngine = null
         selfPagingEngine = null
         engine = null

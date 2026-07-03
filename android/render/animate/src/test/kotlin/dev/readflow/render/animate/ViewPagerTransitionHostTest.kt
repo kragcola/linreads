@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.net.Uri
 import android.view.View
+import android.view.ViewGroup
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import dev.readflow.core.model.BookFormat
@@ -13,6 +14,7 @@ import dev.readflow.core.model.TransitionType
 import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.SelfPagingReaderEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,6 +26,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -117,6 +120,33 @@ class ViewPagerTransitionHostTest {
         host.unbind()
     }
 
+    @Test
+    fun `self paging engine is mounted directly without ViewPager adapter`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = FakeSelfPagingEngine(context)
+        val host = ViewPagerTransitionHost(context, TransitionType.CURL)
+
+        host.bind(engine)
+
+        val hostView = host.hostView()
+        assertFalse(
+            "self-paging EPUB should not be routed through ViewPager2 adapter/layout callbacks",
+            hostView is ViewPager2,
+        )
+        val container = hostView as ViewGroup
+        assertEquals(1, container.childCount)
+        assertEquals(engine.view, container.getChildAt(0))
+        assertEquals(ViewGroup.LayoutParams.MATCH_PARENT, engine.view.layoutParams.width)
+        assertEquals(ViewGroup.LayoutParams.MATCH_PARENT, engine.view.layoutParams.height)
+
+        host.next()
+        host.previous()
+
+        assertEquals(listOf(1, -1), engine.adjacentDeltas)
+        host.unbind()
+    }
+
     private class FakePagedEngine(
         private val context: Context,
         initialPageCount: Int,
@@ -162,5 +192,42 @@ class ViewPagerTransitionHostTest {
         override suspend fun setFontSize(sp: Float) = Unit
 
         override suspend fun setMode(mode: ReadingMode) = Unit
+    }
+
+    private class FakeSelfPagingEngine(
+        private val context: Context,
+    ) : SelfPagingReaderEngine {
+        val view = View(context)
+        val adjacentDeltas = mutableListOf<Int>()
+        private val locatorState = MutableStateFlow(Locator(LocatorStrategy.Page(index = 0, total = 1)))
+
+        override val id: String = "fake-self-paging"
+        override val format: BookFormat = BookFormat.EPUB
+        override val priority: Int = 0
+        override val pagingKind: StateFlow<PagingKind> = MutableStateFlow(PagingKind.PAGED)
+        override val supportsSearch: Boolean = false
+        override val currentLocator: StateFlow<Locator> = locatorState
+        override val pageCount: StateFlow<Int> = MutableStateFlow(1)
+        override val selfPagingActive: Boolean = true
+
+        override suspend fun supports(uri: Uri): Boolean = true
+
+        override suspend fun openBook(uri: Uri): Locator = locatorState.value
+
+        override fun createView(): View = view
+
+        override suspend fun close() = Unit
+
+        override suspend fun goTo(locator: Locator) {
+            locatorState.value = locator
+        }
+
+        override suspend fun setFontSize(sp: Float) = Unit
+
+        override suspend fun setMode(mode: ReadingMode) = Unit
+
+        override suspend fun goToAdjacentPage(delta: Int) {
+            adjacentDeltas += delta
+        }
     }
 }
