@@ -386,6 +386,186 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     @Test
+    fun epubFlowShelfOpenByIdReopensWithoutVisibleBookStartRuntime() {
+        val title = "flow-shelf-reopen-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+        var bookId: String
+        var expectedPageTop: Int
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val target = waitForConditionResult("expected flow view to paginate before saving shelf-open anchor") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
+                    val pageThreeTop = view.reflectNullableInt("pageTopPxAt", 3) ?: return@withActivity null
+                    FlowReopenTarget(view = view, pageTop = pageThreeTop)
+                }
+            }
+
+            val parked = scenario.withActivity {
+                target.view.scrollTo(0, 0)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                FlowReopenFrame(
+                    currentPage = target.view.reflectInt("currentPageIndex"),
+                    scrollY = target.view.scrollY,
+                    contentAlpha = target.view.flowContentAlpha(),
+                    pageCount = target.view.reflectInt("pageCount"),
+                )
+            }
+            assertEquals("setup should park on page 3", 3, parked.currentPage)
+            assertEquals("setup should land on the page-3 canonical top", target.pageTop, parked.scrollY)
+            expectedPageTop = target.pageTop
+
+            bookId = waitForBookByTitle(title).id
+            waitForConditionResult("expected EPUB progress to persist page-3 anchor before shelf open", DB_TIMEOUT_MS) {
+                latestProgress(bookId)?.takeIf { it.totalProgression > 0.02f }
+            }
+        }
+
+        ActivityScenario.launch<MainActivity>(mainIntent()).use { shelf ->
+            dismissBlockingDialogs()
+            val shelfItem = waitForObject(By.desc("打开 $title"))
+            val bounds = shelfItem.visibleBounds
+            device.click(bounds.centerX(), bounds.centerY())
+
+            val firstFrame = waitForFirstFlowFrame(shelf)
+            assertTrue(
+                "shelf OpenById must not expose a visible book-start frame before restore: $firstFrame",
+                firstFrame.contentAlpha < 1f || firstFrame.scrollY != 0 || firstFrame.currentPage != 0,
+            )
+
+            val restored = waitForConditionResult("expected shelf OpenById to restore EPUB page-3 anchor") {
+                shelf.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val currentPage = view.reflectInt("currentPageIndex")
+                    val scrollY = view.scrollY
+                    val alpha = view.flowContentAlpha()
+                    if (currentPage == 3 && scrollY == expectedPageTop && alpha >= 1f) {
+                        FlowReopenFrame(
+                            currentPage = currentPage,
+                            scrollY = scrollY,
+                            contentAlpha = alpha,
+                            pageCount = view.reflectInt("pageCount"),
+                        )
+                    } else {
+                        null
+                    }
+                }
+            }
+
+            assertEquals("shelf OpenById should restore page 3", 3, restored.currentPage)
+            assertEquals("shelf OpenById should restore the canonical page-3 top", expectedPageTop, restored.scrollY)
+            assertEquals("shelf OpenById should reuse one stable EPUB book row", 1, booksByTitle(title).size)
+        }
+    }
+
+    @Test
+    fun epubFlowShelfRestoredFirstRightTapStartsSlideAnimationRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.NONE)
+        val title = "flow-shelf-first-slide-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+        var bookId: String
+        var expectedPageTop: Int
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val target = waitForConditionResult("expected flow view to paginate before saving shelf first-tap anchor") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 5 || view.width <= 0 || view.height <= 0) return@withActivity null
+                    val pageThreeTop = view.reflectNullableInt("pageTopPxAt", 3) ?: return@withActivity null
+                    FlowReopenTarget(view = view, pageTop = pageThreeTop)
+                }
+            }
+
+            val parked = scenario.withActivity {
+                target.view.scrollTo(0, 0)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                FlowReopenFrame(
+                    currentPage = target.view.reflectInt("currentPageIndex"),
+                    scrollY = target.view.scrollY,
+                    contentAlpha = target.view.flowContentAlpha(),
+                    pageCount = target.view.reflectInt("pageCount"),
+                )
+            }
+            assertEquals("setup should park on page 3", 3, parked.currentPage)
+            assertEquals("setup should land on the page-3 canonical top", target.pageTop, parked.scrollY)
+            expectedPageTop = target.pageTop
+
+            bookId = waitForBookByTitle(title).id
+            waitForConditionResult("expected EPUB progress to persist page-3 anchor before shelf first tap", DB_TIMEOUT_MS) {
+                latestProgress(bookId)?.takeIf { it.totalProgression > 0.02f }
+            }
+        }
+
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        ActivityScenario.launch<MainActivity>(mainIntent()).use { shelf ->
+            dismissBlockingDialogs()
+            val shelfItem = waitForObject(By.desc("打开 $title"))
+            val shelfBounds = shelfItem.visibleBounds
+            device.click(shelfBounds.centerX(), shelfBounds.centerY())
+
+            val target = waitForConditionResult("expected shelf OpenById to park restored page before first tap") {
+                shelf.withActivity { activity ->
+                    val surface = activity.findReaderSurfaceOrNull() ?: return@withActivity null
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val currentPage = view.reflectInt("currentPageIndex")
+                    val scrollY = view.scrollY
+                    if (
+                        currentPage != 3 ||
+                        scrollY != expectedPageTop ||
+                        surface.width <= 0 ||
+                        surface.height <= 0 ||
+                        view.width <= 0 ||
+                        view.height <= 0
+                    ) {
+                        return@withActivity null
+                    }
+                    val pageFourTop = view.reflectNullableInt("pageTopPxAt", 4) ?: return@withActivity null
+                    FlowSurfaceTapTarget(surface = surface, view = view, nextPageTop = pageFourTop)
+                }
+            }
+
+            val result = shelf.withActivity {
+                val point = PointF(target.surface.width * 0.85f, target.surface.height * 0.50f)
+                val downTime = SystemClock.uptimeMillis()
+                target.surface.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, point))
+                target.surface.dispatchTouchEvent(
+                    motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_UP, point),
+                )
+                FlowFirstSlideTapResult(
+                    currentPage = target.view.reflectInt("currentPageIndex"),
+                    scrollY = target.view.scrollY,
+                    slideDrawablePresent = target.view.reflectPrivateAny("slideDrawable") != null,
+                    flipAnimatorPresent = target.view.reflectPrivateAny("flipAnimator") != null,
+                )
+            }
+
+            assertEquals("first shelf-restored slide tap should advance one page", 4, result.currentPage)
+            assertEquals(
+                "first shelf-restored slide tap should park the live content on page 4",
+                target.nextPageTop,
+                result.scrollY,
+            )
+            assertTrue(
+                "first shelf-restored tap must start the normal slide animation instead of cutting instantly",
+                result.slideDrawablePresent && result.flipAnimatorPresent,
+            )
+        }
+    }
+
+    @Test
     fun epubFlowScrollToPagedModeSwitchKeepsFrozenViewportCoverRuntime(): Unit = runBlocking {
         settings.setReadingMode(ReaderReadingMode.SCROLL)
         val title = "flow-conversion-${UUID.randomUUID().toString().take(8)}"
@@ -657,6 +837,58 @@ class EpubFlowAnchorRuntimeSmokeTest {
             try {
                 assertSampledPixelsEqual(
                     "ACTION_DOWN must not tint or shift the EPUB paper texture",
+                    frames.first,
+                    frames.second,
+                )
+            } finally {
+                frames.first.recycle()
+                frames.second.recycle()
+            }
+        }
+    }
+
+    @Test
+    fun epubFlowReaderSurfaceActionDownKeepsPaperTextureRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-surface-down-paper-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val target = waitForConditionResult("expected reader surface and flow view for surface paper test") {
+                scenario.withActivity { activity ->
+                    val surface = activity.findReaderSurface()
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || surface.width <= 0 || surface.height <= 0 || view.width <= 0 || view.height <= 0) {
+                        return@withActivity null
+                    }
+                    FlowSurfaceTapTarget(
+                        surface = surface,
+                        view = view,
+                        nextPageTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null,
+                    )
+                }
+            }
+
+            val frames = scenario.withActivity {
+                target.view.scrollTo(0, 0)
+                val staticFrame = target.surface.drawRuntimeBitmap()
+                val point = PointF(target.surface.width * 0.85f, target.surface.height * 0.50f)
+                val downTime = SystemClock.uptimeMillis()
+                target.surface.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, point))
+                val pressedFrame = target.surface.drawRuntimeBitmap()
+                target.surface.dispatchTouchEvent(
+                    motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_CANCEL, point),
+                )
+                staticFrame to pressedFrame
+            }
+
+            try {
+                assertSampledPixelsEqual(
+                    "Reader surface ACTION_DOWN must not tint or shift the EPUB paper texture",
                     frames.first,
                     frames.second,
                 )
@@ -1085,6 +1317,11 @@ class EpubFlowAnchorRuntimeSmokeTest {
             clipData = ClipData.newRawUri("epub-flow-anchor-runtime-smoke", uri)
         }
 
+    private fun mainIntent() =
+        Intent(appContext, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+
     private fun createEpubUri(fileName: String): Uri {
         val file = File(appContext.cacheDir, fileName)
         writeEpub(file, linked = false)
@@ -1259,10 +1496,13 @@ class EpubFlowAnchorRuntimeSmokeTest {
         window.decorView.findDescendant { it.javaClass.name == EPUB_CURL_OVERLAY_CLASS_NAME }
 
     private fun MainActivity.findReaderSurface(): View =
-        checkNotNull(window.decorView.findDescendant { view ->
-            view.contentDescription?.toString()?.startsWith("阅读内容") == true
-        }) {
+        checkNotNull(findReaderSurfaceOrNull()) {
             "Unable to find reader surface"
+        }
+
+    private fun MainActivity.findReaderSurfaceOrNull(): View? =
+        window.decorView.findDescendant { view ->
+            view.contentDescription?.toString()?.startsWith("阅读内容") == true
         }
 
     private fun MainActivity.readerSurfaceAccessibilityActions(): List<String> {
