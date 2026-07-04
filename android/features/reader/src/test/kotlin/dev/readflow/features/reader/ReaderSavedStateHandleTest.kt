@@ -314,6 +314,56 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `skips initial font choice replay after opening restored book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val restoredLocator = Locator(LocatorStrategy.Page(index = 4, total = 10), totalProgression = 0.4f)
+        val settings = FakeSettingsRepository().apply {
+            useSourceHanFont.value = false
+            fontChoice.value = FontChoice.System
+        }
+        val progressDao = FakeProgressDao().apply {
+            upsert(
+                ReadingProgressEntity(
+                    bookId = "book-1",
+                    locatorJson = Json.encodeToString(restoredLocator),
+                    totalProgression = 0.4f,
+                    progressPercent = 0.4f,
+                    updatedAt = 100L,
+                    deviceId = "phone",
+                ),
+            )
+        }
+        val events = mutableListOf<String>()
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = events,
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            progressDao = progressDao,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        assertEquals(
+            "font must be applied once as part of the pre-open layout transaction, not replayed after load",
+            1,
+            events.count { it == "setFont:system" },
+        )
+
+        settings.setFontChoice(FontChoice.SourceHan)
+        advanceUntilIdle()
+
+        assertTrue(
+            "real user font changes after open must still reach the engine, events=$events",
+            "setFont:source_han" in events,
+        )
+    }
+
+    @Test
     fun `restores engine acceleration state from store when opening book`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val cacheState = byteArrayOf(7, 8, 9)

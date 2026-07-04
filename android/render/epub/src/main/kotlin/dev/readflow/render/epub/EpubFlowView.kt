@@ -819,8 +819,10 @@ internal class EpubFlowView(
      */
     private fun goToPageAnimated(index: Int, forward: Boolean) {
         val target = index.coerceIn(0, paged.lastIndex)
+        var frozenOutgoing = conversionSnapshotCopy()
         finishInitialRevealForTurn()
         if (!pageTurnAnimated || mode != Mode.PAGED || width == 0 || height == 0) {
+            frozenOutgoing?.recycle()
             goToPage(target)
             preCachePageTextures()
             return
@@ -829,7 +831,10 @@ internal class EpubFlowView(
         // (rapid double-tap). The turn is silently dropped to avoid double-committing — the user
         // can tap again once the current animation settles. Combined with EpubCurlOverlay's
         // 5s safety timeout, this also prevents turns when a GL curl is stuck active.
-        if (turnInFlight) return
+        if (turnInFlight) {
+            frozenOutgoing?.recycle()
+            return
+        }
         // Snap the outgoing page to its own top with the clip re-armed BEFORE snapshotting: after a
         // middle-column free scroll scrollY sits mid-page with pageClipActive off, so an un-snapped
         // snapshot would carry the next/prev page's half-line at top & bottom and slide it away (审计:
@@ -837,7 +842,14 @@ internal class EpubFlowView(
         scrollToPage(currentPage, report = false)
         // SIMULATION → OpenGL realistic curl (harism). Snapshot front (current) + revealed (target),
         // hand them to the GL overlay, and commit the page only when the curl settles committed.
-        if (useGlCurl && startGlCurlTurn(currentPage, target, forward)) return
+        if (useGlCurl) {
+            val glFrozenOutgoing = frozenOutgoing?.let(::copyPageShotBitmap)
+            if (startGlCurlTurn(currentPage, target, forward, frontOverride = glFrozenOutgoing)) {
+                frozenOutgoing?.recycle()
+                frozenOutgoing = null
+                return
+            }
+        }
         // GL curl unavailable or failed — dismiss any stuck GL overlay so the slide path is clean.
         if (curlOverlay?.active == true) {
             curlOverlay?.dismiss()
@@ -845,10 +857,11 @@ internal class EpubFlowView(
             cancelPendingGlDiscreteSettle()
         }
         val targetTop = textureTopPxForPage(target) ?: run {
+            frozenOutgoing?.recycle()
             goToPage(target)
             return
         }
-        val outgoing = snapshotViewport() ?: run {
+        val outgoing = frozenOutgoing ?: snapshotViewport() ?: run {
             goToPage(target)
             return
         }
@@ -868,23 +881,47 @@ internal class EpubFlowView(
      * On settle, commits the page in the real view and dismisses the overlay. Returns false (caller
      * falls back to slide) if a snapshot can't be taken or the overlay is unavailable.
      */
-    private fun startGlCurlTurn(fromPage: Int, target: Int, forward: Boolean): Boolean {
-        val overlay = obtainCurlOverlay() ?: return false
-        if (overlay.active) return false
+    private fun startGlCurlTurn(
+        fromPage: Int,
+        target: Int,
+        forward: Boolean,
+        frontOverride: Bitmap? = null,
+    ): Boolean {
+        val overlay = obtainCurlOverlay() ?: run {
+            frontOverride?.recycle()
+            return false
+        }
+        if (overlay.active) {
+            frontOverride?.recycle()
+            return false
+        }
+        var ownedFront: Bitmap? = frontOverride
+        var ownedRevealed: Bitmap? = null
         return runCatching {
             // Use pre-cached textures when available (avoids live snapshot on image-text pages).
-            val fromTop = textureTopPxForPage(fromPage) ?: return@runCatching false
-            val targetTop = textureTopPxForPage(target) ?: return@runCatching false
+            val fromTop = textureTopPxForPage(fromPage) ?: run {
+                ownedFront?.recycle()
+                ownedFront = null
+                return@runCatching false
+            }
+            val targetTop = textureTopPxForPage(target) ?: run {
+                ownedFront?.recycle()
+                ownedFront = null
+                return@runCatching false
+            }
             recycleCachedTexturesIfStaleForTurn(fromPage, fromTop, target, targetTop)
-            val front = if (
-                fromPage == cachedFromPage &&
-                fromTop == cachedFromTopPx &&
-                cachedFrontBitmap != null
-            ) {
-                cachedFrontBitmap?.copy(pageShotConfig, false)
-            } else {
-                snapshotPageAt(fromTop)
+            val front = ownedFront ?: run {
+                if (
+                    fromPage == cachedFromPage &&
+                    fromTop == cachedFromTopPx &&
+                    cachedFrontBitmap != null
+                ) {
+                    cachedFrontBitmap?.copy(pageShotConfig, false)
+                } else {
+                    snapshotPageAt(fromTop)
+                }
             } ?: return@runCatching false
+            ownedFront = front
             val revealed = if (
                 target == cachedTargetPage &&
                 targetTop == cachedTargetTopPx &&
@@ -893,7 +930,12 @@ internal class EpubFlowView(
                 cachedRevealedBitmap?.copy(pageShotConfig, false)
             } else {
                 snapshotPageAt(targetTop)
-            } ?: run { front.recycle(); return@runCatching false }
+            } ?: run {
+                ownedFront?.recycle()
+                ownedFront = null
+                return@runCatching false
+            }
+            ownedRevealed = revealed
             overlay.start(front, revealed, forward) { committed ->
                 cancelPendingGlDiscreteSettle()
                 if (committed) {
@@ -904,10 +946,16 @@ internal class EpubFlowView(
                 overlay.dismiss()
                 preCachePageTextures()
             }
+            ownedFront = null
+            ownedRevealed = null
             scheduleGlDiscreteSettleFallback(overlay, target)
             overlay.animateTurn(glCurlDurationMs)
             true
-        }.getOrDefault(false)
+        }.getOrElse {
+            ownedFront?.recycle()
+            ownedRevealed?.recycle()
+            false
+        }
     }
 
     private fun scheduleGlDiscreteSettleFallback(overlay: EpubCurlTurnOverlay, target: Int) {
@@ -941,20 +989,29 @@ internal class EpubFlowView(
         val from = snapToNearestCanonicalPageAnchor(report = false)
         val target = from + if (forward) 1 else -1
         if (target < 0 || target > paged.lastIndex) return false
+        val frozenOutgoing = conversionSnapshotCopy()
         finishInitialRevealForTurn()
         return runCatching {
             // Use pre-cached textures when available (Moon+ model: no live snapshot under finger).
-            val fromTop = textureTopPxForPage(from) ?: return@runCatching false
-            val targetTop = textureTopPxForPage(target) ?: return@runCatching false
+            val fromTop = textureTopPxForPage(from) ?: run {
+                frozenOutgoing?.recycle()
+                return@runCatching false
+            }
+            val targetTop = textureTopPxForPage(target) ?: run {
+                frozenOutgoing?.recycle()
+                return@runCatching false
+            }
             recycleCachedTexturesIfStaleForTurn(from, fromTop, target, targetTop)
-            val front = if (
-                from == cachedFromPage &&
-                fromTop == cachedFromTopPx &&
-                cachedFrontBitmap != null
-            ) {
-                cachedFrontBitmap?.copy(pageShotConfig, false)
-            } else {
-                snapshotPageAt(fromTop)
+            val front = frozenOutgoing ?: run {
+                if (
+                    from == cachedFromPage &&
+                    fromTop == cachedFromTopPx &&
+                    cachedFrontBitmap != null
+                ) {
+                    cachedFrontBitmap?.copy(pageShotConfig, false)
+                } else {
+                    snapshotPageAt(fromTop)
+                }
             } ?: return@runCatching false
             val revealed = if (
                 target == cachedTargetPage &&
@@ -979,7 +1036,10 @@ internal class EpubFlowView(
             }
             glInteractive = true
             true
-        }.getOrDefault(false)
+        }.getOrElse {
+            frozenOutgoing?.recycle()
+            false
+        }
     }
 
     private fun snapshotViewport(): Bitmap? = try {
@@ -1165,6 +1225,16 @@ internal class EpubFlowView(
         overlay.add(drawable)
     }
 
+    private fun conversionSnapshotCopy(): Bitmap? =
+        conversionSnapshotDrawable?.copyBitmap(pageShotConfig)
+
+    private fun copyPageShotBitmap(bitmap: Bitmap): Bitmap? =
+        if (bitmap.isRecycled) {
+            null
+        } else {
+            runCatching { bitmap.copy(pageShotConfig, false) }.getOrNull()
+        }
+
     private fun positionConversionSnapshot() {
         conversionSnapshotDrawable?.setBounds(0, scrollY, width, scrollY + height)
     }
@@ -1198,12 +1268,16 @@ internal class EpubFlowView(
         val from = snapToNearestCanonicalPageAnchor(report = false)
         val target = from + if (forward) 1 else -1
         if (target < 0 || target > paged.lastIndex) return false
+        val frozenOutgoing = conversionSnapshotCopy()
         finishInitialRevealForTurn()
         // Snap the outgoing page to its own top so the snapshot is the clean page (a mid-page free
         // scroll leaves scrollY between two page tops → the snapshot would carry top/bottom half-lines).
         scrollToPage(from, report = false)
-        val targetTop = textureTopPxForPage(target) ?: return false
-        val outgoing = snapshotViewport() ?: return false
+        val targetTop = textureTopPxForPage(target) ?: run {
+            frozenOutgoing?.recycle()
+            return false
+        }
+        val outgoing = frozenOutgoing ?: snapshotViewport() ?: return false
         val revealed = snapshotPageAt(targetTop) ?: run {
             outgoing.recycle()
             return false
@@ -1637,6 +1711,13 @@ private class ViewportSnapshotDrawable(
     fun recycle() {
         if (!bitmap.isRecycled) bitmap.recycle()
     }
+
+    fun copyBitmap(config: Bitmap.Config): Bitmap? =
+        if (bitmap.isRecycled) {
+            null
+        } else {
+            runCatching { bitmap.copy(config, false) }.getOrNull()
+        }
 
     override fun setAlpha(alpha: Int) {
         alphaValue = alpha

@@ -455,7 +455,12 @@ class ReaderViewModel(
     private fun watchSettings(engine: ReaderEngine) {
         settingsFontJob?.cancel()
         settingsFontJob = viewModelScope.launch {
+            var firstEmission = true
             settings.fontChoice.collect { choice ->
+                if (firstEmission) {
+                    firstEmission = false
+                    return@collect
+                }
                 engine.setFont(choice.serialize())
             }
         }

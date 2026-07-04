@@ -603,6 +603,60 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `first slide turn during frozen conversion uses visible cover as outgoing page shot`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.setPrivateField("awaitingReveal", true)
+        view.getChildAt(0).alpha = 0f
+        val visibleCover = markerBitmap(view.width, view.height)
+        view.showConversionSnapshotForTest(visibleCover.copy(Bitmap.Config.ARGB_8888, false))
+        view.getChildAt(0).alpha = 1f
+        val livePagedFrame = requireNotNull(view.snapshotViewportForTest())
+        view.getChildAt(0).alpha = 0f
+        assertTrue(
+            "test requires a visible frozen frame that differs from the hidden paged frame",
+            !bitmapsHaveSamePixels(visibleCover, livePagedFrame),
+        )
+        livePagedFrame.recycle()
+
+        assertTrue(view.goToAdjacentPage(1))
+
+        val slide = view.privateField("slideDrawable")
+        assertNotNull("the first tap during conversion should still start the normal slide animation", slide)
+        val front = slide!!.privateBitmap("frontBitmap")
+        assertAllPixelsEqual(
+            "the turn must start from the frame the reader was visibly showing under the finger",
+            visibleCover,
+            front,
+        )
+        visibleCover.recycle()
+    }
+
+    @Test
+    fun `first simulation turn during frozen conversion uses visible cover as front texture`() {
+        val overlay = FakeCurlOverlay()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.setPrivateField("awaitingReveal", true)
+        view.getChildAt(0).alpha = 0f
+        val visibleCover = markerBitmap(view.width, view.height)
+        view.showConversionSnapshotForTest(visibleCover.copy(Bitmap.Config.ARGB_8888, false))
+
+        assertTrue(view.goToAdjacentPage(1))
+
+        val front = requireNotNull(overlay.frontBitmapCopy) { "GL turn should receive a front texture" }
+        assertAllPixelsEqual(
+            "the GL curl must start from the same frozen frame that was visible before the tap",
+            visibleCover,
+            front,
+        )
+        front.recycle()
+        visibleCover.recycle()
+    }
+
+    @Test
     fun `self paging clean tap reports consumed to the outer reader host`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE, onTapZone = tapZones::add)
@@ -1692,6 +1746,12 @@ class EpubFlowViewTest {
             .apply { isAccessible = true }
             .invoke(this) as Bitmap?
 
+    private fun EpubFlowView.showConversionSnapshotForTest(bitmap: Bitmap) {
+        javaClass.getDeclaredMethod("showConversionSnapshot", Bitmap::class.java)
+            .apply { isAccessible = true }
+            .invoke(this, bitmap)
+    }
+
     private fun EpubFlowView.drawToBitmapForTest(): Bitmap =
         Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { draw(Canvas(it)) }
 
@@ -1721,6 +1781,40 @@ class EpubFlowViewTest {
             y += stepY
         }
     }
+
+    private fun assertAllPixelsEqual(message: String, expected: Bitmap, actual: Bitmap) {
+        assertEquals("$message: width", expected.width, actual.width)
+        assertEquals("$message: height", expected.height, actual.height)
+        for (y in 0 until expected.height) {
+            for (x in 0 until expected.width) {
+                assertEquals(
+                    "$message at ($x,$y)",
+                    expected.getPixel(x, y),
+                    actual.getPixel(x, y),
+                )
+            }
+        }
+    }
+
+    private fun bitmapsHaveSamePixels(first: Bitmap, second: Bitmap): Boolean {
+        if (first.width != second.width || first.height != second.height) return false
+        for (y in 0 until first.height) {
+            for (x in 0 until first.width) {
+                if (first.getPixel(x, y) != second.getPixel(x, y)) return false
+            }
+        }
+        return true
+    }
+
+    private fun markerBitmap(width: Int, height: Int): Bitmap =
+        Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
+            val canvas = Canvas(bitmap)
+            val paint = Paint()
+            for (y in 0 until height) {
+                paint.color = if ((y / 5) % 2 == 0) 0xFF204060.toInt() else 0xFFE0C080.toInt()
+                canvas.drawRect(0f, y.toFloat(), width.toFloat(), (y + 1).toFloat(), paint)
+            }
+        }
 
     private fun EpubFlowView.textureTopPxForPageForTest(index: Int): Int? =
         javaClass.getDeclaredMethod("textureTopPxForPage", Int::class.javaPrimitiveType)
@@ -1883,6 +1977,8 @@ class EpubFlowViewTest {
             private set
         var revealedHeight: Int = -1
             private set
+        var frontBitmapCopy: Bitmap? = null
+            private set
 
         override fun start(
             front: Bitmap,
@@ -1894,6 +1990,8 @@ class EpubFlowViewTest {
             frontHeight = front.height
             revealedWidth = revealed.width
             revealedHeight = revealed.height
+            frontBitmapCopy?.recycle()
+            frontBitmapCopy = front.copy(Bitmap.Config.ARGB_8888, false)
             front.recycle()
             revealed.recycle()
             this.settled = settled
