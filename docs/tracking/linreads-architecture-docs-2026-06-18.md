@@ -19,6 +19,13 @@ Owner: Codex
 - 当前 `git status --short docs/tracking maintenance-log.md CLAUDE.md` 显示 `docs/tracking/`、`CLAUDE.md`、`maintenance-log.md` 尚未纳入 git 跟踪。
 - 当前 wiki `docs/wiki/Active-Work.md` 仍停在 2026-06-18/HEAD `44f0a64`，没有反映 Phase 1 地基和 TXT slice，需要后续刷新。
 
+## 2026-07-04 EPUB Flow Open/Conversion Continuation
+
+- 继续修“已读书首开不能露快速滚动”和复杂 `SCROLL -> PAGED` 转换可见感。MoonReader 本地源码证据仍指向 page-shot 模型：`ActivityTxt.getPageShot(...)` 先 `A.setBackgroundImage(canvas)` 再 `contentLay.draw(canvas)`；成熟 reader 参考（Readium/Foliate）也倾向先 render/anchor/直接定位，再显示稳定帧。
+- `EpubFlowView.revealContent()` 现在不再让 conversion snapshot 与 live paged content 交叉淡化；旧 scroll viewport shot 保持完全不透明，live paged frame 在背后完成 reveal/stabilize 后才回收遮罩，避免复杂内容下看到滚动几何和分页几何叠帧。
+- 新增 `EpubFlowViewTest.scroll to paged conversion does not crossfade scroll geometry with paged geometry`，RED 于旧实现已启动 `conversionSnapshotAnimator`；新增 `EpubReflowEngineTest.flow restored open view stays hidden until restored viewport is parked`，锁住 engine host 从 `createView()` 到 attach/settle 都保持 restored flow content alpha-hidden，直到 restored viewport 已停好才 reveal。
+- Validation: targeted RED/GREEN；`EpubFlowViewTest` + restored-open targeted SUCCESS；phase2 `:render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :render:animate:testDebugUnitTest :app:assembleDebug` SUCCESS；`git diff --check` clean；`:app:compileDebugAndroidTestKotlin :app:installDebug :app:installDebugAndroidTest` SUCCESS；AVD `EpubFlowAnchorRuntimeSmokeTest` on `emulator-5554` = `OK (14 tests)` / `157.482s`；narrow logcat `FATAL EXCEPTION|E AndroidRuntime|OutOfMemory|recycled bitmap|AssertionError|\bANR\b` 无匹配。仍是 JVM/AVD 证据，不是真机/平板物理手感。
+
 ## 2026-07-02 MoonReader Handfeel Note
 
 - 已把 MoonReader EPUB/PAGED 手感可借鉴项整理到 `docs/research/moonreader-handfeel-borrowing-backlog-2026-07-02.md`，并落地 Android EPUB/PAGED P0/P1：中心 `1/3 x 1/3` dead zone 消费不翻页、中心 `1/5 x 1/5` 临时滚动、翻页前 canonical anchor snap、page-top keyed texture cache。

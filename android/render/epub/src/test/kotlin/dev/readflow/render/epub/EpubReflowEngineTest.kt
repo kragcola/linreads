@@ -190,6 +190,66 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `flow restored open view stays hidden until restored viewport is parked`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val paragraphs = List(260) { index -> "restore paragraph ${index + 1}" }
+        val targetParagraph = 189
+        val epub = tempDir.newFile("flow-restored-open-hidden.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to paragraphs.joinToString(
+                separator = "",
+                prefix = "<html><body>",
+                postfix = "</body></html>",
+            ) { paragraph -> "<p>$paragraph</p>" },
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+
+        engine.setFontSize(32f)
+        engine.setLineSpacing(1.8f)
+        engine.setMode(ReadingMode.PAGED)
+        engine.setInitialLocator(
+            Locator(
+                LocatorStrategy.Section(
+                    spineIndex = 0,
+                    elementIndex = targetParagraph,
+                    charOffset = 0,
+                ),
+            ),
+        )
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        val content = flowView.getChildAt(0)
+
+        assertEquals("restored flow content must be hidden before the AndroidView host is attached", 0f, content.alpha)
+
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 80))
+        host.measure(exactly(360), exactly(80))
+        host.layout(0, 0, 360, 80)
+
+        assertEquals("first attached frame must not expose chapter-start text", 0f, content.alpha)
+
+        shadowOf(Looper.getMainLooper()).idle()
+        host.measure(exactly(360), exactly(80))
+        host.layout(0, 0, 360, 80)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue(
+            "restore target should be parked while still hidden: scrollY=${flowView.scrollY}, " +
+                "layoutHeight=${flowView.textView.layout?.height}, viewHeight=${flowView.height}, targetParagraph=$targetParagraph",
+            flowView.scrollY > 0,
+        )
+        assertEquals("restored content must remain hidden through the positioning post", 0f, content.alpha)
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        assertEquals("only the already-parked restored viewport should be revealed", 1f, content.alpha)
+    }
+
+    @Test
     fun `open book honors pre-applied paged typography before publishing restored position`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val firstParagraph = (1..120).joinToString(separator = "") { "a" }

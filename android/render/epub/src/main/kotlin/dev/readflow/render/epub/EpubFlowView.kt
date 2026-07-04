@@ -111,6 +111,7 @@ internal class EpubFlowView(
     private var awaitingReveal = false
     private var lastReportedTopOffset: Int? = null
     private val initialRevealRunnable = Runnable { revealContent() }
+    private val conversionSnapshotClearRunnable = Runnable { clearConversionSnapshot() }
     /** First page turn requested before the initial layout exists; replayed once pagination is ready. */
     private var pendingInitialPageTurnDelta: Int? = null
     private val pageShotConfig = Bitmap.Config.ARGB_8888
@@ -177,7 +178,6 @@ internal class EpubFlowView(
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
     private var conversionSnapshotDrawable: ViewportSnapshotDrawable? = null
-    private var conversionSnapshotAnimator: ValueAnimator? = null
     private val flipDurationMs = 280L
     /** Discrete GL curl sweep — a touch longer than the slide so the realistic curl reads fully. */
     private val glCurlDurationMs = 420L
@@ -611,13 +611,16 @@ internal class EpubFlowView(
     private fun revealContent() {
         if (!awaitingReveal) return
         removeCallbacks(initialRevealRunnable)
+        removeCallbacks(conversionSnapshotClearRunnable)
         awaitingReveal = false
-        fadeOutConversionSnapshot()
+        if (conversionSnapshotDrawable != null) {
+            // Keep the old scroll page-shot fully opaque until the live paged frame is stable.
+            postDelayed(conversionSnapshotClearRunnable, REVEAL_FADE_MS * 2)
+        }
         container.animate()
             .alpha(1f)
             .setDuration(REVEAL_FADE_MS)
             .withEndAction {
-                clearConversionSnapshot()
                 if (!consumePendingInitialPageTurn()) {
                     preCachePageTextures()
                 }
@@ -1166,28 +1169,13 @@ internal class EpubFlowView(
         conversionSnapshotDrawable?.setBounds(0, scrollY, width, scrollY + height)
     }
 
-    private fun fadeOutConversionSnapshot() {
-        val drawable = conversionSnapshotDrawable ?: return
-        conversionSnapshotAnimator?.cancel()
-        conversionSnapshotAnimator = ValueAnimator.ofInt(255, 0).apply {
-            duration = REVEAL_FADE_MS
-            addUpdateListener { animator ->
-                drawable.alphaValue = animator.animatedValue as Int
-                invalidate()
-            }
-            start()
-        }
-    }
-
     private fun resetConversionSnapshotFade() {
-        conversionSnapshotAnimator?.cancel()
-        conversionSnapshotAnimator = null
+        removeCallbacks(conversionSnapshotClearRunnable)
         conversionSnapshotDrawable?.alphaValue = 255
     }
 
     private fun clearConversionSnapshot() {
-        conversionSnapshotAnimator?.cancel()
-        conversionSnapshotAnimator = null
+        removeCallbacks(conversionSnapshotClearRunnable)
         conversionSnapshotDrawable?.let {
             overlay.remove(it)
             it.recycle()

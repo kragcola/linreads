@@ -1188,12 +1188,51 @@ class EpubFlowViewTest {
         assertEquals(view.height, bitmap.height)
         assertEquals(0f, view.getChildAt(0).alpha)
 
-        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        shadowOf(Looper.getMainLooper()).idleFor(360L, TimeUnit.MILLISECONDS)
 
-        assertEquals("the conversion cover should be removed after the stable paged frame is revealed", null, view.privateField("conversionSnapshotDrawable"))
+        assertEquals("the conversion cover should be removed after the stable paged frame has settled", null, view.privateField("conversionSnapshotDrawable"))
         assertTrue("the temporary conversion cover bitmap must be recycled", bitmap.isRecycled)
         assertEquals(1f, view.getChildAt(0).alpha)
         assertEquals(pageTwoTop, view.scrollY)
+    }
+
+    @Test
+    fun `scroll to paged conversion does not crossfade scroll geometry with paged geometry`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val nearNextPageLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (midpoint + 1) until pageTwoTop }
+
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(layout.getLineForVertical(nearNextPageLineTop)),
+        )
+        val cover = view.privateField("conversionSnapshotDrawable")
+        assertNotNull("test requires a frozen conversion cover", cover)
+
+        (view.privateField("initialRevealRunnable") as Runnable).run()
+
+        assertEquals(false, view.privateBool("awaitingReveal"))
+        assertEquals(
+            "the frozen scroll frame must stay fully opaque while the paged frame is still revealing",
+            255,
+            cover!!.privateInt("alphaValue"),
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(60L, TimeUnit.MILLISECONDS)
+
+        assertEquals(
+            "mid-reveal must still show only the frozen frame, never a scroll/page geometry crossfade",
+            255,
+            cover.privateInt("alphaValue"),
+        )
+        assertEquals(cover, view.privateField("conversionSnapshotDrawable"))
     }
 
     @Test
@@ -1293,7 +1332,7 @@ class EpubFlowViewTest {
         assertEquals(0f, view.getChildAt(0).alpha)
         assertEquals(pageTwoTop, view.scrollY)
 
-        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        shadowOf(Looper.getMainLooper()).idleFor(360L, TimeUnit.MILLISECONDS)
 
         assertEquals(null, view.privateField("conversionSnapshotDrawable"))
     }
