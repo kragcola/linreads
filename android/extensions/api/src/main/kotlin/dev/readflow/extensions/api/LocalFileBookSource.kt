@@ -54,6 +54,7 @@ class LocalFileBookSource(
         mimeType: String?,
     ): ReadflowResult<Pair<BookMeta, DownloadedAsset>> =
         withContext(Dispatchers.IO) {
+            var stagingFile: File? = null
             try {
                 // SAF URIs (content://) encode an opaque ID in lastPathSegment, not
                 // the real filename. Query OpenableColumns.DISPLAY_NAME to get the
@@ -77,49 +78,56 @@ class LocalFileBookSource(
 
                 val booksDir = File(context.filesDir, "books").apply { mkdirs() }
                 val stagingFile = File.createTempFile("incoming-", ".$ext", booksDir)
-                val digest = MessageDigest.getInstance("SHA-256")
+                // Any failure below must not leave the empty staging file behind
+                // (scoped-storage read denials produced 0-byte incoming-* orphans).
+                try {
+                    val digest = MessageDigest.getInstance("SHA-256")
 
-                context.contentResolver.openInputStream(uri)?.use { input ->
-                    stagingFile.outputStream().use { output ->
-                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read < 0) break
-                            output.write(buffer, 0, read)
-                            digest.update(buffer, 0, read)
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        stagingFile.outputStream().use { output ->
+                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                output.write(buffer, 0, read)
+                                digest.update(buffer, 0, read)
+                            }
                         }
+                    } ?: return@withContext ReadflowResult.Failure(
+                        ReadflowError.io("无法读取文件"),
+                    )
+                    val id = localBookIdForDigest(ext, digest.digest())
+                    val outFile = File(booksDir, "$id.$ext")
+                    if (!stagingFile.renameTo(outFile)) {
+                        stagingFile.copyTo(outFile, overwrite = true)
                     }
-                } ?: return@withContext ReadflowResult.Failure(
-                    ReadflowError.io("无法读取文件"),
-                )
-                val id = localBookIdForDigest(ext, digest.digest())
-                val outFile = File(booksDir, "$id.$ext")
-                if (!stagingFile.renameTo(outFile)) {
-                    stagingFile.copyTo(outFile, overwrite = true)
+
+                    val title = fileName.substringBeforeLast('.')
+                    val coverUri = CoverExtractor.extract(context, outFile, format, id)
+                    val meta = BookMeta(
+                        id = id,
+                        title = title,
+                        author = "未知作者",
+                        format = format,
+                        coverUrl = coverUri,
+                        downloadStatus = DownloadStatus.DOWNLOADED,
+                        localUri = Uri.fromFile(outFile).toString(),
+                        lastReadAt = null,
+                        collectionName = null,
+                        progress = 0f,
+                    )
+                    val asset = DownloadedAsset(
+                        bookId = id,
+                        format = format.name,
+                        localUri = Uri.fromFile(outFile).toString(),
+                        sizeBytes = outFile.length(),
+                    )
+                    ReadflowResult.Success(meta to asset)
+                } finally {
+                    // Deletes the staging file on every failure path; on success it
+                    // was already renamed/copied away, so this is a harmless no-op.
                     stagingFile.delete()
                 }
-
-                val title = fileName.substringBeforeLast('.')
-                val coverUri = CoverExtractor.extract(context, outFile, format, id)
-                val meta = BookMeta(
-                    id = id,
-                    title = title,
-                    author = "未知作者",
-                    format = format,
-                    coverUrl = coverUri,
-                    downloadStatus = DownloadStatus.DOWNLOADED,
-                    localUri = Uri.fromFile(outFile).toString(),
-                    lastReadAt = null,
-                    collectionName = null,
-                    progress = 0f,
-                )
-                val asset = DownloadedAsset(
-                    bookId = id,
-                    format = format.name,
-                    localUri = Uri.fromFile(outFile).toString(),
-                    sizeBytes = outFile.length(),
-                )
-                ReadflowResult.Success(meta to asset)
             } catch (e: Exception) {
                 ReadflowResult.Failure(ReadflowError.io(e.message ?: "导入失败"))
             }

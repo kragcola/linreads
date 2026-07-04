@@ -51,6 +51,29 @@ class LocalFileBookSourceTest {
         assertTrue(txt.first.id != md.first.id)
     }
 
+    @Test
+    fun `a failed import leaves no incoming staging file behind`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val source = LocalFileBookSource(context)
+        // A supported extension gets us past the format check so the staging
+        // file is created, but the missing file makes openInputStream fail —
+        // the exact shape of the scoped-storage read denial that produced
+        // 0-byte incoming-* orphans in the books dir.
+        val missing = File(context.cacheDir, "does-not-exist.epub")
+        missing.delete()
+
+        val result = source.import(Uri.fromFile(missing), "application/epub+zip")
+
+        assertTrue(result is ReadflowResult.Failure)
+        val booksDir = File(context.filesDir, "books")
+        val orphans = booksDir.listFiles { file -> file.name.startsWith("incoming-") }
+        assertTrue(
+            "failed import must not leave incoming-* orphans, found: " +
+                orphans?.joinToString { it.name },
+            orphans.isNullOrEmpty(),
+        )
+    }
+
     private fun <T> ReadflowResult<T>.successValue(): T =
         when (this) {
             is ReadflowResult.Success -> value
