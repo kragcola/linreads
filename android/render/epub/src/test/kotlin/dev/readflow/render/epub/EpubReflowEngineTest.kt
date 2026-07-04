@@ -190,7 +190,7 @@ class EpubReflowEngineTest {
     }
 
     @Test
-    fun `flow restored open view stays hidden until restored viewport is parked`() = runTest(dispatcher) {
+    fun `flow restored open view reveals immediately when parked and layout settled`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val paragraphs = List(260) { index -> "restore paragraph ${index + 1}" }
         val targetParagraph = 189
@@ -224,13 +224,11 @@ class EpubReflowEngineTest {
         val flowView = host.getChildAt(0) as EpubFlowView
         val content = flowView.getChildAt(0)
 
-        assertEquals("restored flow content must be hidden before the AndroidView host is attached", 0f, content.alpha)
-
+        // With no images to decode, the stability gate passes immediately after positioning.
+        // Content is revealed at the parked restore position in the first painted frame.
         activity.addContentView(host, ViewGroup.LayoutParams(360, 80))
         host.measure(exactly(360), exactly(80))
         host.layout(0, 0, 360, 80)
-
-        assertEquals("first attached frame must not expose chapter-start text", 0f, content.alpha)
 
         shadowOf(Looper.getMainLooper()).idle()
         host.measure(exactly(360), exactly(80))
@@ -238,15 +236,14 @@ class EpubReflowEngineTest {
         shadowOf(Looper.getMainLooper()).idle()
 
         assertTrue(
-            "restore target should be parked while still hidden: scrollY=${flowView.scrollY}, " +
+            "restore target should be parked when revealed: scrollY=${flowView.scrollY}, " +
                 "layoutHeight=${flowView.textView.layout?.height}, viewHeight=${flowView.height}, targetParagraph=$targetParagraph",
             flowView.scrollY > 0,
         )
-        assertEquals("restored content must remain hidden through the positioning post", 0f, content.alpha)
 
         shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
 
-        assertEquals("only the already-parked restored viewport should be revealed", 1f, content.alpha)
+        assertEquals("content should reveal at the parked restore position", 1f, content.alpha)
     }
 
     @Test

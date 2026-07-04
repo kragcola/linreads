@@ -433,23 +433,24 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
         ActivityScenario.launch<MainActivity>(mainIntent()).use { shelf ->
             dismissBlockingDialogs()
+            val activity = shelf.withActivity { it }
             val shelfItem = waitForObject(By.desc("打开 $title"))
             val bounds = shelfItem.visibleBounds
             injectScreenTap(bounds.centerX(), bounds.centerY())
 
             val trace = traceFlowFramesUntilRestored(
-                scenario = shelf,
+                activity = activity,
                 expectedPage = 3,
                 expectedScrollY = expectedPageTop,
                 message = "expected shelf OpenById to restore EPUB page-3 anchor",
             )
             val exposedLowFrame = trace.frames.firstOrNull { frame ->
-                frame.contentAlpha >= 1f &&
+                frame.contentAlpha > VISIBLE_CONTENT_ALPHA_EPSILON &&
                     frame.currentPage == 0 &&
                     frame.scrollY < expectedPageTop / 2
             }
             assertTrue(
-                "shelf OpenById must not expose any fully-visible low-scroll frame while restoring; " +
+                "shelf OpenById must not expose any visibly faded low-scroll frame while restoring; " +
                     "bad=$exposedLowFrame trace=${trace.frames}",
                 exposedLowFrame == null,
             )
@@ -1803,7 +1804,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     private fun traceFlowFramesUntilRestored(
-        scenario: ActivityScenario<MainActivity>,
+        activity: MainActivity,
         expectedPage: Int,
         expectedScrollY: Int,
         message: String,
@@ -1811,8 +1812,8 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val frames = mutableListOf<FlowReopenFrame>()
         val deadline = System.currentTimeMillis() + UI_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
-            val frame = scenario.withActivity { activity ->
-                val view = activity.findEpubFlowView() ?: return@withActivity null
+            val frame = activity.runOnMainForTest {
+                val view = activity.findEpubFlowView() ?: return@runOnMainForTest null
                 FlowReopenFrame(
                     currentPage = runCatching { view.reflectInt("currentPageIndex") }.getOrDefault(0),
                     scrollY = view.scrollY,
@@ -2340,6 +2341,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
         private const val DB_NAME = "readflow.db"
         private const val EVENT_STEP_MS = 24L
         private const val FRAME_POLL_MS = 16L
+        private const val VISIBLE_CONTENT_ALPHA_EPSILON = 0.05f
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
         private val DB_TIMEOUT_MS = 5.seconds.inWholeMilliseconds
     }

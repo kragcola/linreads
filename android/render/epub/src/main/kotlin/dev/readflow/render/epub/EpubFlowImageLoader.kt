@@ -79,6 +79,9 @@ internal class EpubFlowImageLoader(
     private val handler = Handler(Looper.getMainLooper())
     private val inFlight = Collections.synchronizedMap(WeakHashMap<AsyncDrawable, Future<*>>())
 
+    /** Returns true while at least one async image decode is still in flight. */
+    fun hasPendingDecodes(): Boolean = inFlight.isNotEmpty()
+
     override fun load(drawable: AsyncDrawable) {
         val file = epubFileProvider() ?: return
         val href = drawable.destination

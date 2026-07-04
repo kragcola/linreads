@@ -752,7 +752,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `initial restore stays hidden until the first layout settle window`() {
+    fun `initial restore reveals immediately when layout settled and no decodes pending`() {
         val context = RuntimeEnvironment.getApplication() as Application
         val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
         val view = EpubFlowView(
@@ -772,15 +772,15 @@ class EpubFlowViewTest {
         view.layout(0, 0, 360, 120)
         val restoreOffset = flow.offsetForParagraph(0, chapterText.indexOf("Line 30").coerceAtLeast(0))
 
+        // No pending decodes → signal-driven reveal fires immediately at the restore position.
         view.setChapter(flow, flow.text, pageHeightPx = 120, restoreOffset = restoreOffset)
         shadowOf(Looper.getMainLooper()).idle()
 
-        assertEquals("restored content must stay hidden until the settle debounce fires", 0f, view.getChildAt(0).alpha)
-        assertEquals("initial reveal should still be pending after the first positioning pass", true, view.privateBool("awaitingReveal"))
-
-        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
-
-        assertEquals("restored content should reveal after the settle window", false, view.privateBool("awaitingReveal"))
+        assertEquals(
+            "with no pending decodes, content must reveal immediately after positioning",
+            false,
+            view.privateBool("awaitingReveal"),
+        )
         assertEquals(1f, view.getChildAt(0).alpha)
     }
 
@@ -1185,7 +1185,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `scroll to paged anchored switch hides conversion until canonical page is parked`() {
+    fun `scroll to paged anchored switch reveals immediately when layout settled`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
@@ -1203,15 +1203,13 @@ class EpubFlowViewTest {
 
         assertEquals("SCROLL->PAGED should park immediately on the target canonical page", pageTwoTop, view.scrollY)
         assertEquals(
-            "SCROLL->PAGED conversion should be hidden so the user never sees scroll geometry becoming pages",
-            0f,
-            view.getChildAt(0).alpha,
+            "SCROLL->PAGED conversion should reveal immediately when layout is settled and no decodes pending",
+            false,
+            view.privateBool("awaitingReveal"),
         )
-        assertEquals(true, view.privateBool("awaitingReveal"))
 
         shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
 
-        assertEquals(false, view.privateBool("awaitingReveal"))
         assertEquals(1f, view.getChildAt(0).alpha)
         assertEquals(pageTwoTop, view.scrollY)
     }
@@ -1251,7 +1249,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `scroll to paged conversion does not crossfade scroll geometry with paged geometry`() {
+    fun `scroll to paged conversion crossfades frozen frame to live paged frame`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
@@ -1270,23 +1268,22 @@ class EpubFlowViewTest {
         val cover = view.privateField("conversionSnapshotDrawable")
         assertNotNull("test requires a frozen conversion cover", cover)
 
-        (view.privateField("initialRevealRunnable") as Runnable).run()
-
+        // setModeAnchored reveals through the real stability gate (tryRevealWhenStable): with layout
+        // settled and no pending decodes it reveals synchronously, so the conversion is already committed.
         assertEquals(false, view.privateBool("awaitingReveal"))
         assertEquals(
-            "the frozen scroll frame must stay fully opaque while the paged frame is still revealing",
+            "the frozen scroll frame must still be at full opacity before the cross-fade animation advances",
             255,
             cover!!.privateInt("alphaValue"),
         )
 
-        shadowOf(Looper.getMainLooper()).idleFor(60L, TimeUnit.MILLISECONDS)
+        // Advance past the REVEAL_FADE_MS cross-fade (120ms).
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
 
-        assertEquals(
-            "mid-reveal must still show only the frozen frame, never a scroll/page geometry crossfade",
-            255,
-            cover.privateInt("alphaValue"),
+        assertNull(
+            "conversion cover must be cleared and removed after cross-fade completes",
+            view.privateField("conversionSnapshotDrawable"),
         )
-        assertEquals(cover, view.privateField("conversionSnapshotDrawable"))
     }
 
     @Test
@@ -1320,7 +1317,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `scroll to paged reflow during reveal fade re-hides conversion until reparked`() {
+    fun `scroll to paged reflow during reveal fade re-hides then immediately re-reveals when settled`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
@@ -1341,16 +1338,18 @@ class EpubFlowViewTest {
         view.runReflowRunnable()
 
         assertEquals(
-            "late reflow during fade must not expose the scroll-to-page conversion",
-            0f,
-            view.getChildAt(0).alpha,
+            "late reflow re-hides then immediately re-reveals via stability gate when layout is settled",
+            false,
+            view.privateBool("awaitingReveal"),
         )
-        assertEquals(true, view.privateBool("awaitingReveal"))
         assertEquals(pageTwoTop, view.scrollY)
+
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+        assertEquals(1f, view.getChildAt(0).alpha)
     }
 
     @Test
-    fun `scroll to paged reflow during frozen reveal keeps cover until reparked reveal`() {
+    fun `scroll to paged reflow during reveal still parks and cross-fades via stability gate`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
@@ -1366,29 +1365,24 @@ class EpubFlowViewTest {
         view.setModeAnchored(EpubFlowView.Mode.PAGED, conversionOffset)
         val cover = view.privateField("conversionSnapshotDrawable")
         assertNotNull("test requires a frozen conversion cover", cover)
-        (view.privateField("initialRevealRunnable") as Runnable).run()
+        // setModeAnchored reveals through the real stability gate (tryRevealWhenStable): no images
+        // pending + layout settled → immediate reveal, so awaitingReveal is already cleared here.
         assertEquals(false, view.privateBool("awaitingReveal"))
 
         view.setPrivateField("paginatedLayoutHeight", layout.height - 1)
         view.runReflowRunnable()
 
         assertEquals(
-            "late reflow during a frozen reveal must keep the static cover over the conversion",
-            cover,
-            view.privateField("conversionSnapshotDrawable"),
+            "reflow re-hides then immediately re-reveals via stability gate when layout settled",
+            false,
+            view.privateBool("awaitingReveal"),
         )
-        assertEquals(
-            "the cover fade should restart from fully opaque after re-hiding the conversion",
-            255,
-            cover!!.privateInt("alphaValue"),
-        )
-        assertEquals(true, view.privateBool("awaitingReveal"))
-        assertEquals(0f, view.getChildAt(0).alpha)
         assertEquals(pageTwoTop, view.scrollY)
 
         shadowOf(Looper.getMainLooper()).idleFor(360L, TimeUnit.MILLISECONDS)
 
         assertEquals(null, view.privateField("conversionSnapshotDrawable"))
+        assertEquals(1f, view.getChildAt(0).alpha)
     }
 
     @Test
@@ -1641,6 +1635,161 @@ class EpubFlowViewTest {
             "a stale child link marker from the previous gesture must not swallow a new clean tap",
             listOf(EpubFlowTapZone.NEXT),
             tapZones,
+        )
+    }
+
+    // ---- Signal-driven reveal (stability gate) tests -------------------------------------------
+
+    @Test
+    fun `reveal is deferred while pending decodes provider reports true`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val restoreOffset = view.textView.layout!!.getLineStart(10)
+        // Simulate "images still decoding" by making the provider return true.
+        view.pendingDecodesProvider = { true }
+
+        view.setChapter(
+            view.privateField("flow") as EpubChapterFlow,
+            (view.textView.text as CharSequence),
+            pageHeightPx = 120,
+            restoreOffset = restoreOffset,
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // With pending decodes, the stability gate must NOT reveal.
+        assertEquals(
+            "content must stay hidden while images are still decoding",
+            true,
+            view.privateBool("awaitingReveal"),
+        )
+        assertEquals(
+            "container alpha must stay 0 while awaiting stability",
+            0f,
+            view.getChildAt(0).alpha,
+        )
+    }
+
+    @Test
+    fun `reveal fires immediately when layout settled and no pending decodes`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val restoreOffset = view.textView.layout!!.getLineStart(10)
+        // No pending decodes → stability gate should pass immediately.
+        view.pendingDecodesProvider = { false }
+
+        view.setChapter(
+            view.privateField("flow") as EpubChapterFlow,
+            (view.textView.text as CharSequence),
+            pageHeightPx = 120,
+            restoreOffset = restoreOffset,
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(
+            "content should reveal immediately when layout is settled and no decodes are pending",
+            false,
+            view.privateBool("awaitingReveal"),
+        )
+        assertEquals(1f, view.getChildAt(0).alpha)
+    }
+
+    @Test
+    fun `800ms safety net reveals even when pending decodes never finish`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val restoreOffset = view.textView.layout!!.getLineStart(10)
+        // Simulate permanently pending decodes
+        view.pendingDecodesProvider = { true }
+
+        view.setChapter(
+            view.privateField("flow") as EpubChapterFlow,
+            (view.textView.text as CharSequence),
+            pageHeightPx = 120,
+            restoreOffset = restoreOffset,
+        )
+        // Let the stability gate arm the safety net but not fire yet (80ms settle + 250ms idle).
+        shadowOf(Looper.getMainLooper()).idleFor(300L, TimeUnit.MILLISECONDS)
+        assertEquals(
+            "content should still be hidden before the 800ms safety fires",
+            true,
+            view.privateBool("awaitingReveal"),
+        )
+
+        // Advance past the 800ms safety net.
+        shadowOf(Looper.getMainLooper()).idleFor(900L, TimeUnit.MILLISECONDS)
+
+        assertEquals(
+            "800ms safety net must reveal content even with pending decodes",
+            false,
+            view.privateBool("awaitingReveal"),
+        )
+        assertEquals(1f, view.getChildAt(0).alpha)
+    }
+
+    @Test
+    fun `settleInitialPosition uses NEAREST anchor to align with setModeAnchored`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        // Pick an offset near the middle of a page boundary so FLOOR vs NEAREST diverge.
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        // Find the first line whose top is >= midpoint (closer to page 2 than page 1).
+        val midpoint = pageOneTop + (pageTwoTop - pageOneTop) / 2
+        val nearPageTwoLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it >= midpoint }
+        val boundaryOffset = layout.getLineStart(layout.getLineForVertical(nearPageTwoLineTop))
+
+        // Simulate settleInitialPosition with this offset.
+        view.setPrivateField("pendingRestoreOffset", boundaryOffset)
+        view.setPrivateField("pendingLandOnLast", false)
+        view.setPrivateField("awaitingReveal", true)
+        view.getChildAt(0).alpha = 0f
+        EpubFlowView::class.java.getDeclaredMethod("settleInitialPosition").apply { isAccessible = true }
+            .invoke(view)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // With NEAREST, the offset should land on page 2 (closer page).
+        assertEquals(
+            "settleInitialPosition must use NEAREST anchor, landing on the closer page",
+            2,
+            view.currentPageIndex(),
+        )
+    }
+
+    @Test
+    fun `conversion snapshot cross-fades alpha to 0 instead of instant removal`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val nearNextPageLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (midpoint + 1) until pageTwoTop }
+
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false } // allow immediate reveal
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(layout.getLineForVertical(nearNextPageLineTop)),
+        )
+        val cover = view.privateField("conversionSnapshotDrawable")
+        assertNotNull("test requires a frozen conversion cover", cover)
+        val coverAlphaBefore = cover!!.privateInt("alphaValue")
+        assertEquals("conversion cover must start fully opaque", 255, coverAlphaBefore)
+
+        // setModeAnchored already revealed via the stability gate (no pending decodes), starting the
+        // cross-fade animator. Advance past the REVEAL_FADE_MS cross-fade (120ms) to let it complete.
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+        // After cross-fade animation completes, alpha should be 0 and the cover cleared.
+        val coverAfter = view.privateField("conversionSnapshotDrawable")
+        assertNull(
+            "conversion cover must be cleared after cross-fade completes",
+            coverAfter,
         )
     }
 

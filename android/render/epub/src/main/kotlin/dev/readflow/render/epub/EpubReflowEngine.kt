@@ -564,6 +564,7 @@ class EpubReflowEngine private constructor(
             highlightRanges = flowHighlightRanges(flow),
         )
         val restoreOffset = restoreToParagraph?.let { flow.offsetForParagraph(it, restoreToParagraphOffset) }
+        view.pendingDecodesProvider = loader::hasPendingDecodes
         view.setChapter(flow, spannable, flowPageHeightPx(), restoreOffset = restoreOffset, landOnLast = landOnLast)
         // Schedule async images after the layout pass; positioning is now done inside setChapter's own
         // post (single pre-paint placement — no chapter-top→resume jump on entry).

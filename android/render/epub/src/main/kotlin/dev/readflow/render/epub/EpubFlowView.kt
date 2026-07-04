@@ -75,7 +75,7 @@ internal class EpubFlowView(
         val hidePagedConversion = modeValue == Mode.SCROLL && value == Mode.PAGED && flow != null
         val conversionSnapshot = if (hidePagedConversion) snapshotViewport() else null
         if (hidePagedConversion) {
-            removeCallbacks(initialRevealRunnable)
+            removeCallbacks(revealSafetyRunnable)
             container.animate().cancel()
             pendingRestoreOffset = layoutOffset
             pendingLandOnLast = false
@@ -87,7 +87,7 @@ internal class EpubFlowView(
         if (hidePagedConversion) {
             showConversionSnapshot(conversionSnapshot)
             if (textView.layout != null) pendingRestoreOffset = topLayoutOffset()
-            scheduleInitialReveal()
+            tryRevealWhenStable()
         }
     }
 
@@ -107,11 +107,23 @@ internal class EpubFlowView(
     /** Resume target for the in-flight [setChapter], applied once layout is ready (before the reveal). */
     private var pendingRestoreOffset: Int? = null
     private var pendingLandOnLast = false
+    /** Provider queried by the stability gate to check for pending async image decodes. */
+    var pendingDecodesProvider: (() -> Boolean)? = null
+
     /** True between [setChapter] and the first positioned frame: content is alpha-hidden until then. */
     private var awaitingReveal = false
     private var lastReportedTopOffset: Int? = null
-    private val initialRevealRunnable = Runnable { revealContent() }
+    private val revealSafetyRunnable = Runnable {
+        if (!awaitingReveal) return@Runnable
+        val offset = pendingRestoreOffset
+        if (offset != null && flow != null) {
+            goToOffset(offset, pagedAnchor = PagedAnchor.NEAREST, forceReport = true)
+        }
+        revealContent()
+    }
     private val conversionSnapshotClearRunnable = Runnable { clearConversionSnapshot() }
+    /** Cross-fade animator retiring the frozen conversion snapshot; cancelled when the cover is replaced. */
+    private var conversionFadeAnimator: android.animation.ValueAnimator? = null
     /** First page turn requested before the initial layout exists; replayed once pagination is ready. */
     private var pendingInitialPageTurnDelta: Int? = null
     private val pageShotConfig = Bitmap.Config.ARGB_8888
@@ -342,9 +354,11 @@ internal class EpubFlowView(
             // Only react to a genuine content reflow (height delta from a decoded image), not our own
             // re-layout after repaginate (which records the new height) or a no-op pass.
             if (layout.height == paginatedLayoutHeight) return@addOnLayoutChangeListener
-            if (awaitingReveal) removeCallbacks(initialRevealRunnable)
+            if (awaitingReveal) removeCallbacks(revealSafetyRunnable)
             removeCallbacks(reflowRunnable)
             postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
+            // Re-check stability after a layout change — an async image may have just filled in.
+            if (awaitingReveal) tryRevealWhenStable()
         }
     }
 
@@ -377,7 +391,7 @@ internal class EpubFlowView(
             return@Runnable
         }
         if (initialRevealActive()) {
-            removeCallbacks(initialRevealRunnable)
+            removeCallbacks(revealSafetyRunnable)
             container.animate().cancel()
             awaitingReveal = true
             container.alpha = 0f
@@ -393,7 +407,7 @@ internal class EpubFlowView(
         if (anchorOffset >= 0) goToOffset(anchorOffset, forceReport = true)
         if (awaitingReveal) {
             positionConversionSnapshot()
-            scheduleInitialReveal()
+            tryRevealWhenStable()
         }
     }
 
@@ -511,7 +525,7 @@ internal class EpubFlowView(
                 repaginate(reposition = false)
                 if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0, forceReport = true)
                 if (consumePendingInitialPageTurn()) return@post
-                scheduleInitialReveal()
+                tryRevealWhenStable()
                 preCachePageTextures()
             }
             return
@@ -568,7 +582,7 @@ internal class EpubFlowView(
         pendingInitialPageTurnDelta = null
         awaitingReveal = true
         lastReportedTopOffset = null
-        removeCallbacks(initialRevealRunnable)
+        removeCallbacks(revealSafetyRunnable)
         container.animate().cancel()
         container.alpha = 0f
         textView.text = spannable
@@ -585,9 +599,9 @@ internal class EpubFlowView(
     private fun settleInitialPosition() {
         if (textView.layout == null || flow == null) return
         repaginate(reposition = false)
-        if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0, forceReport = true)
+        if (pendingLandOnLast) goToLastPage() else goToOffset(pendingRestoreOffset ?: 0, pagedAnchor = PagedAnchor.NEAREST, forceReport = true)
         if (consumePendingInitialPageTurn()) return
-        if (height > 0) scheduleInitialReveal()
+        if (height > 0) tryRevealWhenStable()
         preCachePageTextures()
     }
 
@@ -602,20 +616,49 @@ internal class EpubFlowView(
         return true
     }
 
-    private fun scheduleInitialReveal() {
-        if (!awaitingReveal || height <= 0) return
-        removeCallbacks(initialRevealRunnable)
-        postDelayed(initialRevealRunnable, INITIAL_REVEAL_SETTLE_MS)
+    /**
+     * Stability gate (MoonReader model): reveals content only when the layout geometry has settled
+     * AND no async image decodes are pending. Arms an 800ms safety net so content never stays hidden
+     * permanently if a decode hangs.
+     */
+    internal fun tryRevealWhenStable() {
+        if (!awaitingReveal) return
+        removeCallbacks(revealSafetyRunnable)
+        if (isLayoutSettled()) {
+            revealContent()
+        } else {
+            // Arm 800ms safety net (MoonReader's postDelayed 800ms recheck)
+            postDelayed(revealSafetyRunnable, REVEAL_SAFETY_MS)
+        }
     }
+
+    private fun isLayoutSettled(): Boolean =
+        textView.layout != null &&
+            height > 0 &&
+            textView.layout!!.height == paginatedLayoutHeight &&
+            pendingDecodesProvider?.invoke() != true
 
     private fun revealContent() {
         if (!awaitingReveal) return
-        removeCallbacks(initialRevealRunnable)
+        removeCallbacks(revealSafetyRunnable)
         removeCallbacks(conversionSnapshotClearRunnable)
         awaitingReveal = false
-        if (conversionSnapshotDrawable != null) {
-            // Keep the old scroll page-shot fully opaque until the live paged frame is stable.
-            postDelayed(conversionSnapshotClearRunnable, REVEAL_FADE_MS * 2)
+        val fadingCover = conversionSnapshotDrawable
+        if (fadingCover != null) {
+            // Cross-fade: animate the frozen SCROLL page-shot out as the live PAGED content fades in.
+            conversionFadeAnimator?.cancel()
+            conversionFadeAnimator = android.animation.ValueAnimator.ofInt(255, 0).apply {
+                duration = REVEAL_FADE_MS
+                addUpdateListener { fadingCover.alphaValue = it.animatedValue as Int }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: android.animation.Animator) {
+                        conversionFadeAnimator = null
+                        // Only retire the cover this animation owned; a new conversion may have
+                        // installed a fresh snapshot mid-fade (do not recycle someone else's cover).
+                        if (conversionSnapshotDrawable === fadingCover) clearConversionSnapshot()
+                    }
+                })
+            }.also { it.start() }
         }
         container.animate()
             .alpha(1f)
@@ -633,7 +676,7 @@ internal class EpubFlowView(
 
     private fun finishInitialRevealForTurn() {
         if (!initialRevealActive()) return
-        removeCallbacks(initialRevealRunnable)
+        removeCallbacks(revealSafetyRunnable)
         container.animate().cancel()
         awaitingReveal = false
         container.alpha = 1f
@@ -733,7 +776,7 @@ internal class EpubFlowView(
         if (mode == Mode.PAGED) {
             if (awaitingReveal && flow != null && (height <= 0 || paged.isEmpty())) {
                 pendingInitialPageTurnDelta = delta.coerceIn(-1, 1)
-                if (height > 0) scheduleInitialReveal()
+                if (height > 0) tryRevealWhenStable()
                 return true
             }
             if (paged.isEmpty()) {
@@ -1224,11 +1267,15 @@ internal class EpubFlowView(
     }
 
     private fun resetConversionSnapshotFade() {
+        conversionFadeAnimator?.cancel()
+        conversionFadeAnimator = null
         removeCallbacks(conversionSnapshotClearRunnable)
         conversionSnapshotDrawable?.alphaValue = 255
     }
 
     private fun clearConversionSnapshot() {
+        conversionFadeAnimator?.cancel()
+        conversionFadeAnimator = null
         removeCallbacks(conversionSnapshotClearRunnable)
         conversionSnapshotDrawable?.let {
             overlay.remove(it)
@@ -1672,7 +1719,8 @@ internal class EpubFlowView(
 
         /** Fade-in for the chapter's first positioned frame — long enough to hide a one-frame settle. */
         const val REVEAL_FADE_MS = 120L
-        const val INITIAL_REVEAL_SETTLE_MS = REFLOW_DEBOUNCE_MS
+        /** Maximum wait for layout stability before forcing reveal (MoonReader 800ms safety net). */
+        const val REVEAL_SAFETY_MS = 800L
         const val GL_DISCRETE_SETTLE_GRACE_MS = 480L
     }
 }
