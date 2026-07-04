@@ -12,6 +12,7 @@ import android.os.SystemClock
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ClickableSpan
+import android.text.style.ReplacementSpan
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -694,6 +695,48 @@ class EpubFlowViewTest {
             view.getTag(dev.readflow.render.api.R.id.selection_aware_interactive_tap_consumed),
         )
         assertEquals("the inner EPUB surface should still report MENU for its engine callback", listOf(EpubFlowTapZone.MENU), tapZones)
+    }
+
+    @Test
+    fun `scroll mode edge tap toggles menu instead of paging`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE, onTapZone = tapZones::add)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.mode = EpubFlowView.Mode.SCROLL
+
+        // Left edge and right edge taps that would page PREV/NEXT in PAGED mode.
+        cleanTap(view, view.width * 0.1f)
+        cleanTap(view, view.width * 0.9f)
+
+        assertEquals(
+            "scroll mode has no pages: edge taps must toggle the menu, never page-jump",
+            listOf(EpubFlowTapZone.MENU, EpubFlowTapZone.MENU),
+            tapZones,
+        )
+    }
+
+    @Test
+    fun `paged mode edge tap still pages`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE, onTapZone = tapZones::add)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+
+        cleanTap(view, view.width * 0.1f)
+        cleanTap(view, view.width * 0.9f)
+        cleanTap(view, view.width * 0.5f)
+
+        assertEquals(
+            "paged mode edge taps must still page PREV/NEXT, center toggles menu",
+            listOf(EpubFlowTapZone.PREV, EpubFlowTapZone.NEXT, EpubFlowTapZone.MENU),
+            tapZones,
+        )
+    }
+
+    private fun cleanTap(view: EpubFlowView, x: Float) {
+        val downTime = SystemClock.uptimeMillis()
+        val y = view.height * 0.5f
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, y))
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_UP, x, y))
     }
 
     @Test
@@ -1793,6 +1836,38 @@ class EpubFlowViewTest {
         )
     }
 
+    @Test
+    fun `full page image taller than viewport is not clipped away when parked on it`() {
+        // A full-page illustration lays out as ONE line taller than the viewport (审: 满页彩插).
+        // Build a chapter whose 2nd line is such an oversized image line, park exactly on its top,
+        // and assert the page clip keeps it (returns null = no clip) instead of backing off to the
+        // previous line and clipping the whole viewport blank — the "闪一下后消失" regression.
+        val tallImageHeight = 300 // > 120 viewport
+        val builder = SpannableString("A\n￼\nB")
+        builder.setSpan(
+            FixedHeightReplacementSpan(tallImageHeight),
+            2, 3, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        val view = pagedFlowView(spannable = builder)
+
+        val layout = requireNotNull(view.textView.layout)
+        // The oversized image sits on line 1 (0="A", 1=image, 2="B").
+        val imageLineTop = layout.getLineTop(1)
+        assertTrue(
+            "image line must be taller than the viewport for this regression",
+            layout.getLineBottom(1) - imageLineTop > view.height,
+        )
+
+        // Park exactly on the image line's top, as a page turn onto the full-page image would.
+        view.setPrivateField("pageClipActive", true)
+        view.scrollTo(0, imageLineTop)
+
+        assertNull(
+            "a full-page image taller than the viewport must not be clipped away when it IS the page",
+            view.pageClipBottomForTest(),
+        )
+    }
+
     private fun pagedFlowView(
         flipStyle: PageFlipStyle = PageFlipStyle.NONE,
         onTapZone: (EpubFlowTapZone) -> Unit = {},
@@ -1986,6 +2061,11 @@ class EpubFlowViewTest {
             .invoke(this)
     }
 
+    private fun EpubFlowView.pageClipBottomForTest(): Int? =
+        javaClass.getDeclaredMethod("pageClipBottomInViewport")
+            .apply { isAccessible = true }
+            .invoke(this) as Int?
+
     private fun EpubFlowView.privateInt(name: String): Int =
         privateField(name) as Int
 
@@ -2162,5 +2242,36 @@ class EpubFlowViewTest {
             active = false
             callback(committed)
         }
+    }
+
+    /** A ReplacementSpan that lays out at a fixed pixel height — stands in for a full-page image line. */
+    private class FixedHeightReplacementSpan(private val heightPx: Int) : ReplacementSpan() {
+        override fun getSize(
+            paint: Paint,
+            text: CharSequence?,
+            start: Int,
+            end: Int,
+            fm: Paint.FontMetricsInt?,
+        ): Int {
+            if (fm != null) {
+                fm.ascent = -heightPx
+                fm.top = -heightPx
+                fm.descent = 0
+                fm.bottom = 0
+            }
+            return 1
+        }
+
+        override fun draw(
+            canvas: Canvas,
+            text: CharSequence?,
+            start: Int,
+            end: Int,
+            x: Float,
+            top: Int,
+            y: Int,
+            bottom: Int,
+            paint: Paint,
+        ) = Unit
     }
 }

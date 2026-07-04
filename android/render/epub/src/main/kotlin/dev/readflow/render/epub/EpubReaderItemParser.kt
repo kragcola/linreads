@@ -83,6 +83,7 @@ private fun collectReaderItems(
         }
         "p" -> addParagraphWithImages(spineIndex, items, element, resourceBaseDir, documentPath, maxDomDepth)
         "img" -> addImageItem(spineIndex, items, element, resourceBaseDir)
+        "svg" -> addSvgImageItems(spineIndex, items, element, resourceBaseDir)
         "br", "hr" -> items += EpubReaderItem.Break(EpubItemLocator(spineIndex, items.size))
         "table" -> addPlainTextItem(
             spineIndex = spineIndex,
@@ -291,6 +292,28 @@ private fun addImageItem(
         altText = element.attr("alt").trim().takeIf { it.isNotEmpty() },
         fragmentIds = element.fragmentIds(),
     )
+}
+
+// SVG cover/illustration wrappers (common EPUB cover pattern: <svg><image xlink:href=".../cover.jpg"/>).
+// Each nested SVG <image> references a raster via xlink:href (SVG 1.1) or href (SVG 2); emit each as an
+// image item so covers using this wrapper render like an <img> (审计: SVG-wrapped covers showed blank —
+// the dispatch only handled <img> and the <svg> subtree fell through to text extraction, dropping the image).
+private fun addSvgImageItems(
+    spineIndex: Int,
+    items: MutableList<EpubReaderItem>,
+    element: Element,
+    resourceBaseDir: String,
+) {
+    element.select("image").forEach { image ->
+        val href = image.attr("xlink:href").trim().ifEmpty { image.attr("href").trim() }
+        if (href.isEmpty()) return@forEach
+        items += EpubReaderItem.Image(
+            locator = EpubItemLocator(spineIndex, items.size),
+            href = resolveResourceHref(resourceBaseDir, href),
+            altText = null,
+            fragmentIds = image.fragmentIds(),
+        )
+    }
 }
 
 private fun Element.fragmentIds(): List<String> =

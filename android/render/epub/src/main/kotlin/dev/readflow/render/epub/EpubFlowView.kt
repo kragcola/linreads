@@ -497,10 +497,15 @@ internal class EpubFlowView(
         if (mode != Mode.PAGED || !pageClipActive || paged.isEmpty()) return null
         val layout = textView.layout ?: return null
         val pageBottom = scrollY + height
+        // The current page's first line (scrollY sits on its top when parked; mid-line when free-scrolled).
+        // Back-off must never cross above it — an oversized line (a full-page image taller than the
+        // viewport) IS the whole page and must keep its one line, mirroring the paginator's oversized-line
+        // guard (审计: 满页图被 clip 退到上一页 → 整屏裁空 → 图闪一下后消失).
+        val firstLine = layout.getLineForVertical(scrollY)
         var line = layout.getLineForVertical(pageBottom - 1)
         // Step back off a line whose bottom spills past the viewport — that partial line belongs to the
         // next page. Leaves a blank gap at the bottom rather than a half-line (Moon+ accepts the gap).
-        if (line > 0 && layout.getLineBottom(line) > pageBottom) line--
+        if (line > firstLine && layout.getLineBottom(line) > pageBottom) line--
         val clip = layout.getLineBottom(line) - scrollY
         // No clip needed once the content fills (or exceeds) the viewport — e.g. a full-page image.
         if (clip >= height) return null
@@ -1704,7 +1709,10 @@ internal class EpubFlowView(
     }
 
     private fun handleTap(x: Float): EpubFlowTapZone {
+        // SCROLL mode has no pages: navigation is by finger scroll, so edge taps must not page-jump.
+        // Any tap toggles the menu instead (matches mainstream readers' scroll/webtoon mode).
         val zone = when {
+            mode != Mode.PAGED -> EpubFlowTapZone.MENU
             x < width / 3f -> EpubFlowTapZone.PREV
             x > width * 2f / 3f -> EpubFlowTapZone.NEXT
             else -> EpubFlowTapZone.MENU

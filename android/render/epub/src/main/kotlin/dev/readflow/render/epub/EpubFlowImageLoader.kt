@@ -93,27 +93,41 @@ internal class EpubFlowImageLoader(
         } else {
             columnWidthPx.coerceAtLeast(64)
         }
-        val reservedBounds = drawable.bounds.takeUnless { it.isEmpty }?.let { Rect(it) }
+        // Inline images (avatars/icons/footnote glyphs) size independently of the page height, so their
+        // pre-decode placeholder box is already final — reuse it to avoid a decode-time reflow. Full-page
+        // images FIT the page height, but the placeholder was reserved pre-measure against the engine's
+        // screen estimate (~100px too tall → the cover overflowed one page and got clipped away). Re-fit
+        // full-page images at decode time, when [pageHeightProvider] returns the MEASURED viewport (审:
+        // 封面/彩插顶到边缘被裁 / 闪一下消失). Never reuse a full-page image's stale reserved box.
+        val isFullPage = href in fullPageHrefs
+        val reservedBounds = if (isFullPage) {
+            null
+        } else {
+            drawable.bounds.takeUnless { it.isEmpty }?.let { Rect(it) }
+        }
         val future = executor.submit {
             val bitmap = decodeEpubImage(file, href, maxSide = maxSide)
             if (bitmap == null) {
                 handler.post { inFlight.remove(drawable) }
                 return@submit
             }
-            val target = reservedBounds ?: epubFlowImageTargetSize(
-                href = href,
-                intrinsicWidth = bitmap.width,
-                intrinsicHeight = bitmap.height,
-                columnWidthPx = columnWidthPx,
-                pageHeightPx = pageHeightPx,
-                inlineMaxHeightPx = inlineMaxHeightPx,
-                fullPageHrefs = fullPageHrefs,
-            )
             val d = BitmapDrawable(null, bitmap)
-            d.setBounds(0, 0, target.width(), target.height())
             handler.post {
                 inFlight.remove(drawable)
-                if (drawable.isAttached) drawable.result = d
+                if (!drawable.isAttached) return@post
+                // Re-read the page height on the main thread: for a full-page image this is now the real
+                // measured viewport, so the fit lands inside one page instead of the pre-measure estimate.
+                val target = reservedBounds ?: epubFlowImageTargetSize(
+                    href = href,
+                    intrinsicWidth = bitmap.width,
+                    intrinsicHeight = bitmap.height,
+                    columnWidthPx = columnWidthPx,
+                    pageHeightPx = pageHeightProvider().coerceAtLeast(1),
+                    inlineMaxHeightPx = inlineMaxHeightPx,
+                    fullPageHrefs = fullPageHrefs,
+                )
+                d.setBounds(0, 0, target.width(), target.height())
+                drawable.result = d
             }
         }
         inFlight[drawable] = future

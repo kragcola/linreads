@@ -306,6 +306,151 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `full page image re-fits to the real viewport at decode time not the pre-measure estimate`() {
+        // Repro of the "封面/彩插 不显示或闪一下消失" bug: the placeholder is reserved BEFORE the view is
+        // measured, when pageHeightProvider still returns the screen-derived estimate (~100px too tall
+        // because it includes the system-bar area the reader avoids). If decode reuses that stale
+        // reserved box, the full-page image line ends up taller than the real viewport and the page clip
+        // drops it. The decode must re-fit the full-page image to the MEASURED viewport.
+        val epub = java.io.File.createTempFile("readflow-fullpage-refit", ".epub")
+        val image = android.graphics.Bitmap.createBitmap(1120, 1600, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            ZipOutputStream(epub.outputStream()).use { zip ->
+                zip.putNextEntry(ZipEntry("cover.png"))
+                image.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, zip)
+                zip.closeEntry()
+            }
+        } finally {
+            image.recycle()
+        }
+
+        val ctx = RuntimeEnvironment.getApplication()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        // pageHeightProvider changes between placeholder (pre-measure estimate) and decode (real viewport).
+        var measured = false
+        val estimatePageH = 1200
+        val realViewportH = 1000
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { if (measured) realViewportH else estimatePageH },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf("cover.png"),
+                imageBoundsProvider = { href ->
+                    if (href == "cover.png") EpubImageBounds(width = 1120, height = 1600) else null
+                },
+            )
+            val resolver = EpubFlowImageSizeResolver(
+                columnWidthPx = 800,
+                pageHeightProvider = { if (measured) realViewportH else estimatePageH },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf("cover.png"),
+            )
+            val drawable = AsyncDrawable("cover.png", loader, resolver, null)
+            // Placeholder reserved at the pre-measure estimate: 1120x1600 fit to 800x1200 → 840 too wide,
+            // so height-bound: 800 wide, 800*1600/1120 = 1142 tall.
+            AsyncDrawableSpan(
+                io.noties.markwon.core.MarkwonTheme.create(ctx),
+                drawable,
+                AsyncDrawableSpan.ALIGN_CENTER,
+                false,
+            ).getSize(Paint(), "￼", 0, 1, Paint.FontMetricsInt())
+
+            // View is now measured — the real viewport is shorter than the estimate.
+            measured = true
+            drawable.setCallback2(object : Drawable.Callback {
+                override fun invalidateDrawable(who: Drawable) = Unit
+                override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) = Unit
+                override fun unscheduleDrawable(who: Drawable, what: Runnable) = Unit
+            })
+            executor.shutdown()
+            assertTrue("decode should finish in the unit test window", executor.awaitTermination(5, TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue("async decode should replace the placeholder", drawable.result is BitmapDrawable)
+            // The decoded full-page image must fit the REAL viewport (1000), not the estimate (1200):
+            // 1120x1600 fit to 800x1000 → height-bound at 1000, width 1000*1120/1600 = 700.
+            assertTrue(
+                "full-page image height must fit the measured viewport (<=1000), was ${drawable.bounds.height()}",
+                drawable.bounds.height() <= realViewportH,
+            )
+            assertEquals("aspect ratio must be preserved", Rect(0, 0, 700, 1000), drawable.bounds)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `inline avatar keeps its capped size regardless of viewport measurement`() {
+        // Regression guard for the "聊天头像不被误触/误缩放" requirement: a 142x142 chat avatar is an
+        // inline image (below FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX), so the full-page re-fit must NOT touch
+        // it — its box stays intrinsic-capped no matter what the viewport measures.
+        val epub = java.io.File.createTempFile("readflow-avatar", ".epub")
+        val image = android.graphics.Bitmap.createBitmap(142, 142, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            ZipOutputStream(epub.outputStream()).use { zip ->
+                zip.putNextEntry(ZipEntry("avatar.png"))
+                image.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, zip)
+                zip.closeEntry()
+            }
+        } finally {
+            image.recycle()
+        }
+
+        val ctx = RuntimeEnvironment.getApplication()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        var measured = false
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { if (measured) 1000 else 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = emptySet(),
+                imageBoundsProvider = { href ->
+                    if (href == "avatar.png") EpubImageBounds(width = 142, height = 142) else null
+                },
+            )
+            val resolver = EpubFlowImageSizeResolver(
+                columnWidthPx = 800,
+                pageHeightProvider = { if (measured) 1000 else 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = emptySet(),
+            )
+            val drawable = AsyncDrawable("avatar.png", loader, resolver, null)
+            AsyncDrawableSpan(
+                io.noties.markwon.core.MarkwonTheme.create(ctx),
+                drawable,
+                AsyncDrawableSpan.ALIGN_CENTER,
+                false,
+            ).getSize(Paint(), "￼", 0, 1, Paint.FontMetricsInt())
+
+            measured = true
+            drawable.setCallback2(object : Drawable.Callback {
+                override fun invalidateDrawable(who: Drawable) = Unit
+                override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) = Unit
+                override fun unscheduleDrawable(who: Drawable, what: Runnable) = Unit
+            })
+            executor.shutdown()
+            assertTrue("decode should finish in the unit test window", executor.awaitTermination(5, TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(
+                "inline avatar must keep its intrinsic 142x142 box, untouched by full-page re-fit",
+                Rect(0, 0, 142, 142),
+                drawable.bounds,
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `first-line indent applies to body paragraph but not heading`() {
         val flow = epubBuildChapterFlow(0, listOf(heading(0, "标题"), text(1, "正文内容")))
         val sb = build(flow, style().copy(firstLineIndentPx = 72)) { null } as android.text.Spanned

@@ -40,6 +40,29 @@ class EpubReaderItemParserTest {
     }
 
     @Test
+    fun `svg image cover is parsed into an image item via xlink href`() {
+        // EPUB 3 fixed-layout covers commonly wrap the bitmap in <svg><image xlink:href=".."/></svg>
+        // instead of <img> — the flow parser must still surface it as an Image item (else the cover
+        // is dropped to text/unknown and never renders).
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <div style="text-align: center;">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1434 2048">
+                      <image width="1434" height="2048" xlink:href="../Images/cover.jpg"/>
+                    </svg>
+                  </div>
+                </body></html>
+            """.trimIndent(),
+            resourceBaseDir = "OEBPS/Text",
+        )
+
+        val image = assertInstanceOf(EpubReaderItem.Image::class.java, items.single())
+        assertEquals("OEBPS/Images/cover.jpg", image.href)
+    }
+
+    @Test
     fun `text links keep ranges and distinguish internal from external hrefs`() {
         val items = parseReaderItemsFromHtml(
             spineIndex = 0,
