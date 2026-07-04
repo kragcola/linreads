@@ -314,7 +314,7 @@ class ReaderViewModel(
             ?.takeIf { it in engine.supportedModes }
         return ReaderOpenSettings(
             fontSize = restoredForBook?.fontSize?.toFloat() ?: settings.fontSize.first().toFloat(),
-            lineSpacing = clampedReaderLineSpacing(settings.lineSpacing.first()),
+            lineSpacing = clampedReaderLineSpacing(restoredForBook?.lineSpacing ?: settings.lineSpacing.first()),
             theme = restoredForBook?.theme ?: settings.themeMode.first(),
             useSourceHanFont = settings.useSourceHanFont.first(),
             fontId = settings.fontChoice.first().serialize(),
@@ -460,7 +460,12 @@ class ReaderViewModel(
         }
         settingsLineSpacingJob?.cancel()
         settingsLineSpacingJob = viewModelScope.launch {
+            var firstEmission = true
             settings.lineSpacing.collect { spacing ->
+                if (firstEmission) {
+                    firstEmission = false
+                    return@collect
+                }
                 val clamped = clampedReaderLineSpacing(spacing)
                 engine.setLineSpacing(clamped)
                 _uiState.update { it.copy(lineSpacing = clamped) }
@@ -821,6 +826,7 @@ class ReaderViewModel(
             loadingState = loadingState,
             currentLocator = currentLocator,
             fontSize = state.fontSizeSp.toInt(),
+            lineSpacing = state.lineSpacing,
             readingMode = state.readingMode.toReaderReadingMode(),
             theme = state.themeMode,
             isUiVisible = state.isUiVisible,
@@ -914,6 +920,7 @@ private fun ReaderState?.toReaderUiState(): ReaderUiState {
         },
         bookTitle = restored.bookMeta?.title.orEmpty(),
         fontSizeSp = restored.fontSize.toFloat(),
+        lineSpacing = clampedReaderLineSpacing(restored.lineSpacing),
         readingMode = restored.readingMode.toReadingMode(),
         themeMode = restored.theme,
         isUiVisible = restored.isUiVisible,

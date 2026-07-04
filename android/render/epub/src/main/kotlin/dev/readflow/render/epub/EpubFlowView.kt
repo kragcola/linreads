@@ -7,6 +7,9 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.ColorFilter
+import android.graphics.Paint
+import android.graphics.PixelFormat
 import android.graphics.drawable.Drawable
 import android.text.Layout
 import android.view.GestureDetector
@@ -70,6 +73,7 @@ internal class EpubFlowView(
 
     fun setModeAnchored(value: Mode, layoutOffset: Int) {
         val hidePagedConversion = modeValue == Mode.SCROLL && value == Mode.PAGED && flow != null
+        val conversionSnapshot = if (hidePagedConversion) snapshotViewport() else null
         if (hidePagedConversion) {
             removeCallbacks(initialRevealRunnable)
             container.animate().cancel()
@@ -81,6 +85,7 @@ internal class EpubFlowView(
         applyMode(value, reposition = false)
         goToOffset(layoutOffset, pagedAnchor = PagedAnchor.NEAREST, forceReport = true)
         if (hidePagedConversion) {
+            showConversionSnapshot(conversionSnapshot)
             if (textView.layout != null) pendingRestoreOffset = topLayoutOffset()
             scheduleInitialReveal()
         }
@@ -171,6 +176,8 @@ internal class EpubFlowView(
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
+    private var conversionSnapshotDrawable: ViewportSnapshotDrawable? = null
+    private var conversionSnapshotAnimator: ValueAnimator? = null
     private val flipDurationMs = 280L
     /** Discrete GL curl sweep — a touch longer than the slide so the realistic curl reads fully. */
     private val glCurlDurationMs = 420L
@@ -374,6 +381,7 @@ internal class EpubFlowView(
             container.animate().cancel()
             awaitingReveal = true
             container.alpha = 0f
+            resetConversionSnapshotFade()
         }
         val anchorOffset = if (awaitingReveal) {
             pendingRestoreOffset ?: if (paged.isNotEmpty()) topLayoutOffset() else -1
@@ -383,7 +391,10 @@ internal class EpubFlowView(
         recycleCachedTextures()
         repaginate(reposition = false)
         if (anchorOffset >= 0) goToOffset(anchorOffset, forceReport = true)
-        if (awaitingReveal) scheduleInitialReveal()
+        if (awaitingReveal) {
+            positionConversionSnapshot()
+            scheduleInitialReveal()
+        }
     }
 
     /**
@@ -542,6 +553,7 @@ internal class EpubFlowView(
     ) {
         flipAnimator?.cancel()
         clearFlipOverlay()
+        clearConversionSnapshot()
         cancelPendingGlDiscreteSettle()
         removeCallbacks(reflowRunnable)
         savedDownEvent?.recycle()
@@ -600,10 +612,12 @@ internal class EpubFlowView(
         if (!awaitingReveal) return
         removeCallbacks(initialRevealRunnable)
         awaitingReveal = false
+        fadeOutConversionSnapshot()
         container.animate()
             .alpha(1f)
             .setDuration(REVEAL_FADE_MS)
             .withEndAction {
+                clearConversionSnapshot()
                 if (!consumePendingInitialPageTurn()) {
                     preCachePageTextures()
                 }
@@ -620,6 +634,7 @@ internal class EpubFlowView(
         container.animate().cancel()
         awaitingReveal = false
         container.alpha = 1f
+        clearConversionSnapshot()
     }
 
     /**
@@ -1141,6 +1156,48 @@ internal class EpubFlowView(
         container.translationX = 0f
     }
 
+    private fun showConversionSnapshot(bitmap: Bitmap?) {
+        clearConversionSnapshot()
+        bitmap ?: return
+        val drawable = ViewportSnapshotDrawable(bitmap)
+        conversionSnapshotDrawable = drawable
+        positionConversionSnapshot()
+        overlay.add(drawable)
+    }
+
+    private fun positionConversionSnapshot() {
+        conversionSnapshotDrawable?.setBounds(0, scrollY, width, scrollY + height)
+    }
+
+    private fun fadeOutConversionSnapshot() {
+        val drawable = conversionSnapshotDrawable ?: return
+        conversionSnapshotAnimator?.cancel()
+        conversionSnapshotAnimator = ValueAnimator.ofInt(255, 0).apply {
+            duration = REVEAL_FADE_MS
+            addUpdateListener { animator ->
+                drawable.alphaValue = animator.animatedValue as Int
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    private fun resetConversionSnapshotFade() {
+        conversionSnapshotAnimator?.cancel()
+        conversionSnapshotAnimator = null
+        conversionSnapshotDrawable?.alphaValue = 255
+    }
+
+    private fun clearConversionSnapshot() {
+        conversionSnapshotAnimator?.cancel()
+        conversionSnapshotAnimator = null
+        conversionSnapshotDrawable?.let {
+            overlay.remove(it)
+            it.recycle()
+        }
+        conversionSnapshotDrawable = null
+    }
+
     // ---- Finger-tracking interactive slide -----------------------------------------------------
 
     /**
@@ -1575,6 +1632,37 @@ internal class EpubFlowView(
         const val INITIAL_REVEAL_SETTLE_MS = REFLOW_DEBOUNCE_MS
         const val GL_DISCRETE_SETTLE_GRACE_MS = 480L
     }
+}
+
+private class ViewportSnapshotDrawable(
+    private val bitmap: Bitmap,
+) : Drawable() {
+    private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+    var alphaValue: Int = 255
+        set(value) {
+            field = value.coerceIn(0, 255)
+            invalidateSelf()
+        }
+
+    override fun draw(canvas: Canvas) {
+        paint.alpha = alphaValue
+        canvas.drawBitmap(bitmap, null, bounds, paint)
+    }
+
+    fun recycle() {
+        if (!bitmap.isRecycled) bitmap.recycle()
+    }
+
+    override fun setAlpha(alpha: Int) {
+        alphaValue = alpha
+    }
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        paint.colorFilter = colorFilter
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
 }
 
 internal enum class EpubFlowTapZone { PREV, NEXT, MENU }

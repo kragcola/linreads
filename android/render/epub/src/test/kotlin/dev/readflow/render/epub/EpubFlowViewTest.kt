@@ -1106,6 +1106,40 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `scroll to paged conversion keeps frozen viewport cover until reveal finishes`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val nearNextPageLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (midpoint + 1) until pageTwoTop }
+
+        view.mode = EpubFlowView.Mode.SCROLL
+
+        view.setModeAnchored(EpubFlowView.Mode.PAGED, layout.getLineStart(layout.getLineForVertical(nearNextPageLineTop)))
+
+        val cover = view.privateField("conversionSnapshotDrawable")
+        assertNotNull(
+            "SCROLL->PAGED should freeze the current viewport over the hidden live content so the user never sees the conversion",
+            cover,
+        )
+        val bitmap = cover!!.privateBitmap("bitmap")
+        assertEquals(view.width, bitmap.width)
+        assertEquals(view.height, bitmap.height)
+        assertEquals(0f, view.getChildAt(0).alpha)
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        assertEquals("the conversion cover should be removed after the stable paged frame is revealed", null, view.privateField("conversionSnapshotDrawable"))
+        assertTrue("the temporary conversion cover bitmap must be recycled", bitmap.isRecycled)
+        assertEquals(1f, view.getChildAt(0).alpha)
+        assertEquals(pageTwoTop, view.scrollY)
+    }
+
+    @Test
     fun `scroll to paged reflow during hidden conversion keeps the conversion anchor`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -1163,6 +1197,48 @@ class EpubFlowViewTest {
         )
         assertEquals(true, view.privateBool("awaitingReveal"))
         assertEquals(pageTwoTop, view.scrollY)
+    }
+
+    @Test
+    fun `scroll to paged reflow during frozen reveal keeps cover until reparked reveal`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val nearNextPageLineTop = (0 until layout.lineCount)
+            .map { layout.getLineTop(it) }
+            .first { it in (midpoint + 1) until pageTwoTop }
+        val conversionOffset = layout.getLineStart(layout.getLineForVertical(nearNextPageLineTop))
+
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.setModeAnchored(EpubFlowView.Mode.PAGED, conversionOffset)
+        val cover = view.privateField("conversionSnapshotDrawable")
+        assertNotNull("test requires a frozen conversion cover", cover)
+        (view.privateField("initialRevealRunnable") as Runnable).run()
+        assertEquals(false, view.privateBool("awaitingReveal"))
+
+        view.setPrivateField("paginatedLayoutHeight", layout.height - 1)
+        view.runReflowRunnable()
+
+        assertEquals(
+            "late reflow during a frozen reveal must keep the static cover over the conversion",
+            cover,
+            view.privateField("conversionSnapshotDrawable"),
+        )
+        assertEquals(
+            "the cover fade should restart from fully opaque after re-hiding the conversion",
+            255,
+            cover!!.privateInt("alphaValue"),
+        )
+        assertEquals(true, view.privateBool("awaitingReveal"))
+        assertEquals(0f, view.getChildAt(0).alpha)
+        assertEquals(pageTwoTop, view.scrollY)
+
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        assertEquals(null, view.privateField("conversionSnapshotDrawable"))
     }
 
     @Test
@@ -1592,6 +1668,11 @@ class EpubFlowViewTest {
         javaClass.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this) as Bitmap
+
+    private fun Any.privateInt(name: String): Int =
+        javaClass.getDeclaredField(name)
+            .apply { isAccessible = true }
+            .get(this) as Int
 
     private class ThrowWhenBoundsTopDrawable(
         private val failingTop: Int,

@@ -63,6 +63,11 @@ import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.float
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -99,6 +104,7 @@ class ReaderSavedStateHandleTest {
         advanceUntilIdle()
         viewModel.onIntent(ReaderIntent.GoTo(moved))
         viewModel.onIntent(ReaderIntent.SetFontSize(22f))
+        viewModel.onIntent(ReaderIntent.SetLineSpacing(2.0f))
         viewModel.onIntent(ReaderIntent.SetTheme(ThemeMode.DARK))
         viewModel.onIntent(ReaderIntent.ToggleChrome)
         advanceUntilIdle()
@@ -112,6 +118,8 @@ class ReaderSavedStateHandleTest {
         assertEquals(ThemeMode.DARK, saved.theme)
         assertEquals(true, saved.isUiVisible)
         assertEquals(LoadingState.Loaded, saved.loadingState)
+        val savedJson = Json.parseToJsonElement(json).jsonObject
+        assertEquals(2.0f, savedJson.getValue("lineSpacing").jsonPrimitive.float, 0.001f)
     }
 
     @Test
@@ -251,6 +259,58 @@ class ReaderSavedStateHandleTest {
         assertEquals(24f, viewModel.uiState.value.fontSizeSp)
         assertEquals(ThemeMode.SEPIA, viewModel.uiState.value.themeMode)
         assertEquals(true, viewModel.uiState.value.isUiVisible)
+    }
+
+    @Test
+    fun `restores saved line spacing before opening restored book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val restoredLocator = Locator(LocatorStrategy.Page(index = 4, total = 10), totalProgression = 0.4f)
+        val handle = SavedStateHandle(
+            mapOf(
+                READER_STATE_SAVED_STATE_KEY to readerStateJsonWithLineSpacing(
+                    ReaderState(
+                        bookId = "book-1",
+                        currentLocator = restoredLocator,
+                        fontSize = 24,
+                        readingMode = ReaderReadingMode.PAGED,
+                        theme = ThemeMode.SEPIA,
+                    ),
+                    lineSpacing = 2.0f,
+                ),
+            ),
+        )
+        val settings = FakeSettingsRepository().apply {
+            lineSpacing.value = 1.1f
+            fontSize.value = 16
+            readingMode.value = ReaderReadingMode.SCROLL
+            themeMode.value = ThemeMode.LIGHT
+        }
+        val events = mutableListOf<String>()
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = events,
+        )
+        val viewModel = readerViewModel(
+            handle = handle,
+            engine = engine,
+            settings = settings,
+        )
+
+        assertEquals(2.0f, viewModel.uiState.value.lineSpacing, 0.001f)
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        val openIndex = events.indexOf("open:0.4")
+        assertTrue(
+            "saved line spacing must be applied before openBook, events=$events",
+            events.indexOf("setLineSpacing:2.0") in 0 until openIndex,
+        )
+        assertEquals(2.0f, viewModel.uiState.value.lineSpacing, 0.001f)
+        assertTrue(
+            "initial global settings replay must not override the restored book geometry, events=$events",
+            events.indexOf("setLineSpacing:1.1") !in 0..events.lastIndex,
+        )
     }
 
     @Test
@@ -979,6 +1039,17 @@ class ReaderSavedStateHandleTest {
         assertEquals(target, Json.decodeFromString<Locator>(saved!!.locatorJson))
         assertEquals(target.totalProgression ?: 0f, saved.totalProgression)
         assertEquals("device-id", saved.deviceId)
+    }
+
+    private fun readerStateJsonWithLineSpacing(
+        state: ReaderState,
+        lineSpacing: Float,
+    ): String {
+        val base = Json.parseToJsonElement(Json.encodeToString(state)).jsonObject
+        return buildJsonObject {
+            base.forEach { (key, value) -> put(key, value) }
+            put("lineSpacing", lineSpacing)
+        }.toString()
     }
 
     private fun readerViewModel(

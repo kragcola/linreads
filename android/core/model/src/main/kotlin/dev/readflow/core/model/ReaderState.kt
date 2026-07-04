@@ -35,6 +35,7 @@ data class ReaderState(
     val totalPages: Int = 0,
     val currentPageIndex: Int = 0,
     val fontSize: Int = 18,
+    val lineSpacing: Float = ReaderTypographyRange.DEFAULT_LINE_SPACING,
     val readingMode: ReaderReadingMode = ReaderReadingMode.SCROLL,
     val theme: ThemeMode = ThemeMode.SYSTEM,
     val zoomLevel: Float = 1.0f,
