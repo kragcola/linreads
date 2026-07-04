@@ -12,6 +12,7 @@ import android.os.SystemClock
 import android.graphics.PointF
 import android.text.Spanned
 import android.text.style.ClickableSpan
+import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
@@ -434,35 +435,27 @@ class EpubFlowAnchorRuntimeSmokeTest {
             dismissBlockingDialogs()
             val shelfItem = waitForObject(By.desc("打开 $title"))
             val bounds = shelfItem.visibleBounds
-            device.click(bounds.centerX(), bounds.centerY())
+            injectScreenTap(bounds.centerX(), bounds.centerY())
 
-            val firstFrame = waitForFirstFlowFrame(shelf)
+            val trace = traceFlowFramesUntilRestored(
+                scenario = shelf,
+                expectedPage = 3,
+                expectedScrollY = expectedPageTop,
+                message = "expected shelf OpenById to restore EPUB page-3 anchor",
+            )
+            val exposedLowFrame = trace.frames.firstOrNull { frame ->
+                frame.contentAlpha >= 1f &&
+                    frame.currentPage == 0 &&
+                    frame.scrollY < expectedPageTop / 2
+            }
             assertTrue(
-                "shelf OpenById must not expose a visible book-start frame before restore: $firstFrame",
-                firstFrame.contentAlpha < 1f || firstFrame.scrollY != 0 || firstFrame.currentPage != 0,
+                "shelf OpenById must not expose any fully-visible low-scroll frame while restoring; " +
+                    "bad=$exposedLowFrame trace=${trace.frames}",
+                exposedLowFrame == null,
             )
 
-            val restored = waitForConditionResult("expected shelf OpenById to restore EPUB page-3 anchor") {
-                shelf.withActivity { activity ->
-                    val view = activity.findEpubFlowView() ?: return@withActivity null
-                    val currentPage = view.reflectInt("currentPageIndex")
-                    val scrollY = view.scrollY
-                    val alpha = view.flowContentAlpha()
-                    if (currentPage == 3 && scrollY == expectedPageTop && alpha >= 1f) {
-                        FlowReopenFrame(
-                            currentPage = currentPage,
-                            scrollY = scrollY,
-                            contentAlpha = alpha,
-                            pageCount = view.reflectInt("pageCount"),
-                        )
-                    } else {
-                        null
-                    }
-                }
-            }
-
-            assertEquals("shelf OpenById should restore page 3", 3, restored.currentPage)
-            assertEquals("shelf OpenById should restore the canonical page-3 top", expectedPageTop, restored.scrollY)
+            assertEquals("shelf OpenById should restore page 3", 3, trace.restored.currentPage)
+            assertEquals("shelf OpenById should restore the canonical page-3 top", expectedPageTop, trace.restored.scrollY)
             assertEquals("shelf OpenById should reuse one stable EPUB book row", 1, booksByTitle(title).size)
         }
     }
@@ -1684,6 +1677,35 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
+    private fun traceFlowFramesUntilRestored(
+        scenario: ActivityScenario<MainActivity>,
+        expectedPage: Int,
+        expectedScrollY: Int,
+        message: String,
+    ): FlowReopenTrace {
+        val frames = mutableListOf<FlowReopenFrame>()
+        val deadline = System.currentTimeMillis() + UI_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            val frame = scenario.withActivity { activity ->
+                val view = activity.findEpubFlowView() ?: return@withActivity null
+                FlowReopenFrame(
+                    currentPage = runCatching { view.reflectInt("currentPageIndex") }.getOrDefault(0),
+                    scrollY = view.scrollY,
+                    contentAlpha = view.flowContentAlpha(),
+                    pageCount = runCatching { view.reflectInt("pageCount") }.getOrDefault(0),
+                )
+            }
+            if (frame != null) {
+                frames += frame
+                if (frame.currentPage == expectedPage && frame.scrollY == expectedScrollY && frame.contentAlpha >= 1f) {
+                    return FlowReopenTrace(frames = frames, restored = frame)
+                }
+            }
+            Thread.sleep(FRAME_POLL_MS)
+        }
+        error("$message; trace=$frames")
+    }
+
     private fun MainActivity.findEpubFlowView(): View? =
         window.decorView.findDescendant { it.javaClass.name == EPUB_FLOW_VIEW_CLASS_NAME }
 
@@ -1915,6 +1937,30 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
+    private fun injectScreenTap(x: Int, y: Int) {
+        val downTime = SystemClock.uptimeMillis()
+        val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat(), 0).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        val up = MotionEvent.obtain(
+            downTime,
+            downTime + EVENT_STEP_MS,
+            MotionEvent.ACTION_UP,
+            x.toFloat(),
+            y.toFloat(),
+            0,
+        ).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
+        try {
+            instrumentation.uiAutomation.injectInputEvent(down, true)
+            instrumentation.uiAutomation.injectInputEvent(up, true)
+        } finally {
+            down.recycle()
+            up.recycle()
+        }
+    }
+
     private fun View.drawRuntimeBitmap(): Bitmap =
         Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
             draw(Canvas(bitmap))
@@ -2009,6 +2055,11 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val scrollY: Int,
         val contentAlpha: Float,
         val pageCount: Int,
+    )
+
+    private data class FlowReopenTrace(
+        val frames: List<FlowReopenFrame>,
+        val restored: FlowReopenFrame,
     )
 
     private data class FlowConversionBefore(
