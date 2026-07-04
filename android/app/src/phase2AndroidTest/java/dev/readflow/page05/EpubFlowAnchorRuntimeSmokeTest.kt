@@ -779,6 +779,131 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     @Test
+    fun epubFlowUiModeChipScrollToPagedKeepsFrozenViewportCoverRuntime(): Unit = runBlocking {
+        settings.setReadingMode(ReaderReadingMode.SCROLL)
+        val title = "flow-ui-conversion-${UUID.randomUUID().toString().take(8)}"
+        val uri = createComplexEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            val activity = scenario.withActivity { it }
+            val readerSurface = waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected complex scroll-mode flow view before UI mode switch") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val textView = view.reflectTextView()
+                    val layout = textView.layout ?: return@withActivity null
+                    val text = textView.text?.toString().orEmpty()
+                    if (view.width <= 0 || view.height <= 0 || layout.height <= view.height * 4) {
+                        return@withActivity null
+                    }
+                    if (!text.contains("COMPLEX-FLOW-050")) {
+                        return@withActivity null
+                    }
+                    if (view.reflectPrivateAny("modeValue")?.toString() != "SCROLL") {
+                        return@withActivity null
+                    }
+                    view
+                }
+            }
+
+            scenario.withActivity {
+                val layoutHeight = checkNotNull(view.reflectTextView().layout).height
+                val targetScrollY = (layoutHeight * 45 / 100)
+                    .coerceAtLeast(1)
+                    .coerceAtMost(layoutHeight - view.height)
+                view.scrollTo(0, targetScrollY)
+            }
+
+            val surfaceBounds = readerSurface.visibleBounds
+            injectScreenTap(surfaceBounds.centerX(), surfaceBounds.centerY())
+            val fontButton = waitForObject(By.text("排版"))
+            val fontBounds = fontButton.visibleBounds
+            injectScreenTap(fontBounds.centerX(), fontBounds.centerY())
+            waitForObject(By.text("滚动"))
+            val pagedChip = waitForObject(By.text("分页"))
+
+            val before = scenario.withActivity {
+                FlowConversionBefore(
+                    scrollY = view.scrollY,
+                    layoutOffset = view.reflectInt("topLayoutOffset"),
+                    contentAlpha = view.flowContentAlpha(),
+                    frame = view.drawRuntimeBitmap(),
+                )
+            }
+            assertTrue("UI mode switch setup should start below the book beginning", before.scrollY > 0)
+            assertEquals("UI mode switch should start from visible scroll content", 1f, before.contentAlpha)
+
+            try {
+                val pagedBounds = pagedChip.visibleBounds
+                injectScreenTap(pagedBounds.centerX(), pagedBounds.centerY())
+                val during = waitForConversionCoverFrame(
+                    activity = activity,
+                    message = "expected UI 分页 chip to route through the frozen SCROLL->PAGED cover",
+                )
+                try {
+                    assertEquals(
+                        "UI SCROLL->PAGED conversion cover must stay fully opaque",
+                        255,
+                        during.coverAlpha,
+                    )
+                    assertEquals("UI conversion cover width should match the visible viewport", before.frame.width, during.coverBitmap.width)
+                    assertEquals("UI conversion cover height should match the visible viewport", before.frame.height, during.coverBitmap.height)
+                    assertTrue(
+                        "UI SCROLL->PAGED should park on a paged canonical page behind the cover",
+                        during.currentPage > 0 || during.scrollY > 0,
+                    )
+                    assertSampledPixelsEqual(
+                        "UI SCROLL->PAGED cover must be the exact pre-chip viewport page shot",
+                        before.frame,
+                        during.coverBitmap,
+                    )
+                    val coveredFrame = checkNotNull(during.drawnFrame) {
+                        "UI conversion helper should capture the covered frame atomically with the cover"
+                    }
+                    try {
+                        assertSampledPixelsEqual(
+                            "UI SCROLL->PAGED conversion should visually show only the frozen viewport cover",
+                            during.coverBitmap,
+                            coveredFrame,
+                        )
+                    } finally {
+                        coveredFrame.recycle()
+                    }
+                } finally {
+                    during.coverBitmap.recycle()
+                }
+
+                waitForConditionResult("expected UI conversion cover to clear after stable paged reveal") {
+                    scenario.withActivity {
+                        val coverGone = view.reflectPrivateAny("conversionSnapshotDrawable") == null
+                        val alpha = view.flowContentAlpha()
+                        val mode = view.reflectPrivateAny("modeValue")?.toString()
+                        if (coverGone && mode == "PAGED" && alpha >= 1f) {
+                            FlowConversionAfter(
+                                currentPage = view.reflectInt("currentPageIndex"),
+                                scrollY = view.scrollY,
+                                contentAlpha = alpha,
+                            )
+                        } else {
+                            null
+                        }
+                    }
+                }.also { after ->
+                    assertTrue(
+                        "UI converted paged view should remain parked after the frozen cover clears",
+                        after.currentPage > 0 || after.scrollY > 0,
+                    )
+                    assertEquals("UI converted live content should finish fully visible", 1f, after.contentAlpha)
+                }
+            } finally {
+                before.frame.recycle()
+            }
+        }
+    }
+
+    @Test
     fun epubFlowFirstRightTapStartsSlideAnimationRuntime() = runBlocking {
         settings.setPageFlipStyle(PageFlipStyle.SLIDE)
         val title = "flow-first-slide-${UUID.randomUUID().toString().take(8)}"
@@ -1706,6 +1831,56 @@ class EpubFlowAnchorRuntimeSmokeTest {
         error("$message; trace=$frames")
     }
 
+    private fun waitForConversionCoverFrame(activity: MainActivity, message: String): FlowConversionDuring {
+        val deadline = System.currentTimeMillis() + UI_TIMEOUT_MS
+        var firstPagedWithoutCover: FlowConversionAfter? = null
+        while (System.currentTimeMillis() < deadline) {
+            val frame = activity.runOnMainForTest {
+                val view = activity.findEpubFlowView()
+                if (view == null) {
+                    null
+                } else {
+                    val cover = view.reflectPrivateAny("conversionSnapshotDrawable")
+                    if (cover != null) {
+                        val bitmap = cover.reflectPrivateBitmap("bitmap")
+                        check(!bitmap.isRecycled) { "conversion cover bitmap should be alive during UI conversion" }
+                        FlowConversionDuring(
+                            currentPage = view.reflectInt("currentPageIndex"),
+                            scrollY = view.scrollY,
+                            contentAlpha = view.flowContentAlpha(),
+                            coverAlpha = cover.reflectPrivateInt("alphaValue"),
+                            coverBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false),
+                            drawnFrame = view.drawRuntimeBitmap(),
+                        )
+                    } else {
+                        val mode = view.reflectPrivateAny("modeValue")?.toString()
+                        val alpha = view.flowContentAlpha()
+                        if (mode == "PAGED" && alpha >= 1f && firstPagedWithoutCover == null) {
+                            firstPagedWithoutCover = FlowConversionAfter(
+                                currentPage = view.reflectInt("currentPageIndex"),
+                                scrollY = view.scrollY,
+                                contentAlpha = alpha,
+                            )
+                        }
+                        null
+                    }
+                }
+            }
+            if (frame != null) return frame
+            Thread.sleep(FRAME_POLL_MS)
+        }
+        error("$message; firstPagedWithoutCover=$firstPagedWithoutCover")
+    }
+
+    private fun <T> MainActivity.runOnMainForTest(block: () -> T): T {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        var result: Result<T>? = null
+        instrumentation.runOnMainSync {
+            result = runCatching(block)
+        }
+        return checkNotNull(result) { "main-thread callback did not return a result" }.getOrThrow()
+    }
+
     private fun MainActivity.findEpubFlowView(): View? =
         window.decorView.findDescendant { it.javaClass.name == EPUB_FLOW_VIEW_CLASS_NAME }
 
@@ -2075,6 +2250,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val contentAlpha: Float,
         val coverAlpha: Int,
         val coverBitmap: Bitmap,
+        val drawnFrame: Bitmap? = null,
     )
 
     private data class FlowConversionAfter(
