@@ -3,6 +3,8 @@ package dev.readflow.page05
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.net.Uri
 import android.os.Looper
 import android.os.SystemClock
@@ -299,6 +301,188 @@ class EpubFlowAnchorRuntimeSmokeTest {
             }
             assertEquals("right tap should turn exactly one page", 1, result.currentPage)
             assertEquals("right tap should land on the next canonical top", target.nextPageTop, result.scrollY)
+        }
+    }
+
+    @Test
+    fun epubFlowFirstRightTapStartsSlideAnimationRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-first-slide-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val target = waitForConditionResult("expected flow view to paginate for first slide tap") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
+                    val nextPageTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null
+                    FlowCleanTapTarget(view = view, nextPageTop = nextPageTop)
+                }
+            }
+
+            val result = scenario.withActivity {
+                target.view.scrollTo(0, 0)
+                val point = PointF(target.view.width * 0.85f, target.view.height * 0.50f)
+                val downTime = SystemClock.uptimeMillis()
+                target.view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, point))
+                target.view.dispatchTouchEvent(
+                    motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_UP, point),
+                )
+                FlowFirstSlideTapResult(
+                    currentPage = target.view.reflectInt("currentPageIndex"),
+                    scrollY = target.view.scrollY,
+                    slideDrawablePresent = target.view.reflectPrivateAny("slideDrawable") != null,
+                    flipAnimatorPresent = target.view.reflectPrivateAny("flipAnimator") != null,
+                )
+            }
+
+            assertEquals("first slide tap should advance one page", 1, result.currentPage)
+            assertEquals("first slide tap should park the live content on the next page", target.nextPageTop, result.scrollY)
+            assertTrue(
+                "first slide tap must start the normal slide animation instead of cutting instantly",
+                result.slideDrawablePresent && result.flipAnimatorPresent,
+            )
+        }
+    }
+
+    @Test
+    fun epubFlowReaderSurfaceFirstRightTapStartsSlideAnimationRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-first-surface-slide-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val target = waitForConditionResult("expected reader surface and flow view for first slide tap") {
+                scenario.withActivity { activity ->
+                    val surface = activity.findReaderSurface()
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || surface.width <= 0 || surface.height <= 0 || view.width <= 0 || view.height <= 0) {
+                        return@withActivity null
+                    }
+                    val nextPageTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null
+                    FlowSurfaceTapTarget(surface = surface, view = view, nextPageTop = nextPageTop)
+                }
+            }
+
+            val result = scenario.withActivity {
+                target.view.scrollTo(0, 0)
+                val point = PointF(target.surface.width * 0.85f, target.surface.height * 0.50f)
+                val downTime = SystemClock.uptimeMillis()
+                target.surface.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, point))
+                target.surface.dispatchTouchEvent(
+                    motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_UP, point),
+                )
+                FlowFirstSlideTapResult(
+                    currentPage = target.view.reflectInt("currentPageIndex"),
+                    scrollY = target.view.scrollY,
+                    slideDrawablePresent = target.view.reflectPrivateAny("slideDrawable") != null,
+                    flipAnimatorPresent = target.view.reflectPrivateAny("flipAnimator") != null,
+                )
+            }
+
+            assertEquals("first reader-surface tap should advance one page", 1, result.currentPage)
+            assertEquals("first reader-surface tap should park the live content on the next page", target.nextPageTop, result.scrollY)
+            assertTrue(
+                "first reader-surface tap must start the normal slide animation instead of cutting instantly",
+                result.slideDrawablePresent && result.flipAnimatorPresent,
+            )
+        }
+    }
+
+    @Test
+    fun epubFlowFirstRightTapWithGuideVisibleTurnsPageRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        settings.setReaderGuideShown(false)
+        val title = "flow-guide-first-tap-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读手势引导"))
+
+            val target = waitForConditionResult("expected flow view to paginate below guide") {
+                scenario.withActivity { activity ->
+                    val surface = activity.findReaderSurface()
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || surface.width <= 0 || surface.height <= 0 || view.width <= 0 || view.height <= 0) {
+                        return@withActivity null
+                    }
+                    val nextPageTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null
+                    FlowSurfaceTapTarget(surface = surface, view = view, nextPageTop = nextPageTop)
+                }
+            }
+
+            scenario.withActivity { target.view.scrollTo(0, 0) }
+            val location = IntArray(2)
+            scenario.withActivity { target.surface.getLocationOnScreen(location) }
+            device.click(
+                location[0] + (target.surface.width * 0.85f).toInt(),
+                location[1] + target.surface.height / 2,
+            )
+
+            waitForFlowPage(
+                scenario = scenario,
+                view = target.view,
+                pageIndex = 1,
+                scrollY = target.nextPageTop,
+                message = "first right tap should turn the page even while the guide is visible",
+            )
+            assertTrue(
+                "the guide should be dismissed by the first real reading action",
+                device.wait(Until.gone(By.descStartsWith("阅读手势引导")), UI_TIMEOUT_MS),
+            )
+        }
+    }
+
+    @Test
+    fun epubFlowActionDownKeepsPaperTextureRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-down-paper-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected flow view to paginate for down paper test") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
+                    view
+                }
+            }
+
+            val frames = scenario.withActivity {
+                view.scrollTo(0, 0)
+                val staticFrame = view.drawRuntimeBitmap()
+                val point = PointF(view.width * 0.85f, view.height * 0.50f)
+                val downTime = SystemClock.uptimeMillis()
+                view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, point))
+                val pressedFrame = view.drawRuntimeBitmap()
+                view.dispatchTouchEvent(motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_CANCEL, point))
+                staticFrame to pressedFrame
+            }
+
+            try {
+                assertSampledPixelsEqual(
+                    "ACTION_DOWN must not tint or shift the EPUB paper texture",
+                    frames.first,
+                    frames.second,
+                )
+            } finally {
+                frames.first.recycle()
+                frames.second.recycle()
+            }
         }
     }
 
@@ -895,6 +1079,9 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private fun View.reflectPrivateBoolean(name: String): Boolean =
         javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this) as Boolean
 
+    private fun View.reflectPrivateAny(name: String): Any? =
+        javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this)
+
     private fun View.reflectTextView(): TextView =
         javaClass.getDeclaredField("textView").apply { isAccessible = true }.get(this) as TextView
 
@@ -1018,6 +1205,27 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
+    private fun View.drawRuntimeBitmap(): Bitmap =
+        Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
+            draw(Canvas(bitmap))
+        }
+
+    private fun assertSampledPixelsEqual(message: String, expected: Bitmap, actual: Bitmap) {
+        assertEquals("$message: width", expected.width, actual.width)
+        assertEquals("$message: height", expected.height, actual.height)
+        val stepX = (expected.width / 6).coerceAtLeast(1)
+        val stepY = (expected.height / 6).coerceAtLeast(1)
+        var y = 0
+        while (y < expected.height) {
+            var x = 0
+            while (x < expected.width) {
+                assertEquals("$message at ($x,$y)", expected.getPixel(x, y), actual.getPixel(x, y))
+                x += stepX
+            }
+            y += stepY
+        }
+    }
+
     private fun motionEvent(
         downTime: Long,
         eventTime: Long,
@@ -1079,6 +1287,19 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private data class FlowCleanTapResult(
         val currentPage: Int,
         val scrollY: Int,
+    )
+
+    private data class FlowSurfaceTapTarget(
+        val surface: View,
+        val view: View,
+        val nextPageTop: Int,
+    )
+
+    private data class FlowFirstSlideTapResult(
+        val currentPage: Int,
+        val scrollY: Int,
+        val slideDrawablePresent: Boolean,
+        val flipAnimatorPresent: Boolean,
     )
 
     private data class FlowCenterTapTarget(

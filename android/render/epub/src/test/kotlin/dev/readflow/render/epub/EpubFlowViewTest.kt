@@ -327,6 +327,34 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `first slide frame preserves real paper texture across the viewport`() {
+        val context = RuntimeEnvironment.getApplication() as Application
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.background = readerPaperBackground(
+            context = context,
+            paperColor = 0xFFEDE6D6.toInt(),
+            inkColor = 0xFF2A2620.toInt(),
+            isNight = false,
+        )
+        view.textView.setTextColor(0x00000000)
+        view.goToPage(1)
+        val staticFrame = view.drawAsScrolledChildToBitmapForTest()
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        val fingerDownFrame = view.drawAsScrolledChildToBitmapForTest()
+
+        assertSampledPixelsEqual(
+            "the first turn layer must reuse the exact same paper texture as the static page",
+            staticFrame,
+            fingerDownFrame,
+        )
+
+        staticFrame.recycle()
+        fingerDownFrame.recycle()
+    }
+
+    @Test
     fun `action down alone preserves real paper texture`() {
         val context = RuntimeEnvironment.getApplication() as Application
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
@@ -409,6 +437,35 @@ class EpubFlowViewTest {
             "static reader draw must paint paper in the same viewport coordinates as page-turn snapshots, recorded=${background.boundsTops}",
             background.boundsTops.isNotEmpty() && background.boundsTops.all { it == 0 },
         )
+    }
+
+    @Test
+    fun `live paged draw paints paper in the viewport instead of exposing host background`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val scrolledPage = (1 until view.pageCount()).firstOrNull { index ->
+            (view.pageTopPxAt(index) ?: 0) > view.height
+        } ?: error("test needs a page top beyond the viewport height")
+        view.background = android.graphics.drawable.ColorDrawable(0xFFEDE6D6.toInt())
+        view.textView.setTextColor(0x00000000)
+
+        view.goToPage(scrolledPage)
+        val staticFrame = view.drawToBitmapForTest()
+        val viewportShot = requireNotNull(view.snapshotViewportForTest())
+
+        assertEquals(
+            "static reader draw must fill the viewport with the same paper as the page-turn snapshot",
+            viewportShot.getPixel(4, 4),
+            staticFrame.getPixel(4, 4),
+        )
+        assertEquals(
+            "the EPUB surface must own the visible paper; otherwise the outer host texture shows through",
+            0xFFEDE6D6.toInt(),
+            staticFrame.getPixel(4, 4),
+        )
+
+        staticFrame.recycle()
+        viewportShot.recycle()
     }
 
     @Test

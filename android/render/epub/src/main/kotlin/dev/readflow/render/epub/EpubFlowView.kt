@@ -1043,10 +1043,7 @@ internal class EpubFlowView(
     }
 
     private fun drawLiveViewportBackground(canvas: Canvas) {
-        val save = canvas.save()
-        canvas.translate(scrollX.toFloat(), scrollY.toFloat())
         drawViewportBackgroundAtOrigin(canvas)
-        canvas.restoreToCount(save)
     }
 
     private fun drawViewportBackgroundAtOrigin(canvas: Canvas) {

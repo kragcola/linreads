@@ -154,15 +154,19 @@ fun ReaderScreen(
                     val zoomScale by zoomScaleFlow.collectAsState()
                     val systemNight = isSystemInDarkTheme()
                     val readerFocusRequester = remember { FocusRequester() }
+                    fun handleReaderAction(action: ReaderTapZone) {
+                        viewModel.onIntent(ReaderIntent.DismissGuide)
+                        when (action) {
+                            ReaderTapZone.PreviousPage -> scope.launch { host.previous() }
+                            ReaderTapZone.ToggleChrome -> viewModel.onIntent(ReaderIntent.ToggleChrome)
+                            ReaderTapZone.NextPage -> scope.launch { host.next() }
+                        }
+                    }
                     fun handleReaderKey(nativeEvent: KeyEvent): Boolean {
                         if (state.activePanel != null) return false
                         val action = readerTapZoneForKey(nativeEvent.keyCode, nativeEvent.isShiftPressed) ?: return false
                         if (nativeEvent.action == KeyEvent.ACTION_UP) {
-                            when (action) {
-                                ReaderTapZone.PreviousPage -> scope.launch { host.previous() }
-                                ReaderTapZone.ToggleChrome -> viewModel.onIntent(ReaderIntent.ToggleChrome)
-                                ReaderTapZone.NextPage -> scope.launch { host.next() }
-                            }
+                            handleReaderAction(action)
                         }
                         return true
                     }
@@ -182,12 +186,9 @@ fun ReaderScreen(
                             factory = { ctx ->
                                 ReaderTapContainer(
                                     context = ctx,
-                                    onAction = { zone ->
-                                        when (zone) {
-                                            ReaderTapZone.PreviousPage -> scope.launch { host.previous() }
-                                            ReaderTapZone.ToggleChrome -> viewModel.onIntent(ReaderIntent.ToggleChrome)
-                                            ReaderTapZone.NextPage -> scope.launch { host.next() }
-                                        }
+                                    onAction = ::handleReaderAction,
+                                    onDocumentTapConsumed = {
+                                        viewModel.onIntent(ReaderIntent.DismissGuide)
                                     },
                                     onFontSizePreview = {
                                         viewModel.onIntent(ReaderIntent.PreviewFontSize(it))
@@ -202,6 +203,10 @@ fun ReaderScreen(
                                 }
                             },
                             update = { view ->
+                                view.onAction = ::handleReaderAction
+                                view.onDocumentTapConsumed = {
+                                    viewModel.onIntent(ReaderIntent.DismissGuide)
+                                }
                                 view.setReaderPaperBackground(state.themeMode, systemNight)
                                 view.setDocumentView(host.hostView())
                                 view.currentFontSizeSp = state.fontSizeSp
@@ -439,7 +444,6 @@ fun ReaderScreen(
                     if (state.showGuide) {
                         ReaderGestureGuideOverlay(
                             pagedMode = pagingKind == PagingKind.PAGED,
-                            onDismiss = { viewModel.onIntent(ReaderIntent.DismissGuide) },
                         )
                     }
                 }
@@ -1067,7 +1071,8 @@ private fun ThemeSwatch(mode: ThemeMode) {
 
 private class ReaderTapContainer(
     context: Context,
-    private val onAction: (ReaderTapZone) -> Unit,
+    var onAction: (ReaderTapZone) -> Unit,
+    var onDocumentTapConsumed: () -> Unit,
     private val onFontSizePreview: (Float) -> Unit,
     private val onZoomPreview: (Float) -> Unit,
 ) : FrameLayout(context) {
@@ -1212,6 +1217,9 @@ private class ReaderTapContainer(
         val handled = super.dispatchTouchEvent(event)
         tapZoneRatio?.let { ratio ->
             val interactiveTapConsumed = documentView?.consumeReaderInteractiveTapReport() == true
+            if (interactiveTapConsumed) {
+                onDocumentTapConsumed()
+            }
             readerTapZoneForTap(
                 xRatio = ratio,
                 interactiveChildConsumedTap = interactiveTapConsumed,
@@ -1338,16 +1346,14 @@ private fun ReaderErrorContent(
 @Composable
 private fun ReaderGestureGuideOverlay(
     pagedMode: Boolean,
-    onDismiss: () -> Unit,
 ) {
-    // 半透明遮罩 + 三区说明；点任意处关闭，仅首次展示
+    // 半透明遮罩 + 三区说明；不拦截触摸，第一次真实阅读动作会同时关闭引导并执行。
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.72f))
-            .clickable(onClick = onDismiss)
             .semantics(mergeDescendants = true) {
-                contentDescription = "阅读手势引导，点击关闭"
+                contentDescription = "阅读手势引导，点击开始阅读"
             },
         contentAlignment = Alignment.Center,
     ) {

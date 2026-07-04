@@ -137,6 +137,7 @@ class ReaderViewModel(
     }
 
     private fun dismissGuide() {
+        if (!_uiState.value.showGuide) return
         _uiState.update { it.copy(showGuide = false) }
         viewModelScope.launch { settings.setReaderGuideShown(true) }
     }
