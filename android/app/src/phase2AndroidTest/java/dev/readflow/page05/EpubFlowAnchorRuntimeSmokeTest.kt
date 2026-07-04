@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
 import android.net.Uri
 import android.os.Looper
 import android.os.SystemClock
@@ -37,6 +38,7 @@ import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.prefs.DataStoreSettingsRepository
 import dev.readflow.render.api.R as RenderApiR
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.UUID
 import java.util.zip.ZipEntry
@@ -658,6 +660,124 @@ class EpubFlowAnchorRuntimeSmokeTest {
                             null
                         }
                     }
+                }
+            } finally {
+                before.frame.recycle()
+            }
+        }
+    }
+
+    @Test
+    fun epubFlowComplexScrollToPagedModeSwitchUsesExactFrozenViewportRuntime(): Unit = runBlocking {
+        settings.setReadingMode(ReaderReadingMode.SCROLL)
+        val title = "flow-complex-conversion-${UUID.randomUUID().toString().take(8)}"
+        val uri = createComplexEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected complex scroll-mode flow view with measurable content") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val textView = view.reflectTextView()
+                    val layout = textView.layout ?: return@withActivity null
+                    val text = textView.text?.toString().orEmpty()
+                    if (view.width <= 0 || view.height <= 0 || layout.height <= view.height * 4) {
+                        return@withActivity null
+                    }
+                    if (!text.contains("COMPLEX-FLOW-050")) {
+                        return@withActivity null
+                    }
+                    if (view.reflectPrivateAny("modeValue")?.toString() != "SCROLL") {
+                        return@withActivity null
+                    }
+                    view
+                }
+            }
+
+            val (before, during) = scenario.withActivity {
+                val layoutHeight = checkNotNull(view.reflectTextView().layout).height
+                val targetScrollY = (layoutHeight * 45 / 100)
+                    .coerceAtLeast(1)
+                    .coerceAtMost(layoutHeight - view.height)
+                view.scrollTo(0, targetScrollY)
+                val before = FlowConversionBefore(
+                    scrollY = view.scrollY,
+                    layoutOffset = view.reflectInt("topLayoutOffset"),
+                    contentAlpha = view.flowContentAlpha(),
+                    frame = view.drawRuntimeBitmap(),
+                )
+                view.invokeSetModeAnchoredPaged(before.layoutOffset)
+                val cover = checkNotNull(view.reflectPrivateAny("conversionSnapshotDrawable")) {
+                    "expected complex SCROLL->PAGED conversion cover through the flow conversion path"
+                }
+                val bitmap = cover.reflectPrivateBitmap("bitmap")
+                check(!bitmap.isRecycled) { "complex conversion cover bitmap should be alive during the covered frame" }
+                val during = FlowConversionDuring(
+                    currentPage = view.reflectInt("currentPageIndex"),
+                    scrollY = view.scrollY,
+                    contentAlpha = view.flowContentAlpha(),
+                    coverAlpha = cover.reflectPrivateInt("alphaValue"),
+                    coverBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false),
+                )
+                before to during
+            }
+            assertTrue("complex scroll-mode setup should start below the book beginning", before.scrollY > 0)
+            assertEquals("complex scroll-mode live content should be visible before switching", 1f, before.contentAlpha)
+
+            try {
+                try {
+                    assertEquals(
+                        "complex conversion cover must stay fully opaque; no scroll/page crossfade",
+                        255,
+                        during.coverAlpha,
+                    )
+                    assertEquals("complex conversion cover width should match the visible viewport", before.frame.width, during.coverBitmap.width)
+                    assertEquals("complex conversion cover height should match the visible viewport", before.frame.height, during.coverBitmap.height)
+                    assertTrue(
+                        "complex SCROLL->PAGED should park on a paged canonical page behind the cover",
+                        during.currentPage > 0 || during.scrollY > 0,
+                    )
+                    assertSampledPixelsEqual(
+                        "complex SCROLL->PAGED cover must be the exact pre-conversion viewport page shot",
+                        before.frame,
+                        during.coverBitmap,
+                    )
+                    val coveredFrame = scenario.withActivity { view.drawRuntimeBitmap() }
+                    try {
+                        assertSampledPixelsEqual(
+                            "complex SCROLL->PAGED conversion should visually show only the frozen viewport cover",
+                            during.coverBitmap,
+                            coveredFrame,
+                        )
+                    } finally {
+                        coveredFrame.recycle()
+                    }
+                } finally {
+                    during.coverBitmap.recycle()
+                }
+
+                waitForConditionResult("expected complex conversion cover to clear after stable paged reveal") {
+                    scenario.withActivity {
+                        val coverGone = view.reflectPrivateAny("conversionSnapshotDrawable") == null
+                        val alpha = view.flowContentAlpha()
+                        if (coverGone && alpha >= 1f) {
+                            FlowConversionAfter(
+                                currentPage = view.reflectInt("currentPageIndex"),
+                                scrollY = view.scrollY,
+                                contentAlpha = alpha,
+                            )
+                        } else {
+                            null
+                        }
+                    }
+                }.also { after ->
+                    assertTrue(
+                        "complex converted paged view should remain parked after the frozen cover clears",
+                        after.currentPage > 0 || after.scrollY > 0,
+                    )
+                    assertEquals("complex converted live content should finish fully visible", 1f, after.contentAlpha)
                 }
             } finally {
                 before.frame.recycle()
@@ -1334,6 +1454,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
         return FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
     }
 
+    private fun createComplexEpubUri(fileName: String): Uri {
+        val file = File(appContext.cacheDir, fileName)
+        writeComplexEpub(file)
+        return FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
+    }
+
     private fun writeEpub(file: File, linked: Boolean) {
         val body = buildString {
             appendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>")
@@ -1384,6 +1510,75 @@ class EpubFlowAnchorRuntimeSmokeTest {
             )
             addText("OEBPS/ch1.xhtml", body)
         }
+    }
+
+    private fun writeComplexEpub(file: File) {
+        val body = buildString {
+            appendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>")
+            appendLine("<h1 id=\"top\">Flow Complex Anchor Runtime</h1>")
+            appendLine("<p><img src=\"scene.png\" alt=\"blue scene\"/> Opening image keeps bitmap layout in the scroll viewport.</p>")
+            repeat(96) { index ->
+                val marker = "COMPLEX-FLOW-${index.toString().padStart(3, '0')}"
+                when (index % 8) {
+                    0 -> appendLine("<p><strong>$marker</strong> 图文混排段落，带 <a href=\"#top\">internal link</a> and inline emphasis.</p>")
+                    1 -> appendLine("<blockquote><p><em>$marker</em> 引用块需要和正文一起冻结。</p></blockquote>")
+                    2 -> appendLine("<ul><li>$marker list item one</li><li>列表第二项保留缩进和行距。</li></ul>")
+                    3 -> appendLine("<table><tr><td>$marker</td><td>cell-${index}</td></tr></table>")
+                    4 -> appendLine("<pre>$marker  preformatted    spacing\nline two for viewport snapshot</pre>")
+                    5 -> appendLine("<p><ruby>$marker<rt>rt</rt></ruby>：雨声、对话、标点都在同一页。</p>")
+                    6 -> appendLine("<p><span>$marker</span><br/><span>second visual line after a break.</span></p>")
+                    else -> appendLine("<p>$marker plain paragraph pads the runtime document for mid-scroll conversion.</p>")
+                }
+            }
+            appendLine("</body></html>")
+        }
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun addText(path: String, content: String) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(content.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+            fun addBinary(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="scene" href="scene.png" media-type="image/png"/>
+                      </manifest>
+                      <spine>
+                        <itemref idref="ch1"/>
+                      </spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText("OEBPS/ch1.xhtml", body)
+            addBinary("OEBPS/scene.png", tinyPngBytes(Color.rgb(0x25, 0x69, 0xBE)))
+        }
+    }
+
+    private fun tinyPngBytes(color: Int): ByteArray {
+        val bitmap = Bitmap.createBitmap(12, 12, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(color)
+        val output = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+        bitmap.recycle()
+        return output.toByteArray()
     }
 
     private fun dismissBlockingDialogs() {

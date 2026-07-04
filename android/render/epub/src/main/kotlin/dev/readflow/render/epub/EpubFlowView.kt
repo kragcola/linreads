@@ -1045,27 +1045,9 @@ internal class EpubFlowView(
     private fun snapshotViewport(): Bitmap? = try {
         val bmp = Bitmap.createBitmap(width, height, pageShotConfig)
         val canvas = Canvas(bmp)
-        drawSnapshotBackground(canvas)
-        // ScrollView draws its children at -scrollY; replicate so the snapshot is exactly what's
-        // on screen now (the current page), independent of the upcoming scroll.
-        canvas.translate(0f, -scrollY.toFloat())
-        // Clip the content to the outgoing page's bottom so the sliding snapshot shows blank
-        // background below the last line — never the next page's bleed (matches on-screen render).
-        val clipBottom = pageClipBottomInViewport()
-        val top = snapshotClipTopFor(scrollY)
-        if (clipBottom != null || top > scrollY) {
-            val save = canvas.save()
-            val bottom = if (clipBottom != null) {
-                snapshotClipBottomFor(scrollY, clipBottom)
-            } else {
-                scrollY + height
-            }
-            canvas.clipRect(0, top, width, bottom)
-            container.draw(canvas)
-            canvas.restoreToCount(save)
-        } else {
-            container.draw(canvas)
-        }
+        // Current-page shots must use the exact same draw path as the visible reader surface.
+        // A hand-rolled ScrollView translation/clipping clone drifts on complex spans/images.
+        draw(canvas)
         bmp
     } catch (_: Throwable) {
         // Throwable, not Exception: Bitmap.createBitmap on a large tablet page can throw
@@ -1236,7 +1218,9 @@ internal class EpubFlowView(
         }
 
     private fun positionConversionSnapshot() {
-        conversionSnapshotDrawable?.setBounds(0, scrollY, width, scrollY + height)
+        // ViewOverlay draws in this view's viewport coordinates. The conversion snapshot is already
+        // a viewport-sized page shot, so pin it to the visible surface instead of content scroll coords.
+        conversionSnapshotDrawable?.setBounds(0, 0, width, height)
     }
 
     private fun resetConversionSnapshotFade() {
