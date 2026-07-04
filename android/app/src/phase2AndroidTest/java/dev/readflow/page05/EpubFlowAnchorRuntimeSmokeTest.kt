@@ -19,6 +19,7 @@ import android.view.ViewGroup
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import androidx.core.content.FileProvider
+import androidx.room.Room
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -28,6 +29,9 @@ import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import dev.readflow.MainActivity
+import dev.readflow.core.database.BookEntity
+import dev.readflow.core.database.ReadflowDatabase
+import dev.readflow.core.database.ReadingProgressEntity
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
@@ -37,6 +41,7 @@ import java.io.File
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.flow.first
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -301,6 +306,182 @@ class EpubFlowAnchorRuntimeSmokeTest {
             }
             assertEquals("right tap should turn exactly one page", 1, result.currentPage)
             assertEquals("right tap should land on the next canonical top", target.nextPageTop, result.scrollY)
+        }
+    }
+
+    @Test
+    fun epubFlowRepeatedActionViewReopensWithoutVisibleBookStartRuntime() {
+        val title = "flow-reopen-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+        var bookId: String
+        var expectedPageTop: Int
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val target = waitForConditionResult("expected flow view to paginate before saving reopen anchor") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
+                    val pageThreeTop = view.reflectNullableInt("pageTopPxAt", 3) ?: return@withActivity null
+                    FlowReopenTarget(view = view, pageTop = pageThreeTop)
+                }
+            }
+
+            val parked = scenario.withActivity {
+                target.view.scrollTo(0, 0)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                FlowReopenFrame(
+                    currentPage = target.view.reflectInt("currentPageIndex"),
+                    scrollY = target.view.scrollY,
+                    contentAlpha = target.view.flowContentAlpha(),
+                    pageCount = target.view.reflectInt("pageCount"),
+                )
+            }
+            assertEquals("setup should park on page 3", 3, parked.currentPage)
+            assertEquals("setup should land on the page-3 canonical top", target.pageTop, parked.scrollY)
+            expectedPageTop = target.pageTop
+
+            bookId = waitForBookByTitle(title).id
+            waitForConditionResult("expected EPUB progress to persist page-3 anchor before reopen", DB_TIMEOUT_MS) {
+                latestProgress(bookId)?.takeIf { it.totalProgression > 0.02f }
+            }
+        }
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { reopened ->
+            dismissBlockingDialogs()
+            val firstFrame = waitForFirstFlowFrame(reopened)
+            assertTrue(
+                "reopened EPUB must not expose a visible book-start frame before restore: $firstFrame",
+                firstFrame.contentAlpha < 1f || firstFrame.scrollY != 0 || firstFrame.currentPage != 0,
+            )
+
+            val restored = waitForConditionResult("expected repeated ACTION_VIEW to restore EPUB page-3 anchor") {
+                reopened.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val currentPage = view.reflectInt("currentPageIndex")
+                    val scrollY = view.scrollY
+                    val alpha = view.flowContentAlpha()
+                    if (currentPage == 3 && scrollY == expectedPageTop && alpha >= 1f) {
+                        FlowReopenFrame(
+                            currentPage = currentPage,
+                            scrollY = scrollY,
+                            contentAlpha = alpha,
+                            pageCount = view.reflectInt("pageCount"),
+                        )
+                    } else {
+                        null
+                    }
+                }
+            }
+
+            assertEquals("reopened EPUB should restore page 3", 3, restored.currentPage)
+            assertEquals("reopened EPUB should restore the canonical page-3 top", expectedPageTop, restored.scrollY)
+            assertEquals("repeated external import should reuse one stable EPUB book row", 1, booksByTitle(title).size)
+        }
+    }
+
+    @Test
+    fun epubFlowScrollToPagedModeSwitchKeepsFrozenViewportCoverRuntime(): Unit = runBlocking {
+        settings.setReadingMode(ReaderReadingMode.SCROLL)
+        val title = "flow-conversion-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected scroll-mode flow view with measurable content") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val textView = view.reflectTextView()
+                    val layout = textView.layout ?: return@withActivity null
+                    if (view.width <= 0 || view.height <= 0 || layout.height <= view.height * 3) {
+                        return@withActivity null
+                    }
+                    if (view.reflectPrivateAny("modeValue")?.toString() != "SCROLL") {
+                        return@withActivity null
+                    }
+                    view
+                }
+            }
+
+            val before = scenario.withActivity {
+                view.scrollTo(0, view.height * 2)
+                FlowConversionBefore(
+                    scrollY = view.scrollY,
+                    layoutOffset = view.reflectInt("topLayoutOffset"),
+                    contentAlpha = view.flowContentAlpha(),
+                    frame = view.drawRuntimeBitmap(),
+                )
+            }
+            assertTrue("scroll-mode setup should start below the book beginning", before.scrollY > 0)
+            assertEquals("scroll-mode live content should be visible before switching", 1f, before.contentAlpha)
+
+            try {
+                val during = scenario.withActivity {
+                    view.invokeSetModeAnchoredPaged(before.layoutOffset)
+                    val cover = checkNotNull(view.reflectPrivateAny("conversionSnapshotDrawable")) {
+                        "expected SCROLL->PAGED conversion cover through the flow conversion path"
+                    }
+                    val bitmap = cover.reflectPrivateBitmap("bitmap")
+                    check(!bitmap.isRecycled) { "conversion cover bitmap should be alive during the covered frame" }
+                    FlowConversionDuring(
+                        currentPage = view.reflectInt("currentPageIndex"),
+                        scrollY = view.scrollY,
+                        contentAlpha = view.flowContentAlpha(),
+                        coverAlpha = cover.reflectPrivateInt("alphaValue"),
+                        coverBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false),
+                    )
+                }
+                try {
+                    assertEquals(
+                        "frozen conversion cover must stay fully opaque; no scroll/page crossfade",
+                        255,
+                        during.coverAlpha,
+                    )
+                    assertEquals("conversion cover width should match the visible viewport", before.frame.width, during.coverBitmap.width)
+                    assertEquals("conversion cover height should match the visible viewport", before.frame.height, during.coverBitmap.height)
+                    assertTrue(
+                        "SCROLL->PAGED should park on a paged canonical page behind the cover",
+                        during.currentPage > 0 || during.scrollY > 0,
+                    )
+                    val coveredFrame = scenario.withActivity { view.drawRuntimeBitmap() }
+                    try {
+                        assertSampledPixelsEqual(
+                            "SCROLL->PAGED conversion should visually show only the frozen viewport cover",
+                            during.coverBitmap,
+                            coveredFrame,
+                        )
+                    } finally {
+                        coveredFrame.recycle()
+                    }
+                } finally {
+                    during.coverBitmap.recycle()
+                }
+
+                waitForConditionResult("expected conversion cover to clear after stable paged reveal") {
+                    scenario.withActivity {
+                        val coverGone = view.reflectPrivateAny("conversionSnapshotDrawable") == null
+                        val alpha = view.flowContentAlpha()
+                        if (coverGone && alpha >= 1f) {
+                            FlowConversionAfter(
+                                currentPage = view.reflectInt("currentPageIndex"),
+                                scrollY = view.scrollY,
+                                contentAlpha = alpha,
+                            )
+                        } else {
+                            null
+                        }
+                    }
+                }
+            } finally {
+                before.frame.recycle()
+            }
         }
     }
 
@@ -980,8 +1161,54 @@ class EpubFlowAnchorRuntimeSmokeTest {
             "Timed out waiting for $selector"
         }
 
-    private fun <T> waitForConditionResult(message: String, producer: () -> T?): T {
-        val deadline = System.currentTimeMillis() + UI_TIMEOUT_MS
+    private fun waitForBookByTitle(title: String): BookEntity =
+        waitForConditionResult("expected imported EPUB book row for title $title", DB_TIMEOUT_MS) {
+            latestBookByTitle(title)
+        }
+
+    private fun booksByTitle(title: String): List<BookEntity> {
+        val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
+            .allowMainThreadQueries()
+            .build()
+        return try {
+            runBlocking {
+                db.bookDao().observeAll().first().filter { it.title == title }
+            }
+        } finally {
+            db.close()
+        }
+    }
+
+    private fun latestBookByTitle(title: String): BookEntity? {
+        val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
+            .allowMainThreadQueries()
+            .build()
+        return try {
+            runBlocking {
+                db.bookDao().observeAll().first().lastOrNull { it.title == title }
+            }
+        } finally {
+            db.close()
+        }
+    }
+
+    private fun latestProgress(bookId: String): ReadingProgressEntity? {
+        val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
+            .allowMainThreadQueries()
+            .build()
+        return try {
+            runBlocking { db.readingProgressDao().get(bookId) }
+        } finally {
+            db.close()
+        }
+    }
+
+    private fun <T> waitForConditionResult(
+        message: String,
+        timeoutMs: Long = UI_TIMEOUT_MS,
+        producer: () -> T?,
+    ): T {
+        val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             producer()?.let { return it }
             Thread.sleep(150)
@@ -993,6 +1220,36 @@ class EpubFlowAnchorRuntimeSmokeTest {
         var result: Result<T>? = null
         onActivity { activity -> result = runCatching { block(activity) } }
         return checkNotNull(result) { "activity callback did not return a result" }.getOrThrow()
+    }
+
+    private fun waitForFirstFlowFrame(scenario: ActivityScenario<MainActivity>): FlowReopenFrame {
+        val deadline = System.currentTimeMillis() + UI_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            val frame = scenario.withActivity { activity ->
+                val view = activity.findEpubFlowView() ?: return@withActivity null
+                FlowReopenFrame(
+                    currentPage = runCatching { view.reflectInt("currentPageIndex") }.getOrDefault(0),
+                    scrollY = view.scrollY,
+                    contentAlpha = view.flowContentAlpha(),
+                    pageCount = runCatching { view.reflectInt("pageCount") }.getOrDefault(0),
+                )
+            }
+            if (frame != null) return frame
+            Thread.sleep(FRAME_POLL_MS)
+        }
+        return checkNotNull(
+            scenario.withActivity { activity ->
+                val view = activity.findEpubFlowView() ?: return@withActivity null
+                FlowReopenFrame(
+                    currentPage = runCatching { view.reflectInt("currentPageIndex") }.getOrDefault(0),
+                    scrollY = view.scrollY,
+                    contentAlpha = view.flowContentAlpha(),
+                    pageCount = runCatching { view.reflectInt("pageCount") }.getOrDefault(0),
+                )
+            },
+        ) {
+            "expected first EPUB flow frame after reopen"
+        }
     }
 
     private fun MainActivity.findEpubFlowView(): View? =
@@ -1084,6 +1341,24 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
     private fun View.reflectTextView(): TextView =
         javaClass.getDeclaredField("textView").apply { isAccessible = true }.get(this) as TextView
+
+    private fun View.invokeSetModeAnchoredPaged(layoutOffset: Int) {
+        val modeClass = Class.forName("$EPUB_FLOW_VIEW_CLASS_NAME\$Mode")
+        val pagedMode = checkNotNull(modeClass.enumConstants) { "EpubFlowView.Mode enum constants unavailable" }
+            .first { (it as Enum<*>).name == "PAGED" }
+        javaClass.getDeclaredMethod("setModeAnchored", modeClass, Int::class.javaPrimitiveType).apply {
+            isAccessible = true
+        }.invoke(this, pagedMode, layoutOffset)
+    }
+
+    private fun Any.reflectPrivateInt(name: String): Int =
+        javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this) as Int
+
+    private fun Any.reflectPrivateBitmap(name: String): Bitmap =
+        javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this) as Bitmap
+
+    private fun View.flowContentAlpha(): Float =
+        ((this as? ViewGroup)?.getChildAt(0) as? View)?.alpha ?: alpha
 
     private fun View.visibleRightSideClickablePoint(textView: TextView): PointF? {
         val layout = textView.layout ?: return null
@@ -1289,6 +1564,39 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val scrollY: Int,
     )
 
+    private data class FlowReopenTarget(
+        val view: View,
+        val pageTop: Int,
+    )
+
+    private data class FlowReopenFrame(
+        val currentPage: Int,
+        val scrollY: Int,
+        val contentAlpha: Float,
+        val pageCount: Int,
+    )
+
+    private data class FlowConversionBefore(
+        val scrollY: Int,
+        val layoutOffset: Int,
+        val contentAlpha: Float,
+        val frame: Bitmap,
+    )
+
+    private data class FlowConversionDuring(
+        val currentPage: Int,
+        val scrollY: Int,
+        val contentAlpha: Float,
+        val coverAlpha: Int,
+        val coverBitmap: Bitmap,
+    )
+
+    private data class FlowConversionAfter(
+        val currentPage: Int,
+        val scrollY: Int,
+        val contentAlpha: Float,
+    )
+
     private data class FlowSurfaceTapTarget(
         val surface: View,
         val view: View,
@@ -1367,7 +1675,10 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private companion object {
         private const val EPUB_FLOW_VIEW_CLASS_NAME = "dev.readflow.render.epub.EpubFlowView"
         private const val EPUB_CURL_OVERLAY_CLASS_NAME = "dev.readflow.render.epub.EpubCurlOverlay"
+        private const val DB_NAME = "readflow.db"
         private const val EVENT_STEP_MS = 24L
+        private const val FRAME_POLL_MS = 16L
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
+        private val DB_TIMEOUT_MS = 5.seconds.inWholeMilliseconds
     }
 }
