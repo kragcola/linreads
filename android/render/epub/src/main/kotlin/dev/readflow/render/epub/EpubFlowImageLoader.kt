@@ -74,6 +74,7 @@ internal class EpubFlowImageLoader(
     private val imageBoundsProvider: (String) -> EpubImageBounds? = { href ->
         epubFileProvider()?.let { decodeEpubImageBounds(it, href) }
     },
+    private val onImageResultChanged: (() -> Unit)? = null,
 ) : AsyncDrawableLoader() {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -128,6 +129,10 @@ internal class EpubFlowImageLoader(
                 )
                 d.setBounds(0, 0, target.width(), target.height())
                 drawable.result = d
+                // Bounds-equal placeholder swaps do not reliably make TextView re-record the image span.
+                // Invalidate the drawable and notify the host to rebuild the text layout.
+                drawable.invalidateSelf()
+                onImageResultChanged?.invoke()
             }
         }
         inFlight[drawable] = future

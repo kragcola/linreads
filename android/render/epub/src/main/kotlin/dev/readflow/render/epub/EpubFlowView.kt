@@ -556,6 +556,15 @@ internal class EpubFlowView(
         return (height - textView.paddingTop - textView.paddingBottom).coerceAtLeast(1)
     }
 
+    fun refreshAfterAsyncImageResult() {
+        // Rebind the same Spannable so TextView rebuilds the layout after a Markwon AsyncDrawable
+        // replaces a transparent placeholder with same-sized bitmap bounds.
+        textView.text = textView.text
+        textView.invalidate()
+        container.invalidate()
+        invalidate()
+    }
+
     /**
      * Installs the chapter Spannable and paginates over the TextView's measured layout, then positions
      * to the resume target ([restoreOffset], or the last page when [landOnLast]) in the SAME post — so

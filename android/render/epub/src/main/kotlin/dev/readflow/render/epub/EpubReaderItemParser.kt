@@ -131,6 +131,7 @@ private fun collectContainerOrUnknown(
     maxDomDepth: Int,
 ) {
     if (depth > maxDomDepth) return
+    if (addImageOnlyContainerItems(spineIndex, items, element, resourceBaseDir)) return
     val blockChildren = element.children().filter { it.tagName().lowercase() !in INLINE_TAGS }
     if (blockChildren.isNotEmpty()) {
         blockChildren.forEach {
@@ -139,6 +140,20 @@ private fun collectContainerOrUnknown(
         return
     }
     addTextItem(spineIndex, items, extractTextWithLinks(element, resourceBaseDir, documentPath, maxDomDepth), element.fragmentIds())
+}
+
+private fun addImageOnlyContainerItems(
+    spineIndex: Int,
+    items: MutableList<EpubReaderItem>,
+    element: Element,
+    resourceBaseDir: String,
+): Boolean {
+    val images = element.select("img").filter { it.attr("src").trim().isNotEmpty() }
+    if (images.isEmpty()) return false
+    val textWithoutImages = element.clone().apply { select("img").remove() }.text()
+    if (textWithoutImages.any { !it.isEpubReaderSpacerChar() }) return false
+    images.forEach { addImageItem(spineIndex, items, it, resourceBaseDir) }
+    return true
 }
 
 private fun collectListItems(

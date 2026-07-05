@@ -157,6 +157,23 @@ class EpubReaderItemParserTest {
     }
 
     @Test
+    fun `image wrapped in a pure link container is emitted as a block image`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <div class="illus"><a href="../Images/plate.jpg"><img alt="plate" src="../Images/plate.jpg"/></a></div>
+                </body></html>
+            """.trimIndent(),
+            resourceBaseDir = "OEBPS/Text",
+        )
+
+        val image = assertInstanceOf(EpubReaderItem.Image::class.java, items.single())
+        assertEquals("OEBPS/Images/plate.jpg", image.href)
+        assertEquals("plate", image.altText)
+    }
+
+    @Test
     fun `footnote marker image nested in a link stays inline text not a block image`() {
         val items = parseReaderItemsFromHtml(
             spineIndex = 0,

@@ -2,6 +2,7 @@ package dev.readflow.render.epub
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.Base64
 import java.io.File
 import java.util.zip.ZipFile
 
@@ -17,6 +18,15 @@ internal fun decodeEpubImageBounds(
     epubFile: File,
     entryPath: String,
 ): EpubImageBounds? = try {
+    decodeEpubDataImageBytes(entryPath, EPUB_MAX_ENCODED_IMAGE_BYTES)?.let { bytes ->
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        return if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            null
+        } else {
+            EpubImageBounds(bounds.outWidth, bounds.outHeight)
+        }
+    }
     ZipFile(epubFile).use { zip ->
         val entry = zip.getEntry(entryPath) ?: return null
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -42,6 +52,19 @@ internal fun decodeEpubImage(
     maxPixels: Int = EPUB_MAX_IMAGE_PIXELS,
     maxEncodedBytes: Long = EPUB_MAX_ENCODED_IMAGE_BYTES,
 ): Bitmap? = try {
+    decodeEpubDataImageBytes(entryPath, maxEncodedBytes)?.let { bytes ->
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val width = bounds.outWidth
+        val height = bounds.outHeight
+        if (width <= 0 || height <= 0) return null
+
+        val decodeOptions = BitmapFactory.Options().apply {
+            inSampleSize = epubImageSampleSize(width, height, maxSide, maxPixels)
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOptions)
+    }
     ZipFile(epubFile).use { zip ->
         val entry = zip.getEntry(entryPath) ?: return null
         if (entry.size > maxEncodedBytes) return null
@@ -66,6 +89,28 @@ internal fun decodeEpubImage(
     null
 } catch (_: Exception) {
     null
+}
+
+private fun decodeEpubDataImageBytes(
+    value: String,
+    maxEncodedBytes: Long,
+): ByteArray? {
+    if (!value.startsWith("data:", ignoreCase = true)) return null
+    val comma = value.indexOf(',')
+    if (comma <= "data:".length) return null
+    val header = value.substring("data:".length, comma)
+    val mediaType = header.substringBefore(';').trim()
+    if (!mediaType.startsWith("image/", ignoreCase = true)) return null
+    if (header.split(';').none { it.equals("base64", ignoreCase = true) }) return null
+
+    val encoded = value.substring(comma + 1).filterNot(Char::isWhitespace)
+    val maxBase64Chars = ((maxEncodedBytes + 2L) / 3L) * 4L + 128L
+    if (encoded.length.toLong() > maxBase64Chars) return null
+    return try {
+        Base64.decode(encoded, Base64.DEFAULT).takeIf { it.size.toLong() <= maxEncodedBytes }
+    } catch (_: IllegalArgumentException) {
+        null
+    }
 }
 
 internal fun epubImageSampleSize(

@@ -6,6 +6,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Looper
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertEquals
@@ -299,6 +300,73 @@ class EpubFlowSpannableTest {
             assertEquals(Rect(0, 0, 800, 200), drawable.bounds)
             drawable.initWithKnownDimensions(800, 18f)
             assertEquals(Rect(0, 0, 800, 200), drawable.bounds)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `decoded image notifies host refresh when reserved bounds are unchanged`() {
+        val epub = java.io.File.createTempFile("readflow-image-refresh", ".epub")
+        val image = android.graphics.Bitmap.createBitmap(1600, 400, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            ZipOutputStream(epub.outputStream()).use { zip ->
+                zip.putNextEntry(ZipEntry("wide.png"))
+                image.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, zip)
+                zip.closeEntry()
+            }
+        } finally {
+            image.recycle()
+        }
+
+        val ctx = RuntimeEnvironment.getApplication()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val refreshes = AtomicInteger(0)
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = emptySet(),
+                imageBoundsProvider = { href ->
+                    if (href == "wide.png") EpubImageBounds(width = 1600, height = 400) else null
+                },
+                onImageResultChanged = { refreshes.incrementAndGet() },
+            )
+            val resolver = EpubFlowImageSizeResolver(
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = emptySet(),
+            )
+            val drawable = AsyncDrawable("wide.png", loader, resolver, null)
+            AsyncDrawableSpan(
+                io.noties.markwon.core.MarkwonTheme.create(ctx),
+                drawable,
+                AsyncDrawableSpan.ALIGN_CENTER,
+                false,
+            ).getSize(Paint(), "\uFFFC", 0, 1, Paint.FontMetricsInt())
+            assertEquals(Rect(0, 0, 800, 200), drawable.bounds)
+
+            drawable.setCallback2(object : Drawable.Callback {
+                override fun invalidateDrawable(who: Drawable) = Unit
+                override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) = Unit
+                override fun unscheduleDrawable(who: Drawable, what: Runnable) = Unit
+            })
+            executor.shutdown()
+            assertTrue("decode should finish in the unit test window", executor.awaitTermination(5, TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue("async decode should replace the transparent placeholder", drawable.result is BitmapDrawable)
+            assertEquals(Rect(0, 0, 800, 200), drawable.bounds)
+            assertEquals(
+                "bounds-equal decode must ask the host TextView to rebuild spans so the bitmap is drawn",
+                1,
+                refreshes.get(),
+            )
         } finally {
             executor.shutdownNow()
             epub.delete()

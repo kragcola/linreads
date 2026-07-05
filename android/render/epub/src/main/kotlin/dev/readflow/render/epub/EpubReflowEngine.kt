@@ -546,6 +546,7 @@ class EpubReflowEngine private constructor(
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
             imageBoundsProvider = ::epubImageBoundsFor,
+            onImageResultChanged = { flowView?.refreshAfterAsyncImageResult() },
         )
         val resolver = EpubFlowImageSizeResolver(
             columnWidthPx = flowColumnWidthPx(),
