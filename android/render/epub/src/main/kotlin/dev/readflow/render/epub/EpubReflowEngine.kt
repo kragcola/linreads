@@ -653,6 +653,7 @@ class EpubReflowEngine private constructor(
         val view = flowView ?: return
         if (view.goToAdjacentPage(delta)) return
         val target = adjacentSpine(flowSpineIndex, delta) ?: return
+        view.prepareBoundaryPageTurn(delta)
         if (delta > 0) {
             loadFlowChapter(target, restoreToParagraph = firstParagraphOfSpine(target))
         } else {

@@ -1281,6 +1281,13 @@ class EpubFlowViewTest {
         val bitmap = cover!!.privateBitmap("bitmap")
         assertEquals(view.width, bitmap.width)
         assertEquals(view.height, bitmap.height)
+        val coverBounds = (cover as Drawable).bounds
+        assertEquals(
+            "conversion cover must be positioned over the current visible scroll window",
+            view.scrollY,
+            coverBounds.top,
+        )
+        assertEquals(view.scrollY + view.height, coverBounds.bottom)
         assertEquals(0f, view.getChildAt(0).alpha)
 
         shadowOf(Looper.getMainLooper()).idleFor(360L, TimeUnit.MILLISECONDS)

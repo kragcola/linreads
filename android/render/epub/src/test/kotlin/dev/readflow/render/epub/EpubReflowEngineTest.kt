@@ -962,6 +962,45 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `flow next across short chapter boundary starts slide animation`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("short-chapter-boundary-slide.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one end.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two start.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("test fixture should start with a single short page", 1, flowView.pageCount())
+
+        engine.goToAdjacentPage(1)
+        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
+
+        val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        val animator = flowView.privateField("flipAnimator")
+        val pending = flowView.privateField("pendingBoundaryPageTurn")
+        assertEquals("the boundary turn should land on the next spine", 1, strategy?.spineIndex)
+        assertEquals("the captured outgoing page shot should be consumed by the target chapter", null, pending)
+        assertNotNull(
+            "cross-spine page turn should be driven by the same slide animator as in-chapter turns",
+            animator,
+        )
+    }
+
+    @Test
     fun `paged runtime packs short list items without one item pages`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("short-list-items-one-page.epub")
@@ -2649,6 +2688,11 @@ class EpubReflowEngineTest {
         field.isAccessible = true
         return field.get(this) as? EpubLazyBook
     }
+
+    private fun EpubFlowView.privateField(name: String): Any? =
+        EpubFlowView::class.java.getDeclaredField(name)
+            .apply { isAccessible = true }
+            .get(this)
 
     private fun writeEpub(file: File, vararg spineEntries: Pair<String, String>) {
         ZipOutputStream(file.outputStream()).use { zip ->

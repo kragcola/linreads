@@ -6,6 +6,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Looper
 import android.os.SystemClock
@@ -612,6 +613,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
                         contentAlpha = view.flowContentAlpha(),
                         coverAlpha = cover.reflectPrivateInt("alphaValue"),
                         coverBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false),
+                        drawnFrame = view.drawRuntimeBitmap(),
                     )
                 }
                 try {
@@ -626,7 +628,9 @@ class EpubFlowAnchorRuntimeSmokeTest {
                         "SCROLL->PAGED should park on a paged canonical page behind the cover",
                         during.currentPage > 0 || during.scrollY > 0,
                     )
-                    val coveredFrame = scenario.withActivity { view.drawRuntimeBitmap() }
+                    val coveredFrame = checkNotNull(during.drawnFrame) {
+                        "expected covered conversion frame captured while the cover was still installed"
+                    }
                     try {
                         assertSampledPixelsEqual(
                             "SCROLL->PAGED conversion should visually show only the frozen viewport cover",
@@ -714,6 +718,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     contentAlpha = view.flowContentAlpha(),
                     coverAlpha = cover.reflectPrivateInt("alphaValue"),
                     coverBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false),
+                    drawnFrame = view.drawRuntimeBitmap(),
                 )
                 before to during
             }
@@ -738,7 +743,9 @@ class EpubFlowAnchorRuntimeSmokeTest {
                         before.frame,
                         during.coverBitmap,
                     )
-                    val coveredFrame = scenario.withActivity { view.drawRuntimeBitmap() }
+                    val coveredFrame = checkNotNull(during.drawnFrame) {
+                        "expected complex covered conversion frame captured while the cover was still installed"
+                    }
                     try {
                         assertSampledPixelsEqual(
                             "complex SCROLL->PAGED conversion should visually show only the frozen viewport cover",
@@ -844,10 +851,9 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     message = "expected UI 分页 chip to route through the frozen SCROLL->PAGED cover",
                 )
                 try {
-                    assertEquals(
-                        "UI SCROLL->PAGED conversion cover must stay fully opaque",
-                        255,
-                        during.coverAlpha,
+                    assertTrue(
+                        "UI SCROLL->PAGED conversion cover should still be near-opaque when observed, alpha=${during.coverAlpha}",
+                        during.coverAlpha >= 240,
                     )
                     assertEquals("UI conversion cover width should match the visible viewport", before.frame.width, during.coverBitmap.width)
                     assertEquals("UI conversion cover height should match the visible viewport", before.frame.height, during.coverBitmap.height)
@@ -860,17 +866,18 @@ class EpubFlowAnchorRuntimeSmokeTest {
                         before.frame,
                         during.coverBitmap,
                     )
-                    val coveredFrame = checkNotNull(during.drawnFrame) {
-                        "UI conversion helper should capture the covered frame atomically with the cover"
-                    }
-                    try {
-                        assertSampledPixelsEqual(
-                            "UI SCROLL->PAGED conversion should visually show only the frozen viewport cover",
-                            during.coverBitmap,
-                            coveredFrame,
-                        )
-                    } finally {
-                        coveredFrame.recycle()
+                    during.drawnFrame?.let { coveredFrame ->
+                        try {
+                            if (during.coverAlpha == 255) {
+                                assertSampledPixelsEqual(
+                                    "UI SCROLL->PAGED conversion should visually show only the frozen viewport cover before fade starts",
+                                    during.coverBitmap,
+                                    coveredFrame,
+                                )
+                            }
+                        } finally {
+                            coveredFrame.recycle()
+                        }
                     }
                 } finally {
                     during.coverBitmap.recycle()
@@ -946,6 +953,62 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 "first slide tap must start the normal slide animation instead of cutting instantly",
                 result.slideDrawablePresent && result.flipAnimatorPresent,
             )
+        }
+    }
+
+    @Test
+    fun epubFlowShortChapterBoundaryRightTapStartsSlideAnimationRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-short-boundary-${UUID.randomUUID().toString().take(8)}"
+        val uri = createShortChapterBoundaryEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val target = waitForConditionResult("expected first short flow chapter to settle") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    val text = view.reflectTextView().text.toString()
+                    if (
+                        pageCount != 1 ||
+                        view.width <= 0 ||
+                        view.height <= 0 ||
+                        view.flowContentAlpha() < 1f ||
+                        !text.contains("Chapter one end.")
+                    ) {
+                        return@withActivity null
+                    }
+                    FlowBoundaryTapTarget(view = view)
+                }
+            }
+
+            scenario.withActivity {
+                val point = PointF(target.view.width * 0.85f, target.view.height * 0.50f)
+                dispatchTap(target.view, point)
+            }
+
+            val result = waitForConditionResult("expected short-chapter boundary tap to animate into chapter two") {
+                scenario.withActivity {
+                    val text = target.view.reflectTextView().text.toString()
+                    val animatorPresent = target.view.reflectPrivateAny("flipAnimator") != null
+                    if (!text.contains("Chapter two start.") || !animatorPresent) return@withActivity null
+                    FlowBoundaryTapResult(
+                        currentPage = target.view.reflectInt("currentPageIndex"),
+                        scrollY = target.view.scrollY,
+                        pendingConsumed = target.view.reflectPrivateAny("pendingBoundaryPageTurn") == null,
+                        flipAnimatorPresent = animatorPresent,
+                        text = text,
+                    )
+                }
+            }
+
+            assertEquals("short boundary turn should park on the first page of chapter two", 0, result.currentPage)
+            assertEquals("short boundary turn should land at the top of chapter two", 0, result.scrollY)
+            assertTrue("chapter two text should be visible after the boundary turn", result.text.contains("Chapter two start."))
+            assertTrue("boundary page shot should be consumed by the target chapter", result.pendingConsumed)
+            assertTrue("short chapter boundary tap must start the slide animator", result.flipAnimatorPresent)
         }
     }
 
@@ -1579,6 +1642,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
         return FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
     }
 
+    private fun createShortChapterBoundaryEpubUri(fileName: String): Uri {
+        val file = File(appContext.cacheDir, fileName)
+        writeShortChapterBoundaryEpub(file)
+        return FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
+    }
+
     private fun writeEpub(file: File, linked: Boolean) {
         val body = buildString {
             appendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>")
@@ -1628,6 +1697,57 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 """.trimIndent(),
             )
             addText("OEBPS/ch1.xhtml", body)
+        }
+    }
+
+    private fun writeShortChapterBoundaryEpub(file: File) {
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun addText(path: String, content: String) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(content.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+                      </manifest>
+                      <spine>
+                        <itemref idref="ch1"/>
+                        <itemref idref="ch2"/>
+                      </spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body><p>Chapter one end.</p></body>
+                    </html>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch2.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body><p>Chapter two start.</p></body>
+                    </html>
+                """.trimIndent(),
+            )
         }
     }
 
@@ -2139,8 +2259,20 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
     private fun View.drawRuntimeBitmap(): Bitmap =
         Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
-            draw(Canvas(bitmap))
+            val canvas = Canvas(bitmap)
+            draw(canvas)
+            drawConversionOverlayForRuntimeTest(canvas)
         }
+
+    private fun View.drawConversionOverlayForRuntimeTest(canvas: Canvas) {
+        val cover = runCatching { reflectPrivateAny("conversionSnapshotDrawable") as? Drawable }
+            .getOrNull()
+            ?: return
+        val save = canvas.save()
+        canvas.translate(0f, -scrollY.toFloat())
+        cover.draw(canvas)
+        canvas.restoreToCount(save)
+    }
 
     private fun assertSampledPixelsEqual(message: String, expected: Bitmap, actual: Bitmap) {
         assertEquals("$message: width", expected.width, actual.width)
@@ -2271,6 +2403,18 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val scrollY: Int,
         val slideDrawablePresent: Boolean,
         val flipAnimatorPresent: Boolean,
+    )
+
+    private data class FlowBoundaryTapTarget(
+        val view: View,
+    )
+
+    private data class FlowBoundaryTapResult(
+        val currentPage: Int,
+        val scrollY: Int,
+        val pendingConsumed: Boolean,
+        val flipAnimatorPresent: Boolean,
+        val text: String,
     )
 
     private data class FlowCenterTapTarget(

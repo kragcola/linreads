@@ -1,10 +1,10 @@
 # Active Work
 
-_最后更新：2026-07-04_
+_最后更新：2026-07-07_
 
-Mode: `task`
-Objective: v4lite 本地阅读闭环（用户验收 Phase A）— **L1–L5 全部 ✅**，Phase A 功能条件已满足
-Active tracker: [linreads-architecture-docs-2026-06-18.md](linreads-architecture-docs-2026-06-18.md)
+Mode: `task-bug`
+Objective: 修复 EPUB flow 跨章节和短页时无法触发翻页动画，并完成 Android 验证、提交与 OTA
+Active tracker: [epub-flow-cross-chapter-short-page-animation-2026-07-07.md](epub-flow-cross-chapter-short-page-animation-2026-07-07.md)
 v4lite 执行文档: [../android-v4lite-plan.md](../android-v4lite-plan.md)
 纯阅读缺口验收表: [android-v4-pure-reading-gap-checklist.md](android-v4-pure-reading-gap-checklist.md)
 未完成项回填总表: [android-v4-pure-reading-unfinished-backfill.md](android-v4-pure-reading-unfinished-backfill.md)

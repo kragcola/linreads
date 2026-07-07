@@ -190,6 +190,7 @@ internal class EpubFlowView(
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
     private var conversionSnapshotDrawable: ViewportSnapshotDrawable? = null
+    private var pendingBoundaryPageTurn: BoundaryPageTurn? = null
     private val flipDurationMs = 280L
     /** Discrete GL curl sweep — a touch longer than the slide so the realistic curl reads fully. */
     private val glCurlDurationMs = 420L
@@ -657,6 +658,12 @@ internal class EpubFlowView(
         removeCallbacks(revealSafetyRunnable)
         removeCallbacks(conversionSnapshotClearRunnable)
         awaitingReveal = false
+        if (pendingBoundaryPageTurn != null) {
+            clearConversionSnapshot()
+            container.animate().cancel()
+            container.alpha = 1f
+            if (consumePendingBoundaryPageTurn()) return
+        }
         val fadingCover = conversionSnapshotDrawable
         if (fadingCover != null) {
             // Cross-fade: animate the frozen SCROLL page-shot out as the live PAGED content fades in.
@@ -812,6 +819,33 @@ internal class EpubFlowView(
         if (delta < 0 && scrollY <= 0) return false
         scrollTo(0, (scrollY + delta * pageHeightPx).coerceIn(0, maxScroll))
         reportTopOffset()
+        return true
+    }
+
+    fun prepareBoundaryPageTurn(delta: Int): Boolean {
+        if (
+            delta == 0 ||
+            !pageTurnAnimated ||
+            mode != Mode.PAGED ||
+            paged.isEmpty() ||
+            width == 0 ||
+            height == 0 ||
+            turnInFlight
+        ) {
+            return false
+        }
+        val frozenOutgoing = conversionSnapshotCopy()
+        finishInitialRevealForTurn()
+        val anchor = snapToNearestCanonicalPageAnchor(report = false)
+        val target = anchor + delta
+        if (target in paged.indices) {
+            frozenOutgoing?.recycle()
+            return false
+        }
+        scrollToPage(anchor, report = false)
+        val outgoing = frozenOutgoing ?: snapshotViewport() ?: return false
+        clearPendingBoundaryPageTurn()
+        pendingBoundaryPageTurn = BoundaryPageTurn(outgoing, forward = delta > 0)
         return true
     }
 
@@ -1275,9 +1309,9 @@ internal class EpubFlowView(
         }
 
     private fun positionConversionSnapshot() {
-        // ViewOverlay draws in this view's viewport coordinates. The conversion snapshot is already
-        // a viewport-sized page shot, so pin it to the visible surface instead of content scroll coords.
-        conversionSnapshotDrawable?.setBounds(0, 0, width, height)
+        // ViewOverlay is drawn in this ScrollView's content coordinates on Android runtime. Keep the
+        // viewport-sized page shot over the visible scroll window while the live paged frame settles.
+        conversionSnapshotDrawable?.setBounds(0, scrollY, width, scrollY + height)
     }
 
     private fun resetConversionSnapshotFade() {
@@ -1296,6 +1330,27 @@ internal class EpubFlowView(
             it.recycle()
         }
         conversionSnapshotDrawable = null
+    }
+
+    private fun consumePendingBoundaryPageTurn(): Boolean {
+        val turn = pendingBoundaryPageTurn ?: return false
+        pendingBoundaryPageTurn = null
+        val outgoing = turn.outgoing
+        if (!pageTurnAnimated || mode != Mode.PAGED || width == 0 || height == 0 || turnInFlight) {
+            outgoing.recycle()
+            return false
+        }
+        val revealed = snapshotViewport() ?: run {
+            outgoing.recycle()
+            return false
+        }
+        startFlip(outgoing, revealed, turn.forward)
+        return true
+    }
+
+    private fun clearPendingBoundaryPageTurn() {
+        pendingBoundaryPageTurn?.outgoing?.let { if (!it.isRecycled) it.recycle() }
+        pendingBoundaryPageTurn = null
     }
 
     // ---- Finger-tracking interactive slide -----------------------------------------------------
@@ -1741,6 +1796,11 @@ internal class EpubFlowView(
         const val GL_DISCRETE_SETTLE_GRACE_MS = 480L
     }
 }
+
+private data class BoundaryPageTurn(
+    val outgoing: Bitmap,
+    val forward: Boolean,
+)
 
 private class ViewportSnapshotDrawable(
     private val bitmap: Bitmap,
