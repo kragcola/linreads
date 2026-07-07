@@ -12,7 +12,7 @@ Fix EPUB flow reader so page-turn animation still triggers when turning across c
 - [x] Implement minimal fix with performance review.
 - [x] Run unit/build/emulator verification.
 - [x] Build local OTA APK.
-- [ ] Commit, push, and confirm OTA workflow.
+- [x] Commit, push, and confirm OTA workflow.
 
 ## Current Evidence
 
@@ -39,6 +39,9 @@ Fix EPUB flow reader so page-turn animation still triggers when turning across c
 | 2026-07-07 | `adb logcat -d | rg -i "FATAL EXCEPTION|AndroidRuntime|OutOfMemory|recycled bitmap|AssertionError|\\bANR\\b"` after full AVD suite | Only instrumentation VM start/exit lines | No app crash/OOM/ANR/recycled-bitmap/assertion logs |
 | 2026-07-07 | `./gradlew -Preadflow.phase=2 :app:assembleOta` | BUILD SUCCESSFUL; `android/app/build/outputs/apk/ota/app-ota.apk` = 9.4M, sha256 `e8926349f793f351142db58a91a22a8440a623502629e302761b34291f2d5cb8` | Local OTA artifact built before commit/push |
 | 2026-07-07 | `.github/workflows/android-release.yml` | `push` to `main` runs `./gradlew -Preadflow.phase=2 :app:assembleOta` and publishes `android/app/build/outputs/apk/ota/app-ota.apk` to `dev-latest` | GitHub OTA path confirmed from workflow code |
+| 2026-07-07 | `git commit` / `git push origin main` | Commit `4a3397c Fix EPUB flow boundary page turns` pushed to `main` | GitHub workflow trigger delivered |
+| 2026-07-07 | `gh run watch 28845443877 --exit-status` | SUCCESS; `Android Dev Release` build job completed in 6m8s; Build OTA APK and Publish dev-latest release both passed | OTA workflow completed for commit `4a3397cf28f576f8a25fa1b147d9b284c5d72a7b` |
+| 2026-07-07 | `gh release view dev-latest --json assets,name,url` | `Dev build #196`; `app-ota.apk` uploaded at `2026-07-07T06:14:27Z`, size `9816397`; release URL `https://github.com/kragcola/linreads/releases/tag/dev-latest` | OTA artifact available from `dev-latest` |
 
 ## Risks / Constraints
 

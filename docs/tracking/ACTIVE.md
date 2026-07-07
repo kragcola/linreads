@@ -2,9 +2,9 @@
 
 _最后更新：2026-07-07_
 
-Mode: `task-bug`
-Objective: 修复 EPUB flow 跨章节和短页时无法触发翻页动画，并完成 Android 验证、提交与 OTA
-Active tracker: [epub-flow-cross-chapter-short-page-animation-2026-07-07.md](epub-flow-cross-chapter-short-page-animation-2026-07-07.md)
+Mode: `none`
+Objective: 无正在执行任务；最近完成：修复 EPUB flow 跨章节和短页时无法触发翻页动画，并通过 Android OTA 发布
+Last completed tracker: [epub-flow-cross-chapter-short-page-animation-2026-07-07.md](epub-flow-cross-chapter-short-page-animation-2026-07-07.md)
 v4lite 执行文档: [../android-v4lite-plan.md](../android-v4lite-plan.md)
 纯阅读缺口验收表: [android-v4-pure-reading-gap-checklist.md](android-v4-pure-reading-gap-checklist.md)
 未完成项回填总表: [android-v4-pure-reading-unfinished-backfill.md](android-v4-pure-reading-unfinished-backfill.md)
