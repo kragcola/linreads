@@ -27,8 +27,8 @@ push `main`, and confirm the Android Dev Release workflow and OTA artifact.
 - [x] Resolve all Critical and Important findings.
 - [x] Pass phase 1, phase 2, and phase 3 Gradle gates plus whitespace checks.
 - [x] Stage only the reviewed Readflow files and verify the staged diff.
-- [ ] Commit with an explicit three-platform status.
-- [ ] Push `main` and confirm CI plus the `dev-latest` OTA artifact.
+- [x] Commit with an explicit three-platform status.
+- [x] Push `main` and confirm CI plus the `dev-latest` OTA artifact.
 
 ## Risks
 
@@ -51,6 +51,23 @@ push `main`, and confirm the Android Dev Release workflow and OTA artifact.
   `LibraryViewModel.downloadingBookId` showing the old ID until later state work.
 - Remaining Minor: the Calibre download-failure smoke does not yet exercise a
   true mid-stream interruption or match the actual `calibre-42-*.part` name.
+
+## Release Evidence
+
+- Implementation commit: `e59780ec40999e10b10ca70235250824cd958b11`.
+- Push advanced `origin/main` from `32c8c7560082d745437e7eacb5baaacb24b9d550`
+  to the implementation commit with no intervening upstream commit.
+- `Android Dev Release` run
+  [29065942672](https://github.com/kragcola/linreads/actions/runs/29065942672)
+  completed successfully in 8m18s.
+- Mutable release `dev-latest` became `Dev build #198`; its body records commit
+  `e59780ec40999e10b10ca70235250824cd958b11`, branch `main`, and unique build tag
+  `dev-198-e59780ec40999e10b10ca70235250824cd958b11`.
+- The refreshed asset was created/updated at `2026-07-10T03:10:11Z/03:10:12Z`,
+  is 9,849,169 bytes, and downloaded with SHA-256
+  `8ccf6a088899ef3e06c862e94b6631829b83c51b1bd22d41591f2907a485a2c5`.
+- The downloaded APK passes ZIP integrity and APK Signature Scheme v2 checks,
+  reports package `dev.readflow`, and embeds the exact unique build tag in DEX.
 
 ## Test Ledger
 
@@ -87,3 +104,6 @@ push `main`, and confirm the Android Dev Release workflow and OTA artifact.
 | 2026-07-10 | Final `projects -Preadflow.phase=3 --quiet` | PASS | Only the expected app/core/extensions/features/ink/render modules are configured. |
 | 2026-07-10 | Final `-Preadflow.phase=2 :app:assembleOta --console=plain` | PASS in 1m51s; 599 actionable tasks | Local OTA is 9,849,169 bytes; SHA-256 `eb9cb1ad5ad5c8a7539800ca9dcd04692e4be89abcd31c6bfacd08a4a53a7965`. |
 | 2026-07-10 | Final `git diff --check` | PASS | Final reviewed worktree contains no whitespace errors before staging. |
+| 2026-07-10 | Commit `e59780ec40999e10b10ca70235250824cd958b11` and `git push origin main` | PASS | The reviewed 62-file Android audit batch reached `origin/main`; excluded root projects and generated files remained untracked. |
+| 2026-07-10 | `gh run watch 29065942672 --exit-status --interval 10` | PASS in 8m18s | `Android Dev Release` built and published `Dev build #198`; only a non-blocking Node 20 action deprecation annotation was emitted. |
+| 2026-07-10 | `gh release view dev-latest`, asset API metadata, download, `unzip -t`, `apksigner verify`, DEX `strings` | PASS | Release commit/branch/build tag match; remote APK is 9,849,169 bytes, SHA-256 `8ccf6a088899ef3e06c862e94b6631829b83c51b1bd22d41591f2907a485a2c5`, v2-signed, intact, and embeds `dev-198-e59780ec40999e10b10ca70235250824cd958b11`. |

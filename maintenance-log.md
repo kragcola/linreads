@@ -15,7 +15,7 @@
 - 独立复核：数据/安全、Reader/Calibre、app/OTA 三线最终均未发现残留 Critical/Important。保留三个 Minor：协调器不支持未来同协程嵌套 `produce()`、删除取消下载后 `downloadingBookId` 可能暂留、Calibre failure smoke 尚未覆盖真实 mid-stream staging 清理
 - RED/GREEN：新增前置 ZIP 压缩炸弹、Reader 入口取消/分步持久化/替换打开、OTA 在途取消与 stale token 拒绝等确定性回归；定向测试全部由失败转为通过
 - 最终本地门禁（JDK 21）：Phase 2 `test lint` 1094 tasks PASS；Phase 3 `test` 705 tasks PASS；Phase 1/3 `assembleDebug` 186/347 tasks PASS；Phase 3 项目图 PASS；Phase 2 `assembleOta` 599 tasks PASS；`git diff --check` PASS。OTA APK `9,849,169` bytes，SHA-256 `eb9cb1ad5ad5c8a7539800ca9dcd04692e4be89abcd31c6bfacd08a4a53a7965`
-- 发布状态：本地复核与门禁完成，远端 `Android Dev Release` / `dev-latest` 证据将在推送后回填
+- 发布状态：实现提交 `e59780ec40999e10b10ca70235250824cd958b11` 已推送；`Android Dev Release` run `29065942672` 在 8m18s 后成功，`dev-latest` 更新为 `Dev build #198` / `BUILD_TAG=dev-198-e59780ec40999e10b10ca70235250824cd958b11`。远端 APK `9,849,169` bytes、SHA-256 `8ccf6a088899ef3e06c862e94b6631829b83c51b1bd22d41591f2907a485a2c5`，ZIP 完整、v2 签名有效且 DEX 内嵌唯一 build tag
 
 ---
 
