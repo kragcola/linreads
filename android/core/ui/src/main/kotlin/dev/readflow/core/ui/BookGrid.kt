@@ -12,6 +12,8 @@ import androidx.compose.foundation.lazy.grid.LazyGridItemInfo
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
@@ -32,11 +34,13 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import dev.readflow.core.model.BookMeta
+import dev.readflow.core.model.BookRemovalMode
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
 import kotlinx.coroutines.Job
@@ -73,7 +77,7 @@ private val BookMeta.canRemoveDownload: Boolean
 fun BookGrid(
     items: List<LibraryItem>,
     onItemClick: (LibraryItem) -> Unit,
-    onDelete: (String) -> Unit = {},
+    onDelete: (String, BookRemovalMode) -> Unit = { _, _ -> },
     onRename: (String, String) -> Unit = { _, _ -> },
     onMoveToGroup: (String, String) -> Unit = { _, _ -> },
     onReorder: (List<LibraryItem>) -> Unit = {},
@@ -126,6 +130,7 @@ fun BookGrid(
     var groupTargetItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var groupName by remember { mutableStateOf("") }
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
+    var deleteMode by remember { mutableStateOf(BookRemovalMode.REMOVE_FROM_SHELF) }
     var deleteConfirmLabel by remember { mutableStateOf("") }
     var ungroupConfirmName by remember { mutableStateOf<String?>(null) }
     var renameBundleOldName by remember { mutableStateOf<String?>(null) }
@@ -674,6 +679,7 @@ fun BookGrid(
                                                 text = { Text("删除") },
                                                 onClick = {
                                                     deleteConfirmId = item.book.id
+                                                    deleteMode = BookRemovalMode.REMOVE_FROM_SHELF
                                                     deleteConfirmLabel = "《${item.book.title}》"
                                                     contextItem = null
                                                     contextMenuAnchor = null
@@ -706,6 +712,7 @@ fun BookGrid(
                                                 text = { Text("删除") },
                                                 onClick = {
                                                     deleteConfirmId = "bundle:${item.bundle.name}"
+                                                    deleteMode = BookRemovalMode.REMOVE_FROM_SHELF
                                                     deleteConfirmLabel = "《${item.bundle.name}》(${item.bundle.books.size}本)"
                                                     contextItem = null
                                                     contextMenuAnchor = null
@@ -766,7 +773,46 @@ fun BookGrid(
             onDismissRequest = { deleteConfirmId = null },
             title = { Text("确认删除") },
             text = {
-                Text("确定要删除 ${deleteConfirmLabel} 吗？\n${if (isBundleDelete) "组内全部书籍将被移出书架。" else "阅读进度将一并删除。"}")
+                Column(
+                    modifier = Modifier.selectableGroup(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text("请选择如何处理 ${deleteConfirmLabel}：")
+                    val removeFromShelfSelected = deleteMode == BookRemovalMode.REMOVE_FROM_SHELF
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .selectable(
+                                selected = removeFromShelfSelected,
+                                role = Role.RadioButton,
+                                onClick = { deleteMode = BookRemovalMode.REMOVE_FROM_SHELF },
+                            ),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = removeFromShelfSelected,
+                            onClick = null,
+                        )
+                        Text("仅移出书架（保留文件和阅读数据）")
+                    }
+                    val deleteAllSelected = deleteMode == BookRemovalMode.DELETE_ALL
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .selectable(
+                                selected = deleteAllSelected,
+                                role = Role.RadioButton,
+                                onClick = { deleteMode = BookRemovalMode.DELETE_ALL },
+                            ),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = deleteAllSelected,
+                            onClick = null,
+                        )
+                        Text("全部删除（文件、进度、书签和笔记）")
+                    }
+                }
             },
             confirmButton = {
                 TextButton(
@@ -777,17 +823,10 @@ fun BookGrid(
                             items.filterIsInstance<LibraryItem.Bundle>()
                                 .firstOrNull { it.bundle.name == bundleName }?.bundle?.books ?: emptyList()
                         } else emptyList()
-                        // Optimistic: remove from UI immediately
-                        mutableItems.removeAll {
-                            when {
-                                isBundleDelete -> it is LibraryItem.Bundle && it.bundle.name == did.removePrefix("bundle:")
-                                else -> it is LibraryItem.Single && it.book.id == did
-                            }
-                        }
                         if (isBundleDelete) {
-                            bundleBooksForDelete.forEach { onDelete(it.id) }
+                            bundleBooksForDelete.forEach { onDelete(it.id, deleteMode) }
                         } else {
-                            onDelete(did)
+                            onDelete(did, deleteMode)
                         }
                         deleteConfirmId = null
                     },

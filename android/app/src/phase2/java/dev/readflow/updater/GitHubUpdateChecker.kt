@@ -1,5 +1,6 @@
 package dev.readflow.updater
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -7,7 +8,12 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
-data class UpdateInfo(val tagName: String, val apkUrl: String, val notes: String)
+data class UpdateInfo(
+    val tagName: String,
+    val buildTag: String?,
+    val apkUrl: String,
+    val notes: String,
+)
 
 /**
  * Checks the `dev-latest` GitHub release for a newer build.
@@ -37,9 +43,7 @@ class GitHubUpdateChecker(
             val root = JSONObject(conn.inputStream.bufferedReader().readText())
             val body = root.optString("body", "")
 
-            val releaseBuildTag = body.lineSequence()
-                .firstOrNull { it.startsWith("BUILD_TAG:") }
-                ?.substringAfter("BUILD_TAG:")?.trim()
+            val releaseBuildTag = releaseBuildTagFromBody(body)
 
             if (releaseBuildTag != null && releaseBuildTag == currentTag) return@withContext null
 
@@ -51,8 +55,17 @@ class GitHubUpdateChecker(
                     apkUrl = a.getString("browser_download_url"); break
                 }
             }
-            apkUrl?.let { UpdateInfo(root.getString("tag_name"), it, body) }
+            apkUrl?.let {
+                UpdateInfo(
+                    tagName = root.getString("tag_name"),
+                    buildTag = releaseBuildTag,
+                    apkUrl = it,
+                    notes = body,
+                )
+            }
                 ?: throw IOException("release has no APK asset")
+        } catch (error: CancellationException) {
+            throw error
         } catch (e: IOException) {
             throw e   // propagate — caller's runCatching will surface it
         } catch (e: Exception) {
@@ -62,4 +75,15 @@ class GitHubUpdateChecker(
         }
     }
 
+}
+
+internal fun releaseBuildTagFromBody(body: String): String? {
+    val lines = body.lineSequence().toList()
+    val metadataStart = lines.indexOfLast { it.trim() == "---" } + 1
+    if (metadataStart <= 0) return null
+    return lines.drop(metadataStart)
+        .firstOrNull { it.trimStart().startsWith("BUILD_TAG:") }
+        ?.substringAfter("BUILD_TAG:")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
 }

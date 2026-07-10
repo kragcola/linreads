@@ -3,9 +3,13 @@ package dev.readflow.core.calibre
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ReadflowResult
 import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.MockEngineConfig
 import io.ktor.client.engine.mock.respond
 import io.ktor.http.HttpHeaders
 import io.ktor.http.headersOf
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -94,5 +98,70 @@ class CalibreDownloadPlannerTest {
         assertEquals(BookFormat.EPUB, downloaded.meta.format)
         assertEquals("epub bytes", downloaded.file.readText())
         assertEquals("http://192.168.1.5:8080/get/EPUB/42/calibre-library", requestedUrl)
+    }
+
+    @Test
+    fun downloadMayOutliveConnectionProbeRequestTimeout() = runTest {
+        val engine = MockEngine(
+            MockEngineConfig().apply {
+                dispatcher = StandardTestDispatcher(testScheduler)
+                addHandler {
+                    delay(8_001)
+                    respond(
+                        content = "slow epub bytes",
+                        headers = headersOf(HttpHeaders.ContentLength, "15"),
+                    )
+                }
+            },
+        )
+        val client = CalibreClient(
+            baseUrl = "http://192.168.1.5:8080",
+            username = "",
+            password = "",
+            libraryId = "calibre-library",
+            http = defaultCalibreHttpClient(engine),
+        )
+        val downloader = CalibreBookDownloader(
+            client = client,
+            booksDir = temp.newFolder("slow-books"),
+        )
+
+        val result = downloader.download(
+            CalibreBookMeta(
+                id = 42,
+                title = "Slow download",
+                formats = listOf("EPUB"),
+            ),
+        )
+
+        assertTrue(
+            "formal download must not inherit the 8 second probe timeout",
+            result is ReadflowResult.Success<*>,
+        )
+    }
+
+    @Test(expected = CancellationException::class)
+    fun downloadDoesNotConvertCoroutineCancellationIntoFailure() = runTest {
+        val client = CalibreClient(
+            baseUrl = "http://192.168.1.5:8080",
+            username = "",
+            password = "",
+            libraryId = "calibre-library",
+            http = defaultCalibreHttpClient(
+                MockEngine { throw CancellationException("cancelled") },
+            ),
+        )
+        val downloader = CalibreBookDownloader(
+            client = client,
+            booksDir = temp.newFolder("cancelled-books"),
+        )
+
+        downloader.download(
+            CalibreBookMeta(
+                id = 42,
+                title = "Cancelled",
+                formats = listOf("EPUB"),
+            ),
+        )
     }
 }

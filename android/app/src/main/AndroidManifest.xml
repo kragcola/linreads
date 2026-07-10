@@ -50,7 +50,10 @@
                 <data android:mimeType="application/pdf" />
             </intent-filter>
         </activity>
-        <receiver android:name=".updater.UpdateInstallReceiver" android:exported="false">
+        <receiver
+            android:name=".updater.UpdateInstallReceiver"
+            android:enabled="${updateReceiverEnabled}"
+            android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.DOWNLOAD_COMPLETE" />
             </intent-filter>

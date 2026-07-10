@@ -45,9 +45,8 @@ phaseInclude(
     ":render:md", ":render:animate",
     ":features:reader", ":features:settings",
 )
-// Phase 3 — premium add-ons (Phase D + E).
+// Phase 3 — implemented premium add-ons only (Phase D + E).
 phaseInclude(
     3,
-    ":render:mupdf", ":ink",
-    ":extensions:tts", ":extensions:stats", ":extensions:opds",
+    ":ink",
 )

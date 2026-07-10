@@ -20,6 +20,10 @@ import dev.readflow.core.sync.SyncBackend
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -197,6 +201,7 @@ class SettingsViewModel(
                     "已导出：进度 ${result.progressCount} 条，书签 ${result.bookmarkCount} 条，标注 ${result.textAnnotationCount} 条",
                 )
             }.onFailure { error ->
+                if (error is CancellationException) throw error
                 _backupExportState.value = BackupExportUiState.Failure(
                     "导出失败：${error.message ?: "请稍后重试"}",
                 )
@@ -220,6 +225,7 @@ class SettingsViewModel(
                     if (count > 0) "已导出 $count 本书的阅读笔记" else "已导出阅读笔记（暂无书签或标注）",
                 )
             }.onFailure { error ->
+                if (error is CancellationException) throw error
                 _notesExportState.value = BackupExportUiState.Failure(
                     "笔记导出失败：${error.message ?: "请稍后重试"}",
                 )
@@ -245,6 +251,7 @@ class SettingsViewModel(
             }.onSuccess {
                 _themeExportState.value = BackupExportUiState.Success("主题已导出")
             }.onFailure { error ->
+                if (error is CancellationException) throw error
                 _themeExportState.value = BackupExportUiState.Failure(
                     "主题导出失败：${error.message ?: "请稍后重试"}",
                 )
@@ -257,7 +264,7 @@ class SettingsViewModel(
         viewModelScope.launch {
             runCatching {
                 withContext(backupDispatcher) {
-                    val raw = input.use { it.readBytes().toString(Charsets.UTF_8) }
+                    val raw = input.use { it.readLimited(MAX_THEME_PROFILE_BYTES) }.toString(Charsets.UTF_8)
                     val profile = ThemeProfile.decode(raw) ?: throw IllegalStateException("无法解析主题文件")
                     ThemeProfile.validated(profile)
                 }
@@ -270,6 +277,7 @@ class SettingsViewModel(
                 runCatching { ReaderReadingMode.valueOf(profile.readingMode) }.getOrNull()?.let { settings.setReadingMode(it) }
                 _themeImportState.value = BackupRestoreUiState.Success("主题已导入")
             }.onFailure { error ->
+                if (error is CancellationException) throw error
                 _themeImportState.value = BackupRestoreUiState.Failure(
                     "主题导入失败：${error.message ?: "请稍后重试"}",
                 )
@@ -289,6 +297,7 @@ class SettingsViewModel(
                     "已恢复：进度 ${result.progressCount} 条，书签 ${result.bookmarkCount} 条，标注 ${result.textAnnotationCount} 条",
                 )
             }.onFailure { error ->
+                if (error is CancellationException) throw error
                 _backupRestoreState.value = BackupRestoreUiState.Failure(
                     "恢复失败：${error.message ?: "请检查备份文件"}",
                 )
@@ -314,14 +323,32 @@ class SettingsViewModel(
      */
     fun importFont(input: InputStream, dest: File, choice: FontChoice.Custom) {
         viewModelScope.launch {
-            runCatching {
-                withContext(backupDispatcher) {
-                    input.use { ins -> dest.outputStream().use { ins.copyTo(it) } }
+            var staging: File? = null
+            try {
+                runCatching {
+                    withContext(backupDispatcher) {
+                        dest.parentFile?.mkdirs()
+                        val temp = File.createTempFile("font-", ".part", dest.parentFile).also { staging = it }
+                        input.use { ins -> temp.outputStream().use { ins.copyTo(it) } }
+                        require(temp.length() > 0L) { "字体文件为空" }
+                        try {
+                            Files.move(
+                                temp.toPath(),
+                                dest.toPath(),
+                                StandardCopyOption.ATOMIC_MOVE,
+                                StandardCopyOption.REPLACE_EXISTING,
+                            )
+                        } catch (_: AtomicMoveNotSupportedException) {
+                            Files.move(temp.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                        }
+                    }
+                }.onSuccess {
+                    settings.setFontChoice(choice)
+                }.onFailure { error ->
+                    if (error is CancellationException) throw error
                 }
-            }.onSuccess {
-                settings.setFontChoice(choice)
-            }.onFailure {
-                runCatching { dest.delete() }
+            } finally {
+                staging?.delete()
             }
         }
     }
@@ -329,6 +356,22 @@ class SettingsViewModel(
 
 private fun String.removeProtocol(): String =
     removePrefix("http://").removePrefix("https://")
+
+private fun InputStream.readLimited(maxBytes: Int): ByteArray {
+    val output = java.io.ByteArrayOutputStream(minOf(maxBytes, DEFAULT_BUFFER_SIZE))
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    var total = 0
+    while (true) {
+        val read = read(buffer)
+        if (read < 0) break
+        total += read
+        require(total <= maxBytes) { "主题文件过大" }
+        output.write(buffer, 0, read)
+    }
+    return output.toByteArray()
+}
+
+private const val MAX_THEME_PROFILE_BYTES = 1024 * 1024
 
 private fun String.withAttempts(result: CalibreProbeResult.Failure): String {
     if (result.attempts.isEmpty()) return this

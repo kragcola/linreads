@@ -31,6 +31,8 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -42,6 +44,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -65,9 +68,16 @@ fun LibraryScreen(
     modifier: Modifier = Modifier,
     viewModel: LibraryViewModel = koinViewModel(),
 ) {
-    val state by viewModel.uiState.collectAsState()
-    val scanProgress by viewModel.scanProgress.collectAsState()
-    val calibreSearchState by viewModel.calibreSearchState.collectAsState()
+    val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val scanProgress by viewModel.scanProgress.collectAsStateWithLifecycle()
+    val calibreSearchState by viewModel.calibreSearchState.collectAsStateWithLifecycle()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(state.notice) {
+        val notice = state.notice ?: return@LaunchedEffect
+        snackbarHostState.showSnackbar(notice)
+        viewModel.clearNotice()
+    }
     val context = LocalContext.current
 
     var openedBundle by remember { mutableStateOf<BookBundle?>(null) }
@@ -93,6 +103,7 @@ fun LibraryScreen(
         Scaffold(
             modifier = modifier.fillMaxSize(),
             containerColor = MaterialTheme.colorScheme.background,
+            snackbarHost = { SnackbarHost(snackbarHostState) },
             topBar = {
                 TopAppBar(
                     title = { Text("书架", style = MaterialTheme.typography.titleLarge) },
@@ -134,7 +145,8 @@ fun LibraryScreen(
             ) {
                 when {
                     state.isLoading -> CircularProgressIndicator(color = MaterialTheme.colorScheme.onBackground)
-                    state.error != null -> Text("加载失败：${state.error}", color = MaterialTheme.colorScheme.onBackground)
+                    state.error != null && state.items.isEmpty() ->
+                        Text("加载失败：${state.error}", color = MaterialTheme.colorScheme.onBackground)
                     state.items.isEmpty() && state.filter == LibraryFilter.ALL -> EmptyState(
                         onConnectCalibre = onSettings,
                         onImportLocal = { fileLauncher.launch(SUPPORTED_MIMES) },

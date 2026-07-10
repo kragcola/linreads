@@ -102,6 +102,7 @@ class SelectionAwareTextView @JvmOverloads constructor(
                 pendingClickableSpan = null
                 if (candidate != null && quickTap && stableTap) {
                     reportInteractiveTapConsumed()
+                    performClick()
                     candidate.onClick(this)
                     pendingLongPressTextOffset = NO_TEXT_OFFSET
                     return true
@@ -116,6 +117,11 @@ class SelectionAwareTextView @JvmOverloads constructor(
             }
         }
         return super.onTouchEvent(event)
+    }
+
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
     }
 
     override fun onSelectionChanged(selStart: Int, selEnd: Int) {

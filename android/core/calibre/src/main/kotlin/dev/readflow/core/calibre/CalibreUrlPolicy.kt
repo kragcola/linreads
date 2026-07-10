@@ -44,6 +44,36 @@ fun requireValidCalibreBaseUrl(rawUrl: String): String {
     return validation.normalizedUrl
 }
 
+fun requireAllowedCalibreRequestUrl(url: String) {
+    val uri = runCatching { URI(url) }.getOrNull()
+    requireNotNull(uri) { "Calibre 请求地址格式不正确" }
+    val scheme = uri.scheme?.lowercase()
+    require(scheme == "http" || scheme == "https") { "Calibre 请求只支持 HTTP 或 HTTPS" }
+    val host = uri.host
+    require(!host.isNullOrBlank()) { "Calibre 请求地址缺少主机" }
+    require(uri.userInfo == null) { "Calibre 请求地址不得包含凭据" }
+    require(scheme != "http" || host.isLocalhost() || host.isRfc1918Ipv4()) {
+        "HTTP 只允许局域网私有地址：10.x、172.16-31.x、192.168.x，公网地址请使用 HTTPS"
+    }
+}
+
+fun requireSameCalibreOrigin(url: String, baseUrl: String) {
+    val request = URI(url)
+    val base = URI(requireValidCalibreBaseUrl(baseUrl))
+    require(
+        request.scheme.equals(base.scheme, ignoreCase = true) &&
+            request.host.equals(base.host, ignoreCase = true) &&
+            request.effectivePort() == base.effectivePort()
+    ) { "Calibre 重定向不得离开已配置的服务器" }
+}
+
+private fun URI.effectivePort(): Int = when {
+    port >= 0 -> port
+    scheme.equals("http", ignoreCase = true) -> 80
+    scheme.equals("https", ignoreCase = true) -> 443
+    else -> -1
+}
+
 private fun invalid(message: String): CalibreUrlValidation =
     CalibreUrlValidation(normalizedUrl = "", errorMessage = message)
 

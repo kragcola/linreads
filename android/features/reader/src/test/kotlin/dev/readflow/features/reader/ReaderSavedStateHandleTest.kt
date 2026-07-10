@@ -1,8 +1,12 @@
 package dev.readflow.features.reader
 
 import android.net.Uri
+import android.os.Looper
 import android.view.View
 import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import dev.readflow.core.database.BookDao
 import dev.readflow.core.database.BookEntity
 import dev.readflow.core.database.BookWithProgress
@@ -49,8 +53,11 @@ import dev.readflow.render.api.ReaderTextSelection
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.TextSelectableReaderEngine
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -216,6 +223,57 @@ class ReaderSavedStateHandleTest {
             viewModel.uiState.value.loadingState,
         )
         assertNull(viewModel.uiState.value.engine)
+    }
+
+    @Test
+    fun `consecutive direct uri opens close the previous engine once and attach the new engine`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstEngine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val secondEngine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 20)))
+        val engines = ArrayDeque(listOf(firstEngine, secondEngine))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = firstEngine,
+            engineProvider = { engines.removeFirst() },
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenBook(Uri.parse("file:///tmp/first-direct.txt")))
+        advanceUntilIdle()
+        assertEquals(firstEngine, viewModel.uiState.value.engine)
+
+        viewModel.onIntent(ReaderIntent.OpenBook(Uri.parse("file:///tmp/second-direct.txt")))
+        advanceUntilIdle()
+
+        assertEquals(secondEngine, viewModel.uiState.value.engine)
+        assertEquals("the second direct-open engine must remain active", 0, secondEngine.closeCalls)
+        assertEquals("the replaced direct-open engine must be closed exactly once", 1, firstEngine.closeCalls)
+    }
+
+    @Test
+    fun `ordinary failure while closing the previous book does not block the replacement open`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstEngine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val secondEngine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 20)))
+        val engines = ArrayDeque(listOf(firstEngine, secondEngine))
+        val progressDao = FakeProgressDao()
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = firstEngine,
+            engineProvider = { engines.removeFirst() },
+            progressDao = progressDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        progressDao.upsertFailure = IllegalStateException("old progress failed")
+
+        viewModel.onIntent(ReaderIntent.OpenBook(Uri.parse("file:///tmp/replacement.txt")))
+        advanceUntilIdle()
+
+        assertEquals(LoadingState.Loaded, viewModel.uiState.value.loadingState)
+        assertEquals(secondEngine, viewModel.uiState.value.engine)
+        assertEquals(1, firstEngine.closeCalls)
+        assertEquals(0, secondEngine.closeCalls)
     }
 
     @Test
@@ -416,6 +474,177 @@ class ReaderSavedStateHandleTest {
         advanceUntilIdle()
 
         assertNull(store.savedStates["book-1"])
+    }
+
+    @Test
+    fun `ordinary close failures are contained and the engine is not closed twice`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+
+        CloseFailurePoint.entries.forEach { failurePoint ->
+            var now = 1_000L
+            val failure = IllegalStateException("$failurePoint failed")
+            val sessionDao = FakeReadingSessionDao()
+            val progressDao = FakeProgressDao()
+            val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+            val viewModel = readerViewModel(
+                handle = SavedStateHandle(),
+                engine = engine,
+                progressDao = progressDao,
+                sessionDao = sessionDao,
+                clock = { now },
+            )
+
+            viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+            advanceUntilIdle()
+            now = 4_000L
+            when (failurePoint) {
+                CloseFailurePoint.READING_SESSION -> sessionDao.insertFailure = failure
+                CloseFailurePoint.PROGRESS -> progressDao.upsertFailure = failure
+                CloseFailurePoint.ENGINE_CLOSE -> engine.closeFailure = failure
+            }
+
+            viewModel.closeBook()
+
+            assertEquals("$failurePoint must still clear reader state", ReaderUiState(), viewModel.uiState.value)
+            assertEquals("$failurePoint must close the engine once", 1, engine.closeCalls)
+
+            viewModel.closeBook()
+            assertEquals("$failurePoint must not close the engine again", 1, engine.closeCalls)
+        }
+    }
+
+    @Test
+    fun `close rethrows cancellation after clearing state and closing the engine`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        var now = 1_000L
+        val cancellation = CancellationException("session insert cancelled")
+        val sessionDao = FakeReadingSessionDao()
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            sessionDao = sessionDao,
+            clock = { now },
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        now = 4_000L
+        sessionDao.insertFailure = cancellation
+        engine.closeFailure = IllegalStateException("engine close failed during cancellation")
+
+        var observed: Throwable? = null
+        try {
+            viewModel.closeBook()
+        } catch (error: Throwable) {
+            observed = error
+        }
+
+        assertEquals(cancellation, observed)
+        assertEquals(ReaderUiState(), viewModel.uiState.value)
+        assertEquals(1, engine.closeCalls)
+    }
+
+    @Test
+    fun `caller cancellation at close entry still clears state and closes the engine`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(handle = SavedStateHandle(), engine = engine)
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        val closeJob = launch(start = CoroutineStart.UNDISPATCHED) {
+            coroutineContext.cancel(CancellationException("caller cancelled before cleanup"))
+            viewModel.closeBook()
+        }
+        advanceUntilIdle()
+
+        assertTrue(closeJob.isCancelled)
+        assertEquals(ReaderUiState(), viewModel.uiState.value)
+        assertEquals(1, engine.closeCalls)
+    }
+
+    @Test
+    fun `ordinary persistence failures do not skip later close snapshots`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+
+        listOf(CloseFailurePoint.READING_SESSION, CloseFailurePoint.PROGRESS).forEach { failurePoint ->
+            var now = 1_000L
+            val handle = SavedStateHandle()
+            val sessionDao = FakeReadingSessionDao()
+            val progressDao = FakeProgressDao()
+            val engineStateStore = FakeEngineStateStore()
+            val target = Locator(LocatorStrategy.Page(index = 7, total = 10), totalProgression = 0.7f)
+            val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10))).apply {
+                stateToSave = byteArrayOf(7, 0)
+            }
+            val viewModel = readerViewModel(
+                handle = handle,
+                engine = engine,
+                engineStateStore = engineStateStore,
+                progressDao = progressDao,
+                sessionDao = sessionDao,
+                clock = { now },
+            )
+
+            viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+            advanceUntilIdle()
+            engine.currentLocator.value = target
+            now = 4_000L
+            when (failurePoint) {
+                CloseFailurePoint.READING_SESSION -> {
+                    sessionDao.insertFailure = IllegalStateException("session failed")
+                }
+                CloseFailurePoint.PROGRESS -> {
+                    progressDao.upsertFailure = IllegalStateException("progress failed")
+                }
+                CloseFailurePoint.ENGINE_CLOSE -> error("not a persistence failure")
+            }
+
+            viewModel.closeBook()
+
+            val savedReaderState = Json.decodeFromString<ReaderState>(
+                checkNotNull(handle[READER_STATE_SAVED_STATE_KEY]),
+            )
+            assertEquals("$failurePoint must not skip the latest SavedState locator", target, savedReaderState.currentLocator)
+            assertArrayEquals(
+                "$failurePoint must not skip the engine-state snapshot",
+                byteArrayOf(7, 0),
+                engineStateStore.savedStates["book-1"],
+            )
+            if (failurePoint == CloseFailurePoint.READING_SESSION) {
+                val savedProgress = checkNotNull(progressDao.savedProgress("book-1"))
+                assertEquals(target, Json.decodeFromString<Locator>(savedProgress.locatorJson))
+            }
+            assertEquals(ReaderUiState(), viewModel.uiState.value)
+            assertEquals(1, engine.closeCalls)
+        }
+    }
+
+    @Test
+    fun `clearing ViewModelStore closes the current engine once on the main thread`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(handle = SavedStateHandle(), engine = engine)
+        val store = ViewModelStore()
+        val storedViewModel = ViewModelProvider(
+            store,
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = viewModel as T
+            },
+        )[ReaderViewModel::class.java]
+
+        storedViewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        assertEquals(engine, storedViewModel.uiState.value.engine)
+
+        store.clear()
+        advanceUntilIdle()
+
+        assertEquals("ViewModelStore.clear must close the active engine exactly once", 1, engine.closeCalls)
+        assertEquals("engine close must run on the Android main thread", listOf(true), engine.closeOnMainLooper)
     }
 
     @Test
@@ -1105,6 +1334,7 @@ class ReaderSavedStateHandleTest {
     private fun readerViewModel(
         handle: SavedStateHandle,
         engine: FakeReaderEngine,
+        engineProvider: () -> FakeReaderEngine = { engine },
         engineStateStore: EngineStateStore = FakeEngineStateStore(),
         progressDao: FakeProgressDao = FakeProgressDao(),
         syncManager: SyncManager = SyncManager(NoOpSyncBackend()),
@@ -1132,7 +1362,7 @@ class ReaderSavedStateHandleTest {
                         format = BookFormat.TXT,
                         priority = 0,
                         quickSupports = { true },
-                        provider = { engine },
+                        provider = engineProvider,
                     ),
                 ),
                 userOverrides = MutableStateFlow(emptyMap()),
@@ -1151,7 +1381,11 @@ class ReaderSavedStateHandleTest {
 
     private class FakeReadingSessionDao : ReadingSessionDao {
         val sessions = mutableListOf<ReadingSessionEntity>()
-        override suspend fun insert(session: ReadingSessionEntity) { sessions.add(session) }
+        var insertFailure: Throwable? = null
+        override suspend fun insert(session: ReadingSessionEntity) {
+            insertFailure?.let { throw it }
+            sessions.add(session)
+        }
         override suspend fun totalDurationSince(sinceMillis: Long) = sessions.filter { it.startedAt >= sinceMillis }.sumOf { it.durationMs }
         override suspend fun totalDurationForBook(bookId: String) = sessions.filter { it.bookId == bookId }.sumOf { it.durationMs }
         override suspend fun allForBackup() = sessions.toList()
@@ -1178,6 +1412,9 @@ class ReaderSavedStateHandleTest {
         val modeChanges = mutableListOf<ReadingMode>()
         val restoredStates = mutableListOf<ByteArray>()
         var clearTextSelectionCalls = 0
+        var closeCalls = 0
+        var closeFailure: Throwable? = null
+        val closeOnMainLooper = mutableListOf<Boolean>()
         var latestAnnotations: List<ReaderTextAnnotation> = emptyList()
         var stateToSave: ByteArray = ByteArray(0)
 
@@ -1185,7 +1422,10 @@ class ReaderSavedStateHandleTest {
         override suspend fun openBook(uri: Uri): Locator = currentLocator.value
         override fun createView(): View = error("FakeReaderEngine does not create Android views in unit tests")
         override suspend fun close() {
+            closeCalls += 1
+            closeOnMainLooper += Looper.myLooper() == Looper.getMainLooper()
             events += "close"
+            closeFailure?.let { throw it }
         }
         override suspend fun goTo(locator: Locator) {
             goToLocators += locator
@@ -1338,15 +1578,23 @@ class ReaderSavedStateHandleTest {
 
     private class FakeProgressDao : ReadingProgressDao {
         private val progress = mutableMapOf<String, ReadingProgressEntity>()
+        var upsertFailure: Throwable? = null
         override suspend fun get(bookId: String): ReadingProgressEntity? = progress[bookId]
         override suspend fun allForBackup(): List<ReadingProgressEntity> = progress.values.toList()
         override suspend fun upsert(progress: ReadingProgressEntity) {
+            upsertFailure?.let { throw it }
             this.progress[progress.bookId] = progress
         }
         fun savedProgress(bookId: String): ReadingProgressEntity? = progress[bookId]
         fun clear() {
             progress.clear()
         }
+    }
+
+    private enum class CloseFailurePoint {
+        READING_SESSION,
+        PROGRESS,
+        ENGINE_CLOSE,
     }
 
     private class FakeSyncBackend(

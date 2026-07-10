@@ -2,11 +2,15 @@ package dev.readflow.core.calibre
 
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.HttpTimeoutConfig
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.basicAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
-import io.ktor.serialization.kotlinx.json.json
+import io.ktor.client.request.prepareGet
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.utils.io.copyTo
+import java.nio.channels.WritableByteChannel
 import kotlinx.serialization.Serializable
 
 /** Raw Calibre `/ajax/search` response (wire shape). */
@@ -35,7 +39,7 @@ class CalibreClient internal constructor(
     private val password: String,
     private val libraryId: String,
     private val http: HttpClient,
-) {
+) : AutoCloseable {
     constructor(
         baseUrl: String,
         username: String = "",
@@ -46,9 +50,7 @@ class CalibreClient internal constructor(
         username = username,
         password = password,
         libraryId = libraryId,
-        http = HttpClient {
-            install(ContentNegotiation) { json() }
-        },
+        http = defaultCalibreHttpClient(allowedBaseUrl = baseUrl),
     )
 
     private val baseUrl = requireValidCalibreBaseUrl(baseUrl)
@@ -71,8 +73,24 @@ class CalibreClient internal constructor(
 
     fun coverUrl(id: Int) = "$baseUrl/get/cover/$id/$libraryId"
 
-    suspend fun downloadBytes(id: Int, format: String): ByteArray =
-        http.get(downloadUrl(id, format)) {
+    suspend fun downloadTo(id: Int, format: String, output: WritableByteChannel): Long =
+        http.prepareGet(downloadUrl(id, format)) {
             if (username.isNotBlank()) basicAuth(username, password)
-        }.body()
+            timeout {
+                connectTimeoutMillis = DOWNLOAD_CONNECT_TIMEOUT_MS
+                socketTimeoutMillis = DOWNLOAD_SOCKET_TIMEOUT_MS
+                requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
+            }
+        }.execute { response ->
+            response.bodyAsChannel().copyTo(output)
+        }
+
+    override fun close() {
+        http.close()
+    }
+
+    private companion object {
+        const val DOWNLOAD_CONNECT_TIMEOUT_MS = 5_000L
+        const val DOWNLOAD_SOCKET_TIMEOUT_MS = 60_000L
+    }
 }

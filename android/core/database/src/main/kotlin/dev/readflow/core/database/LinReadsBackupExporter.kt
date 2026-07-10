@@ -19,6 +19,10 @@ interface LinReadsBackupRestoreStore {
     suspend fun restore(input: InputStream): LinReadsBackupRestoreResult
 }
 
+fun interface BackupRestoreTransactionRunner {
+    suspend fun run(block: suspend () -> LinReadsBackupRestoreResult): LinReadsBackupRestoreResult
+}
+
 class LinReadsBackupExporter(
     private val progressDao: ReadingProgressDao,
     private val bookmarkDao: BookmarkDao,
@@ -37,6 +41,9 @@ class LinReadsBackupExporter(
             textAnnotations = textAnnotations.map { it.toBackupRecord() },
         )
         val manifestBytes = backupJson.encodeToString(manifest).encodeToByteArray()
+        require(manifestBytes.size <= MAX_BACKUP_MANIFEST_BYTES) {
+            "备份 manifest.json 过大"
+        }
         ZipOutputStream(output).use { zip ->
             zip.putNextEntry(ZipEntry("manifest.json"))
             zip.write(manifestBytes)
@@ -96,12 +103,17 @@ class LinReadsBackupRestorer(
     private val progressDao: ReadingProgressDao,
     private val bookmarkDao: BookmarkDao,
     private val textAnnotationDao: TextAnnotationDao,
+    private val transactionRunner: BackupRestoreTransactionRunner,
 ) : LinReadsBackupRestoreStore {
     override suspend fun restore(input: InputStream): LinReadsBackupRestoreResult {
         val manifest = input.use { backupJson.decodeFromString<LinReadsBackupManifest>(it.readManifestJson()) }
         require(manifest.format == BACKUP_FORMAT) { "不是 LinReads 备份文件" }
         require(manifest.schemaVersion == BACKUP_SCHEMA_VERSION) { "不支持的备份版本：${manifest.schemaVersion}" }
 
+        return transactionRunner.run { restoreManifest(manifest) }
+    }
+
+    private suspend fun restoreManifest(manifest: LinReadsBackupManifest): LinReadsBackupRestoreResult {
         var progressCount = 0
         for (record in manifest.readingProgress) {
             val entity = record.toEntity()
@@ -141,14 +153,32 @@ class LinReadsBackupRestorer(
 
     private fun InputStream.readManifestJson(): String {
         ZipInputStream(this).use { zip ->
-            while (true) {
-                val entry = zip.nextEntry ?: break
-                if (!entry.isDirectory && entry.name == "manifest.json") {
-                    return zip.readBytes().decodeToString()
-                }
+            val entry = zip.nextEntry ?: error("备份文件缺少 manifest.json")
+            if (entry.isDirectory || entry.name != "manifest.json") {
+                error("备份首个条目必须是 manifest.json")
             }
+            if (entry.size > MAX_BACKUP_MANIFEST_BYTES) {
+                error("备份 manifest.json 过大")
+            }
+            val bytes = zip.readAtMost(MAX_BACKUP_MANIFEST_BYTES + 1)
+            if (bytes.size > MAX_BACKUP_MANIFEST_BYTES) {
+                error("备份 manifest.json 过大")
+            }
+            return bytes.decodeToString()
         }
-        error("备份文件缺少 manifest.json")
+    }
+
+    private fun InputStream.readAtMost(limit: Int): ByteArray {
+        val output = java.io.ByteArrayOutputStream(minOf(limit, DEFAULT_BUFFER_SIZE))
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        var remaining = limit
+        while (remaining > 0) {
+            val read = read(buffer, 0, minOf(buffer.size, remaining))
+            if (read < 0) break
+            output.write(buffer, 0, read)
+            remaining -= read
+        }
+        return output.toByteArray()
     }
 
     private fun BackupReadingProgress.toEntity() = ReadingProgressEntity(
@@ -202,6 +232,7 @@ private val backupJson = Json {
 
 private const val BACKUP_FORMAT = "linreads-backup"
 private const val BACKUP_SCHEMA_VERSION = 1
+private const val MAX_BACKUP_MANIFEST_BYTES = 16 * 1024 * 1024
 
 @Serializable
 private data class LinReadsBackupManifest(

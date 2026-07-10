@@ -134,6 +134,45 @@ class DownloadedBookCacheTest {
     }
 
     @Test
+    fun repositoryPreservesLocalShelfStateDuringBatchImport() = runTest {
+        val dao = FakeBookDao()
+        val repository = LibraryRepository(dao, RecordingCache())
+        dao.upsert(
+            BookEntity(
+                id = "local-txt-stable",
+                title = "User renamed title",
+                author = "Reader",
+                format = BookFormat.TXT.name,
+                downloadStatus = DownloadStatus.DOWNLOADED.name,
+                localUri = "file:///books/local-txt-stable.txt",
+                lastReadAt = 1234L,
+                collectionName = "Offline",
+                sortOrder = 7,
+            ),
+        )
+
+        repository.upsertAll(
+            listOf(
+                BookMeta(
+                    id = "local-txt-stable",
+                    title = "incoming-filename",
+                    author = "未知作者",
+                    format = BookFormat.TXT,
+                    downloadStatus = DownloadStatus.DOWNLOADED,
+                    localUri = "file:///books/local-txt-stable.txt",
+                ),
+            ),
+        )
+
+        val book = dao.book("local-txt-stable")
+        assertEquals("User renamed title", book?.title)
+        assertEquals("Reader", book?.author)
+        assertEquals(1234L, book?.lastReadAt)
+        assertEquals("Offline", book?.collectionName)
+        assertEquals(7, book?.sortOrder)
+    }
+
+    @Test
     fun repositoryRemovesDownloadedAssetThroughCache() = runTest {
         val dao = FakeBookDao()
         val cache = RecordingCache()

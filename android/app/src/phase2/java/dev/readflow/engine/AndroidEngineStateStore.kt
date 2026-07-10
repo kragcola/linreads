@@ -4,6 +4,9 @@ import dev.readflow.render.api.EngineStateStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
 class AndroidEngineStateStore(
@@ -20,11 +23,26 @@ class AndroidEngineStateStore(
         root.mkdirs()
         val target = stateFile(bookId)
         val temp = File(root, "${target.name}.tmp")
-        temp.writeBytes(state)
-        if (!temp.renameTo(target)) {
-            temp.copyTo(target, overwrite = true)
+        try {
+            temp.writeBytes(state)
+            try {
+                Files.move(
+                    temp.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(
+                    temp.toPath(),
+                    target.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+        } finally {
             temp.delete()
         }
+        Unit
     }
 
     override suspend fun evict(bookId: String) = withContext(Dispatchers.IO) {

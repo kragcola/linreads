@@ -11,7 +11,7 @@ internal object PdfOutlineParser {
         if (pageCount <= 0 || !file.isFile || file.length() > MAX_SCAN_BYTES) return emptyList()
         val source = runCatching {
             file.inputStream().use { input ->
-                val bytes = input.readNBytes(MAX_SCAN_BYTES + 1)
+                val bytes = input.readAtMost(MAX_SCAN_BYTES + 1)
                 if (bytes.size > MAX_SCAN_BYTES) return emptyList()
                 String(bytes, StandardCharsets.ISO_8859_1)
             }
@@ -515,6 +515,19 @@ internal object PdfOutlineParser {
     private val destArrayRegex = Regex("""/Dest\s*\[\s*(\d+)\s+(\d+)\s+R""")
     private val actionDestArrayRegex = Regex("""/D\s*\[\s*(\d+)\s+(\d+)\s+R""")
     private val pdfNameEscapeRegex = Regex("""#([0-9A-Fa-f]{2})""")
+}
+
+private fun java.io.InputStream.readAtMost(limit: Int): ByteArray {
+    val output = java.io.ByteArrayOutputStream(minOf(limit, DEFAULT_BUFFER_SIZE))
+    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+    var remaining = limit
+    while (remaining > 0) {
+        val read = read(buffer, 0, minOf(buffer.size, remaining))
+        if (read < 0) break
+        output.write(buffer, 0, read)
+        remaining -= read
+    }
+    return output.toByteArray()
 }
 
 internal fun buildPdfFallbackToc(total: Int): List<TocEntry> =

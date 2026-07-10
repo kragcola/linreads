@@ -4,6 +4,21 @@
 
 ---
 
+## 2026-07-10
+
+### Android full audit hardening and release review
+- 范围：基于 `32c8c756` 对当前 Android 全量审计修复做发布前复核，只提交 Readflow 自有的 Android 源码、测试与追踪文档；HarmonyOS/Web 本批无实现变更
+- 数据与文件一致性：完整删除按 Room 最终状态决定 staging 提交/恢复，中断恢复按书隔离，并按稳定 `bookId` 清理陈旧或缺失 URI 的受控文件；共享资产协调器串行化 Calibre 下载、本地导入与删除。备份恢复在单一 Room transaction 中执行，只接受首个 ZIP 条目为非目录 `manifest.json`，拒绝前置高压缩大条目，manifest 实际解压限制为 16 MiB
+- Reader：打开/关闭串行化，关闭从入口起在 `NonCancellable` 中完成；会话、最终进度、SavedState、引擎快照和引擎关闭逐步隔离，单步普通失败不跳过后续落盘、不阻断替换打开，取消在清理后继续向上传播。Reader route 的系统返回和工具栏返回都会等待 `closeBook()` 后退栈
+- OTA/安全：`dev-latest` 下载身份绑定 workflow `BUILD_TAG`，缺失或变化时不复用旧 APK；前台检查在 STOP/dispose 取消在途 Job，synchronized generation guard 只允许最新结果发布通知。Android 13+ 缺通知权限、系统通知禁用及通知发布异常均被安全隔离；Phase 1 禁用 OTA receiver
+- Calibre/EPUB：正式下载覆盖短探测超时并流式写 staging；明文 HTTP 限制 localhost/RFC1918 且重定向保持同源。EPUB container/OPF 按实际解压字节限制 2 MiB，并保留规范化的 archive-root 封面兼容路径
+- 独立复核：数据/安全、Reader/Calibre、app/OTA 三线最终均未发现残留 Critical/Important。保留三个 Minor：协调器不支持未来同协程嵌套 `produce()`、删除取消下载后 `downloadingBookId` 可能暂留、Calibre failure smoke 尚未覆盖真实 mid-stream staging 清理
+- RED/GREEN：新增前置 ZIP 压缩炸弹、Reader 入口取消/分步持久化/替换打开、OTA 在途取消与 stale token 拒绝等确定性回归；定向测试全部由失败转为通过
+- 最终本地门禁（JDK 21）：Phase 2 `test lint` 1094 tasks PASS；Phase 3 `test` 705 tasks PASS；Phase 1/3 `assembleDebug` 186/347 tasks PASS；Phase 3 项目图 PASS；Phase 2 `assembleOta` 599 tasks PASS；`git diff --check` PASS。OTA APK `9,849,169` bytes，SHA-256 `eb9cb1ad5ad5c8a7539800ca9dcd04692e4be89abcd31c6bfacd08a4a53a7965`
+- 发布状态：本地复核与门禁完成，远端 `Android Dev Release` / `dev-latest` 证据将在推送后回填
+
+---
+
 ## 2026-06-27
 
 ### LinReads TXT offline S7 deep proof and locator race fix

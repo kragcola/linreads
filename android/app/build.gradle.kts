@@ -24,6 +24,7 @@ android {
         buildConfigField("String", "GITHUB_REPO", "\"kragcola/linreads\"")
         buildConfigField("String", "BUILD_TAG", "\"$buildTag\"")
         buildConfigField("String", "GITHUB_OTA_TOKEN", "\"${System.getenv("GITHUB_OTA_TOKEN") ?: ""}\"" )
+        manifestPlaceholders["updateReceiverEnabled"] = readflowPhase >= 2
     }
 
     // Explicit signing so the key never silently changes between machines/CI runs.

@@ -2,14 +2,20 @@ package dev.readflow.di
 
 import android.app.Application
 import androidx.room.Room
+import androidx.room.withTransaction
 import dev.readflow.core.calibre.CalibreClient
 import dev.readflow.core.calibre.CalibreRepository
 import dev.readflow.core.calibre.CalibreRepositoryImpl
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.database.LibraryStore
+import dev.readflow.core.database.CompleteBookDeletionStore
+import dev.readflow.core.database.CoroutineBookAssetOperationCoordinator
+import dev.readflow.core.database.FileManagedBookAssetDeletionStore
+import dev.readflow.core.database.LibraryDeletionTransactionRunner
 import dev.readflow.core.database.ReadflowDatabase
 import dev.readflow.core.prefs.DataStoreSettingsRepository
 import dev.readflow.core.prefs.SettingsRepository
+import dev.readflow.core.model.BookAssetOperationCoordinator
 import dev.readflow.core.sync.NoOpSyncBackend
 import dev.readflow.core.sync.SyncBackend
 import dev.readflow.core.sync.SyncManager
@@ -33,6 +39,7 @@ import java.io.File
  */
 
 val coreModule = module {
+    single<BookAssetOperationCoordinator> { CoroutineBookAssetOperationCoordinator() }
     single<SyncBackend> { NoOpSyncBackend() }
     single { SyncManager(get()) }
     single { ReaderEventBus() }
@@ -49,19 +56,31 @@ val databaseModule = module {
             .build()
     }
     single { get<ReadflowDatabase>().bookDao() }
+    single { get<ReadflowDatabase>().bookDeletionDao() }
     single { get<ReadflowDatabase>().readingProgressDao() }
     single { get<ReadflowDatabase>().textAnnotationDao() }
     single { get<ReadflowDatabase>().inkStrokeDao() }
     single { get<ReadflowDatabase>().bookmarkDao() }
     single { get<ReadflowDatabase>().readingSessionDao() }
-    single { LibraryRepository(get()) }
+    single {
+        val database = get<ReadflowDatabase>()
+        CompleteBookDeletionStore(
+            deletionDao = get(),
+            assetStore = FileManagedBookAssetDeletionStore(File(androidContext().filesDir, "books")),
+            transactionRunner = LibraryDeletionTransactionRunner { block ->
+                database.withTransaction { block() }
+            },
+            assetOperations = get(),
+        )
+    }
+    single { LibraryRepository(bookDao = get(), completeBookDeletionStore = get()) }
     single<LibraryStore> { get<LibraryRepository>() }
 }
 
 val extensionsModule = module {
     single { LocalFileBookSource(androidContext()) }
     single<LocalBookImporter> { get<LocalFileBookSource>() }
-    single { FirstLaunchSeeder(androidContext(), get(), get()) }
+    single { FirstLaunchSeeder(androidContext(), get(), get(), get()) }
 }
 
 val settingsModule = module {
@@ -77,7 +96,7 @@ val settingsModule = module {
 }
 
 val featureModule = module {
-    viewModel { LibraryViewModel(get(), get(), get(), get()) }
+    viewModel { LibraryViewModel(get(), get(), get(), get(), get()) }
 }
 
 val appModules = listOf(coreModule, databaseModule, extensionsModule, settingsModule, featureModule)

@@ -76,6 +76,28 @@ class CalibreConnectionTesterTest {
         assertEquals("http://192.168.1.5:8080/ajax/search?query=&num=1&offset=0", requestedUrl)
     }
 
+    @Test
+    fun refusesRedirectFromPrivateCalibreToPublicHttp() = runTest {
+        var requestCount = 0
+        val tester = testerWithEngine { request ->
+            requestCount++
+            if (requestCount == 1) {
+                respond(
+                    content = "",
+                    status = HttpStatusCode.Found,
+                    headers = headersOf(HttpHeaders.Location, "http://example.com/books"),
+                )
+            } else {
+                error("public redirect must not be requested: ${request.url}")
+            }
+        }
+
+        val result = tester.check("http://192.168.1.5:8080")
+
+        assertTrue(result is CalibreConnectionCheckResult.Failure)
+        assertEquals(1, requestCount)
+    }
+
     private fun testerWithResponse(json: String): CalibreConnectionTester =
         testerWithEngine {
             respond(content = json, headers = jsonHeaders)
@@ -84,7 +106,9 @@ class CalibreConnectionTesterTest {
     private fun testerWithEngine(
         handler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
     ): CalibreConnectionTester =
-        KtorCalibreConnectionTester { defaultCalibreHttpClient(MockEngine(handler)) }
+        KtorCalibreConnectionTester { baseUrl ->
+            defaultCalibreHttpClient(MockEngine(handler), allowedBaseUrl = baseUrl)
+        }
 
     private companion object {
         val jsonHeaders = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())

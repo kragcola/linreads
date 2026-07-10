@@ -1,6 +1,7 @@
 package dev.readflow.core.sync
 
 import dev.readflow.core.model.Bookmark
+import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.model.ReadingProgress
 
 /**
@@ -17,7 +18,10 @@ class SyncManager(private val backend: SyncBackend) {
      */
     suspend fun syncProgress(bookId: String, local: ReadingProgress): ReadingProgress? {
         if (!isSyncEnabled) return null
-        val remote = backend.pullProgress(bookId).getOrNull()
+        val remote = when (val result = backend.pullProgress(bookId)) {
+            is ReadflowResult.Success -> result.value
+            is ReadflowResult.Failure -> return null
+        }
         if (remote == null) {
             backend.pushProgress(bookId, local)
             return null

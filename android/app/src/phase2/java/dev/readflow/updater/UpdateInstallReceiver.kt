@@ -24,40 +24,52 @@ class UpdateInstallReceiver : BroadcastReceiver() {
 
     private fun onInstallRequested(context: Context, intent: Intent) {
         val apkUrl = intent.getStringExtra("apk_url") ?: return
+        val buildTag = intent.getStringExtra("build_tag")
         val authToken = intent.getStringExtra("auth_token") ?: ""
 
         val prefs = context.getSharedPreferences("update", Context.MODE_PRIVATE)
         val prevId = prefs.getLong("dl_id", -1)
+        val reusableDownload = canReuseUpdateDownload(
+            savedUrl = prefs.getString("dl_url", null),
+            savedTag = prefs.getString("dl_tag", null),
+            requestedUrl = apkUrl,
+            requestedTag = buildTag,
+        )
 
         // Check if we have a completed download already
         if (prevId != -1L) {
             val dm = context.getSystemService(DownloadManager::class.java)
-            val q = dm.query(DownloadManager.Query().setFilterById(prevId))
-            if (q.moveToFirst()) {
-                val status = q.getInt(q.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
-                q.close()
-                when (status) {
-                    DownloadManager.STATUS_SUCCESSFUL -> {
-                        // Old completed download exists - verify it's still valid
-                        val uri = dm.getUriForDownloadedFile(prevId)
-                        if (uri != null) {
-                            launchInstaller(context, uri)
+            if (!reusableDownload) {
+                dm.remove(prevId)
+                prefs.edit().remove("dl_id").remove("dl_url").remove("dl_tag").apply()
+            } else {
+                val q = dm.query(DownloadManager.Query().setFilterById(prevId))
+                if (q.moveToFirst()) {
+                    val status = q.getInt(q.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                    q.close()
+                    when (status) {
+                        DownloadManager.STATUS_SUCCESSFUL -> {
+                            // Old completed download exists - verify it's still valid
+                            val uri = dm.getUriForDownloadedFile(prevId)
+                            if (uri != null) {
+                                launchInstaller(context, uri)
+                                return
+                            }
+                            // File missing, clean up and re-download
+                            dm.remove(prevId)
+                        }
+                        DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING -> {
+                            // Download already in progress - do nothing
                             return
                         }
-                        // File missing, clean up and re-download
-                        dm.remove(prevId)
+                        else -> {
+                            // Failed/paused - clean up and restart
+                            dm.remove(prevId)
+                        }
                     }
-                    DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING -> {
-                        // Download already in progress - do nothing
-                        return
-                    }
-                    else -> {
-                        // Failed/paused - clean up and restart
-                        dm.remove(prevId)
-                    }
+                } else {
+                    q.close()
                 }
-            } else {
-                q.close()
             }
         }
 
@@ -80,7 +92,11 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                 setDestinationInExternalFilesDir(context, null, "update.apk")
             }
         )
-        prefs.edit().putLong("dl_id", dlId).apply()
+        prefs.edit()
+            .putLong("dl_id", dlId)
+            .putString("dl_url", apkUrl)
+            .putString("dl_tag", buildTag)
+            .apply()
     }
 
     private fun launchInstaller(context: Context, uri: Uri) {

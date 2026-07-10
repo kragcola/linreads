@@ -1,6 +1,7 @@
 package dev.readflow.di
 
 import androidx.room.Room
+import androidx.room.withTransaction
 import dev.readflow.core.calibre.CalibreEndpointProbe
 import dev.readflow.core.calibre.CalibreConnectionTester
 import dev.readflow.core.calibre.CalibreClient
@@ -10,6 +11,11 @@ import dev.readflow.core.calibre.GuidedCalibreEndpointProbe
 import dev.readflow.core.calibre.createCalibreConnectionTester
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.database.LibraryStore
+import dev.readflow.core.database.BackupRestoreTransactionRunner
+import dev.readflow.core.database.CompleteBookDeletionStore
+import dev.readflow.core.database.CoroutineBookAssetOperationCoordinator
+import dev.readflow.core.database.FileManagedBookAssetDeletionStore
+import dev.readflow.core.database.LibraryDeletionTransactionRunner
 import dev.readflow.core.database.LinReadsBackupExportStore
 import dev.readflow.core.database.LinReadsBackupExporter
 import dev.readflow.core.database.LinReadsBackupRestoreStore
@@ -18,6 +24,7 @@ import dev.readflow.core.database.NotesMarkdownExportStore
 import dev.readflow.core.database.NotesMarkdownFileExporter
 import dev.readflow.core.database.ReadflowDatabase
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.BookAssetOperationCoordinator
 import dev.readflow.core.sync.NoOpSyncBackend
 import dev.readflow.core.sync.SyncBackend
 import dev.readflow.core.sync.SyncManager
@@ -52,6 +59,7 @@ import java.io.File
 import org.koin.dsl.module
 
 val coreModule = module {
+    single<BookAssetOperationCoordinator> { CoroutineBookAssetOperationCoordinator() }
     single<SyncBackend> { NoOpSyncBackend() }
     single { SyncManager(get()) }
     single { ReaderEventBus() }
@@ -64,22 +72,44 @@ val databaseModule = module {
             .build()
     }
     single { get<ReadflowDatabase>().bookDao() }
+    single { get<ReadflowDatabase>().bookDeletionDao() }
     single { get<ReadflowDatabase>().readingProgressDao() }
     single { get<ReadflowDatabase>().textAnnotationDao() }
     single { get<ReadflowDatabase>().inkStrokeDao() }
     single { get<ReadflowDatabase>().bookmarkDao() }
     single { get<ReadflowDatabase>().readingSessionDao() }
-    single { LibraryRepository(get()) }
+    single {
+        val database = get<ReadflowDatabase>()
+        CompleteBookDeletionStore(
+            deletionDao = get(),
+            assetStore = FileManagedBookAssetDeletionStore(File(androidContext().filesDir, "books")),
+            transactionRunner = LibraryDeletionTransactionRunner { block ->
+                database.withTransaction { block() }
+            },
+            assetOperations = get(),
+        )
+    }
+    single { LibraryRepository(bookDao = get(), completeBookDeletionStore = get()) }
     single<LibraryStore> { get<LibraryRepository>() }
     single<LinReadsBackupExportStore> { LinReadsBackupExporter(get(), get(), get()) }
-    single<LinReadsBackupRestoreStore> { LinReadsBackupRestorer(get(), get(), get()) }
+    single<LinReadsBackupRestoreStore> {
+        val database = get<ReadflowDatabase>()
+        LinReadsBackupRestorer(
+            progressDao = get(),
+            bookmarkDao = get(),
+            textAnnotationDao = get(),
+            transactionRunner = BackupRestoreTransactionRunner { block ->
+                database.withTransaction { block() }
+            },
+        )
+    }
     single<NotesMarkdownExportStore> { NotesMarkdownFileExporter(get(), get(), get()) }
 }
 
 val extensionsModule = module {
     single { LocalFileBookSource(androidContext()) }
     single<LocalBookImporter> { get<LocalFileBookSource>() }
-    single { FirstLaunchSeeder(androidContext(), get(), get()) }
+    single { FirstLaunchSeeder(androidContext(), get(), get(), get()) }
 }
 
 val renderModule = module {
@@ -161,7 +191,7 @@ val settingsModule = module {
 }
 
 val featureModule = module {
-    viewModel { LibraryViewModel(get(), get(), get(), get()) }
+    viewModel { LibraryViewModel(get(), get(), get(), get(), get()) }
     viewModel { SettingsViewModel(get(), get(), get(), get(), get(), get(), get()) }
     viewModel { ReaderViewModel(get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get()) }
 }

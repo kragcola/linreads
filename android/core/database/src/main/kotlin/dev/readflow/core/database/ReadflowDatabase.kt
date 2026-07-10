@@ -23,6 +23,7 @@ import androidx.room.RoomDatabase
 )
 abstract class ReadflowDatabase : RoomDatabase() {
     abstract fun bookDao(): BookDao
+    abstract fun bookDeletionDao(): BookDeletionDao
     abstract fun readingProgressDao(): ReadingProgressDao
     abstract fun textAnnotationDao(): TextAnnotationDao
     abstract fun inkStrokeDao(): InkStrokeDao

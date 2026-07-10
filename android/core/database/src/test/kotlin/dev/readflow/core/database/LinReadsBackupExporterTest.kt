@@ -14,9 +14,12 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class LinReadsBackupExporterTest {
+
+    private val directTransactionRunner = BackupRestoreTransactionRunner { restore -> restore() }
 
     @Test
     fun exportsProgressBookmarksAndTextAnnotationsAsManifestZip() = runTest {
@@ -84,6 +87,40 @@ class LinReadsBackupExporterTest {
             "annotation-1",
             manifest.getValue("text_annotations").jsonArray.single().jsonObject.getValue("id").jsonPrimitive.content,
         )
+    }
+
+    @Test
+    fun exportRejectsManifestLargerThanRestoreLimit() = runTest {
+        val output = ByteArrayOutputStream()
+        val exporter = LinReadsBackupExporter(
+            progressDao = FakeProgressDao(),
+            bookmarkDao = FakeBookmarkDao(),
+            textAnnotationDao = FakeTextAnnotationDao(
+                TextAnnotationEntity(
+                    id = "oversized-annotation",
+                    bookId = "book-1",
+                    totalProgression = 0.5f,
+                    anchorType = "text-selection-range",
+                    anchorJson = "{}",
+                    selectedText = "x".repeat(16 * 1024 * 1024 + 1),
+                    note = null,
+                    color = 0,
+                    createdAt = 1,
+                    updatedAt = 1,
+                    deviceId = "device-a",
+                    isDeleted = false,
+                ),
+            ),
+        )
+
+        val exportAttempt = runCatching { exporter.export(output) }
+
+        assertTrue(
+            "export must fail instead of reporting success for an unrestorable manifest",
+            exportAttempt.isFailure,
+        )
+        assertEquals("备份 manifest.json 过大", exportAttempt.exceptionOrNull()?.message)
+        assertEquals("oversized export must not write a partial ZIP", 0, output.size())
     }
 
     @Test
@@ -171,7 +208,12 @@ class LinReadsBackupExporterTest {
             ),
         )
         val localAnnotations = FakeTextAnnotationDao()
-        val restorer = LinReadsBackupRestorer(localProgress, localBookmarks, localAnnotations)
+        val restorer = LinReadsBackupRestorer(
+            localProgress,
+            localBookmarks,
+            localAnnotations,
+            directTransactionRunner,
+        )
 
         val result = restorer.restore(ByteArrayInputStream(backupBytes))
 
@@ -183,6 +225,41 @@ class LinReadsBackupExporterTest {
         assertEquals(true, localBookmarks.row("new-bookmark")?.isDeleted)
         assertEquals("newer local bookmark", localBookmarks.row("existing-bookmark")?.text)
         assertEquals("restored", localAnnotations.row("new-annotation")?.note)
+    }
+
+    @Test
+    fun restoreRunsAllDatabaseWritesInsideOneTransactionBoundary() = runTest {
+        val backupBytes = ByteArrayOutputStream().also { output ->
+            LinReadsBackupExporter(
+                progressDao = FakeProgressDao(
+                    ReadingProgressEntity(
+                        bookId = "book-1",
+                        locatorJson = """{"type":"byte","offset":128}""",
+                        totalProgression = 0.42f,
+                        progressPercent = 42f,
+                        updatedAt = 300,
+                        deviceId = "backup-device",
+                    ),
+                ),
+                bookmarkDao = FakeBookmarkDao(),
+                textAnnotationDao = FakeTextAnnotationDao(),
+            ).export(output)
+        }.toByteArray()
+        var transactionCount = 0
+        val restorer = LinReadsBackupRestorer(
+            progressDao = FakeProgressDao(),
+            bookmarkDao = FakeBookmarkDao(),
+            textAnnotationDao = FakeTextAnnotationDao(),
+            transactionRunner = BackupRestoreTransactionRunner { restore ->
+                transactionCount += 1
+                restore()
+            },
+        )
+
+        val result = restorer.restore(ByteArrayInputStream(backupBytes))
+
+        assertEquals(1, transactionCount)
+        assertEquals(1, result.progressCount)
     }
 
     @Test
@@ -210,7 +287,12 @@ class LinReadsBackupExporterTest {
             """.trimIndent(),
         )
         val localProgress = FakeProgressDao()
-        val restorer = LinReadsBackupRestorer(localProgress, FakeBookmarkDao(), FakeTextAnnotationDao())
+        val restorer = LinReadsBackupRestorer(
+            localProgress,
+            FakeBookmarkDao(),
+            FakeTextAnnotationDao(),
+            directTransactionRunner,
+        )
 
         val error = runCatching {
             restorer.restore(ByteArrayInputStream(backupBytes))
@@ -245,7 +327,12 @@ class LinReadsBackupExporterTest {
             """.trimIndent(),
         )
         val localProgress = FakeProgressDao()
-        val restorer = LinReadsBackupRestorer(localProgress, FakeBookmarkDao(), FakeTextAnnotationDao())
+        val restorer = LinReadsBackupRestorer(
+            localProgress,
+            FakeBookmarkDao(),
+            FakeTextAnnotationDao(),
+            directTransactionRunner,
+        )
 
         val error = runCatching {
             restorer.restore(ByteArrayInputStream(backupBytes))
@@ -254,6 +341,59 @@ class LinReadsBackupExporterTest {
         assertNotNull(error)
         assertEquals(true, error?.message?.contains("schema_version"))
         assertEquals(null, localProgress.row("missing-schema-book"))
+    }
+
+    @Test
+    fun restoreRejectsCompressedEntryBeforeManifestWithoutMutatingLocalData() = runTest {
+        val manifestJson =
+            """
+            {
+              "format": "linreads-backup",
+              "schema_version": 1,
+              "exported_at": 1,
+              "reading_progress": [
+                {
+                  "book_id": "preceded-manifest-book",
+                  "locator_json": "{\"type\":\"byte\",\"offset\":1}",
+                  "total_progression": 0.1,
+                  "progress_percent": 10.0,
+                  "updated_at": 10,
+                  "device_id": "backup-device"
+                }
+              ],
+              "bookmarks": [],
+              "text_annotations": [],
+              "assets": []
+            }
+            """.trimIndent()
+        val backupBytes = ByteArrayOutputStream().also { output ->
+            ZipOutputStream(output).use { zip ->
+                zip.putNextEntry(ZipEntry("compressed-bomb.bin"))
+                val zeroes = ByteArray(DEFAULT_BUFFER_SIZE)
+                repeat((16 * 1024 * 1024) / zeroes.size + 1) {
+                    zip.write(zeroes)
+                }
+                zip.closeEntry()
+                zip.putNextEntry(ZipEntry("manifest.json"))
+                zip.write(manifestJson.encodeToByteArray())
+                zip.closeEntry()
+            }
+        }.toByteArray()
+        val localProgress = FakeProgressDao()
+        val restorer = LinReadsBackupRestorer(
+            localProgress,
+            FakeBookmarkDao(),
+            FakeTextAnnotationDao(),
+            directTransactionRunner,
+        )
+
+        val error = runCatching {
+            restorer.restore(ByteArrayInputStream(backupBytes))
+        }.exceptionOrNull()
+
+        assertNotNull(error)
+        assertEquals("备份首个条目必须是 manifest.json", error?.message)
+        assertEquals(null, localProgress.row("preceded-manifest-book"))
     }
 
     private fun manifestZip(manifestJson: String): ByteArray {

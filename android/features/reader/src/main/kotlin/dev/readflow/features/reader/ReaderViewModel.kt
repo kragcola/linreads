@@ -34,8 +34,16 @@ import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.TextSelectableReaderEngine
 import dev.readflow.render.api.ZoomableReaderEngine
 import dev.readflow.render.api.toReadingMode
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.StateFlow
@@ -44,6 +52,9 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.UUID
@@ -99,6 +110,10 @@ class ReaderViewModel(
     private var annotationJob: Job? = null
     private var settingsFontJob: Job? = null
     private var settingsLineSpacingJob: Job? = null
+    private var openJob: Job? = null
+    private var activeEngine: ReaderEngine? = _uiState.value.engine
+    private val sessionMutex = Mutex()
+    private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var sessionStartedAt: Long? = null
     // 记录最近一次打开请求，供错误页「重试」复用。
     private var lastOpenRequest: OpenRequest? = null
@@ -107,7 +122,7 @@ class ReaderViewModel(
         is ReaderIntent.OpenById -> openById(intent.bookId)
         is ReaderIntent.OpenBook -> openByUri(null, intent.uri)
         ReaderIntent.Retry -> retry()
-        ReaderIntent.CloseBook -> close()
+        ReaderIntent.CloseBook -> viewModelScope.launch { closeBook() }
         is ReaderIntent.GoTo -> goTo(intent.locator)
         is ReaderIntent.SeekToProgress -> seekToProgress(intent.fraction)
         is ReaderIntent.GoToTocEntry -> goToTocEntry(intent.entry)
@@ -171,24 +186,28 @@ class ReaderViewModel(
         lastOpenRequest = OpenRequest.ById(bookId)
         val restoredForBook = restoredReaderState?.takeIf { it.bookId == bookId }
         _uiState.update { it.copy(loadingState = LoadingState.Loading) }
-        currentBookId = bookId
-        persistReaderState(bookId = bookId, loadingState = LoadingState.Loading)
-        viewModelScope.launch {
-            val book = bookDao.getById(bookId)
-            if (book == null) {
-                val error = ReadflowError.notFound("book", bookId)
-                _uiState.update { it.copy(loadingState = LoadingState.Error(error)) }
-                persistReaderState(bookId = bookId, loadingState = LoadingState.Error(error), error = error)
-                return@launch
+        replaceOpenJob {
+            sessionMutex.withLock {
+                closeLocked()
+                currentBookId = bookId
+                _uiState.update { it.copy(loadingState = LoadingState.Loading) }
+                persistReaderState(bookId = bookId, loadingState = LoadingState.Loading)
+                val book = bookDao.getById(bookId)
+                if (book == null) {
+                    val error = ReadflowError.notFound("book", bookId)
+                    _uiState.update { it.copy(loadingState = LoadingState.Error(error)) }
+                    persistReaderState(bookId = bookId, loadingState = LoadingState.Error(error), error = error)
+                    return@withLock
+                }
+                val uri = book.localUri?.let { Uri.parse(it) }
+                if (uri == null) {
+                    val error = ReadflowError.io("本地文件未找到")
+                    _uiState.update { it.copy(loadingState = LoadingState.Error(error), bookTitle = book.title) }
+                    persistReaderState(bookId = bookId, loadingState = LoadingState.Error(error), error = error)
+                    return@withLock
+                }
+                openByUriLocked(bookId, uri, book.title, restoredForBook)
             }
-            val uri = book.localUri?.let { Uri.parse(it) }
-            if (uri == null) {
-                val error = ReadflowError.io("本地文件未找到")
-                _uiState.update { it.copy(loadingState = LoadingState.Error(error), bookTitle = book.title) }
-                persistReaderState(bookId = bookId, loadingState = LoadingState.Error(error), error = error)
-                return@launch
-            }
-            openByUri(bookId, uri, book.title, restoredForBook)
         }
     }
 
@@ -213,15 +232,32 @@ class ReaderViewModel(
                 textSelection = null,
             )
         }
-        viewModelScope.launch {
-            val engine = runCatching { engineRegistry.resolve(uri) }.getOrElse { error ->
-                val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
-                _uiState.update { it.copy(loadingState = LoadingState.Error(readflowError), bookTitle = title) }
-                bookId?.let {
-                    persistReaderState(bookId = it, loadingState = LoadingState.Error(readflowError), error = readflowError)
-                }
-                return@launch
+        replaceOpenJob {
+            sessionMutex.withLock {
+                closeLocked()
+                _uiState.update { it.copy(loadingState = LoadingState.Loading) }
+                openByUriLocked(bookId, uri, title, restoredForBook)
             }
+        }
+    }
+
+    private suspend fun openByUriLocked(
+        bookId: String?,
+        uri: Uri,
+        title: String,
+        restoredForBook: ReaderState?,
+    ) {
+        val engine = runCatching { engineRegistry.resolve(uri) }.getOrElse { error ->
+            if (error is CancellationException) throw error
+            val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
+            _uiState.update { it.copy(loadingState = LoadingState.Error(readflowError), bookTitle = title) }
+            bookId?.let {
+                persistReaderState(bookId = it, loadingState = LoadingState.Error(readflowError), error = readflowError)
+            }
+            return
+        }
+        var engineAttached = false
+        try {
             restoreEngineStateIfPresent(bookId, engine)
             val restoredLocator = restoredForBook?.currentLocator
             val persistedProgress = bookId?.let { id -> progressDao.get(id) }
@@ -245,12 +281,13 @@ class ReaderViewModel(
             }
             initialLocatorAwareEngine?.setInitialLocator(displayLocator)
             val openedLocator = runCatching { engine.openBook(uri) }.getOrElse { error ->
+                if (error is CancellationException) throw error
                 val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
                 _uiState.update { it.copy(loadingState = LoadingState.Error(readflowError), bookTitle = title) }
                 bookId?.let {
                     persistReaderState(bookId = it, loadingState = LoadingState.Error(readflowError), error = readflowError)
                 }
-                return@launch
+                return
             }
             if (initialLocatorAwareEngine != null && displayLocator != null) {
                 displayLocator = openedLocator
@@ -267,10 +304,18 @@ class ReaderViewModel(
             }
             displayLocator?.let { locator ->
                 if (!engine.currentLocator.value.sameDisplayPositionAs(locator)) {
-                    runCatching { engine.goTo(locator) }
+                    try {
+                        engine.goTo(locator)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Throwable) {
+                        Unit
+                    }
                 }
             }
             currentBookId = bookId
+            activeEngine = engine
+            engineAttached = true
             _uiState.update {
                 it.copy(
                     loadingState = LoadingState.Loaded,
@@ -303,7 +348,16 @@ class ReaderViewModel(
             bookId?.let {
                 persistReaderState(bookId = it, locator = engine.currentLocator.value, loadingState = LoadingState.Loaded)
             }
+        } finally {
+            if (!engineAttached) {
+                withContext(NonCancellable) { runCatching { engine.close() } }
+            }
         }
+    }
+
+    private fun replaceOpenJob(block: suspend () -> Unit) {
+        openJob?.cancel()
+        openJob = viewModelScope.launch { block() }
     }
 
     private suspend fun readerOpenSettings(
@@ -339,7 +393,13 @@ class ReaderViewModel(
             engine.setTxtEncodingOverride(openSettings.txtEncodingCharsetName)
         }
         openSettings.readingMode?.let { mode ->
-            runCatching { engine.setMode(mode) }
+            try {
+                engine.setMode(mode)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                Unit
+            }
         }
     }
 
@@ -604,7 +664,13 @@ class ReaderViewModel(
             )
         }
         searchJob = viewModelScope.launch {
-            val searchResult = runCatching { engine.search(query) }
+            val searchResult = try {
+                Result.success(engine.search(query))
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Result.failure(error)
+            }
             _uiState.update { state ->
                 if (state.search.query != query) {
                     state
@@ -751,9 +817,35 @@ class ReaderViewModel(
         }
     }
 
-    private fun close() {
+    suspend fun closeBook() {
+        val callerContext = currentCoroutineContext()
+        var closeCancellation: CancellationException? = null
+        withContext(NonCancellable) {
+            try {
+                openJob?.cancelAndJoin()
+            } catch (error: CancellationException) {
+                closeCancellation = error
+            } catch (_: Throwable) {
+                Unit
+            } finally {
+                openJob = null
+            }
+            try {
+                sessionMutex.withLock { closeLocked() }
+            } catch (error: CancellationException) {
+                closeCancellation = closeCancellation ?: error
+            } catch (_: Throwable) {
+                Unit
+            }
+        }
+        closeCancellation?.let { throw it }
+        callerContext.ensureActive()
+    }
+
+    private suspend fun closeLocked() {
         val bookId = currentBookId
-        val locator = _uiState.value.engine?.currentLocator?.value
+        val engine = activeEngine
+        val locator = engine?.currentLocator?.value
         progressJob?.cancel()
         fontPreviewPersistJob?.cancel()
         searchJob?.cancel()
@@ -762,53 +854,109 @@ class ReaderViewModel(
         annotationJob?.cancel()
         settingsFontJob?.cancel()
         settingsLineSpacingJob?.cancel()
-        val engine = _uiState.value.engine
-        viewModelScope.launch {
+        var closeCancellation: CancellationException? = null
+
+        suspend fun attempt(block: suspend () -> Unit) {
+            try {
+                block()
+            } catch (error: CancellationException) {
+                closeCancellation = closeCancellation ?: error
+            } catch (_: Throwable) {
+                Unit
+            }
+        }
+
+        try {
             // Write reading session before close (threshold > 1s to filter noise)
             val sessionStart = sessionStartedAt
             sessionStartedAt = null
-            if (bookId != null && sessionStart != null) {
-                val duration = clock() - sessionStart
-                if (duration > 1_000L) {
-                    // Room suspend DAOs run on Room's own executor; no manual withContext needed.
-                    readingSessionDao.insert(
-                        dev.readflow.core.database.ReadingSessionEntity(
-                            id = java.util.UUID.randomUUID().toString(),
-                            bookId = bookId,
-                            startedAt = sessionStart,
-                            durationMs = duration,
-                            deviceId = settings.deviceId.first(),
+            attempt {
+                if (bookId != null && sessionStart != null) {
+                    val duration = clock() - sessionStart
+                    if (duration > 1_000L) {
+                        // Room suspend DAOs run on Room's own executor; no manual withContext needed.
+                        readingSessionDao.insert(
+                            dev.readflow.core.database.ReadingSessionEntity(
+                                id = java.util.UUID.randomUUID().toString(),
+                                bookId = bookId,
+                                startedAt = sessionStart,
+                                durationMs = duration,
+                                deviceId = settings.deviceId.first(),
+                            )
                         )
-                    )
+                    }
                 }
             }
             // Force-save progress before close so debounce doesn't swallow it.
             if (bookId != null && locator != null) {
-                persistProgress(bookId, locator, settings.deviceId.first())
-                persistReaderState(bookId = bookId, locator = locator)
-                saveEngineStateIfPresent(bookId, engine)
+                attempt { persistProgress(bookId, locator, settings.deviceId.first()) }
+                attempt { persistReaderState(bookId = bookId, locator = locator) }
+                attempt { saveEngineStateIfPresent(bookId, engine) }
             }
-            engine?.close()
-            _uiState.value = ReaderUiState()
+        } finally {
+            try {
+                withContext(NonCancellable) {
+                    attempt { engine?.close() }
+                }
+            } finally {
+                _uiState.value = ReaderUiState()
+                currentBookId = null
+                activeEngine = null
+            }
         }
+        closeCancellation?.let { throw it }
+    }
+
+    override fun onCleared() {
+        openJob?.cancel()
+        activeEngine?.let { engine ->
+            cleanupScope.launch { runCatching { engine.close() } }
+        }
+        super.onCleared()
     }
 
     private suspend fun restoreEngineStateIfPresent(bookId: String?, engine: ReaderEngine) {
         val id = bookId ?: return
-        val state = runCatching { engineStateStore.load(id) }.getOrNull()
+        val state = try {
+            engineStateStore.load(id)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            null
+        }
         if (state == null || state.isEmpty()) return
-        runCatching {
+        try {
             engine.restoreState(state)
-        }.onFailure {
-            runCatching { engineStateStore.evict(id) }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            try {
+                engineStateStore.evict(id)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                Unit
+            }
         }
     }
 
     private suspend fun saveEngineStateIfPresent(bookId: String?, engine: ReaderEngine?) {
         val id = bookId ?: return
-        val state = runCatching { engine?.saveState() }.getOrNull()
+        val state = try {
+            engine?.saveState()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            null
+        }
         if (state == null || state.isEmpty()) return
-        runCatching { engineStateStore.save(id, state) }
+        try {
+            engineStateStore.save(id, state)
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            Unit
+        }
     }
 
     private fun updateUiStateAndPersist(transform: (ReaderUiState) -> ReaderUiState) {

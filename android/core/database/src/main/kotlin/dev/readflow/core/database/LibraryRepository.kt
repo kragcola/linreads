@@ -14,6 +14,7 @@ interface LibraryStore {
     suspend fun upsertBook(book: BookMeta)
     suspend fun upsertAll(books: List<BookMeta>)
     suspend fun deleteBook(id: String)
+    suspend fun deleteBookCompletely(id: String)
     suspend fun removeDownloadedAsset(id: String): Boolean
     suspend fun renameBook(id: String, title: String)
     suspend fun setCollection(id: String, name: String?)
@@ -25,6 +26,7 @@ interface LibraryStore {
 class LibraryRepository(
     private val bookDao: BookDao,
     private val downloadedBookCache: DownloadedBookCacheStore = DownloadedBookCache(bookDao),
+    private val completeBookDeletionStore: CompleteBookDeletionStore? = null,
 ) : LibraryStore {
 
     override fun observeShelf(): Flow<List<LibraryItem>> =
@@ -39,10 +41,16 @@ class LibraryRepository(
     }
 
     override suspend fun upsertAll(books: List<BookMeta>) {
-        bookDao.upsertAll(books.map { it.toEntity() })
+        val entities = books.map { book ->
+            book.toEntity().preserveShelfStateFrom(bookDao.getById(book.id))
+        }
+        bookDao.upsertAll(entities)
         books.lastOrNull { it.isDownloadedRemoteCacheBook() }?.let { downloadedBookCache.trim(it.id) }
     }
     override suspend fun deleteBook(id: String) = bookDao.deleteById(id)
+    override suspend fun deleteBookCompletely(id: String) {
+        checkNotNull(completeBookDeletionStore) { "完整删除未配置" }.delete(id)
+    }
     override suspend fun removeDownloadedAsset(id: String): Boolean =
         downloadedBookCache.removeDownloadedAsset(id) != null
     override suspend fun renameBook(id: String, title: String) = bookDao.updateTitle(id, title)

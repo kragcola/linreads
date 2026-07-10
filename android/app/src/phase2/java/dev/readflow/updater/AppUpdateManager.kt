@@ -1,15 +1,24 @@
 package dev.readflow.updater
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import dev.readflow.BuildConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlin.coroutines.coroutineContext
 
 /**
  * Checks for a newer GitHub release on every app foreground.
@@ -27,11 +36,43 @@ object AppUpdateManager {
         repoSlug = BuildConfig.GITHUB_REPO,
         currentTag = BuildConfig.BUILD_TAG,
     )
+    private val foregroundCheckGuard = LatestUpdateCheckGuard()
 
-    fun checkOnForeground(context: Context, scope: CoroutineScope) {
-        scope.launch(Dispatchers.IO) {
-            val info = runCatching { checker.check() }.getOrNull() ?: return@launch
-            postNotification(context.applicationContext, info)
+    fun checkOnForeground(context: Context, scope: CoroutineScope): Job {
+        val request = foregroundCheckGuard.newRequest()
+        return scope.launch(Dispatchers.IO) {
+            val info = try {
+                checker.check()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                null
+            } ?: return@launch
+            coroutineContext.ensureActive()
+            val appContext = context.applicationContext
+            try {
+                val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                    ContextCompat.checkSelfPermission(
+                        appContext,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                    ) == PackageManager.PERMISSION_GRANTED
+                if (
+                    shouldPostUpdateNotification(
+                        sdkInt = Build.VERSION.SDK_INT,
+                        permissionGranted = permissionGranted,
+                        notificationsEnabled = NotificationManagerCompat.from(appContext).areNotificationsEnabled(),
+                    )
+                ) {
+                    foregroundCheckGuard.runIfLatest(request) {
+                        coroutineContext.ensureActive()
+                        postNotification(appContext, info)
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                Unit
+            }
         }
     }
 
@@ -77,7 +118,7 @@ object AppUpdateManager {
             ctx, 0,
             Intent(ctx, UpdateInstallReceiver::class.java).apply {
                 putExtra("apk_url", info.apkUrl)
-                putExtra("tag_name", info.tagName)
+                putExtra("build_tag", info.buildTag)
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -94,3 +135,28 @@ object AppUpdateManager {
         )
     }
 }
+
+internal class LatestUpdateCheckGuard {
+    private val lock = Any()
+    private var latestRequest = 0L
+
+    fun newRequest(): Long = synchronized(lock) {
+        latestRequest += 1
+        latestRequest
+    }
+
+    fun runIfLatest(request: Long, action: () -> Unit): Boolean = synchronized(lock) {
+        if (request != latestRequest) {
+            false
+        } else {
+            action()
+            true
+        }
+    }
+}
+
+internal fun shouldPostUpdateNotification(
+    sdkInt: Int,
+    permissionGranted: Boolean,
+    notificationsEnabled: Boolean,
+): Boolean = notificationsEnabled && (sdkInt < 33 || permissionGranted)

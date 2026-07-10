@@ -4,6 +4,7 @@ import dev.readflow.core.model.Bookmark
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.ReadflowResult
+import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadingProgress
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -71,6 +72,20 @@ class SyncManagerTest {
         assertEquals(listOf("pull:book-1", "push:book-1:0.62"), backend.calls)
     }
 
+    @Test
+    fun pullFailureDoesNotPushLocalAndRiskOverwritingRemoteProgress() = runBlocking {
+        val local = progress(updatedAt = 1_000_000L, totalProgression = 0.62f, deviceId = "phone")
+        val backend = FakeSyncBackend(
+            remoteProgress = null,
+            pullFailure = ReadflowError.network(null, "offline"),
+        )
+
+        val winner = SyncManager(backend).syncProgress("book-1", local)
+
+        assertNull(winner)
+        assertEquals(listOf("pull:book-1"), backend.calls)
+    }
+
     private fun progress(
         updatedAt: Long,
         totalProgression: Float,
@@ -89,6 +104,7 @@ class SyncManagerTest {
 
     private class FakeSyncBackend(
         private val remoteProgress: ReadingProgress?,
+        private val pullFailure: ReadflowError? = null,
     ) : SyncBackend {
         val calls = mutableListOf<String>()
         override val backendId = "fake"
@@ -101,7 +117,7 @@ class SyncManagerTest {
 
         override suspend fun pullProgress(bookId: String): ReadflowResult<ReadingProgress?> {
             calls += "pull:$bookId"
-            return ReadflowResult.Success(remoteProgress)
+            return pullFailure?.let { ReadflowResult.Failure(it) } ?: ReadflowResult.Success(remoteProgress)
         }
 
         override suspend fun pushBookmark(bookmark: Bookmark): ReadflowResult<Unit> =

@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.drawable.Drawable
@@ -35,6 +36,7 @@ import dev.readflow.MainActivity
 import dev.readflow.core.database.BookEntity
 import dev.readflow.core.database.ReadflowDatabase
 import dev.readflow.core.database.ReadingProgressEntity
+import dev.readflow.core.database.ReadingSessionEntity
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
@@ -80,6 +82,34 @@ class EpubFlowAnchorRuntimeSmokeTest {
     fun tearDown() {
         device.pressHome()
         device.waitForIdle()
+    }
+
+    @Test
+    fun epubImportExtractsCoverWithAndroidXmlParserRuntime() {
+        val title = "epub-cover-${UUID.randomUUID().toString().take(8)}"
+        val uri = createCoverEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use {
+            dismissBlockingDialogs()
+            val book = waitForBookByTitle(title)
+            val coverUrl = checkNotNull(book.coverUrl) {
+                "Android EPUB import must persist the extracted cover URL"
+            }
+            val coverFile = File(checkNotNull(Uri.parse(coverUrl).path))
+            assertTrue("extracted EPUB cover must exist", coverFile.isFile && coverFile.length() > 0L)
+            val bitmap = checkNotNull(BitmapFactory.decodeFile(coverFile.path)) {
+                "extracted EPUB cover must be a decodable image"
+            }
+            try {
+                assertEquals(
+                    "extracted EPUB cover should preserve the source image",
+                    Color.rgb(0x25, 0x69, 0xBE),
+                    bitmap.getPixel(bitmap.width / 2, bitmap.height / 2),
+                )
+            } finally {
+                bitmap.recycle()
+            }
+        }
     }
 
     @Test
@@ -386,6 +416,99 @@ class EpubFlowAnchorRuntimeSmokeTest {
             assertEquals("reopened EPUB should restore page 3", 3, restored.currentPage)
             assertEquals("reopened EPUB should restore the canonical page-3 top", expectedPageTop, restored.scrollY)
             assertEquals("repeated external import should reuse one stable EPUB book row", 1, booksByTitle(title).size)
+        }
+    }
+
+    @Test
+    fun epubFlowSystemBackFlushesLatestLocatorAndReadingSessionRuntime() {
+        val title = "flow-system-back-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val book = waitForBookByTitle(title)
+            val initialProgress = waitForConditionResult(
+                message = "expected initial EPUB progress before exercising system Back",
+                timeoutMs = DB_TIMEOUT_MS,
+            ) {
+                latestProgress(book.id)
+            }
+            val target = waitForConditionResult("expected flow view to paginate before system Back") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
+                    val pageThreeTop = view.reflectNullableInt("pageTopPxAt", 3) ?: return@withActivity null
+                    FlowReopenTarget(view = view, pageTop = pageThreeTop)
+                }
+            }
+
+            val parked = scenario.withActivity {
+                target.view.scrollTo(0, 0)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                target.view.reflectBoolean("goToAdjacentPage", 1)
+                FlowReopenFrame(
+                    currentPage = target.view.reflectInt("currentPageIndex"),
+                    scrollY = target.view.scrollY,
+                    contentAlpha = target.view.flowContentAlpha(),
+                    pageCount = target.view.reflectInt("pageCount"),
+                )
+            }
+            assertEquals("setup should park on page 3 before system Back", 3, parked.currentPage)
+            assertEquals("setup should land on the page-3 canonical top", target.pageTop, parked.scrollY)
+
+            val expectedProgress = waitForConditionResult(
+                message = "expected page-3 locator to persist before seeding the stale Back sentinel",
+                timeoutMs = DB_TIMEOUT_MS,
+            ) {
+                latestProgress(book.id)?.takeIf { progress ->
+                    progress.locatorJson != initialProgress.locatorJson &&
+                        progress.totalProgression > initialProgress.totalProgression
+                }
+            }
+            SystemClock.sleep(1_200)
+            val staleProgress = initialProgress.copy(
+                updatedAt = System.currentTimeMillis(),
+                deviceId = "system-back-sentinel",
+            )
+            upsertProgress(staleProgress)
+            assertEquals(staleProgress.locatorJson, latestProgress(book.id)?.locatorJson)
+            assertTrue("reading session must be written by close, not before Back", readingSessions(book.id).isEmpty())
+
+            device.pressBack()
+            device.waitForIdle()
+            assertTrue(
+                "system Back should return from Reader to the shelf",
+                device.wait(Until.findObject(By.desc("打开 $title")), UI_TIMEOUT_MS) != null,
+            )
+
+            var persistedProgress = latestProgress(book.id)
+            var sessions = readingSessions(book.id)
+            val deadline = System.currentTimeMillis() + DB_TIMEOUT_MS
+            while (
+                System.currentTimeMillis() < deadline &&
+                (persistedProgress?.locatorJson != expectedProgress.locatorJson || sessions.size != 1)
+            ) {
+                Thread.sleep(150)
+                persistedProgress = latestProgress(book.id)
+                sessions = readingSessions(book.id)
+            }
+
+            assertEquals(
+                "system Back must flush the latest locator before leaving Reader; sessions=$sessions",
+                expectedProgress.locatorJson,
+                persistedProgress?.locatorJson,
+            )
+            assertEquals(
+                "system Back must flush the latest total progression",
+                expectedProgress.totalProgression.toDouble(),
+                persistedProgress?.totalProgression?.toDouble() ?: -1.0,
+                0.0001,
+            )
+            assertEquals("system Back must write exactly one reading session", 1, sessions.size)
+            assertTrue("system Back session must include meaningful reading time", sessions.single().durationMs >= 1_000)
         }
     }
 
@@ -1630,6 +1753,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
         return FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
     }
 
+    private fun createCoverEpubUri(fileName: String): Uri {
+        val file = File(appContext.cacheDir, fileName)
+        writeCoverEpub(file)
+        return FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
+    }
+
     private fun createLinkedEpubUri(fileName: String): Uri {
         val file = File(appContext.cacheDir, fileName)
         writeEpub(file, linked = true)
@@ -1697,6 +1826,48 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 """.trimIndent(),
             )
             addText("OEBPS/ch1.xhtml", body)
+        }
+    }
+
+    private fun writeCoverEpub(file: File) {
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun addText(path: String, content: String) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(content.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+            fun addBinary(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+            addText(
+                "META-INF/container.xml",
+                """
+                    <ocf:container xmlns:ocf="urn:oasis:names:tc:opendocument:xmlns:container">
+                      <ocf:rootfiles>
+                        <ocf:rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </ocf:rootfiles>
+                    </ocf:container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <opf:package xmlns:opf="http://www.idpf.org/2007/opf" version="3.0">
+                      <opf:manifest>
+                        <opf:item id="cover" href="../Images/cover%20art.png" media-type="image/png" properties="thumbnail cover-image"/>
+                        <opf:item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                      </opf:manifest>
+                      <opf:spine><opf:itemref idref="ch1"/></opf:spine>
+                    </opf:package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Cover runtime.</p></body></html>",
+            )
+            addBinary("Images/cover art.png", tinyPngBytes(Color.rgb(0x25, 0x69, 0xBE)))
         }
     }
 
@@ -1869,6 +2040,28 @@ class EpubFlowAnchorRuntimeSmokeTest {
             .build()
         return try {
             runBlocking { db.readingProgressDao().get(bookId) }
+        } finally {
+            db.close()
+        }
+    }
+
+    private fun upsertProgress(progress: ReadingProgressEntity) {
+        val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            runBlocking { db.readingProgressDao().upsert(progress) }
+        } finally {
+            db.close()
+        }
+    }
+
+    private fun readingSessions(bookId: String): List<ReadingSessionEntity> {
+        val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
+            .allowMainThreadQueries()
+            .build()
+        return try {
+            runBlocking { db.readingSessionDao().allForBackup().filter { it.bookId == bookId } }
         } finally {
             db.close()
         }

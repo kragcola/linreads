@@ -25,6 +25,8 @@ enum class BookFormat {
 /** Download / availability state of a book's local asset. */
 enum class DownloadStatus { NOT_DOWNLOADED, DOWNLOADING, DOWNLOADED, FAILED }
 
+enum class BookRemovalMode { REMOVE_FROM_SHELF, DELETE_ALL }
+
 /**
  * Reading theme preference. SYSTEM follows the OS day/night; the rest are flat reading-colour
  * presets ported from 静读天下 (Moon+ Reader)'s built-in themes (see [ReaderPalette]). LIGHT/DARK/SEPIA

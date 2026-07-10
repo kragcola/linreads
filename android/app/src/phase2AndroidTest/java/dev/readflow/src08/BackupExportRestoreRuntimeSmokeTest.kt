@@ -2,11 +2,13 @@ package dev.readflow.src08
 
 import android.content.Context
 import androidx.room.Room
+import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
 import dev.readflow.core.database.BookEntity
 import dev.readflow.core.database.BookmarkEntity
+import dev.readflow.core.database.BackupRestoreTransactionRunner
 import dev.readflow.core.database.LinReadsBackupExporter
 import dev.readflow.core.database.LinReadsBackupRestorer
 import dev.readflow.core.database.ReadflowDatabase
@@ -88,6 +90,9 @@ class BackupExportRestoreRuntimeSmokeTest {
             targetDb.readingProgressDao(),
             targetDb.bookmarkDao(),
             targetDb.textAnnotationDao(),
+            BackupRestoreTransactionRunner { restore ->
+                targetDb.withTransaction { restore() }
+            },
         )
 
         val restoreResult = exportFile.inputStream().use { restorer.restore(it) }
@@ -163,6 +168,9 @@ class BackupExportRestoreRuntimeSmokeTest {
             targetDb.readingProgressDao(),
             targetDb.bookmarkDao(),
             targetDb.textAnnotationDao(),
+            BackupRestoreTransactionRunner { restore ->
+                targetDb.withTransaction { restore() }
+            },
         )
 
         val error = runCatching {

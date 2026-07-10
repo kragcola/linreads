@@ -1,12 +1,16 @@
 package dev.readflow.features.settings
 
+import android.Manifest
 import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -65,6 +69,17 @@ fun SettingsScreen(
     var urlDraft by remember(url) { mutableStateOf(url ?: "") }
     val scope = rememberCoroutineScope()
     var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
+    var pendingUpdateDownload by remember { mutableStateOf<UpdateState.Available?>(null) }
+    fun startUpdateDownload(update: UpdateState.Available) {
+        val dlId = context.startFreshDownload(update.apkUrl, authToken)
+        updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        pendingUpdateDownload?.let(::startUpdateDownload)
+        pendingUpdateDownload = null
+    }
     val isBackupBusy = backupExportState is BackupExportUiState.Exporting ||
         backupRestoreState is BackupRestoreUiState.Restoring
     val backupLauncher = rememberLauncherForActivityResult(
@@ -556,9 +571,11 @@ fun SettingsScreen(
                             if (!context.packageManager.canRequestPackageInstalls()) {
                                 context.openUnknownAppSourcesSettings()
                                 updateState = UpdateState.Error("请先允许 LinReads 安装未知来源应用，然后返回重试")
+                            } else if (context.shouldRequestUpdateNotificationPermission()) {
+                                pendingUpdateDownload = s
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                             } else {
-                                val dlId = context.startFreshDownload(s.apkUrl, authToken)
-                                updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
+                                startUpdateDownload(s)
                             }
                         },
                         enabled = true
@@ -619,7 +636,7 @@ private fun ConnectionResultText(title: String, detail: String, isError: Boolean
  * Always start a fresh download — GitHub release URL never changes between builds
  * so we cannot rely on URL comparison for version detection.
  * Cleans up any previous download before starting a new one.
- * After installation, caller should call clearDownloadState() to wipe the dl_id.
+ * After installation, caller should call clearDownloadState() to wipe all download identity metadata.
  */
 private fun Context.startFreshDownload(apkUrl: String, authToken: String): Long {
     val prefs = getSharedPreferences("update", Context.MODE_PRIVATE)
@@ -641,7 +658,11 @@ private fun Context.startFreshDownload(apkUrl: String, authToken: String): Long 
             setDestinationInExternalFilesDir(this@startFreshDownload, null, "update.apk")
         }
     )
-    prefs.edit().putLong("dl_id", dlId).apply()
+    prefs.edit()
+        .putLong("dl_id", dlId)
+        .putString("dl_url", apkUrl)
+        .remove("dl_tag")
+        .apply()
     return dlId
 }
 
@@ -652,7 +673,11 @@ fun Context.clearDownloadState() {
     if (oldId != -1L) {
         getSystemService(DownloadManager::class.java).remove(oldId)
     }
-    prefs.edit().remove("dl_id").apply()
+    prefs.edit()
+        .remove("dl_id")
+        .remove("dl_url")
+        .remove("dl_tag")
+        .apply()
 }
 
 private fun launchInstaller(context: Context, uri: Uri) {
@@ -668,6 +693,20 @@ private fun Context.openUnknownAppSourcesSettings() {
         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     })
 }
+
+internal fun Context.shouldRequestUpdateNotificationPermission(): Boolean =
+    shouldRequestUpdateNotificationPermission(
+        sdkInt = Build.VERSION.SDK_INT,
+        permissionGranted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED,
+    )
+
+internal fun shouldRequestUpdateNotificationPermission(
+    sdkInt: Int,
+    permissionGranted: Boolean,
+): Boolean = sdkInt >= Build.VERSION_CODES.TIRAMISU && !permissionGranted
 
 private sealed interface UpdateState {
     data object Idle : UpdateState

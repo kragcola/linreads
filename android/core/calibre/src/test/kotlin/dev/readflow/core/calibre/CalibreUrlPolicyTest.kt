@@ -43,6 +43,32 @@ class CalibreUrlPolicyTest {
     }
 
     @Test
+    fun requestPolicyRejectsPublicHttpRedirectTargets() {
+        val error = runCatching {
+            requireAllowedCalibreRequestUrl("http://example.com/download.epub")
+        }.exceptionOrNull()
+
+        assertTrue(error is IllegalArgumentException)
+    }
+
+    @Test
+    fun redirectPolicyRequiresSameSchemeHostAndPort() {
+        requireSameCalibreOrigin(
+            "http://192.168.1.5:8080/get/EPUB/1/library",
+            "http://192.168.1.5:8080",
+        )
+        listOf(
+            "https://192.168.1.5:8080/get/EPUB/1/library",
+            "http://192.168.1.6:8080/get/EPUB/1/library",
+            "http://192.168.1.5:8081/get/EPUB/1/library",
+        ).forEach { target ->
+            assertTrue(runCatching {
+                requireSameCalibreOrigin(target, "http://192.168.1.5:8080")
+            }.exceptionOrNull() is IllegalArgumentException)
+        }
+    }
+
+    @Test
     fun rejectsMalformedUnsupportedOrCredentialUrls() {
         assertEquals("地址缺少协议，请以 http:// 或 https:// 开头", validateCalibreBaseUrl("192.168.1.5:8080").errorMessage)
         assertEquals("Calibre 地址只支持 http:// 或 https://", validateCalibreBaseUrl("ftp://192.168.1.5").errorMessage)

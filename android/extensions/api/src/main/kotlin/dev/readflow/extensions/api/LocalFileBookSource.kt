@@ -9,9 +9,15 @@ import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.DownloadedAsset
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
 /**
@@ -89,6 +95,7 @@ class LocalFileBookSource(
                             while (true) {
                                 val read = input.read(buffer)
                                 if (read < 0) break
+                                currentCoroutineContext().ensureActive()
                                 output.write(buffer, 0, read)
                                 digest.update(buffer, 0, read)
                             }
@@ -98,8 +105,19 @@ class LocalFileBookSource(
                     )
                     val id = localBookIdForDigest(ext, digest.digest())
                     val outFile = File(booksDir, "$id.$ext")
-                    if (!stagingFile.renameTo(outFile)) {
-                        stagingFile.copyTo(outFile, overwrite = true)
+                    try {
+                        Files.move(
+                            stagingFile.toPath(),
+                            outFile.toPath(),
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING,
+                        )
+                    } catch (_: AtomicMoveNotSupportedException) {
+                        Files.move(
+                            stagingFile.toPath(),
+                            outFile.toPath(),
+                            StandardCopyOption.REPLACE_EXISTING,
+                        )
                     }
 
                     val title = fileName.substringBeforeLast('.')
@@ -128,6 +146,8 @@ class LocalFileBookSource(
                     // was already renamed/copied away, so this is a harmless no-op.
                     stagingFile.delete()
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (e: Exception) {
                 ReadflowResult.Failure(ReadflowError.io(e.message ?: "导入失败"))
             }

@@ -6,9 +6,11 @@ import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.network.sockets.ConnectTimeoutException
 import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.HttpRequestTimeoutException
+import io.ktor.client.plugins.HttpSend
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.ServerResponseException
+import io.ktor.client.plugins.plugin
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
@@ -17,6 +19,7 @@ import io.ktor.serialization.JsonConvertException
 import io.ktor.serialization.kotlinx.json.json
 import java.net.ConnectException
 import java.net.UnknownHostException
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.SerializationException
 
 sealed interface CalibreConnectionCheckResult {
@@ -31,7 +34,9 @@ fun interface CalibreConnectionTester {
 fun createCalibreConnectionTester(): CalibreConnectionTester = KtorCalibreConnectionTester()
 
 internal class KtorCalibreConnectionTester(
-    private val httpClientFactory: () -> HttpClient = { defaultCalibreHttpClient() },
+    private val httpClientFactory: (String) -> HttpClient = { baseUrl ->
+        defaultCalibreHttpClient(allowedBaseUrl = baseUrl)
+    },
 ) : CalibreConnectionTester {
 
     override suspend fun check(baseUrl: String): CalibreConnectionCheckResult {
@@ -44,7 +49,7 @@ internal class KtorCalibreConnectionTester(
         }
 
         return runCatching {
-            httpClientFactory().use { http ->
+            httpClientFactory(validation.normalizedUrl).use { http ->
                 val result = http.get("${validation.normalizedUrl}/ajax/search") {
                     parameter("query", "")
                     parameter("num", 1)
@@ -53,12 +58,16 @@ internal class KtorCalibreConnectionTester(
                 CalibreConnectionCheckResult.Success(bookCount = result.total_num)
             }
         }.getOrElse { error ->
+            if (error is CancellationException) throw error
             error.toConnectionFailure()
         }
     }
 }
 
-internal fun defaultCalibreHttpClient(engine: HttpClientEngine? = null): HttpClient {
+internal fun defaultCalibreHttpClient(
+    engine: HttpClientEngine? = null,
+    allowedBaseUrl: String? = null,
+): HttpClient {
     val config: HttpClientConfigBlock = {
         expectSuccess = true
         install(ContentNegotiation) { json() }
@@ -67,7 +76,15 @@ internal fun defaultCalibreHttpClient(engine: HttpClientEngine? = null): HttpCli
             requestTimeoutMillis = 8_000
         }
     }
-    return if (engine == null) HttpClient(config) else HttpClient(engine, config)
+    val client = if (engine == null) HttpClient(config) else HttpClient(engine, config)
+    client.plugin(HttpSend).intercept { request ->
+        requireAllowedCalibreRequestUrl(request.url.buildString())
+        if (allowedBaseUrl != null) {
+            requireSameCalibreOrigin(request.url.buildString(), allowedBaseUrl)
+        }
+        execute(request)
+    }
+    return client
 }
 
 private typealias HttpClientConfigBlock = io.ktor.client.HttpClientConfig<*>.() -> Unit

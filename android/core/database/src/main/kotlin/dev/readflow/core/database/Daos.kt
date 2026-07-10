@@ -73,6 +73,30 @@ interface BookDao {
 }
 
 @Dao
+interface BookDeletionDao {
+    @Query("SELECT * FROM books WHERE id = :bookId LIMIT 1")
+    suspend fun getBook(bookId: String): BookEntity?
+
+    @Query("DELETE FROM reading_progress WHERE bookId = :bookId")
+    suspend fun deleteProgress(bookId: String)
+
+    @Query("DELETE FROM text_annotations WHERE bookId = :bookId")
+    suspend fun deleteAnnotations(bookId: String)
+
+    @Query("DELETE FROM ink_strokes WHERE bookId = :bookId")
+    suspend fun deleteInkStrokes(bookId: String)
+
+    @Query("DELETE FROM bookmarks WHERE bookId = :bookId")
+    suspend fun deleteBookmarks(bookId: String)
+
+    @Query("DELETE FROM reading_sessions WHERE bookId = :bookId")
+    suspend fun deleteSessions(bookId: String)
+
+    @Query("DELETE FROM books WHERE id = :bookId")
+    suspend fun deleteBook(bookId: String)
+}
+
+@Dao
 interface ReadingProgressDao {
     @Query("SELECT * FROM reading_progress WHERE bookId = :bookId")
     suspend fun get(bookId: String): ReadingProgressEntity?
