@@ -120,6 +120,32 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `clearing previews during committed interactive settle publishes the parked target once`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        reportedOffsets.clear()
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        view.updateInteractiveCurl(x = 0f)
+        view.endInteractiveCurl(velocityX = 0f)
+
+        val targetPage = view.currentPageIndex()
+        val targetOffset = view.topLayoutOffset()
+        assertTrue("the committed gesture must park an adjacent target", targetPage > 0)
+        assertTrue("the target stays silent until settle", reportedOffsets.isEmpty())
+
+        view.clearBoundaryPreviews()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(targetPage, view.currentPageIndex())
+        assertEquals(listOf(targetOffset), reportedOffsets)
+        assertNull(view.privateField("slideDrawable"))
+    }
+
+    @Test
     fun `simulation drag uses software curl without activating gl overlay`() {
         val overlay = FakeCurlOverlay()
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
@@ -193,7 +219,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `simulation drag at a real chapter boundary still requests the adjacent chapter`() {
+    fun `cache ready simulation boundary move stays finger driven without requesting navigation`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val overlay = FakeCurlOverlay()
         val view = pagedFlowView(
@@ -203,6 +229,47 @@ class EpubFlowViewTest {
             curlOverlay = overlay
         }
         view.goToLastPage()
+        val preview = view.offerReadyBoundaryPreviewForTest(forward = true)
+        val downX = view.width * 0.75f
+        val moveX = view.width * 0.10f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+
+            assertTrue(
+                "a cache-ready chapter boundary must start the same software curl as an in-chapter drag",
+                view.privateField("curlDrawable") is PageCurlDrawable,
+            )
+            assertTrue(
+                "boundary MOVE must retain the finger transaction instead of requesting chapter navigation",
+                tapZones.isEmpty(),
+            )
+            assertEquals("finger tracking must not start the discrete GL overlay", 0, overlay.startCount)
+            assertFalse("finger tracking must leave the discrete GL overlay inactive", overlay.active)
+        } finally {
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            if (!preview.isRecycled) preview.recycle()
+        }
+    }
+
+    @Test
+    fun `cancelling cache ready boundary drag leaves logical position silent and unchanged`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTapZone = tapZones::add,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        view.goToLastPage()
+        reportedOffsets.clear()
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        val preview = view.offerReadyBoundaryPreviewForTest(forward = true, token = 2L)
         val downX = view.width * 0.75f
         val moveX = view.width * 0.10f
         val y = view.height * 0.10f
@@ -210,10 +277,341 @@ class EpubFlowViewTest {
 
         view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
         view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+        view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
 
-        assertEquals(listOf(EpubFlowTapZone.NEXT), tapZones)
-        assertEquals("a chapter-boundary drag must not start an in-chapter GL turn", 0, overlay.startCount)
-        assertFalse("a chapter-boundary drag must leave the GL overlay inactive", overlay.active)
+        assertEquals("ACTION_CANCEL must keep the outgoing logical page", startPage, view.currentPageIndex())
+        assertEquals("ACTION_CANCEL must restore the outgoing page anchor", startTop, view.scrollY)
+        assertTrue("ACTION_CANCEL must not request adjacent-chapter navigation", tapZones.isEmpty())
+        assertTrue(
+            "ACTION_CANCEL must not report a target offset that the engine could publish as a locator",
+            reportedOffsets.isEmpty(),
+        )
+        if (!preview.isRecycled) preview.recycle()
+    }
+
+    @Test
+    fun `boundary up before preview ready cancels and late preview cannot revive the gesture`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTapZone = tapZones::add,
+        )
+        view.goToLastPage()
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        val downX = view.width * 0.75f
+        val moveX = view.width * 0.10f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+        view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
+        val latePreview = view.offerReadyBoundaryPreviewForTest(forward = true, token = 3L)
+        shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+        assertEquals("UP-before-ready must keep the outgoing logical page", startPage, view.currentPageIndex())
+        assertEquals("UP-before-ready must keep the outgoing page anchor", startTop, view.scrollY)
+        assertTrue("UP-before-ready and late readiness must not request navigation", tapZones.isEmpty())
+        assertNull(
+            "a preview arriving after ACTION_UP must not create a detached software curl",
+            view.privateField("curlDrawable"),
+        )
+        if (!latePreview.isRecycled) latePreview.recycle()
+    }
+
+    @Test
+    fun `NONE boundary swipe released before preview arrives cannot auto commit`() {
+        lateinit var view: EpubFlowView
+        val commits = mutableListOf<Any>()
+        view = pagedFlowView(
+            flipStyle = PageFlipStyle.NONE,
+            onTapZone = { zone ->
+                if (zone == EpubFlowTapZone.NEXT) view.startDiscreteBoundaryTurn(1)
+            },
+        )
+        view.installBoundaryCommitRecorderForTest(commits)
+        view.goToLastPage()
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.05f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+        assertEquals(
+            "BOUNDARY_WAITING",
+            view.privateField("interactiveTurnState").toString(),
+        )
+
+        view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
+        val latePreview = view.offerReadyBoundaryPreviewForTest(forward = true, token = 99L)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+        assertEquals(startPage, view.currentPageIndex())
+        assertEquals(startTop, view.scrollY)
+        assertTrue(commits.isEmpty())
+        assertNull(view.privateField("conversionSnapshotDrawable"))
+        assertFalse("the late result remains cached for a later explicit input", latePreview.isRecycled)
+        if (!latePreview.isRecycled) latePreview.recycle()
+    }
+
+    @Test
+    fun `committed cache ready boundary drag publishes exactly one commit`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val commits = mutableListOf<Any>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTapZone = tapZones::add,
+        )
+        view.installBoundaryCommitRecorderForTest(commits)
+        view.goToLastPage()
+        val preview = view.offerReadyBoundaryPreviewForTest(forward = true, token = 4L)
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.05f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+        view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
+        shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+        assertEquals("a committed boundary transaction must publish once", 1, commits.size)
+        assertTrue("commit must not re-enter the legacy tap-zone navigation path", tapZones.isEmpty())
+        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+        assertEquals("settle and reveal callbacks must not publish the same commit again", 1, commits.size)
+        if (!preview.isRecycled) preview.recycle()
+    }
+
+    @Test
+    fun `discrete slide boundary cache hit commits once and hands revealed bitmap to continuity cover`() {
+        val commits = mutableListOf<Any>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        view.installBoundaryCommitRecorderForTest(commits)
+        view.goToLastPage()
+        val revealed = view.offerReadyBoundaryPreviewForTest(forward = true, token = 5L)
+
+        try {
+            assertTrue(view.startDiscreteBoundaryTurn(1))
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+            assertTrue(
+                "the settled software turn must transfer the cached target without copying it",
+                cover.privateBitmap("bitmap") === revealed,
+            )
+            assertFalse("the continuity cover must keep the revealed target alive", revealed.isRecycled)
+            assertEquals("the discrete software turn must publish exactly once", 1, commits.size)
+
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+            assertEquals("settle callbacks must not publish the same target twice", 1, commits.size)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `discrete simulation boundary commit transfers fake gl reveal before dismiss`() {
+        val commits = mutableListOf<Any>()
+        val overlay = FakeCurlOverlay(transferRevealedOwnership = true)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        view.installBoundaryCommitRecorderForTest(commits)
+        view.goToLastPage()
+        val revealed = view.offerReadyBoundaryPreviewForTest(forward = true, token = 6L)
+
+        try {
+            assertTrue(view.startDiscreteBoundaryTurn(1))
+            assertEquals("the cache-hit turn must enter the GL renderer immediately", 1, overlay.startCount)
+
+            overlay.settle(committed = true)
+
+            val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+            assertEquals("the host must claim the GL target exactly once", 1, overlay.takeRevealedCount)
+            assertEquals("the completed overlay must still be dismissed", 1, overlay.dismissCount)
+            assertTrue(
+                "the continuity cover must own the exact bitmap released by GL",
+                cover.privateBitmap("bitmap") === revealed,
+            )
+            assertFalse("dismiss must not recycle a revealed bitmap after ownership transfer", revealed.isRecycled)
+            assertEquals("the GL boundary transaction must publish exactly once", 1, commits.size)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `boundary continuity cover blocks all input after safety reveal until one stable report`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val reportedOffsets = mutableListOf<Int>()
+        var linkClicks = 0
+        val incomingText = "Open linked chapter only after stability.\n" +
+            (1..80).joinToString("\n") { "Incoming chapter line $it remains gated." }
+        val linkStart = incomingText.indexOf("linked")
+        val incomingSpannable = SpannableString(incomingText).apply {
+            setSpan(
+                object : ClickableSpan() {
+                    override fun onClick(widget: View) {
+                        linkClicks += 1
+                    }
+                },
+                linkStart,
+                linkStart + "linked".length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTapZone = tapZones::add,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        view.pendingDecodesProvider = { true }
+        view.onBoundaryTurnCommitted = {
+            view.setChapter(
+                flow = incomingFlow,
+                spannable = incomingSpannable,
+                pageHeightPx = view.height,
+                reportPositionAfterStableReveal = true,
+            )
+        }
+        view.goToLastPage()
+        reportedOffsets.clear()
+        view.offerReadyBoundaryPreviewForTest(forward = true, token = 7L)
+
+        try {
+            assertTrue(view.startDiscreteBoundaryTurn(1))
+            assertEquals("starting the visual transaction must remain locator-silent", emptyList<Int>(), reportedOffsets)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            assertEquals("committing and installing the hidden target must remain locator-silent", emptyList<Int>(), reportedOffsets)
+            view.measure(exactly(360), exactly(120))
+            view.layout(0, 0, 360, 120)
+            shadowOf(Looper.getMainLooper()).idle()
+            shadowOf(Looper.getMainLooper()).idleFor(801L, TimeUnit.MILLISECONDS)
+
+            assertEquals("the safety reveal must retire only the hidden flag", false, view.privateBool("awaitingReveal"))
+            assertEquals("pending image work must keep the chapter unstable", true, view.privateBool("awaitingStableChapter"))
+            assertEquals("the live target may render beneath the frozen owner", 1f, view.getChildAt(0).alpha)
+            assertNotNull("the boundary frame must still own the visible window", view.privateField("conversionSnapshotDrawable"))
+            assertTrue("the committed boundary cover gate must remain active", view.privateBool("boundaryContinuityCover"))
+            assertEquals("safety reveal must not publish target progress early", emptyList<Int>(), reportedOffsets)
+
+            val tapTime = SystemClock.uptimeMillis()
+            view.dispatchTouchEvent(
+                motionEvent(tapTime, tapTime, MotionEvent.ACTION_DOWN, view.width * 0.85f, view.height * 0.50f),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(tapTime, tapTime + 24L, MotionEvent.ACTION_UP, view.width * 0.85f, view.height * 0.50f),
+            )
+
+            val dragTime = tapTime + 40L
+            view.dispatchTouchEvent(
+                motionEvent(dragTime, dragTime, MotionEvent.ACTION_DOWN, view.width * 0.85f, view.height * 0.10f),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(dragTime, dragTime + 24L, MotionEvent.ACTION_MOVE, view.width * 0.10f, view.height * 0.10f),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(dragTime, dragTime + 48L, MotionEvent.ACTION_UP, view.width * 0.10f, view.height * 0.10f),
+            )
+
+            val linkPoint = view.pointForTextOffset(linkStart + 1)
+            val linkTime = dragTime + 80L
+            view.dispatchTouchEvent(
+                motionEvent(linkTime, linkTime, MotionEvent.ACTION_DOWN, linkPoint.first, linkPoint.second),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(linkTime, linkTime + 24L, MotionEvent.ACTION_UP, linkPoint.first, linkPoint.second),
+            )
+
+            assertEquals("the cover gate must consume clean page taps", emptyList<EpubFlowTapZone>(), tapZones)
+            assertEquals("the cover gate must keep child links inactive", 0, linkClicks)
+            assertNull("gated input must not start another slide", view.privateField("slideDrawable"))
+            assertNull("gated input must not start a software curl", view.privateField("curlDrawable"))
+            assertFalse(
+                "gated input must not start a running animator",
+                (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.isRunning == true,
+            )
+            assertEquals("gated input must leave the target parked", 0, view.currentPageIndex())
+            assertEquals("gated input must remain silent to locator persistence", emptyList<Int>(), reportedOffsets)
+
+            view.pendingDecodesProvider = { false }
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals("the stable target must publish its locator exactly once", 1, reportedOffsets.size)
+            assertEquals("the stable handoff must retire the continuity cover", false, view.privateBool("boundaryContinuityCover"))
+        } finally {
+            view.pendingDecodesProvider = { false }
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `discrete boundary cache miss timeout releases state for another turn`() {
+        val previewRequests = mutableListOf<Pair<Boolean, Long>>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE).apply {
+            onBoundaryPreviewNeeded = { forward, generation ->
+                previewRequests += forward to generation
+            }
+        }
+        view.goToLastPage()
+
+        try {
+            assertTrue(view.startDiscreteBoundaryTurn(1))
+            assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
+            assertEquals(1, previewRequests.size)
+
+            shadowOf(Looper.getMainLooper()).idleFor(3_001L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "a cold preview timeout must release turnInFlight",
+                "NONE",
+                view.privateField("interactiveTurnState").toString(),
+            )
+            assertTrue("the reader must accept another turn after timeout", view.startDiscreteBoundaryTurn(1))
+            assertEquals("the retry must request a fresh preview", 2, previewRequests.size)
+            assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
+
+            view.clearBoundaryPreviews()
+
+            assertEquals(
+                "settings invalidation must also release an active wait",
+                "NONE",
+                view.privateField("interactiveTurnState").toString(),
+            )
+            assertTrue("clearing previews must not permanently lock navigation", view.startDiscreteBoundaryTurn(1))
+            assertEquals(3, previewRequests.size)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `width only resize rejects a preview produced for the old viewport token`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        val stalePreview = view.newBoundaryPreviewForTest(forward = true, token = 41L)
+
+        view.measure(exactly(420), exactly(120))
+        view.layout(0, 0, 420, 120)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertFalse(
+            "a frame rendered at 360px wide must not be accepted after a width-only resize to 420px",
+            view.offerBoundaryPreviewForTest(stalePreview),
+        )
+        assertTrue("the rejected stale viewport frame must be recycled", stalePreview.bitmap.isRecycled)
     }
 
     @Test
@@ -394,6 +792,38 @@ class EpubFlowViewTest {
         shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
 
         assertNull("the resumed reveal must eventually retire its cover", view.privateField("conversionSnapshotDrawable"))
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `clearing previews aborts pre-frame gl turn and resumes conversion fade`() {
+        val overlay = FakeCurlOverlay(autoFirstFrameReady = false)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        val layout = requireNotNull(view.textView.layout)
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+
+        assertTrue(view.goToAdjacentPage(1))
+        assertTrue(overlay.active)
+        assertNull(view.privateField("conversionFadeAnimator"))
+
+        view.clearBoundaryPreviews()
+
+        assertFalse(overlay.active)
+        assertFalse(view.privateBool("glConversionOwnerHeld"))
+        assertFalse(view.privateBool("glConversionFadePaused"))
+        assertNotNull(view.privateField("conversionFadeAnimator"))
+
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+        assertNull("the resumed reveal must retire its cover", view.privateField("conversionSnapshotDrawable"))
     }
 
     @Test
@@ -2883,6 +3313,83 @@ class EpubFlowViewTest {
         return result.name == "STARTED"
     }
 
+    private fun EpubFlowView.offerReadyBoundaryPreviewForTest(
+        forward: Boolean,
+        token: Long = 1L,
+    ): Bitmap {
+        val preview = newBoundaryPreviewForTest(forward, token)
+        assertTrue("the current-generation boundary preview must be accepted", offerBoundaryPreviewForTest(preview))
+        return preview.bitmap
+    }
+
+    private fun EpubFlowView.newBoundaryPreviewForTest(
+        forward: Boolean,
+        token: Long,
+    ): BoundaryPagePreview {
+        val previewClass = runCatching {
+            Class.forName("dev.readflow.render.epub.BoundaryPagePreview")
+        }.getOrNull()
+        assertNotNull(
+            "方案 A requires BoundaryPagePreview(token, forward, sourceChapterGeneration, bitmap)",
+            previewClass,
+        )
+        val constructor = previewClass!!.declaredConstructors.firstOrNull { candidate ->
+            candidate.parameterTypes.contentEquals(
+                arrayOf(
+                    Long::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                    Long::class.javaPrimitiveType,
+                    Bitmap::class.java,
+                ),
+            )
+        }
+        assertNotNull(
+            "BoundaryPagePreview must expose token, direction, source generation, and target frame",
+            constructor,
+        )
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+            val paperColor = 0xFFF3EFE5.toInt()
+            val contentColor = 0xFF26352D.toInt()
+            eraseColor(paperColor)
+            for (x in (width / 4) until (width * 3 / 4)) {
+                setPixel(x, height / 2, contentColor)
+            }
+            assertEquals(
+                "a ready boundary preview must carry rendered content pixels",
+                contentColor,
+                getPixel(width / 2, height / 2),
+            )
+            assertTrue(
+                "a ready boundary preview must not be a pure paper background",
+                getPixel(width / 2, height / 2) != getPixel(0, 0),
+            )
+        }
+        val generation = privateField("chapterGeneration") as Long
+        return constructor!!.apply { isAccessible = true }
+            .newInstance(token, forward, generation, bitmap) as BoundaryPagePreview
+    }
+
+    private fun EpubFlowView.offerBoundaryPreviewForTest(preview: BoundaryPagePreview): Boolean {
+        val offer = javaClass.declaredMethods.firstOrNull { method ->
+            method.name == "offerBoundaryPreview" &&
+                method.parameterTypes.contentEquals(arrayOf(BoundaryPagePreview::class.java))
+        }
+        assertNotNull("EpubFlowView must accept a ready preview through offerBoundaryPreview", offer)
+        return offer!!.apply { isAccessible = true }.invoke(this, preview) as Boolean
+    }
+
+    private fun EpubFlowView.installBoundaryCommitRecorderForTest(commits: MutableList<Any>) {
+        val callbackField = javaClass.declaredFields.firstOrNull { field ->
+            field.name == "onBoundaryTurnCommitted"
+        }
+        assertNotNull(
+            "EpubFlowView must expose an onBoundaryTurnCommitted delegate for model publication",
+            callbackField,
+        )
+        val callback: (Any) -> Unit = { commit -> commits.add(commit) }
+        callbackField!!.apply { isAccessible = true }.set(this, callback)
+    }
+
     private fun EpubFlowView.updateInteractiveCurl(x: Float) {
         javaClass.getDeclaredMethod(
             "updateInteractiveCurl",
@@ -3160,9 +3667,12 @@ class EpubFlowViewTest {
 
     private class FakeCurlOverlay(
         private val autoFirstFrameReady: Boolean = true,
+        private val transferRevealedOwnership: Boolean = false,
     ) : EpubCurlTurnOverlay {
         private var settled: ((Boolean) -> Unit)? = null
         private var firstFrameReady: (() -> Unit)? = null
+        private var ownedFrontBitmap: Bitmap? = null
+        private var ownedRevealedBitmap: Bitmap? = null
         override var active: Boolean = false
             private set
         var startCount: Int = 0
@@ -3179,6 +3689,8 @@ class EpubFlowViewTest {
             private set
         var dismissCount: Int = 0
             private set
+        var takeRevealedCount: Int = 0
+            private set
 
         override fun start(
             front: Bitmap,
@@ -3193,8 +3705,13 @@ class EpubFlowViewTest {
             revealedHeight = revealed.height
             frontBitmapCopy?.recycle()
             frontBitmapCopy = front.copy(Bitmap.Config.ARGB_8888, false)
-            front.recycle()
-            revealed.recycle()
+            if (transferRevealedOwnership) {
+                ownedFrontBitmap = front
+                ownedRevealedBitmap = revealed
+            } else {
+                front.recycle()
+                revealed.recycle()
+            }
             this.settled = settled
             this.firstFrameReady = firstFrameReady
             active = true
@@ -3204,10 +3721,22 @@ class EpubFlowViewTest {
 
         override fun animateTurn(durationMs: Long) = Unit
 
+        override fun takeRevealedBitmap(): Bitmap? {
+            takeRevealedCount += 1
+            val bitmap = ownedRevealedBitmap
+            ownedRevealedBitmap = null
+            if (ownedFrontBitmap === bitmap) ownedFrontBitmap = null
+            return bitmap?.takeUnless { it.isRecycled }
+        }
+
         override fun dismiss() {
             dismissCount += 1
             active = false
             firstFrameReady = null
+            ownedFrontBitmap?.let { if (!it.isRecycled) it.recycle() }
+            ownedRevealedBitmap?.let { if (!it.isRecycled) it.recycle() }
+            ownedFrontBitmap = null
+            ownedRevealedBitmap = null
         }
 
         fun settle(committed: Boolean) {

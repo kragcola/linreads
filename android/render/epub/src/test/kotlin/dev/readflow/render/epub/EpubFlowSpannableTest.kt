@@ -5,11 +5,17 @@ import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Looper
+import java.io.File
+import java.util.ArrayDeque
+import java.util.concurrent.AbstractExecutorService
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -28,6 +34,12 @@ import io.noties.markwon.image.AsyncDrawableSpan
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class EpubFlowSpannableTest {
+
+    private val attachedDrawableCallback = object : Drawable.Callback {
+        override fun invalidateDrawable(who: Drawable) = Unit
+        override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) = Unit
+        override fun unscheduleDrawable(who: Drawable, what: Runnable) = Unit
+    }
 
     private fun style() = EpubFlowStyle(
         fontSizeSp = 18f,
@@ -419,6 +431,139 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `releaseAll rejects a decoded result already posted to the main handler`() {
+        val epub = createImageEpub("release-all-late-result")
+        val executor = QueuedExecutorService()
+        val refreshes = AtomicInteger(0)
+        val completions = AtomicInteger(0)
+        try {
+            val loader = imageLoader(
+                epub = epub,
+                executor = executor,
+                onImageResultChanged = { refreshes.incrementAndGet() },
+                onDecodeFinished = { completions.incrementAndGet() },
+            )
+            val drawable = asyncDrawable(loader)
+            drawable.setCallback2(attachedDrawableCallback)
+            assertEquals("attach should queue exactly one decode", 1, executor.queuedTaskCount)
+
+            executor.runNext()
+            assertTrue("the posted result must still count as pending until the main handler consumes it", loader.hasPendingDecodes())
+            loader.releaseAll()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertFalse(loader.hasPendingDecodes())
+            assertFalse("a released loader must not install a late bitmap", drawable.result is BitmapDrawable)
+            assertEquals("a released loader must not wake its retired host", 0, refreshes.get())
+            assertEquals("a released loader must not wake its retired host", 0, completions.get())
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `cancelAll rejects a posted result and remains reusable`() {
+        val epub = createImageEpub("cancel-all-reuse")
+        val executor = QueuedExecutorService()
+        val refreshes = AtomicInteger(0)
+        try {
+            val loader = imageLoader(
+                epub = epub,
+                executor = executor,
+                onImageResultChanged = { refreshes.incrementAndGet() },
+            )
+            val retired = asyncDrawable(loader)
+            retired.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+
+            loader.cancelAll()
+            val replacement = asyncDrawable(loader)
+            replacement.setCallback2(attachedDrawableCallback)
+            assertEquals("the reusable generation should queue the replacement decode", 1, executor.queuedTaskCount)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertFalse(loader.hasPendingDecodes())
+            assertFalse("the retired generation must not install its late result", retired.result is BitmapDrawable)
+            assertTrue("cancelAll must not permanently release the loader", replacement.result is BitmapDrawable)
+            assertEquals("only the replacement result may refresh the host", 1, refreshes.get())
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `provider exceptions do not escape image scheduling or placeholder lookup`() {
+        val executor = QueuedExecutorService()
+        try {
+            val fileFailureLoader = EpubFlowImageLoader(
+                epubFileProvider = { throw IllegalStateException("book already closed") },
+                executor = executor,
+                columnWidthPx = 8,
+                pageHeightProvider = { 8 },
+                inlineMaxHeightPx = 8,
+                fullPageHrefs = emptySet(),
+            )
+            val fileFailure = runCatching { fileFailureLoader.load(asyncDrawable(fileFailureLoader)) }.exceptionOrNull()
+            assertNull("a closing book provider must degrade to a missing image", fileFailure)
+            assertFalse(fileFailureLoader.hasPendingDecodes())
+
+            val boundsFailureLoader = EpubFlowImageLoader(
+                epubFileProvider = { File("/tmp/unused.epub") },
+                executor = executor,
+                columnWidthPx = 8,
+                pageHeightProvider = { 8 },
+                inlineMaxHeightPx = 8,
+                fullPageHrefs = emptySet(),
+                imageBoundsProvider = { throw IllegalStateException("bounds source retired") },
+            )
+            val placeholder = runCatching {
+                boundsFailureLoader.placeholder(asyncDrawable(boundsFailureLoader))
+            }
+            assertNull("a retired bounds provider must degrade to no placeholder", placeholder.exceptionOrNull())
+            assertNull(placeholder.getOrNull())
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `late page height provider exception finishes the request without crashing the handler`() {
+        val epub = createImageEpub("late-page-height-provider")
+        val executor = QueuedExecutorService()
+        val completions = AtomicInteger(0)
+        var providerRetired = false
+        try {
+            val loader = imageLoader(
+                epub = epub,
+                executor = executor,
+                fullPage = true,
+                pageHeightProvider = {
+                    if (providerRetired) throw IllegalStateException("preview viewport retired")
+                    8
+                },
+                onDecodeFinished = { completions.incrementAndGet() },
+            )
+            val drawable = asyncDrawable(loader)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            providerRetired = true
+
+            val handlerFailure = runCatching { shadowOf(Looper.getMainLooper()).idle() }.exceptionOrNull()
+
+            assertNull("a late provider failure must not escape the main handler", handlerFailure)
+            assertFalse(loader.hasPendingDecodes())
+            assertFalse("a failed layout provider must not install a bitmap with unknown bounds", drawable.result is BitmapDrawable)
+            assertEquals("provider failure must still release reveal gates", 1, completions.get())
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `full page image re-fits to the real viewport at decode time not the pre-measure estimate`() {
         // Repro of the "封面/彩插 不显示或闪一下消失" bug: the placeholder is reserved BEFORE the view is
         // measured, when pageHeightProvider still returns the screen-derived estimate (~100px too tall
@@ -590,5 +735,83 @@ class EpubFlowSpannableTest {
         val sb = build(flow, style().copy(firstLineIndentPx = 0)) { null } as android.text.Spanned
         val margins = sb.getSpans(0, sb.length, android.text.style.LeadingMarginSpan.Standard::class.java)
         assertEquals(0, margins.size)
+    }
+
+    private fun imageLoader(
+        epub: File,
+        executor: QueuedExecutorService,
+        fullPage: Boolean = false,
+        pageHeightProvider: () -> Int = { 8 },
+        onImageResultChanged: (() -> Unit)? = null,
+        onDecodeFinished: (() -> Unit)? = null,
+    ) = EpubFlowImageLoader(
+        epubFileProvider = { epub },
+        executor = executor,
+        columnWidthPx = 8,
+        pageHeightProvider = pageHeightProvider,
+        inlineMaxHeightPx = 8,
+        fullPageHrefs = if (fullPage) setOf(TEST_IMAGE_HREF) else emptySet(),
+        onImageResultChanged = onImageResultChanged,
+        onDecodeFinished = onDecodeFinished,
+    )
+
+    private fun asyncDrawable(loader: EpubFlowImageLoader) = AsyncDrawable(
+        TEST_IMAGE_HREF,
+        loader,
+        EpubFlowImageSizeResolver(
+            columnWidthPx = 8,
+            pageHeightProvider = { 8 },
+            inlineMaxHeightPx = 8,
+            fullPageHrefs = emptySet(),
+        ),
+        null,
+    )
+
+    private fun createImageEpub(prefix: String): File {
+        val epub = File.createTempFile(prefix, ".epub")
+        val image = android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            ZipOutputStream(epub.outputStream()).use { zip ->
+                zip.putNextEntry(ZipEntry(TEST_IMAGE_HREF))
+                image.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, zip)
+                zip.closeEntry()
+            }
+        } finally {
+            image.recycle()
+        }
+        return epub
+    }
+
+    private class QueuedExecutorService : AbstractExecutorService() {
+        private val tasks = ArrayDeque<Runnable>()
+        private var stopped = false
+
+        val queuedTaskCount: Int get() = tasks.size
+
+        fun runNext() {
+            tasks.removeFirst().run()
+        }
+
+        override fun execute(command: Runnable) {
+            if (stopped) throw RejectedExecutionException("executor stopped")
+            tasks.addLast(command)
+        }
+
+        override fun shutdown() {
+            stopped = true
+        }
+
+        override fun shutdownNow(): MutableList<Runnable> {
+            stopped = true
+            return tasks.toMutableList().also { tasks.clear() }
+        }
+
+        override fun isShutdown(): Boolean = stopped
+        override fun isTerminated(): Boolean = stopped && tasks.isEmpty()
+        override fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean = isTerminated
+    }
+
+    private companion object {
+        const val TEST_IMAGE_HREF = "image.png"
     }
 }

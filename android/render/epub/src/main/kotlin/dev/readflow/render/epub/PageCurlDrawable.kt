@@ -28,13 +28,16 @@ import android.graphics.drawable.Drawable
  * the revealed page just past the spine.
  */
 internal class PageCurlDrawable(
-    private val frontBitmap: Bitmap,
-    private val revealedBitmap: Bitmap,
+    frontBitmap: Bitmap,
+    revealedBitmap: Bitmap,
     private val viewportW: Int,
     private val viewportH: Int,
     private val forward: Boolean,
     private val density: Float,
 ) : Drawable() {
+
+    private var frontBitmap: Bitmap? = frontBitmap
+    private var revealedBitmap: Bitmap? = revealedBitmap
 
     /** 0 = page flat (no fold), 1 = page fully turned (folded edge-on, off the spine). */
     var progress: Float = 0f
@@ -62,9 +65,9 @@ internal class PageCurlDrawable(
         canvas.translate(bounds.left.toFloat(), bounds.top.toFloat())
         val w = viewportW.toFloat()
         val h = viewportH.toFloat()
-        canvas.drawBitmap(revealedBitmap, 0f, 0f, paint)
+        revealedBitmap?.let { canvas.drawBitmap(it, 0f, 0f, paint) }
         if (progress <= 0f) {
-            canvas.drawBitmap(frontBitmap, 0f, 0f, paint)
+            frontBitmap?.let { canvas.drawBitmap(it, 0f, 0f, paint) }
             canvas.restoreToCount(save)
             return
         }
@@ -85,7 +88,7 @@ internal class PageCurlDrawable(
 
         val mSave = canvas.save()
         canvas.concat(matrix)
-        canvas.drawBitmap(frontBitmap, 0f, 0f, paint)
+        frontBitmap?.let { canvas.drawBitmap(it, 0f, 0f, paint) }
         // The tilting surface catches less light → darken proportionally to the fold angle.
         shadePaint.shader = null
         shadePaint.color = 0xFF000000.toInt()
@@ -115,9 +118,21 @@ internal class PageCurlDrawable(
         shadePaint.shader = null
     }
 
+    /** Transfers the revealed page to the caller without copying it. */
+    fun takeRevealedBitmap(): Bitmap? {
+        val bitmap = revealedBitmap
+        revealedBitmap = null
+        if (frontBitmap === bitmap) frontBitmap = null
+        return bitmap?.takeUnless { it.isRecycled }
+    }
+
     fun recycle() {
-        if (!frontBitmap.isRecycled) frontBitmap.recycle()
-        if (!revealedBitmap.isRecycled) revealedBitmap.recycle()
+        val front = frontBitmap
+        val revealed = revealedBitmap
+        frontBitmap = null
+        revealedBitmap = null
+        if (front != null && !front.isRecycled) front.recycle()
+        if (revealed != null && revealed !== front && !revealed.isRecycled) revealed.recycle()
     }
 
     override fun setAlpha(alpha: Int) {}

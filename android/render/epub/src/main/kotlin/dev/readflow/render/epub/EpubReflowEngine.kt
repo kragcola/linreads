@@ -7,6 +7,8 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.text.TextPaint
 import android.util.TypedValue
 import android.view.Gravity
@@ -76,6 +78,7 @@ import io.noties.markwon.core.MarkwonTheme
 import io.noties.markwon.image.AsyncDrawableScheduler
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -233,6 +236,15 @@ class EpubReflowEngine private constructor(
     private var flowSpineIndex: Int = -1
     private var flowAppliedPalette: ReaderPalette? = null
     private val flowExecutor: ExecutorService by lazy { Executors.newFixedThreadPool(2) }
+    private val flowMainHandler = Handler(Looper.getMainLooper())
+    private var liveFlowImageLoader: EpubFlowImageLoader? = null
+    private var boundaryPreviewGeneration = 0L
+    private var nextBoundaryPreviewToken = 0L
+    private var nextBoundaryPreviewRequestId = 0L
+    private val boundaryPreviewJobs = mutableMapOf<Boolean, Future<*>>()
+    private val boundaryPreviewJobTokens = mutableMapOf<Boolean, Long>()
+    private val boundaryPreviewSessions = mutableMapOf<Boolean, BoundaryPreviewRenderSession>()
+    private val boundaryPreviewTargets = mutableMapOf<Long, BoundaryPreviewTarget>()
     override val selfPagingActive: Boolean get() = flowEngineEnabled
     private var cacheJob: Job? = null
     private var cacheScope: CoroutineScope? = null
@@ -242,6 +254,25 @@ class EpubReflowEngine private constructor(
     private val activePagedCompositePages = WeakHashMap<View, EpubPagedImagePageState>()
     private val imageBoundsCache = mutableMapOf<String, EpubImageBoundsCacheEntry>()
     private var pendingInitialLocator: Locator? = null
+
+    private data class BoundaryPreviewRenderSession(
+        val generation: Long,
+        val forward: Boolean,
+        val sourceSpine: Int,
+        val sourceChapterGeneration: Long,
+        val targetSpine: Int,
+        val view: EpubFlowView,
+        val loader: EpubFlowImageLoader,
+        var timeoutRunnable: Runnable? = null,
+    )
+
+    private data class BoundaryPreviewTarget(
+        val generation: Long,
+        val sourceSpine: Int,
+        val sourcePreviewGeneration: Long,
+        val targetSpine: Int,
+        val forward: Boolean,
+    )
 
     /** Start index (inclusive) and end index (exclusive) of each chapter in paras. */
     private data class ChapterBoundary(
@@ -422,17 +453,16 @@ class EpubReflowEngine private constructor(
             onTapZone = ::handleFlowTapZone,
             onTopOffsetChanged = ::handleFlowTopOffsetChanged,
             onSelectionRange = { start, end -> updateFlowSelection(start, end) },
-        ).apply {
-            mode = if (_pagingKind.value == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
-            flipStyle = this@EpubReflowEngine.flipStyle
-            background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
-            textView.setTextColor(palette.ink)
-            val padH = (PAGE_HORIZONTAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
-            val padV = (PAGE_VERTICAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
-            textView.setPadding(padH, padV, padH, padV)
-            textView.typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
-            textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
-            applyFlowLineSpacing(textView)
+        ).also { configureFlowView(it, palette) }
+        view.onBoundaryPreviewNeeded = ::requestBoundaryPreview
+        view.onBoundaryPreviewConfigurationChanged = {
+            invalidateBoundaryPreviewState(clearViewSlots = false)
+        }
+        view.canCommitBoundaryTurn = ::canCommitBoundaryPreview
+        view.onBoundaryTurnCommitted = ::commitBoundaryPreview
+        view.onBoundaryTurnDiscarded = ::discardBoundaryPreview
+        view.onChapterStable = {
+            if (flowView === view && flowSpineIndex >= 0) prewarmBoundaryPreviews()
         }
         flowAppliedPalette = palette
         flowView = view
@@ -472,6 +502,19 @@ class EpubReflowEngine private constructor(
             overlay
         }
         return host
+    }
+
+    private fun configureFlowView(view: EpubFlowView, palette: ReaderPalette) {
+        view.mode = if (_pagingKind.value == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
+        view.flipStyle = flipStyle
+        view.background = readerPaperBackground(context, palette.paper, palette.ink, palette.isNight)
+        view.textView.setTextColor(palette.ink)
+        val padH = (PAGE_HORIZONTAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
+        val padV = (PAGE_VERTICAL_PADDING_DP * context.resources.displayMetrics.density).toInt()
+        view.textView.setPadding(padH, padV, padH, padV)
+        view.textView.typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
+        view.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
+        applyFlowLineSpacing(view.textView)
     }
 
     private fun spineIndexForParagraph(paragraphIndex: Int): Int =
@@ -520,24 +563,51 @@ class EpubReflowEngine private constructor(
         restoreToParagraph: Int? = null,
         restoreToParagraphOffset: Int = 0,
         landOnLast: Boolean = false,
+        reportPositionAfterStableReveal: Boolean = false,
     ) {
         val view = flowView ?: return
         val book = lazyBook ?: return
-        book.prefetchAroundParagraph(paras.indexOfFirst { it.spineIndex == spineIndex }.coerceAtLeast(0))
         val blocks = book.layoutBlocks().filter {
             paras.getOrNull(it.paragraphIndex)?.spineIndex == spineIndex
         }
         val flow = epubBuildChapterFlow(spineIndex, blocks)
+        liveFlowImageLoader?.releaseAll()
+        liveFlowImageLoader = installFlowChapter(
+            view = view,
+            flow = flow,
+            restoreToParagraph = restoreToParagraph,
+            restoreToParagraphOffset = restoreToParagraphOffset,
+            landOnLast = landOnLast,
+            reportPositionAfterStableReveal = reportPositionAfterStableReveal,
+            isCurrent = { flowCurrentFlow === flow },
+            onLinkClick = ::handleLinkClick,
+        ) ?: return
         flowSpineIndex = spineIndex
+        flowCurrentFlow = flow
+    }
+
+    private fun installFlowChapter(
+        view: EpubFlowView,
+        flow: EpubChapterFlow,
+        restoreToParagraph: Int? = null,
+        restoreToParagraphOffset: Int = 0,
+        landOnLast: Boolean = false,
+        reportPositionAfterStableReveal: Boolean = false,
+        isCurrent: () -> Boolean,
+        onLinkClick: (EpubTextLink) -> Unit,
+    ): EpubFlowImageLoader? {
         val density = context.resources.displayMetrics.density
         val palette = paletteFor(themeMode, context.resources.configuration)
+        val measuredColumnWidth = (view.width - view.textView.paddingLeft - view.textView.paddingRight)
+            .takeIf { it > 0 }
+            ?: flowColumnWidthPx()
         val style = EpubFlowStyle(
             fontSizeSp = fontSizeSp,
             lineSpacingMultiplier = lineSpacingMultiplier,
             inkColor = palette.ink,
             typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId),
-            columnWidthPx = flowColumnWidthPx(),
-            imageMaxHeightPx = flowPageHeightPx(),
+            columnWidthPx = measuredColumnWidth,
+            imageMaxHeightPx = view.usablePageImageHeightPx().takeIf { it > 0 } ?: flowPageHeightPx(),
             density = density,
             firstLineIndentPx = flowFirstLineIndentPx(density),
         )
@@ -548,25 +618,26 @@ class EpubReflowEngine private constructor(
         // system bars + padding), the engine's screen estimate is ~100px too tall → cover spilled onto
         // a blank 2nd page. Read it lazily at decode time, falling back to the estimate pre-measure.
         val pageHeightProvider = {
-            (flowView?.usablePageImageHeightPx() ?: 0).takeIf { it > 0 } ?: flowPageHeightPx()
+            view.usablePageImageHeightPx().takeIf { it > 0 } ?: flowPageHeightPx()
         }
-        val loader = EpubFlowImageLoader(
+        lateinit var loader: EpubFlowImageLoader
+        loader = EpubFlowImageLoader(
             epubFileProvider = { epubFile },
             executor = flowExecutor,
-            columnWidthPx = flowColumnWidthPx(),
+            columnWidthPx = measuredColumnWidth,
             pageHeightProvider = pageHeightProvider,
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
             imageBoundsProvider = ::epubImageBoundsFor,
             onImageResultChanged = {
-                if (flowCurrentFlow === flow) view.refreshAfterAsyncImageResult()
+                if (isCurrent()) view.refreshAfterAsyncImageResult()
             },
             onDecodeFinished = {
-                if (flowCurrentFlow === flow) view.onAsyncImageDecodeFinished()
+                if (isCurrent()) view.onAsyncImageDecodeFinished()
             },
         )
         val resolver = EpubFlowImageSizeResolver(
-            columnWidthPx = flowColumnWidthPx(),
+            columnWidthPx = measuredColumnWidth,
             pageHeightProvider = pageHeightProvider,
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
@@ -578,7 +649,7 @@ class EpubReflowEngine private constructor(
             markwonTheme = theme,
             imageLoader = loader,
             imageSizeResolver = resolver,
-            onLinkClick = ::handleLinkClick,
+            onLinkClick = onLinkClick,
             highlightRanges = flowHighlightRanges(flow),
         )
         val restoreOffset = restoreToParagraph?.let { flow.offsetForParagraph(it, restoreToParagraphOffset) }
@@ -587,7 +658,14 @@ class EpubReflowEngine private constructor(
         // transparent placeholders before loader.inFlight has a chance to become non-empty.
         var imageSchedulingPending = true
         view.pendingDecodesProvider = { imageSchedulingPending || loader.hasPendingDecodes() }
-        view.setChapter(flow, spannable, flowPageHeightPx(), restoreOffset = restoreOffset, landOnLast = landOnLast)
+        view.setChapter(
+            flow,
+            spannable,
+            flowPageHeightPx(),
+            restoreOffset = restoreOffset,
+            landOnLast = landOnLast,
+            reportPositionAfterStableReveal = reportPositionAfterStableReveal,
+        )
         // Schedule async images after the layout pass; positioning is now done inside setChapter's own
         // post (single pre-paint placement — no chapter-top→resume jump on entry).
         view.textView.post {
@@ -598,10 +676,238 @@ class EpubReflowEngine private constructor(
                 view.tryRevealWhenStable()
             }
         }
-        flowCurrentFlow = flow
+        return loader
     }
 
     private var flowCurrentFlow: EpubChapterFlow? = null
+
+    private fun prewarmBoundaryPreviews() {
+        val view = flowView ?: return
+        if (_pagingKind.value != PagingKind.PAGED || flowSpineIndex < 0) return
+        val sourceGeneration = view.boundaryPreviewGenerationToken()
+        requestBoundaryPreview(forward = false, sourceChapterGeneration = sourceGeneration)
+        requestBoundaryPreview(forward = true, sourceChapterGeneration = sourceGeneration)
+    }
+
+    private fun requestBoundaryPreview(forward: Boolean, sourceChapterGeneration: Long) {
+        val view = flowView ?: return
+        val book = lazyBook ?: return
+        val host = flowHost ?: return
+        if (
+            _pagingKind.value != PagingKind.PAGED ||
+            view.boundaryPreviewGenerationToken() != sourceChapterGeneration ||
+            boundaryPreviewJobs.containsKey(forward) ||
+            boundaryPreviewSessions.containsKey(forward)
+        ) return
+        val sourceSpine = flowSpineIndex
+        val targetSpine = adjacentSpine(sourceSpine, if (forward) 1 else -1) ?: return
+        val generation = boundaryPreviewGeneration
+        val blocks = book.layoutBlocks().filter {
+            paras.getOrNull(it.paragraphIndex)?.spineIndex == targetSpine
+        }
+        val requestId = ++nextBoundaryPreviewRequestId
+        boundaryPreviewJobTokens[forward] = requestId
+        boundaryPreviewJobs[forward] = flowExecutor.submit {
+            val targetFlow = runCatching { epubBuildChapterFlow(targetSpine, blocks) }.getOrNull()
+            flowMainHandler.post {
+                if (boundaryPreviewJobTokens[forward] != requestId) return@post
+                boundaryPreviewJobs.remove(forward)
+                boundaryPreviewJobTokens.remove(forward)
+                if (targetFlow == null) return@post
+                if (
+                    generation != boundaryPreviewGeneration ||
+                    flowView !== view ||
+                    flowHost !== host ||
+                    flowSpineIndex != sourceSpine ||
+                    view.boundaryPreviewGenerationToken() != sourceChapterGeneration
+                ) return@post
+                installBoundaryPreviewRenderer(
+                    generation = generation,
+                    forward = forward,
+                    sourceSpine = sourceSpine,
+                    sourceChapterGeneration = sourceChapterGeneration,
+                    targetSpine = targetSpine,
+                    targetFlow = targetFlow,
+                )
+            }
+        }
+    }
+
+    private fun installBoundaryPreviewRenderer(
+        generation: Long,
+        forward: Boolean,
+        sourceSpine: Int,
+        sourceChapterGeneration: Long,
+        targetSpine: Int,
+        targetFlow: EpubChapterFlow,
+    ) {
+        val host = flowHost ?: return
+        val liveView = flowView ?: return
+        if (liveView.width <= 0 || liveView.height <= 0) return
+        boundaryPreviewSessions.remove(forward)?.let(::disposeBoundaryPreviewSession)
+        val palette = paletteFor(themeMode, context.resources.configuration)
+        val previewView = EpubFlowView(
+            context = context,
+            onTapZone = {},
+            onTopOffsetChanged = {},
+            onSelectionRange = { _, _ -> },
+        ).also {
+            configureFlowView(it, palette)
+            it.animateChapterReveal = false
+            it.pageTexturePrecacheEnabled = false
+            // Kept behind the opaque live reader. A zero-alpha view may be skipped by ViewRoot and
+            // never receive the pre-draw that closes the async-image stability gate.
+            it.alpha = 1f
+            it.isEnabled = false
+            it.isClickable = false
+            it.isFocusable = false
+            it.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+            it.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            it.textView.setTextIsSelectable(false)
+            it.textView.isEnabled = false
+            it.textView.isFocusable = false
+            it.textView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        }
+        host.addView(
+            previewView,
+            0,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        val widthSpec = View.MeasureSpec.makeMeasureSpec(liveView.width, View.MeasureSpec.EXACTLY)
+        val heightSpec = View.MeasureSpec.makeMeasureSpec(liveView.height, View.MeasureSpec.EXACTLY)
+        previewView.measure(widthSpec, heightSpec)
+        previewView.layout(0, 0, liveView.width, liveView.height)
+        previewView.onChapterStable = {
+            completeBoundaryPreviewRenderer(forward, generation, previewView)
+        }
+        val loader = installFlowChapter(
+            view = previewView,
+            flow = targetFlow,
+            landOnLast = !forward,
+            isCurrent = {
+                val session = boundaryPreviewSessions[forward]
+                session?.generation == generation && session.view === previewView
+            },
+            onLinkClick = {},
+        ) ?: run {
+            host.removeView(previewView)
+            previewView.dispose()
+            return
+        }
+        val session = BoundaryPreviewRenderSession(
+            generation = generation,
+            forward = forward,
+            sourceSpine = sourceSpine,
+            sourceChapterGeneration = sourceChapterGeneration,
+            targetSpine = targetSpine,
+            view = previewView,
+            loader = loader,
+        )
+        boundaryPreviewSessions[forward] = session
+        val timeout = Runnable {
+                val stale = boundaryPreviewSessions[forward]
+                if (stale?.view === previewView && stale.generation == generation) {
+                    boundaryPreviewSessions.remove(forward)
+                    disposeBoundaryPreviewSession(stale)
+                }
+            }
+        session.timeoutRunnable = timeout
+        previewView.postDelayed(timeout, BOUNDARY_PREVIEW_TIMEOUT_MS)
+    }
+
+    private fun completeBoundaryPreviewRenderer(
+        forward: Boolean,
+        generation: Long,
+        previewView: EpubFlowView,
+    ) {
+        val session = boundaryPreviewSessions[forward] ?: return
+        if (session.generation != generation || session.view !== previewView) return
+        val bitmap = previewView.snapshotBoundaryLandingPage(landOnLast = !forward)
+        boundaryPreviewSessions.remove(forward)
+        disposeBoundaryPreviewSession(session)
+        if (bitmap == null) return
+        val liveView = flowView
+        if (
+            generation != boundaryPreviewGeneration ||
+            liveView == null ||
+            flowSpineIndex != session.sourceSpine ||
+            liveView.boundaryPreviewGenerationToken() != session.sourceChapterGeneration
+        ) {
+            bitmap.recycle()
+            return
+        }
+        val token = ++nextBoundaryPreviewToken
+        boundaryPreviewTargets[token] = BoundaryPreviewTarget(
+            generation = generation,
+            sourceSpine = session.sourceSpine,
+            sourcePreviewGeneration = session.sourceChapterGeneration,
+            targetSpine = session.targetSpine,
+            forward = forward,
+        )
+        val accepted = liveView.offerBoundaryPreview(
+            BoundaryPagePreview(
+                token = token,
+                forward = forward,
+                sourceChapterGeneration = session.sourceChapterGeneration,
+                bitmap = bitmap,
+            ),
+        )
+        if (!accepted) boundaryPreviewTargets.remove(token)
+    }
+
+    private fun commitBoundaryPreview(preview: BoundaryPagePreview) {
+        if (!canCommitBoundaryPreview(preview)) return
+        val target = boundaryPreviewTargets.remove(preview.token) ?: return
+        invalidateBoundaryPreviewState(clearViewSlots = true)
+        loadFlowChapter(
+            spineIndex = target.targetSpine,
+            restoreToParagraph = if (target.forward) firstParagraphOfSpine(target.targetSpine) else null,
+            landOnLast = !target.forward,
+            reportPositionAfterStableReveal = true,
+        )
+    }
+
+    private fun canCommitBoundaryPreview(preview: BoundaryPagePreview): Boolean {
+        val target = boundaryPreviewTargets[preview.token] ?: return false
+        return target.generation == boundaryPreviewGeneration &&
+            target.sourceSpine == flowSpineIndex &&
+            target.sourcePreviewGeneration == preview.sourceChapterGeneration &&
+            target.sourcePreviewGeneration == flowView?.boundaryPreviewGenerationToken() &&
+            target.forward == preview.forward
+    }
+
+    private fun discardBoundaryPreview(preview: BoundaryPagePreview) {
+        boundaryPreviewTargets.remove(preview.token)
+        val view = flowView ?: return
+        view.post {
+            if (flowView === view && flowSpineIndex >= 0) {
+                requestBoundaryPreview(preview.forward, view.boundaryPreviewGenerationToken())
+            }
+        }
+    }
+
+    private fun invalidateBoundaryPreviewState(clearViewSlots: Boolean) {
+        boundaryPreviewGeneration++
+        boundaryPreviewJobs.values.forEach { it.cancel(true) }
+        boundaryPreviewJobs.clear()
+        boundaryPreviewJobTokens.clear()
+        boundaryPreviewSessions.values.toList().forEach(::disposeBoundaryPreviewSession)
+        boundaryPreviewSessions.clear()
+        boundaryPreviewTargets.clear()
+        if (clearViewSlots) flowView?.clearBoundaryPreviews()
+    }
+
+    private fun disposeBoundaryPreviewSession(session: BoundaryPreviewRenderSession) {
+        session.timeoutRunnable?.let(session.view::removeCallbacks)
+        session.timeoutRunnable = null
+        runCatching { AsyncDrawableScheduler.unschedule(session.view.textView) }
+        session.loader.releaseAll()
+        session.view.dispose()
+        (session.view.parent as? ViewGroup)?.removeView(session.view)
+    }
 
     /**
      * Hrefs of the chapter's full-page illustrations (covers/彩插), by the same intrinsic-pixel gate
@@ -678,18 +984,8 @@ class EpubReflowEngine private constructor(
     private fun advanceFlowPage(delta: Int) {
         val view = flowView ?: return
         if (view.goToAdjacentPage(delta)) return
-        val target = adjacentSpine(flowSpineIndex, delta) ?: return
-        if (
-            view.prepareBoundaryPageTurnResult(delta) ==
-            EpubFlowView.BoundaryPageTurnPreparation.SNAPSHOT_UNAVAILABLE
-        ) {
-            return
-        }
-        if (delta > 0) {
-            loadFlowChapter(target, restoreToParagraph = firstParagraphOfSpine(target))
-        } else {
-            loadFlowChapter(target, landOnLast = true)
-        }
+        adjacentSpine(flowSpineIndex, delta) ?: return
+        view.startDiscreteBoundaryTurn(delta)
     }
 
     private fun handleFlowTopOffsetChanged(layoutOffset: Int) {
@@ -1105,6 +1401,7 @@ class EpubReflowEngine private constructor(
         val targetSpine = spineIndexForParagraph(idx)
         withContext(Dispatchers.IO) { lazyBook?.prefetchAroundParagraph(idx) }
         withContext(Dispatchers.Main) {
+            invalidateBoundaryPreviewState(clearViewSlots = true)
             val view = flowView
             if (view == null) {
                 _currentLocator.value = epubLocatorForOffset(paras, idx, paraOffset)
@@ -1116,6 +1413,7 @@ class EpubReflowEngine private constructor(
             } else {
                 val offset = flowCurrentFlow?.offsetForParagraph(idx, paraOffset) ?: 0
                 view.goToOffset(offset)
+                prewarmBoundaryPreviews()
             }
             _currentLocator.value = epubLocatorForOffset(paras, idx, paraOffset)
             updateChapterInfo(idx)
@@ -1176,9 +1474,20 @@ class EpubReflowEngine private constructor(
 
     override fun setTextAnnotations(annotations: List<ReaderTextAnnotation>) {
         textAnnotations = annotations
+        if (flowEngineEnabled && flowView != null) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                invalidateBoundaryPreviewState(clearViewSlots = true)
+            } else {
+                flowMainHandler.post {
+                    invalidateBoundaryPreviewState(clearViewSlots = true)
+                    prewarmBoundaryPreviews()
+                }
+            }
+        }
         // Flow mode owns its own single-Spannable surface; refresh its highlight spans in place
         // (no reload, no repagination) so newly added annotations paint immediately.
         flowView?.let { view -> flowCurrentFlow?.let { flow -> view.refreshHighlights(flowHighlightRanges(flow)) } }
+        if (flowEngineEnabled && Looper.myLooper() == Looper.getMainLooper()) prewarmBoundaryPreviews()
         (recyclerView?.adapter as? EpubParaAdapter)?.updateTextAnnotations()
         activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
     }
@@ -1362,10 +1671,15 @@ class EpubReflowEngine private constructor(
     }
 
     private fun resetBookStateForOpen() {
+        invalidateBoundaryPreviewState(clearViewSlots = false)
+        flowMainHandler.removeCallbacksAndMessages(null)
+        liveFlowImageLoader?.releaseAll()
+        liveFlowImageLoader = null
         cacheJob?.cancel()
         cacheJob = null
         cacheScope = null
         flowView?.textView?.let { runCatching { AsyncDrawableScheduler.unschedule(it) } }
+        flowView?.dispose()
         flowView = null
         flowHost = null
         flowCurrentFlow = null
@@ -1403,10 +1717,15 @@ class EpubReflowEngine private constructor(
         epubHighlightRanges(paras, paragraphIndex, textAnnotations)
 
     override suspend fun close() {
+        invalidateBoundaryPreviewState(clearViewSlots = false)
+        flowMainHandler.removeCallbacksAndMessages(null)
+        liveFlowImageLoader?.releaseAll()
+        liveFlowImageLoader = null
         recyclerView = null
         pageRequestCallback = null
         pendingInitialLocator = null
         flowView?.textView?.let { runCatching { AsyncDrawableScheduler.unschedule(it) } }
+        flowView?.dispose()
         flowView = null
         flowHost = null
         flowCurrentFlow = null
@@ -1427,6 +1746,7 @@ class EpubReflowEngine private constructor(
         activePagedCompositePages.clear()
         lazyBook?.close()
         lazyBook = null
+        imageBoundsCache.clear()
         paras = emptyList()
         displayBlockCount = 0
         epubFile = null
@@ -1469,7 +1789,11 @@ class EpubReflowEngine private constructor(
     override suspend fun setPageFlipStyle(style: dev.readflow.core.model.PageFlipStyle) {
         if (flipStyle == style) return
         flipStyle = style
-        flowView?.flipStyle = style
+        withContext(Dispatchers.Main) {
+            invalidateBoundaryPreviewState(clearViewSlots = true)
+            flowView?.flipStyle = style
+            prewarmBoundaryPreviews()
+        }
     }
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {
@@ -1524,6 +1848,7 @@ class EpubReflowEngine private constructor(
     /** Rebuilds the current flow chapter's Spannable in place, preserving reading position. */
     private suspend fun rebuildFlowChapter() {
         withContext(Dispatchers.Main) {
+            invalidateBoundaryPreviewState(clearViewSlots = true)
             val view = flowView ?: return@withContext
             val (anchorParagraph, anchorOffset) = flowAnchorFromLocator(_currentLocator.value)
             view.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
@@ -1547,6 +1872,7 @@ class EpubReflowEngine private constructor(
         if (targetKind == _pagingKind.value) return
         if (flowEngineEnabled) {
             withContext(Dispatchers.Main) {
+                invalidateBoundaryPreviewState(clearViewSlots = true)
                 _pagingKind.value = targetKind
                 flowView?.let { view ->
                     val offset = flowCurrentFlow?.let { flow ->
@@ -1617,6 +1943,11 @@ class EpubReflowEngine private constructor(
         if (key.isEmpty()) return
         val targetPosition = internalLinkTargetIndexes[key] ?: return
         val target = epubLocatorForTarget(paras, targetPosition)
+        if (flowEngineEnabled && flowView != null) {
+            clearTextSelection()
+            cacheScope?.launch { goToFlow(target) }
+            return
+        }
         if (_pagingKind.value == PagingKind.PAGED) {
             clearTextSelection()
             _currentLocator.value = target
@@ -2182,6 +2513,7 @@ class EpubReflowEngine private constructor(
         const val PAGE_VERTICAL_PADDING_DP = 24
         const val INLINE_IMAGE_MAX_HEIGHT_DP = 360
         const val INLINE_IMAGE_VERTICAL_PADDING_DP = 24
+        const val BOUNDARY_PREVIEW_TIMEOUT_MS = 10_000L
         // Intrinsic-pixel gate for full-page placement. Light-novel illustrations/彩插/covers run
         // ~800px+ on the long side; inline avatars (~142px) and icons (~300-400px) sit well below.
         const val FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX = 600

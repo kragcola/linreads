@@ -121,10 +121,31 @@ edges that block commit/push:
 The architecture decision is resolved as architecture A. Every finger-tracked
 `PageFlipStyle.SIMULATION` drag uses the software `PageCurlDrawable`; horizontal
 and sidebar-vertical turns track their own axis. Tap/key discrete turns retain
-harism GL, while chapter boundaries retain the existing software `startFlip()`.
+harism GL. Chapter-boundary turns now use the same software curl with a prepared
+adjacent-chapter page shot instead of falling back to a post-release discrete turn.
 If the software page shot cannot be created, the gesture is rejected without
 creating or prewarming a GL overlay. The abandoned interactive-GL, PixelCopy
 verifier, and finger-hold watchdog experiments have been deleted.
+
+## Cross-Chapter Continuity Continuation - 2026-07-11/12
+
+The user selected AA for the remaining simulation boundary discontinuity:
+
+- maintain independently owned forward and backward adjacent-chapter preview slots;
+- use a hidden `EpubFlowView` with the live typography, Markwon image pipeline, and
+  layout-stability gate to capture the target chapter's first/last landing page;
+- keep the finger-driven software curl continuous when the preview is ready;
+- if the finger reaches `UP` before a cold preview is ready, cancel immediately and
+  never auto-turn after release;
+- install the real target chapter only after commit, keep the transferred target page
+  shot as the continuity owner until the target layout is stable, and publish the new
+  locator once at that stable handoff.
+
+Preview jobs, hidden render sessions, bitmap ownership, settings/rotation/mode
+invalidation, internal-link navigation, close/dispose, and late image callbacks are
+generation/token guarded. Discrete tap/key turns use the same preview transaction and
+time out their waiting state after three seconds. Physical-device handfeel remains
+deferred by the user; this continuation is validated at JVM/lint/build level only.
 
 ## Visual Acceptance Contract
 
@@ -156,6 +177,9 @@ verifier, and finger-hold watchdog experiments have been deleted.
 - [x] Remove the interactive GL, PixelCopy verifier, and hold-watchdog experiment paths.
 - [x] Run targeted and full JVM/AVD/build verification for architecture A.
 - [x] Complete independent architecture, verification-scope, and runtime-evidence reviews.
+- [x] Implement AA bidirectional adjacent-chapter previews and cancel-on-UP cold behavior.
+- [x] Run the 365-test EPUB module, lint, debug APK, and local OTA build gates.
+- [x] Complete the final independent AA lifecycle/integration review and resolve all P0/P1 findings.
 - [ ] Commit, push, and verify the new OTA artifact.
 
 ## Risks / Decision Points
@@ -207,6 +231,11 @@ verifier, and finger-hold watchdog experiments have been deleted.
 | 2026-07-11 | Stress the horizontal committed-Window case and the tightened horizontal+cold-first pair | Horizontal Window 5/5 GREEN; tightened pair `OK (2 tests)` for 3 consecutive rounds | The final Window oracle is stable after isolating the test fixture from long-press selection timing. |
 | 2026-07-11 | Diagnose intermittent Window classification failure with a forced post-DOWN delay | Delayed DOWN frame changed 6.1% of pixels and entered TextView selection timing; the two Window tests pass after temporarily disabling host long-press/selectable and restore those flags afterward | The flake was a screenshot-induced test-clock distortion, not a production first-MOVE loss. Independent long-press selection coverage remains active. |
 | 2026-07-11 | Final combined Gradle gate: EPUB, Reader, Animate, AndroidTest Kotlin compile, and debug APK assembly | `BUILD SUCCESSFUL` | The production/test changes compile and pass all requested JVM/build gates together. |
+| 2026-07-12 | Rerun the three prior failures after correcting the `NONE` test's old synchronous assumption and guarding flow-only internal-link routing with a live flow view | JUnit XML: `tests=3`, `failures=0`, `errors=0`, `skipped=0` | Cold boundary preview remains asynchronous by design; legacy Compose-link tests no longer enter a flow navigation surface that does not exist. |
+| 2026-07-12 | `./gradlew -Preadflow.phase=2 :render:epub:testDebugUnitTest --rerun-tasks --no-daemon`; aggregate all JUnit XML after final review fixes | 25 suites, 365 tests, 0 failures, 0 errors, 2 skipped; `EpubReflowEngineTest` 82/82 | AA gesture, discrete navigation, lifecycle, ownership, stable locator, GL invalidation, and `NONE` UP-cancel coverage are green at the full EPUB module gate. |
+| 2026-07-12 | `:features:reader:testDebugUnitTest :render:animate:testDebugUnitTest --rerun-tasks` | Reader: 12 suites/80 tests; Animate: 3 suites/13 tests; 0 failures, 0 errors, 0 skipped | The reader host and retained animation module remain green with the AA EPUB integration. |
+| 2026-07-12 | Final independent AA review, targeted RED/GREEN, and fix re-review | Initial review found two confirmed P1s plus one candidate: GL preview invalidation left a paused conversion owner; `NONE` swipe used discrete waiting and could auto-turn after UP; the locator candidate was disproved because animator cancel reaches the existing end/commit branch. Both confirmed REDs turned GREEN; re-review found no remaining P0/P1 | Preview invalidation now follows a unified GL abort path; every boundary drag, including `NONE`, obeys finger-owned UP-cancel semantics. P2 only suggests a table-driven backward/vertical NONE test. |
+| 2026-07-12 | `:render:epub:lintDebug :app:assembleDebug :app:assembleOta`; verify ZIP and APK signature | Combined gate successful; lint 0 errors/8 warnings; OTA APK 9.4 MiB, SHA-256 `91244e127dc103e6845f4edb40f95ce83ad002b14d6ce3c49fd629a4b4ab5e8a`; ZIP clean and APK Signature Scheme v2 verifies with the LinReads Debug certificate | The exact debug and CI OTA variants build locally and the final package is structurally/signature valid. No device install was attempted. |
 
 ## Verification Status
 
@@ -216,6 +245,7 @@ verifier, and finger-hold watchdog experiments have been deleted.
 - JVM regression: `EpubFlowViewTest` 96/96, `EpubCurlOverlayTest` 14/14, full EPUB module and combined Reader/Animate/build gates GREEN.
 - Emulator frame sequence: targeted architecture-A 6/6 and full runtime 36/36 GREEN; horizontal Window 5/5 plus tightened horizontal+cold-first 3 consecutive rounds GREEN.
 - Runtime hygiene: critical logcat has no matching fatal/ANR/OOM/recycled-bitmap/assertion; no touched display remains.
-- Independent review: architecture, verification scope, and runtime evidence all clear production submission; remaining findings are test-hardening P2s only.
+- AA JVM regression: full EPUB module 365 tests, 0 failures, 0 errors, 2 skipped; Reader 80/80 and Animate 13/13; debug lint/build and local OTA build are green.
+- Independent review: final AA lifecycle/integration review and fix re-review found no remaining P0/P1; the only P2 is optional table-driven backward/vertical `NONE` test coverage.
 - Physical-device handfeel: deferred by user.
-- Commit/push/OTA: next action after independent review and exact staged-file inspection; existing OTA remains `dev-latest #198` until CI publishes the new artifact.
+- Commit/push/OTA: next action after the final AA review and exact staged-file inspection; current OTA is `dev-latest` / Dev build `#200` for baseline `35f8605` until CI publishes the new artifact.

@@ -1,5 +1,6 @@
 package dev.readflow.render.epub
 
+import android.graphics.Bitmap
 import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
@@ -10,7 +11,6 @@ import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableLoader
 import io.noties.markwon.image.ImageSizeResolver
 import java.io.File
-import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
@@ -79,15 +79,27 @@ internal class EpubFlowImageLoader(
 ) : AsyncDrawableLoader() {
 
     private val handler = Handler(Looper.getMainLooper())
-    private val inFlight = Collections.synchronizedMap(WeakHashMap<AsyncDrawable, Future<*>>())
+    private val lifecycleLock = Any()
+    private val inFlight = WeakHashMap<AsyncDrawable, DecodeRequest>()
+    private var lifecycleGeneration = 0L
+    private var released = false
 
     /** Returns true while at least one async image decode is still in flight. */
-    fun hasPendingDecodes(): Boolean = inFlight.isNotEmpty()
+    fun hasPendingDecodes(): Boolean = synchronized(lifecycleLock) { inFlight.isNotEmpty() }
 
     override fun load(drawable: AsyncDrawable) {
-        val file = epubFileProvider() ?: return
+        if (synchronized(lifecycleLock) { released }) return
+        val file = try {
+            epubFileProvider()
+        } catch (_: RuntimeException) {
+            null
+        } ?: return
         val href = drawable.destination
-        val pageHeightPx = pageHeightProvider().coerceAtLeast(1)
+        val pageHeightPx = try {
+            pageHeightProvider().coerceAtLeast(1)
+        } catch (_: RuntimeException) {
+            return
+        }
         // Full-page images may be upscaled to fill the viewport, so decode them at the larger of the
         // two viewport dimensions to avoid blur; inline images never exceed the column width.
         val maxSide = if (href in fullPageHrefs) {
@@ -107,57 +119,67 @@ internal class EpubFlowImageLoader(
         } else {
             drawable.bounds.takeUnless { it.isEmpty }?.let { Rect(it) }
         }
-        val future = executor.submit {
-            val bitmap = decodeEpubImage(file, href, maxSide = maxSide)
-            handler.post {
-                if (inFlight.remove(drawable) == null) {
-                    bitmap?.recycle()
-                    return@post
-                }
-                var installed = false
+        val (request, superseded) = synchronized(lifecycleLock) {
+            if (released) return
+            val old = inFlight.remove(drawable)
+            val new = DecodeRequest(lifecycleGeneration)
+            inFlight[drawable] = new
+            new to old
+        }
+        superseded?.future?.cancel(true)
+        val future = try {
+            executor.submit {
+                var bitmap: Bitmap? = null
                 try {
-                    if (bitmap != null && drawable.isAttached) {
-                        val d = BitmapDrawable(null, bitmap)
-                        // Re-read the page height on the main thread: for a full-page image this is now the real
-                        // measured viewport, so the fit lands inside one page instead of the pre-measure estimate.
-                        val target = reservedBounds ?: epubFlowImageTargetSize(
-                            href = href,
-                            intrinsicWidth = bitmap.width,
-                            intrinsicHeight = bitmap.height,
-                            columnWidthPx = columnWidthPx,
-                            pageHeightPx = pageHeightProvider().coerceAtLeast(1),
-                            inlineMaxHeightPx = inlineMaxHeightPx,
-                            fullPageHrefs = fullPageHrefs,
-                        )
-                        d.setBounds(0, 0, target.width(), target.height())
-                        drawable.result = d
-                        installed = true
-                        // Bounds-equal placeholder swaps do not reliably make TextView re-record the image span.
-                        // Invalidate the drawable and notify the host to rebuild the text layout.
-                        drawable.invalidateSelf()
-                        onImageResultChanged?.invoke()
-                    }
+                    bitmap = decodeEpubImage(file, href, maxSide = maxSide)
                 } finally {
-                    if (!installed) bitmap?.recycle()
-                    onDecodeFinished?.invoke()
+                    postDecodeResult(drawable, request, href, reservedBounds, bitmap)
                 }
             }
+        } catch (_: RuntimeException) {
+            finishWithoutResult(drawable, request)
+            return
         }
-        inFlight[drawable] = future
+        val shouldCancel = synchronized(lifecycleLock) {
+            request.future = future
+            !isCurrentRequestLocked(drawable, request)
+        }
+        if (shouldCancel) future.cancel(true)
     }
 
     override fun cancel(drawable: AsyncDrawable) {
-        val pending = inFlight.remove(drawable) ?: return
-        pending.cancel(true)
-        handler.post { onDecodeFinished?.invoke() }
+        val (pending, generation) = synchronized(lifecycleLock) {
+            (inFlight.remove(drawable) ?: return) to lifecycleGeneration
+        }
+        pending.future?.cancel(true)
+        notifyDecodeFinished(generation)
+    }
+
+    /** Cancels current work while keeping this loader reusable for a later scheduling pass. */
+    fun cancelAll() {
+        cancelAll(permanently = false)
+    }
+
+    /** Permanently releases this loader. Subsequent [load] calls are ignored. */
+    fun releaseAll() {
+        cancelAll(permanently = true)
     }
 
     // Reserve the final image box before pixel decode. Markwon treats a non-empty-bounds placeholder
     // as a result for ReplacementSpan measurement, but still calls load(...) after attach because the
     // current result is the placeholder. This keeps first pagination close to the final image geometry.
     override fun placeholder(drawable: AsyncDrawable): Drawable? {
-        val bounds = imageBoundsProvider(drawable.destination) ?: return null
-        val pageHeightPx = pageHeightProvider().coerceAtLeast(1)
+        if (synchronized(lifecycleLock) { released }) return null
+        val bounds = try {
+            imageBoundsProvider(drawable.destination)
+        } catch (_: RuntimeException) {
+            null
+        } ?: return null
+        val pageHeightPx = try {
+            pageHeightProvider().coerceAtLeast(1)
+        } catch (_: RuntimeException) {
+            return null
+        }
         val target = epubFlowImageTargetSize(
             href = drawable.destination,
             intrinsicWidth = bounds.width,
@@ -171,6 +193,118 @@ internal class EpubFlowImageLoader(
             setBounds(0, 0, target.width(), target.height())
         }
     }
+
+    private fun postDecodeResult(
+        drawable: AsyncDrawable,
+        request: DecodeRequest,
+        href: String,
+        reservedBounds: Rect?,
+        bitmap: Bitmap?,
+    ) {
+        val posted = handler.post {
+            var accepted = false
+            var installed = false
+            var decodeFinishedNotified = false
+            try {
+                synchronized(lifecycleLock) {
+                    if (!isCurrentRequestLocked(drawable, request)) return@synchronized
+                    accepted = true
+                    if (bitmap != null && drawable.isAttached) {
+                        val result = BitmapDrawable(null, bitmap).apply {
+                            // Full-page images are fitted again against the measured viewport on the main thread.
+                            val target = reservedBounds ?: epubFlowImageTargetSize(
+                                href = href,
+                                intrinsicWidth = bitmap.width,
+                                intrinsicHeight = bitmap.height,
+                                columnWidthPx = columnWidthPx,
+                                pageHeightPx = pageHeightProvider().coerceAtLeast(1),
+                                inlineMaxHeightPx = inlineMaxHeightPx,
+                                fullPageHrefs = fullPageHrefs,
+                            )
+                            setBounds(0, 0, target.width(), target.height())
+                        }
+                        if (drawable.isAttached) {
+                            drawable.result = result
+                            installed = true
+                        }
+                    }
+                    inFlight.remove(drawable)
+                }
+                if (accepted) {
+                    synchronized(lifecycleLock) {
+                        if (!released && request.generation == lifecycleGeneration) {
+                            try {
+                                if (installed) {
+                                    drawable.invalidateSelf()
+                                    onImageResultChanged?.invoke()
+                                }
+                            } finally {
+                                if (!released) {
+                                    decodeFinishedNotified = true
+                                    onDecodeFinished?.invoke()
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: RuntimeException) {
+                // Providers and drawable hosts belong to a chapter generation that may already be retired.
+                // Treat their failure like a decode miss while still releasing pending/reveal gates below.
+            } finally {
+                if (accepted) {
+                    synchronized(lifecycleLock) {
+                        if (isCurrentRequestLocked(drawable, request)) inFlight.remove(drawable)
+                    }
+                    if (!decodeFinishedNotified) notifyDecodeFinished(request.generation)
+                }
+                if (!installed) bitmap?.recycle()
+            }
+        }
+        if (!posted) {
+            bitmap?.recycle()
+            finishWithoutResult(drawable, request)
+        }
+    }
+
+    private fun finishWithoutResult(drawable: AsyncDrawable, request: DecodeRequest) {
+        val removed = synchronized(lifecycleLock) {
+            if (isCurrentRequestLocked(drawable, request)) {
+                inFlight.remove(drawable)
+                true
+            } else {
+                false
+            }
+        }
+        if (removed) notifyDecodeFinished(request.generation)
+    }
+
+    private fun cancelAll(permanently: Boolean) {
+        val (pending, generation) = synchronized(lifecycleLock) {
+            lifecycleGeneration++
+            if (permanently) released = true
+            inFlight.values.toList().also { inFlight.clear() } to lifecycleGeneration
+        }
+        pending.forEach { it.future?.cancel(true) }
+        if (!permanently && pending.isNotEmpty()) notifyDecodeFinished(generation)
+    }
+
+    private fun isCurrentRequestLocked(drawable: AsyncDrawable, request: DecodeRequest): Boolean =
+        !released && request.generation == lifecycleGeneration && inFlight[drawable] === request
+
+    private fun notifyDecodeFinished(generation: Long) {
+        handler.post {
+            synchronized(lifecycleLock) {
+                if (!released && generation == lifecycleGeneration) {
+                    onDecodeFinished?.invoke()
+                }
+            }
+        }
+    }
+
+    private class DecodeRequest(
+        val generation: Long,
+        var future: Future<*>? = null,
+    )
 }
 
 /**

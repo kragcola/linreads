@@ -22,6 +22,8 @@ internal interface EpubCurlTurnOverlay {
 
     fun animateTurn(durationMs: Long)
 
+    fun takeRevealedBitmap(): Bitmap? = null
+
     fun dismiss()
 }
 
@@ -245,6 +247,13 @@ internal class EpubCurlOverlay(
         if (!active) return
         pendingDiscreteTurnDurationMs = durationMs
         schedulePendingDiscreteTurn()
+    }
+
+    override fun takeRevealedBitmap(): Bitmap? = synchronized(bitmapOwnershipLock) {
+        val bitmap = revealedBitmap
+        revealedBitmap = null
+        if (frontBitmap === bitmap) frontBitmap = null
+        bitmap?.takeUnless { it.isRecycled }
     }
 
     private fun schedulePendingDiscreteTurn() {

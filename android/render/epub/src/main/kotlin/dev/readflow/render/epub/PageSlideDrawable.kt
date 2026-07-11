@@ -27,13 +27,16 @@ import kotlin.math.min
  * A soft edge shadow is drawn on the leading seam between the two pages for depth.
  */
 internal class PageSlideDrawable(
-    private val frontBitmap: Bitmap,
-    private val revealedBitmap: Bitmap,
+    frontBitmap: Bitmap,
+    revealedBitmap: Bitmap,
     private val viewportW: Int,
     private val viewportH: Int,
     private val forward: Boolean,
     private val density: Float,
 ) : Drawable() {
+
+    private var frontBitmap: Bitmap? = frontBitmap
+    private var revealedBitmap: Bitmap? = revealedBitmap
 
     /** 0 = outgoing page fully covers the viewport, 1 = outgoing fully slid off (turn complete). */
     var progress: Float = 0f
@@ -55,8 +58,8 @@ internal class PageSlideDrawable(
         val incomingDx = incomingLeft(w)
         val save = canvas.save()
         canvas.translate(bounds.left.toFloat(), bounds.top.toFloat())
-        drawBitmapWindow(canvas, revealedBitmap, incomingDx, w, viewportH.toFloat())
-        drawBitmapWindow(canvas, frontBitmap, dx, w, viewportH.toFloat())
+        revealedBitmap?.let { drawBitmapWindow(canvas, it, incomingDx, w, viewportH.toFloat()) }
+        frontBitmap?.let { drawBitmapWindow(canvas, it, dx, w, viewportH.toFloat()) }
         drawSeamShadow(canvas, dx, w, viewportH.toFloat())
         canvas.restoreToCount(save)
     }
@@ -110,9 +113,21 @@ internal class PageSlideDrawable(
         shadePaint.shader = null
     }
 
+    /** Transfers the revealed page to the caller without copying it. */
+    fun takeRevealedBitmap(): Bitmap? {
+        val bitmap = revealedBitmap
+        revealedBitmap = null
+        if (frontBitmap === bitmap) frontBitmap = null
+        return bitmap?.takeUnless { it.isRecycled }
+    }
+
     fun recycle() {
-        if (!frontBitmap.isRecycled) frontBitmap.recycle()
-        if (!revealedBitmap.isRecycled) revealedBitmap.recycle()
+        val front = frontBitmap
+        val revealed = revealedBitmap
+        frontBitmap = null
+        revealedBitmap = null
+        if (front != null && !front.isRecycled) front.recycle()
+        if (revealed != null && revealed !== front && !revealed.isRecycled) revealed.recycle()
     }
 
     override fun setAlpha(alpha: Int) {}
