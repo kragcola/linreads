@@ -1,6 +1,5 @@
 package dev.readflow.render.epub
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -13,11 +12,15 @@ import fi.harism.curl.CurlView
 internal interface EpubCurlTurnOverlay {
     val active: Boolean
 
-    fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, settled: (committed: Boolean) -> Unit)
+    fun start(
+        front: Bitmap,
+        revealed: Bitmap,
+        forward: Boolean,
+        settled: (committed: Boolean) -> Unit,
+        firstFrameReady: () -> Unit = {},
+    )
 
     fun animateTurn(durationMs: Long)
-
-    fun forwardTouch(ev: MotionEvent)
 
     fun dismiss()
 }
@@ -30,12 +33,14 @@ internal interface EpubCurlTurnOverlay {
  * Moon+ "纸背透出本页文字" (see-through reverse text) effect; harism's mesh handles the geometric flip so
  * the back appears mirrored automatically.
  *
- * Finger-tracking + release settle + lighting/shadow all come from [CurlView]. The host forwards the
- * touch stream here while a SIMULATION drag is active; [onTurnSettled] fires once the curl animation
- * finishes, with `committed` = whether the turn actually advanced to the revealed page.
+ * Discrete tap/key animation, lighting, and shadow come from [CurlView]. Finger drags stay in the host
+ * View hierarchy so their frames participate in the same Window composition as the reader content.
  */
 internal class EpubCurlOverlay(
     context: Context,
+    private val textureCopier: (Bitmap, Bitmap.Config) -> Bitmap? = { source, config ->
+        source.copy(config, false)
+    },
 ) : FrameLayout(context), EpubCurlTurnOverlay {
 
     /**
@@ -46,22 +51,30 @@ internal class EpubCurlOverlay(
      */
     private val backFaceBlend = Color.argb(0xFF, 0xCC, 0xCC, 0xCC)
 
+    private val bitmapOwnershipLock = Any()
     private var frontBitmap: Bitmap? = null
     private var revealedBitmap: Bitmap? = null
     private var forward = true
     /** Per-turn settle callback (committed = whether the turn advanced to the revealed page). */
     private var onTurnSettled: ((committed: Boolean) -> Unit)? = null
-    /** True between start() and the settle callback — gates touch forwarding + double-starts. */
+    /** True between start() and the settle callback; also gates double-starts. */
     override var active = false
         private set
     private var pendingDiscreteTurnDurationMs: Long? = null
-    private var pendingDiscreteTurnPosted = false
+    private var pendingDiscreteTurnRunnable: Runnable? = null
+    private var turnFrameReady = false
+    private var turnVisibilityGeneration = 0L
+    @Volatile
+    private var texturePreparationFailure: Throwable? = null
 
     /** Safety dismiss: if harism never fires setCurlAnimationObserver, force-clean after 5s. */
     private val safetyDismissRunnable = Runnable {
         if (active) {
+            turnVisibilityGeneration++
+            turnFrameReady = false
+            curlView.abortTurn()
             active = false
-            visibility = GONE
+            alpha = 0f
             clearPendingDiscreteTurn()
             onTurnSettled?.invoke(false)
             onTurnSettled = null
@@ -78,19 +91,48 @@ internal class EpubCurlOverlay(
      */
     private val provider = object : CurlView.PageProvider {
         override fun getPageCount(): Int = 2
-        override fun updatePage(page: CurlPage, width: Int, height: Int, index: Int) {
-            // The page that physically curls (and thus needs a back face) is index 0 forward, index 1 back.
-            val curlingIndex = if (forward) 0 else 1
-            val bmp = if (index == 0) bmp0() else bmp1()
-            val src = bmp ?: return
-            val cfg = src.config ?: Bitmap.Config.RGB_565
-            if (index == curlingIndex) {
-                page.setTexture(src.copy(cfg, false), CurlPage.SIDE_FRONT)
-                page.setTexture(src.copy(cfg, false), CurlPage.SIDE_BACK)
-                page.setColor(backFaceBlend, CurlPage.SIDE_BACK)
-            } else {
-                page.setTexture(src.copy(cfg, false), CurlPage.SIDE_BOTH)
+        override fun updatePage(page: CurlPage, width: Int, height: Int, index: Int) =
+            synchronized(bitmapOwnershipLock) {
+                if (texturePreparationFailure != null) return
+                // The page that physically curls (and thus needs a back face) is index 0 forward, index 1 back.
+                val curlingIndex = if (forward) 0 else 1
+                val bmp = if (index == 0) bmp0() else bmp1()
+                val src = bmp ?: return
+                val cfg = src.config ?: Bitmap.Config.RGB_565
+                if (index == curlingIndex) {
+                    val front = copyTexture(src, cfg) ?: return
+                    val back = copyTexture(src, cfg) ?: run {
+                        if (!front.isRecycled) front.recycle()
+                        return
+                    }
+                    page.setTexture(front, CurlPage.SIDE_FRONT)
+                    page.setTexture(back, CurlPage.SIDE_BACK)
+                    page.setColor(backFaceBlend, CurlPage.SIDE_BACK)
+                } else {
+                    val both = copyTexture(src, cfg) ?: return
+                    page.setTexture(both, CurlPage.SIDE_BOTH)
+                }
             }
+    }
+
+    private fun copyTexture(source: Bitmap, config: Bitmap.Config): Bitmap? =
+        try {
+            textureCopier(source, config) ?: run {
+                recordTexturePreparationFailure(IllegalStateException("Page texture copy returned null"))
+                null
+            }
+        } catch (failure: Throwable) {
+            recordTexturePreparationFailure(failure)
+            null
+        }
+
+    private fun recordTexturePreparationFailure(failure: Throwable) {
+        if (texturePreparationFailure != null) return
+        texturePreparationFailure = failure
+        val failureGeneration = turnVisibilityGeneration
+        post textureFailureCleanup@{
+            if (failureGeneration != turnVisibilityGeneration) return@textureFailureCleanup
+            settleTexturePreparationFailure()
         }
     }
 
@@ -127,31 +169,70 @@ internal class EpubCurlOverlay(
             onTurnSettled = null
             cb?.invoke(committed)
         }
-        visibility = GONE
+        // Keep the translucent SurfaceView attached after the first creation. Toggling GONE destroys its
+        // surface, so the next turn can commit an opaque black initialization buffer before GL redraws.
+        visibility = VISIBLE
+        alpha = 0f
     }
+
+    /** The flow view owns gesture classification; this visual surface only receives explicitly forwarded events. */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean = false
+
+    fun start(
+        front: Bitmap,
+        revealed: Bitmap,
+        forward: Boolean,
+        settled: (committed: Boolean) -> Unit,
+    ) = start(front, revealed, forward, settled, firstFrameReady = {})
 
     /**
      * Begins a SIMULATION turn. [front] is the current (turning) page, [revealed] the adjacent page
      * beneath. [forward] picks the curl direction (true = next page). [settled] fires once the curl
-     * animation finishes. The overlay becomes visible; the caller then either drives a discrete tap turn
-     * via [animateTurn], or hands off a live finger drag via [forwardTouch] (real touch events replayed).
+     * animation finishes. The overlay becomes visible only after the queued texture frame is ready; the
+     * caller then drives a discrete tap/key turn via [animateTurn].
      */
-    override fun start(front: Bitmap, revealed: Bitmap, forward: Boolean, settled: (committed: Boolean) -> Unit) {
-        recycleBitmaps()
-        frontBitmap = front
-        revealedBitmap = revealed
-        this.forward = forward
+    override fun start(
+        front: Bitmap,
+        revealed: Bitmap,
+        forward: Boolean,
+        settled: (committed: Boolean) -> Unit,
+        firstFrameReady: () -> Unit,
+    ) {
+        turnVisibilityGeneration++
+        turnFrameReady = false
+        clearPendingDiscreteTurn()
+        curlView.abortTurn()
+        synchronized(bitmapOwnershipLock) {
+            recycleBitmapsLocked()
+            texturePreparationFailure = null
+            frontBitmap = front
+            revealedBitmap = revealed
+            this.forward = forward
+        }
         onTurnSettled = settled
         active = true
-        clearPendingDiscreteTurn()
         visibility = VISIBLE
+        alpha = 0f
         // Safety timeout: if the curl never settles (GL error, synthetic DOWN not triggering harism state),
         // force-dismiss after 5s so turnInFlight doesn't stay stuck forever (审计: active 卡死 → 所有翻页失效).
-        removeCallbacks(safetyDismissRunnable)
-        postDelayed(safetyDismissRunnable, SAFETY_DISMISS_MS)
+        armSafetyDismiss()
         // Forward curls the page at index 0 over to reveal 1; backward starts parked on 1 and curls the
         // index-0 page back in from the left. setCurrentIndex re-runs the provider for the new anchor.
         curlView.setCurrentIndex(if (forward) 0 else 1)
+        texturePreparationFailure?.let { failure ->
+            dismiss()
+            throw failure
+        }
+        val visibilityGeneration = turnVisibilityGeneration
+        curlView.setNextFrameRenderedCallback frameReady@{
+            if (!active || visibilityGeneration != turnVisibilityGeneration) return@frameReady
+            if (settleTexturePreparationFailure()) return@frameReady
+            turnFrameReady = true
+            alpha = 1f
+            firstFrameReady()
+            schedulePendingDiscreteTurn()
+        }
+        curlView.requestRender()
         bringToFront()
     }
 
@@ -167,17 +248,23 @@ internal class EpubCurlOverlay(
     }
 
     private fun schedulePendingDiscreteTurn() {
-        if (pendingDiscreteTurnPosted || pendingDiscreteTurnDurationMs == null) return
-        pendingDiscreteTurnPosted = true
-        postOnAnimation {
-            pendingDiscreteTurnPosted = false
-            runPendingDiscreteTurn()
+        if (!turnFrameReady || pendingDiscreteTurnRunnable != null || pendingDiscreteTurnDurationMs == null) return
+        val visibilityGeneration = turnVisibilityGeneration
+        lateinit var runnable: Runnable
+        runnable = Runnable {
+            if (pendingDiscreteTurnRunnable !== runnable) return@Runnable
+            pendingDiscreteTurnRunnable = null
+            if (visibilityGeneration != turnVisibilityGeneration) return@Runnable
+            runPendingDiscreteTurn(visibilityGeneration)
         }
+        pendingDiscreteTurnRunnable = runnable
+        postOnAnimation(runnable)
     }
 
-    private fun runPendingDiscreteTurn() {
+    private fun runPendingDiscreteTurn(visibilityGeneration: Long) {
+        if (visibilityGeneration != turnVisibilityGeneration) return
         val durationMs = pendingDiscreteTurnDurationMs ?: return
-        if (!active) {
+        if (!active || !turnFrameReady) {
             clearPendingDiscreteTurn()
             return
         }
@@ -186,34 +273,52 @@ internal class EpubCurlOverlay(
             schedulePendingDiscreteTurn()
             return
         }
-        if (curlView.animatePageTurn(forward, durationMs)) {
+        val animationStarted = curlView.animatePageTurn(forward, durationMs)
+        if (settleTexturePreparationFailure()) return
+        if (animationStarted) {
             clearPendingDiscreteTurn()
         } else {
             schedulePendingDiscreteTurn()
         }
     }
 
-    /** Re-dispatches a host touch event into the GL curl view (finger-tracking). */
-    @SuppressLint("ClickableViewAccessibility")
-    override fun forwardTouch(ev: MotionEvent) {
-        if (!active) return
-        curlView.dispatchTouchEvent(ev)
+    private fun settleTexturePreparationFailure(): Boolean {
+        if (texturePreparationFailure == null) return false
+        val callback = onTurnSettled
+        dismiss()
+        callback?.invoke(false)
+        return true
     }
 
     /** Hides + frees the overlay after a turn settles (or to abort). */
     override fun dismiss() {
         removeCallbacks(safetyDismissRunnable)
+        turnVisibilityGeneration++
+        turnFrameReady = false
+        curlView.abortTurn()
         active = false
         clearPendingDiscreteTurn()
         onTurnSettled = null
-        visibility = GONE
+        alpha = 0f
         recycleBitmaps()
+        texturePreparationFailure = null
+    }
+
+    override fun onDetachedFromWindow() {
+        dismiss()
+        super.onDetachedFromWindow()
     }
 
     fun onPauseGl() = curlView.onPause()
     fun onResumeGl() = curlView.onResume()
 
     private fun recycleBitmaps() {
+        synchronized(bitmapOwnershipLock) {
+            recycleBitmapsLocked()
+        }
+    }
+
+    private fun recycleBitmapsLocked() {
         frontBitmap?.let { if (!it.isRecycled) it.recycle() }
         revealedBitmap?.let { if (!it.isRecycled) it.recycle() }
         frontBitmap = null
@@ -221,8 +326,14 @@ internal class EpubCurlOverlay(
     }
 
     private fun clearPendingDiscreteTurn() {
+        pendingDiscreteTurnRunnable?.let(::removeCallbacks)
+        pendingDiscreteTurnRunnable = null
         pendingDiscreteTurnDurationMs = null
-        pendingDiscreteTurnPosted = false
+    }
+
+    private fun armSafetyDismiss() {
+        removeCallbacks(safetyDismissRunnable)
+        if (active) postDelayed(safetyDismissRunnable, SAFETY_DISMISS_MS)
     }
 
     private companion object {

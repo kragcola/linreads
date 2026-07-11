@@ -24,6 +24,8 @@ import android.util.AttributeSet;
 import android.view.MotionEvent;
 import android.view.View;
 
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * OpenGL ES View.
  * 
@@ -48,7 +50,7 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 
 	private boolean mAllowLastPageCurl = true;
 
-	private boolean mAnimate = false;
+	private volatile boolean mAnimate = false;
 	private long mAnimationDurationTime = 300;
 	private PointF mAnimationSource = new PointF();
 	private long mAnimationStartTime;
@@ -58,7 +60,7 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 	private PointF mCurlDir = new PointF();
 
 	private PointF mCurlPos = new PointF();
-	private int mCurlState = CURL_NONE;
+	private volatile int mCurlState = CURL_NONE;
 	// Current bitmap index. This is always showed as front of right page.
 	private int mCurrentIndex = 0;
 
@@ -89,6 +91,21 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 
 	// LinReads addition (Apache-2.0; see NOTICE.txt): observer fired when a curl animation settles.
 	private CurlAnimationObserver mCurlAnimationObserver;
+	private final AtomicLong mTurnEpoch = new AtomicLong();
+	private volatile FrameReadyTicket mFrameReadyTicket;
+
+	private static final class FrameReadyTicket {
+		private final Runnable callback;
+		private int renderedFrames;
+
+		FrameReadyTicket(Runnable callback) {
+			this.callback = callback;
+		}
+
+		boolean onFrameRendered() {
+			return ++renderedFrames >= 2;
+		}
+	}
 
 	/**
 	 * Default constructor.
@@ -166,6 +183,7 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 			mAnimationDurationTime = durationMs;
 		}
 		mAnimationStartTime = System.currentTimeMillis();
+		mTurnEpoch.incrementAndGet();
 		mAnimate = true;
 		requestRender();
 		return true;
@@ -246,11 +264,14 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 			// once a curl animation settles so the EPUB engine can commit/clean up the page turn.
 			if (mCurlAnimationObserver != null) {
 				final int idx = mCurrentIndex;
+				final long turnEpoch = mTurnEpoch.get();
+				final CurlAnimationObserver observer = mCurlAnimationObserver;
 				post(new Runnable() {
 					@Override
 					public void run() {
-						if (mCurlAnimationObserver != null) {
-							mCurlAnimationObserver.onCurlAnimationEnd(idx);
+						if (turnEpoch == mTurnEpoch.get()
+								&& observer == mCurlAnimationObserver) {
+							observer.onCurlAnimationEnd(idx);
 						}
 					}
 				});
@@ -266,10 +287,29 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 	}
 
 	@Override
+	public void onFrameRendered() {
+		final FrameReadyTicket ticket = mFrameReadyTicket;
+		if (ticket == null) {
+			return;
+		}
+		if (!ticket.onFrameRendered()) {
+			requestRender();
+			return;
+		}
+		if (ticket != mFrameReadyTicket) {
+			return;
+		}
+		mFrameReadyTicket = null;
+		post(ticket.callback);
+	}
+
+	@Override
 	public void onPageSizeChanged(int width, int height) {
-		mPageBitmapWidth = width;
-		mPageBitmapHeight = height;
-		updatePages();
+		synchronized (mRenderer) {
+			mPageBitmapWidth = width;
+			mPageBitmapHeight = height;
+			updatePages();
+		}
 		requestRender();
 	}
 
@@ -315,7 +355,6 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 
 		switch (me.getAction()) {
 		case MotionEvent.ACTION_DOWN: {
-
 			// Once we receive pointer down event its position is mapped to
 			// right or left edge of page and that'll be the position from where
 			// user is holding the paper to make curl happen.
@@ -578,6 +617,26 @@ public class CurlView extends GLSurfaceView implements View.OnTouchListener,
 	 */
 	public void setCurlAnimationObserver(CurlAnimationObserver observer) {
 		mCurlAnimationObserver = observer;
+	}
+
+	/** Runs once after a subsequently requested GL frame has rendered. */
+	public void setNextFrameRenderedCallback(Runnable callback) {
+		mFrameReadyTicket = callback == null ? null : new FrameReadyTicket(callback);
+	}
+
+	/**
+	 * LinReads addition. Aborts any finger/discrete turn and invalidates observer work already posted by
+	 * an older GL frame. Renderer synchronization prevents a completing frame from racing the reset.
+	 */
+	public void abortTurn() {
+		synchronized (mRenderer) {
+			mTurnEpoch.incrementAndGet();
+			mFrameReadyTicket = null;
+			mAnimate = false;
+			mAnimationTargetEvent = 0;
+			mCurlState = CURL_NONE;
+		}
+		requestRender();
 	}
 
 	/**

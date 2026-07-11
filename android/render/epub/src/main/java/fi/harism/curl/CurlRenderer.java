@@ -109,10 +109,11 @@ public class CurlRenderer implements GLSurfaceView.Renderer {
 		for (int i = 0; i < mCurlMeshes.size(); ++i) {
 			mCurlMeshes.get(i).onDrawFrame(gl);
 		}
+		mObserver.onFrameRendered();
 	}
 
 	@Override
-	public void onSurfaceChanged(GL10 gl, int width, int height) {
+	public synchronized void onSurfaceChanged(GL10 gl, int width, int height) {
 		gl.glViewport(0, 0, width, height);
 		mViewportWidth = width;
 		mViewportHeight = height;
@@ -250,6 +251,9 @@ public class CurlRenderer implements GLSurfaceView.Renderer {
 		 * intended to be used for animation purposes.
 		 */
 		public void onDrawFrame();
+
+		/** Called after the current page meshes have been submitted to GL. */
+		public void onFrameRendered();
 
 		/**
 		 * Called once page size is changed. Width and height tell the page size

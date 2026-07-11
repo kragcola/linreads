@@ -1,21 +1,24 @@
 # Active Work
 
-_最后更新：2026-07-10_
+_最后更新：2026-07-11_
 
-Mode: `none`
-Objective: 无正在执行任务；最近完成：Android 全量审计加固、独立复核、推送及 `dev-latest` OTA 发布确认
+Mode: `task-bug`
+Objective: 重新审计并修正 Android EPUB 阅读器手感；以触摸前后逐帧视觉连续性为验收，不以静态落帧或状态字段通过代替用户可见证据
+Active tracker: [android-epub-handfeel-reaudit-2026-07-10.md](android-epub-handfeel-reaudit-2026-07-10.md)
 Last completed tracker: [android-audit-review-push-2026-07-10.md](android-audit-review-push-2026-07-10.md)
 v4lite 执行文档: [../android-v4lite-plan.md](../android-v4lite-plan.md)
 纯阅读缺口验收表: [android-v4-pure-reading-gap-checklist.md](android-v4-pure-reading-gap-checklist.md)
 未完成项回填总表: [android-v4-pure-reading-unfinished-backfill.md](android-v4-pure-reading-unfinished-backfill.md)
 静读天下对比协议: [../research/moonreader-linreads-extreme-reading-comparison.md](../research/moonreader-linreads-extreme-reading-comparison.md)
 静读天下手感借鉴 backlog: [../research/moonreader-handfeel-borrowing-backlog-2026-07-02.md](../research/moonreader-handfeel-borrowing-backlog-2026-07-02.md)
-Test ledger: N/A
+Test ledger: [android-epub-handfeel-reaudit-2026-07-10.md#test-ledger](android-epub-handfeel-reaudit-2026-07-10.md#test-ledger)
 
 > ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
 ## 当前状态
 
+- 2026-07-11 architecture A final：用户已选择软件跟手架构。`PageFlipStyle.SIMULATION` 的所有手指拖拽现在由 `PageCurlDrawable` 按横向宽度或侧栏纵向高度连续跟踪，点击/按键的离散翻页继续使用 harism GL，跨章节继续使用既有软件 `startFlip()`；软件快照失败时拒绝手势，cold-first 拖拽不创建或预热 GL overlay。interactive GL、PixelCopy verifier 与 finger-hold watchdog 实验链路已完整删除，离散 GL 保留 two-draw 首帧 ticket、conversion owner、timeout、generation 与失败回收。验证：`EpubFlowViewTest` 96/96、`EpubCurlOverlayTest` 14/14、完整 EPUB module 与联合 Gradle 门 GREEN；AVD targeted 6 项 `OK (6 tests)` / `80.185s`，完整 `EpubFlowAnchorRuntimeSmokeTest` `OK (36 tests)` / `437.296s`，横向 committed-Window 5/5 及收紧后横向+cold-first 连续 3 轮 GREEN；critical logcat 无匹配，`TouchStatesByDisplay: <no displays touched>`。三路独立只读复核已收口，无 P0/P1/P2/P3 production finding；物理手机/平板手感验证按用户要求 deferred。当前下一步为精确提交、推送和 OTA 校验。
+- 2026-07-11 architecture A flake RCA：横向 committed-Window 用例的间歇失败来自 DOWN 后 Window 截图偶尔跨过长按阈值，使 TextView 进入选择态，而不是 production 丢失首个 MOVE。两条 Window 用例仅在测试期间关闭宿主 `GestureDetector` 长按与 TextView selectable/longClickable，结束后恢复；独立长按选择测试仍保留。
 - Phase 1 地基框架 ✅、v4lite L1–L5 全部完成 ✅
 - `-Preadflow.phase=2 :app:assembleDebug` SUCCESSFUL
 - 真机通过 OTA 安装验证 ✅

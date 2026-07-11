@@ -374,6 +374,51 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `failed image decode notifies the host that pending work finished`() {
+        val epub = java.io.File.createTempFile("readflow-image-missing", ".epub")
+        ZipOutputStream(epub.outputStream()).use { }
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val completions = AtomicInteger(0)
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = emptySet(),
+                onDecodeFinished = { completions.incrementAndGet() },
+            )
+            val resolver = EpubFlowImageSizeResolver(
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = emptySet(),
+            )
+            val drawable = AsyncDrawable("missing.png", loader, resolver, null)
+            drawable.setCallback2(object : Drawable.Callback {
+                override fun invalidateDrawable(who: Drawable) = Unit
+                override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) = Unit
+                override fun unscheduleDrawable(who: Drawable, what: Runnable) = Unit
+            })
+
+            executor.shutdown()
+            assertTrue("missing-image decode should finish in the unit test window", executor.awaitTermination(5, TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(false, loader.hasPendingDecodes())
+            assertEquals(
+                "even a failed decode must wake a reveal gate waiting for the pending set to empty",
+                1,
+                completions.get(),
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `full page image re-fits to the real viewport at decode time not the pre-measure estimate`() {
         // Repro of the "封面/彩插 不显示或闪一下消失" bug: the placeholder is reserved BEFORE the view is
         // measured, when pageHeightProvider still returns the screen-derived estimate (~100px too tall

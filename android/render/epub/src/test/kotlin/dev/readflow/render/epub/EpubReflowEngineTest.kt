@@ -2,7 +2,12 @@ package dev.readflow.render.epub
 
 import android.app.Application
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorFilter
+import android.graphics.PixelFormat
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Looper
 import android.view.ViewGroup
@@ -29,6 +34,7 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -42,6 +48,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -147,6 +154,26 @@ class EpubReflowEngineTest {
         assertEquals("theme change must keep the host transparent so press/turn layers reveal the same paper", null, host.background)
         assertNotNull("theme change must keep flow paper background", flowView.background)
         assertTrue("flow background should refresh with theme", flowView.background !== initialFlowBackground)
+    }
+
+    @Test
+    fun `flow image scheduling is pending before the posted scheduler attaches drawables`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-image-scheduling.epub")
+        writeImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+
+        assertTrue(
+            "the initial reveal gate must treat not-yet-attached image work as pending; " +
+                "otherwise settle can reveal before AsyncDrawableScheduler runs",
+            flowView.pendingDecodesProvider?.invoke() == true,
+        )
     }
 
     @Test
@@ -998,6 +1025,116 @@ class EpubReflowEngineTest {
             "cross-spine page turn should be driven by the same slide animator as in-chapter turns",
             animator,
         )
+    }
+
+    @Test
+    fun `flow NONE turn crosses a short chapter boundary with an opaque owner throughout`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("short-chapter-boundary-none.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one end.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two start.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.setPageFlipStyle(PageFlipStyle.NONE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("test fixture should start with one short page", 1, flowView.pageCount())
+        assertEquals("the initial live chapter must own the viewport", 1f, flowView.getChildAt(0).alpha)
+
+        engine.goToAdjacentPage(1)
+
+        assertTrue("NONE must still install the adjacent chapter", flowView.textView.text.toString().contains("Chapter two start."))
+        val continuityOwner = flowView.privateField("conversionSnapshotDrawable")
+        val continuityAlpha = continuityOwner?.let { owner ->
+            owner.javaClass.getDeclaredField("alphaValue")
+                .apply { isAccessible = true }
+                .get(owner) as Int
+        }
+        val continuityBitmap = continuityOwner?.let { owner ->
+            owner.javaClass.getDeclaredField("bitmap")
+                .apply { isAccessible = true }
+                .get(owner) as? Bitmap
+        }
+        assertTrue(
+            "the target may stay hidden only while a live opaque continuity owner covers it",
+            flowView.getChildAt(0).alpha == 1f ||
+                (
+                    continuityAlpha == 255 &&
+                        continuityBitmap != null &&
+                        !continuityBitmap.isRecycled
+                    ),
+        )
+        assertNull("NONE must not start a page-turn animator", flowView.privateField("flipAnimator"))
+
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertEquals("NONE must settle on the adjacent spine", 1, strategy?.spineIndex)
+        assertEquals("the stable target must fully own the viewport", 1f, flowView.getChildAt(0).alpha)
+        assertNull("the continuity owner must retire after the target is stable", flowView.privateField("conversionSnapshotDrawable"))
+        assertNull("NONE must remain animation-free", flowView.privateField("flipAnimator"))
+    }
+
+    @Test
+    fun `flow boundary snapshot failure rejects the turn and a later retry can cross`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("short-chapter-boundary-snapshot-failure.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one end.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two start.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals("test fixture should start with one short page", 1, flowView.pageCount())
+        assertEquals("the initial live chapter must own the viewport", 1f, flowView.getChildAt(0).alpha)
+        assertNull(flowView.privateField("conversionSnapshotDrawable"))
+        val paper = flowView.background
+        flowView.background = FailNextDrawDrawable(paper)
+        assertFalse("fixture must force boundary page-shot preparation to fail", flowView.prepareBoundaryPageTurn(1))
+
+        flowView.background = FailNextDrawDrawable(paper)
+        engine.goToAdjacentPage(1)
+
+        val rejectedStrategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertTrue("the rejected turn must retain chapter one", flowView.textView.text.toString().contains("Chapter one end."))
+        assertFalse("the failed request must not install chapter two", flowView.textView.text.toString().contains("Chapter two start."))
+        assertEquals("the rejected turn must keep the chapter-one locator", 0, rejectedStrategy?.spineIndex)
+        assertEquals("the current live page must remain the visible owner", 1f, flowView.getChildAt(0).alpha)
+        assertNull("a failed preparation must not leave a pending boundary transaction", flowView.privateField("pendingBoundaryPageTurn"))
+        assertNull("a failed preparation must not install an empty continuity cover", flowView.privateField("conversionSnapshotDrawable"))
+
+        flowView.background = paper
+        engine.goToAdjacentPage(1)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val retriedStrategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertEquals("a later healthy request must still cross to chapter two", 1, retriedStrategy?.spineIndex)
+        assertTrue(flowView.textView.text.toString().contains("Chapter two start."))
     }
 
     @Test
@@ -2683,6 +2820,28 @@ class EpubReflowEngineTest {
             text.indices.map { index -> EpubTextLayoutLineRange(index, index + 1) }
         }
 
+    private class FailNextDrawDrawable(
+        private val delegate: Drawable?,
+    ) : Drawable() {
+        private var failNext = true
+
+        override fun draw(canvas: Canvas) {
+            if (failNext) {
+                failNext = false
+                error("boundary snapshot draw failure")
+            }
+            delegate?.bounds = bounds
+            delegate?.draw(canvas)
+        }
+
+        override fun setAlpha(alpha: Int) = Unit
+
+        override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
     private fun EpubReflowEngine.lazyBookForTest(): EpubLazyBook? {
         val field = EpubReflowEngine::class.java.getDeclaredField("lazyBook")
         field.isAccessible = true
@@ -2730,6 +2889,61 @@ class EpubReflowEngineTest {
                 },
             )
             spineEntries.forEach { (path, content) -> add(path, content) }
+        }
+    }
+
+    private fun writeImageEpub(file: File) {
+        val imageBytes = ByteArrayOutputStream().use { output ->
+            Bitmap.createBitmap(12, 12, Bitmap.Config.ARGB_8888).let { bitmap ->
+                try {
+                    bitmap.eraseColor(0xFF1A8F5D.toInt())
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                    output.toByteArray()
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+        }
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+
+            fun addText(path: String, content: String) = add(path, content.toByteArray(Charsets.UTF_8))
+
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="c0" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="image" href="image.png" media-type="image/png"/>
+                      </manifest>
+                      <spine><itemref idref="c0"/></spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body><p>Before image.</p><img src="image.png"/><p>After image.</p></body>
+                    </html>
+                """.trimIndent(),
+            )
+            add("OEBPS/image.png", imageBytes)
         }
     }
 }

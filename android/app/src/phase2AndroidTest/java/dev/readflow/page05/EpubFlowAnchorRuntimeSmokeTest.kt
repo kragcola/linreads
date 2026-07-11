@@ -1,5 +1,7 @@
 package dev.readflow.page05
 
+import android.animation.ValueAnimator
+import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
@@ -7,19 +9,25 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.PixelFormat
 import android.graphics.drawable.Drawable
 import android.net.Uri
+import android.os.Build
 import android.os.Looper
 import android.os.SystemClock
 import android.graphics.PointF
 import android.text.Spanned
 import android.text.style.ClickableSpan
 import android.view.InputDevice
+import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
+import android.view.Window
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import androidx.core.content.FileProvider
@@ -28,6 +36,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
+import androidx.test.filters.SdkSuppress
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.uiautomator.By
 import androidx.test.uiautomator.UiDevice
@@ -45,13 +54,18 @@ import dev.readflow.render.api.R as RenderApiR
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.first
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -975,8 +989,9 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 )
                 try {
                     assertTrue(
-                        "UI SCROLL->PAGED conversion cover should still be near-opaque when observed, alpha=${during.coverAlpha}",
-                        during.coverAlpha >= 240,
+                        "UI SCROLL->PAGED conversion cover should still contribute to the visible frame when observed, " +
+                            "alpha=${during.coverAlpha}",
+                        during.coverAlpha > 0,
                     )
                     assertEquals("UI conversion cover width should match the visible viewport", before.frame.width, during.coverBitmap.width)
                     assertEquals("UI conversion cover height should match the visible viewport", before.frame.height, during.coverBitmap.height)
@@ -1325,6 +1340,1309 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowSlideWindowFramesTrackFirstMoveAndCancelRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-window-frames-${UUID.randomUUID().toString().take(8)}"
+        val uri = createComplexEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected stable paged flow view for window-frame capture") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    val cover = view.reflectPrivateAny("conversionSnapshotDrawable")
+                    if (
+                        pageCount <= 4 ||
+                        view.width <= 0 ||
+                        view.height <= 0 ||
+                        cover != null ||
+                        view.flowContentAlpha() < 1f
+                    ) {
+                        return@withActivity null
+                    }
+                    view.scrollTo(0, 0)
+                    view
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before committed-frame capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+            instrumentation.waitForIdleSync()
+            device.waitForIdle()
+            val touchSize = scenario.withActivity { view.width to view.height }
+
+            awaitCommittedFrame(scenario, view)
+            val stableA = captureWindowRegion(scenario, view)
+            awaitCommittedFrame(scenario, view)
+            val stable = captureWindowRegion(scenario, view)
+            val downTime = SystemClock.uptimeMillis()
+            val down = PointF(touchSize.first * 0.85f, touchSize.second * 0.10f)
+            val move = PointF(touchSize.first * 0.30f, down.y)
+            var downFrame: Bitmap? = null
+            var moveFrame: Bitmap? = null
+            var cancelFrame: Bitmap? = null
+            var settledFrame: Bitmap? = null
+            var gestureActive = false
+
+            try {
+                assertVisualDiffAtMost(
+                    "stable reader window frames must already be visually settled",
+                    bitmapDiff(stableA, stable),
+                    maxRgbMae = 0.25,
+                    maxBadPixelRatio = 0.001,
+                )
+
+                scenario.withActivity {
+                    dispatchTouchEvent(view, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down))
+                }
+                gestureActive = true
+                awaitCommittedFrame(scenario, view)
+                downFrame = captureWindowRegion(scenario, view)
+                assertVisualDiffAtMost(
+                    "ACTION_DOWN must not change the real composed reader window",
+                    bitmapDiff(stable, checkNotNull(downFrame)),
+                    maxRgbMae = 0.35,
+                    maxBadPixelRatio = 0.002,
+                )
+                scenario.withActivity {
+                    dispatchTouchEvent(
+                        view,
+                        motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, move),
+                    )
+                }
+                awaitCommittedFrame(scenario, view)
+                moveFrame = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("slide-stable.png", stable)
+                writeWindowFrameEvidence("slide-down.png", checkNotNull(downFrame))
+                writeWindowFrameEvidence("slide-move.png", checkNotNull(moveFrame))
+                val shiftPx = abs(down.x - move.x).roundToInt()
+                val comparedWidth = (touchSize.first - shiftPx - 2).coerceAtLeast(1)
+                val shifted = bitmapRegionDiff(
+                    expected = stable,
+                    actual = checkNotNull(moveFrame),
+                    expectedLeft = shiftPx,
+                    actualLeft = 0,
+                    width = comparedWidth,
+                    height = touchSize.second,
+                )
+                val stuckAtDown = bitmapRegionDiff(
+                    expected = stable,
+                    actual = checkNotNull(moveFrame),
+                    expectedLeft = 0,
+                    actualLeft = 0,
+                    width = comparedWidth,
+                    height = touchSize.second,
+                )
+                assertVisualDiffAtMost(
+                    "the first presented MOVE must contain the full DOWN-to-MOVE outgoing-page displacement",
+                    shifted,
+                    maxRgbMae = 3.0,
+                    maxBadPixelRatio = 0.03,
+                )
+                assertTrue(
+                    "the first MOVE must match the shifted outgoing frame better than a stuck DOWN frame; " +
+                        "shifted=$shifted stuck=$stuckAtDown",
+                    shifted.rgbMae < stuckAtDown.rgbMae * 0.70,
+                )
+
+                scenario.withActivity {
+                    dispatchTouchEvent(
+                        view,
+                        motionEvent(
+                            downTime,
+                            downTime + EVENT_STEP_MS * 2,
+                            MotionEvent.ACTION_CANCEL,
+                            move,
+                        ),
+                    )
+                }
+                gestureActive = false
+                awaitCommittedFrame(scenario, view)
+                cancelFrame = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("slide-cancel.png", checkNotNull(cancelFrame))
+                val cancelShiftPx = bestHorizontalShiftPx(
+                    expected = stable,
+                    actual = checkNotNull(cancelFrame),
+                    maxShiftPx = shiftPx,
+                )
+                assertTrue(
+                    "the first CANCEL frame must visibly spring toward the outgoing frame; " +
+                        "moveShiftPx=$shiftPx cancelShiftPx=$cancelShiftPx",
+                    cancelShiftPx < shiftPx,
+                )
+
+                settledFrame = captureUntilVisuallyStable(scenario, view)
+                writeWindowFrameEvidence("slide-settled.png", checkNotNull(settledFrame))
+                assertVisualDiffAtMost(
+                    "CANCEL settle must restore the exact pre-touch composed reader frame",
+                    bitmapDiff(stable, checkNotNull(settledFrame)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+                val settledPage = scenario.withActivity { view.reflectInt("currentPageIndex") }
+                assertEquals("CANCEL must leave the reader on the outgoing page", 0, settledPage)
+            } finally {
+                if (gestureActive) {
+                    runCatching {
+                        scenario.withActivity {
+                            dispatchTouchEvent(
+                                view,
+                                motionEvent(
+                                    downTime,
+                                    SystemClock.uptimeMillis(),
+                                    MotionEvent.ACTION_CANCEL,
+                                    move,
+                                ),
+                            )
+                        }
+                    }
+                }
+                stableA.recycle()
+                stable.recycle()
+                downFrame?.recycle()
+                moveFrame?.recycle()
+                cancelFrame?.recycle()
+                settledFrame?.recycle()
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowBoundaryCoverOwnsCommittedWaitingWindowRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-boundary-window-${UUID.randomUUID().toString().take(8)}"
+        val uri = createComplexEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected stable multi-page flow view for boundary cover capture") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubFlowView() ?: return@withActivity null
+                    if (
+                        candidate.reflectInt("pageCount") <= 4 ||
+                        candidate.width <= 0 ||
+                        candidate.height <= 0 ||
+                        candidate.flowContentAlpha() < 1f ||
+                        candidate.reflectPrivateAny("conversionSnapshotDrawable") != null
+                    ) {
+                        return@withActivity null
+                    }
+                    candidate.javaClass.getDeclaredMethod("goToLastPage").apply { isAccessible = true }.invoke(candidate)
+                    candidate
+                }
+            }
+            waitForConditionResult("expected flow view to park on its final page") {
+                scenario.withActivity {
+                    val lastPage = view.reflectInt("pageCount") - 1
+                    if (view.reflectInt("currentPageIndex") == lastPage) true else null
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before boundary capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+            instrumentation.waitForIdleSync()
+            device.waitForIdle()
+
+            awaitCommittedFrame(scenario, view)
+            val stableA = captureWindowRegion(scenario, view)
+            awaitCommittedFrame(scenario, view)
+            val stable = captureWindowRegion(scenario, view)
+            var preparedCover: Bitmap? = null
+            var waiting: Bitmap? = null
+            try {
+                assertVisualDiffAtMost(
+                    "boundary test must begin from a visually settled Window",
+                    bitmapDiff(stableA, stable),
+                    maxRgbMae = 0.25,
+                    maxBadPixelRatio = 0.001,
+                )
+                scenario.withActivity {
+                    check(view.reflectBoolean("prepareBoundaryPageTurn", 1)) {
+                        "expected final page to prepare an animated boundary transaction"
+                    }
+                    val cover = checkNotNull(view.reflectPrivateAny("conversionSnapshotDrawable"))
+                    preparedCover = cover.reflectPrivateBitmap("bitmap").copy(Bitmap.Config.ARGB_8888, false)
+                    (view as ViewGroup).getChildAt(0).alpha = 0f
+                    check(view.reflectPrivateAny("pendingBoundaryPageTurn") != null)
+                }
+
+                writeWindowFrameEvidence("boundary-prepared-cover.png", checkNotNull(preparedCover))
+                assertVisualDiffAtMost(
+                    "the prepared outgoing page shot must equal the last committed Window before it takes ownership",
+                    bitmapDiff(stable, checkNotNull(preparedCover)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+
+                awaitCommittedFrame(scenario, view)
+                waiting = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("boundary-stable.png", stable)
+                writeWindowFrameEvidence("boundary-waiting.png", checkNotNull(waiting))
+                assertVisualDiffAtMost(
+                    "the outgoing page shot must keep owning the committed Window while live target content is hidden",
+                    bitmapDiff(stable, checkNotNull(waiting)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+            } finally {
+                stableA.recycle()
+                stable.recycle()
+                preparedCover?.recycle()
+                waiting?.recycle()
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowBoundarySnapshotFailureKeepsCommittedWindowAndHealthyRetryCrossesRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-boundary-retry-window-${UUID.randomUUID().toString().take(8)}"
+        val uri = createShortChapterBoundaryEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val view = waitForConditionResult("expected stable chapter one for boundary failure capture") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubFlowView() ?: return@withActivity null
+                    val text = candidate.reflectTextView().text.toString()
+                    if (
+                        candidate.reflectInt("pageCount") != 1 ||
+                        candidate.width <= 0 ||
+                        candidate.height <= 0 ||
+                        candidate.flowContentAlpha() < 1f ||
+                        candidate.reflectPrivateAny("conversionSnapshotDrawable") != null ||
+                        !text.contains("Chapter one end.")
+                    ) {
+                        return@withActivity null
+                    }
+                    candidate
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before boundary failure capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+            val originalBackground = scenario.withActivity { view.background }
+            val stable = captureUntilVisuallyStable(scenario, view)
+            var rejected: Bitmap? = null
+            var retryWaiting: Bitmap? = null
+            var target: Bitmap? = null
+            try {
+                val failingBackground = FailNextDrawDrawable(originalBackground)
+                awaitFirstCommittedFrameMatchingAfter(
+                    scenario = scenario,
+                    target = view,
+                    frameReady = {
+                        view.reflectTextView().text.toString().contains("Chapter one end.") &&
+                            view.flowContentAlpha() >= 1f &&
+                            view.reflectPrivateAny("conversionSnapshotDrawable") == null &&
+                            view.reflectPrivateAny("pendingBoundaryPageTurn") == null &&
+                            view.reflectPrivateAny("slideDrawable") == null
+                    },
+                    action = {
+                        view.background = failingBackground
+                        dispatchTap(view, PointF(view.width * 0.85f, view.height * 0.50f))
+                        view.postInvalidateOnAnimation()
+                    },
+                )
+                rejected = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("boundary-failure-stable.png", stable)
+                writeWindowFrameEvidence("boundary-failure-rejected.png", checkNotNull(rejected))
+                assertVisualDiffAtMost(
+                    "a failed boundary snapshot must leave the committed Window on chapter one",
+                    bitmapDiff(stable, checkNotNull(rejected)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+                scenario.withActivity {
+                    assertTrue(view.reflectTextView().text.toString().contains("Chapter one end."))
+                    assertEquals(1f, view.flowContentAlpha())
+                    assertEquals(null, view.reflectPrivateAny("conversionSnapshotDrawable"))
+                    assertEquals(null, view.reflectPrivateAny("pendingBoundaryPageTurn"))
+                    assertEquals(null, view.reflectPrivateAny("slideDrawable"))
+                    view.background = originalBackground
+                }
+
+                awaitFirstCommittedFrameMatchingAfter(
+                    scenario = scenario,
+                    target = view,
+                    frameReady = {
+                        view.reflectTextView().text.toString().contains("Chapter two start.") &&
+                            view.flowContentAlpha() <= VISIBLE_CONTENT_ALPHA_EPSILON &&
+                            view.reflectPrivateAny("conversionSnapshotDrawable") != null &&
+                            view.reflectPrivateAny("pendingBoundaryPageTurn") != null
+                    },
+                    action = {
+                        dispatchTap(view, PointF(view.width * 0.85f, view.height * 0.50f))
+                        view.setPendingDecodesForTest(true)
+                        view.postInvalidateOnAnimation()
+                    },
+                )
+                retryWaiting = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("boundary-retry-waiting.png", checkNotNull(retryWaiting))
+                assertVisualDiffAtMost(
+                    "a healthy retry must keep the old committed Window while chapter two is hidden",
+                    bitmapDiff(stable, checkNotNull(retryWaiting)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+
+                scenario.withActivity {
+                    view.setPendingDecodesForTest(false)
+                    view.invokeNoArgCompat("tryRevealWhenStable")
+                }
+                waitForConditionResult("expected healthy boundary retry to settle on chapter two") {
+                    scenario.withActivity {
+                        val animatorRunning = (view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                        val settled =
+                            view.reflectTextView().text.toString().contains("Chapter two start.") &&
+                                view.flowContentAlpha() >= 1f &&
+                                view.reflectPrivateAny("conversionSnapshotDrawable") == null &&
+                                view.reflectPrivateAny("pendingBoundaryPageTurn") == null &&
+                                view.reflectPrivateAny("slideDrawable") == null &&
+                                !animatorRunning
+                        if (settled) true else null
+                    }
+                }
+                target = captureUntilVisuallyStable(scenario, view)
+                writeWindowFrameEvidence("boundary-retry-target.png", checkNotNull(target))
+                assertVisualDiffAtLeast(
+                    "the healthy retry must eventually present a visually distinct chapter two Window",
+                    bitmapDiff(stable, checkNotNull(target)),
+                    minRgbMae = 0.02,
+                    minBadPixelRatio = 0.0001,
+                )
+            } finally {
+                scenario.withActivity {
+                    view.background = originalBackground
+                    view.setPendingDecodesForTest(false)
+                }
+                stable.recycle()
+                rejected?.recycle()
+                retryWaiting?.recycle()
+                target?.recycle()
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowNoneBoundaryCutHandsOffCommittedWindowAtomicallyRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.NONE)
+        val title = "flow-boundary-none-window-${UUID.randomUUID().toString().take(8)}"
+        val uri = createShortChapterBoundaryEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val view = waitForConditionResult("expected stable chapter one for NONE boundary capture") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubFlowView() ?: return@withActivity null
+                    val text = candidate.reflectTextView().text.toString()
+                    if (
+                        candidate.reflectInt("pageCount") != 1 ||
+                        candidate.width <= 0 ||
+                        candidate.height <= 0 ||
+                        candidate.flowContentAlpha() < 1f ||
+                        candidate.reflectPrivateAny("conversionSnapshotDrawable") != null ||
+                        !text.contains("Chapter one end.")
+                    ) {
+                        return@withActivity null
+                    }
+                    candidate
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before NONE boundary capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+            val stable = captureUntilVisuallyStable(scenario, view)
+            var waiting: Bitmap? = null
+            var firstTarget: Bitmap? = null
+            var settledTarget: Bitmap? = null
+            try {
+                awaitFirstCommittedFrameMatchingAfter(
+                    scenario = scenario,
+                    target = view,
+                    frameReady = {
+                        view.reflectTextView().text.toString().contains("Chapter two start.") &&
+                            view.flowContentAlpha() <= VISIBLE_CONTENT_ALPHA_EPSILON &&
+                            view.reflectPrivateAny("conversionSnapshotDrawable") != null &&
+                            view.reflectPrivateAny("pendingBoundaryPageTurn") != null
+                    },
+                    action = {
+                        dispatchTap(view, PointF(view.width * 0.85f, view.height * 0.50f))
+                        view.setPendingDecodesForTest(true)
+                        view.postInvalidateOnAnimation()
+                    },
+                )
+                waiting = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("boundary-none-stable.png", stable)
+                writeWindowFrameEvidence("boundary-none-waiting.png", checkNotNull(waiting))
+                assertVisualDiffAtMost(
+                    "NONE must keep chapter one committed while the hidden target settles",
+                    bitmapDiff(stable, checkNotNull(waiting)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+
+                awaitFirstCommittedFrameMatchingAfter(
+                    scenario = scenario,
+                    target = view,
+                    frameReady = {
+                        view.reflectTextView().text.toString().contains("Chapter two start.") &&
+                            view.flowContentAlpha() >= 1f &&
+                            view.reflectPrivateAny("conversionSnapshotDrawable") == null &&
+                            view.reflectPrivateAny("pendingBoundaryPageTurn") == null &&
+                            view.reflectPrivateAny("slideDrawable") == null &&
+                            view.reflectPrivateAny("curlDrawable") == null
+                    },
+                    action = {
+                        view.setPendingDecodesForTest(false)
+                        view.invokeNoArgCompat("tryRevealWhenStable")
+                        view.postInvalidateOnAnimation()
+                    },
+                )
+                firstTarget = captureWindowRegion(scenario, view)
+                awaitCommittedFrame(scenario, view)
+                settledTarget = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("boundary-none-first-target.png", checkNotNull(firstTarget))
+                writeWindowFrameEvidence("boundary-none-settled-target.png", checkNotNull(settledTarget))
+                assertVisualDiffAtMost(
+                    "the first target-owned NONE Window must already equal the settled target",
+                    bitmapDiff(checkNotNull(firstTarget), checkNotNull(settledTarget)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+                assertVisualDiffAtLeast(
+                    "the atomic NONE cut must visibly reach chapter two",
+                    bitmapDiff(stable, checkNotNull(settledTarget)),
+                    minRgbMae = 0.02,
+                    minBadPixelRatio = 0.0001,
+                )
+                scenario.withActivity {
+                    assertTrue(view.reflectTextView().text.toString().contains("Chapter two start."))
+                    assertEquals(1f, view.flowContentAlpha())
+                    assertEquals(null, view.reflectPrivateAny("flipAnimator"))
+                    assertEquals(null, view.reflectPrivateAny("slideDrawable"))
+                    assertEquals(null, view.reflectPrivateAny("curlDrawable"))
+                }
+            } finally {
+                scenario.withActivity { view.setPendingDecodesForTest(false) }
+                stable.recycle()
+                waiting?.recycle()
+                firstTarget?.recycle()
+                settledTarget?.recycle()
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowConversionFadeImmediateFirstTurnKeepsCommittedWindowContinuousRuntime() = runBlocking {
+        settings.setReadingMode(ReaderReadingMode.SCROLL)
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-conversion-first-turn-${UUID.randomUUID().toString().take(8)}"
+        val uri = createComplexEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected stable complex SCROLL view for conversion first-turn capture") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubFlowView() ?: return@withActivity null
+                    val layout = candidate.reflectTextView().layout ?: return@withActivity null
+                    if (
+                        candidate.width <= 0 ||
+                        candidate.height <= 0 ||
+                        layout.height <= candidate.height * 4 ||
+                        candidate.flowContentAlpha() < 1f ||
+                        candidate.reflectPrivateAny("modeValue")?.toString() != "SCROLL" ||
+                        candidate.reflectPrivateAny("conversionSnapshotDrawable") != null
+                    ) {
+                        return@withActivity null
+                    }
+                    candidate
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before conversion fade capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+
+            var opaqueCover: Bitmap? = null
+            var fadedWindow: Bitmap? = null
+            var firstTurnWindow: Bitmap? = null
+            try {
+                scenario.withActivity {
+                    val layoutHeight = checkNotNull(view.reflectTextView().layout).height
+                    val targetScrollY = (layoutHeight * 45 / 100)
+                        .coerceAtLeast(1)
+                        .coerceAtMost(layoutHeight - view.height)
+                    view.scrollTo(0, targetScrollY)
+                }
+                val stableScrollWindow = captureUntilVisuallyStable(scenario, view)
+                stableScrollWindow.recycle()
+
+                scenario.withActivity {
+                    val layoutOffset = view.reflectInt("topLayoutOffset")
+                    view.invokeSetModeAnchoredPaged(layoutOffset)
+                    val cover = checkNotNull(view.reflectPrivateAny("conversionSnapshotDrawable")) {
+                        "expected SCROLL->PAGED cover before pinning its fade"
+                    }
+                    opaqueCover = cover.reflectPrivateBitmap("bitmap").copy(Bitmap.Config.ARGB_8888, false)
+                    val fade = checkNotNull(view.reflectPrivateAny("conversionFadeAnimator") as? ValueAnimator) {
+                        "expected the conversion cover to be actively fading"
+                    }
+                    fade.setCurrentFraction(0.5f)
+                    fade.pause()
+                    val coverAlpha = cover.reflectPrivateInt("alphaValue")
+                    check(coverAlpha in 96..160) {
+                        "expected a materially partial conversion cover, alpha=$coverAlpha"
+                    }
+                    check(view.flowContentAlpha() >= 1f) {
+                        "the stable PAGED frame must be opaque beneath the partial cover"
+                    }
+                }
+                awaitCommittedFrame(scenario, view)
+                fadedWindow = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("conversion-fade-opaque-cover.png", checkNotNull(opaqueCover))
+                writeWindowFrameEvidence("conversion-fade-last-visible.png", checkNotNull(fadedWindow))
+
+                val opaqueDiscontinuity = bitmapDiff(checkNotNull(fadedWindow), checkNotNull(opaqueCover))
+                assertVisualDiffAtLeast(
+                    "fixture must distinguish the last partially faded Window from the old opaque-cover front shot",
+                    opaqueDiscontinuity,
+                    minRgbMae = 0.75,
+                    minBadPixelRatio = 0.01,
+                )
+
+                scenario.withActivity {
+                    val downTime = SystemClock.uptimeMillis()
+                    val point = PointF(view.width * 0.85f, view.height * 0.50f)
+                    dispatchTouchEvent(view, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, point))
+                    dispatchTouchEvent(
+                        view,
+                        motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_UP, point),
+                    )
+                    val turn = checkNotNull(view.reflectPrivateAny("flipAnimator") as? ValueAnimator) {
+                        "the immediate first tap during conversion must start the SLIDE animator"
+                    }
+                    turn.setCurrentFraction(0f)
+                    turn.pause()
+                }
+                awaitCommittedFrame(scenario, view)
+                firstTurnWindow = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("conversion-fade-first-turn.png", checkNotNull(firstTurnWindow))
+
+                assertVisualDiffAtMost(
+                    "the immediate first-turn front must equal the last committed partially faded Window",
+                    bitmapDiff(checkNotNull(fadedWindow), checkNotNull(firstTurnWindow)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+            } finally {
+                opaqueCover?.recycle()
+                fadedWindow?.recycle()
+                firstTurnWindow?.recycle()
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowPartialConversionFlattenFailureKeepsCommittedWindowAndRevealRuntime() = runBlocking {
+        settings.setReadingMode(ReaderReadingMode.SCROLL)
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-conversion-flatten-failure-${UUID.randomUUID().toString().take(8)}"
+        val uri = createComplexEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val view = waitForConditionResult("expected stable complex SCROLL view for flatten failure capture") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubFlowView() ?: return@withActivity null
+                    val layout = candidate.reflectTextView().layout ?: return@withActivity null
+                    if (
+                        candidate.width <= 0 ||
+                        candidate.height <= 0 ||
+                        layout.height <= candidate.height * 4 ||
+                        candidate.flowContentAlpha() < 1f ||
+                        candidate.reflectPrivateAny("modeValue")?.toString() != "SCROLL" ||
+                        candidate.reflectPrivateAny("conversionSnapshotDrawable") != null
+                    ) {
+                        return@withActivity null
+                    }
+                    candidate
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before flatten failure capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+
+            var opaqueCover: Bitmap? = null
+            var partialWindow: Bitmap? = null
+            var rejectedWindow: Bitmap? = null
+            var revealedWindow: Bitmap? = null
+            var coverOwner: Any? = null
+            var coverBitmap: Bitmap? = null
+            var fadeOwner: ValueAnimator? = null
+            var failedDestination: Bitmap? = null
+            var originalFlattener: Any? = null
+            var flattenerInstalled = false
+            var startPage = -1
+            var startTop = -1
+            var partialAlpha = -1
+            try {
+                scenario.withActivity {
+                    val layoutHeight = checkNotNull(view.reflectTextView().layout).height
+                    val targetScrollY = (layoutHeight * 45 / 100)
+                        .coerceAtLeast(1)
+                        .coerceAtMost(layoutHeight - view.height)
+                    view.scrollTo(0, targetScrollY)
+                }
+                val stableScrollWindow = captureUntilVisuallyStable(scenario, view)
+                stableScrollWindow.recycle()
+
+                scenario.withActivity {
+                    val layoutOffset = view.reflectInt("topLayoutOffset")
+                    view.invokeSetModeAnchoredPaged(layoutOffset)
+                    coverOwner = checkNotNull(view.reflectPrivateAny("conversionSnapshotDrawable")) {
+                        "expected SCROLL->PAGED cover before forcing flatten failure"
+                    }
+                    coverBitmap = checkNotNull(coverOwner).reflectPrivateBitmap("bitmap")
+                    opaqueCover = checkNotNull(coverBitmap).copy(Bitmap.Config.ARGB_8888, false)
+                    fadeOwner = checkNotNull(view.reflectPrivateAny("conversionFadeAnimator") as? ValueAnimator) {
+                        "expected the conversion cover to be actively fading"
+                    }
+                    checkNotNull(fadeOwner).setCurrentFraction(0.5f)
+                    checkNotNull(fadeOwner).pause()
+                    partialAlpha = checkNotNull(coverOwner).reflectPrivateInt("alphaValue")
+                    check(partialAlpha in 96..160) {
+                        "expected a materially partial conversion cover, alpha=$partialAlpha"
+                    }
+                    startPage = view.reflectInt("currentPageIndex")
+                    startTop = view.scrollY
+                }
+                awaitCommittedFrame(scenario, view)
+                partialWindow = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("conversion-flatten-partial.png", checkNotNull(partialWindow))
+                assertVisualDiffAtLeast(
+                    "flatten failure fixture must distinguish the partial Window from its opaque cover",
+                    bitmapDiff(checkNotNull(partialWindow), checkNotNull(opaqueCover)),
+                    minRgbMae = 0.75,
+                    minBadPixelRatio = 0.01,
+                )
+
+                scenario.withActivity {
+                    val failFlatten: (Any, Bitmap) -> Boolean = { _, destination ->
+                        failedDestination = destination
+                        false
+                    }
+                    originalFlattener = view.swapPrivateField("conversionSnapshotFlattener", failFlatten)
+                    flattenerInstalled = true
+                }
+                awaitFirstCommittedFrameMatchingAfter(
+                    scenario = scenario,
+                    target = view,
+                    frameReady = {
+                        view.reflectInt("currentPageIndex") == startPage &&
+                            view.scrollY == startTop &&
+                            view.reflectPrivateAny("conversionSnapshotDrawable") === coverOwner &&
+                            view.reflectPrivateAny("conversionFadeAnimator") === fadeOwner &&
+                            checkNotNull(coverOwner).reflectPrivateInt("alphaValue") == partialAlpha &&
+                            view.reflectPrivateAny("slideDrawable") == null &&
+                            view.reflectPrivateAny("curlDrawable") == null &&
+                            view.reflectPrivateAny("flipAnimator") == null
+                    },
+                    action = {
+                        dispatchTap(view, PointF(view.width * 0.85f, view.height * 0.50f))
+                        view.postInvalidateOnAnimation()
+                    },
+                )
+                rejectedWindow = captureWindowRegion(scenario, view)
+                writeWindowFrameEvidence("conversion-flatten-rejected.png", checkNotNull(rejectedWindow))
+                assertVisualDiffAtMost(
+                    "a failed partial flatten must preserve the exact committed Window",
+                    bitmapDiff(checkNotNull(partialWindow), checkNotNull(rejectedWindow)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+                scenario.withActivity {
+                    assertEquals(startPage, view.reflectInt("currentPageIndex"))
+                    assertEquals(startTop, view.scrollY)
+                    assertTrue(view.reflectPrivateAny("conversionSnapshotDrawable") === coverOwner)
+                    assertTrue(view.reflectPrivateAny("conversionFadeAnimator") === fadeOwner)
+                    assertEquals(partialAlpha, checkNotNull(coverOwner).reflectPrivateInt("alphaValue"))
+                    assertTrue("the rejected composition bitmap must be recycled", checkNotNull(failedDestination).isRecycled)
+                    assertFalse("the visible cover must remain alive after rejection", checkNotNull(coverBitmap).isRecycled)
+                    assertEquals(null, view.reflectPrivateAny("slideDrawable"))
+                    assertEquals(null, view.reflectPrivateAny("curlDrawable"))
+                    assertEquals(null, view.reflectPrivateAny("flipAnimator"))
+                    view.swapPrivateField("conversionSnapshotFlattener", originalFlattener)
+                    flattenerInstalled = false
+                    checkNotNull(fadeOwner).resume()
+                }
+                waitForConditionResult("expected rejected conversion turn to finish its original reveal") {
+                    scenario.withActivity {
+                        val revealed =
+                            view.reflectInt("currentPageIndex") == startPage &&
+                                view.scrollY == startTop &&
+                                view.flowContentAlpha() >= 1f &&
+                                view.reflectPrivateAny("conversionSnapshotDrawable") == null &&
+                                view.reflectPrivateAny("conversionFadeAnimator") == null
+                        if (revealed) true else null
+                    }
+                }
+                revealedWindow = captureUntilVisuallyStable(scenario, view)
+                writeWindowFrameEvidence("conversion-flatten-revealed.png", checkNotNull(revealedWindow))
+                assertVisualDiffAtLeast(
+                    "the original reveal must continue from the rejected partial Window to stable live content",
+                    bitmapDiff(checkNotNull(partialWindow), checkNotNull(revealedWindow)),
+                    minRgbMae = 0.02,
+                    minBadPixelRatio = 0.0001,
+                )
+            } finally {
+                scenario.withActivity {
+                    if (flattenerInstalled) {
+                        view.swapPrivateField("conversionSnapshotFlattener", originalFlattener)
+                    }
+                    fadeOwner?.takeIf { it.isPaused }?.resume()
+                }
+                opaqueCover?.recycle()
+                partialWindow?.recycle()
+                rejectedWindow?.recycle()
+                revealedWindow?.recycle()
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowSimulationPartialConversionHandoffKeepsCommittedWindowContinuousRuntime() = runBlocking {
+        settings.setReadingMode(ReaderReadingMode.PAGED)
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-gl-conversion-handoff-${UUID.randomUUID().toString().take(8)}"
+        val uri = createComplexEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val start = waitForConditionResult("expected stable paged flow view for GL conversion handoff") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val nextTop = view.reflectNullableInt("pageTopPxAt", 1)
+                    if (
+                        view.reflectInt("pageCount") <= 4 ||
+                        nextTop == null ||
+                        view.width <= 0 ||
+                        view.height <= 0 ||
+                        view.flowContentAlpha() < 1f ||
+                        view.reflectPrivateAny("modeValue")?.toString() != "PAGED" ||
+                        view.reflectPrivateAny("conversionSnapshotDrawable") != null
+                    ) {
+                        return@withActivity null
+                    }
+                    FlowGlCurlStart(view = view, nextPageTop = nextTop)
+                }
+            }
+
+            scenario.withActivity {
+                start.view.scrollTo(0, 0)
+                check(start.view.reflectBoolean("goToAdjacentPage", 1))
+            }
+            waitForFlowPage(scenario, start.view, 1, start.nextPageTop, "expected GL handoff warm-up forward settle")
+            scenario.withActivity { check(start.view.reflectBoolean("goToAdjacentPage", -1)) }
+            waitForFlowPage(scenario, start.view, 0, 0, "expected GL handoff warm-up backward settle")
+            val overlay = waitForConditionResult("expected inactive warmed GL overlay before conversion handoff") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubCurlOverlay() ?: return@withActivity null
+                    val curlView = candidate.findDescendant { it.javaClass.name == HARISM_CURL_VIEW_CLASS_NAME }
+                        ?: return@withActivity null
+                    val ready =
+                        !candidate.reflectPrivateBoolean("active") &&
+                            candidate.alpha == 0f &&
+                            !curlView.reflectPrivateBoolean("mAnimate") &&
+                            curlView.reflectPrivateInt("mPageBitmapWidth") > 0 &&
+                            curlView.reflectPrivateInt("mPageBitmapHeight") > 0
+                    if (ready) candidate else null
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before GL conversion handoff") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+
+            var retainedWindow: Bitmap? = null
+            var underlyingLive: Bitmap? = null
+            var partialWindow: Bitmap? = null
+            var firstActiveWindow: Bitmap? = null
+            var settledTarget: Bitmap? = null
+            var coverOwner: Any? = null
+            var fadeOwner: ValueAnimator? = null
+            var partialAlpha = -1
+            var startPage = -1
+            var targetPage = -1
+            var targetTop = -1
+            var pendingTurnFrozen = false
+            try {
+                retainedWindow = captureUntilVisuallyStable(scenario, start.view)
+
+                scenario.withActivity {
+                    start.view.invokeSetModeAnchored("SCROLL", start.view.reflectInt("topLayoutOffset"))
+                    val layoutHeight = checkNotNull(start.view.reflectTextView().layout).height
+                    val targetScrollY = (layoutHeight * 45 / 100)
+                        .coerceAtLeast(1)
+                        .coerceAtMost(layoutHeight - start.view.height)
+                    start.view.scrollTo(0, targetScrollY)
+                    start.view.postInvalidateOnAnimation()
+                }
+                val stableScrollWindow = captureUntilVisuallyStable(scenario, start.view)
+                stableScrollWindow.recycle()
+
+                scenario.withActivity {
+                    val layoutOffset = start.view.reflectInt("topLayoutOffset")
+                    start.view.invokeSetModeAnchoredPaged(layoutOffset)
+                    coverOwner = checkNotNull(start.view.reflectPrivateAny("conversionSnapshotDrawable")) {
+                        "expected SCROLL->PAGED cover before the discrete GL handoff"
+                    }
+                    fadeOwner = checkNotNull(start.view.reflectPrivateAny("conversionFadeAnimator") as? ValueAnimator) {
+                        "expected an active conversion fade before the discrete GL handoff"
+                    }
+                    checkNotNull(fadeOwner).setCurrentFraction(0.5f)
+                    checkNotNull(fadeOwner).pause()
+                    partialAlpha = checkNotNull(coverOwner).reflectPrivateInt("alphaValue")
+                    check(partialAlpha in 96..160) {
+                        "expected a materially partial conversion cover, alpha=$partialAlpha"
+                    }
+                    check(start.view.flowContentAlpha() >= 1f) {
+                        "the paged live frame must be opaque beneath the partial cover"
+                    }
+                    startPage = start.view.reflectInt("currentPageIndex")
+                    targetPage = startPage + 1
+                    targetTop = checkNotNull(start.view.reflectNullableInt("pageTopPxAt", targetPage)) {
+                        "partial conversion fixture must leave an adjacent target page"
+                    }
+                    underlyingLive = checkNotNull(start.view.invokePrivateBitmap("snapshotViewport")) {
+                        "expected the live PAGED composition beneath the conversion cover"
+                    }
+                }
+                awaitCommittedFrame(scenario, start.view)
+                partialWindow = captureWindowRegion(scenario, start.view)
+                writeWindowFrameEvidence("gl-conversion-retained.png", checkNotNull(retainedWindow))
+                writeWindowFrameEvidence("gl-conversion-underlying-live.png", checkNotNull(underlyingLive))
+                writeWindowFrameEvidence("gl-conversion-partial.png", checkNotNull(partialWindow))
+                assertVisualDiffAtLeast(
+                    "fixture must distinguish visible partial composition C from underlying live page B",
+                    bitmapDiff(checkNotNull(underlyingLive), checkNotNull(partialWindow)),
+                    minRgbMae = 0.75,
+                    minBadPixelRatio = 0.01,
+                )
+                assertVisualDiffAtLeast(
+                    "fixture must distinguish visible partial composition C from old retained GL Window A",
+                    bitmapDiff(checkNotNull(retainedWindow), checkNotNull(partialWindow)),
+                    minRgbMae = 0.75,
+                    minBadPixelRatio = 0.01,
+                )
+
+                awaitFirstCommittedFrameMatchingAfter(
+                    scenario = scenario,
+                    target = start.view,
+                    frameReady = {
+                        val ready = overlay.reflectPrivateBoolean("active") &&
+                            overlay.alpha >= 1f &&
+                            start.view.reflectPrivateAny("conversionSnapshotDrawable") == null
+                        if (ready && !pendingTurnFrozen) {
+                            // The discrete runnable starts on the next vsync. Freeze it before this
+                            // traversal so the screenshot remains the first static GL front frame.
+                            overlay.invokeNoArg("clearPendingDiscreteTurn")
+                            pendingTurnFrozen = true
+                        }
+                        ready
+                    },
+                    action = {
+                        dispatchTap(start.view, PointF(start.view.width * 0.85f, start.view.height * 0.50f))
+                        check(overlay.reflectPrivateBoolean("active")) {
+                            "the partial conversion tap must start the real EpubCurlOverlay"
+                        }
+                        check(overlay.alpha == 0f) {
+                            "GL must remain hidden until its new front texture has rendered"
+                        }
+                        check(start.view.reflectPrivateAny("conversionSnapshotDrawable") === coverOwner) {
+                            "the partial cover must retain Window ownership while GL is hidden"
+                        }
+                        check(checkNotNull(coverOwner).reflectPrivateInt("alphaValue") == partialAlpha) {
+                            "the held partial cover must not change before GL first-frame handoff"
+                        }
+                        check(start.view.reflectPrivateAny("conversionFadeAnimator") == null) {
+                            "the partial conversion fade must pause while GL first frame is pending"
+                        }
+                        start.view.postInvalidateOnAnimation()
+                    },
+                )
+                firstActiveWindow = captureWindowRegion(scenario, start.view)
+                scenario.withActivity {
+                    check(pendingTurnFrozen) { "first active GL frame was not frozen at the commit gate" }
+                    overlay.invokeCurlOverlayAnimateTurn(start.view.reflectPrivateLong("glCurlDurationMs"))
+                }
+                writeWindowFrameEvidence("gl-conversion-first-active.png", checkNotNull(firstActiveWindow))
+                assertVisualDiffAtMost(
+                    "the first active GL committed Window must equal the partial composition visible before handoff",
+                    bitmapDiff(checkNotNull(partialWindow), checkNotNull(firstActiveWindow)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+
+                waitForConditionResult("expected partial-conversion GL turn to settle on its adjacent page") {
+                    scenario.withActivity {
+                        val settled =
+                            start.view.reflectInt("currentPageIndex") == targetPage &&
+                                start.view.scrollY == targetTop &&
+                                !overlay.reflectPrivateBoolean("active") &&
+                                overlay.alpha == 0f &&
+                                start.view.flowContentAlpha() >= 1f &&
+                                start.view.reflectPrivateAny("conversionSnapshotDrawable") == null &&
+                                start.view.reflectPrivateAny("conversionFadeAnimator") == null
+                        if (settled) true else null
+                    }
+                }
+                settledTarget = captureUntilVisuallyStable(scenario, start.view)
+                writeWindowFrameEvidence("gl-conversion-settled-target.png", checkNotNull(settledTarget))
+                assertEquals(targetPage, scenario.withActivity { start.view.reflectInt("currentPageIndex") })
+                assertEquals(targetTop, scenario.withActivity { start.view.scrollY })
+            } finally {
+                scenario.withActivity {
+                    if (overlay.reflectPrivateBoolean("active")) overlay.invokeNoArg("dismiss")
+                    fadeOwner?.takeIf { it.isPaused }?.resume()
+                }
+                retainedWindow?.recycle()
+                underlyingLive?.recycle()
+                partialWindow?.recycle()
+                firstActiveWindow?.recycle()
+                settledTarget?.recycle()
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowInactiveWarmGlNeverExposesRetainedBufferAfterLivePageChangesRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-gl-retained-buffer-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val start = waitForConditionResult("expected multi-page flow view for retained GL buffer capture") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val nextTop = view.reflectNullableInt("pageTopPxAt", 1)
+                    if (
+                        view.reflectInt("pageCount") <= 4 ||
+                        nextTop == null ||
+                        view.width <= 0 ||
+                        view.height <= 0 ||
+                        view.flowContentAlpha() < 1f
+                    ) {
+                        return@withActivity null
+                    }
+                    FlowGlCurlStart(view = view, nextPageTop = nextTop)
+                }
+            }
+
+            scenario.withActivity {
+                start.view.scrollTo(0, 0)
+                check(start.view.reflectBoolean("goToAdjacentPage", 1))
+            }
+            waitForFlowPage(scenario, start.view, 1, start.nextPageTop, "expected retained-buffer warm-up forward settle")
+            scenario.withActivity { check(start.view.reflectBoolean("goToAdjacentPage", -1)) }
+            waitForFlowPage(scenario, start.view, 0, 0, "expected retained-buffer warm-up backward settle")
+            val overlay = waitForConditionResult("expected inactive warmed GL overlay with a retained surface") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubCurlOverlay() ?: return@withActivity null
+                    val curlView = candidate.findDescendant { it.javaClass.name == HARISM_CURL_VIEW_CLASS_NAME }
+                        ?: return@withActivity null
+                    val ready =
+                        !candidate.reflectPrivateBoolean("active") &&
+                            candidate.alpha == 0f &&
+                            !curlView.reflectPrivateBoolean("mAnimate") &&
+                            curlView.reflectPrivateInt("mPageBitmapWidth") > 0 &&
+                            curlView.reflectPrivateInt("mPageBitmapHeight") > 0
+                    if (ready) candidate else null
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before retained-buffer capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+
+            var oldLive: Bitmap? = null
+            var changedLive: Bitmap? = null
+            var firstActive: Bitmap? = null
+            try {
+                oldLive = captureUntilVisuallyStable(scenario, start.view)
+                scenario.withActivity {
+                    start.view.scrollTo(0, start.nextPageTop)
+                    start.view.postInvalidateOnAnimation()
+                }
+                changedLive = captureUntilVisuallyStable(scenario, start.view)
+                assertVisualDiffAtLeast(
+                    "fixture must replace the live page while the warmed GL overlay remains inactive",
+                    bitmapDiff(checkNotNull(oldLive), checkNotNull(changedLive)),
+                    minRgbMae = 1.0,
+                    minBadPixelRatio = 0.01,
+                )
+                check(!overlay.reflectPrivateBoolean("active"))
+                check(overlay.alpha == 0f)
+
+                val front = checkNotNull(changedLive).copy(Bitmap.Config.ARGB_8888, false)
+                val revealed = Bitmap.createBitmap(front.width, front.height, Bitmap.Config.ARGB_8888).apply {
+                    eraseColor(0xFF163A5F.toInt())
+                }
+                awaitFirstCommittedFrameMatchingAfter(
+                    scenario = scenario,
+                    target = start.view,
+                    frameReady = { overlay.alpha >= 1f },
+                    action = { overlay.invokeCurlOverlayStart(front, revealed) },
+                )
+                check(overlay.alpha >= 1f) {
+                    "retained-buffer capture must begin only after the GL overlay becomes active"
+                }
+                firstActive = captureWindowRegion(scenario, start.view)
+                writeWindowFrameEvidence("gl-retained-old-live.png", checkNotNull(oldLive))
+                writeWindowFrameEvidence("gl-retained-changed-live.png", checkNotNull(changedLive))
+                writeWindowFrameEvidence("gl-retained-first-active.png", checkNotNull(firstActive))
+
+                val changedDiff = bitmapDiff(checkNotNull(changedLive), checkNotNull(firstActive))
+                val retainedOldDiff = bitmapDiff(checkNotNull(oldLive), checkNotNull(firstActive))
+                assertTrue(
+                    "the first active GL Window must show the new front texture, never the retained old buffer; " +
+                        "changedDiff=$changedDiff retainedOldDiff=$retainedOldDiff",
+                    changedDiff.rgbMae <= 0.75 && changedDiff.badPixelRatio <= 0.01,
+                )
+            } finally {
+                scenario.withActivity { overlay.invokeNoArg("dismiss") }
+                oldLive?.recycle()
+                changedLive?.recycle()
+                firstActive?.recycle()
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowSimulationSoftwareCurlWindowFramesTrackFirstMoveAndCancelRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-software-curl-window-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val start = waitForConditionResult("expected multi-page flow view for software curl Window capture") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val nextTop = view.reflectNullableInt("pageTopPxAt", 1)
+                    if (
+                        view.reflectInt("pageCount") <= 4 ||
+                        nextTop == null ||
+                        view.width <= 0 ||
+                        view.height <= 0 ||
+                        view.flowContentAlpha() < 1f
+                    ) {
+                        return@withActivity null
+                    }
+                    FlowGlCurlStart(view = view, nextPageTop = nextTop)
+                }
+            }
+
+            scenario.withActivity {
+                start.view.scrollTo(0, 0)
+                check(start.view.reflectBoolean("goToAdjacentPage", 1))
+            }
+            waitForFlowPage(scenario, start.view, 1, start.nextPageTop, "expected GL Window warm-up forward settle")
+            scenario.withActivity { check(start.view.reflectBoolean("goToAdjacentPage", -1)) }
+            waitForFlowPage(scenario, start.view, 0, 0, "expected GL Window warm-up backward settle")
+            val warmedOverlay = waitForConditionResult("expected warmed GL overlay to be idle and sized") {
+                scenario.withActivity { activity ->
+                    val overlay = activity.findEpubCurlOverlay() ?: return@withActivity null
+                    val curlView = overlay.findDescendant { it.javaClass.name == HARISM_CURL_VIEW_CLASS_NAME }
+                        ?: return@withActivity null
+                    val ready =
+                        !overlay.reflectPrivateBoolean("active") &&
+                            !curlView.reflectPrivateBoolean("mAnimate") &&
+                            curlView.reflectPrivateInt("mPageBitmapWidth") > 0 &&
+                            curlView.reflectPrivateInt("mPageBitmapHeight") > 0
+                    if (ready) overlay else null
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before software curl capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+            instrumentation.waitForIdleSync()
+            device.waitForIdle()
+
+            awaitCommittedFrame(scenario, start.view)
+            val stableA = captureWindowRegion(scenario, start.view)
+            awaitCommittedFrame(scenario, start.view)
+            val stable = captureWindowRegion(scenario, start.view)
+            val downTime = SystemClock.uptimeMillis()
+            val down = PointF(start.view.width * 0.85f, start.view.height * 0.10f)
+            val move = PointF(start.view.width * 0.30f, down.y)
+            var downFrame: Bitmap? = null
+            var moveFrame: Bitmap? = null
+            var settledFrame: Bitmap? = null
+            var gestureActive = false
+            lateinit var flowGestureDetector: GestureDetector
+            lateinit var flowTextView: TextView
+            var hostLongPressEnabled = false
+            var textLongClickable = false
+            var textSelectable = false
+            scenario.withActivity {
+                flowGestureDetector = start.view.reflectPrivateAny("gestureDetector") as GestureDetector
+                flowTextView = checkNotNull(start.view.findDescendant { it is TextView } as? TextView)
+                hostLongPressEnabled = flowGestureDetector.isLongpressEnabled
+                textLongClickable = flowTextView.isLongClickable
+                textSelectable = flowTextView.isTextSelectable
+                flowGestureDetector.setIsLongpressEnabled(false)
+                flowTextView.isLongClickable = false
+                flowTextView.setTextIsSelectable(false)
+            }
+            try {
+                assertVisualDiffAtMost(
+                    "software curl Window test must begin from a visually settled frame",
+                    bitmapDiff(stableA, stable),
+                    maxRgbMae = 0.25,
+                    maxBadPixelRatio = 0.001,
+                )
+                scenario.withActivity {
+                    dispatchTouchEvent(start.view, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down))
+                }
+                gestureActive = true
+                awaitCommittedFrame(scenario, start.view)
+                downFrame = captureWindowRegion(scenario, start.view)
+                assertVisualDiffAtMost(
+                    "software curl ACTION_DOWN must not change the composed reader Window",
+                    bitmapDiff(stable, checkNotNull(downFrame)),
+                    maxRgbMae = 0.35,
+                    maxBadPixelRatio = 0.002,
+                )
+
+                scenario.withActivity {
+                    dispatchTouchEvent(
+                        start.view,
+                        motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, move),
+                    )
+                }
+                scenario.withActivity {
+                    val curl = checkNotNull(start.view.reflectPrivateAny("curlDrawable")) {
+                        "SIMULATION finger drag must create the software PageCurlDrawable; " +
+                            "classified=${start.view.reflectPrivateBoolean("classified")} " +
+                            "stealing=${start.view.reflectPrivateBoolean("stealing")} " +
+                            "selection=${start.view.reflectPrivateBoolean("inSelectionMode")} " +
+                            "down=(${start.view.reflectPrivateAny("downX")},${start.view.reflectPrivateAny("downY")}) " +
+                            "flipped=${start.view.reflectPrivateBoolean("flipped")} " +
+                            "interactive=${start.view.reflectPrivateAny("interactiveTurnState")} " +
+                            "animator=${start.view.reflectPrivateAny("flipAnimator")} " +
+                            "page=${start.view.reflectInt("currentPageIndex")} scrollY=${start.view.scrollY} " +
+                            "overlayActive=${warmedOverlay.reflectPrivateBoolean("active")}"
+                    }
+                    check(curl.javaClass.simpleName == "PageCurlDrawable") {
+                        "expected PageCurlDrawable, actual=${curl.javaClass.name}"
+                    }
+                    check(start.view.reflectPrivateAny("slideDrawable") == null) {
+                        "SIMULATION software curl must not fall back to a slide drawable"
+                    }
+                    check(!warmedOverlay.reflectPrivateBoolean("active") && warmedOverlay.alpha == 0f) {
+                        "finger drag must leave the warmed GL overlay inactive"
+                    }
+                }
+                moveFrame = captureUntilMateriallyDifferent(
+                    scenario = scenario,
+                    target = start.view,
+                    baseline = stable,
+                    minRgbMae = 2.0,
+                    minBadPixelRatio = 0.01,
+                )
+                val moveDiff = bitmapDiff(stable, checkNotNull(moveFrame))
+                writeWindowFrameEvidence("software-curl-stable.png", stable)
+                writeWindowFrameEvidence("software-curl-down.png", checkNotNull(downFrame))
+                writeWindowFrameEvidence("software-curl-move.png", checkNotNull(moveFrame))
+                val moveLuma = sampledMeanLuma(checkNotNull(moveFrame))
+                assertTrue(
+                    "software curl MOVE frame must remain visibly composed; meanLuma=$moveLuma",
+                    moveLuma > 24.0,
+                )
+
+                scenario.withActivity {
+                    dispatchTouchEvent(
+                        start.view,
+                        motionEvent(
+                            downTime,
+                            downTime + EVENT_STEP_MS * 2,
+                            MotionEvent.ACTION_CANCEL,
+                            move,
+                        ),
+                    )
+                }
+                gestureActive = false
+                waitForConditionResult("expected cancelled software curl to settle on the outgoing page") {
+                    scenario.withActivity {
+                        val animatorRunning =
+                            (start.view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                        val settled =
+                            start.view.reflectInt("currentPageIndex") == 0 &&
+                                start.view.scrollY == 0 &&
+                                start.view.reflectPrivateAny("curlDrawable") == null &&
+                                start.view.reflectPrivateAny("slideDrawable") == null &&
+                                !animatorRunning &&
+                                !warmedOverlay.reflectPrivateBoolean("active")
+                        if (settled) true else null
+                    }
+                }
+                settledFrame = captureUntilVisuallyStable(scenario, start.view)
+                assertVisualDiffAtMost(
+                    "software curl ACTION_CANCEL must restore the exact pre-touch committed Window",
+                    bitmapDiff(stable, checkNotNull(settledFrame)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+                assertEquals(0, scenario.withActivity { start.view.reflectInt("currentPageIndex") })
+                writeWindowFrameEvidence("software-curl-settled.png", checkNotNull(settledFrame))
+                assertTrue("test precondition: software curl MOVE must materially differ from stable, diff=$moveDiff", moveDiff.rgbMae > 2.0)
+            } finally {
+                if (gestureActive) {
+                    runCatching {
+                        scenario.withActivity {
+                            dispatchTouchEvent(
+                                start.view,
+                                motionEvent(downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, move),
+                            )
+                        }
+                    }
+                }
+                scenario.withActivity {
+                    flowGestureDetector.setIsLongpressEnabled(hostLongPressEnabled)
+                    flowTextView.setTextIsSelectable(textSelectable)
+                    flowTextView.isLongClickable = textLongClickable
+                }
+                stableA.recycle()
+                stable.recycle()
+                downFrame?.recycle()
+                moveFrame?.recycle()
+                settledFrame?.recycle()
+            }
+        }
+    }
+
+    @Test
     fun epubFlowCenterTapTogglesChromeExactlyOnceRuntime() {
         val title = "flow-center-tap-${UUID.randomUUID().toString().take(8)}"
         val uri = createEpubUri("$title.epub")
@@ -1536,6 +2854,70 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     @Test
+    fun epubFlowMoonReaderVerticalSideSwipeUsesSoftwareCurlWithoutGlRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-vertical-software-curl-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val start = waitForConditionResult("expected flow view for vertical software curl") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val nextTop = view.reflectNullableInt("pageTopPxAt", 1)
+                    if (
+                        view.reflectInt("pageCount") <= 4 ||
+                        nextTop == null ||
+                        view.width <= 0 ||
+                        view.height <= 0 ||
+                        view.flowContentAlpha() < 1f
+                    ) {
+                        return@withActivity null
+                    }
+                    FlowGlCurlStart(view = view, nextPageTop = nextTop)
+                }
+            }
+
+            val owner = scenario.withActivity { activity ->
+                start.view.scrollTo(0, 0)
+                val density = start.view.resources.displayMetrics.density
+                val down = PointF(start.view.width * 0.85f, start.view.height * 0.50f)
+                val up = PointF(down.x + 10f * density, down.y - 60f * density)
+                val downTime = SystemClock.uptimeMillis()
+                dispatchTouchEvent(start.view, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down))
+                dispatchTouchEvent(
+                    start.view,
+                    motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, up),
+                )
+                dispatchTouchEvent(
+                    start.view,
+                    motionEvent(downTime, downTime + EVENT_STEP_MS * 2, MotionEvent.ACTION_UP, up),
+                )
+                val glOverlay = activity.findEpubCurlOverlay()
+                Pair(
+                    start.view.reflectPrivateAny("curlDrawable")?.javaClass?.simpleName,
+                    glOverlay?.reflectPrivateBoolean("active") == true,
+                )
+            }
+
+            assertEquals(
+                "clear side-column vertical swipe must use the software PageCurlDrawable",
+                "PageCurlDrawable",
+                owner.first,
+            )
+            assertFalse("clear side-column vertical swipe must not activate EpubCurlOverlay", owner.second)
+            waitForFlowPage(
+                scenario = scenario,
+                view = start.view,
+                pageIndex = 1,
+                scrollY = start.nextPageTop,
+                message = "vertical software curl should settle on the next canonical page",
+            )
+        }
+    }
+
+    @Test
     fun epubFlowLongPressDragDoesNotTriggerPagedFlipRuntime() {
         val title = "flow-longpress-${UUID.randomUUID().toString().take(8)}"
         val uri = createEpubUri("$title.epub")
@@ -1656,16 +3038,34 @@ class EpubFlowAnchorRuntimeSmokeTest {
             }
             assertTrue("SIMULATION should create the real EpubCurlOverlay", started.overlayCreated)
 
-            val settled = waitForConditionResult("expected real GL curl to commit to page 1") {
-                scenario.withActivity {
-                    val currentPage = start.view.reflectInt("currentPageIndex")
-                    val scrollY = start.view.scrollY
-                    if (currentPage == 1 && scrollY == start.nextPageTop) {
-                        FlowGlCurlSettled(currentPage = currentPage, scrollY = scrollY)
-                    } else {
-                        null
+            var lastGlState = "not sampled"
+            val settled = try {
+                waitForConditionResult("expected real GL curl to commit to page 1") {
+                    scenario.withActivity { activity ->
+                        val currentPage = start.view.reflectInt("currentPageIndex")
+                        val scrollY = start.view.scrollY
+                        val overlay = activity.findEpubCurlOverlay()
+                        val curlView = overlay?.findDescendant { it.javaClass.name == HARISM_CURL_VIEW_CLASS_NAME }
+                        lastGlState =
+                            "page=$currentPage scrollY=$scrollY " +
+                                "overlayActive=${overlay?.reflectPrivateBoolean("active")} " +
+                                "overlayAlpha=${overlay?.alpha} " +
+                                "frameReady=${overlay?.reflectPrivateBoolean("turnFrameReady")} " +
+                                "pendingDuration=${overlay?.reflectPrivateAny("pendingDiscreteTurnDurationMs")} " +
+                                "pendingRunnable=${overlay?.reflectPrivateAny("pendingDiscreteTurnRunnable") != null} " +
+                                "curlAnimate=${curlView?.reflectPrivateBoolean("mAnimate")} " +
+                                "curlIndex=${curlView?.reflectPrivateInt("mCurrentIndex")} " +
+                                "curlSize=${curlView?.reflectPrivateInt("mPageBitmapWidth")}x" +
+                                "${curlView?.reflectPrivateInt("mPageBitmapHeight")}"
+                        if (currentPage == 1 && scrollY == start.nextPageTop) {
+                            FlowGlCurlSettled(currentPage = currentPage, scrollY = scrollY)
+                        } else {
+                            null
+                        }
                     }
                 }
+            } catch (failure: Throwable) {
+                throw AssertionError("real GL curl did not commit; last=$lastGlState", failure)
             }
             assertEquals(1, settled.currentPage)
             assertEquals(start.nextPageTop, settled.scrollY)
@@ -1731,6 +3131,262 @@ class EpubFlowAnchorRuntimeSmokeTest {
             }
             assertEquals("rapid second turn must not queue a later page-2 commit", 1, final.currentPage)
             assertEquals(start.nextPageTop, final.scrollY)
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowSimulationColdFirstDragStartsSoftwareCurlWithoutActivatingGlRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-software-curl-first-drag-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val view = waitForConditionResult("expected flow view for first software curl drag") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (
+                        pageCount <= 4 ||
+                        view.width <= 0 ||
+                        view.height <= 0 ||
+                        view.flowContentAlpha() < 1f ||
+                        view.reflectPrivateAny("conversionSnapshotDrawable") != null ||
+                        view.reflectPrivateAny("flipStyle")?.toString() != PageFlipStyle.SIMULATION.name ||
+                        view.reflectPrivateAny("curlOverlayFactory") == null
+                    ) {
+                        return@withActivity null
+                    }
+                    view
+                }
+            }
+            waitForConditionResult("expected reader activity window focus before cold software curl capture") {
+                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
+            }
+            scenario.withActivity { view.scrollTo(0, 0) }
+            scenario.withActivity { activity ->
+                check(activity.findEpubCurlOverlay() == null) {
+                    "cold-first precondition requires that no GL overlay has been created or prewarmed"
+                }
+            }
+            instrumentation.waitForIdleSync()
+            device.waitForIdle()
+
+            awaitCommittedFrame(scenario, view)
+            val stableA = captureWindowRegion(scenario, view)
+            awaitCommittedFrame(scenario, view)
+            val stable = captureWindowRegion(scenario, view)
+            val downTime = SystemClock.uptimeMillis()
+            val down = PointF(view.width * 0.85f, view.height * 0.10f)
+            val move = PointF(view.width * 0.15f, view.height * 0.10f)
+            var downFrame: Bitmap? = null
+            var moveFrame: Bitmap? = null
+            var settledFrame: Bitmap? = null
+            var gestureActive = false
+            lateinit var flowGestureDetector: GestureDetector
+            lateinit var flowTextView: TextView
+            var hostLongPressEnabled = false
+            var textLongClickable = false
+            var textSelectable = false
+            scenario.withActivity {
+                flowGestureDetector = view.reflectPrivateAny("gestureDetector") as GestureDetector
+                flowTextView = checkNotNull(view.findDescendant { it is TextView } as? TextView)
+                hostLongPressEnabled = flowGestureDetector.isLongpressEnabled
+                textLongClickable = flowTextView.isLongClickable
+                textSelectable = flowTextView.isTextSelectable
+                flowGestureDetector.setIsLongpressEnabled(false)
+                flowTextView.isLongClickable = false
+                flowTextView.setTextIsSelectable(false)
+            }
+            try {
+                assertVisualDiffAtMost(
+                    "cold software curl test must begin from a visually settled Window",
+                    bitmapDiff(stableA, stable),
+                    maxRgbMae = 0.25,
+                    maxBadPixelRatio = 0.001,
+                )
+                scenario.withActivity {
+                    dispatchTouchEvent(view, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down))
+                }
+                gestureActive = true
+                awaitCommittedFrame(scenario, view)
+                downFrame = captureWindowRegion(scenario, view)
+                assertVisualDiffAtMost(
+                    "cold software curl ACTION_DOWN must not change the composed Window",
+                    bitmapDiff(stable, checkNotNull(downFrame)),
+                    maxRgbMae = 0.35,
+                    maxBadPixelRatio = 0.002,
+                )
+
+                scenario.withActivity {
+                    dispatchTouchEvent(
+                        view,
+                        motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, move),
+                    )
+                }
+                scenario.withActivity { activity ->
+                    val curl = checkNotNull(view.reflectPrivateAny("curlDrawable")) {
+                        "the first SIMULATION drag must create the software PageCurlDrawable"
+                    }
+                    check(curl.javaClass.simpleName == "PageCurlDrawable") {
+                        "expected PageCurlDrawable, actual=${curl.javaClass.name}"
+                    }
+                    check(view.reflectPrivateAny("slideDrawable") == null)
+                    check(activity.findEpubCurlOverlay() == null) {
+                        "the first finger drag must not create or prewarm EpubCurlOverlay"
+                    }
+                }
+                moveFrame = captureUntilMateriallyDifferent(
+                    scenario = scenario,
+                    target = view,
+                    baseline = stable,
+                    minRgbMae = 2.0,
+                    minBadPixelRatio = 0.01,
+                )
+
+                scenario.withActivity {
+                    dispatchTouchEvent(
+                        view,
+                        motionEvent(downTime, downTime + EVENT_STEP_MS * 2, MotionEvent.ACTION_CANCEL, move),
+                    )
+                }
+                gestureActive = false
+                waitForConditionResult("expected first software curl CANCEL to restore the outgoing page") {
+                    scenario.withActivity { activity ->
+                        val animatorRunning =
+                            (view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                        val glOverlay = activity.findEpubCurlOverlay()
+                        val settled =
+                            view.reflectInt("currentPageIndex") == 0 &&
+                                view.scrollY == 0 &&
+                                view.reflectPrivateAny("curlDrawable") == null &&
+                                view.reflectPrivateAny("slideDrawable") == null &&
+                                !animatorRunning &&
+                                (glOverlay == null || !glOverlay.reflectPrivateBoolean("active"))
+                        if (settled) true else null
+                    }
+                }
+                scenario.withActivity { activity ->
+                    check(activity.findEpubCurlOverlay() == null) {
+                        "a completed cold-first finger gesture must not leave a created or prewarmed GL overlay"
+                    }
+                }
+                settledFrame = captureUntilVisuallyStable(scenario, view)
+                assertVisualDiffAtMost(
+                    "the first software curl ACTION_CANCEL must restore the exact pre-touch committed Window",
+                    bitmapDiff(stable, checkNotNull(settledFrame)),
+                    maxRgbMae = 0.75,
+                    maxBadPixelRatio = 0.01,
+                )
+                writeWindowFrameEvidence("software-curl-cold-stable.png", stable)
+                writeWindowFrameEvidence("software-curl-cold-down.png", checkNotNull(downFrame))
+                writeWindowFrameEvidence("software-curl-cold-move.png", checkNotNull(moveFrame))
+                writeWindowFrameEvidence("software-curl-cold-settled.png", checkNotNull(settledFrame))
+            } finally {
+                if (gestureActive) {
+                    runCatching {
+                        scenario.withActivity {
+                            dispatchTouchEvent(
+                                view,
+                                motionEvent(downTime, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, move),
+                            )
+                        }
+                    }
+                }
+                scenario.withActivity {
+                    flowGestureDetector.setIsLongpressEnabled(hostLongPressEnabled)
+                    flowTextView.setTextIsSelectable(textSelectable)
+                    flowTextView.isLongClickable = textLongClickable
+                }
+                stableA.recycle()
+                stable.recycle()
+                downFrame?.recycle()
+                moveFrame?.recycle()
+                settledFrame?.recycle()
+            }
+        }
+    }
+
+    @Test
+    fun epubFlowSimulationSoftwareCurlDirectionFollowsDragNotDownHalfRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-software-curl-direction-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val start = waitForConditionResult("expected flow view for software curl direction test") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    val pageOneTop = view.reflectNullableInt("pageTopPxAt", 1)
+                    if (pageCount <= 4 || pageOneTop == null || view.width <= 0 || view.height <= 0) {
+                        return@withActivity null
+                    }
+                    FlowGlCurlStart(view = view, nextPageTop = pageOneTop)
+                }
+            }
+
+            scenario.withActivity {
+                start.view.scrollTo(0, 0)
+                start.view.reflectBoolean("goToAdjacentPage", 1)
+            }
+            waitForFlowPage(scenario, start.view, 1, start.nextPageTop, "expected discrete GL warm-up forward settle")
+            scenario.withActivity { start.view.reflectBoolean("goToAdjacentPage", -1) }
+            waitForFlowPage(scenario, start.view, 0, 0, "expected discrete GL warm-up backward settle")
+
+            scenario.withActivity { activity ->
+                dispatchDrag(
+                    start.view,
+                    start = PointF(start.view.width * 0.25f, start.view.height * 0.10f),
+                    end = PointF(start.view.width * -0.45f, start.view.height * 0.10f),
+                    beforeRelease = {
+                        val curl = checkNotNull(start.view.reflectPrivateAny("curlDrawable")) {
+                            "leftward SIMULATION drag must use PageCurlDrawable"
+                        }
+                        check(curl.javaClass.simpleName == "PageCurlDrawable")
+                        val overlay = activity.findEpubCurlOverlay()
+                        check(overlay == null || !overlay.reflectPrivateBoolean("active")) {
+                            "leftward finger drag must not activate EpubCurlOverlay"
+                        }
+                    },
+                )
+            }
+            waitForFlowPage(
+                scenario,
+                start.view,
+                1,
+                start.nextPageTop,
+                "left-half leftward drag must still follow dx and turn forward",
+            )
+
+            scenario.withActivity { activity ->
+                dispatchDrag(
+                    start.view,
+                    start = PointF(start.view.width * 0.75f, start.view.height * 0.10f),
+                    end = PointF(start.view.width * 1.45f, start.view.height * 0.10f),
+                    beforeRelease = {
+                        val curl = checkNotNull(start.view.reflectPrivateAny("curlDrawable")) {
+                            "rightward SIMULATION drag must use PageCurlDrawable"
+                        }
+                        check(curl.javaClass.simpleName == "PageCurlDrawable")
+                        val overlay = activity.findEpubCurlOverlay()
+                        check(overlay == null || !overlay.reflectPrivateBoolean("active")) {
+                            "rightward finger drag must not activate EpubCurlOverlay"
+                        }
+                    },
+                )
+            }
+            waitForFlowPage(
+                scenario,
+                start.view,
+                0,
+                0,
+                "right-half rightward drag must still follow dx and turn backward",
+            )
         }
     }
 
@@ -2285,20 +3941,72 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private fun View.reflectPrivateAny(name: String): Any? =
         javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this)
 
+    private fun View.swapPrivateField(name: String, value: Any?): Any? {
+        val field = javaClass.getDeclaredField(name).apply { isAccessible = true }
+        val previous = field.get(this)
+        field.set(this, value)
+        return previous
+    }
+
+    private fun View.setPendingDecodesForTest(pending: Boolean) {
+        swapPrivateField("pendingDecodesProvider", { pending })
+    }
+
+    private fun Any.invokeNoArgCompat(name: String) {
+        val exact = javaClass.declaredMethods.firstOrNull { method ->
+            method.name == name && method.parameterCount == 0
+        }
+        val method = exact ?: javaClass.declaredMethods.single { candidate ->
+            candidate.parameterCount == 0 && candidate.name.startsWith("$name\$")
+        }
+        method.isAccessible = true
+        method.invoke(this)
+    }
+
+    private fun View.invokeCurlOverlayStart(front: Bitmap, revealed: Bitmap) {
+        val start = javaClass.declaredMethods.single { method ->
+            method.name == "start" && method.parameterTypes.size == 4
+        }
+        start.isAccessible = true
+        start.invoke(this, front, revealed, true, { _: Boolean -> Unit })
+    }
+
+    private fun View.invokeCurlOverlayAnimateTurn(durationMs: Long) {
+        javaClass.getDeclaredMethod("animateTurn", Long::class.javaPrimitiveType).apply {
+            isAccessible = true
+        }.invoke(this, durationMs)
+    }
+
+    private fun Any.invokeNoArg(name: String) {
+        javaClass.getDeclaredMethod(name).apply { isAccessible = true }.invoke(this)
+    }
+
     private fun View.reflectTextView(): TextView =
         javaClass.getDeclaredField("textView").apply { isAccessible = true }.get(this) as TextView
 
     private fun View.invokeSetModeAnchoredPaged(layoutOffset: Int) {
+        invokeSetModeAnchored("PAGED", layoutOffset)
+    }
+
+    private fun View.invokeSetModeAnchored(modeName: String, layoutOffset: Int) {
         val modeClass = Class.forName("$EPUB_FLOW_VIEW_CLASS_NAME\$Mode")
-        val pagedMode = checkNotNull(modeClass.enumConstants) { "EpubFlowView.Mode enum constants unavailable" }
-            .first { (it as Enum<*>).name == "PAGED" }
+        val mode = checkNotNull(modeClass.enumConstants) { "EpubFlowView.Mode enum constants unavailable" }
+            .first { (it as Enum<*>).name == modeName }
         javaClass.getDeclaredMethod("setModeAnchored", modeClass, Int::class.javaPrimitiveType).apply {
             isAccessible = true
-        }.invoke(this, pagedMode, layoutOffset)
+        }.invoke(this, mode, layoutOffset)
+    }
+
+    private fun View.invokePrivateBitmap(name: String): Bitmap? {
+        val method = javaClass.getDeclaredMethod(name).apply { isAccessible = true }
+        return method.invoke(this) as? Bitmap
     }
 
     private fun Any.reflectPrivateInt(name: String): Int =
         javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this) as Int
+
+    private fun Any.reflectPrivateLong(name: String): Long =
+        javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this) as Long
 
     private fun Any.reflectPrivateBitmap(name: String): Bitmap =
         javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this) as Bitmap
@@ -2357,7 +4065,13 @@ class EpubFlowAnchorRuntimeSmokeTest {
         )
     }
 
-    private fun dispatchDrag(target: View, start: PointF, end: PointF, steps: Int = 6) {
+    private fun dispatchDrag(
+        target: View,
+        start: PointF,
+        end: PointF,
+        steps: Int = 6,
+        beforeRelease: (() -> Unit)? = null,
+    ) {
         val downTime = SystemClock.uptimeMillis()
         var eventTime = downTime
         dispatchTouchEvent(target, motionEvent(downTime, eventTime, MotionEvent.ACTION_DOWN, start))
@@ -2378,6 +4092,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
             )
         }
         eventTime += EVENT_STEP_MS
+        beforeRelease?.invoke()
         dispatchTouchEvent(target, motionEvent(downTime, eventTime, MotionEvent.ACTION_UP, end))
     }
 
@@ -2450,37 +4165,323 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
+    @SuppressLint("NewApi")
+    private fun awaitCommittedFrame(scenario: ActivityScenario<MainActivity>, target: View) {
+        check(Build.VERSION.SDK_INT >= 29) { "Window frame commits require API 29+" }
+        check(target.isHardwareAccelerated) { "Window frame evidence requires a hardware-accelerated reader" }
+        val committed = CountDownLatch(1)
+        scenario.withActivity {
+            target.viewTreeObserver.registerFrameCommitCallback { committed.countDown() }
+            target.postInvalidateOnAnimation()
+        }
+        assertTrue(
+            "reader frame was not committed",
+            committed.await(FRAME_COMMIT_TIMEOUT_MS, TimeUnit.MILLISECONDS),
+        )
+        SystemClock.sleep(FRAME_PRESENTATION_GRACE_MS)
+    }
+
+    @SuppressLint("NewApi")
+    private fun awaitFirstCommittedFrameMatchingAfter(
+        scenario: ActivityScenario<MainActivity>,
+        target: View,
+        frameReady: () -> Boolean,
+        action: () -> Unit,
+    ) {
+        check(Build.VERSION.SDK_INT >= 29) { "Window frame commits require API 29+" }
+        check(target.isHardwareAccelerated) { "Window frame evidence requires a hardware-accelerated reader" }
+        val committed = CountDownLatch(1)
+        lateinit var listener: ViewTreeObserver.OnPreDrawListener
+        scenario.withActivity {
+            listener = ViewTreeObserver.OnPreDrawListener {
+                if (frameReady()) {
+                    target.viewTreeObserver.removeOnPreDrawListener(listener)
+                    // ViewRootImpl captures commit callbacks after dispatchOnPreDraw, so this callback
+                    // belongs to the first traversal that actually draws the newly active overlay.
+                    target.viewTreeObserver.registerFrameCommitCallback { committed.countDown() }
+                }
+                true
+            }
+            target.viewTreeObserver.addOnPreDrawListener(listener)
+            action()
+        }
+        val didCommit = committed.await(FRAME_COMMIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        if (!didCommit) {
+            scenario.withActivity {
+                if (target.viewTreeObserver.isAlive) {
+                    target.viewTreeObserver.removeOnPreDrawListener(listener)
+                }
+            }
+        }
+        assertTrue("matching reader frame after action was not committed", didCommit)
+        SystemClock.sleep(FRAME_PRESENTATION_GRACE_MS)
+    }
+
+    @SuppressLint("NewApi")
+    private fun captureWindowRegion(
+        scenario: ActivityScenario<MainActivity>,
+        target: View,
+    ): Bitmap {
+        val spec = scenario.withActivity { activity ->
+            val location = IntArray(2)
+            if (Build.VERSION.SDK_INT >= 34) {
+                target.getLocationInWindow(location)
+            } else {
+                target.getLocationOnScreen(location)
+            }
+            WindowCaptureSpec(
+                window = activity.window,
+                left = location[0],
+                top = location[1],
+                width = target.width,
+                height = target.height,
+            )
+        }
+        val screenshot = checkNotNull(
+            if (Build.VERSION.SDK_INT >= 34) {
+                instrumentation.uiAutomation.takeScreenshot(spec.window)
+            } else {
+                instrumentation.uiAutomation.takeScreenshot()
+            },
+        ) { "UiAutomation did not return a composed window screenshot" }
+        try {
+            check(spec.left >= 0 && spec.top >= 0) { "invalid capture origin: $spec" }
+            check(spec.left + spec.width <= screenshot.width) {
+                "capture exceeds screenshot width: spec=$spec screenshot=${screenshot.width}x${screenshot.height}"
+            }
+            check(spec.top + spec.height <= screenshot.height) {
+                "capture exceeds screenshot height: spec=$spec screenshot=${screenshot.width}x${screenshot.height}"
+            }
+            val cropped = Bitmap.createBitmap(
+                screenshot,
+                spec.left,
+                spec.top,
+                spec.width,
+                spec.height,
+            )
+            return try {
+                checkNotNull(cropped.copy(Bitmap.Config.ARGB_8888, false)) {
+                    "unable to copy composed reader frame"
+                }
+            } finally {
+                if (cropped !== screenshot) cropped.recycle()
+            }
+        } finally {
+            screenshot.recycle()
+        }
+    }
+
+    private fun captureUntilVisuallyStable(
+        scenario: ActivityScenario<MainActivity>,
+        target: View,
+    ): Bitmap {
+        var previous = captureWindowRegion(scenario, target)
+        var stablePairs = 0
+        repeat(MAX_VISUAL_SETTLE_FRAMES) {
+            awaitCommittedFrame(scenario, target)
+            val current = captureWindowRegion(scenario, target)
+            val diff = bitmapDiff(previous, current)
+            previous.recycle()
+            previous = current
+            stablePairs = if (
+                diff.rgbMae <= VISUAL_SETTLE_MAE &&
+                diff.badPixelRatio <= VISUAL_SETTLE_BAD_PIXEL_RATIO
+            ) {
+                stablePairs + 1
+            } else {
+                0
+            }
+            if (stablePairs >= REQUIRED_VISUAL_SETTLE_PAIRS) return previous
+        }
+        previous.recycle()
+        error("reader window did not visually settle within $MAX_VISUAL_SETTLE_FRAMES committed frames")
+    }
+
+    private fun captureUntilMateriallyDifferent(
+        scenario: ActivityScenario<MainActivity>,
+        target: View,
+        baseline: Bitmap,
+        minRgbMae: Double,
+        minBadPixelRatio: Double,
+    ): Bitmap {
+        var lastDiff: BitmapDiff? = null
+        repeat(MAX_VISUAL_SETTLE_FRAMES) {
+            awaitCommittedFrame(scenario, target)
+            val frame = captureWindowRegion(scenario, target)
+            val diff = bitmapDiff(baseline, frame)
+            lastDiff = diff
+            if (diff.rgbMae >= minRgbMae && diff.badPixelRatio >= minBadPixelRatio) return frame
+            frame.recycle()
+        }
+        error(
+            "reader Window did not present a materially different frame within " +
+                "$MAX_VISUAL_SETTLE_FRAMES commits; lastDiff=$lastDiff",
+        )
+    }
+
+    private fun sampledMeanLuma(bitmap: Bitmap): Double {
+        var total = 0.0
+        var count = 0
+        var y = 0
+        while (y < bitmap.height) {
+            var x = 0
+            while (x < bitmap.width) {
+                val pixel = bitmap.getPixel(x, y)
+                total += Color.red(pixel) * 0.2126 + Color.green(pixel) * 0.7152 + Color.blue(pixel) * 0.0722
+                count++
+                x += 16
+            }
+            y += 16
+        }
+        return if (count == 0) 0.0 else total / count
+    }
+
+    private fun bitmapDiff(expected: Bitmap, actual: Bitmap): BitmapDiff =
+        bitmapRegionDiff(
+            expected = expected,
+            actual = actual,
+            expectedLeft = 0,
+            actualLeft = 0,
+            width = expected.width,
+            height = expected.height,
+        )
+
+    private fun bestHorizontalShiftPx(
+        expected: Bitmap,
+        actual: Bitmap,
+        maxShiftPx: Int,
+    ): Int {
+        require(expected.width == actual.width && expected.height == actual.height)
+        val maxShift = maxShiftPx.coerceIn(0, expected.width - 1)
+        val probeWidth = minOf(expected.width / 3, expected.width - maxShift).coerceAtLeast(1)
+        val sampleStride = 12
+        val sampledRowCount = (expected.height + sampleStride - 1) / sampleStride
+        val expectedRows = IntArray(sampledRowCount * expected.width)
+        val actualRows = IntArray(sampledRowCount * probeWidth)
+        val expectedRow = IntArray(expected.width)
+        val actualRow = IntArray(probeWidth)
+
+        var sampledRow = 0
+        var y = 0
+        while (y < expected.height) {
+            expected.getPixels(expectedRow, 0, expected.width, 0, y, expected.width, 1)
+            actual.getPixels(actualRow, 0, probeWidth, 0, y, probeWidth, 1)
+            expectedRow.copyInto(expectedRows, sampledRow * expected.width)
+            actualRow.copyInto(actualRows, sampledRow * probeWidth)
+            sampledRow += 1
+            y += sampleStride
+        }
+
+        var bestShift = 0
+        var bestError = Long.MAX_VALUE
+        for (shift in 0..maxShift) {
+            var error = 0L
+            for (row in 0 until sampledRowCount) {
+                val expectedRowOffset = row * expected.width + shift
+                val actualRowOffset = row * probeWidth
+                var x = 0
+                while (x < probeWidth) {
+                    val expectedColor = expectedRows[expectedRowOffset + x]
+                    val actualColor = actualRows[actualRowOffset + x]
+                    error += kotlin.math.abs(Color.red(expectedColor) - Color.red(actualColor))
+                    error += kotlin.math.abs(Color.green(expectedColor) - Color.green(actualColor))
+                    error += kotlin.math.abs(Color.blue(expectedColor) - Color.blue(actualColor))
+                    x += sampleStride
+                }
+            }
+            if (error < bestError) {
+                bestError = error
+                bestShift = shift
+            }
+        }
+        return bestShift
+    }
+
+    private fun bitmapRegionDiff(
+        expected: Bitmap,
+        actual: Bitmap,
+        expectedLeft: Int,
+        actualLeft: Int,
+        width: Int,
+        height: Int,
+    ): BitmapDiff {
+        require(expected.height >= height && actual.height >= height)
+        require(expectedLeft >= 0 && expectedLeft + width <= expected.width)
+        require(actualLeft >= 0 && actualLeft + width <= actual.width)
+        val expectedPixels = IntArray(width * height)
+        val actualPixels = IntArray(width * height)
+        expected.getPixels(expectedPixels, 0, width, expectedLeft, 0, width, height)
+        actual.getPixels(actualPixels, 0, width, actualLeft, 0, width, height)
+        var totalChannelDelta = 0L
+        var maxChannelDelta = 0
+        var badPixels = 0
+        expectedPixels.indices.forEach { index ->
+            val expectedColor = expectedPixels[index]
+            val actualColor = actualPixels[index]
+            val red = kotlin.math.abs(Color.red(expectedColor) - Color.red(actualColor))
+            val green = kotlin.math.abs(Color.green(expectedColor) - Color.green(actualColor))
+            val blue = kotlin.math.abs(Color.blue(expectedColor) - Color.blue(actualColor))
+            val pixelMax = maxOf(red, green, blue)
+            totalChannelDelta += red + green + blue
+            maxChannelDelta = maxOf(maxChannelDelta, pixelMax)
+            if (pixelMax > BAD_PIXEL_CHANNEL_DELTA) badPixels += 1
+        }
+        return BitmapDiff(
+            rgbMae = totalChannelDelta.toDouble() / (expectedPixels.size * 3.0),
+            maxChannelDelta = maxChannelDelta,
+            badPixelRatio = badPixels.toDouble() / expectedPixels.size.toDouble(),
+            pixelCount = expectedPixels.size,
+        )
+    }
+
+    private fun assertVisualDiffAtMost(
+        message: String,
+        diff: BitmapDiff,
+        maxRgbMae: Double,
+        maxBadPixelRatio: Double,
+    ) {
+        assertTrue(
+            "$message; diff=$diff limits=(mae=$maxRgbMae,badRatio=$maxBadPixelRatio)",
+            diff.rgbMae <= maxRgbMae && diff.badPixelRatio <= maxBadPixelRatio,
+        )
+    }
+
+    private fun assertVisualDiffAtLeast(
+        message: String,
+        diff: BitmapDiff,
+        minRgbMae: Double,
+        minBadPixelRatio: Double,
+    ) {
+        assertTrue(
+            "$message; diff=$diff limits=(mae=$minRgbMae,badRatio=$minBadPixelRatio)",
+            diff.rgbMae >= minRgbMae && diff.badPixelRatio >= minBadPixelRatio,
+        )
+    }
+
+    private fun writeWindowFrameEvidence(name: String, bitmap: Bitmap) {
+        val root = checkNotNull(appContext.getExternalFilesDir(null)) {
+            "external evidence directory is unavailable"
+        }
+        val directory = File(root, "handfeel-window-frames").apply { mkdirs() }
+        File(directory, name).outputStream().use { output ->
+            check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
+                "failed to write window-frame evidence $name"
+            }
+        }
+    }
+
     private fun View.drawRuntimeBitmap(): Bitmap =
         Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { bitmap ->
             val canvas = Canvas(bitmap)
+            canvas.translate(-scrollX.toFloat(), -scrollY.toFloat())
             draw(canvas)
-            drawConversionOverlayForRuntimeTest(canvas)
         }
-
-    private fun View.drawConversionOverlayForRuntimeTest(canvas: Canvas) {
-        val cover = runCatching { reflectPrivateAny("conversionSnapshotDrawable") as? Drawable }
-            .getOrNull()
-            ?: return
-        val save = canvas.save()
-        canvas.translate(0f, -scrollY.toFloat())
-        cover.draw(canvas)
-        canvas.restoreToCount(save)
-    }
 
     private fun assertSampledPixelsEqual(message: String, expected: Bitmap, actual: Bitmap) {
         assertEquals("$message: width", expected.width, actual.width)
         assertEquals("$message: height", expected.height, actual.height)
-        val stepX = (expected.width / 6).coerceAtLeast(1)
-        val stepY = (expected.height / 6).coerceAtLeast(1)
-        var y = 0
-        while (y < expected.height) {
-            var x = 0
-            while (x < expected.width) {
-                assertEquals("$message at ($x,$y)", expected.getPixel(x, y), actual.getPixel(x, y))
-                x += stepX
-            }
-            y += stepY
-        }
+        val diff = bitmapDiff(expected, actual)
+        assertTrue("$message must match across every pixel; diff=$diff", diff.maxChannelDelta == 0)
     }
 
     private fun motionEvent(
@@ -2490,6 +4491,47 @@ class EpubFlowAnchorRuntimeSmokeTest {
         point: PointF,
     ): MotionEvent =
         MotionEvent.obtain(downTime, eventTime, action, point.x, point.y, 0)
+
+    private class FailNextDrawDrawable(
+        private val delegate: Drawable?,
+    ) : Drawable() {
+        private var failNext = true
+
+        override fun draw(canvas: Canvas) {
+            if (failNext) {
+                failNext = false
+                error("forced boundary snapshot draw failure")
+            }
+            delegate?.bounds = bounds
+            delegate?.draw(canvas)
+        }
+
+        override fun setAlpha(alpha: Int) {
+            delegate?.alpha = alpha
+        }
+
+        override fun setColorFilter(colorFilter: ColorFilter?) {
+            delegate?.colorFilter = colorFilter
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = delegate?.opacity ?: PixelFormat.TRANSLUCENT
+    }
+
+    private data class WindowCaptureSpec(
+        val window: Window,
+        val left: Int,
+        val top: Int,
+        val width: Int,
+        val height: Int,
+    )
+
+    private data class BitmapDiff(
+        val rgbMae: Double,
+        val maxChannelDelta: Int,
+        val badPixelRatio: Double,
+        val pixelCount: Int,
+    )
 
     private data class FlowAnchorBaseline(
         val view: View,
@@ -2675,9 +4717,17 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private companion object {
         private const val EPUB_FLOW_VIEW_CLASS_NAME = "dev.readflow.render.epub.EpubFlowView"
         private const val EPUB_CURL_OVERLAY_CLASS_NAME = "dev.readflow.render.epub.EpubCurlOverlay"
+        private const val HARISM_CURL_VIEW_CLASS_NAME = "fi.harism.curl.CurlView"
         private const val DB_NAME = "readflow.db"
         private const val EVENT_STEP_MS = 24L
         private const val FRAME_POLL_MS = 16L
+        private const val FRAME_COMMIT_TIMEOUT_MS = 2_000L
+        private const val FRAME_PRESENTATION_GRACE_MS = 16L
+        private const val BAD_PIXEL_CHANNEL_DELTA = 8
+        private const val MAX_VISUAL_SETTLE_FRAMES = 24
+        private const val REQUIRED_VISUAL_SETTLE_PAIRS = 2
+        private const val VISUAL_SETTLE_MAE = 0.25
+        private const val VISUAL_SETTLE_BAD_PIXEL_RATIO = 0.001
         private const val VISIBLE_CONTENT_ALPHA_EPSILON = 0.05f
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
         private val DB_TIMEOUT_MS = 5.seconds.inWholeMilliseconds

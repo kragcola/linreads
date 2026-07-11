@@ -457,6 +457,18 @@ class EpubReflowEngine private constructor(
         view.curlOverlayFactory = factory@{
             val overlay = runCatching { EpubCurlOverlay(context) }.getOrNull() ?: return@factory null
             host.addView(overlay, matchParent())
+            // AndroidView hosts do not necessarily schedule another ViewGroup layout when a child is
+            // added from the first touch dispatch. Size the lazy GL child now so its first frame can gate
+            // the turn instead of waiting until after the safety timeout.
+            val overlayWidth = host.width.takeIf { it > 0 } ?: view.width
+            val overlayHeight = host.height.takeIf { it > 0 } ?: view.height
+            if (overlayWidth > 0 && overlayHeight > 0) {
+                overlay.measure(
+                    android.view.View.MeasureSpec.makeMeasureSpec(overlayWidth, android.view.View.MeasureSpec.EXACTLY),
+                    android.view.View.MeasureSpec.makeMeasureSpec(overlayHeight, android.view.View.MeasureSpec.EXACTLY),
+                )
+                overlay.layout(0, 0, overlayWidth, overlayHeight)
+            }
             overlay
         }
         return host
@@ -546,7 +558,12 @@ class EpubReflowEngine private constructor(
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
             imageBoundsProvider = ::epubImageBoundsFor,
-            onImageResultChanged = { flowView?.refreshAfterAsyncImageResult() },
+            onImageResultChanged = {
+                if (flowCurrentFlow === flow) view.refreshAfterAsyncImageResult()
+            },
+            onDecodeFinished = {
+                if (flowCurrentFlow === flow) view.onAsyncImageDecodeFinished()
+            },
         )
         val resolver = EpubFlowImageSizeResolver(
             columnWidthPx = flowColumnWidthPx(),
@@ -565,12 +582,21 @@ class EpubReflowEngine private constructor(
             highlightRanges = flowHighlightRanges(flow),
         )
         val restoreOffset = restoreToParagraph?.let { flow.offsetForParagraph(it, restoreToParagraphOffset) }
-        view.pendingDecodesProvider = loader::hasPendingDecodes
+        // setChapter posts its first settle before the Markwon scheduler attaches AsyncDrawables. Treat
+        // that not-yet-scheduled window as pending too, or the stability gate can reveal/pre-cache the
+        // transparent placeholders before loader.inFlight has a chance to become non-empty.
+        var imageSchedulingPending = true
+        view.pendingDecodesProvider = { imageSchedulingPending || loader.hasPendingDecodes() }
         view.setChapter(flow, spannable, flowPageHeightPx(), restoreOffset = restoreOffset, landOnLast = landOnLast)
         // Schedule async images after the layout pass; positioning is now done inside setChapter's own
         // post (single pre-paint placement — no chapter-top→resume jump on entry).
         view.textView.post {
-            AsyncDrawableScheduler.schedule(view.textView)
+            try {
+                AsyncDrawableScheduler.schedule(view.textView)
+            } finally {
+                imageSchedulingPending = false
+                view.tryRevealWhenStable()
+            }
         }
         flowCurrentFlow = flow
     }
@@ -653,7 +679,12 @@ class EpubReflowEngine private constructor(
         val view = flowView ?: return
         if (view.goToAdjacentPage(delta)) return
         val target = adjacentSpine(flowSpineIndex, delta) ?: return
-        view.prepareBoundaryPageTurn(delta)
+        if (
+            view.prepareBoundaryPageTurnResult(delta) ==
+            EpubFlowView.BoundaryPageTurnPreparation.SNAPSHOT_UNAVAILABLE
+        ) {
+            return
+        }
         if (delta > 0) {
             loadFlowChapter(target, restoreToParagraph = firstParagraphOfSpine(target))
         } else {

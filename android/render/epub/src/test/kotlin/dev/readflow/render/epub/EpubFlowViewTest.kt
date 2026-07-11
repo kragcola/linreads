@@ -6,13 +6,14 @@ import android.graphics.Canvas
 import android.graphics.ColorFilter
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Looper
 import android.os.SystemClock
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ClickableSpan
-import android.text.style.ReplacementSpan
+import android.text.style.ImageSpan
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -20,6 +21,7 @@ import android.view.ViewGroup
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.ui.readerPaperBackground
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -30,6 +32,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
@@ -76,6 +79,28 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `action cancel rolls back an interactive slide even after the commit threshold`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val startTop = requireNotNull(view.pageTopPxAt(0))
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.15f
+        val y = view.height * 0.50f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+        val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+        assertTrue("test must cross the normal release commit threshold", slide.progress > 0.5f)
+
+        view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+        assertEquals("input cancellation must never commit a page turn", 0, view.currentPageIndex())
+        assertEquals("input cancellation must restore the outgoing page anchor", startTop, view.scrollY)
+    }
+
+    @Test
     fun `committed interactive turn lands on adjacent page from normalized anchor`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -95,44 +120,100 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `cancelled gl curl restores normalized from page anchor`() {
+    fun `simulation drag uses software curl without activating gl overlay`() {
         val overlay = FakeCurlOverlay()
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
             curlOverlay = overlay
         }
-        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
-        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
-        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
-        val nearPageTwo = pageOneTop + ((pageTwoTop - pageOneTop) * 3 / 4)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.15f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
 
-        view.scrollTo(0, nearPageTwo)
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
 
-        assertTrue(view.beginGlInteractiveCurl(forward = true, atY = view.height / 2f))
-        overlay.settle(committed = false)
+            assertNotNull(
+                "SIMULATION finger drag must create the software PageCurlDrawable",
+                view.privateField("curlDrawable") as PageCurlDrawable?,
+            )
+            assertNull("software curl must not fall back to a slide drawable", view.privateField("slideDrawable"))
+            assertEquals("interactive finger drag must not start the GL overlay", 0, overlay.startCount)
+            assertFalse("interactive finger drag must leave the GL overlay inactive", overlay.active)
+        } finally {
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            if (overlay.active) overlay.dismiss()
+        }
 
-        assertEquals(2, view.currentPageIndex())
-        assertEquals(pageTwoTop, view.scrollY)
+        assertEquals("ACTION_CANCEL must keep the outgoing logical page", startPage, view.currentPageIndex())
+        assertEquals("ACTION_CANCEL must restore the outgoing page anchor", startTop, view.scrollY)
     }
 
     @Test
-    fun `committed gl curl lands on adjacent page from normalized anchor`() {
+    fun `simulation vertical side swipe uses software curl without activating gl overlay`() {
         val overlay = FakeCurlOverlay()
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
             curlOverlay = overlay
         }
-        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
-        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
-        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
-        val pageThreeTop = requireNotNull(view.pageTopPxAt(3))
-        val nearPageTwo = pageOneTop + ((pageTwoTop - pageOneTop) * 3 / 4)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val x = view.width * 0.85f
+        val downY = view.height * 0.65f
+        val upY = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
 
-        view.scrollTo(0, nearPageTwo)
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, downY))
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, x, upY),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, x, upY),
+            )
 
-        assertTrue(view.beginGlInteractiveCurl(forward = true, atY = view.height / 2f))
-        overlay.settle(committed = true)
+            assertNotNull(
+                "SIMULATION vertical side swipe must create the software PageCurlDrawable",
+                view.privateField("curlDrawable") as PageCurlDrawable?,
+            )
+            assertNull("vertical software curl must not fall back to a slide drawable", view.privateField("slideDrawable"))
+            assertEquals("vertical finger swipe must not start the GL overlay", 0, overlay.startCount)
+            assertFalse("vertical finger swipe must leave the GL overlay inactive", overlay.active)
+        } finally {
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            if (overlay.active) overlay.dismiss()
+        }
+    }
 
-        assertEquals(3, view.currentPageIndex())
-        assertEquals(pageThreeTop, view.scrollY)
+    @Test
+    fun `simulation drag at a real chapter boundary still requests the adjacent chapter`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val overlay = FakeCurlOverlay()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTapZone = tapZones::add,
+        ).apply {
+            curlOverlay = overlay
+        }
+        view.goToLastPage()
+        val downX = view.width * 0.75f
+        val moveX = view.width * 0.10f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+
+        assertEquals(listOf(EpubFlowTapZone.NEXT), tapZones)
+        assertEquals("a chapter-boundary drag must not start an in-chapter GL turn", 0, overlay.startCount)
+        assertFalse("a chapter-boundary drag must leave the GL overlay inactive", overlay.active)
     }
 
     @Test
@@ -153,6 +234,197 @@ class EpubFlowViewTest {
 
         assertEquals(2, view.currentPageIndex())
         assertEquals(pageTwoTop, view.scrollY)
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `discrete gl conversion front copy failure rejects turn and preserves partial owner`() {
+        val overlay = FakeCurlOverlay()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+        val fade = checkNotNull(view.privateField("conversionFadeAnimator"))
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        val failCopy: (Bitmap) -> Bitmap? = { null }
+        view.setPrivateField("pageShotBitmapCopier", failCopy)
+
+        assertTrue(view.goToAdjacentPage(1))
+
+        assertEquals("a failed GL front copy must not start the overlay", 0, overlay.startCount)
+        assertEquals(startPage, view.currentPageIndex())
+        assertEquals(startTop, view.scrollY)
+        assertEquals("the exact partial owner must remain installed", cover, view.privateField("conversionSnapshotDrawable"))
+        assertEquals(128, cover.privateInt("alphaValue"))
+        assertTrue("the original reveal must continue", view.privateField("conversionFadeAnimator") === fade)
+        assertNull(view.privateField("slideDrawable"))
+        assertNull(view.privateField("flipAnimator"))
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `discrete gl turn keeps partial conversion owner until first frame is ready`() {
+        val overlay = FakeCurlOverlay(autoFirstFrameReady = false)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+
+        assertTrue(view.goToAdjacentPage(1))
+
+        assertEquals(true, overlay.active)
+        assertEquals(
+            "the discrete GL handoff must keep the exact visible cover until GL draws its first frame",
+            cover,
+            view.privateField("conversionSnapshotDrawable"),
+        )
+        assertEquals("the visible conversion composition must remain frozen", 128, cover.privateInt("alphaValue"))
+        assertNull(
+            "the conversion reveal must pause while the discrete GL first frame is pending",
+            view.privateField("conversionFadeAnimator"),
+        )
+
+        overlay.signalFirstFrameReady()
+
+        assertEquals("GL must still own the turn when the cover retires", true, overlay.active)
+        assertNull(view.privateField("conversionSnapshotDrawable"))
+        overlay.settle(committed = false)
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `discrete gl rejects conversion turn when captured front cannot be copied`() {
+        val overlay = FakeCurlOverlay(autoFirstFrameReady = false)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+        val fade = checkNotNull(view.privateField("conversionFadeAnimator"))
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        var capturedFront: Bitmap? = null
+        val failGlFrontCopy: (Bitmap) -> Bitmap? = { source ->
+            capturedFront = source
+            null
+        }
+        view.setPrivateField("pageShotBitmapCopier", failGlFrontCopy)
+
+        try {
+            assertTrue("the failed turn must remain consumed by the self-paging view", view.goToAdjacentPage(1))
+
+            assertNotNull("the visible conversion composition must reach the GL front-copy seam", capturedFront)
+            assertEquals("a failed GL front copy must not start the curl overlay", 0, overlay.startCount)
+            assertEquals("the rejected turn must retain the current page", startPage, view.currentPageIndex())
+            assertEquals("the rejected turn must retain the current visual anchor", startTop, view.scrollY)
+            assertEquals("the same conversion cover must remain the visible owner", cover, view.privateField("conversionSnapshotDrawable"))
+            assertTrue("the original conversion reveal must continue without being restarted", view.privateField("conversionFadeAnimator") === fade)
+            assertNull("the rejected GL turn must not fall through to a slide", view.privateField("slideDrawable"))
+            assertNull("the rejected GL turn must not start any page-turn animator", view.privateField("flipAnimator"))
+            assertEquals(false, overlay.active)
+        } finally {
+            overlay.dismiss()
+            overlay.frontBitmapCopy?.let { if (!it.isRecycled) it.recycle() }
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `cancelled discrete gl turn before first frame resumes partial conversion reveal`() {
+        val overlay = FakeCurlOverlay(autoFirstFrameReady = false)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+
+        assertTrue(view.goToAdjacentPage(1))
+        overlay.settle(committed = false)
+
+        assertEquals(startPage, view.currentPageIndex())
+        assertEquals(startTop, view.scrollY)
+        assertEquals(
+            "a pre-first-frame cancel must restore the same cover instead of exposing a different owner",
+            cover,
+            view.privateField("conversionSnapshotDrawable"),
+        )
+        assertEquals(128, cover.privateInt("alphaValue"))
+        assertNotNull(
+            "a pre-first-frame cancel must resume the interrupted conversion reveal",
+            view.privateField("conversionFadeAnimator"),
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+        assertNull("the resumed reveal must eventually retire its cover", view.privateField("conversionSnapshotDrawable"))
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `discrete gl settle timeout before first frame does not commit target page`() {
+        val overlay = FakeCurlOverlay(autoFirstFrameReady = false)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            curlOverlay = overlay
+        }
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+
+        assertTrue(view.goToAdjacentPage(1))
+        shadowOf(Looper.getMainLooper()).idleFor(1_000L, TimeUnit.MILLISECONDS)
+
+        assertEquals(
+            "the host timeout must not commit a target that GL never proved visible",
+            startPage,
+            view.currentPageIndex(),
+        )
+        assertEquals("the host timeout must restore the outgoing page anchor", startTop, view.scrollY)
     }
 
     @Test
@@ -423,6 +695,67 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `first threshold crossing move uses the full down displacement for interactive slide progress`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.55f
+        val y = view.height * 0.50f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        assertTrue(
+            view.onInterceptTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+            ),
+        )
+
+        try {
+            val slide = view.privateField("slideDrawable") as PageSlideDrawable?
+            assertNotNull("the first threshold-crossing MOVE should start the interactive slide", slide)
+            val expectedProgress = (downX - moveX) / view.width.toFloat()
+            assertEquals(
+                "the first interactive frame must include all finger travel since ACTION_DOWN",
+                expectedProgress,
+                checkNotNull(slide).progress,
+                0.001f,
+            )
+        } finally {
+            view.onTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y),
+            )
+        }
+    }
+
+    @Test
+    fun `first threshold crossing move uses the full down displacement for temporary scroll`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val x = view.width * 0.50f
+        val downY = view.height * 0.50f
+        val moveY = view.height * 0.15f
+        val downTime = SystemClock.uptimeMillis()
+        val startScrollY = view.scrollY
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, downY))
+        assertTrue(
+            view.onInterceptTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, x, moveY),
+            ),
+        )
+
+        try {
+            assertEquals(
+                "the first temporary-scroll frame must include all finger travel since ACTION_DOWN",
+                startScrollY + (downY - moveY).toInt(),
+                view.scrollY,
+            )
+        } finally {
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, x, moveY))
+        }
+    }
+
+    @Test
     fun `live paged draw keeps paper background anchored to viewport while scrolled`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -501,6 +834,24 @@ class EpubFlowViewTest {
 
         assertEquals(1, view.currentPageIndex())
         assertEquals(pageOneTop, view.scrollY)
+    }
+
+    @Test
+    fun `active slide into the final page consumes a rapid next without reporting a chapter boundary`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val finalPage = view.pageCount() - 1
+        view.goToPage(finalPage - 1)
+
+        assertTrue(view.goToAdjacentPage(1))
+        assertEquals("the live page is parked beneath the active slide", finalPage, view.currentPageIndex())
+        assertNotNull(view.privateField("slideDrawable"))
+
+        assertTrue(
+            "a rapid request during the active slide must be consumed, not reported as a chapter boundary",
+            view.goToAdjacentPage(1),
+        )
+        assertEquals(finalPage, view.currentPageIndex())
     }
 
     @Test
@@ -655,6 +1006,324 @@ class EpubFlowViewTest {
         )
         front.recycle()
         visibleCover.recycle()
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `first turn during conversion fade flattens the last visible composition into its front shot`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val livePage = requireNotNull(view.snapshotViewportForTest())
+        val coverPixels = markerBitmap(view.width, view.height)
+        val expected = livePage.copy(Bitmap.Config.ARGB_8888, true)
+        Canvas(expected).drawBitmap(
+            coverPixels,
+            0f,
+            0f,
+            Paint(Paint.FILTER_BITMAP_FLAG).apply { alpha = 128 },
+        )
+        assertFalse(
+            "the fixture must produce a partial composition rather than another opaque cover copy",
+            bitmapsHaveSamePixels(expected, coverPixels),
+        )
+        view.showConversionSnapshotForTest(coverPixels.copy(Bitmap.Config.ARGB_8888, false))
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+
+        assertTrue(view.goToAdjacentPage(1))
+
+        val slide = checkNotNull(view.privateField("slideDrawable"))
+        assertAllPixelsEqual(
+            "the turn front must equal the exact live-plus-partial-cover composition visible before the tap",
+            expected,
+            slide.privateBitmap("frontBitmap"),
+        )
+        assertNull("the captured conversion cover must not remain beneath the active turn", view.privateField("conversionSnapshotDrawable"))
+        livePage.recycle()
+        coverPixels.recycle()
+        expected.recycle()
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `partial conversion capture failure rejects the turn and lets the reveal finish`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        val originalBackground = view.background
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+        assertNotNull("fixture requires an active conversion reveal", view.privateField("conversionFadeAnimator"))
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        view.background = CaptureTargetBitmapThenThrowDrawable()
+
+        assertTrue("the failed request must still be consumed by the self-paging view", view.goToAdjacentPage(1))
+
+        view.background = originalBackground
+        assertEquals("a failed visible-frame capture must not advance the page", startPage, view.currentPageIndex())
+        assertEquals("a failed visible-frame capture must keep the current anchor", startTop, view.scrollY)
+        assertEquals("the partially visible cover must remain the same owner", cover, view.privateField("conversionSnapshotDrawable"))
+        assertNull("no slide may start from a stale opaque cover", view.privateField("slideDrawable"))
+        assertNull("no page-turn animator may start after capture failure", view.privateField("flipAnimator"))
+        assertNotNull("the existing reveal must continue after the rejected turn", view.privateField("conversionFadeAnimator"))
+
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+        assertNull("the uninterrupted reveal must eventually retire its cover", view.privateField("conversionSnapshotDrawable"))
+        assertEquals(1f, view.getChildAt(0).alpha)
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `partial conversion flatten failure recycles only the failed destination and preserves the reveal`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+        val coverBitmap = cover.privateBitmap("bitmap")
+        val fade = checkNotNull(view.privateField("conversionFadeAnimator"))
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        var failedDestination: Bitmap? = null
+        val failFlatten: (Any, Bitmap) -> Boolean = { _, destination ->
+            failedDestination = destination
+            false
+        }
+        view.setPrivateField("conversionSnapshotFlattener", failFlatten)
+
+        assertTrue(view.goToAdjacentPage(1))
+
+        val destination = checkNotNull(failedDestination)
+        assertTrue("the failed mutable composition must be recycled immediately", destination.isRecycled)
+        assertFalse("the still-visible cover must retain ownership", coverBitmap.isRecycled)
+        assertEquals(startPage, view.currentPageIndex())
+        assertEquals(startTop, view.scrollY)
+        assertEquals(cover, view.privateField("conversionSnapshotDrawable"))
+        assertEquals(128, cover.privateInt("alphaValue"))
+        assertTrue("the same reveal animator must continue", view.privateField("conversionFadeAnimator") === fade)
+        assertNull(view.privateField("slideDrawable"))
+
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+        assertTrue("the cover is recycled only after its original reveal completes", coverBitmap.isRecycled)
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `partial conversion capture failure cannot escape through interactive slide or gl fallbacks`() {
+        listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION).forEach { style ->
+            val tapZones = mutableListOf<EpubFlowTapZone>()
+            val curlOverlay = FakeCurlOverlay()
+            val view = pagedFlowView(flipStyle = style, onTapZone = tapZones::add).apply {
+                if (style == PageFlipStyle.SIMULATION) this.curlOverlay = curlOverlay
+            }
+            assertTrue("style=$style pageCount=${view.pageCount()}", view.pageCount() > 3)
+            val layout = requireNotNull(view.textView.layout)
+            val originalBackground = view.background
+            view.mode = EpubFlowView.Mode.SCROLL
+            view.pendingDecodesProvider = { false }
+            view.setModeAnchored(
+                EpubFlowView.Mode.PAGED,
+                layout.getLineStart(5.coerceAtMost(layout.lineCount - 1)),
+            )
+            val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+            cover.javaClass.getDeclaredField("alphaValue").apply { isAccessible = true }.setInt(cover, 128)
+            val startPage = view.currentPageIndex()
+            val startTop = view.scrollY
+            view.background = CaptureTargetBitmapThenThrowDrawable()
+            val downX = view.width * 0.75f
+            val moveX = view.width * 0.10f
+            val y = view.height * 0.10f
+            val downTime = SystemClock.uptimeMillis()
+
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+
+            view.background = originalBackground
+            assertEquals("style=$style must not request a fallback turn", emptyList<EpubFlowTapZone>(), tapZones)
+            assertEquals("style=$style must retain the current page", startPage, view.currentPageIndex())
+            assertEquals("style=$style must retain the current anchor", startTop, view.scrollY)
+            assertEquals("style=$style must retain the partial owner", cover, view.privateField("conversionSnapshotDrawable"))
+            assertNull("style=$style must not start a slide", view.privateField("slideDrawable"))
+            assertEquals("style=$style must not hand failed shots to GL", 0, curlOverlay.startCount)
+
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+            assertNull("style=$style reveal must still finish", view.privateField("conversionSnapshotDrawable"))
+        }
+    }
+
+    @Test
+    fun `boundary turn keeps the outgoing frame visible while the incoming chapter waits`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToLastPage()
+        val visibleOutgoing = requireNotNull(view.snapshotViewportForTest())
+        view.pendingDecodesProvider = { true }
+
+        assertTrue("the final page should prepare an animated cross-chapter turn", view.prepareBoundaryPageTurn(1))
+        val incomingText = (1..40).joinToString("\n") { "Incoming chapter line $it." }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+
+        try {
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
+
+            assertEquals("the incoming live chapter stays hidden until it is stable", 0f, view.getChildAt(0).alpha)
+            val cover = view.privateField("conversionSnapshotDrawable")
+            assertNotNull(
+                "the outgoing frame must remain the visible owner while the incoming chapter is hidden",
+                cover,
+            )
+            assertAllPixelsEqual(
+                "the waiting cover must be the exact frame visible before the boundary request",
+                visibleOutgoing,
+                checkNotNull(cover).privateBitmap("bitmap"),
+            )
+        } finally {
+            visibleOutgoing.recycle()
+            view.pendingDecodesProvider = { false }
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `pending boundary turn consumes a second navigation without mutating the target chapter`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToLastPage()
+        view.pendingDecodesProvider = { true }
+        assertTrue("the outgoing chapter should prepare a boundary turn", view.prepareBoundaryPageTurn(1))
+        val incomingText = (1..120).joinToString("\n") { "Incoming chapter line $it keeps the target paginated." }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+
+        try {
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            assertTrue("precondition: incoming chapter needs multiple pages", view.pageCount() > 1)
+            assertNotNull(view.privateField("pendingBoundaryPageTurn"))
+            assertNotNull(view.privateField("conversionSnapshotDrawable"))
+
+            assertTrue("a gated navigation is consumed by the flow view", view.goToAdjacentPage(1))
+
+            assertEquals("the waiting target chapter must stay on its first page", 0, view.currentPageIndex())
+            assertNotNull("the first boundary transaction must remain pending", view.privateField("pendingBoundaryPageTurn"))
+            assertNotNull("the outgoing frame must remain the visible owner", view.privateField("conversionSnapshotDrawable"))
+            assertNull("a second turn must not start while the boundary transaction is pending", view.privateField("slideDrawable"))
+        } finally {
+            view.pendingDecodesProvider = { false }
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `boundary turn cannot settle into a later target chapter generation`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToLastPage()
+        view.pendingDecodesProvider = { true }
+        assertTrue("the outgoing chapter should prepare a boundary turn", view.prepareBoundaryPageTurn(1))
+        val incomingText = (1..80).joinToString("\n") { "Incoming generation line $it." }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+
+        try {
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            assertNotNull("the first target generation should still own the pending turn", view.privateField("pendingBoundaryPageTurn"))
+
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+
+            assertNull(
+                "reinstalling the target chapter must invalidate the older boundary transaction",
+                view.privateField("pendingBoundaryPageTurn"),
+            )
+            assertNotNull(
+                "the frozen frame must remain the visible owner while the later generation is hidden",
+                view.privateField("conversionSnapshotDrawable"),
+            )
+            assertEquals(0f, view.getChildAt(0).alpha)
+            assertNull("the stale transaction must not start a turn", view.privateField("slideDrawable"))
+
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            assertNull(view.privateField("pendingBoundaryPageTurn"))
+            assertNotNull(
+                "the boundary cover must survive any number of target-generation rebuilds until reveal",
+                view.privateField("conversionSnapshotDrawable"),
+            )
+            assertEquals(0f, view.getChildAt(0).alpha)
+
+            view.pendingDecodesProvider = { false }
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+            assertNull("the superseded transaction must never start a turn", view.privateField("slideDrawable"))
+            assertNull("the cover should retire only after the later generation is visible", view.privateField("conversionSnapshotDrawable"))
+            assertEquals(1f, view.getChildAt(0).alpha)
+        } finally {
+            view.pendingDecodesProvider = { false }
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `superseded boundary cover gates navigation until the later chapter reveals`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToLastPage()
+        view.pendingDecodesProvider = { true }
+        assertTrue("the outgoing chapter should prepare a boundary turn", view.prepareBoundaryPageTurn(1))
+        val incomingText = (1..120).joinToString("\n") { "Replacement chapter line $it remains hidden." }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+
+        try {
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            assertNull("the original boundary transaction is superseded", view.privateField("pendingBoundaryPageTurn"))
+            assertNotNull("its frame must still cover the hidden replacement", view.privateField("conversionSnapshotDrawable"))
+            assertEquals(0f, view.getChildAt(0).alpha)
+
+            assertTrue("navigation must be consumed while the continuity cover owns the window", view.goToAdjacentPage(1))
+
+            assertEquals("the hidden target must stay parked on its first page", 0, view.currentPageIndex())
+            assertNotNull("the continuity cover must remain installed", view.privateField("conversionSnapshotDrawable"))
+            assertEquals(0f, view.getChildAt(0).alpha)
+            assertNull("no turn may start from an unstable replacement chapter", view.privateField("slideDrawable"))
+        } finally {
+            view.pendingDecodesProvider = { false }
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+        }
     }
 
     @Test
@@ -845,6 +1514,22 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.LEGACY)
+    fun `snapshotting a page recycles its allocated bitmap when drawing fails`() {
+        val view = pagedFlowView()
+        val failingDrawable = CaptureTargetBitmapThenThrowDrawable()
+        view.background = failingDrawable
+        val pageTop = requireNotNull(view.pageTopPxAt(0))
+
+        assertNull(view.snapshotPageAt(pageTop))
+
+        val allocated = requireNotNull(failingDrawable.targetBitmap)
+        assertEquals(view.width, allocated.width)
+        assertEquals(view.height, allocated.height)
+        assertTrue("the failed full-page allocation must be recycled immediately", allocated.isRecycled)
+    }
+
+    @Test
     fun `rapid discrete gl turn while overlay is active does not restart or double advance`() {
         val overlay = FakeCurlOverlay()
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
@@ -900,7 +1585,7 @@ class EpubFlowViewTest {
         val currentLayoutHeight = requireNotNull(view.textView.layout).height
         view.setPrivateField("paginatedLayoutHeight", currentLayoutHeight - 1)
 
-        view.runReflowRunnable()
+        view.runReflowRunnable(idlePostedWork = false)
 
         assertTrue("stale front texture should be recycled after reflow", staleFront.isRecycled)
         assertTrue("stale revealed texture should be recycled after reflow", staleRevealed.isRecycled)
@@ -1091,6 +1776,120 @@ class EpubFlowViewTest {
         assertEquals(-1, view.privateInt("cachedTargetPage"))
         assertEquals(-1, view.privateInt("cachedFromTopPx"))
         assertEquals(-1, view.privateInt("cachedTargetTopPx"))
+    }
+
+    @Test
+    fun `interactive slide keeps ownership while precache and reflow are pending`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
+        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
+        view.setPrivateField("cachedFrontBitmap", null)
+        view.setPrivateField("cachedRevealedBitmap", null)
+        view.setPrivateField("cachedFromPage", -1)
+        view.setPrivateField("cachedTargetPage", -1)
+        view.setPrivateField("cachedFromTopPx", -1)
+        view.setPrivateField("cachedTargetTopPx", -1)
+        reportedOffsets.clear()
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        view.updateInteractiveCurl(x = view.width * 0.55f)
+        val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+        val progressBeforeBackgroundWork = slide.progress
+        try {
+            view.preCachePageTexturesForTest()
+
+            assertNull(
+                "pre-cache must not replace turn ownership with a new front page shot while the finger is down",
+                view.privateField("cachedFrontBitmap"),
+            )
+            assertNull(
+                "pre-cache must not replace turn ownership with a new revealed page shot while the finger is down",
+                view.privateField("cachedRevealedBitmap"),
+            )
+
+            val currentLayoutHeight = requireNotNull(view.textView.layout).height
+            view.setPrivateField("paginatedLayoutHeight", currentLayoutHeight - 1)
+            view.runReflowRunnable()
+
+            assertEquals(
+                "reflow must leave the active finger-tracked drawable installed",
+                slide,
+                view.privateField("slideDrawable"),
+            )
+            assertEquals(
+                "reflow must not move the page shot beneath the live finger",
+                progressBeforeBackgroundWork,
+                slide.progress,
+                0.001f,
+            )
+            assertTrue(
+                "reflow must not report or commit new locator geometry while the finger owns the turn; " +
+                    "reported=$reportedOffsets",
+                reportedOffsets.isEmpty(),
+            )
+        } finally {
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `precache waits until pending image decodes finish`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
+        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
+        view.setPrivateField("cachedFrontBitmap", null)
+        view.setPrivateField("cachedRevealedBitmap", null)
+        view.setPrivateField("cachedFromPage", -1)
+        view.setPrivateField("cachedTargetPage", -1)
+        view.pendingDecodesProvider = { true }
+
+        view.preCachePageTexturesForTest()
+
+        assertNull("transparent image placeholders must not become cached turn fronts", view.privateField("cachedFrontBitmap"))
+        assertNull("transparent image placeholders must not become cached revealed pages", view.privateField("cachedRevealedBitmap"))
+    }
+
+    @Test
+    fun `precache waits until image reflow pagination matches the live layout`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
+        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
+        view.setPrivateField("cachedFrontBitmap", null)
+        view.setPrivateField("cachedRevealedBitmap", null)
+        view.setPrivateField("cachedFromPage", -1)
+        view.setPrivateField("cachedTargetPage", -1)
+        val layoutHeight = requireNotNull(view.textView.layout).height
+        view.setPrivateField("paginatedLayoutHeight", layoutHeight - 1)
+
+        view.preCachePageTexturesForTest()
+
+        assertNull("stale pagination must not produce a front page shot", view.privateField("cachedFrontBitmap"))
+        assertNull("stale pagination must not produce a revealed page shot", view.privateField("cachedRevealedBitmap"))
+    }
+
+    @Test
+    fun `async image result invalidates same geometry turn textures`() {
+        val view = pagedFlowView()
+        val cachedFront = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+        val cachedRevealed = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+        view.setPrivateField("cachedFrontBitmap", cachedFront)
+        view.setPrivateField("cachedRevealedBitmap", cachedRevealed)
+        view.setPrivateField("cachedFromPage", 0)
+        view.setPrivateField("cachedTargetPage", 1)
+
+        view.refreshAfterAsyncImageResult()
+
+        assertTrue("the placeholder front texture must be retired when image pixels arrive", cachedFront.isRecycled)
+        assertTrue("the placeholder revealed texture must be retired when image pixels arrive", cachedRevealed.isRecycled)
+        assertNull(view.privateField("cachedFrontBitmap"))
+        assertNull(view.privateField("cachedRevealedBitmap"))
     }
 
     @Test
@@ -1288,7 +2087,11 @@ class EpubFlowViewTest {
             coverBounds.top,
         )
         assertEquals(view.scrollY + view.height, coverBounds.bottom)
-        assertEquals(0f, view.getChildAt(0).alpha)
+        assertEquals(
+            "the stable paged content should be fully opaque beneath the still-opaque conversion cover",
+            1f,
+            view.getChildAt(0).alpha,
+        )
 
         shadowOf(Looper.getMainLooper()).idleFor(360L, TimeUnit.MILLISECONDS)
 
@@ -1467,6 +2270,32 @@ class EpubFlowViewTest {
 
         assertEquals("temporary-scroll CANCEL must not be treated as a clean tap", emptyList<EpubFlowTapZone>(), tapZones)
         assertEquals("temporary-scroll CANCEL should re-arm page clipping", true, view.privateBool("pageClipActive"))
+    }
+
+    @Test
+    fun `scroll mode cancel reports the last visible offset without snapping`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(onTopOffsetChanged = reportedOffsets::add)
+        view.mode = EpubFlowView.Mode.SCROLL
+        reportedOffsets.clear()
+        val x = view.width * 0.50f
+        val downY = view.height * 0.75f
+        val moveY = view.height * 0.20f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, downY))
+        view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, x, moveY))
+        val cancelledAtScrollY = view.scrollY
+        assertTrue("test must visibly scroll before cancellation", cancelledAtScrollY > 0)
+
+        view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, x, moveY))
+
+        assertEquals("SCROLL cancellation must keep the visible position", cancelledAtScrollY, view.scrollY)
+        assertEquals(
+            "SCROLL cancellation ends the stream, so its final visible locator must be reported",
+            view.topLayoutOffset(),
+            reportedOffsets.lastOrNull(),
+        )
     }
 
     @Test
@@ -1720,6 +2549,71 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `completed async image wakes reveal before the safety timeout`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val restoreOffset = view.textView.layout!!.getLineStart(10)
+        var decodePending = true
+        view.pendingDecodesProvider = { decodePending }
+
+        view.setChapter(
+            view.privateField("flow") as EpubChapterFlow,
+            view.textView.text,
+            pageHeightPx = 120,
+            restoreOffset = restoreOffset,
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        assertTrue("precondition: decode should still hold the reveal gate", view.privateBool("awaitingReveal"))
+
+        decodePending = false
+        view.refreshAfterAsyncImageResult()
+        view.textView.viewTreeObserver.dispatchOnPreDraw()
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+        assertEquals(
+            "decode completion must wake the stability gate instead of waiting for the 800ms safety net",
+            false,
+            view.privateBool("awaitingReveal"),
+        )
+        assertEquals(1f, view.getChildAt(0).alpha)
+    }
+
+    @Test
+    fun `async image completion waits for requested layout before revealing`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        var decodePending = true
+        view.pendingDecodesProvider = { decodePending }
+        view.setChapter(
+            view.privateField("flow") as EpubChapterFlow,
+            view.textView.text,
+            pageHeightPx = 120,
+            restoreOffset = view.textView.layout!!.getLineStart(10),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        assertTrue("precondition: decode should hold the reveal gate", view.privateBool("awaitingReveal"))
+
+        decodePending = false
+        view.suppressLayout(true)
+        view.textView.requestLayout()
+        view.refreshAfterAsyncImageResult()
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+        assertTrue(
+            "an image completion callback must not reveal from the stale pre-layout geometry",
+            view.privateBool("awaitingReveal"),
+        )
+
+        view.suppressLayout(false)
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        view.textView.viewTreeObserver.dispatchOnPreDraw()
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+        assertEquals(false, view.privateBool("awaitingReveal"))
+        assertEquals(1f, view.getChildAt(0).alpha)
+    }
+
+    @Test
     fun `reveal fires immediately when layout settled and no pending decodes`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -1844,15 +2738,47 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `conversion cover fades over a fully opaque live page`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val layout = requireNotNull(view.textView.layout)
+        val midpoint = pageOneTop + ((pageTwoTop - pageOneTop) / 2)
+        val conversionLineTop = (0 until layout.lineCount)
+            .map(layout::getLineTop)
+            .first { it in (midpoint + 1) until pageTwoTop }
+
+        view.mode = EpubFlowView.Mode.SCROLL
+        view.pendingDecodesProvider = { false }
+        view.setModeAnchored(
+            EpubFlowView.Mode.PAGED,
+            layout.getLineStart(layout.getLineForVertical(conversionLineTop)),
+        )
+        val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+        assertEquals(255, cover.privateInt("alphaValue"))
+        assertEquals(
+            "once the conversion cover begins retiring, the stable live page must already be fully opaque " +
+                "so both owners are never faded at the same time",
+            1f,
+            view.getChildAt(0).alpha,
+        )
+    }
+
+    @Test
     fun `full page image taller than viewport is not clipped away when parked on it`() {
         // A full-page illustration lays out as ONE line taller than the viewport (审: 满页彩插).
         // Build a chapter whose 2nd line is such an oversized image line, park exactly on its top,
         // and assert the page clip keeps it (returns null = no clip) instead of backing off to the
         // previous line and clipping the whole viewport blank — the "闪一下后消失" regression.
         val tallImageHeight = 300 // > 120 viewport
+        val imageColor = 0xFF1A8F5D.toInt()
         val builder = SpannableString("A\n￼\nB")
+        val imageDrawable = ColorDrawable(imageColor).apply {
+            setBounds(0, 0, 360, tallImageHeight)
+        }
         builder.setSpan(
-            FixedHeightReplacementSpan(tallImageHeight),
+            ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
             2, 3, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
         )
         val view = pagedFlowView(spannable = builder)
@@ -1873,6 +2799,16 @@ class EpubFlowViewTest {
             "a full-page image taller than the viewport must not be clipped away when it IS the page",
             view.pageClipBottomForTest(),
         )
+        val snapshot = requireNotNull(view.snapshotPageAt(imageLineTop))
+        try {
+            assertEquals(
+                "the page-turn snapshot must retain the same oversized image line as the live viewport",
+                imageColor,
+                snapshot.getPixel(view.width / 2, view.height / 2),
+            )
+        } finally {
+            snapshot.recycle()
+        }
     }
 
     private fun pagedFlowView(
@@ -1934,17 +2870,27 @@ class EpubFlowViewTest {
         return x to y
     }
 
-    private fun EpubFlowView.beginInteractiveCurl(forward: Boolean, anchorX: Float): Boolean =
-        javaClass.getDeclaredMethod(
+    private fun EpubFlowView.beginInteractiveCurl(forward: Boolean, anchorX: Float): Boolean {
+        val axisClass = javaClass.declaredClasses.single { it.simpleName == "InteractiveTurnAxis" }
+        val horizontal = checkNotNull(axisClass.enumConstants)
+            .single { (it as Enum<*>).name == "HORIZONTAL" }
+        val result = javaClass.getDeclaredMethod(
             "beginInteractiveCurl",
             Boolean::class.javaPrimitiveType,
+            axisClass,
             Float::class.javaPrimitiveType,
-        ).apply { isAccessible = true }.invoke(this, forward, anchorX) as Boolean
+        ).apply { isAccessible = true }.invoke(this, forward, horizontal, anchorX) as Enum<*>
+        return result.name == "STARTED"
+    }
 
     private fun EpubFlowView.updateInteractiveCurl(x: Float) {
-        javaClass.getDeclaredMethod("updateInteractiveCurl", Float::class.javaPrimitiveType)
+        javaClass.getDeclaredMethod(
+            "updateInteractiveCurl",
+            Float::class.javaPrimitiveType,
+            Float::class.javaPrimitiveType,
+        )
             .apply { isAccessible = true }
-            .invoke(this, x)
+            .invoke(this, x, 0f)
     }
 
     private fun EpubFlowView.endInteractiveCurl(velocityX: Float) {
@@ -1953,16 +2899,9 @@ class EpubFlowViewTest {
             .invoke(this, velocityX)
     }
 
-    private fun EpubFlowView.beginGlInteractiveCurl(forward: Boolean, atY: Float): Boolean =
-        javaClass.getDeclaredMethod(
-            "beginGlInteractiveCurl",
-            Boolean::class.javaPrimitiveType,
-            Float::class.javaPrimitiveType,
-        ).apply { isAccessible = true }.invoke(this, forward, atY) as Boolean
-
-    private fun EpubFlowView.runReflowRunnable() {
+    private fun EpubFlowView.runReflowRunnable(idlePostedWork: Boolean = true) {
         (privateField("reflowRunnable") as Runnable).run()
-        shadowOf(Looper.getMainLooper()).idle()
+        if (idlePostedWork) shadowOf(Looper.getMainLooper()).idle()
     }
 
     private fun EpubFlowView.preCachePageTexturesForTest(idlePostedWork: Boolean = true) {
@@ -2115,6 +3054,26 @@ class EpubFlowViewTest {
         override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
     }
 
+    private class CaptureTargetBitmapThenThrowDrawable : Drawable() {
+        var targetBitmap: Bitmap? = null
+            private set
+
+        override fun draw(canvas: Canvas) {
+            val targetBitmapField = org.robolectric.shadows.ShadowLegacyCanvas::class.java
+                .getDeclaredField("targetBitmap")
+                .apply { isAccessible = true }
+            targetBitmap = targetBitmapField.get(shadowOf(canvas)) as Bitmap
+            error("snapshot draw failure after bitmap allocation")
+        }
+
+        override fun setAlpha(alpha: Int) = Unit
+
+        override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
     private class ThrowOnSecondDrawDrawable : Drawable() {
         private var drawCount = 0
 
@@ -2199,8 +3158,11 @@ class EpubFlowViewTest {
         override fun getOpacity(): Int = PixelFormat.OPAQUE
     }
 
-    private class FakeCurlOverlay : EpubCurlTurnOverlay {
+    private class FakeCurlOverlay(
+        private val autoFirstFrameReady: Boolean = true,
+    ) : EpubCurlTurnOverlay {
         private var settled: ((Boolean) -> Unit)? = null
+        private var firstFrameReady: (() -> Unit)? = null
         override var active: Boolean = false
             private set
         var startCount: Int = 0
@@ -2215,12 +3177,15 @@ class EpubFlowViewTest {
             private set
         var frontBitmapCopy: Bitmap? = null
             private set
+        var dismissCount: Int = 0
+            private set
 
         override fun start(
             front: Bitmap,
             revealed: Bitmap,
             forward: Boolean,
             settled: (committed: Boolean) -> Unit,
+            firstFrameReady: () -> Unit,
         ) {
             frontWidth = front.width
             frontHeight = front.height
@@ -2231,16 +3196,18 @@ class EpubFlowViewTest {
             front.recycle()
             revealed.recycle()
             this.settled = settled
+            this.firstFrameReady = firstFrameReady
             active = true
             startCount += 1
+            if (autoFirstFrameReady) signalFirstFrameReady()
         }
 
         override fun animateTurn(durationMs: Long) = Unit
 
-        override fun forwardTouch(ev: MotionEvent) = Unit
-
         override fun dismiss() {
+            dismissCount += 1
             active = false
+            firstFrameReady = null
         }
 
         fun settle(committed: Boolean) {
@@ -2249,36 +3216,12 @@ class EpubFlowViewTest {
             active = false
             callback(committed)
         }
-    }
 
-    /** A ReplacementSpan that lays out at a fixed pixel height — stands in for a full-page image line. */
-    private class FixedHeightReplacementSpan(private val heightPx: Int) : ReplacementSpan() {
-        override fun getSize(
-            paint: Paint,
-            text: CharSequence?,
-            start: Int,
-            end: Int,
-            fm: Paint.FontMetricsInt?,
-        ): Int {
-            if (fm != null) {
-                fm.ascent = -heightPx
-                fm.top = -heightPx
-                fm.descent = 0
-                fm.bottom = 0
-            }
-            return 1
+        fun signalFirstFrameReady() {
+            val callback = checkNotNull(firstFrameReady) { "curl overlay was not waiting for its first frame" }
+            firstFrameReady = null
+            callback()
         }
-
-        override fun draw(
-            canvas: Canvas,
-            text: CharSequence?,
-            start: Int,
-            end: Int,
-            x: Float,
-            top: Int,
-            y: Int,
-            bottom: Int,
-            paint: Paint,
-        ) = Unit
     }
+
 }

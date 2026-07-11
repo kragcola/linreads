@@ -75,6 +75,7 @@ internal class EpubFlowImageLoader(
         epubFileProvider()?.let { decodeEpubImageBounds(it, href) }
     },
     private val onImageResultChanged: (() -> Unit)? = null,
+    private val onDecodeFinished: (() -> Unit)? = null,
 ) : AsyncDrawableLoader() {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -108,38 +109,47 @@ internal class EpubFlowImageLoader(
         }
         val future = executor.submit {
             val bitmap = decodeEpubImage(file, href, maxSide = maxSide)
-            if (bitmap == null) {
-                handler.post { inFlight.remove(drawable) }
-                return@submit
-            }
-            val d = BitmapDrawable(null, bitmap)
             handler.post {
-                inFlight.remove(drawable)
-                if (!drawable.isAttached) return@post
-                // Re-read the page height on the main thread: for a full-page image this is now the real
-                // measured viewport, so the fit lands inside one page instead of the pre-measure estimate.
-                val target = reservedBounds ?: epubFlowImageTargetSize(
-                    href = href,
-                    intrinsicWidth = bitmap.width,
-                    intrinsicHeight = bitmap.height,
-                    columnWidthPx = columnWidthPx,
-                    pageHeightPx = pageHeightProvider().coerceAtLeast(1),
-                    inlineMaxHeightPx = inlineMaxHeightPx,
-                    fullPageHrefs = fullPageHrefs,
-                )
-                d.setBounds(0, 0, target.width(), target.height())
-                drawable.result = d
-                // Bounds-equal placeholder swaps do not reliably make TextView re-record the image span.
-                // Invalidate the drawable and notify the host to rebuild the text layout.
-                drawable.invalidateSelf()
-                onImageResultChanged?.invoke()
+                if (inFlight.remove(drawable) == null) {
+                    bitmap?.recycle()
+                    return@post
+                }
+                var installed = false
+                try {
+                    if (bitmap != null && drawable.isAttached) {
+                        val d = BitmapDrawable(null, bitmap)
+                        // Re-read the page height on the main thread: for a full-page image this is now the real
+                        // measured viewport, so the fit lands inside one page instead of the pre-measure estimate.
+                        val target = reservedBounds ?: epubFlowImageTargetSize(
+                            href = href,
+                            intrinsicWidth = bitmap.width,
+                            intrinsicHeight = bitmap.height,
+                            columnWidthPx = columnWidthPx,
+                            pageHeightPx = pageHeightProvider().coerceAtLeast(1),
+                            inlineMaxHeightPx = inlineMaxHeightPx,
+                            fullPageHrefs = fullPageHrefs,
+                        )
+                        d.setBounds(0, 0, target.width(), target.height())
+                        drawable.result = d
+                        installed = true
+                        // Bounds-equal placeholder swaps do not reliably make TextView re-record the image span.
+                        // Invalidate the drawable and notify the host to rebuild the text layout.
+                        drawable.invalidateSelf()
+                        onImageResultChanged?.invoke()
+                    }
+                } finally {
+                    if (!installed) bitmap?.recycle()
+                    onDecodeFinished?.invoke()
+                }
             }
         }
         inFlight[drawable] = future
     }
 
     override fun cancel(drawable: AsyncDrawable) {
-        inFlight.remove(drawable)?.cancel(true)
+        val pending = inFlight.remove(drawable) ?: return
+        pending.cancel(true)
+        handler.post { onDecodeFinished?.invoke() }
     }
 
     // Reserve the final image box before pixel decode. Markwon treats a non-empty-bounds placeholder
