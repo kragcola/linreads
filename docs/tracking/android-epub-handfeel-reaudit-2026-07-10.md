@@ -147,6 +147,66 @@ generation/token guarded. Discrete tap/key turns use the same preview transactio
 time out their waiting state after three seconds. Physical-device handfeel remains
 deferred by the user; this continuation is validated at JVM/lint/build level only.
 
+## Mature Renderer Source Audit - 2026-07-12
+
+The user explicitly rejected real 3D as a requirement. Source-level comparison, rather
+than README claims, found the following mature patterns:
+
+- MoonReader keeps no-animation as the default and exposes both GL curl and lightweight
+  horizontal page-strip/cover modes. Its lightweight modes update page positions from
+  the same finger delta instead of rotating a rigid full-page slab.
+- Current Legado defaults to Cover. Cover keeps the target page fixed, moves the current
+  page with the finger, and adds an edge shadow; its optional Simulation renderer is a
+  pure Canvas/Bezier/clipPath illusion rather than real 3D.
+- FBReaderJ defaults to Slide with Cover semantics. Its Curl renderer is also a 2D
+  Bezier/clipPath illusion and reuses two page bitmaps by swapping ownership.
+- CoolReader defaults to `PAGE_ANIMATION_SLIDE2`. Its optional
+  `PAGE_ANIMATION_PAPER` is the closest proven shortcut for LinReads: roughly 70% of
+  the page remains flat, only the edge region (capped at 30%) is compressed as narrow
+  strips using precomputed sine/arc-sine/source/destination tables, and cached highlight
+  or shadow gradients create the paper-flex illusion.
+- Readium Kotlin Toolkit and Librera prioritize continuous paging/fling physics and
+  adjacent-page preparation rather than paper geometry. Readium's velocity tracking and
+  spring-like settle are useful for release dynamics, but not as a curl renderer.
+
+Therefore the previously selected architecture A remains fixed and TextureView/EGL
+harism is removed from consideration. The remaining product decision inside architecture
+A is A1 Cover (lightest and most direct) versus A2 CoolReader-PAPER-style local strip
+bending (keeps a simulation identity without real 3D). The existing rigid whole-page
+`Camera.rotateY(0..90)` renderer is not a mature equivalent of either choice and must not
+be tuned further as the final implementation. The current split where finger drags use
+software while taps/keys use harism GL must also end: whichever A1/A2 renderer is chosen
+will own finger drag, tap/key settle, in-chapter turns, and cross-chapter turns. Existing
+bidirectional cross-chapter previews remain reusable; in-chapter prewarming must be made
+bidirectional so neither forward nor backward first MOVE captures full-screen bitmaps.
+
+## A2 PAPER Implementation - 2026-07-12
+
+The user selected A2. `PageCurlDrawable` now implements CoolReader's three-phase local
+PAPER geometry: a bend band capped at 30% of viewport width, approximately 5px
+equal-angle strips, 1024-entry sine/arc-sine/source/destination lookup tables, and 16
+prebuilt highlight/shade levels. The page body outside the moving band remains a 1:1
+bitmap draw. MOVE updates primitive coordinates only; no Bitmap, Rect, Paint, Shader,
+Path, Matrix, mesh, or 3D scene is created per frame.
+
+All SIMULATION entry points now share that renderer: finger drag, tap/key discrete turn,
+in-chapter, prepared cross-chapter, and adjacent-preview boundary turns. The flow engine
+does not create a GL child; the obsolete EpubFlowView GL state machine, first-frame
+timeout, conversion owner, and texture-copy seam were removed. Harism source remains
+unreferenced for rollback during this no-physical-device iteration.
+
+In-chapter prewarming now owns current + previous + next shots. Once direction is known,
+the current and selected neighbour transfer to the drawable without copying and the
+unused side is recycled. Discrete turns consume the same warmed slots, silently park the
+target under the overlay, publish its locator only after settle, and restore the outgoing
+canonical page on cancel. A failed outgoing boundary snapshot returns an already prepared
+valid target preview to its slot instead of destroying it and forcing an async rerender.
+The final review also closed the 30% bend-boundary flash and duplicate precache queue:
+pending precache requests now coalesce, cache invalidation advances a generation so stale
+posted work cannot publish old page shots, and failed posts release the pending state.
+Phase-2 runtime tests no longer require the removed GL child; discrete/rapid, committed
+Window, vertical, cold-first, and direction cases now assert the local PAPER renderer.
+
 ## Visual Acceptance Contract
 
 - Capture controlled frames at: stable pre-touch, immediately after down,
@@ -180,7 +240,12 @@ deferred by the user; this continuation is validated at JVM/lint/build level onl
 - [x] Implement AA bidirectional adjacent-chapter previews and cancel-on-UP cold behavior.
 - [x] Run the 365-test EPUB module, lint, debug APK, and local OTA build gates.
 - [x] Complete the final independent AA lifecycle/integration review and resolve all P0/P1 findings.
-- [ ] Commit, push, and verify the new OTA artifact.
+- [x] Re-audit the reported rigid drag and frame hitch against MoonReader and mature open-source readers.
+- [x] RED/GREEN forward cache ownership, release-velocity continuation, and steady-state drawable allocations.
+- [x] Remove TextureView/EGL harism from the decision set after the user rejected real 3D.
+- [x] Obtain the user's architecture-A visual decision: A2 CoolReader-PAPER local strip bending.
+- [x] Prewarm both adjacent in-chapter directions; route drag/tap/key/in-chapter/cross-chapter through the selected 2D renderer; implement and verify it.
+- [ ] Commit, push, and verify the new OTA artifact after the new handfeel slice is complete.
 
 ## Risks / Decision Points
 
@@ -236,16 +301,28 @@ deferred by the user; this continuation is validated at JVM/lint/build level onl
 | 2026-07-12 | `:features:reader:testDebugUnitTest :render:animate:testDebugUnitTest --rerun-tasks` | Reader: 12 suites/80 tests; Animate: 3 suites/13 tests; 0 failures, 0 errors, 0 skipped | The reader host and retained animation module remain green with the AA EPUB integration. |
 | 2026-07-12 | Final independent AA review, targeted RED/GREEN, and fix re-review | Initial review found two confirmed P1s plus one candidate: GL preview invalidation left a paused conversion owner; `NONE` swipe used discrete waiting and could auto-turn after UP; the locator candidate was disproved because animator cancel reaches the existing end/commit branch. Both confirmed REDs turned GREEN; re-review found no remaining P0/P1 | Preview invalidation now follows a unified GL abort path; every boundary drag, including `NONE`, obeys finger-owned UP-cancel semantics. P2 only suggests a table-driven backward/vertical NONE test. |
 | 2026-07-12 | `:render:epub:lintDebug :app:assembleDebug :app:assembleOta`; verify ZIP and APK signature | Combined gate successful; lint 0 errors/8 warnings; OTA APK 9.4 MiB, SHA-256 `91244e127dc103e6845f4edb40f95ce83ad002b14d6ce3c49fd629a4b4ab5e8a`; ZIP clean and APK Signature Scheme v2 verifies with the LinReads Debug certificate | The exact debug and CI OTA variants build locally and the final package is structurally/signature valid. No device install was attempted. |
+| 2026-07-12 | Trace `ReaderTapContainer -> EpubFlowView FSM -> PageCurlDrawable`; inspect MoonReader `ActivityTxt`/`NewCurl3D`; cross-check fixed Readium/android-PageFlip revisions | SIMULATION drag always uses the rigid software hinge; MoonReader keeps DOWN/MOVE/UP in one real mesh state, prepares page shots before MOVE, and settles from current pointer geometry. The current crossing MOVE also synchronously creates/draws two viewport bitmaps and release velocity is discarded after target selection | “Hard flip” is the selected renderer's mathematics, not a tap-zone/discrete fallback. Shader/interpolator tuning alone cannot turn it into a real curl; a renderer decision is required. |
+| 2026-07-12 | Add REDs for warmed interactive cache transfer and velocity-sensitive settle; apply cache ownership, allocation-free drawable state, and Hermite velocity continuation; run full `:render:epub:testDebugUnitTest` | Both REDs failed on the baseline and passed after the implementation. Full JUnit aggregate: 367 tests, 0 failures, 0 errors, 2 skipped; `git diff --check` clean | The no-choice performance slice is regression-covered. Worktree remains uncommitted while the flexible renderer choice and backward prewarm are unresolved. |
+| 2026-07-12 | A2 RED/GREEN sequence: discrete SIMULATION must use local renderer; 50% PAPER frame must keep a 1:1 flat body; boundary discrete must use the same renderer and transfer target ownership; backward warm drag and warmed discrete turn must not recapture live pages; discrete target must remain silent until settle | Every new assertion failed on the rigid/GL/forward-only baseline and passed after the local PAPER, unified routing, three-slot cache, and settle-publication changes | A2 is covered at geometry, routing, cache, ownership, and locator-transaction boundaries rather than only by renderer fields. |
+| 2026-07-12 | Full `:render:epub:testDebugUnitTest`; aggregate JUnit XML | 366 tests, 0 failures, 0 errors, 2 skipped | Local PAPER, flow engine, boundary previews, ownership, conversion, pagination, images, links, and legacy unused overlay unit coverage are GREEN. |
+| 2026-07-12 | `:render:epub:testDebugUnitTest :features:reader:testDebugUnitTest :render:animate:testDebugUnitTest :app:assembleDebug` | BUILD SUCCESSFUL; EPUB 366, Reader 80, Animate 13 | The A2 integration compiles through the reader host and produces the debug APK. |
+| 2026-07-12 | `:render:epub:lintDebug :app:compileDebugAndroidTestKotlin --quiet`; `git diff --check` | Exit 0; diff check clean | Android lint and instrumentation source compilation are green. Runtime GL-specific instrumentation assertions still require migration before the next emulator suite; no physical-device handfeel claim is made. |
+| 2026-07-12 | Independent A2 review RED/GREEN fixes and production re-review | Closed 3 P1 production findings (30% bend-boundary flash, boundary first-MOVE live capture, preview loss after outgoing capture failure) and 1 P2 duplicate-precache Bitmap leak; final re-review found no P0-P3 | Boundary drag now transfers warmed current ownership, failed outgoing capture restores the prepared target, and pending/generation prevents stale or duplicate page-shot publication. |
+| 2026-07-12 | Migrate phase-2 AndroidTest away from removed GL renderer; run final combined phase-2 gate | Deleted pure GL retained-buffer/first-frame cases; discrete/rapid, committed Window, vertical, cold-first, and direction assertions use `PageCurlDrawable` and require no legacy GL child. EPUB 370/0/0/2, Reader 80/80, Animate 13/13; lint, AndroidTest Kotlin compile, and debug APK assembly `BUILD SUCCESSFUL` | Test sources now match A2 production architecture. Emulator/physical-device execution remains deferred; compile and JVM/build evidence do not claim panel-level handfeel. |
+| 2026-07-12 | Run migrated A2 AVD gate; investigate one committed-Window CANCEL flake without relaxing pixel limits | Initial 6-test run had 1 visual failure (`rgbMae=2.7974`, bad pixels `6.119%`) after the test captured baseline before changing TextView selectable/long-click render state. Moving those test-only mutations before baseline fixed the oracle; strict committed-Window + cold-first pair passed 3 consecutive rounds (6/6), then the full A2 targeted set passed `OK (6 tests)` / `73.19s`. Narrow fatal/ANR/OOM/recycled-bitmap/assertion logcat grep was empty; `TouchStatesByDisplay: <no displays touched>` | The failure was a test-state mismatch, not accepted as a production regression or hidden by threshold changes. Stable and settled success frames are byte-identical; physical-device handfeel remains deferred. |
+| 2026-07-12 | Final local OTA build and package verification before push | `:app:assembleOta` `BUILD SUCCESSFUL` in 2m22s; `app-ota.apk` is 9.4 MiB, SHA-256 `b1e76543fe7f2f4a9f3435dddbc96c5d3deaee1a437b6559c0f391a54ba032cd`; ZIP integrity passes and APK Signature Scheme v2 verifies with `CN=LinReads Debug, O=Dev, C=US` | Local package gate is green. Push to `main` will trigger `Android Dev Release`; remote `dev-latest` identity and asset still require post-push verification. |
 
 ## Verification Status
 
 - Root cause: confirmed for the first crossing MOVE and the interactive `GLSurfaceView` composition boundary.
-- Architecture: user-selected A implemented; all finger drags are software curl, discrete tap/key turns retain GL.
+- Architecture: user-selected A2 implemented; all SIMULATION triggers use one local PAPER renderer and production no longer creates a GL child.
 - Removed experiments: interactive GL state/touch forwarding, PixelCopy verifier, and finger-hold watchdog are absent.
-- JVM regression: `EpubFlowViewTest` 96/96, `EpubCurlOverlayTest` 14/14, full EPUB module and combined Reader/Animate/build gates GREEN.
+- JVM regression: full EPUB 370 tests / 0 failures / 0 errors / 2 skipped; Reader 80/80; Animate 13/13; combined build GREEN.
 - Emulator frame sequence: targeted architecture-A 6/6 and full runtime 36/36 GREEN; horizontal Window 5/5 plus tightened horizontal+cold-first 3 consecutive rounds GREEN.
 - Runtime hygiene: critical logcat has no matching fatal/ANR/OOM/recycled-bitmap/assertion; no touched display remains.
 - AA JVM regression: full EPUB module 365 tests, 0 failures, 0 errors, 2 skipped; Reader 80/80 and Animate 13/13; debug lint/build and local OTA build are green.
 - Independent review: final AA lifecycle/integration review and fix re-review found no remaining P0/P1; the only P2 is optional table-driven backward/vertical `NONE` test coverage.
 - Physical-device handfeel: deferred by user.
-- Commit/push/OTA: next action after the final AA review and exact staged-file inspection; current OTA is `dev-latest` / Dev build `#200` for baseline `35f8605` until CI publishes the new artifact.
+- A2 runtime boundary: AndroidTest sources use local PAPER/no-GL semantics; the six targeted migrated emulator cases pass, including strict committed-Window/cold-first checks after fixing their baseline-order test flake. Physical-device handfeel remains deferred by user.
+- Independent A2 review: all 3 production P1 findings and the duplicate-precache P2 are closed; final production re-review found no P0-P3.
+- Commit/push/OTA: final local OTA is built and verified; commit/push plus remote `dev-latest` verification are the active next step.

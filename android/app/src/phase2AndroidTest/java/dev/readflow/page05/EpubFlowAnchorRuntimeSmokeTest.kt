@@ -1340,6 +1340,135 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     @Test
+    fun epubFlowSimulationDiscreteTurnUsesA2DrawableAndCommitsRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-a2-discrete-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val start = waitForConditionResult("expected flow view to paginate") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
+                    val nextPageTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null
+                    FlowSimulationTurnStart(view = view, nextPageTop = nextPageTop)
+                }
+            }
+
+            val started = scenario.withActivity { activity ->
+                start.view.scrollTo(0, 0)
+                check(start.view.reflectBoolean("goToAdjacentPage", 1))
+                check(activity.findLegacyEpubCurlOverlay() == null) {
+                    "SIMULATION discrete turn must not create the removed GL overlay child"
+                }
+                FlowSimulationTurnStarted(
+                    drawableName = start.view.reflectPrivateAny("curlDrawable")?.javaClass?.simpleName,
+                    animatorRunning = (start.view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true,
+                    currentPage = start.view.reflectInt("currentPageIndex"),
+                    scrollY = start.view.scrollY,
+                )
+            }
+            assertEquals("PageCurlDrawable", started.drawableName)
+            assertTrue("A2 discrete turn must animate in the local View overlay", started.animatorRunning)
+            assertEquals("the target page should be parked silently beneath the A2 overlay", 1, started.currentPage)
+            assertEquals(start.nextPageTop, started.scrollY)
+
+            val settled = waitForConditionResult("expected A2 discrete turn to settle on page 1") {
+                scenario.withActivity {
+                    val animatorRunning =
+                        (start.view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                    val currentPage = start.view.reflectInt("currentPageIndex")
+                    val scrollY = start.view.scrollY
+                    if (
+                        currentPage == 1 &&
+                        scrollY == start.nextPageTop &&
+                        start.view.reflectPrivateAny("curlDrawable") == null &&
+                        !animatorRunning
+                    ) {
+                        FlowTurnSettled(currentPage = currentPage, scrollY = scrollY)
+                    } else {
+                        null
+                    }
+                }
+            }
+            assertEquals(1, settled.currentPage)
+            assertEquals(start.nextPageTop, settled.scrollY)
+        }
+    }
+
+    @Test
+    fun epubFlowSimulationA2TurnIgnoresRapidSecondTurnRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-a2-rapid-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val start = waitForConditionResult("expected flow view to paginate") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
+                    val nextPageTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null
+                    FlowSimulationTurnStart(view = view, nextPageTop = nextPageTop)
+                }
+            }
+
+            val rapid = scenario.withActivity { activity ->
+                start.view.scrollTo(0, 0)
+                check(start.view.reflectBoolean("goToAdjacentPage", 1))
+                val firstAnimator = start.view.reflectPrivateAny("flipAnimator")
+                check(start.view.reflectBoolean("goToAdjacentPage", 1))
+                check(activity.findLegacyEpubCurlOverlay() == null)
+                check(start.view.reflectPrivateAny("flipAnimator") === firstAnimator) {
+                    "rapid second request must not replace or restart the active A2 animator"
+                }
+                FlowSimulationTurnStarted(
+                    drawableName = start.view.reflectPrivateAny("curlDrawable")?.javaClass?.simpleName,
+                    animatorRunning = (firstAnimator as? ValueAnimator)?.isRunning == true,
+                    currentPage = start.view.reflectInt("currentPageIndex"),
+                    scrollY = start.view.scrollY,
+                )
+            }
+            assertEquals("PageCurlDrawable", rapid.drawableName)
+            assertTrue(rapid.animatorRunning)
+            assertEquals("second rapid request must not park page 2", 1, rapid.currentPage)
+            assertEquals(start.nextPageTop, rapid.scrollY)
+
+            waitForConditionResult("expected rapid A2 turn sequence to settle once on page 1") {
+                scenario.withActivity {
+                    val animatorRunning =
+                        (start.view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                    if (
+                        start.view.reflectInt("currentPageIndex") == 1 &&
+                        start.view.scrollY == start.nextPageTop &&
+                        start.view.reflectPrivateAny("curlDrawable") == null &&
+                        !animatorRunning
+                    ) true else null
+                }
+            }
+
+            SystemClock.sleep(650)
+            instrumentation.waitForIdleSync()
+            device.waitForIdle()
+            val final = scenario.withActivity {
+                FlowTurnSettled(
+                    currentPage = start.view.reflectInt("currentPageIndex"),
+                    scrollY = start.view.scrollY,
+                )
+            }
+            assertEquals("rapid second turn must not queue a later page-2 commit", 1, final.currentPage)
+            assertEquals(start.nextPageTop, final.scrollY)
+        }
+    }
+
+    @Test
     @SdkSuppress(minSdkVersion = 29)
     fun epubFlowSlideWindowFramesTrackFirstMoveAndCancelRuntime() = runBlocking {
         settings.setPageFlipStyle(PageFlipStyle.SLIDE)
@@ -2125,316 +2254,6 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
-    @Test
-    @SdkSuppress(minSdkVersion = 29)
-    fun epubFlowSimulationPartialConversionHandoffKeepsCommittedWindowContinuousRuntime() = runBlocking {
-        settings.setReadingMode(ReaderReadingMode.PAGED)
-        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
-        val title = "flow-gl-conversion-handoff-${UUID.randomUUID().toString().take(8)}"
-        val uri = createComplexEpubUri("$title.epub")
-
-        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
-            dismissBlockingDialogs()
-            waitForObject(By.descStartsWith("阅读内容"))
-            val start = waitForConditionResult("expected stable paged flow view for GL conversion handoff") {
-                scenario.withActivity { activity ->
-                    val view = activity.findEpubFlowView() ?: return@withActivity null
-                    val nextTop = view.reflectNullableInt("pageTopPxAt", 1)
-                    if (
-                        view.reflectInt("pageCount") <= 4 ||
-                        nextTop == null ||
-                        view.width <= 0 ||
-                        view.height <= 0 ||
-                        view.flowContentAlpha() < 1f ||
-                        view.reflectPrivateAny("modeValue")?.toString() != "PAGED" ||
-                        view.reflectPrivateAny("conversionSnapshotDrawable") != null
-                    ) {
-                        return@withActivity null
-                    }
-                    FlowGlCurlStart(view = view, nextPageTop = nextTop)
-                }
-            }
-
-            scenario.withActivity {
-                start.view.scrollTo(0, 0)
-                check(start.view.reflectBoolean("goToAdjacentPage", 1))
-            }
-            waitForFlowPage(scenario, start.view, 1, start.nextPageTop, "expected GL handoff warm-up forward settle")
-            scenario.withActivity { check(start.view.reflectBoolean("goToAdjacentPage", -1)) }
-            waitForFlowPage(scenario, start.view, 0, 0, "expected GL handoff warm-up backward settle")
-            val overlay = waitForConditionResult("expected inactive warmed GL overlay before conversion handoff") {
-                scenario.withActivity { activity ->
-                    val candidate = activity.findEpubCurlOverlay() ?: return@withActivity null
-                    val curlView = candidate.findDescendant { it.javaClass.name == HARISM_CURL_VIEW_CLASS_NAME }
-                        ?: return@withActivity null
-                    val ready =
-                        !candidate.reflectPrivateBoolean("active") &&
-                            candidate.alpha == 0f &&
-                            !curlView.reflectPrivateBoolean("mAnimate") &&
-                            curlView.reflectPrivateInt("mPageBitmapWidth") > 0 &&
-                            curlView.reflectPrivateInt("mPageBitmapHeight") > 0
-                    if (ready) candidate else null
-                }
-            }
-            waitForConditionResult("expected reader activity window focus before GL conversion handoff") {
-                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
-            }
-
-            var retainedWindow: Bitmap? = null
-            var underlyingLive: Bitmap? = null
-            var partialWindow: Bitmap? = null
-            var firstActiveWindow: Bitmap? = null
-            var settledTarget: Bitmap? = null
-            var coverOwner: Any? = null
-            var fadeOwner: ValueAnimator? = null
-            var partialAlpha = -1
-            var startPage = -1
-            var targetPage = -1
-            var targetTop = -1
-            var pendingTurnFrozen = false
-            try {
-                retainedWindow = captureUntilVisuallyStable(scenario, start.view)
-
-                scenario.withActivity {
-                    start.view.invokeSetModeAnchored("SCROLL", start.view.reflectInt("topLayoutOffset"))
-                    val layoutHeight = checkNotNull(start.view.reflectTextView().layout).height
-                    val targetScrollY = (layoutHeight * 45 / 100)
-                        .coerceAtLeast(1)
-                        .coerceAtMost(layoutHeight - start.view.height)
-                    start.view.scrollTo(0, targetScrollY)
-                    start.view.postInvalidateOnAnimation()
-                }
-                val stableScrollWindow = captureUntilVisuallyStable(scenario, start.view)
-                stableScrollWindow.recycle()
-
-                scenario.withActivity {
-                    val layoutOffset = start.view.reflectInt("topLayoutOffset")
-                    start.view.invokeSetModeAnchoredPaged(layoutOffset)
-                    coverOwner = checkNotNull(start.view.reflectPrivateAny("conversionSnapshotDrawable")) {
-                        "expected SCROLL->PAGED cover before the discrete GL handoff"
-                    }
-                    fadeOwner = checkNotNull(start.view.reflectPrivateAny("conversionFadeAnimator") as? ValueAnimator) {
-                        "expected an active conversion fade before the discrete GL handoff"
-                    }
-                    checkNotNull(fadeOwner).setCurrentFraction(0.5f)
-                    checkNotNull(fadeOwner).pause()
-                    partialAlpha = checkNotNull(coverOwner).reflectPrivateInt("alphaValue")
-                    check(partialAlpha in 96..160) {
-                        "expected a materially partial conversion cover, alpha=$partialAlpha"
-                    }
-                    check(start.view.flowContentAlpha() >= 1f) {
-                        "the paged live frame must be opaque beneath the partial cover"
-                    }
-                    startPage = start.view.reflectInt("currentPageIndex")
-                    targetPage = startPage + 1
-                    targetTop = checkNotNull(start.view.reflectNullableInt("pageTopPxAt", targetPage)) {
-                        "partial conversion fixture must leave an adjacent target page"
-                    }
-                    underlyingLive = checkNotNull(start.view.invokePrivateBitmap("snapshotViewport")) {
-                        "expected the live PAGED composition beneath the conversion cover"
-                    }
-                }
-                awaitCommittedFrame(scenario, start.view)
-                partialWindow = captureWindowRegion(scenario, start.view)
-                writeWindowFrameEvidence("gl-conversion-retained.png", checkNotNull(retainedWindow))
-                writeWindowFrameEvidence("gl-conversion-underlying-live.png", checkNotNull(underlyingLive))
-                writeWindowFrameEvidence("gl-conversion-partial.png", checkNotNull(partialWindow))
-                assertVisualDiffAtLeast(
-                    "fixture must distinguish visible partial composition C from underlying live page B",
-                    bitmapDiff(checkNotNull(underlyingLive), checkNotNull(partialWindow)),
-                    minRgbMae = 0.75,
-                    minBadPixelRatio = 0.01,
-                )
-                assertVisualDiffAtLeast(
-                    "fixture must distinguish visible partial composition C from old retained GL Window A",
-                    bitmapDiff(checkNotNull(retainedWindow), checkNotNull(partialWindow)),
-                    minRgbMae = 0.75,
-                    minBadPixelRatio = 0.01,
-                )
-
-                awaitFirstCommittedFrameMatchingAfter(
-                    scenario = scenario,
-                    target = start.view,
-                    frameReady = {
-                        val ready = overlay.reflectPrivateBoolean("active") &&
-                            overlay.alpha >= 1f &&
-                            start.view.reflectPrivateAny("conversionSnapshotDrawable") == null
-                        if (ready && !pendingTurnFrozen) {
-                            // The discrete runnable starts on the next vsync. Freeze it before this
-                            // traversal so the screenshot remains the first static GL front frame.
-                            overlay.invokeNoArg("clearPendingDiscreteTurn")
-                            pendingTurnFrozen = true
-                        }
-                        ready
-                    },
-                    action = {
-                        dispatchTap(start.view, PointF(start.view.width * 0.85f, start.view.height * 0.50f))
-                        check(overlay.reflectPrivateBoolean("active")) {
-                            "the partial conversion tap must start the real EpubCurlOverlay"
-                        }
-                        check(overlay.alpha == 0f) {
-                            "GL must remain hidden until its new front texture has rendered"
-                        }
-                        check(start.view.reflectPrivateAny("conversionSnapshotDrawable") === coverOwner) {
-                            "the partial cover must retain Window ownership while GL is hidden"
-                        }
-                        check(checkNotNull(coverOwner).reflectPrivateInt("alphaValue") == partialAlpha) {
-                            "the held partial cover must not change before GL first-frame handoff"
-                        }
-                        check(start.view.reflectPrivateAny("conversionFadeAnimator") == null) {
-                            "the partial conversion fade must pause while GL first frame is pending"
-                        }
-                        start.view.postInvalidateOnAnimation()
-                    },
-                )
-                firstActiveWindow = captureWindowRegion(scenario, start.view)
-                scenario.withActivity {
-                    check(pendingTurnFrozen) { "first active GL frame was not frozen at the commit gate" }
-                    overlay.invokeCurlOverlayAnimateTurn(start.view.reflectPrivateLong("glCurlDurationMs"))
-                }
-                writeWindowFrameEvidence("gl-conversion-first-active.png", checkNotNull(firstActiveWindow))
-                assertVisualDiffAtMost(
-                    "the first active GL committed Window must equal the partial composition visible before handoff",
-                    bitmapDiff(checkNotNull(partialWindow), checkNotNull(firstActiveWindow)),
-                    maxRgbMae = 0.75,
-                    maxBadPixelRatio = 0.01,
-                )
-
-                waitForConditionResult("expected partial-conversion GL turn to settle on its adjacent page") {
-                    scenario.withActivity {
-                        val settled =
-                            start.view.reflectInt("currentPageIndex") == targetPage &&
-                                start.view.scrollY == targetTop &&
-                                !overlay.reflectPrivateBoolean("active") &&
-                                overlay.alpha == 0f &&
-                                start.view.flowContentAlpha() >= 1f &&
-                                start.view.reflectPrivateAny("conversionSnapshotDrawable") == null &&
-                                start.view.reflectPrivateAny("conversionFadeAnimator") == null
-                        if (settled) true else null
-                    }
-                }
-                settledTarget = captureUntilVisuallyStable(scenario, start.view)
-                writeWindowFrameEvidence("gl-conversion-settled-target.png", checkNotNull(settledTarget))
-                assertEquals(targetPage, scenario.withActivity { start.view.reflectInt("currentPageIndex") })
-                assertEquals(targetTop, scenario.withActivity { start.view.scrollY })
-            } finally {
-                scenario.withActivity {
-                    if (overlay.reflectPrivateBoolean("active")) overlay.invokeNoArg("dismiss")
-                    fadeOwner?.takeIf { it.isPaused }?.resume()
-                }
-                retainedWindow?.recycle()
-                underlyingLive?.recycle()
-                partialWindow?.recycle()
-                firstActiveWindow?.recycle()
-                settledTarget?.recycle()
-            }
-        }
-    }
-
-    @Test
-    @SdkSuppress(minSdkVersion = 29)
-    fun epubFlowInactiveWarmGlNeverExposesRetainedBufferAfterLivePageChangesRuntime() = runBlocking {
-        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
-        val title = "flow-gl-retained-buffer-${UUID.randomUUID().toString().take(8)}"
-        val uri = createEpubUri("$title.epub")
-
-        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
-            dismissBlockingDialogs()
-            waitForObject(By.descStartsWith("阅读内容"))
-            val start = waitForConditionResult("expected multi-page flow view for retained GL buffer capture") {
-                scenario.withActivity { activity ->
-                    val view = activity.findEpubFlowView() ?: return@withActivity null
-                    val nextTop = view.reflectNullableInt("pageTopPxAt", 1)
-                    if (
-                        view.reflectInt("pageCount") <= 4 ||
-                        nextTop == null ||
-                        view.width <= 0 ||
-                        view.height <= 0 ||
-                        view.flowContentAlpha() < 1f
-                    ) {
-                        return@withActivity null
-                    }
-                    FlowGlCurlStart(view = view, nextPageTop = nextTop)
-                }
-            }
-
-            scenario.withActivity {
-                start.view.scrollTo(0, 0)
-                check(start.view.reflectBoolean("goToAdjacentPage", 1))
-            }
-            waitForFlowPage(scenario, start.view, 1, start.nextPageTop, "expected retained-buffer warm-up forward settle")
-            scenario.withActivity { check(start.view.reflectBoolean("goToAdjacentPage", -1)) }
-            waitForFlowPage(scenario, start.view, 0, 0, "expected retained-buffer warm-up backward settle")
-            val overlay = waitForConditionResult("expected inactive warmed GL overlay with a retained surface") {
-                scenario.withActivity { activity ->
-                    val candidate = activity.findEpubCurlOverlay() ?: return@withActivity null
-                    val curlView = candidate.findDescendant { it.javaClass.name == HARISM_CURL_VIEW_CLASS_NAME }
-                        ?: return@withActivity null
-                    val ready =
-                        !candidate.reflectPrivateBoolean("active") &&
-                            candidate.alpha == 0f &&
-                            !curlView.reflectPrivateBoolean("mAnimate") &&
-                            curlView.reflectPrivateInt("mPageBitmapWidth") > 0 &&
-                            curlView.reflectPrivateInt("mPageBitmapHeight") > 0
-                    if (ready) candidate else null
-                }
-            }
-            waitForConditionResult("expected reader activity window focus before retained-buffer capture") {
-                scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
-            }
-
-            var oldLive: Bitmap? = null
-            var changedLive: Bitmap? = null
-            var firstActive: Bitmap? = null
-            try {
-                oldLive = captureUntilVisuallyStable(scenario, start.view)
-                scenario.withActivity {
-                    start.view.scrollTo(0, start.nextPageTop)
-                    start.view.postInvalidateOnAnimation()
-                }
-                changedLive = captureUntilVisuallyStable(scenario, start.view)
-                assertVisualDiffAtLeast(
-                    "fixture must replace the live page while the warmed GL overlay remains inactive",
-                    bitmapDiff(checkNotNull(oldLive), checkNotNull(changedLive)),
-                    minRgbMae = 1.0,
-                    minBadPixelRatio = 0.01,
-                )
-                check(!overlay.reflectPrivateBoolean("active"))
-                check(overlay.alpha == 0f)
-
-                val front = checkNotNull(changedLive).copy(Bitmap.Config.ARGB_8888, false)
-                val revealed = Bitmap.createBitmap(front.width, front.height, Bitmap.Config.ARGB_8888).apply {
-                    eraseColor(0xFF163A5F.toInt())
-                }
-                awaitFirstCommittedFrameMatchingAfter(
-                    scenario = scenario,
-                    target = start.view,
-                    frameReady = { overlay.alpha >= 1f },
-                    action = { overlay.invokeCurlOverlayStart(front, revealed) },
-                )
-                check(overlay.alpha >= 1f) {
-                    "retained-buffer capture must begin only after the GL overlay becomes active"
-                }
-                firstActive = captureWindowRegion(scenario, start.view)
-                writeWindowFrameEvidence("gl-retained-old-live.png", checkNotNull(oldLive))
-                writeWindowFrameEvidence("gl-retained-changed-live.png", checkNotNull(changedLive))
-                writeWindowFrameEvidence("gl-retained-first-active.png", checkNotNull(firstActive))
-
-                val changedDiff = bitmapDiff(checkNotNull(changedLive), checkNotNull(firstActive))
-                val retainedOldDiff = bitmapDiff(checkNotNull(oldLive), checkNotNull(firstActive))
-                assertTrue(
-                    "the first active GL Window must show the new front texture, never the retained old buffer; " +
-                        "changedDiff=$changedDiff retainedOldDiff=$retainedOldDiff",
-                    changedDiff.rgbMae <= 0.75 && changedDiff.badPixelRatio <= 0.01,
-                )
-            } finally {
-                scenario.withActivity { overlay.invokeNoArg("dismiss") }
-                oldLive?.recycle()
-                changedLive?.recycle()
-                firstActive?.recycle()
-            }
-        }
-    }
 
     @Test
     @SdkSuppress(minSdkVersion = 29)
@@ -2459,7 +2278,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     ) {
                         return@withActivity null
                     }
-                    FlowGlCurlStart(view = view, nextPageTop = nextTop)
+                    FlowSimulationTurnStart(view = view, nextPageTop = nextTop)
                 }
             }
 
@@ -2467,39 +2286,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 start.view.scrollTo(0, 0)
                 check(start.view.reflectBoolean("goToAdjacentPage", 1))
             }
-            waitForFlowPage(scenario, start.view, 1, start.nextPageTop, "expected GL Window warm-up forward settle")
+            waitForFlowPageTurnSettled(scenario, start.view, 1, start.nextPageTop, "expected A2 warm-up forward settle")
             scenario.withActivity { check(start.view.reflectBoolean("goToAdjacentPage", -1)) }
-            waitForFlowPage(scenario, start.view, 0, 0, "expected GL Window warm-up backward settle")
-            val warmedOverlay = waitForConditionResult("expected warmed GL overlay to be idle and sized") {
-                scenario.withActivity { activity ->
-                    val overlay = activity.findEpubCurlOverlay() ?: return@withActivity null
-                    val curlView = overlay.findDescendant { it.javaClass.name == HARISM_CURL_VIEW_CLASS_NAME }
-                        ?: return@withActivity null
-                    val ready =
-                        !overlay.reflectPrivateBoolean("active") &&
-                            !curlView.reflectPrivateBoolean("mAnimate") &&
-                            curlView.reflectPrivateInt("mPageBitmapWidth") > 0 &&
-                            curlView.reflectPrivateInt("mPageBitmapHeight") > 0
-                    if (ready) overlay else null
-                }
-            }
+            waitForFlowPageTurnSettled(scenario, start.view, 0, 0, "expected A2 warm-up backward settle")
             waitForConditionResult("expected reader activity window focus before software curl capture") {
                 scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
             }
-            instrumentation.waitForIdleSync()
-            device.waitForIdle()
-
-            awaitCommittedFrame(scenario, start.view)
-            val stableA = captureWindowRegion(scenario, start.view)
-            awaitCommittedFrame(scenario, start.view)
-            val stable = captureWindowRegion(scenario, start.view)
-            val downTime = SystemClock.uptimeMillis()
-            val down = PointF(start.view.width * 0.85f, start.view.height * 0.10f)
-            val move = PointF(start.view.width * 0.30f, down.y)
-            var downFrame: Bitmap? = null
-            var moveFrame: Bitmap? = null
-            var settledFrame: Bitmap? = null
-            var gestureActive = false
             lateinit var flowGestureDetector: GestureDetector
             lateinit var flowTextView: TextView
             var hostLongPressEnabled = false
@@ -2515,6 +2307,20 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 flowTextView.isLongClickable = false
                 flowTextView.setTextIsSelectable(false)
             }
+            instrumentation.waitForIdleSync()
+            device.waitForIdle()
+
+            awaitCommittedFrame(scenario, start.view)
+            val stableA = captureWindowRegion(scenario, start.view)
+            awaitCommittedFrame(scenario, start.view)
+            val stable = captureWindowRegion(scenario, start.view)
+            val downTime = SystemClock.uptimeMillis()
+            val down = PointF(start.view.width * 0.85f, start.view.height * 0.10f)
+            val move = PointF(start.view.width * 0.30f, down.y)
+            var downFrame: Bitmap? = null
+            var moveFrame: Bitmap? = null
+            var settledFrame: Bitmap? = null
+            var gestureActive = false
             try {
                 assertVisualDiffAtMost(
                     "software curl Window test must begin from a visually settled frame",
@@ -2551,8 +2357,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
                             "flipped=${start.view.reflectPrivateBoolean("flipped")} " +
                             "interactive=${start.view.reflectPrivateAny("interactiveTurnState")} " +
                             "animator=${start.view.reflectPrivateAny("flipAnimator")} " +
-                            "page=${start.view.reflectInt("currentPageIndex")} scrollY=${start.view.scrollY} " +
-                            "overlayActive=${warmedOverlay.reflectPrivateBoolean("active")}"
+                            "page=${start.view.reflectInt("currentPageIndex")} scrollY=${start.view.scrollY}"
                     }
                     check(curl.javaClass.simpleName == "PageCurlDrawable") {
                         "expected PageCurlDrawable, actual=${curl.javaClass.name}"
@@ -2560,8 +2365,8 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     check(start.view.reflectPrivateAny("slideDrawable") == null) {
                         "SIMULATION software curl must not fall back to a slide drawable"
                     }
-                    check(!warmedOverlay.reflectPrivateBoolean("active") && warmedOverlay.alpha == 0f) {
-                        "finger drag must leave the warmed GL overlay inactive"
+                    check(start.view.rootView.findDescendant { it.javaClass.name == LEGACY_EPUB_CURL_OVERLAY_CLASS_NAME } == null) {
+                        "A2 finger drag must not create the removed GL overlay child"
                     }
                 }
                 moveFrame = captureUntilMateriallyDifferent(
@@ -2602,12 +2407,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
                                 start.view.scrollY == 0 &&
                                 start.view.reflectPrivateAny("curlDrawable") == null &&
                                 start.view.reflectPrivateAny("slideDrawable") == null &&
-                                !animatorRunning &&
-                                !warmedOverlay.reflectPrivateBoolean("active")
+                                !animatorRunning
                         if (settled) true else null
                     }
                 }
                 settledFrame = captureUntilVisuallyStable(scenario, start.view)
+                writeWindowFrameEvidence("software-curl-settled.png", checkNotNull(settledFrame))
                 assertVisualDiffAtMost(
                     "software curl ACTION_CANCEL must restore the exact pre-touch committed Window",
                     bitmapDiff(stable, checkNotNull(settledFrame)),
@@ -2615,7 +2420,6 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     maxBadPixelRatio = 0.01,
                 )
                 assertEquals(0, scenario.withActivity { start.view.reflectInt("currentPageIndex") })
-                writeWindowFrameEvidence("software-curl-settled.png", checkNotNull(settledFrame))
                 assertTrue("test precondition: software curl MOVE must materially differ from stable, diff=$moveDiff", moveDiff.rgbMae > 2.0)
             } finally {
                 if (gestureActive) {
@@ -2854,7 +2658,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     @Test
-    fun epubFlowMoonReaderVerticalSideSwipeUsesSoftwareCurlWithoutGlRuntime() = runBlocking {
+    fun epubFlowMoonReaderVerticalSideSwipeUsesA2PageCurlRuntime() = runBlocking {
         settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
         val title = "flow-vertical-software-curl-${UUID.randomUUID().toString().take(8)}"
         val uri = createEpubUri("$title.epub")
@@ -2875,11 +2679,11 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     ) {
                         return@withActivity null
                     }
-                    FlowGlCurlStart(view = view, nextPageTop = nextTop)
+                    FlowSimulationTurnStart(view = view, nextPageTop = nextTop)
                 }
             }
 
-            val owner = scenario.withActivity { activity ->
+            val drawableName = scenario.withActivity { activity ->
                 start.view.scrollTo(0, 0)
                 val density = start.view.resources.displayMetrics.density
                 val down = PointF(start.view.width * 0.85f, start.view.height * 0.50f)
@@ -2894,20 +2698,18 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     start.view,
                     motionEvent(downTime, downTime + EVENT_STEP_MS * 2, MotionEvent.ACTION_UP, up),
                 )
-                val glOverlay = activity.findEpubCurlOverlay()
-                Pair(
-                    start.view.reflectPrivateAny("curlDrawable")?.javaClass?.simpleName,
-                    glOverlay?.reflectPrivateBoolean("active") == true,
-                )
+                check(activity.findLegacyEpubCurlOverlay() == null) {
+                    "A2 vertical swipe must not create the removed GL overlay child"
+                }
+                start.view.reflectPrivateAny("curlDrawable")?.javaClass?.simpleName
             }
 
             assertEquals(
                 "clear side-column vertical swipe must use the software PageCurlDrawable",
                 "PageCurlDrawable",
-                owner.first,
+                drawableName,
             )
-            assertFalse("clear side-column vertical swipe must not activate EpubCurlOverlay", owner.second)
-            waitForFlowPage(
+            waitForFlowPageTurnSettled(
                 scenario = scenario,
                 view = start.view,
                 pageIndex = 1,
@@ -3007,136 +2809,10 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
-    @Test
-    fun epubFlowSimulationCurlCreatesRealOverlayAndCommitsRuntime() = runBlocking {
-        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
-        val title = "flow-gl-${UUID.randomUUID().toString().take(8)}"
-        val uri = createEpubUri("$title.epub")
-
-        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
-            dismissBlockingDialogs()
-            waitForObject(By.descStartsWith("阅读内容"))
-
-            val start = waitForConditionResult("expected flow view to paginate") {
-                scenario.withActivity { activity ->
-                    val view = activity.findEpubFlowView() ?: return@withActivity null
-                    val pageCount = view.reflectInt("pageCount")
-                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
-                    val nextPageTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null
-                    FlowGlCurlStart(view = view, nextPageTop = nextPageTop)
-                }
-            }
-
-            val started = scenario.withActivity { activity ->
-                start.view.scrollTo(0, 0)
-                start.view.reflectBoolean("goToAdjacentPage", 1)
-                FlowGlCurlStarted(
-                    overlayCreated = activity.findEpubCurlOverlay() != null,
-                    currentPage = start.view.reflectInt("currentPageIndex"),
-                    scrollY = start.view.scrollY,
-                )
-            }
-            assertTrue("SIMULATION should create the real EpubCurlOverlay", started.overlayCreated)
-
-            var lastGlState = "not sampled"
-            val settled = try {
-                waitForConditionResult("expected real GL curl to commit to page 1") {
-                    scenario.withActivity { activity ->
-                        val currentPage = start.view.reflectInt("currentPageIndex")
-                        val scrollY = start.view.scrollY
-                        val overlay = activity.findEpubCurlOverlay()
-                        val curlView = overlay?.findDescendant { it.javaClass.name == HARISM_CURL_VIEW_CLASS_NAME }
-                        lastGlState =
-                            "page=$currentPage scrollY=$scrollY " +
-                                "overlayActive=${overlay?.reflectPrivateBoolean("active")} " +
-                                "overlayAlpha=${overlay?.alpha} " +
-                                "frameReady=${overlay?.reflectPrivateBoolean("turnFrameReady")} " +
-                                "pendingDuration=${overlay?.reflectPrivateAny("pendingDiscreteTurnDurationMs")} " +
-                                "pendingRunnable=${overlay?.reflectPrivateAny("pendingDiscreteTurnRunnable") != null} " +
-                                "curlAnimate=${curlView?.reflectPrivateBoolean("mAnimate")} " +
-                                "curlIndex=${curlView?.reflectPrivateInt("mCurrentIndex")} " +
-                                "curlSize=${curlView?.reflectPrivateInt("mPageBitmapWidth")}x" +
-                                "${curlView?.reflectPrivateInt("mPageBitmapHeight")}"
-                        if (currentPage == 1 && scrollY == start.nextPageTop) {
-                            FlowGlCurlSettled(currentPage = currentPage, scrollY = scrollY)
-                        } else {
-                            null
-                        }
-                    }
-                }
-            } catch (failure: Throwable) {
-                throw AssertionError("real GL curl did not commit; last=$lastGlState", failure)
-            }
-            assertEquals(1, settled.currentPage)
-            assertEquals(start.nextPageTop, settled.scrollY)
-        }
-    }
-
-    @Test
-    fun epubFlowSimulationCurlIgnoresRapidSecondTurnRuntime() = runBlocking {
-        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
-        val title = "flow-gl-rapid-${UUID.randomUUID().toString().take(8)}"
-        val uri = createEpubUri("$title.epub")
-
-        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
-            dismissBlockingDialogs()
-            waitForObject(By.descStartsWith("阅读内容"))
-
-            val start = waitForConditionResult("expected flow view to paginate") {
-                scenario.withActivity { activity ->
-                    val view = activity.findEpubFlowView() ?: return@withActivity null
-                    val pageCount = view.reflectInt("pageCount")
-                    if (pageCount <= 4 || view.width <= 0 || view.height <= 0) return@withActivity null
-                    val nextPageTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null
-                    FlowGlCurlStart(view = view, nextPageTop = nextPageTop)
-                }
-            }
-
-            val rapid = scenario.withActivity { activity ->
-                start.view.scrollTo(0, 0)
-                start.view.reflectBoolean("goToAdjacentPage", 1)
-                start.view.reflectBoolean("goToAdjacentPage", 1)
-                FlowGlCurlStarted(
-                    overlayCreated = activity.findEpubCurlOverlay() != null,
-                    currentPage = start.view.reflectInt("currentPageIndex"),
-                    scrollY = start.view.scrollY,
-                )
-            }
-            assertTrue("SIMULATION should create the real EpubCurlOverlay", rapid.overlayCreated)
-            assertEquals("second rapid turn must not pre-advance while GL curl is active", 0, rapid.currentPage)
-            assertEquals("second rapid turn must not move the live anchor while GL curl is active", 0, rapid.scrollY)
-
-            val settled = waitForConditionResult("expected rapid GL curl sequence to settle to page 1 only") {
-                scenario.withActivity {
-                    val currentPage = start.view.reflectInt("currentPageIndex")
-                    val scrollY = start.view.scrollY
-                    if (currentPage == 1 && scrollY == start.nextPageTop) {
-                        FlowGlCurlSettled(currentPage = currentPage, scrollY = scrollY)
-                    } else {
-                        null
-                    }
-                }
-            }
-            assertEquals(1, settled.currentPage)
-            assertEquals(start.nextPageTop, settled.scrollY)
-
-            SystemClock.sleep(650)
-            instrumentation.waitForIdleSync()
-            device.waitForIdle()
-            val final = scenario.withActivity {
-                FlowGlCurlSettled(
-                    currentPage = start.view.reflectInt("currentPageIndex"),
-                    scrollY = start.view.scrollY,
-                )
-            }
-            assertEquals("rapid second turn must not queue a later page-2 commit", 1, final.currentPage)
-            assertEquals(start.nextPageTop, final.scrollY)
-        }
-    }
 
     @Test
     @SdkSuppress(minSdkVersion = 29)
-    fun epubFlowSimulationColdFirstDragStartsSoftwareCurlWithoutActivatingGlRuntime() = runBlocking {
+    fun epubFlowSimulationColdFirstDragStartsA2CurlWithoutLegacyGlChildRuntime() = runBlocking {
         settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
         val title = "flow-software-curl-first-drag-${UUID.randomUUID().toString().take(8)}"
         val uri = createEpubUri("$title.epub")
@@ -3154,8 +2830,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
                         view.height <= 0 ||
                         view.flowContentAlpha() < 1f ||
                         view.reflectPrivateAny("conversionSnapshotDrawable") != null ||
-                        view.reflectPrivateAny("flipStyle")?.toString() != PageFlipStyle.SIMULATION.name ||
-                        view.reflectPrivateAny("curlOverlayFactory") == null
+                        view.reflectPrivateAny("flipStyle")?.toString() != PageFlipStyle.SIMULATION.name
                     ) {
                         return@withActivity null
                     }
@@ -3167,24 +2842,10 @@ class EpubFlowAnchorRuntimeSmokeTest {
             }
             scenario.withActivity { view.scrollTo(0, 0) }
             scenario.withActivity { activity ->
-                check(activity.findEpubCurlOverlay() == null) {
-                    "cold-first precondition requires that no GL overlay has been created or prewarmed"
+                check(activity.findLegacyEpubCurlOverlay() == null) {
+                    "cold-first A2 precondition requires no legacy GL overlay child"
                 }
             }
-            instrumentation.waitForIdleSync()
-            device.waitForIdle()
-
-            awaitCommittedFrame(scenario, view)
-            val stableA = captureWindowRegion(scenario, view)
-            awaitCommittedFrame(scenario, view)
-            val stable = captureWindowRegion(scenario, view)
-            val downTime = SystemClock.uptimeMillis()
-            val down = PointF(view.width * 0.85f, view.height * 0.10f)
-            val move = PointF(view.width * 0.15f, view.height * 0.10f)
-            var downFrame: Bitmap? = null
-            var moveFrame: Bitmap? = null
-            var settledFrame: Bitmap? = null
-            var gestureActive = false
             lateinit var flowGestureDetector: GestureDetector
             lateinit var flowTextView: TextView
             var hostLongPressEnabled = false
@@ -3200,6 +2861,20 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 flowTextView.isLongClickable = false
                 flowTextView.setTextIsSelectable(false)
             }
+            instrumentation.waitForIdleSync()
+            device.waitForIdle()
+
+            awaitCommittedFrame(scenario, view)
+            val stableA = captureWindowRegion(scenario, view)
+            awaitCommittedFrame(scenario, view)
+            val stable = captureWindowRegion(scenario, view)
+            val downTime = SystemClock.uptimeMillis()
+            val down = PointF(view.width * 0.85f, view.height * 0.10f)
+            val move = PointF(view.width * 0.15f, view.height * 0.10f)
+            var downFrame: Bitmap? = null
+            var moveFrame: Bitmap? = null
+            var settledFrame: Bitmap? = null
+            var gestureActive = false
             try {
                 assertVisualDiffAtMost(
                     "cold software curl test must begin from a visually settled Window",
@@ -3234,8 +2909,8 @@ class EpubFlowAnchorRuntimeSmokeTest {
                         "expected PageCurlDrawable, actual=${curl.javaClass.name}"
                     }
                     check(view.reflectPrivateAny("slideDrawable") == null)
-                    check(activity.findEpubCurlOverlay() == null) {
-                        "the first finger drag must not create or prewarm EpubCurlOverlay"
+                    check(activity.findLegacyEpubCurlOverlay() == null) {
+                        "the first finger drag must remain entirely in the local A2 renderer"
                     }
                 }
                 moveFrame = captureUntilMateriallyDifferent(
@@ -3254,23 +2929,21 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 }
                 gestureActive = false
                 waitForConditionResult("expected first software curl CANCEL to restore the outgoing page") {
-                    scenario.withActivity { activity ->
+                    scenario.withActivity {
                         val animatorRunning =
                             (view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
-                        val glOverlay = activity.findEpubCurlOverlay()
                         val settled =
                             view.reflectInt("currentPageIndex") == 0 &&
                                 view.scrollY == 0 &&
                                 view.reflectPrivateAny("curlDrawable") == null &&
                                 view.reflectPrivateAny("slideDrawable") == null &&
-                                !animatorRunning &&
-                                (glOverlay == null || !glOverlay.reflectPrivateBoolean("active"))
+                                !animatorRunning
                         if (settled) true else null
                     }
                 }
                 scenario.withActivity { activity ->
-                    check(activity.findEpubCurlOverlay() == null) {
-                        "a completed cold-first finger gesture must not leave a created or prewarmed GL overlay"
+                    check(activity.findLegacyEpubCurlOverlay() == null) {
+                        "a completed cold-first gesture must not leave a legacy GL overlay child"
                     }
                 }
                 settledFrame = captureUntilVisuallyStable(scenario, view)
@@ -3326,7 +2999,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     if (pageCount <= 4 || pageOneTop == null || view.width <= 0 || view.height <= 0) {
                         return@withActivity null
                     }
-                    FlowGlCurlStart(view = view, nextPageTop = pageOneTop)
+                    FlowSimulationTurnStart(view = view, nextPageTop = pageOneTop)
                 }
             }
 
@@ -3334,9 +3007,9 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 start.view.scrollTo(0, 0)
                 start.view.reflectBoolean("goToAdjacentPage", 1)
             }
-            waitForFlowPage(scenario, start.view, 1, start.nextPageTop, "expected discrete GL warm-up forward settle")
+            waitForFlowPageTurnSettled(scenario, start.view, 1, start.nextPageTop, "expected discrete A2 warm-up forward settle")
             scenario.withActivity { start.view.reflectBoolean("goToAdjacentPage", -1) }
-            waitForFlowPage(scenario, start.view, 0, 0, "expected discrete GL warm-up backward settle")
+            waitForFlowPageTurnSettled(scenario, start.view, 0, 0, "expected discrete A2 warm-up backward settle")
 
             scenario.withActivity { activity ->
                 dispatchDrag(
@@ -3348,14 +3021,13 @@ class EpubFlowAnchorRuntimeSmokeTest {
                             "leftward SIMULATION drag must use PageCurlDrawable"
                         }
                         check(curl.javaClass.simpleName == "PageCurlDrawable")
-                        val overlay = activity.findEpubCurlOverlay()
-                        check(overlay == null || !overlay.reflectPrivateBoolean("active")) {
-                            "leftward finger drag must not activate EpubCurlOverlay"
+                        check(activity.findLegacyEpubCurlOverlay() == null) {
+                            "leftward finger drag must not create a legacy GL overlay child"
                         }
                     },
                 )
             }
-            waitForFlowPage(
+            waitForFlowPageTurnSettled(
                 scenario,
                 start.view,
                 1,
@@ -3373,14 +3045,13 @@ class EpubFlowAnchorRuntimeSmokeTest {
                             "rightward SIMULATION drag must use PageCurlDrawable"
                         }
                         check(curl.javaClass.simpleName == "PageCurlDrawable")
-                        val overlay = activity.findEpubCurlOverlay()
-                        check(overlay == null || !overlay.reflectPrivateBoolean("active")) {
-                            "rightward finger drag must not activate EpubCurlOverlay"
+                        check(activity.findLegacyEpubCurlOverlay() == null) {
+                            "rightward finger drag must not create a legacy GL overlay child"
                         }
                     },
                 )
             }
-            waitForFlowPage(
+            waitForFlowPageTurnSettled(
                 scenario,
                 start.view,
                 0,
@@ -3854,8 +3525,8 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private fun MainActivity.findEpubFlowView(): View? =
         window.decorView.findDescendant { it.javaClass.name == EPUB_FLOW_VIEW_CLASS_NAME }
 
-    private fun MainActivity.findEpubCurlOverlay(): View? =
-        window.decorView.findDescendant { it.javaClass.name == EPUB_CURL_OVERLAY_CLASS_NAME }
+    private fun MainActivity.findLegacyEpubCurlOverlay(): View? =
+        window.decorView.findDescendant { it.javaClass.name == LEGACY_EPUB_CURL_OVERLAY_CLASS_NAME }
 
     private fun MainActivity.findReaderSurface(): View =
         checkNotNull(findReaderSurfaceOrNull()) {
@@ -3915,6 +3586,28 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
+    private fun waitForFlowPageTurnSettled(
+        scenario: ActivityScenario<MainActivity>,
+        view: View,
+        pageIndex: Int,
+        scrollY: Int,
+        message: String,
+    ) {
+        waitForConditionResult(message) {
+            scenario.withActivity {
+                val animatorRunning =
+                    (view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                if (
+                    view.reflectInt("currentPageIndex") == pageIndex &&
+                    view.scrollY == scrollY &&
+                    view.reflectPrivateAny("curlDrawable") == null &&
+                    view.reflectPrivateAny("slideDrawable") == null &&
+                    !animatorRunning
+                ) true else null
+            }
+        }
+    }
+
     private fun View.findDescendant(predicate: (View) -> Boolean): View? {
         if (predicate(this)) return this
         val group = this as? ViewGroup ?: return null
@@ -3961,24 +3654,6 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
         method.isAccessible = true
         method.invoke(this)
-    }
-
-    private fun View.invokeCurlOverlayStart(front: Bitmap, revealed: Bitmap) {
-        val start = javaClass.declaredMethods.single { method ->
-            method.name == "start" && method.parameterTypes.size == 4
-        }
-        start.isAccessible = true
-        start.invoke(this, front, revealed, true, { _: Boolean -> Unit })
-    }
-
-    private fun View.invokeCurlOverlayAnimateTurn(durationMs: Long) {
-        javaClass.getDeclaredMethod("animateTurn", Long::class.javaPrimitiveType).apply {
-            isAccessible = true
-        }.invoke(this, durationMs)
-    }
-
-    private fun Any.invokeNoArg(name: String) {
-        javaClass.getDeclaredMethod(name).apply { isAccessible = true }.invoke(this)
     }
 
     private fun View.reflectTextView(): TextView =
@@ -4669,18 +4344,19 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val actions: List<String>,
     )
 
-    private data class FlowGlCurlStart(
+    private data class FlowSimulationTurnStart(
         val view: View,
         val nextPageTop: Int,
     )
 
-    private data class FlowGlCurlStarted(
-        val overlayCreated: Boolean,
+    private data class FlowSimulationTurnStarted(
+        val drawableName: String?,
+        val animatorRunning: Boolean,
         val currentPage: Int,
         val scrollY: Int,
     )
 
-    private data class FlowGlCurlSettled(
+    private data class FlowTurnSettled(
         val currentPage: Int,
         val scrollY: Int,
     )
@@ -4716,8 +4392,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
     private companion object {
         private const val EPUB_FLOW_VIEW_CLASS_NAME = "dev.readflow.render.epub.EpubFlowView"
-        private const val EPUB_CURL_OVERLAY_CLASS_NAME = "dev.readflow.render.epub.EpubCurlOverlay"
-        private const val HARISM_CURL_VIEW_CLASS_NAME = "fi.harism.curl.CurlView"
+        private const val LEGACY_EPUB_CURL_OVERLAY_CLASS_NAME = "dev.readflow.render.epub.EpubCurlOverlay"
         private const val DB_NAME = "readflow.db"
         private const val EVENT_STEP_MS = 24L
         private const val FRAME_POLL_MS = 16L

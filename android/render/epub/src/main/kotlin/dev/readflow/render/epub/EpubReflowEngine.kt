@@ -472,35 +472,17 @@ class EpubReflowEngine private constructor(
             restoreToParagraph = startAnchor.first,
             restoreToParagraphOffset = startAnchor.second,
         )
-        // Host the reader + a (lazily created) GL curl overlay in one FrameLayout. The overlay is built
-        // ONLY on the first SIMULATION turn (SLIDE/NONE readers never allocate a GL context), and any GL
-        // construction failure leaves it null so SIMULATION degrades to the slide path — never crashes.
+        // Keep a host container for the reader and the existing hidden adjacent-chapter preview views.
+        // SIMULATION now stays entirely in EpubFlowView's local PAPER drawable; no GL child is created.
         val host = android.widget.FrameLayout(context)
         flowHost = host
-        val matchParent = {
+        host.addView(
+            view,
             android.widget.FrameLayout.LayoutParams(
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
                 android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-            )
-        }
-        host.addView(view, matchParent())
-        view.curlOverlayFactory = factory@{
-            val overlay = runCatching { EpubCurlOverlay(context) }.getOrNull() ?: return@factory null
-            host.addView(overlay, matchParent())
-            // AndroidView hosts do not necessarily schedule another ViewGroup layout when a child is
-            // added from the first touch dispatch. Size the lazy GL child now so its first frame can gate
-            // the turn instead of waiting until after the safety timeout.
-            val overlayWidth = host.width.takeIf { it > 0 } ?: view.width
-            val overlayHeight = host.height.takeIf { it > 0 } ?: view.height
-            if (overlayWidth > 0 && overlayHeight > 0) {
-                overlay.measure(
-                    android.view.View.MeasureSpec.makeMeasureSpec(overlayWidth, android.view.View.MeasureSpec.EXACTLY),
-                    android.view.View.MeasureSpec.makeMeasureSpec(overlayHeight, android.view.View.MeasureSpec.EXACTLY),
-                )
-                overlay.layout(0, 0, overlayWidth, overlayHeight)
-            }
-            overlay
-        }
+            ),
+        )
         return host
     }
 

@@ -47,6 +47,18 @@ internal class PageSlideDrawable(
 
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val shadePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val bitmapSrc = Rect()
+    private val bitmapDst = RectF()
+    private val shadowMatrix = android.graphics.Matrix()
+    private val seamShadowShader = LinearGradient(
+        0f,
+        0f,
+        1f,
+        0f,
+        0x40000000,
+        0x00000000,
+        Shader.TileMode.CLAMP,
+    )
 
     override fun draw(canvas: Canvas) {
         // The host is a ScrollView, so its ViewOverlay draws in CONTENT coordinates (canvas already
@@ -84,12 +96,9 @@ internal class PageSlideDrawable(
             ?.coerceIn(srcLeft, viewportW)
             ?: viewportW
         if (srcRight <= srcLeft) return
-        canvas.drawBitmap(
-            bitmap,
-            Rect(srcLeft, 0, srcRight, viewportH),
-            RectF(visibleLeft, 0f, visibleRight, h),
-            paint,
-        )
+        bitmapSrc.set(srcLeft, 0, srcRight, viewportH)
+        bitmapDst.set(visibleLeft, 0f, visibleRight, h)
+        canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, paint)
     }
 
     private fun sourceXForViewportX(left: Float, viewportX: Float, w: Float): Int? {
@@ -105,10 +114,10 @@ internal class PageSlideDrawable(
         // The incoming page abuts the outgoing edge that faces the slide direction: forward → right edge.
         val edge = outgoingLeft + if (forward) w else 0f
         val to = if (forward) edge + shadowW else edge - shadowW
-        shadePaint.shader = LinearGradient(
-            edge, 0f, to, 0f,
-            intArrayOf(0x40000000, 0x00000000), null, Shader.TileMode.CLAMP,
-        )
+        shadowMatrix.setScale(if (forward) shadowW else -shadowW, 1f)
+        shadowMatrix.postTranslate(edge, 0f)
+        seamShadowShader.setLocalMatrix(shadowMatrix)
+        shadePaint.shader = seamShadowShader
         canvas.drawRect(min(edge, to), 0f, max(edge, to), h, shadePaint)
         shadePaint.shader = null
     }
