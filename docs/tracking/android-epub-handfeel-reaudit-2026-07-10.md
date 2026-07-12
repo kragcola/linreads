@@ -245,7 +245,7 @@ Window, vertical, cold-first, and direction cases now assert the local PAPER ren
 - [x] Remove TextureView/EGL harism from the decision set after the user rejected real 3D.
 - [x] Obtain the user's architecture-A visual decision: A2 CoolReader-PAPER local strip bending.
 - [x] Prewarm both adjacent in-chapter directions; route drag/tap/key/in-chapter/cross-chapter through the selected 2D renderer; implement and verify it.
-- [ ] Commit, push, and verify the new OTA artifact after the new handfeel slice is complete.
+- [x] Commit, push, and verify the new OTA artifact after the new handfeel slice is complete.
 
 ## Risks / Decision Points
 
@@ -311,6 +311,7 @@ Window, vertical, cold-first, and direction cases now assert the local PAPER ren
 | 2026-07-12 | Migrate phase-2 AndroidTest away from removed GL renderer; run final combined phase-2 gate | Deleted pure GL retained-buffer/first-frame cases; discrete/rapid, committed Window, vertical, cold-first, and direction assertions use `PageCurlDrawable` and require no legacy GL child. EPUB 370/0/0/2, Reader 80/80, Animate 13/13; lint, AndroidTest Kotlin compile, and debug APK assembly `BUILD SUCCESSFUL` | Test sources now match A2 production architecture. Emulator/physical-device execution remains deferred; compile and JVM/build evidence do not claim panel-level handfeel. |
 | 2026-07-12 | Run migrated A2 AVD gate; investigate one committed-Window CANCEL flake without relaxing pixel limits | Initial 6-test run had 1 visual failure (`rgbMae=2.7974`, bad pixels `6.119%`) after the test captured baseline before changing TextView selectable/long-click render state. Moving those test-only mutations before baseline fixed the oracle; strict committed-Window + cold-first pair passed 3 consecutive rounds (6/6), then the full A2 targeted set passed `OK (6 tests)` / `73.19s`. Narrow fatal/ANR/OOM/recycled-bitmap/assertion logcat grep was empty; `TouchStatesByDisplay: <no displays touched>` | The failure was a test-state mismatch, not accepted as a production regression or hidden by threshold changes. Stable and settled success frames are byte-identical; physical-device handfeel remains deferred. |
 | 2026-07-12 | Final local OTA build and package verification before push | `:app:assembleOta` `BUILD SUCCESSFUL` in 2m22s; `app-ota.apk` is 9.4 MiB, SHA-256 `b1e76543fe7f2f4a9f3435dddbc96c5d3deaee1a437b6559c0f391a54ba032cd`; ZIP integrity passes and APK Signature Scheme v2 verifies with `CN=LinReads Debug, O=Dev, C=US` | Local package gate is green. Push to `main` will trigger `Android Dev Release`; remote `dev-latest` identity and asset still require post-push verification. |
+| 2026-07-12 | Commit/push A2 and verify `Android Dev Release` run `29173101982` | Commit `4cee1a3e87f2899aabcf5f2ce5c555515b056b23` pushed to `main`; run #202 completed in 5m29s and published `Dev build #202`. Release body, run head SHA, branch, and APK DEX all contain `dev-202-4cee1a3e87f2899aabcf5f2ce5c555515b056b23`. Remote asset is 9,849,169 bytes with SHA-256 `23260e12250746abfb10d8054e208e8df2841aec6f0b85eef8435eda4a478900`, matching the GitHub digest; ZIP, package `dev.readflow`, v2 signature, and trusted certificate digest all verify | The A2 implementation is published through OTA. Physical-device handfeel remains intentionally deferred; package identity and integrity are verified. |
 
 ## Verification Status
 
@@ -325,4 +326,4 @@ Window, vertical, cold-first, and direction cases now assert the local PAPER ren
 - Physical-device handfeel: deferred by user.
 - A2 runtime boundary: AndroidTest sources use local PAPER/no-GL semantics; the six targeted migrated emulator cases pass, including strict committed-Window/cold-first checks after fixing their baseline-order test flake. Physical-device handfeel remains deferred by user.
 - Independent A2 review: all 3 production P1 findings and the duplicate-precache P2 are closed; final production re-review found no P0-P3.
-- Commit/push/OTA: final local OTA is built and verified; commit/push plus remote `dev-latest` verification are the active next step.
+- Commit/push/OTA: A2 code commit `4cee1a3e87f2899aabcf5f2ce5c555515b056b23` is pushed to `main` and verified in `Dev build #202`; the mutable `dev-latest` asset identity, digest, ZIP, package, v2 signature, certificate, and embedded build tag all pass.
