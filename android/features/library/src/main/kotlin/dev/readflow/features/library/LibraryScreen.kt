@@ -15,6 +15,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Settings
@@ -37,6 +41,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.Surface
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -56,6 +62,8 @@ import dev.readflow.core.ui.BookCover
 import dev.readflow.core.ui.BookGrid
 import dev.readflow.core.ui.EmptyState
 import dev.readflow.core.ui.PaperSurface
+import dev.readflow.core.ui.ReadflowType
+import dev.readflow.core.ui.Dimens
 import org.koin.androidx.compose.koinViewModel
 
 private val SUPPORTED_MIMES = arrayOf("text/plain", "application/epub+zip", "application/pdf")
@@ -98,6 +106,12 @@ fun LibraryScreen(
     }
 
     var showAddMenu by remember { mutableStateOf(false) }
+    val visibleBookCount = state.items.sumOf { item ->
+        when (item) {
+            is dev.readflow.core.model.LibraryItem.Single -> 1
+            is dev.readflow.core.model.LibraryItem.Bundle -> item.bundle.books.size
+        }
+    }
 
     PaperSurface {
         Scaffold(
@@ -105,38 +119,84 @@ fun LibraryScreen(
             containerColor = MaterialTheme.colorScheme.background,
             snackbarHost = { SnackbarHost(snackbarHostState) },
             topBar = {
-                TopAppBar(
-                    title = { Text("书架", style = MaterialTheme.typography.titleLarge) },
-                    actions = {
+                Surface(
+                    color = MaterialTheme.colorScheme.background,
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .windowInsetsPadding(WindowInsets.statusBars)
+                            .padding(start = 24.dp, top = 18.dp, end = 16.dp, bottom = 12.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "书架",
+                                    style = ReadflowType.display,
+                                    color = MaterialTheme.colorScheme.onBackground,
+                                )
+                                Text(
+                                    text = if (visibleBookCount == 0) {
+                                        "让下一本书从这里开始"
+                                    } else {
+                                        "$visibleBookCount 本藏书 · 随时继续阅读"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         Box {
-                            IconButton(onClick = { showAddMenu = true }) {
-                                Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
-                            }
-                            DropdownMenu(expanded = showAddMenu, onDismissRequest = { showAddMenu = false }) {
-                                DropdownMenuItem(
-                                    text = { Text("选择文件") },
-                                    onClick = { showAddMenu = false; fileLauncher.launch(SUPPORTED_MIMES) },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("扫描文件夹") },
-                                    onClick = { showAddMenu = false; folderLauncher.launch(null) },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Calibre 搜索") },
-                                    onClick = { showAddMenu = false; showCalibreSearch = true },
-                                )
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.surfaceVariant,
+                                        shape = CircleShape,
+                                    ) {
+                                        IconButton(
+                                            onClick = { showAddMenu = true },
+                                            modifier = Modifier.size(Dimens.touchTarget),
+                                        ) {
+                                            Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
+                                        }
+                                    }
+                                    DropdownMenu(expanded = showAddMenu, onDismissRequest = { showAddMenu = false }) {
+                                        DropdownMenuItem(
+                                            text = { Text("选择文件") },
+                                            onClick = { showAddMenu = false; fileLauncher.launch(SUPPORTED_MIMES) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("扫描文件夹") },
+                                            onClick = { showAddMenu = false; folderLauncher.launch(null) },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Calibre 搜索") },
+                                            onClick = { showAddMenu = false; showCalibreSearch = true },
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    shape = CircleShape,
+                                ) {
+                                    IconButton(
+                                        onClick = onSettings,
+                                        modifier = Modifier.size(Dimens.touchTarget),
+                                    ) {
+                                        Icon(Icons.Outlined.Settings, contentDescription = "设置")
+                                    }
+                                }
                             }
                         }
-                        IconButton(onClick = onSettings) {
-                            Icon(Icons.Outlined.Settings, contentDescription = "设置")
-                        }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = MaterialTheme.colorScheme.background,
-                        titleContentColor = MaterialTheme.colorScheme.onBackground,
-                        actionIconContentColor = MaterialTheme.colorScheme.onBackground,
-                    ),
-                )
+                        Spacer(Modifier.height(18.dp))
+                        LibraryFilterBar(
+                            filter = state.filter,
+                            offlineCount = state.offlineCount,
+                            onFilterChange = viewModel::setLibraryFilter,
+                        )
+                    }
+                }
             },
         ) { padding ->
             Box(
@@ -154,11 +214,6 @@ fun LibraryScreen(
                     else -> Column(
                         modifier = Modifier.fillMaxSize(),
                     ) {
-                        LibraryFilterBar(
-                            filter = state.filter,
-                            offlineCount = state.offlineCount,
-                            onFilterChange = viewModel::setLibraryFilter,
-                        )
                         if (state.items.isEmpty()) {
                             OfflineEmptyState(
                                 onShowAll = { viewModel.setLibraryFilter(LibraryFilter.ALL) },
@@ -227,9 +282,7 @@ private fun LibraryFilterBar(
     onFilterChange: (LibraryFilter) -> Unit,
 ) {
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp),
+        modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -237,11 +290,19 @@ private fun LibraryFilterBar(
             selected = filter == LibraryFilter.ALL,
             onClick = { onFilterChange(LibraryFilter.ALL) },
             label = { Text("全部") },
+            colors = FilterChipDefaults.filterChipColors(
+                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
+            ),
         )
         FilterChip(
             selected = filter == LibraryFilter.OFFLINE,
             onClick = { onFilterChange(LibraryFilter.OFFLINE) },
             label = { Text("离线可读 $offlineCount") },
+            colors = FilterChipDefaults.filterChipColors(
+                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
+            ),
         )
     }
 }

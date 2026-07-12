@@ -25,15 +25,15 @@ data class ReaderPalette(
  * an explicit flat preset whose colours are fixed (independent of the OS setting).
  *
  * Moon+ source triples (bg / text):
- *  - LIGHT  日间     #EDE6D6 / #2A2620  (warm paper — our historical default day)
+ *  - LIGHT  日间     #F7F5EF / #202522  (warm editorial paper)
  *  - WHITE  纯白     #FAFAF8 / #1A1A1A  (clean off-white; Moon+ pure-white #FFFFFF softened per WCAG)
  *  - SEPIA  护眼黄   #F5F0E8 / #5B4636  (parchment; Moon+ Day2 sepia family)
  *  - GREEN  护眼绿   #DBECE1 / #34433A  (Moon+ pro2 mint — eye-care green)
  *  - GREY   灰      #DBD7D1 / #2A2620  (Moon+ Day3 light grey paper)
- *  - DARK   夜间     #2A2620 / #D8CFBC  (our historical warm-dark default night)
+ *  - DARK   夜间     #171B18 / #E5E9E4  (soft evergreen black, never pure black)
  *  - SLATE  深灰     #232323 / #CCCCCC  (Moon+ Night Theme)
  *  - NAVY   深蓝     #0E141E / #BDC9C8  (Moon+ pro3 deep navy)
- *  - BLACK  纯黑     #000000 / #E8E6E1  (AMOLED; Moon+ pure-white text softened per night rule)
+ *  - BLACK  纯黑     #101310 / #E8E6E1  (legacy label; near-black without harsh pure black)
  */
 fun readerPaletteFor(mode: ThemeMode, systemNight: Boolean): ReaderPalette = when (mode) {
     ThemeMode.SYSTEM -> if (systemNight) DARK_PALETTE else LIGHT_PALETTE
@@ -45,7 +45,7 @@ fun readerPaletteFor(mode: ThemeMode, systemNight: Boolean): ReaderPalette = whe
     ThemeMode.DARK -> DARK_PALETTE
     ThemeMode.SLATE -> ReaderPalette(0xFF232323.toInt(), 0xFFCCCCCC.toInt(), isNight = true)
     ThemeMode.NAVY -> ReaderPalette(0xFF0E141E.toInt(), 0xFFBDC9C8.toInt(), isNight = true)
-    ThemeMode.BLACK -> ReaderPalette(0xFF000000.toInt(), 0xFFE8E6E1.toInt(), isNight = true)
+    ThemeMode.BLACK -> ReaderPalette(0xFF101310.toInt(), 0xFFE8E6E1.toInt(), isNight = true)
 }
 
 /** Chinese picker label for each preset (used by reader + settings theme choosers). */
@@ -62,5 +62,5 @@ fun ThemeMode.readerThemeLabel(): String = when (this) {
     ThemeMode.BLACK -> "纯黑"
 }
 
-private val LIGHT_PALETTE = ReaderPalette(0xFFEDE6D6.toInt(), 0xFF2A2620.toInt(), isNight = false)
-private val DARK_PALETTE = ReaderPalette(0xFF2A2620.toInt(), 0xFFD8CFBC.toInt(), isNight = true)
+private val LIGHT_PALETTE = ReaderPalette(0xFFF7F5EF.toInt(), 0xFF202522.toInt(), isNight = false)
+private val DARK_PALETTE = ReaderPalette(0xFF171B18.toInt(), 0xFFE5E9E4.toInt(), isNight = true)

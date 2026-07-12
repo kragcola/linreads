@@ -3,6 +3,7 @@ package dev.readflow.core.ui
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
@@ -11,6 +12,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
@@ -34,17 +36,22 @@ fun BookCover(
     modifier: Modifier = Modifier,
     showProgress: Boolean = true,
 ) {
-    val palette = readflowPalette
     val clothColor = remember(book.id) { clothColorFor(book.id) }
 
     Box(
         modifier = modifier
+            .shadow(
+                elevation = 8.dp,
+                shape = RoundedCornerShape(Dimens.coverCorner),
+                ambientColor = Color.Black.copy(alpha = 0.16f),
+                spotColor = Color.Black.copy(alpha = 0.20f),
+            )
             .clip(RoundedCornerShape(Dimens.coverCorner))
             .drawWithContent {
                 drawContent()
                 drawRect(
                     brush = Brush.radialGradient(
-                        colors = listOf(Color.Transparent, Color(0x33000000)),
+                        colors = listOf(Color.Transparent, Color(0x20000000)),
                         center = Offset(size.width / 2f, size.height / 2f),
                         radius = size.maxDimension * 0.72f,
                     ),
@@ -60,16 +67,22 @@ fun BookCover(
                 modifier = Modifier.fillMaxSize(),
             )
         } else {
-            PlainStampedCover(book, clothColor, palette)
+            PlainStampedCover(book, clothColor)
         }
 
-        // 圆形进度指示器（右下角）
         if (showProgress && book.progress > 0f) {
-            PaperProgress(
-                progress = book.progress.coerceIn(0f, 1f),
+            Box(
                 modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(end = 6.dp, bottom = 6.dp),
+                    .align(Alignment.BottomStart)
+                    .fillMaxWidth()
+                    .height(3.dp)
+                    .drawBehind {
+                        drawRect(Color.Black.copy(alpha = 0.62f))
+                        drawRect(
+                            color = ReadflowColors.EvergreenNight,
+                            size = size.copy(width = size.width * book.progress.coerceIn(0f, 1f)),
+                        )
+                    },
             )
         }
     }
@@ -80,22 +93,21 @@ fun BookCover(
 private fun PlainStampedCover(
     book: BookMeta,
     clothColor: Color,
-    palette: ReadflowPalette,
 ) {
-    val stamp = palette.paper.copy(alpha = 0.86f)
+    val titleStamp = ReadflowColors.InkNight.copy(alpha = 0.92f)
+    val authorStamp = ReadflowColors.InkNight.copy(alpha = 0.90f)
     Box(
         modifier = Modifier
             .fillMaxSize()
             .drawBehind {
                 drawRect(clothColor)
-                // 布纹竖向极淡条纹，暗示布面织纹。
-                val stripe = Color.Black.copy(alpha = 0.04f)
-                var x = 0f
-                while (x < size.width) {
-                    drawRect(color = stripe, topLeft = Offset(x, 0f),
-                        size = size.copy(width = 1f))
-                    x += 3f
-                }
+                drawRect(
+                    brush = Brush.linearGradient(
+                        colors = listOf(Color.White.copy(alpha = 0.08f), Color.Transparent),
+                        start = Offset.Zero,
+                        end = Offset(size.width, size.height),
+                    ),
+                )
             },
         contentAlignment = Alignment.Center,
     ) {
@@ -105,7 +117,7 @@ private fun PlainStampedCover(
         ) {
             Text(
                 text = book.title,
-                style = ReadflowType.bookTitle.copy(color = stamp),
+                style = ReadflowType.bookTitle.copy(color = titleStamp),
                 maxLines = 4,
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center,
@@ -113,7 +125,7 @@ private fun PlainStampedCover(
         }
         Text(
             text = book.author,
-            style = ReadflowType.meta.copy(color = stamp.copy(alpha = 0.7f)),
+            style = ReadflowType.meta.copy(color = authorStamp),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center,

@@ -41,7 +41,7 @@ fun readerPaperBackground(
     // fibres are opaque, peak ~0x78); the paint alpha scales the whole tooth. Night papers are darker
     // and show grain more readily, so pull it down a touch there. The grain is forced white RGB so the
     // SRC_IN ink tint sets its hue per palette (dark fibre on light paper / light tooth on dark paper).
-    val alpha = if (isNight) 0x80 else 0xC0
+    val alpha = if (isNight) 0x28 else 0x42
     val tintedGrain = tintPaperGrain(grain, inkColor, alpha)
     val shader = BitmapShader(tintedGrain, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT)
     return PaperTextureDrawable(paperColor, shader)

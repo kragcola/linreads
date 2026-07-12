@@ -4,9 +4,11 @@ import android.view.HapticFeedbackConstants
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyGridItemInfo
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -27,12 +29,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
@@ -62,6 +65,13 @@ private val BookMeta.canRemoveDownload: Boolean
         downloadStatus == DownloadStatus.DOWNLOADED &&
         localUri != null
 
+internal fun libraryGridColumns(widthDp: Float): Int = when {
+    widthDp < 480f -> 2
+    widthDp < 720f -> 3
+    widthDp < 1_000f -> 4
+    else -> 5
+}
+
 /**
  * 书架网格，支持点击、拖拽重排、dwell 悬停建组。
  *
@@ -87,6 +97,14 @@ fun BookGrid(
     modifier: Modifier = Modifier,
 ) {
     val palette = readflowPalette
+    val windowWidthPx = LocalWindowInfo.current.containerSize.width
+    val screenWidthDp = with(LocalDensity.current) { windowWidthPx.toDp().value }
+    val gridColumns = libraryGridColumns(screenWidthDp)
+    val gridGap = when (gridColumns) {
+        2 -> Dimens.gridGapCompact
+        3, 4 -> Dimens.gridGapMedium
+        else -> Dimens.gridGapExpanded
+    }
     val mutableItems = remember { mutableStateListOf(*items.toTypedArray()) }
     LaunchedEffect(items) {
         if (mutableItems.toList() != items) {
@@ -223,51 +241,21 @@ fun BookGrid(
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-        // ── 整行联通书架隔板（先渲染 = 在网格后面）──
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val visInfo = gridState.layoutInfo.visibleItemsInfo
-            val processedRows = mutableSetOf<Int>()
-            for (info in visInfo) {
-                // 用 top edge 做行标识 — 同行 item 的 offset.y 一致
-                val rowY = info.offset.y
-                if (processedRows.add(rowY)) {
-                    // 整行底板：暖木色 + 上下投影
-                    val boardY = rowY.toFloat()
-                    val boardH = 4.dp.toPx()
-                    val shadowH = 5.dp.toPx()
-                    drawRect(
-                        brush = Brush.verticalGradient(
-                            colors = listOf(Color(0x1A000000), Color.Transparent),
-                            startY = boardY - shadowH,
-                            endY = boardY,
-                        ),
-                        topLeft = Offset(0f, boardY - shadowH),
-                        size = Size(size.width, shadowH),
-                    )
-                    drawRect(
-                        color = Color(0xFFD4C9AE),
-                        topLeft = Offset(0f, boardY),
-                        size = Size(size.width, boardH),
-                    )
-                    drawRect(
-                        color = Color(0x12000000),
-                        topLeft = Offset(0f, boardY + boardH),
-                        size = Size(size.width, 0.5.dp.toPx()),
-                    )
-                }
-            }
-        }
-
         LazyVerticalGrid(
             state = gridState,
-            columns = GridCells.Adaptive(minSize = Dimens.coverTargetWidthPhone),
+            columns = GridCells.Fixed(gridColumns),
             contentPadding = PaddingValues(
-                horizontal = Dimens.screenEdge,
-                vertical = Dimens.spaceMd,
+                start = Dimens.screenEdge,
+                top = Dimens.spaceLg,
+                end = Dimens.screenEdge,
+                bottom = Dimens.spaceXl,
             ),
-            horizontalArrangement = Arrangement.spacedBy(Dimens.gridGapCompact),
-            verticalArrangement = Arrangement.spacedBy(Dimens.gridGapCompact),
-            modifier = Modifier.widthIn(max = Dimens.maxContentWidth),
+            horizontalArrangement = Arrangement.spacedBy(gridGap),
+            verticalArrangement = Arrangement.spacedBy(Dimens.spaceXl),
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .widthIn(max = Dimens.maxContentWidth)
+                .fillMaxWidth(),
         ) {
             itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
                 val isDragging = dragItemKey == item.key
@@ -538,7 +526,7 @@ fun BookGrid(
                     Box(
                         modifier = Modifier
                             .aspectRatio(Dimens.coverAspectRatio)
-                            .padding(bottom = Dimens.spaceXs),
+                            .padding(bottom = Dimens.spaceSm),
                     ) {
                         when (item) {
                             is LibraryItem.Single -> {
@@ -610,25 +598,21 @@ fun BookGrid(
                                 modifier = Modifier
                                     .align(Alignment.TopEnd)
                                     .zIndex(2f)
-                                    .size(36.dp),
+                                    .size(Dimens.touchTarget),
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
-                                    // 底层：暗色羽化描边（稍大）
-                                    Icon(
-                                        imageVector = Icons.Default.MoreVert,
-                                        contentDescription = null,
-                                        tint = Color.Black.copy(alpha = 0.35f),
-                                        modifier = Modifier
-                                            .size(22.dp)
-                                            .graphicsLayer { scaleX = 1.2f; scaleY = 1.2f },
-                                    )
-                                    // 顶层：白色三点
-                                    Icon(
-                                        imageVector = Icons.Default.MoreVert,
-                                        contentDescription = menuDescription,
-                                        tint = Color.White,
-                                        modifier = Modifier.size(20.dp),
-                                    )
+                                    Surface(
+                                        color = Color.Black.copy(alpha = 0.56f),
+                                        shape = CircleShape,
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.MoreVert,
+                                            contentDescription = menuDescription,
+                                            tint = Color.White,
+                                            modifier = Modifier.padding(6.dp),
+                                        )
+                                    }
                                 }
                             }
 
@@ -730,14 +714,30 @@ fun BookGrid(
 
                     Text(
                         text = title,
-                        modifier = Modifier.padding(horizontal = Dimens.spaceXs),
+                        modifier = Modifier.padding(horizontal = 2.dp),
                         style = ReadflowType.bookTitle,
                         color = palette.ink,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Spacer(modifier = Modifier.height(Dimens.spaceSm))
-                    if (item is LibraryItem.Single) { /* 作者识别不到，已移除 */ }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = when (item) {
+                            is LibraryItem.Single -> buildString {
+                                append(item.book.author.ifBlank { "未知作者" })
+                                if (item.book.progress > 0f) {
+                                    append(" · ")
+                                    append("${(item.book.progress.coerceIn(0f, 1f) * 100).toInt()}%")
+                                }
+                            }
+                            is LibraryItem.Bundle -> "${item.bundle.books.size} 本合集"
+                        },
+                        modifier = Modifier.padding(horizontal = 2.dp),
+                        style = ReadflowType.meta,
+                        color = palette.inkSoft,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
             }
         }

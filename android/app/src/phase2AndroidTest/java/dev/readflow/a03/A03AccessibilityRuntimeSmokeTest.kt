@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.view.View
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityNodeInfo
@@ -50,6 +51,7 @@ class A03AccessibilityRuntimeSmokeTest {
     @Before
     fun setUp() = runBlocking {
         resetTargetAppState()
+        settings.setReaderGuideShown(false)
         settings.setFontSize(16)
         settings.setLineSpacing(1.75f)
         settings.setThemeMode(ThemeMode.LIGHT)
@@ -72,6 +74,24 @@ class A03AccessibilityRuntimeSmokeTest {
 
         ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use { scenario ->
             dismissBlockingDialogs()
+            val guide = checkNotNull(waitForFreshObject(By.desc(READER_GUIDE_DESC))) {
+                "expected first-reader guide"
+            }
+            assertTrue("reader guide must expose a clickable dismiss action", guide.isClickable)
+            assertTrue(
+                "reader guide must expose ACTION_CLICK",
+                accessibilityNodeHasAction(
+                    READER_GUIDE_DESC,
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_CLICK.id,
+                ),
+            )
+            assertTrue(
+                "reader guide ACTION_CLICK must dismiss the overlay",
+                performAccessibilityNodeAction(
+                    READER_GUIDE_DESC,
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_CLICK.id,
+                ),
+            )
             waitForObject(By.desc(EPUB_READER_DESC))
             waitForObject(By.textContains(OPENING_PARAGRAPH))
             val importedBook = waitForBookByTitle(title)
@@ -110,7 +130,8 @@ class A03AccessibilityRuntimeSmokeTest {
             waitForObject(By.desc("添加书签"))
             waitForObject(By.desc("上一章"))
             waitForObject(By.desc("下一章"))
-            waitForObject(By.desc("全书进度"))
+            val overallProgress = waitForObject(By.desc("全书进度，拖动跳转"))
+            assertAdjustableTouchTarget("全书进度", overallProgress)
             waitForObject(By.descContains("第 1 / 2 章"))
             listOf("目录", "搜索", "书签", "标注", "排版", "主题").forEach { label ->
                 waitForObject(By.desc(label))
@@ -119,9 +140,13 @@ class A03AccessibilityRuntimeSmokeTest {
             dumpHierarchy("reader-chrome.xml")
 
             openBottomPanel("目录", "A03 Start")
+            val tocClose = waitForObject(By.desc("关闭目录"))
+            assertTrue("expected TOC scrim to expose a close action", tocClose.isClickable)
+            val tocCloseDescription = tocClose.contentDescription.orEmpty()
             val tocDescription = waitForObject(By.desc("1 级目录，A03 Start")).contentDescription.orEmpty()
             takeScreenshot("panel-toc.png")
             dumpHierarchy("panel-toc.xml")
+            clickObject(By.desc("关闭目录"))
 
             openBottomPanel("搜索", "关键词")
             waitForObject(By.desc("执行搜索"))
@@ -138,8 +163,12 @@ class A03AccessibilityRuntimeSmokeTest {
             dumpHierarchy("panel-annotations.xml")
 
             openBottomPanel("排版", "正文预览")
-            val fontSliderDescription = waitForObject(By.desc("字号")).contentDescription.orEmpty()
-            val lineSpacingSliderDescription = waitForObject(By.desc("行距")).contentDescription.orEmpty()
+            val fontSlider = waitForObject(By.desc("字号"))
+            val lineSpacingSlider = waitForObject(By.desc("行距"))
+            assertAdjustableTouchTarget("字号", fontSlider)
+            assertAdjustableTouchTarget("行距", lineSpacingSlider)
+            val fontSliderDescription = fontSlider.contentDescription.orEmpty()
+            val lineSpacingSliderDescription = lineSpacingSlider.contentDescription.orEmpty()
             val fontSizeLabel = waitForObject(By.text("16sp")).text.orEmpty()
             val lineSpacingLabel = waitForObject(By.text("1.75x")).text.orEmpty()
             waitForObject(By.text("滚动"))
@@ -150,7 +179,8 @@ class A03AccessibilityRuntimeSmokeTest {
             openBottomPanel("主题", "跟随系统")
             waitForObject(By.text("日间"))
             waitForObject(By.text("夜间"))
-            waitForObject(By.text("护眼"))
+            waitForObject(By.text("护眼黄"))
+            waitForObject(By.text("护眼绿"))
             takeScreenshot("panel-theme.png")
             dumpHierarchy("panel-theme.xml")
 
@@ -164,13 +194,15 @@ class A03AccessibilityRuntimeSmokeTest {
                     appendLine("library_menu_description=$libraryMenuDescription")
                     appendLine("reader_surface_description=${readerSurfaceSummary.contentDescription}")
                     appendLine("reader_surface_actions=${readerSurfaceSummary.actions.joinToString("|")}")
-                    appendLine("reader_chrome_labels=返回|添加书签|上一章|下一章|目录|搜索|书签|标注|排版|主题")
+                    appendLine("reader_chrome_labels=返回|添加书签|上一章|下一章|全书进度，拖动跳转|目录|搜索|书签|标注|排版|主题")
+                    appendLine("toc_close_description=$tocCloseDescription")
                     appendLine("toc_item_description=$tocDescription")
                     appendLine("search_actions=执行搜索|清空搜索")
                     appendLine("empty_panels=暂无书签|暂无标注")
                     appendLine("font_slider_desc=$fontSliderDescription visible_label=$fontSizeLabel")
                     appendLine("line_spacing_slider_desc=$lineSpacingSliderDescription visible_label=$lineSpacingLabel")
-                    appendLine("theme_options=跟随系统|日间|夜间|护眼")
+                    appendLine("theme_options=跟随系统|日间|夜间|护眼黄|护眼绿")
+                    appendLine("touch_target_min_dp=48")
                     appendLine("evidence_boundary=AVD instrumentation + UIAutomator/XML/screenshots; no physical device, human TalkBack speech, or full focus-order traversal")
                 },
             )
@@ -277,8 +309,29 @@ class A03AccessibilityRuntimeSmokeTest {
 
     private fun openBottomPanel(buttonText: String, expectedText: String) {
         ensureChromeVisible()
-        clickBottomControl(buttonText)
-        waitForObject(By.text(expectedText))
+        val clickedBounds = clickBottomControl(buttonText)
+        if (waitForFreshObject(By.text(expectedText)) == null) {
+            takeScreenshot("panel-$buttonText-click-failure.png")
+            dumpHierarchy("panel-$buttonText-click-failure.xml")
+            error(
+                "Timed out waiting for panel text '$expectedText' after clicking " +
+                    "'$buttonText' at $clickedBounds",
+            )
+        }
+    }
+
+    private fun waitForFreshObject(
+        selector: BySelector,
+        timeoutMs: Long = UI_TIMEOUT_MS,
+    ): UiObject2? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            clearAccessibilityCache()
+            device.findObject(selector)?.let { return it }
+            Thread.sleep(100)
+        }
+        clearAccessibilityCache()
+        return device.findObject(selector)
     }
 
     private fun ensureChromeVisible() {
@@ -290,13 +343,18 @@ class A03AccessibilityRuntimeSmokeTest {
         waitForObject(By.desc("目录"))
     }
 
-    private fun clickBottomControl(label: String) {
-        val objectToClick = device.findObjects(By.text(label))
+    private fun clickBottomControl(label: String): android.graphics.Rect {
+        val objectToClick = device.findObjects(By.desc(label))
             .maxByOrNull { it.visibleBounds.centerY() }
-            ?: device.findObjects(By.desc(label)).maxByOrNull { it.visibleBounds.centerY() }
+            ?: device.findObjects(By.text(label)).maxByOrNull { it.visibleBounds.centerY() }
             ?: error("Unable to find bottom control: $label")
-        objectToClick.click()
+        val clickTarget = generateSequence(objectToClick) { it.parent }
+            .firstOrNull { it.isClickable }
+            ?: error("Unable to find clickable ancestor for bottom control: $label")
+        val bounds = clickTarget.visibleBounds
+        clickTarget.click()
         device.waitForIdle()
+        return bounds
     }
 
     private fun clickObject(selector: BySelector, timeoutMs: Long = UI_TIMEOUT_MS) {
@@ -378,6 +436,68 @@ class A03AccessibilityRuntimeSmokeTest {
             "Timed out waiting for selector: $selector"
         }
 
+    private fun assertAdjustableTouchTarget(label: String, target: UiObject2) {
+        val minHeightPx = kotlin.math.ceil(
+            48f * appContext.resources.displayMetrics.density,
+        ).toInt()
+        assertTrue(
+            "$label touch target must be at least 48dp: ${target.visibleBounds}",
+            target.visibleBounds.height() >= minHeightPx,
+        )
+        assertEquals("$label must expose one adjustable node", "android.widget.SeekBar", target.className)
+        assertTrue(
+            "$label must expose ACTION_SET_PROGRESS",
+            accessibilityNodeHasAction(
+                target.contentDescription.orEmpty(),
+                AccessibilityNodeInfo.AccessibilityAction.ACTION_SET_PROGRESS.id,
+            ),
+        )
+    }
+
+    private fun accessibilityNodeHasAction(description: String, actionId: Int): Boolean {
+        return withAccessibilityNode(description) { node ->
+            node.actionList.any { it.id == actionId }
+        }
+    }
+
+    private fun performAccessibilityNodeAction(description: String, actionId: Int): Boolean {
+        return withAccessibilityNode(description) { node ->
+            node.performAction(actionId)
+        }
+    }
+
+    private fun withAccessibilityNode(
+        description: String,
+        block: (AccessibilityNodeInfo) -> Boolean,
+    ): Boolean {
+        clearAccessibilityCache()
+        val root = instrumentation.uiAutomation.rootInActiveWindow ?: return false
+        val pending = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        while (pending.isNotEmpty()) {
+            val node = pending.removeFirst()
+            if (node.contentDescription?.toString() == description) {
+                val result = block(node)
+                node.recycle()
+                pending.forEach(AccessibilityNodeInfo::recycle)
+                return result
+            }
+            repeat(node.childCount) { index ->
+                node.getChild(index)?.let(pending::addLast)
+            }
+            node.recycle()
+        }
+        return false
+    }
+
+    private fun clearAccessibilityCache() {
+        val automation = instrumentation.uiAutomation
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            automation.clearCache()
+        } else {
+            automation.serviceInfo = checkNotNull(automation.serviceInfo)
+        }
+    }
+
     private fun waitForConditionResult(
         message: String,
         timeoutMs: Long = UI_TIMEOUT_MS,
@@ -441,6 +561,7 @@ class A03AccessibilityRuntimeSmokeTest {
     private companion object {
         private const val DB_NAME = "readflow.db"
         private const val EPUB_READER_DESC = "阅读内容，捏合调整字号"
+        private const val READER_GUIDE_DESC = "阅读手势引导，点击开始阅读"
         private const val OPENING_PARAGRAPH = "A03 opening paragraph proves TalkBack-ready reader text."
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
         private val DB_TIMEOUT_MS = 12.seconds.inWholeMilliseconds

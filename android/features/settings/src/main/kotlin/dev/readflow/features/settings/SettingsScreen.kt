@@ -11,7 +11,7 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
@@ -24,6 +24,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -33,6 +36,7 @@ import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
 import dev.readflow.core.prefs.ReaderTypography
+import dev.readflow.core.ui.AccessibleSlider
 import dev.readflow.core.ui.FontProvider
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -177,24 +181,48 @@ fun SettingsScreen(
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text("设置") },
+                title = {
+                    Column {
+                        Text("设置", style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            "阅读与设备",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
                     }
                 },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                ),
             )
         },
     ) { padding ->
-        Column(
-            Modifier
+        Box(
+            modifier = Modifier
                 .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp),
+                .fillMaxSize(),
         ) {
+            Column(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .widthIn(max = 840.dp)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(24.dp),
+            ) {
+            SettingsSection(
+                title = "书源连接",
+                description = "连接局域网 Calibre，统一管理和下载藏书。",
+            ) {
             OutlinedTextField(
                 value = urlDraft,
                 onValueChange = {
@@ -249,32 +277,45 @@ fun SettingsScreen(
                     isError = true,
                 )
             }
+            }
 
+            SettingsSection(
+                title = "阅读体验",
+                description = "这些选项会立即应用到正文排版和阅读界面。",
+            ) {
             Text("字号：${fontSize}sp", style = MaterialTheme.typography.bodyMedium)
-            Slider(
+            AccessibleSlider(
                 value = ReaderTypography.clampFontSp(fontSize.toFloat()),
                 onValueChange = { vm.setFontSize(it.toInt()) },
                 valueRange = ReaderTypography.MIN_FONT_SP..ReaderTypography.MAX_FONT_SP,
                 steps = ReaderTypography.FONT_SLIDER_STEPS,
+                label = "字号",
+                valueDescription = "${fontSize}sp",
                 modifier = Modifier.fillMaxWidth(),
             )
             Text("这是 ${fontSize}sp 的正文效果。The quick brown fox.",
                 fontSize = fontSize.sp, color = MaterialTheme.colorScheme.onBackground)
 
             Text("行距：${"%.2f".format(lineSpacing)}x", style = MaterialTheme.typography.bodyMedium)
-            Slider(
+            AccessibleSlider(
                 value = ReaderTypography.clampLineSpacing(lineSpacing),
                 onValueChange = { vm.setLineSpacing(it) },
                 valueRange = ReaderTypography.MIN_LINE_SPACING..ReaderTypography.MAX_LINE_SPACING,
                 steps = ReaderTypography.LINE_SPACING_SLIDER_STEPS,
+                label = "行距",
+                valueDescription = "${"%.2f".format(lineSpacing)}倍",
                 modifier = Modifier.fillMaxWidth(),
             )
 
             Text("阅读模式", style = MaterialTheme.typography.bodyMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 ReaderReadingMode.entries.forEach { mode ->
-                    FilterChip(selected = readingMode == mode, onClick = { vm.setReadingMode(mode) },
-                        label = { Text(mode.label()) })
+                    FilterChip(
+                        selected = readingMode == mode,
+                        onClick = { vm.setReadingMode(mode) },
+                        label = { Text(mode.label()) },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    )
                 }
             }
 
@@ -287,14 +328,14 @@ fun SettingsScreen(
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(selected = fontChoice == FontChoice.System, onClick = { vm.setFontChoice(FontChoice.System) },
-                        label = { Text("系统宋体") })
+                        label = { Text("系统宋体") }, modifier = Modifier.heightIn(min = 48.dp))
                     FilterChip(selected = fontChoice == FontChoice.SourceHan, onClick = { vm.setFontChoice(FontChoice.SourceHan) },
-                        label = { Text("思源宋体（内置）") })
+                        label = { Text("思源宋体（内置）") }, modifier = Modifier.heightIn(min = 48.dp))
                 }
                 customFonts.forEach { name ->
                     val c = FontChoice.Custom(name)
                     FilterChip(selected = fontChoice == c, onClick = { vm.setFontChoice(c) },
-                        label = { Text(name) })
+                        label = { Text(name) }, modifier = Modifier.heightIn(min = 48.dp))
                 }
                 OutlinedButton(onClick = {
                     fontImportLauncher.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream"))
@@ -305,36 +346,40 @@ fun SettingsScreen(
             }
 
             Text("TXT 编码", style = MaterialTheme.typography.bodyMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 TxtEncoding.entries.forEach { enc ->
                     FilterChip(selected = txtEncoding == enc, onClick = { vm.setTxtEncoding(enc) },
-                        label = { Text(enc.label()) })
+                        label = { Text(enc.label()) }, modifier = Modifier.heightIn(min = 48.dp))
                 }
             }
 
             Text("主题", style = MaterialTheme.typography.bodyMedium)
-            Row(
+            FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 ThemeMode.entries.forEach { mode ->
                     FilterChip(selected = theme == mode, onClick = { vm.setTheme(mode) },
-                        label = { Text(mode.readerThemeLabel()) })
+                        label = { Text(mode.readerThemeLabel()) }, modifier = Modifier.heightIn(min = 48.dp))
                 }
             }
+            }
 
-            HorizontalDivider()
-
-            Text("同步", style = MaterialTheme.typography.bodyMedium)
+            SettingsSection(
+                title = "同步与备份",
+                description = "阅读记录优先保留在本地；备份可安全迁移进度、书签和标注。",
+            ) {
             ConnectionResultText(
                 title = syncStatus.title,
                 detail = syncStatus.detail,
                 isError = !syncStatus.isRemoteSyncEnabled,
             )
 
-            HorizontalDivider()
-
-            Text("备份", style = MaterialTheme.typography.bodyMedium)
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Text("完整备份", style = MaterialTheme.typography.titleSmall)
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -404,10 +449,13 @@ fun SettingsScreen(
                     isError = true,
                 )
             }
+            }
 
-            HorizontalDivider()
-
-            Text("导出笔记", style = MaterialTheme.typography.bodyMedium)
+            SettingsSection(
+                title = "数据与主题",
+                description = "将笔记导出为 Markdown，或迁移整套阅读主题。",
+            ) {
+            Text("阅读笔记", style = MaterialTheme.typography.titleSmall)
             OutlinedButton(
                 onClick = { notesExportLauncher.launch("LinReads 笔记.md") },
                 enabled = notesExportState !is BackupExportUiState.Exporting,
@@ -437,9 +485,9 @@ fun SettingsScreen(
                 )
             }
 
-            HorizontalDivider()
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-            Text("主题导入导出", style = MaterialTheme.typography.bodyMedium)
+            Text("主题方案", style = MaterialTheme.typography.titleSmall)
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -501,16 +549,18 @@ fun SettingsScreen(
                     isError = true,
                 )
             }
+            }
 
-            HorizontalDivider()
-
-            // 诊断：显示当前构建标识 + 更新日志
+            SettingsSection(
+                title = "关于与更新",
+                description = "查看当前构建，并在需要时检查开发版更新。",
+            ) {
             val buildNum = buildTag.removePrefix("dev-").substringBefore("-").takeIf { it.all { c -> c.isDigit() } }
             val tagDisplay = if (buildNum != null) "构建 #$buildNum" else buildTag
             Text(
                 text = tagDisplay,
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             // 始终显示缓存的更新日志（中文 commit message）
             if (cachedNotes.isNotBlank()) {
@@ -611,6 +661,47 @@ fun SettingsScreen(
                     TextButton(onClick = { updateState = UpdateState.Idle }) { Text("重试") }
                 }
             }
+            }
+            Spacer(Modifier.height(12.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsSection(
+    title: String,
+    description: String,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(
+            modifier = Modifier.padding(horizontal = 4.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+            Text(
+                text = description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 1.dp,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+                content = content,
+            )
         }
     }
 }
