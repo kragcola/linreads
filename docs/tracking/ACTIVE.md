@@ -3,20 +3,21 @@
 _最后更新：2026-07-12_
 
 Mode: `none`
-Objective: 当前无进行中主任务；Android Contemporary Editorial UI redesign 已完成并通过 AVD、单测、lint 与独立复审
-Active tracker: `none`
-Last completed tracker: [android-ui-reader-redesign-2026-07-12.md](android-ui-reader-redesign-2026-07-12.md)
+Objective: 无（Android 平板比例与 Reader 菜单卡顿已按 AVD fallback 验收收口）
+Active tracker: none
+Last completed tracker: [android-tablet-scale-reader-menu-jank-2026-07-12.md](android-tablet-scale-reader-menu-jank-2026-07-12.md)
 v4lite 执行文档: [../android-v4lite-plan.md](../android-v4lite-plan.md)
 纯阅读缺口验收表: [android-v4-pure-reading-gap-checklist.md](android-v4-pure-reading-gap-checklist.md)
 未完成项回填总表: [android-v4-pure-reading-unfinished-backfill.md](android-v4-pure-reading-unfinished-backfill.md)
 静读天下对比协议: [../research/moonreader-linreads-extreme-reading-comparison.md](../research/moonreader-linreads-extreme-reading-comparison.md)
 静读天下手感借鉴 backlog: [../research/moonreader-handfeel-borrowing-backlog-2026-07-02.md](../research/moonreader-handfeel-borrowing-backlog-2026-07-02.md)
-Test ledger: [android-ui-reader-redesign-2026-07-12.md#test-ledger](android-ui-reader-redesign-2026-07-12.md#test-ledger)
+Test ledger: [android-tablet-scale-reader-menu-jank-2026-07-12.md#test-ledger](android-tablet-scale-reader-menu-jank-2026-07-12.md#test-ledger)
 
 > ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
 ## 当前状态
 
+- 2026-07-12 tablet scale / reader menu jank（已收口，2026-07-13 获 OTA 发布授权）：360/800/1280dp 主页恢复 2/5/7 列与旧版多设备比例，设置密度收回且完整可见交互节点保持 48dp。Reader 采用固定 base chrome + sibling panel、150ms/12dp alpha+translation-only；退出内容保留、空白触摸拦截、横向 navigation inset 与共同退出短位移全部闭环。最终 598-task 门、Reader 83/83、独立复审无 P0/P1/P2；AVD 五类 panel 下 base bounds 最大差 0px，静态接缝 y=2166，157 个 Reader 交互节点均 >=48dp，空白不穿透。最终 chrome-open P95 155.75ms，较 baseline 231.76ms 改善 32.8%，但与 motion-only 155.94ms 持平且六类绝对 24ms 门均未过；明确归因 ANGLE/SwiftShader post-Sync 瓶颈，不宣称额外帧时收益。Reader critical log 0。边界：仅 AVD、gesture-nav 竖屏；三键侧栏/横屏 Reader、专用 panel-close 高帧率证据和物理设备手感未覆盖。未改阅读内核、翻页算法、locator 或正文手势路由；本批次随当前实现 commit 推送 `main` 并触发 `Android Dev Release`，发布身份以 workflow commit / BUILD_TAG / `dev-latest` 资产为准。
 - 2026-07-12 Android Contemporary Editorial UI redesign 已收口：书架改为 2/3/4/5 响应式网格并在 1120dp 限宽，阅读 chrome 压为可即时隐藏的顶部浮条 + 底部单一控制面，设置页重组为 5 个分组并在 840dp 限宽；Light/Dark/Sepia 容器色阶、低纸纹、无封面封套、底边进度和衬线/无衬线层级统一落地。无障碍复核闭环首次引导 TalkBack `ACTION_CLICK`、五个单一 48dp `SeekBar` + `ACTION_SET_PROGRESS`、TOC stale node、封面文字/进度对比、护眼黄 outline 与“纯黑”标签兼容。复审新增的限宽 Modifier 顺序和无封面作者暗角对比两项 P2 已修复；360dp、800dp 与 1280dp AVD 无溢出，最终 598-task 静态门 `BUILD SUCCESSFUL in 23s`，独立代码/视觉复审无 P0-P2，Design Audit 19/20。未修改阅读内核、翻页算法、locator 或正文手势路由；按用户要求未做实机，当前未提交、未推送、未发布 OTA。
 - 2026-07-12 A2 PAPER implementation：用户选择 A2 后，`PageCurlDrawable` 已从整页 `Camera.rotateY` 重写为 CoolReader `PAGE_ANIMATION_PAPER` 同源的三阶段局部正弦条带：可见弯曲带上限 30%，约 5px 等角度条带，1024 项 sin/asin/src/dst 预计算表，16 级预建高光/阴影，MOVE 不创建 Bitmap/Rect/Paint/Shader。SIMULATION 的拖动、点击/按键、章内与跨章已统一走该 2D renderer；`EpubReflowEngine` 不再创建 GL child，`EpubFlowView` 的 GL 状态机/timeout/conversion-owner/copy seam 已删除。章内缓存扩为 current+prev+next，方向确定时零复制转移当前页和目标页并回收未选侧；离散翻页同样消费缓存，静默 park 后仅在 settle 发布 locator，取消恢复原页。最终 review 已闭环 30% 临界闪帧、跨章首 MOVE 截图、失败销毁 target preview 三项 P1，以及重复 precache 覆盖/泄漏 P2；pending+generation 会合并重复任务并阻止 stale posted work 写回。phase-2 AndroidTest 已移除纯 GL retained-buffer/first-frame 用例，并迁移离散/rapid/Window/vertical/cold-first/direction 到 `PageCurlDrawable` + no legacy GL child。验证：EPUB 370 tests / 0 failures / 0 errors / 2 skipped；Reader 80/80；Animate 13/13；EPUB lint、AndroidTest Kotlin compile、debug APK assemble 和 `git diff --check` 成功；修正 baseline 前后 TextView 测试状态不一致的 flake 后，严格 Window+cold-first 连续 3 轮 6/6，完整 A2 targeted AVD `OK (6 tests)` / `73.19s`，关键 logcat 为空且无残留触摸。最终生产复核无 P0-P3；物理设备手感按用户要求未验证。A2 已提交为 `4cee1a3` 并推送 `main`，`Android Dev Release` run #202 成功发布且远端 OTA 身份、SHA-256、ZIP、包名、v2 签名、证书与内嵌 BUILD_TAG 全部验证通过。
 - 2026-07-12 mature renderer source audit：用户已明确不需要真实 3D，因此不再保留 TextureView/EGL harism 作为候选。固定源码复核 MoonReader、当前活跃 Legado、FBReaderJ、CoolReader、Readium Kotlin Toolkit 与 Librera 后，成熟默认路径收敛为 Cover/Slide/无动画；保留“仿真”辨识度时则用纯 2D 假卷页。当前只剩 architecture A 内的产品选择：A1 Cover（目标页静止、当前页跟手移出、边缘阴影，最轻最稳）或 A2 CoolReader PAPER 式局部条带弯曲（主体约 70% 保持平面，仅边缘最多 30% 用预计算正弦/反正弦条带压缩并叠加高光阴影，推荐用于保留仿真观感）。不再继续整页固定书脊 `rotateY`，也不移植真实 3D。选定后，SIMULATION 的手指拖动、点击/按键、章内和跨章统一走同一 2D renderer，消除当前软件拖动/harism 离散翻页的双 renderer 割裂；现有 warmed cache、零稳态分配与 velocity-aware Hermite settle 保留，并补齐章内双向预热。

@@ -1,31 +1,65 @@
 package dev.readflow.core.ui
 
+import androidx.compose.ui.unit.sp
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class LibraryGridLayoutTest {
 
     @Test
-    fun `compact phones keep two readable book columns`() {
+    fun `library grid restores phone tablet and expanded proportions`() {
         assertEquals(2, libraryGridColumns(360f))
-        assertEquals(2, libraryGridColumns(479f))
+        assertEquals(5, libraryGridColumns(800f))
+        assertEquals(7, libraryGridColumns(1_280f))
     }
 
     @Test
-    fun `medium screens add columns without shrinking covers`() {
-        assertEquals(3, libraryGridColumns(480f))
-        assertEquals(3, libraryGridColumns(719f))
+    fun `grid keeps covers near the previous multi-device scale`() {
+        assertEquals(150f, libraryGridLayout(360f).coverWidthDp, 0.001f)
+        assertEquals(132.8f, libraryGridLayout(800f).coverWidthDp, 0.001f)
+        assertEquals(130.2857f, libraryGridLayout(1_280f).coverWidthDp, 0.001f)
     }
 
     @Test
-    fun `tablet shelf uses four generous columns`() {
-        assertEquals(4, libraryGridColumns(720f))
-        assertEquals(4, libraryGridColumns(999f))
+    fun `expanded grid content width remains capped`() {
+        assertEquals(Dimens.maxContentWidth.value, libraryGridLayout(1_280f).effectiveWidthDp)
+        assertEquals(Dimens.maxContentWidth.value, libraryGridLayout(1_600f).effectiveWidthDp)
     }
 
     @Test
-    fun `expanded shelf caps density at five columns`() {
-        assertEquals(5, libraryGridColumns(1_000f))
-        assertEquals(5, libraryGridColumns(1_600f))
+    fun `tablet and expanded covers never become oversized`() {
+        val oversizedWidths = (600..1_600 step 40)
+            .map(Int::toFloat)
+            .associateWith { libraryGridLayout(it).coverWidthDp }
+            .filterValues { it > 156f }
+
+        assertTrue(
+            oversizedWidths.isEmpty(),
+            "Cover widths exceed 156dp: $oversizedWidths",
+        )
     }
+
+    @Test
+    fun `column count never decreases when the window grows across expanded gap`() {
+        val columns = (995..1_021).map { width -> libraryGridColumns(width.toFloat()) }
+
+        assertTrue(
+            columns.zipWithNext().all { (before, after) -> after >= before },
+            "Column count regressed across 995..1021dp: $columns",
+        )
+    }
+
+    @Test
+    fun `display type is compact enough for the library header`() {
+        assertEquals(26.sp, ReadflowType.display.fontSize)
+        assertEquals(34.sp, ReadflowType.display.lineHeight)
+    }
+
+    @Test
+    fun `title type retains the previous settings proportion`() {
+        assertEquals(22.sp, ReadflowType.title.fontSize)
+        assertEquals(30.sp, ReadflowType.title.lineHeight)
+    }
+
 }

@@ -14,15 +14,15 @@ object ReadflowType {
     val display = TextStyle(
         fontFamily = Serif,
         fontWeight = FontWeight.SemiBold,
-        fontSize = 34.sp,
-        lineHeight = 42.sp,
+        fontSize = 26.sp,
+        lineHeight = 34.sp,
     )
 
     val title = TextStyle(
         fontFamily = Serif,
         fontWeight = FontWeight.SemiBold,
-        fontSize = 26.sp,
-        lineHeight = 34.sp,
+        fontSize = 22.sp,
+        lineHeight = 30.sp,
     )
 
     val bookTitle = TextStyle(

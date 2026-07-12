@@ -26,11 +26,9 @@ object Dimens {
     /** 触摸目标下限。 */
     val touchTarget = 48.dp
 
-    // 自适应封面网格（§3.2）
-    /** 目标封面宽：手机 116dp。GridCells.Adaptive 用此值算列数。 */
-    val coverTargetWidthPhone = 144.dp
-    /** 目标封面宽：平板 132dp。 */
-    val coverTargetWidthTablet = 156.dp
+    /** 书架自适应网格允许的最小封面宽。 */
+    val coverMinWidth = 116.dp
+
     /** 封面宽高比固定 2:3。 */
     const val coverAspectRatio = 2f / 3f
 

@@ -184,16 +184,7 @@ fun SettingsScreen(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = {
-                    Column {
-                        Text("设置", style = MaterialTheme.typography.titleLarge)
-                        Text(
-                            "阅读与设备",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                },
+                title = { Text("设置", style = MaterialTheme.typography.titleLarge) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
@@ -216,12 +207,11 @@ fun SettingsScreen(
                     .widthIn(max = 840.dp)
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 20.dp, vertical = 20.dp),
-                verticalArrangement = Arrangement.spacedBy(24.dp),
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
             SettingsSection(
                 title = "书源连接",
-                description = "连接局域网 Calibre，统一管理和下载藏书。",
             ) {
             OutlinedTextField(
                 value = urlDraft,
@@ -281,7 +271,6 @@ fun SettingsScreen(
 
             SettingsSection(
                 title = "阅读体验",
-                description = "这些选项会立即应用到正文排版和阅读界面。",
             ) {
             Text("字号：${fontSize}sp", style = MaterialTheme.typography.bodyMedium)
             AccessibleSlider(
@@ -370,7 +359,6 @@ fun SettingsScreen(
 
             SettingsSection(
                 title = "同步与备份",
-                description = "阅读记录优先保留在本地；备份可安全迁移进度、书签和标注。",
             ) {
             ConnectionResultText(
                 title = syncStatus.title,
@@ -453,7 +441,6 @@ fun SettingsScreen(
 
             SettingsSection(
                 title = "数据与主题",
-                description = "将笔记导出为 Markdown，或迁移整套阅读主题。",
             ) {
             Text("阅读笔记", style = MaterialTheme.typography.titleSmall)
             OutlinedButton(
@@ -553,7 +540,6 @@ fun SettingsScreen(
 
             SettingsSection(
                 title = "关于与更新",
-                description = "查看当前构建，并在需要时检查开发版更新。",
             ) {
             val buildNum = buildTag.removePrefix("dev-").substringBefore("-").takeIf { it.all { c -> c.isDigit() } }
             val tagDisplay = if (buildNum != null) "构建 #$buildNum" else buildTag
@@ -671,35 +657,25 @@ fun SettingsScreen(
 @Composable
 private fun SettingsSection(
     title: String,
-    description: String,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Column(
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onBackground,
             modifier = Modifier.padding(horizontal = 4.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onBackground,
-            )
-            Text(
-                text = description,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+        )
         Surface(
             modifier = Modifier.fillMaxWidth(),
-            shape = MaterialTheme.shapes.medium,
+            shape = MaterialTheme.shapes.small,
             color = MaterialTheme.colorScheme.surface,
             tonalElevation = 1.dp,
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
-                modifier = Modifier.padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
                 content = content,
             )
         }

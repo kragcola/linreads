@@ -50,6 +50,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.floor
 
 /** 拖拽时手指命中的区域类型 */
 private enum class DragZone { GAP_ABOVE, BOOK, GAP_BELOW, CANCEL }
@@ -65,12 +66,38 @@ private val BookMeta.canRemoveDownload: Boolean
         downloadStatus == DownloadStatus.DOWNLOADED &&
         localUri != null
 
-internal fun libraryGridColumns(widthDp: Float): Int = when {
-    widthDp < 480f -> 2
-    widthDp < 720f -> 3
-    widthDp < 1_000f -> 4
-    else -> 5
+private const val LibraryExpandedGapMinWidthDp = 1_020f
+
+private fun libraryGridGapDp(widthDp: Float): Float = when {
+    widthDp < 600f -> Dimens.gridGapCompact.value
+    widthDp < LibraryExpandedGapMinWidthDp -> Dimens.gridGapMedium.value
+    else -> Dimens.gridGapExpanded.value
 }
+
+internal data class LibraryGridLayout(
+    val effectiveWidthDp: Float,
+    val gapDp: Float,
+    val columns: Int,
+    val coverWidthDp: Float,
+)
+
+internal fun libraryGridLayout(widthDp: Float): LibraryGridLayout {
+    val effectiveWidth = widthDp.coerceAtMost(Dimens.maxContentWidth.value)
+    val gap = libraryGridGapDp(effectiveWidth)
+    val usableWidth = (effectiveWidth - Dimens.screenEdge.value * 2f).coerceAtLeast(0f)
+    val columns = floor((usableWidth + gap) / (Dimens.coverMinWidth.value + gap))
+        .toInt()
+        .coerceAtLeast(1)
+    val coverWidth = (usableWidth - gap * (columns - 1)) / columns
+    return LibraryGridLayout(
+        effectiveWidthDp = effectiveWidth,
+        gapDp = gap,
+        columns = columns,
+        coverWidthDp = coverWidth.coerceAtLeast(0f),
+    )
+}
+
+internal fun libraryGridColumns(widthDp: Float): Int = libraryGridLayout(widthDp).columns
 
 /**
  * 书架网格，支持点击、拖拽重排、dwell 悬停建组。
@@ -99,12 +126,7 @@ fun BookGrid(
     val palette = readflowPalette
     val windowWidthPx = LocalWindowInfo.current.containerSize.width
     val screenWidthDp = with(LocalDensity.current) { windowWidthPx.toDp().value }
-    val gridColumns = libraryGridColumns(screenWidthDp)
-    val gridGap = when (gridColumns) {
-        2 -> Dimens.gridGapCompact
-        3, 4 -> Dimens.gridGapMedium
-        else -> Dimens.gridGapExpanded
-    }
+    val gridLayout = libraryGridLayout(screenWidthDp)
     val mutableItems = remember { mutableStateListOf(*items.toTypedArray()) }
     LaunchedEffect(items) {
         if (mutableItems.toList() != items) {
@@ -243,14 +265,14 @@ fun BookGrid(
     Box(modifier = modifier.fillMaxSize()) {
         LazyVerticalGrid(
             state = gridState,
-            columns = GridCells.Fixed(gridColumns),
+            columns = GridCells.Fixed(gridLayout.columns),
             contentPadding = PaddingValues(
                 start = Dimens.screenEdge,
-                top = Dimens.spaceLg,
+                top = Dimens.spaceMd,
                 end = Dimens.screenEdge,
                 bottom = Dimens.spaceXl,
             ),
-            horizontalArrangement = Arrangement.spacedBy(gridGap),
+            horizontalArrangement = Arrangement.spacedBy(gridLayout.gapDp.dp),
             verticalArrangement = Arrangement.spacedBy(Dimens.spaceXl),
             modifier = Modifier
                 .align(Alignment.TopCenter)

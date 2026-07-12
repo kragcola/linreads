@@ -17,6 +17,7 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -42,9 +43,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -58,6 +61,8 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -101,6 +106,9 @@ enum class ReaderFeature(val label: String) {
     FONT("排版"),
     THEME("主题"),
 }
+
+private val ReaderBottomChromeOuterPadding = 8.dp
+private val ReaderPanelBaseOverlap = 12.dp
 
 internal enum class ReaderHostKind { CONTINUOUS, PAGED }
 
@@ -155,6 +163,16 @@ fun ReaderScreen(
                     DisposableEffect(host) {
                         onDispose { host.unbind() }
                     }
+                    var bottomChromeHeightPx by remember { mutableIntStateOf(0) }
+                    val bottomChromeHeightDp = with(LocalDensity.current) {
+                        bottomChromeHeightPx.toDp()
+                    }
+                    val chromeOffsetPx = with(LocalDensity.current) {
+                        ReaderMenuMotionPolicy.panelTranslationDp.dp.roundToPx()
+                    }
+                    val panelBottomPadding = (
+                        bottomChromeHeightDp - ReaderBottomChromeOuterPadding - ReaderPanelBaseOverlap
+                    ).coerceAtLeast(0.dp)
 
                     // Document view — observe taps in dispatch, then pass events through to the engine view.
                     val zoomableEngine = engine as? ZoomableReaderEngine
@@ -250,8 +268,14 @@ fun ReaderScreen(
                     AnimatedVisibility(
                         visible = state.isUiVisible,
                         modifier = Modifier.align(Alignment.TopCenter),
-                        enter = slideInVertically { -it } + fadeIn(),
-                        exit = slideOutVertically { -it } + fadeOut(),
+                        enter = slideInVertically(
+                            animationSpec = tween(ReaderMenuMotionPolicy.durationMillis),
+                            initialOffsetY = { -chromeOffsetPx },
+                        ) + fadeIn(tween(ReaderMenuMotionPolicy.durationMillis)),
+                        exit = slideOutVertically(
+                            animationSpec = tween(ReaderMenuMotionPolicy.durationMillis),
+                            targetOffsetY = { -chromeOffsetPx },
+                        ) + fadeOut(tween(ReaderMenuMotionPolicy.durationMillis)),
                     ) {
                         Surface(
                             modifier = Modifier
@@ -299,12 +323,53 @@ fun ReaderScreen(
                         }
                     }
 
-                    // ── Bottom chrome: one compact floating control surface ──
+                    // Keep the variable-height panel independent from the fixed base chrome.
+                    ReaderControlPanel(
+                        panel = state.activePanel.takeIf { state.isUiVisible },
+                        fontSizeSp = state.fontSizeSp,
+                        lineSpacing = state.lineSpacing,
+                        readingMode = state.readingMode,
+                        supportedModes = state.supportedModes,
+                        pageFlipStyle = state.pageFlipStyle,
+                        themeMode = state.themeMode,
+                        searchState = state.search,
+                        bookmarkState = state.bookmarks,
+                        annotationState = state.annotations,
+                        onBookmarkClick = { viewModel.onIntent(ReaderIntent.GoToBookmark(it)) },
+                        onBookmarkRemove = { viewModel.onIntent(ReaderIntent.RemoveBookmark(it)) },
+                        onAnnotationClick = { viewModel.onIntent(ReaderIntent.GoToAnnotation(it)) },
+                        onSearchQueryChange = { viewModel.onIntent(ReaderIntent.SetSearchQuery(it)) },
+                        onSearchSubmit = { viewModel.onIntent(ReaderIntent.SubmitSearch) },
+                        onSearchResultClick = { viewModel.onIntent(ReaderIntent.GoToSearchResult(it)) },
+                        onSearchClear = { viewModel.onIntent(ReaderIntent.ClearSearch) },
+                        onFontSizeChange = { viewModel.onIntent(ReaderIntent.SetFontSize(it)) },
+                        onLineSpacingChange = { viewModel.onIntent(ReaderIntent.SetLineSpacing(it)) },
+                        onModeChange = { viewModel.onIntent(ReaderIntent.SetMode(it)) },
+                        onPageFlipStyleChange = { viewModel.onIntent(ReaderIntent.SetPageFlipStyle(it)) },
+                        onThemeChange = { viewModel.onIntent(ReaderIntent.SetTheme(it)) },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .windowInsetsPadding(
+                                WindowInsets.navigationBars.only(WindowInsetsSides.Horizontal),
+                            )
+                            .padding(horizontal = 10.dp)
+                            .padding(bottom = panelBottomPadding),
+                    )
+
+                    // ── Bottom chrome: stable compact control surface ──
                     AnimatedVisibility(
                         visible = state.isUiVisible,
-                        modifier = Modifier.align(Alignment.BottomCenter),
-                        enter = slideInVertically { it } + fadeIn(),
-                        exit = slideOutVertically { it } + fadeOut(),
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .onSizeChanged { bottomChromeHeightPx = it.height },
+                        enter = slideInVertically(
+                            animationSpec = tween(ReaderMenuMotionPolicy.durationMillis),
+                            initialOffsetY = { chromeOffsetPx },
+                        ) + fadeIn(tween(ReaderMenuMotionPolicy.durationMillis)),
+                        exit = slideOutVertically(
+                            animationSpec = tween(ReaderMenuMotionPolicy.durationMillis),
+                            targetOffsetY = { chromeOffsetPx },
+                        ) + fadeOut(tween(ReaderMenuMotionPolicy.durationMillis)),
                     ) {
                         val chapter by engine.chapterInfo.collectAsState()
                         val locator by engine.currentLocator.collectAsState()
@@ -318,7 +383,10 @@ fun ReaderScreen(
                         Surface(
                             modifier = Modifier
                                 .windowInsetsPadding(WindowInsets.navigationBars)
-                                .padding(horizontal = 10.dp, vertical = 8.dp)
+                                .padding(
+                                    horizontal = 10.dp,
+                                    vertical = ReaderBottomChromeOuterPadding,
+                                )
                                 .fillMaxWidth(),
                             shape = RoundedCornerShape(24.dp),
                             color = MaterialTheme.colorScheme.surface,
@@ -326,30 +394,6 @@ fun ReaderScreen(
                             tonalElevation = 3.dp,
                         ) {
                             Column(modifier = Modifier.fillMaxWidth()) {
-                                ReaderControlPanel(
-                                    panel = state.activePanel,
-                                    fontSizeSp = state.fontSizeSp,
-                                    lineSpacing = state.lineSpacing,
-                                    readingMode = state.readingMode,
-                                    supportedModes = state.supportedModes,
-                                    pageFlipStyle = state.pageFlipStyle,
-                                    themeMode = state.themeMode,
-                                    searchState = state.search,
-                                    bookmarkState = state.bookmarks,
-                                    annotationState = state.annotations,
-                                    onBookmarkClick = { viewModel.onIntent(ReaderIntent.GoToBookmark(it)) },
-                                    onBookmarkRemove = { viewModel.onIntent(ReaderIntent.RemoveBookmark(it)) },
-                                    onAnnotationClick = { viewModel.onIntent(ReaderIntent.GoToAnnotation(it)) },
-                                    onSearchQueryChange = { viewModel.onIntent(ReaderIntent.SetSearchQuery(it)) },
-                                    onSearchSubmit = { viewModel.onIntent(ReaderIntent.SubmitSearch) },
-                                    onSearchResultClick = { viewModel.onIntent(ReaderIntent.GoToSearchResult(it)) },
-                                    onSearchClear = { viewModel.onIntent(ReaderIntent.ClearSearch) },
-                                    onFontSizeChange = { viewModel.onIntent(ReaderIntent.SetFontSize(it)) },
-                                    onLineSpacingChange = { viewModel.onIntent(ReaderIntent.SetLineSpacing(it)) },
-                                    onModeChange = { viewModel.onIntent(ReaderIntent.SetMode(it)) },
-                                    onPageFlipStyleChange = { viewModel.onIntent(ReaderIntent.SetPageFlipStyle(it)) },
-                                    onThemeChange = { viewModel.onIntent(ReaderIntent.SetTheme(it)) },
-                                )
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -502,46 +546,83 @@ private fun ReaderControlPanel(
     onModeChange: (ReadingMode) -> Unit,
     onPageFlipStyleChange: (dev.readflow.core.model.PageFlipStyle) -> Unit,
     onThemeChange: (ThemeMode) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     // 目录改为左半屏抽屉（见 TocDrawer），底部面板不再承载 TOC。
-    AnimatedVisibility(visible = panel != null && panel != ReaderPanel.TOC) {
-        Column(
+    val panelOffsetPx = with(LocalDensity.current) {
+        ReaderMenuMotionPolicy.panelTranslationDp.dp.roundToPx()
+    }
+    val motionState = remember { ReaderPanelMotionState() }
+    val contentPanel = motionState.contentFor(panel)
+    SideEffect {
+        motionState.commit(panel)
+    }
+    AnimatedVisibility(
+        visible = panel != null && panel != ReaderPanel.TOC,
+        modifier = modifier,
+        enter = fadeIn(tween(ReaderMenuMotionPolicy.durationMillis)) + slideInVertically(
+            animationSpec = tween(ReaderMenuMotionPolicy.durationMillis),
+            initialOffsetY = { panelOffsetPx },
+        ),
+        exit = fadeOut(tween(ReaderMenuMotionPolicy.durationMillis)) + slideOutVertically(
+            animationSpec = tween(ReaderMenuMotionPolicy.durationMillis),
+            targetOffsetY = { panelOffsetPx },
+        ),
+    ) {
+        Surface(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.38f))
-                .padding(top = 4.dp),
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = {})
+                },
+            shape = RoundedCornerShape(
+                topStart = 24.dp,
+                topEnd = 24.dp,
+                bottomEnd = 0.dp,
+                bottomStart = 0.dp,
+            ),
+            color = MaterialTheme.colorScheme.surface,
+            shadowElevation = 10.dp,
+            tonalElevation = 3.dp,
         ) {
-            when (panel) {
-                ReaderPanel.TOC -> Unit
-                ReaderPanel.BOOKMARKS -> BookmarkPanel(
-                    bookmarkState = bookmarkState,
-                    onBookmarkClick = onBookmarkClick,
-                    onBookmarkRemove = onBookmarkRemove,
-                )
-                ReaderPanel.ANNOTATIONS -> AnnotationPanel(
-                    annotationState = annotationState,
-                    onAnnotationClick = onAnnotationClick,
-                )
-                ReaderPanel.SEARCH -> SearchPanel(
-                    searchState = searchState,
-                    onQueryChange = onSearchQueryChange,
-                    onSubmit = onSearchSubmit,
-                    onResultClick = onSearchResultClick,
-                    onClear = onSearchClear,
-                )
-                ReaderPanel.FONT -> FontPanel(
-                    fontSizeSp = fontSizeSp,
-                    lineSpacing = lineSpacing,
-                    readingMode = readingMode,
-                    supportedModes = supportedModes,
-                    pageFlipStyle = pageFlipStyle,
-                    onFontSizeChange = onFontSizeChange,
-                    onLineSpacingChange = onLineSpacingChange,
-                    onModeChange = onModeChange,
-                    onPageFlipStyleChange = onPageFlipStyleChange,
-                )
-                ReaderPanel.THEME -> ThemePanel(themeMode, onThemeChange)
-                null -> Unit
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.38f))
+                    .padding(top = 4.dp),
+            ) {
+                when (contentPanel) {
+                    ReaderPanel.TOC -> Unit
+                    ReaderPanel.BOOKMARKS -> BookmarkPanel(
+                        bookmarkState = bookmarkState,
+                        onBookmarkClick = onBookmarkClick,
+                        onBookmarkRemove = onBookmarkRemove,
+                    )
+                    ReaderPanel.ANNOTATIONS -> AnnotationPanel(
+                        annotationState = annotationState,
+                        onAnnotationClick = onAnnotationClick,
+                    )
+                    ReaderPanel.SEARCH -> SearchPanel(
+                        searchState = searchState,
+                        onQueryChange = onSearchQueryChange,
+                        onSubmit = onSearchSubmit,
+                        onResultClick = onSearchResultClick,
+                        onClear = onSearchClear,
+                    )
+                    ReaderPanel.FONT -> FontPanel(
+                        fontSizeSp = fontSizeSp,
+                        lineSpacing = lineSpacing,
+                        readingMode = readingMode,
+                        supportedModes = supportedModes,
+                        pageFlipStyle = pageFlipStyle,
+                        onFontSizeChange = onFontSizeChange,
+                        onLineSpacingChange = onLineSpacingChange,
+                        onModeChange = onModeChange,
+                        onPageFlipStyleChange = onPageFlipStyleChange,
+                    )
+                    ReaderPanel.THEME -> ThemePanel(themeMode, onThemeChange)
+                    null -> Unit
+                }
             }
         }
     }
@@ -798,8 +879,8 @@ private fun TocDrawer(
     }
     AnimatedVisibility(
         visible = visible,
-        enter = fadeIn(),
-        exit = fadeOut(),
+        enter = fadeIn(tween(ReaderMenuMotionPolicy.durationMillis)),
+        exit = fadeOut(tween(ReaderMenuMotionPolicy.durationMillis)),
     ) {
         Box(
             modifier = Modifier.fillMaxSize(),
@@ -825,8 +906,12 @@ private fun TocDrawer(
             )
             AnimatedVisibility(
                 visible = visible,
-                enter = slideInHorizontally { -it } + fadeIn(),
-                exit = slideOutHorizontally { -it } + fadeOut(),
+                enter = slideInHorizontally(
+                    animationSpec = tween(ReaderMenuMotionPolicy.durationMillis),
+                ) { -it } + fadeIn(tween(ReaderMenuMotionPolicy.durationMillis)),
+                exit = slideOutHorizontally(
+                    animationSpec = tween(ReaderMenuMotionPolicy.durationMillis),
+                ) { -it } + fadeOut(tween(ReaderMenuMotionPolicy.durationMillis)),
             ) {
                 Surface(
                     modifier = Modifier
