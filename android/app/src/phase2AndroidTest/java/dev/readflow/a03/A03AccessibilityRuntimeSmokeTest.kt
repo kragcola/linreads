@@ -100,14 +100,14 @@ class A03AccessibilityRuntimeSmokeTest {
 
             ensureChromeVisible()
             clickObject(By.desc("返回"))
-            waitForObject(By.desc("打开 $title，未知作者"))
+            waitForObject(By.desc("打开 $title"))
             val libraryCardDescription =
-                waitForObject(By.desc("打开 $title，未知作者")).contentDescription.orEmpty()
+                waitForObject(By.desc("打开 $title")).contentDescription.orEmpty()
             val libraryMenuDescription = waitForObject(By.desc("$title 的菜单")).contentDescription.orEmpty()
             takeScreenshot("library-book-card.png")
             dumpHierarchy("library-book-card.xml")
 
-            clickObject(By.desc("打开 $title，未知作者"))
+            clickObject(By.desc("打开 $title"))
             waitForObject(By.desc(EPUB_READER_DESC))
             waitForObject(By.textContains(OPENING_PARAGRAPH))
             ensureChromeVisible()
@@ -208,7 +208,7 @@ class A03AccessibilityRuntimeSmokeTest {
                 },
             )
 
-            assertEquals("打开 $title，未知作者", libraryCardDescription)
+            assertEquals("打开 $title", libraryCardDescription)
             assertEquals("$title 的菜单", libraryMenuDescription)
             assertEquals(EPUB_READER_DESC, readerSurfaceSummary.contentDescription)
             assertTrue(

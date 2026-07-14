@@ -72,14 +72,62 @@ interface BookDao {
     @Query("UPDATE books SET title = :title WHERE id = :id")
     suspend fun updateTitle(id: String, title: String)
 
-    @Query("UPDATE books SET collectionName = :name WHERE id = :id")
-    suspend fun updateCollectionName(id: String, name: String?)
+    @Query("UPDATE books SET collectionId = :collectionId, collectionName = :name WHERE id = :id")
+    suspend fun updateCollection(
+        id: String,
+        collectionId: String?,
+        name: String?,
+    ): Int
 
-    @Query("UPDATE books SET collectionName = :newName WHERE collectionName = :oldName")
-    suspend fun renameCollection(oldName: String, newName: String)
+    @Query(
+        """
+        UPDATE books
+        SET collectionId = :targetCollectionId,
+            collectionName = (
+                SELECT collectionName
+                FROM books
+                WHERE collectionId = :targetCollectionId
+                LIMIT 1
+            )
+        WHERE id = :sourceId
+          AND collectionId IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM books
+              WHERE collectionId = :targetCollectionId
+                AND id != :sourceId
+          )
+        """,
+    )
+    suspend fun moveToGroup(sourceId: String, targetCollectionId: String): Int
 
-    @Query("UPDATE books SET collectionName = NULL WHERE collectionName = :name")
-    suspend fun clearCollection(name: String)
+    @Query(
+        """
+        UPDATE books
+        SET collectionId = :collectionId,
+            collectionName = :name
+        WHERE id IN (:sourceId, :targetId)
+          AND collectionId IS NULL
+          AND (
+              SELECT COUNT(*)
+              FROM books
+              WHERE id IN (:sourceId, :targetId)
+                AND collectionId IS NULL
+          ) = 2
+        """,
+    )
+    suspend fun createGroup(
+        sourceId: String,
+        targetId: String,
+        collectionId: String,
+        name: String,
+    ): Int
+
+    @Query("UPDATE books SET collectionName = :newName WHERE collectionId = :collectionId")
+    suspend fun renameCollection(collectionId: String, newName: String): Int
+
+    @Query("UPDATE books SET collectionId = NULL, collectionName = NULL WHERE collectionId = :collectionId")
+    suspend fun clearCollection(collectionId: String): Int
 
     @Query("UPDATE books SET sortOrder = :order WHERE id = :id")
     suspend fun updateSortOrder(id: String, order: Int)

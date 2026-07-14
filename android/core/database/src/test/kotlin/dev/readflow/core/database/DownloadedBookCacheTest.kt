@@ -4,10 +4,13 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -108,6 +111,7 @@ class DownloadedBookCacheTest {
                 downloadStatus = DownloadStatus.DOWNLOADED.name,
                 localUri = "file:///books/local-txt-stable.txt",
                 lastReadAt = 1234L,
+                collectionId = "group-offline",
                 collectionName = "Offline",
                 sortOrder = 7,
             ),
@@ -130,6 +134,7 @@ class DownloadedBookCacheTest {
         assertEquals("User renamed title", book?.title)
         assertEquals("Reader", book?.author)
         assertEquals(1234L, book?.lastReadAt)
+        assertEquals("group-offline", book?.collectionId)
         assertEquals("Offline", book?.collectionName)
         assertEquals(7, book?.sortOrder)
     }
@@ -147,6 +152,7 @@ class DownloadedBookCacheTest {
                 downloadStatus = DownloadStatus.DOWNLOADED.name,
                 localUri = "file:///books/local-txt-stable.txt",
                 lastReadAt = 1234L,
+                collectionId = "group-offline",
                 collectionName = "Offline",
                 sortOrder = 7,
             ),
@@ -169,8 +175,125 @@ class DownloadedBookCacheTest {
         assertEquals("User renamed title", book?.title)
         assertEquals("Reader", book?.author)
         assertEquals(1234L, book?.lastReadAt)
+        assertEquals("group-offline", book?.collectionId)
         assertEquals("Offline", book?.collectionName)
         assertEquals(7, book?.sortOrder)
+    }
+
+    @Test
+    fun repositorySerializesGroupCreationWithShelfUpsert() = runTest {
+        val dao = FakeBookDao()
+        val repository = LibraryRepository(dao, RecordingCache())
+        dao.upsert(shelfEntity(id = "source", title = "Source", lastReadAt = null))
+        dao.upsert(shelfEntity(id = "target", title = "Target", lastReadAt = null, sortOrder = 1))
+        val upsertReadStarted = CompletableDeferred<Unit>()
+        val allowUpsertToContinue = CompletableDeferred<Unit>()
+        dao.beforeGetById = {
+            upsertReadStarted.complete(Unit)
+            allowUpsertToContinue.await()
+        }
+
+        val upsertJob = launch {
+            repository.upsertBook(
+                BookMeta(
+                    id = "source",
+                    title = "Refreshed Source",
+                    author = "Author",
+                    format = BookFormat.EPUB,
+                    downloadStatus = DownloadStatus.DOWNLOADED,
+                ),
+            )
+        }
+        upsertReadStarted.await()
+        val createGroupJob = launch {
+            repository.createGroup("source", "target", "Reading List")
+        }
+        yield()
+        val groupWriteRanWhileUpsertWasBlocked = dao.createGroupCalls > 0
+
+        allowUpsertToContinue.complete(Unit)
+        upsertJob.join()
+        createGroupJob.join()
+
+        assertFalse(groupWriteRanWhileUpsertWasBlocked)
+        assertEquals("Reading List", dao.book("source")?.collectionName)
+        assertEquals("Reading List", dao.book("target")?.collectionName)
+    }
+
+    @Test
+    fun repositorySerializesMoveToGroupWithShelfUpsert() = runTest {
+        val dao = FakeBookDao()
+        val repository = LibraryRepository(dao, RecordingCache())
+        dao.upsert(shelfEntity(id = "source", title = "Source", lastReadAt = null))
+        dao.upsert(
+            shelfEntity(
+                id = "target-member",
+                title = "Target",
+                lastReadAt = null,
+                collectionId = "Reading List",
+                collectionName = "Reading List",
+                sortOrder = 1,
+            ),
+        )
+        val upsertReadStarted = CompletableDeferred<Unit>()
+        val allowUpsertToContinue = CompletableDeferred<Unit>()
+        dao.beforeGetById = {
+            upsertReadStarted.complete(Unit)
+            allowUpsertToContinue.await()
+        }
+
+        val upsertJob = launch {
+            repository.upsertBook(
+                BookMeta(
+                    id = "source",
+                    title = "Refreshed Source",
+                    author = "Author",
+                    format = BookFormat.EPUB,
+                    downloadStatus = DownloadStatus.DOWNLOADED,
+                ),
+            )
+        }
+        upsertReadStarted.await()
+        val moveJob = launch {
+            repository.moveToGroup("source", "Reading List")
+        }
+        yield()
+        val groupWriteRanWhileUpsertWasBlocked = dao.updateCollectionNameCalls > 0
+
+        allowUpsertToContinue.complete(Unit)
+        upsertJob.join()
+        moveJob.join()
+
+        assertFalse(groupWriteRanWhileUpsertWasBlocked)
+        assertEquals("Reading List", dao.book("source")?.collectionName)
+    }
+
+    @Test
+    fun repositoryRejectsRenameWhenTheGroupDisappeared() = runTest {
+        val repository = LibraryRepository(FakeBookDao(), RecordingCache())
+
+        val failure = runCatching {
+            repository.renameBundle("Missing Group", "Renamed Group")
+        }.exceptionOrNull()
+
+        assertTrue(
+            "renaming a missing group must fail as a recoverable state change",
+            failure is IllegalStateException && failure.message?.contains("状态已变化") == true,
+        )
+    }
+
+    @Test
+    fun repositoryRejectsUngroupWhenTheGroupDisappeared() = runTest {
+        val repository = LibraryRepository(FakeBookDao(), RecordingCache())
+
+        val failure = runCatching {
+            repository.ungroupBundle("Missing Group")
+        }.exceptionOrNull()
+
+        assertTrue(
+            "ungrouping a missing group must fail as a recoverable state change",
+            failure is IllegalStateException && failure.message?.contains("状态已变化") == true,
+        )
     }
 
     @Test
@@ -309,6 +432,9 @@ class DownloadedBookCacheTest {
 
     private class FakeBookDao : BookDao {
         private val books = mutableMapOf<String, BookEntity>()
+        var beforeGetById: (suspend () -> Unit)? = null
+        var createGroupCalls: Int = 0
+        var updateCollectionNameCalls: Int = 0
         override fun observeAll(): Flow<List<BookEntity>> = MutableStateFlow(books.values.toList())
         override fun observeShelf(): Flow<List<BookWithProgress>> = MutableStateFlow(
             books.values
@@ -336,7 +462,10 @@ class DownloadedBookCacheTest {
         override suspend fun upsertAll(books: List<BookEntity>) {
             books.forEach { upsert(it) }
         }
-        override suspend fun getById(id: String): BookEntity? = books[id]
+        override suspend fun getById(id: String): BookEntity? {
+            beforeGetById?.invoke()
+            return books[id]
+        }
         override suspend fun setLastReadAt(id: String, ts: Long) {
             books[id]?.let { books[id] = it.copy(lastReadAt = ts) }
         }
@@ -355,18 +484,63 @@ class DownloadedBookCacheTest {
         override suspend fun updateTitle(id: String, title: String) {
             books[id]?.let { books[id] = it.copy(title = title) }
         }
-        override suspend fun updateCollectionName(id: String, name: String?) {
-            books[id]?.let { books[id] = it.copy(collectionName = name) }
+        override suspend fun updateCollection(
+            id: String,
+            collectionId: String?,
+            name: String?,
+        ): Int {
+            updateCollectionNameCalls++
+            val book = books[id] ?: return 0
+            books[id] = book.copy(collectionId = collectionId, collectionName = name)
+            return 1
         }
-        override suspend fun renameCollection(oldName: String, newName: String) {
-            books.replaceAll { _, book ->
-                if (book.collectionName == oldName) book.copy(collectionName = newName) else book
-            }
+        override suspend fun moveToGroup(sourceId: String, targetCollectionId: String): Int {
+            val source = books[sourceId] ?: return 0
+            if (source.collectionId != null) return 0
+            val target = books.values.firstOrNull {
+                it.id != sourceId && it.collectionId == targetCollectionId
+            } ?: return 0
+            books[sourceId] = source.copy(
+                collectionId = targetCollectionId,
+                collectionName = target.collectionName,
+            )
+            updateCollectionNameCalls++
+            return 1
         }
-        override suspend fun clearCollection(name: String) {
-            books.replaceAll { _, book ->
-                if (book.collectionName == name) book.copy(collectionName = null) else book
+        override suspend fun createGroup(
+            sourceId: String,
+            targetId: String,
+            collectionId: String,
+            name: String,
+        ): Int {
+            createGroupCalls++
+            val source = books[sourceId]
+            val target = books[targetId]
+            if (source?.collectionId != null || target?.collectionId != null || sourceId == targetId) {
+                return 0
             }
+            if (source == null || target == null) return 0
+            updateCollection(sourceId, collectionId, name)
+            updateCollection(targetId, collectionId, name)
+            return 2
+        }
+        override suspend fun renameCollection(collectionId: String, newName: String): Int {
+            val affected = books.values.count { it.collectionId == collectionId }
+            books.replaceAll { _, book ->
+                if (book.collectionId == collectionId) book.copy(collectionName = newName) else book
+            }
+            return affected
+        }
+        override suspend fun clearCollection(collectionId: String): Int {
+            val affected = books.values.count { it.collectionId == collectionId }
+            books.replaceAll { _, book ->
+                if (book.collectionId == collectionId) {
+                    book.copy(collectionId = null, collectionName = null)
+                } else {
+                    book
+                }
+            }
+            return affected
         }
         override suspend fun updateSortOrder(id: String, order: Int) {
             books[id]?.let { books[id] = it.copy(sortOrder = order) }
@@ -379,6 +553,7 @@ class DownloadedBookCacheTest {
         title: String,
         lastReadAt: Long?,
         collectionName: String? = null,
+        collectionId: String? = collectionName,
         sortOrder: Int = 0,
     ) = BookEntity(
         id = id,
@@ -387,6 +562,7 @@ class DownloadedBookCacheTest {
         format = BookFormat.EPUB.name,
         downloadStatus = DownloadStatus.DOWNLOADED.name,
         lastReadAt = lastReadAt,
+        collectionId = collectionId,
         collectionName = collectionName,
         sortOrder = sortOrder,
     )

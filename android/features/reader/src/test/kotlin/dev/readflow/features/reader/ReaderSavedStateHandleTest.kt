@@ -1572,9 +1572,20 @@ class ReaderSavedStateHandleTest {
             books.remove(id)
         }
         override suspend fun updateTitle(id: String, title: String) = Unit
-        override suspend fun updateCollectionName(id: String, name: String?) = Unit
-        override suspend fun renameCollection(oldName: String, newName: String) = Unit
-        override suspend fun clearCollection(name: String) = Unit
+        override suspend fun updateCollection(
+            id: String,
+            collectionId: String?,
+            name: String?,
+        ): Int = 1
+        override suspend fun moveToGroup(sourceId: String, targetCollectionId: String): Int = 1
+        override suspend fun createGroup(
+            sourceId: String,
+            targetId: String,
+            collectionId: String,
+            name: String,
+        ): Int = 2
+        override suspend fun renameCollection(collectionId: String, newName: String): Int = 0
+        override suspend fun clearCollection(collectionId: String): Int = 0
         override suspend fun updateSortOrder(id: String, order: Int) = Unit
     }
 

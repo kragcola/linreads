@@ -144,7 +144,7 @@ class CalibreGroupedRuntimeSmokeTest {
             waitForObject(By.text("关闭")).click()
             waitForObject(By.text("Remote EPUB Smoke"))
             val shelfCardDescription =
-                waitForObject(By.desc("打开 Remote EPUB Smoke，Calibre")).contentDescription
+                waitForObject(By.desc("打开 Remote EPUB Smoke")).contentDescription
             dumpHierarchy("shelf-after-download.xml")
 
             shutdownFakeCalibreServer()

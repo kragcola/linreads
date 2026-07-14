@@ -259,7 +259,13 @@ class LibraryViewModelTest {
         val remoteOnly = remoteBook("43", "Remote Only")
         val store = FakeLibraryStore(
             initialItems = listOf(
-                LibraryItem.Bundle(BookBundle("Mixed", listOf(localBook, remoteOnly))),
+                LibraryItem.Bundle(
+                    BookBundle(
+                        id = "Mixed",
+                        name = "Mixed",
+                        books = listOf(localBook, remoteOnly),
+                    ),
+                ),
             ),
         )
         val viewModel = viewModel(store = store)
@@ -274,6 +280,41 @@ class LibraryViewModelTest {
     }
 
     @Test
+    fun deleteBundleRemovesAllOriginalMembersWhenOfflineFilterHidesRemoteMembers() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val collectionId = "collection-mixed-delete"
+        val remoteBefore = remoteBook("remote-before", "Remote Before")
+        val offlineMember = localBook("offline-member", "Offline Member")
+        val remoteAfter = remoteBook("remote-after", "Remote After")
+        val originalBooks = listOf(remoteBefore, offlineMember, remoteAfter)
+        val store = FakeLibraryStore(
+            initialItems = listOf(
+                LibraryItem.Bundle(
+                    BookBundle(
+                        id = collectionId,
+                        name = "Mixed Delete",
+                        books = originalBooks,
+                    ),
+                ),
+            ),
+        )
+        val viewModel = viewModel(store = store)
+        advanceUntilIdle()
+
+        viewModel.setLibraryFilter(LibraryFilter.OFFLINE)
+        advanceUntilIdle()
+
+        val visibleBundle = viewModel.uiState.value.items.single() as LibraryItem.Bundle
+        assertEquals(collectionId, visibleBundle.bundle.id)
+        assertEquals(listOf(offlineMember.id), visibleBundle.bundle.books.map { it.id })
+
+        viewModel.deleteBundle(collectionId, BookRemovalMode.REMOVE_FROM_SHELF)
+        advanceUntilIdle()
+
+        assertEquals(originalBooks.map { it.id }, store.removedFromShelfIds)
+    }
+
+    @Test
     fun reorderPersistsOneFlattenedShelfOrder() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val first = localBook("first", "First")
@@ -285,7 +326,13 @@ class LibraryViewModelTest {
         viewModel.reorder(
             listOf(
                 LibraryItem.Single(first),
-                LibraryItem.Bundle(BookBundle("Group", listOf(groupedA, groupedB))),
+                LibraryItem.Bundle(
+                    BookBundle(
+                        id = "Group",
+                        name = "Group",
+                        books = listOf(groupedA, groupedB),
+                    ),
+                ),
             ),
         )
         advanceUntilIdle()
@@ -325,6 +372,226 @@ class LibraryViewModelTest {
         )
     }
 
+    @Test
+    fun offlineReorderKeepsSameNameBundlesDistinctByBundleId() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstBundleBook = localBook("first-bundle-book", "First Bundle Book")
+        val secondBundleBook = localBook("second-bundle-book", "Second Bundle Book")
+        val hiddenRemote = remoteBook("hidden-remote", "Hidden Remote")
+        val firstBundle = BookBundle(
+            id = "first-bundle",
+            name = "Same Name",
+            books = listOf(firstBundleBook),
+        )
+        val secondBundle = BookBundle(
+            id = "second-bundle",
+            name = "Same Name",
+            books = listOf(secondBundleBook),
+        )
+        val store = FakeLibraryStore(
+            initialItems = listOf(
+                LibraryItem.Bundle(firstBundle),
+                LibraryItem.Single(hiddenRemote),
+                LibraryItem.Bundle(secondBundle),
+            ),
+        )
+        val viewModel = viewModel(store = store)
+        advanceUntilIdle()
+
+        viewModel.setLibraryFilter(LibraryFilter.OFFLINE)
+        advanceUntilIdle()
+        viewModel.reorder(
+            listOf(
+                LibraryItem.Bundle(secondBundle),
+                LibraryItem.Bundle(firstBundle),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(listOf("second-bundle-book", "hidden-remote", "first-bundle-book")),
+            store.savedShelfOrders,
+        )
+    }
+
+    @Test
+    fun reorderFailurePublishesARecoverableNotice() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore(
+            updateShelfOrderFailure = IllegalStateException("书架状态已变化，请重试"),
+        )
+        val viewModel = viewModel(store = store)
+        var completed: Boolean? = null
+
+        viewModel.reorder(
+            listOf(LibraryItem.Single(localBook("source-book", "Source"))),
+        ) { completed = it }
+        advanceUntilIdle()
+
+        assertTrue(
+            "reorder failure must surface a retryable notice",
+            viewModel.uiState.value.notice?.contains("书架状态已变化，请重试") == true,
+        )
+        assertEquals(false, completed)
+    }
+
+    @Test
+    fun reorderSuccessCompletesWithTrue() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val viewModel = viewModel()
+        var completed: Boolean? = null
+
+        viewModel.reorder(
+            listOf(LibraryItem.Single(localBook("source-book", "Source"))),
+        ) { completed = it }
+        advanceUntilIdle()
+
+        assertEquals(true, completed)
+    }
+
+    @Test
+    fun ungroupFailurePublishesARecoverableNotice() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore(
+            ungroupBundleFailure = IllegalStateException("书组状态已变化，请重试"),
+        )
+        val viewModel = viewModel(store = store)
+        var completed: Boolean? = null
+
+        viewModel.ungroupBundle("Reading List") { completed = it }
+        advanceUntilIdle()
+
+        assertTrue(
+            "ungroup failure must surface a retryable notice",
+            viewModel.uiState.value.notice?.contains("书组状态已变化，请重试") == true,
+        )
+        assertEquals(false, completed)
+    }
+
+    @Test
+    fun ungroupSuccessCompletesWithTrue() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore()
+        val viewModel = viewModel(store = store)
+        var completed: Boolean? = null
+
+        viewModel.ungroupBundle("collection-reading-list") { completed = it }
+        advanceUntilIdle()
+
+        assertEquals(true, completed)
+        assertEquals(listOf("collection-reading-list"), store.ungroupedCollectionIds)
+    }
+
+    @Test
+    fun renameBundleFailurePublishesARecoverableNotice() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore(
+            renameBundleFailure = IllegalStateException("书组状态已变化，请重试"),
+        )
+        val viewModel = viewModel(store = store)
+        var completed: Boolean? = null
+
+        viewModel.renameBundle("Reading List", "Renamed List") { completed = it }
+        advanceUntilIdle()
+
+        assertTrue(
+            "rename failure must surface a retryable notice",
+            viewModel.uiState.value.notice?.contains("书组状态已变化，请重试") == true,
+        )
+        assertEquals(false, completed)
+    }
+
+    @Test
+    fun renameBundleSuccessCompletesWithTrue() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore()
+        val viewModel = viewModel(store = store)
+        var completed: Boolean? = null
+
+        viewModel.renameBundle("collection-reading-list", "Renamed List") { completed = it }
+        advanceUntilIdle()
+
+        assertEquals(true, completed)
+        assertEquals(
+            listOf("collection-reading-list" to "Renamed List"),
+            store.renamedBundleCalls,
+        )
+    }
+
+    @Test
+    fun createGroupDelegatesToOneAtomicStoreOperation() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore()
+        val viewModel = viewModel(store = store)
+
+        viewModel.createGroup(
+            sourceId = "source-book",
+            targetId = "target-book",
+            name = "Reading List",
+        )
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(Triple("source-book", "target-book", "Reading List")),
+            store.createdGroupCalls,
+        )
+        assertEquals(emptyList<Triple<String, String?, String?>>(), store.setCollectionCalls)
+    }
+
+    @Test
+    fun createGroupFailurePublishesARecoverableNotice() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore(
+            createGroupFailure = IllegalStateException("书籍状态已变化，请重试"),
+        )
+        val viewModel = viewModel(store = store)
+
+        viewModel.createGroup(
+            sourceId = "source-book",
+            targetId = "target-book",
+            name = "Reading List",
+        )
+        advanceUntilIdle()
+
+        assertEquals(
+            "建组失败：书籍状态已变化，请重试",
+            viewModel.uiState.value.notice,
+        )
+    }
+
+    @Test
+    fun moveToGroupFailurePublishesARecoverableNotice() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore(
+            moveToGroupFailure = IllegalStateException("书籍状态已变化，请重试"),
+        )
+        val viewModel = viewModel(store = store)
+        var completed: Boolean? = null
+
+        viewModel.moveToGroup("source-book", "Reading List") { completed = it }
+        advanceUntilIdle()
+
+        assertEquals(
+            "移动到书组失败：书籍状态已变化，请重试",
+            viewModel.uiState.value.notice,
+        )
+        assertEquals(false, completed)
+    }
+
+    @Test
+    fun moveToGroupSuccessCompletesAfterTheStoreWrite() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val store = FakeLibraryStore()
+        val viewModel = viewModel(store = store)
+        var completed: Boolean? = null
+
+        viewModel.moveToGroup("source-book", "collection-reading-list") { completed = it }
+        advanceUntilIdle()
+
+        assertEquals(listOf("source-book" to "collection-reading-list"), store.movedToGroupCalls)
+        assertEquals(true, completed)
+    }
+
     private fun viewModel(
         store: FakeLibraryStore = FakeLibraryStore(),
         settings: FakeSettingsRepository = FakeSettingsRepository(),
@@ -342,6 +609,11 @@ class LibraryViewModelTest {
         initialItems: List<LibraryItem> = emptyList(),
         private val removeDownloadedAssetResult: Boolean = false,
         private val deleteFailure: Throwable? = null,
+        private val createGroupFailure: Throwable? = null,
+        private val moveToGroupFailure: Throwable? = null,
+        private val updateShelfOrderFailure: Throwable? = null,
+        private val renameBundleFailure: Throwable? = null,
+        private val ungroupBundleFailure: Throwable? = null,
     ) : LibraryStore {
         private val shelf = MutableStateFlow(initialItems)
         val upsertedBooks = mutableListOf<BookMeta>()
@@ -349,6 +621,11 @@ class LibraryViewModelTest {
         val removedFromShelfIds = mutableListOf<String>()
         val deletedCompletelyIds = mutableListOf<String>()
         val savedShelfOrders = mutableListOf<List<String>>()
+        val createdGroupCalls = mutableListOf<Triple<String, String, String>>()
+        val setCollectionCalls = mutableListOf<Triple<String, String?, String?>>()
+        val movedToGroupCalls = mutableListOf<Pair<String, String>>()
+        val renamedBundleCalls = mutableListOf<Pair<String, String>>()
+        val ungroupedCollectionIds = mutableListOf<String>()
 
         override fun observeShelf(): Flow<List<LibraryItem>> = shelf
         override suspend fun count(): Int = upsertedBooks.size
@@ -369,10 +646,27 @@ class LibraryViewModelTest {
             return removeDownloadedAssetResult
         }
         override suspend fun renameBook(id: String, title: String) = Unit
-        override suspend fun setCollection(id: String, name: String?) = Unit
-        override suspend fun renameBundle(oldName: String, newName: String) = Unit
-        override suspend fun ungroupBundle(name: String) = Unit
+        override suspend fun setCollection(id: String, collectionId: String?, name: String?) {
+            setCollectionCalls += Triple(id, collectionId, name)
+        }
+        override suspend fun moveToGroup(sourceId: String, targetCollectionId: String) {
+            moveToGroupFailure?.let { throw it }
+            movedToGroupCalls += sourceId to targetCollectionId
+        }
+        override suspend fun createGroup(sourceId: String, targetId: String, name: String) {
+            createGroupFailure?.let { throw it }
+            createdGroupCalls += Triple(sourceId, targetId, name)
+        }
+        override suspend fun renameBundle(collectionId: String, newName: String) {
+            renameBundleFailure?.let { throw it }
+            renamedBundleCalls += collectionId to newName
+        }
+        override suspend fun ungroupBundle(collectionId: String) {
+            ungroupBundleFailure?.let { throw it }
+            ungroupedCollectionIds += collectionId
+        }
         override suspend fun updateShelfOrder(ids: List<String>) {
+            updateShelfOrderFailure?.let { throw it }
             savedShelfOrders += ids
         }
 

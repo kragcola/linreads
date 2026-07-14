@@ -13,6 +13,7 @@ import dev.readflow.core.database.CoroutineBookAssetOperationCoordinator
 import dev.readflow.core.database.FileManagedBookAssetDeletionStore
 import dev.readflow.core.database.LibraryDeletionTransactionRunner
 import dev.readflow.core.database.ReadflowDatabase
+import dev.readflow.core.database.MIGRATION_4_5
 import dev.readflow.core.prefs.DataStoreSettingsRepository
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.model.BookAssetOperationCoordinator
@@ -52,7 +53,7 @@ val databaseModule = module {
             ReadflowDatabase::class.java,
             "readflow.db",
         )
-            .fallbackToDestructiveMigration(dropAllTables = true) // Phase 1: schema 不稳定，简化为销毁重建
+            .addMigrations(MIGRATION_4_5)
             .build()
     }
     single { get<ReadflowDatabase>().bookDao() }

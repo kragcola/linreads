@@ -157,21 +157,40 @@ class LibraryViewModel(
 
     fun deleteBook(id: String, mode: BookRemovalMode) {
         viewModelScope.launch {
-            runCatching {
+            deleteBooks(listOf(id), mode)
+        }
+    }
+
+    fun deleteBundle(collectionId: String, mode: BookRemovalMode) {
+        viewModelScope.launch {
+            val bookIds = allShelfItems
+                .filterIsInstance<LibraryItem.Bundle>()
+                .firstOrNull { it.bundle.id == collectionId }
+                ?.bundle
+                ?.books
+                ?.map(BookMeta::id)
+                .orEmpty()
+            deleteBooks(bookIds, mode)
+        }
+    }
+
+    private suspend fun deleteBooks(ids: List<String>, mode: BookRemovalMode) {
+        runCatching {
+            ids.forEach { id ->
                 assetOperations.delete(id) {
                     when (mode) {
                         BookRemovalMode.REMOVE_FROM_SHELF -> repository.deleteBook(id)
                         BookRemovalMode.DELETE_ALL -> repository.deleteBookCompletely(id)
                     }
                 }
-            }.onFailure { error ->
-                if (error is CancellationException) throw error
-                clearDeleteFailureOnNextShelfEmission = true
-                _uiState.value = _uiState.value.copy(
-                    error = error.message ?: "删除失败",
-                    notice = "删除失败：${error.message ?: "请稍后重试"}",
-                )
             }
+        }.onFailure { error ->
+            if (error is CancellationException) throw error
+            clearDeleteFailureOnNextShelfEmission = true
+            _uiState.value = _uiState.value.copy(
+                error = error.message ?: "删除失败",
+                notice = "删除失败：${error.message ?: "请稍后重试"}",
+            )
         }
     }
 
@@ -193,33 +212,104 @@ class LibraryViewModel(
         viewModelScope.launch { repository.renameBook(id, title) }
     }
 
-    fun reorder(items: List<LibraryItem>) {
+    fun reorder(
+        items: List<LibraryItem>,
+        onComplete: (Boolean) -> Unit = {},
+    ) {
         viewModelScope.launch {
-            val completeItems = mergeVisibleShelfOrder(allShelfItems, items) ?: return@launch
+            val completeItems = mergeVisibleShelfOrder(allShelfItems, items)
+            if (completeItems == null) {
+                _uiState.value = _uiState.value.copy(
+                    notice = "排序失败：书架状态已变化，请重试",
+                )
+                onComplete(false)
+                return@launch
+            }
             val ids = completeItems.flatMap { item ->
                 when (item) {
                     is LibraryItem.Single -> listOf(item.book.id)
                     is LibraryItem.Bundle -> item.bundle.books.map { it.id }
                 }
             }
-            repository.updateShelfOrder(ids)
+            runCatching { repository.updateShelfOrder(ids) }
+                .onSuccess { onComplete(true) }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    _uiState.value = _uiState.value.copy(
+                        notice = "排序失败：${error.message ?: "请稍后重试"}",
+                    )
+                    onComplete(false)
+                }
         }
     }
 
-    fun moveToGroup(bookId: String, groupName: String) {
-        viewModelScope.launch { repository.setCollection(bookId, groupName) }
+    fun moveToGroup(
+        bookId: String,
+        targetCollectionId: String,
+        onComplete: (Boolean) -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            runCatching { repository.moveToGroup(bookId, targetCollectionId) }
+                .onSuccess { onComplete(true) }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    _uiState.value = _uiState.value.copy(
+                        notice = "移动到书组失败：${error.message ?: "请稍后重试"}",
+                    )
+                    onComplete(false)
+                }
+        }
+    }
+
+    fun createGroup(sourceId: String, targetId: String, name: String) {
+        viewModelScope.launch {
+            runCatching { repository.createGroup(sourceId, targetId, name) }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    _uiState.value = _uiState.value.copy(
+                        notice = "建组失败：${error.message ?: "请稍后重试"}",
+                    )
+                }
+        }
     }
 
     fun removeFromGroup(bookId: String) {
-        viewModelScope.launch { repository.setCollection(bookId, null) }
+        viewModelScope.launch { repository.setCollection(bookId, null, null) }
     }
 
-    fun ungroupBundle(name: String) {
-        viewModelScope.launch { repository.ungroupBundle(name) }
+    fun ungroupBundle(
+        collectionId: String,
+        onComplete: (Boolean) -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            runCatching { repository.ungroupBundle(collectionId) }
+                .onSuccess { onComplete(true) }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    _uiState.value = _uiState.value.copy(
+                        notice = "拆组失败：${error.message ?: "请稍后重试"}",
+                    )
+                    onComplete(false)
+                }
+        }
     }
 
-    fun renameBundle(oldName: String, newName: String) {
-        viewModelScope.launch { repository.renameBundle(oldName, newName) }
+    fun renameBundle(
+        collectionId: String,
+        newName: String,
+        onComplete: (Boolean) -> Unit = {},
+    ) {
+        viewModelScope.launch {
+            runCatching { repository.renameBundle(collectionId, newName) }
+                .onSuccess { onComplete(true) }
+                .onFailure { error ->
+                    if (error is CancellationException) throw error
+                    _uiState.value = _uiState.value.copy(
+                        notice = "书组改名失败：${error.message ?: "请稍后重试"}",
+                    )
+                    onComplete(false)
+                }
+        }
     }
 
     fun setLibraryFilter(filter: LibraryFilter) {
@@ -357,7 +447,7 @@ private fun mergeVisibleShelfOrder(
 
 private fun LibraryItem.shelfIdentity(): String = when (this) {
     is LibraryItem.Single -> "book:${book.id}"
-    is LibraryItem.Bundle -> "bundle:${bundle.name}"
+    is LibraryItem.Bundle -> "bundle:${bundle.id}"
 }
 
 private fun List<LibraryItem>.filterFor(filter: LibraryFilter): List<LibraryItem> =

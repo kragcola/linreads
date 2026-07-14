@@ -1,16 +1,19 @@
 package dev.readflow.core.ui
 
 import android.view.HapticFeedbackConstants
-import androidx.compose.foundation.Canvas
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyGridItemInfo
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
@@ -27,14 +30,11 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
@@ -42,26 +42,31 @@ import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.BookRemovalMode
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlin.math.abs
 import kotlin.math.floor
-
-/** 拖拽时手指命中的区域类型 */
-private enum class DragZone { GAP_ABOVE, BOOK, GAP_BELOW, CANCEL }
+import kotlin.math.pow
+import kotlin.math.roundToInt
+import kotlin.math.sign
 
 private val LibraryItem.key: String
     get() = when (this) {
         is LibraryItem.Single -> "book:${book.id}"
-        is LibraryItem.Bundle -> "bundle:${bundle.name}"
+        is LibraryItem.Bundle -> "bundle:${bundle.id}"
     }
+
+internal fun retainContextMenuAnchor(
+    anchorKey: String?,
+    currentItemKeys: Collection<String>,
+): String? = anchorKey?.takeIf(currentItemKeys::contains)
 
 private val BookMeta.canRemoveDownload: Boolean
     get() = id.startsWith("calibre-") &&
@@ -106,14 +111,14 @@ internal fun libraryGridLayout(widthDp: Float): LibraryGridLayout {
 internal fun libraryGridColumns(widthDp: Float): Int = libraryGridLayout(widthDp).columns
 
 /**
- * 书架网格，支持点击、拖拽重排、dwell 悬停建组。
+ * 书架网格，支持点击、拖拽重排和封面重合建组预览。
  *
- * **手势设计 v2**：
+ * **手势设计 v3**：
  * - 点击 → 打开书
  * - ⋮ 菜单 → 改名/建组/删除
- * - 长按拖动到间隙区（上下30%）→ 实时换位预览，松手生效
- * - 长按拖动到书本区（中间40%）→ 停留700ms建组，环形进度倒计时
- * - 拖到屏幕底部取消区 → 红色提示，松手回到原位
+ * - 长按拖动越过目标中心 → 实时换位预览，松手生效
+ * - 拖动封面与目标四边近乎重合 → 立即显示建组预览，松手提交
+ * - 拖到上下边缘 → 逐帧连续自动滚动；手势取消则恢复原顺序
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -121,11 +126,13 @@ fun BookGrid(
     items: List<LibraryItem>,
     onItemClick: (LibraryItem) -> Unit,
     onDelete: (String, BookRemovalMode) -> Unit = { _, _ -> },
+    onDeleteBundle: (String, BookRemovalMode) -> Unit = { _, _ -> },
     onRename: (String, String) -> Unit = { _, _ -> },
-    onMoveToGroup: (String, String) -> Unit = { _, _ -> },
-    onReorder: (List<LibraryItem>) -> Unit = {},
-    onUngroup: (String) -> Unit = {},
-    onRenameBundle: (String, String) -> Unit = { _, _ -> },
+    onMoveToGroup: (String, String, (Boolean) -> Unit) -> Unit = { _, _, onComplete -> onComplete(true) },
+    onCreateGroup: (String, String, String) -> Unit = { _, _, _ -> },
+    onReorder: (List<LibraryItem>, (Boolean) -> Unit) -> Unit = { _, onComplete -> onComplete(true) },
+    onUngroup: (String, (Boolean) -> Unit) -> Unit = { _, onComplete -> onComplete(true) },
+    onRenameBundle: (String, String, (Boolean) -> Unit) -> Unit = { _, _, onComplete -> onComplete(true) },
     onRemoveDownload: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
@@ -133,139 +140,234 @@ fun BookGrid(
     val windowWidthPx = LocalWindowInfo.current.containerSize.width
     val screenWidthDp = with(LocalDensity.current) { windowWidthPx.toDp().value }
     val gridLayout = libraryGridLayout(screenWidthDp)
-    val mutableItems = remember { mutableStateListOf(*items.toTypedArray()) }
-    LaunchedEffect(items) {
-        if (mutableItems.toList() != items) {
-            mutableItems.clear()
-            mutableItems.addAll(items)
-        }
-    }
-
+    val density = LocalDensity.current
+    var mutableItems by remember { mutableStateOf(items) }
     val gridState = rememberLazyGridState()
-    val scope = rememberCoroutineScope()
 
     // ── 拖动状态 ──
     var dragItemKey by remember { mutableStateOf("") }
     var dragOffset by remember { mutableStateOf(Offset.Zero) }
     var dragStartAbsPos by remember { mutableStateOf(Offset.Zero) }
     var dragInitialItemOffset by remember { mutableStateOf(Offset.Zero) }
-    var currentInsertIndex by remember { mutableIntStateOf(-1) }
-    var currentHoverKey by remember { mutableStateOf("") }
-    var currentZone by remember { mutableStateOf(DragZone.GAP_BELOW) }
-    var dwellTargetKey by remember { mutableStateOf("") }
-    var isInCancelZone by remember { mutableStateOf(false) }
-    var reorderPreviewActive by remember { mutableStateOf(false) }
+    var dragCoverWidthPx by remember { mutableFloatStateOf(0f) }
+    var dragStartOrder by remember { mutableStateOf<List<LibraryItem>>(emptyList()) }
+    var mergeTargetKey by remember { mutableStateOf("") }
+    var autoScrollIntent by remember { mutableFloatStateOf(0f) }
     var dragGeneration by remember { mutableIntStateOf(0) }
+    var settlingItemKey by remember { mutableStateOf("") }
+    var settlingOffset by remember { mutableStateOf(Offset.Zero) }
+    var settlingStartScale by remember { mutableFloatStateOf(1f) }
+    var settlingStartAlpha by remember { mutableFloatStateOf(1f) }
+    var settlingStartShadowPx by remember { mutableFloatStateOf(0f) }
+    var settlingTarget by remember { mutableFloatStateOf(0f) }
+    var pendingItemsSnapshot by remember { mutableStateOf<List<LibraryItem>?>(null) }
+    var latestItemsSnapshot by remember { mutableStateOf(items) }
+    var itemsRevision by remember { mutableIntStateOf(0) }
+    var shelfMutationInFlight by remember { mutableStateOf(false) }
+    val settlingProgress by animateFloatAsState(
+        targetValue = settlingTarget,
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "shelf-drag-settle",
+        finishedListener = { value ->
+            if (value >= 1f) {
+                settlingItemKey = ""
+                settlingOffset = Offset.Zero
+                settlingStartShadowPx = 0f
+                settlingTarget = 0f
+            }
+        },
+    )
 
-    // dwell 计时
-    var dwellJob by remember { mutableStateOf<Job?>(null) }
-    var dwellStartTime by remember { mutableStateOf(0L) }
-    var dwellProgress by remember { mutableStateOf(0f) }
-    val dwellThresholdMs = 700L
+    fun replaceMutableItems(snapshot: List<LibraryItem>) {
+        if (mutableItems != snapshot) mutableItems = snapshot
+    }
 
-    // 自动滚动
-    var autoScrollJob by remember { mutableStateOf<Job?>(null) }
-    val scrollEdgeThreshold = 80.dp
+    LaunchedEffect(items) {
+        latestItemsSnapshot = items
+        itemsRevision++
+        if (dragItemKey.isNotEmpty() || settlingItemKey.isNotEmpty() || shelfMutationInFlight) {
+            pendingItemsSnapshot = items
+        } else {
+            replaceMutableItems(items)
+        }
+    }
+
+    LaunchedEffect(dragItemKey, settlingItemKey, shelfMutationInFlight) {
+        if (dragItemKey.isEmpty() && settlingItemKey.isEmpty() && !shelfMutationInFlight) {
+            pendingItemsSnapshot?.let(::replaceMutableItems)
+            pendingItemsSnapshot = null
+        }
+    }
+
+    val mergeTolerancePx = with(density) { 20.dp.toPx() }
+    val scrollEdgeThresholdPx = with(density) { 72.dp.toPx() }
+    val maxAutoScrollPxPerSecond = with(density) { 960.dp.toPx() }
 
     // 菜单/对话框状态
     var contextItem by remember { mutableStateOf<LibraryItem?>(null) }
-    var contextMenuAnchor by remember { mutableStateOf<Int?>(null) }
+    var contextMenuAnchorKey by remember { mutableStateOf<String?>(null) }
     var renameItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var renameText by remember { mutableStateOf("") }
     var groupSourceId by remember { mutableStateOf("") }
     var groupTargetItem by remember { mutableStateOf<LibraryItem.Single?>(null) }
     var groupName by remember { mutableStateOf("") }
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
+    var deleteConfirmIsBundle by remember { mutableStateOf(false) }
     var deleteMode by remember { mutableStateOf(BookRemovalMode.REMOVE_FROM_SHELF) }
     var deleteConfirmLabel by remember { mutableStateOf("") }
-    var ungroupConfirmName by remember { mutableStateOf<String?>(null) }
-    var renameBundleOldName by remember { mutableStateOf<String?>(null) }
+    var ungroupConfirmId by remember { mutableStateOf<String?>(null) }
+    var ungroupConfirmName by remember { mutableStateOf("") }
+    var renameBundleId by remember { mutableStateOf<String?>(null) }
+    var renameBundleName by remember { mutableStateOf("") }
 
-    // 取消区高度
-    val cancelZoneHeight = 64.dp
-
-    /** 根据手指绝对位置和 item info 计算命中区域 */
-    fun hitZone(absPos: Offset, info: LazyGridItemInfo): DragZone {
-        val itemTop = info.offset.y.toFloat()
-        val itemH = info.size.height.toFloat()
-        val zoneH = itemH * 0.40f  // 上下各40% = 间隙，中间20% = 书本
-        val relY = absPos.y - itemTop
-        return when {
-            relY < zoneH -> DragZone.GAP_ABOVE
-            relY < itemH - zoneH -> DragZone.BOOK
-            else -> DragZone.GAP_BELOW
+    LaunchedEffect(mutableItems) {
+        val retainedAnchor = retainContextMenuAnchor(
+            anchorKey = contextMenuAnchorKey,
+            currentItemKeys = mutableItems.map(LibraryItem::key),
+        )
+        if (retainedAnchor != contextMenuAnchorKey) {
+            contextMenuAnchorKey = retainedAnchor
+            contextItem = null
         }
     }
 
-    /** 根据手指位置找到插入目标 index 和所在 zone */
-    fun findDropTarget(absPos: Offset): Pair<Int, DragZone> {
-        val visInfo = gridState.layoutInfo.visibleItemsInfo
-        if (visInfo.isEmpty()) return -1 to DragZone.GAP_BELOW
+    fun visibleDropCandidates(): List<GridDropCandidate> =
+        gridState.layoutInfo.visibleItemsInfo.mapNotNull { info ->
+            if (info.index !in mutableItems.indices) return@mapNotNull null
+            val left = info.offset.x.toFloat()
+            val top = info.offset.y.toFloat()
+            val width = info.size.width.toFloat()
+            GridDropCandidate(
+                index = info.index,
+                rect = GridDragRect(
+                    left = left,
+                    top = top,
+                    right = left + width,
+                    bottom = top + width / Dimens.coverAspectRatio,
+                ),
+            )
+        }
 
-        // 手指在最后一个 item 下方 → 插入到末尾
-        val last = visInfo.last()
-        if (absPos.y > last.offset.y + last.size.height) {
-            return mutableItems.lastIndex to DragZone.GAP_BELOW
-        }
-        // 手指在第一个 item 上方 → 插入到开头
-        val first = visInfo.first()
-        if (absPos.y < first.offset.y) {
-            return 0 to DragZone.GAP_ABOVE
-        }
+    fun currentDraggedRect(): GridDragRect? {
+        if (dragItemKey.isEmpty() || dragCoverWidthPx <= 0f) return null
+        val left = dragInitialItemOffset.x + dragOffset.x
+        val top = dragInitialItemOffset.y + dragOffset.y
+        return GridDragRect(
+            left = left,
+            top = top,
+            right = left + dragCoverWidthPx,
+            bottom = top + dragCoverWidthPx / Dimens.coverAspectRatio,
+        )
+    }
 
-        // 找到 X 轴和 Y 轴都覆盖手指的 item
-        val hitInfo = visInfo.firstOrNull { info ->
-            val rx = info.offset.x.toFloat()
-            val ry = info.offset.y.toFloat()
-            absPos.x in rx..(rx + info.size.width) &&
-                absPos.y in ry..(ry + info.size.height)
+    /** Updates merge preview first, then live order only after the drag passes the target centre. */
+    fun updateDragTargets(): Boolean {
+        val draggedRect = currentDraggedRect() ?: return false
+        val sourceIndex = mutableItems.indexOfFirst { it.key == dragItemKey }
+        if (sourceIndex < 0) return false
+        val candidates = visibleDropCandidates()
+        val sourceItem = mutableItems[sourceIndex]
+        val mergeIndex = if (sourceItem is LibraryItem.Single) {
+            resolveMergeCandidate(
+                sourceIndex = sourceIndex,
+                draggedRect = draggedRect,
+                candidates = candidates,
+                tolerancePx = mergeTolerancePx,
+            )
+        } else {
+            null
         }
-        if (hitInfo != null) {
-            val zone = hitZone(absPos, hitInfo)
-            val insertIdx = when (zone) {
-                DragZone.GAP_ABOVE -> hitInfo.index
-                DragZone.BOOK -> hitInfo.index
-                DragZone.GAP_BELOW -> (hitInfo.index + 1).coerceAtMost(mutableItems.lastIndex)
-                DragZone.CANCEL -> currentInsertIndex
+        mergeTargetKey = mergeIndex?.let { mutableItems.getOrNull(it)?.key }.orEmpty()
+        if (mergeTargetKey.isNotEmpty()) return false
+
+        val insertionSlot = resolveReorderInsertionSlot(
+            sourceIndex = sourceIndex,
+            draggedRect = draggedRect,
+            candidates = candidates,
+            totalDragX = dragOffset.x,
+            totalDragY = dragOffset.y,
+            thresholdPx = mergeTolerancePx,
+        ) ?: resolveTrailingInsertionSlot(
+            sourceIndex = sourceIndex,
+            draggedRect = draggedRect,
+            candidates = candidates,
+            itemCount = mutableItems.size,
+            totalDragX = dragOffset.x,
+            totalDragY = dragOffset.y,
+        )
+        if (insertionSlot == null) return false
+
+        val reordered = moveItemToInsertionSlot(
+            items = mutableItems.toList(),
+            sourceIndex = sourceIndex,
+            insertionSlot = insertionSlot,
+        )
+        if (reordered == mutableItems.toList()) return false
+        mutableItems = reordered
+        return true
+    }
+
+    fun resetDragState() {
+        dragItemKey = ""
+        dragOffset = Offset.Zero
+        dragStartAbsPos = Offset.Zero
+        dragInitialItemOffset = Offset.Zero
+        dragCoverWidthPx = 0f
+        dragStartOrder = emptyList()
+        mergeTargetKey = ""
+        autoScrollIntent = 0f
+        dragGeneration++
+    }
+
+    fun beginSettling(itemKey: String, finalOrder: List<LibraryItem>) {
+        val finalIndex = finalOrder.indexOfFirst { it.key == itemKey }
+        if (finalIndex < 0) return
+        val finalInfo = gridState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == finalIndex }
+            ?: return
+        val visualTopLeft = dragInitialItemOffset + dragOffset
+        val finalTopLeft = Offset(finalInfo.offset.x.toFloat(), finalInfo.offset.y.toFloat())
+        settlingItemKey = itemKey
+        settlingOffset = visualTopLeft - finalTopLeft
+        settlingStartScale = if (mergeTargetKey.isNotEmpty()) 0.84f else 1.04f
+        settlingStartAlpha = if (mergeTargetKey.isNotEmpty()) 0.82f else 0.96f
+        settlingStartShadowPx = if (mergeTargetKey.isNotEmpty()) {
+            0f
+        } else {
+            with(density) { 12.dp.toPx() }
+        }
+        settlingTarget = 1f
+    }
+
+    LaunchedEffect(dragItemKey) {
+        if (dragItemKey.isEmpty()) return@LaunchedEffect
+        var previousFrameNanos = withFrameNanos { it }
+        var edgeStartNanos = previousFrameNanos
+        var previousDirection = 0f
+        while (currentCoroutineContext().isActive && dragItemKey.isNotEmpty()) {
+            val frameNanos = withFrameNanos { it }
+            val intent = autoScrollIntent
+            val direction = intent.sign
+            if (direction == 0f) {
+                previousDirection = 0f
+                edgeStartNanos = frameNanos
+                previousFrameNanos = frameNanos
+                continue
             }
-            return insertIdx to zone
-        }
-
-        // 没有直接 XY 命中 → 手指在行列间隙中
-        // 找到 Y 轴覆盖的 item（同一行），用实际手指位置判断 zone
-        val sameRow = visInfo.filter { info ->
-            val ry = info.offset.y.toFloat()
-            absPos.y in ry..(ry + info.size.height)
-        }
-        if (sameRow.isNotEmpty()) {
-            // 手指在行内但 X 轴未覆盖 → X 间隙 → 找到最近 item，用实际 Y 判断上下间隙
-            val nearest = sameRow.minByOrNull {
-                val cx = it.offset.x + it.size.width / 2f
-                abs(absPos.x - cx)
-            }!!
-            val zone = hitZone(absPos, nearest) // 用实际手指 Y
-            val insertIdx = when {
-                zone == DragZone.GAP_ABOVE -> nearest.index
-                absPos.x < (nearest.offset.x + nearest.size.width / 2f) -> nearest.index
-                else -> (nearest.index + 1).coerceAtMost(mutableItems.lastIndex)
+            if (direction != previousDirection) {
+                previousDirection = direction
+                edgeStartNanos = frameNanos
             }
-            return insertIdx to zone
+            val deltaSeconds = ((frameNanos - previousFrameNanos) / 1_000_000_000f)
+                .coerceIn(0f, 0.05f)
+            previousFrameNanos = frameNanos
+            val ramp = ((frameNanos - edgeStartNanos) / 2_000_000_000f).coerceIn(0f, 1f)
+            val rampedSpeed = 0.35f + 0.65f * (1f - (1f - ramp).pow(3f))
+            val distanceFactor = abs(intent).pow(1.35f)
+            val consumed = gridState.scrollBy(
+                maxAutoScrollPxPerSecond * direction * distanceFactor * rampedSpeed * deltaSeconds,
+            )
+            if (abs(consumed) > 0.1f) updateDragTargets()
         }
-
-        // 完全不在任何行内 → 用二维距离找最近 item，强制视为间隙
-        val nearest = visInfo.minByOrNull { info ->
-            val cx = info.offset.x + info.size.width / 2f
-            val cy = info.offset.y + info.size.height / 2f
-            val dx = absPos.x - cx
-            val dy = absPos.y - cy
-            dx * dx + dy * dy
-        } ?: return -1 to DragZone.GAP_BELOW
-
-        // 手指不在 item 上 → 强制间隙区，禁止触发 dwell
-        val zone = if (absPos.y < nearest.offset.y + nearest.size.height / 2f) DragZone.GAP_ABOVE else DragZone.GAP_BELOW
-        val insertIdx = if (zone == DragZone.GAP_ABOVE) nearest.index
-            else (nearest.index + 1).coerceAtMost(mutableItems.lastIndex)
-        return insertIdx to zone
     }
 
     Box(modifier = modifier.fillMaxSize()) {
@@ -285,23 +387,43 @@ fun BookGrid(
                 .widthIn(max = Dimens.maxContentWidth)
                 .fillMaxWidth(),
         ) {
-            itemsIndexed(mutableItems, key = { _, item -> item.key }) { index, item ->
+            itemsIndexed(mutableItems, key = { _, item -> item.key }) { _, item ->
                 val isDragging = dragItemKey == item.key
-                val isDwellTarget = dwellTargetKey == item.key && dragItemKey.isNotEmpty() && dragItemKey != item.key
+                val isMergeTarget = mergeTargetKey == item.key && dragItemKey.isNotEmpty() && dragItemKey != item.key
+                val isSettling = settlingItemKey == item.key
+                val draggedSingle = mutableItems.firstOrNull { it.key == dragItemKey } as? LibraryItem.Single
                 val view = LocalView.current
+                val targetScale by animateFloatAsState(
+                    targetValue = if (isMergeTarget) 0.96f else 1f,
+                    animationSpec = tween(durationMillis = 160, easing = FastOutSlowInEasing),
+                    label = "shelf-merge-target-scale",
+                )
+                val draggedScale by animateFloatAsState(
+                    targetValue = when {
+                        !isDragging -> 1f
+                        mergeTargetKey.isNotEmpty() -> 0.84f
+                        else -> 1.04f
+                    },
+                    animationSpec = tween(durationMillis = 140, easing = FastOutSlowInEasing),
+                    label = "shelf-drag-scale",
+                )
+                val draggedMetadataAlpha by animateFloatAsState(
+                    targetValue = if (isDragging && mergeTargetKey.isNotEmpty()) 0f else 1f,
+                    animationSpec = tween(durationMillis = 140, easing = FastOutSlowInEasing),
+                    label = "shelf-drag-metadata-alpha",
+                )
                 val title = when (item) {
                     is LibraryItem.Single -> item.book.title
                     is LibraryItem.Bundle -> item.bundle.name
                 }
                 val openDescription = when (item) {
-                    is LibraryItem.Single ->
-                        "打开 ${item.book.title}，${item.book.author.ifBlank { "未知作者" }}"
+                    is LibraryItem.Single -> "打开 ${item.book.title}"
                     is LibraryItem.Bundle -> "打开书组 ${item.bundle.name}，共 ${item.bundle.books.size} 本"
                 }
                 val itemStateDescription = when (item) {
                     is LibraryItem.Single -> buildList {
                         if (item.book.progress > 0f) {
-                            add("阅读进度 ${(item.book.progress.coerceIn(0f, 1f) * 100).toInt()}%")
+                            add("阅读进度 ${(item.book.progress.coerceIn(0f, 1f) * 100f).roundToInt()}%")
                         }
                         if (item.book.isOfflineReadable) add("可离线")
                     }.joinToString("，").ifBlank { null }
@@ -315,61 +437,90 @@ fun BookGrid(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .zIndex(if (isDragging) 1f else 0f)
+                        .zIndex(when {
+                            isDragging -> 3f
+                            isSettling -> 2f
+                            isMergeTarget -> 1f
+                            else -> 0f
+                        })
+                        .animateItem(
+                            fadeInSpec = null,
+                            placementSpec = if (isDragging) {
+                                snap<IntOffset>()
+                            } else {
+                                tween<IntOffset>(durationMillis = 240, easing = FastOutSlowInEasing)
+                            },
+                            fadeOutSpec = null,
+                        )
                         .graphicsLayer {
-                            // Calvin 公式补偿实时换位导致的 item 位移
                             if (isDragging) {
                                 val dragInfo = gridState.layoutInfo.visibleItemsInfo
                                     .firstOrNull { mutableItems.getOrNull(it.index)?.key == dragItemKey }
-                                val cur = if (dragInfo != null) Offset(dragInfo.offset.x.toFloat(), dragInfo.offset.y.toFloat()) else Offset.Zero
+                                val cur = if (dragInfo != null) {
+                                    Offset(dragInfo.offset.x.toFloat(), dragInfo.offset.y.toFloat())
+                                } else {
+                                    dragInitialItemOffset
+                                }
                                 val vo = dragOffset + (dragInitialItemOffset - cur)
-                                translationX = vo.x; translationY = vo.y
-                                scaleX = 1.10f; scaleY = 1.10f; alpha = 0.7f; shadowElevation = 8f
+                                translationX = vo.x
+                                translationY = vo.y
+                                scaleX = draggedScale
+                                scaleY = draggedScale
+                                alpha = if (mergeTargetKey.isNotEmpty()) 0.82f else 0.96f
+                                shadowElevation = if (mergeTargetKey.isNotEmpty()) 0f else 12.dp.toPx()
+                            } else if (isSettling) {
+                                val remaining = 1f - settlingProgress
+                                translationX = settlingOffset.x * remaining
+                                translationY = settlingOffset.y * remaining
+                                scaleX = 1f + (settlingStartScale - 1f) * remaining
+                                scaleY = 1f + (settlingStartScale - 1f) * remaining
+                                alpha = 1f - (1f - settlingStartAlpha) * remaining
+                                shadowElevation = settlingStartShadowPx * remaining
                             } else {
-                                translationX = 0f; translationY = 0f
-                                scaleX = if (isDwellTarget) 0.94f else 1f
-                                scaleY = if (isDwellTarget) 0.94f else 1f
-                                alpha = 1f; shadowElevation = 0f
+                                translationX = 0f
+                                translationY = 0f
+                                scaleX = targetScale
+                                scaleY = targetScale
+                                alpha = 1f
+                                shadowElevation = if (isMergeTarget) 6.dp.toPx() else 0f
                             }
                         }
-                        .then(if (!isDragging) Modifier.animateItem() else Modifier)
                         .semantics {
                             contentDescription = openDescription
                             itemStateDescription?.let { stateDescription = it }
                         }
-                        .clickable(role = Role.Button) { onItemClick(item) }
+                        .clickable(
+                            enabled = dragItemKey.isEmpty() &&
+                                settlingItemKey.isEmpty() &&
+                                !shelfMutationInFlight,
+                            role = Role.Button,
+                        ) { onItemClick(item) }
                         .pointerInput(item.key, dragGeneration) {
-                            var dwellLocalStart = 0L
-
                             detectDragGesturesAfterLongPress(
                                 onDragStart = { localPos ->
-                                    if (dragItemKey.isEmpty()) {
-                                        dragItemKey = item.key
-                                        dragOffset = Offset.Zero
-                                        dwellTargetKey = ""
-                                        currentHoverKey = ""
-                                        currentInsertIndex = -1
-                                        currentZone = DragZone.GAP_BELOW
-                                        reorderPreviewActive = false
-                                        isInCancelZone = false
-                                        dwellJob?.cancel()
-                                        autoScrollJob?.cancel()
-                                        dwellProgress = 0f
-
-                                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-
+                                    if (dragItemKey.isEmpty() && !shelfMutationInFlight) {
                                         val itemInfo = gridState.layoutInfo.visibleItemsInfo
-                                            .firstOrNull { it.index == index }
+                                            .firstOrNull { info ->
+                                                mutableItems.getOrNull(info.index)?.key == item.key
+                                            } ?: return@detectDragGesturesAfterLongPress
+                                        dragItemKey = item.key
+                                        settlingItemKey = ""
+                                        settlingTarget = 0f
+                                        dragOffset = Offset.Zero
+                                        dragStartOrder = mutableItems.toList()
+                                        mergeTargetKey = ""
+                                        autoScrollIntent = 0f
+                                        contextMenuAnchorKey = null
                                         dragStartAbsPos = Offset(
-                                            (itemInfo?.offset?.x ?: 0).toFloat() + localPos.x,
-                                            (itemInfo?.offset?.y ?: 0).toFloat() + localPos.y,
+                                            itemInfo.offset.x.toFloat() + localPos.x,
+                                            itemInfo.offset.y.toFloat() + localPos.y,
                                         )
                                         dragInitialItemOffset = Offset(
-                                            (itemInfo?.offset?.x ?: 0).toFloat(),
-                                            (itemInfo?.offset?.y ?: 0).toFloat(),
+                                            itemInfo.offset.x.toFloat(),
+                                            itemInfo.offset.y.toFloat(),
                                         )
-                                        dwellLocalStart = System.currentTimeMillis()
-                                        dwellStartTime = dwellLocalStart
+                                        dragCoverWidthPx = itemInfo.size.width.toFloat()
+                                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                                     }
                                 },
                                 onDrag = { change, delta ->
@@ -378,189 +529,102 @@ fun BookGrid(
                                     change.consume()
 
                                     val absPos = dragStartAbsPos + dragOffset
-
-                                    // ── 取消区检测 ──
-                                    val viewportHeight = gridState.layoutInfo.viewportEndOffset -
-                                        gridState.layoutInfo.viewportStartOffset
-                                    val cancelTop = viewportHeight - cancelZoneHeight.toPx()
-                                    val newInCancel = absPos.y > cancelTop
-                                    if (newInCancel != isInCancelZone) {
-                                        isInCancelZone = newInCancel
-                                        if (newInCancel) {
-                                            dwellJob?.cancel()
-                                            dwellTargetKey = ""
-                                            dwellProgress = 0f
-                                            reorderPreviewActive = false
-                                            currentInsertIndex = -1
-                                        }
-                                    }
-
-                                    if (isInCancelZone) return@detectDragGesturesAfterLongPress
-
-                                    // ── 命中检测 ──
-                                    val (insertIdx, zone) = findDropTarget(absPos)
-                                    val hoverHit = gridState.layoutInfo.visibleItemsInfo
-                                        .firstOrNull { info ->
-                                            val rx = info.offset.x.toFloat()
-                                            val ry = info.offset.y.toFloat()
-                                            absPos.x in rx..(rx + info.size.width) &&
-                                                absPos.y in ry..(ry + info.size.height)
-                                        }
-                                    val hoverKey = hoverHit?.let { mutableItems.getOrNull(it.index)?.key } ?: ""
-
-                                    // ── 状态迁移 ──
-                                    val bookChanged = zone == DragZone.BOOK && (zone != currentZone || hoverKey != currentHoverKey)
-                                    val gapChanged = zone != DragZone.BOOK && (zone != currentZone || insertIdx != currentInsertIndex)
-                                    val sameBook = zone == DragZone.BOOK && zone == currentZone && hoverKey == currentHoverKey
-
-                                    when {
-                                        bookChanged -> {
-                                            // 进入/切换到书本区 → 暂停换位 + 启动 dwell
-                                            dwellJob?.cancel()
-                                            dwellTargetKey = ""
-                                            dwellProgress = 0f
-                                            reorderPreviewActive = false
-                                            currentInsertIndex = -1
-                                            currentZone = zone
-                                            currentHoverKey = hoverKey
-                                            dwellLocalStart = System.currentTimeMillis()
-                                            dwellStartTime = dwellLocalStart
-
-                                            val targetItem = mutableItems.getOrNull(insertIdx)
-                                            if (targetItem != null && hoverKey != dragItemKey) {
-                                                val dragItem = mutableItems.firstOrNull { it.key == dragItemKey }
-                                                if (dragItem is LibraryItem.Single &&
-                                                    (targetItem is LibraryItem.Single || targetItem is LibraryItem.Bundle)) {
-                                                    dwellJob = scope.launch {
-                                                        while (true) {
-                                                            delay(50)
-                                                            val elapsed = System.currentTimeMillis() - dwellLocalStart
-                                                            dwellProgress = (elapsed.toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
-                                                            if (elapsed >= dwellThresholdMs) {
-                                                                dwellTargetKey = hoverKey
-                                                                dwellProgress = 1f
-                                                                break
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        sameBook -> {
-                                            // 同一书本区内 → 更新进度
-                                            dwellProgress = ((System.currentTimeMillis() - dwellLocalStart).toFloat() / dwellThresholdMs).coerceIn(0f, 1f)
-                                        }
-                                        gapChanged -> {
-                                            // 进入/切换到间隙区 → 实时换位
-                                            dwellJob?.cancel()
-                                            dwellTargetKey = ""
-                                            dwellProgress = 0f
-                                            currentZone = zone
-                                            currentHoverKey = ""
-                                            currentInsertIndex = insertIdx
-                                            reorderPreviewActive = true
-
-                                            val dragIdx = mutableItems.indexOfFirst { it.key == dragItemKey }
-                                            if (dragIdx >= 0 && insertIdx >= 0) {
-                                                val targetIdx = if (insertIdx > dragIdx) insertIdx - 1 else insertIdx
-                                                if (targetIdx != dragIdx && targetIdx in 0 until mutableItems.size) {
-                                                    val moved = mutableItems.removeAt(dragIdx)
-                                                    mutableItems.add(targetIdx, moved)
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // ── 自动滚动 ──
-                                    val relativeY = absPos.y - gridState.layoutInfo.viewportStartOffset
-                                    autoScrollJob?.cancel()
-                                    val scrollSpeed = when {
-                                        relativeY < scrollEdgeThreshold.toPx() -> -(scrollEdgeThreshold.toPx() - relativeY) / 10f
-                                        relativeY > viewportHeight - scrollEdgeThreshold.toPx() ->
-                                            (relativeY - (viewportHeight - scrollEdgeThreshold.toPx())) / 10f
+                                    val viewportStart = gridState.layoutInfo.viewportStartOffset.toFloat()
+                                    val viewportEnd = gridState.layoutInfo.viewportEndOffset.toFloat()
+                                    autoScrollIntent = when {
+                                        absPos.y < viewportStart + scrollEdgeThresholdPx ->
+                                            -((viewportStart + scrollEdgeThresholdPx - absPos.y) /
+                                                scrollEdgeThresholdPx).coerceIn(0f, 1f)
+                                        absPos.y > viewportEnd - scrollEdgeThresholdPx ->
+                                            ((absPos.y - (viewportEnd - scrollEdgeThresholdPx)) /
+                                                scrollEdgeThresholdPx).coerceIn(0f, 1f)
                                         else -> 0f
                                     }
-                                    if (abs(scrollSpeed) > 1f) {
-                                        autoScrollJob = scope.launch {
-                                            while (true) {
-                                                gridState.scrollToItem(
-                                                    index = (gridState.firstVisibleItemIndex + if (scrollSpeed > 0) 1 else -1)
-                                                        .coerceIn(0, mutableItems.lastIndex)
-                                                )
-                                                delay(100)
-                                            }
-                                        }
+
+                                    val previousMergeTarget = mergeTargetKey
+                                    val reordered = updateDragTargets()
+                                    if ((mergeTargetKey.isNotEmpty() && mergeTargetKey != previousMergeTarget) || reordered) {
+                                        view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                                     }
-
-                                }, // close onDrag lambda
+                                },
                                 onDragEnd = {
-                                    dwellJob?.cancel()
-                                    autoScrollJob?.cancel()
+                                    val startOrder = dragStartOrder.ifEmpty { items }
+                                    val sourceKey = dragItemKey
+                                    val source = mutableItems.firstOrNull { it.key == dragItemKey }
+                                    val target = mutableItems.firstOrNull { it.key == mergeTargetKey }
+                                    if (source is LibraryItem.Single && target != null) {
+                                        mutableItems = startOrder
+                                        when (target) {
+                                            is LibraryItem.Bundle -> {
+                                                val authoritativeBase = pendingItemsSnapshot ?: startOrder
+                                                pendingItemsSnapshot = null
+                                                val sourceIndex = authoritativeBase.indexOfFirst { it.key == source.key }
+                                                val targetIndex = authoritativeBase.indexOfFirst { it.key == target.key }
+                                                val latestSource = authoritativeBase.getOrNull(sourceIndex)
+                                                    as? LibraryItem.Single
+                                                val latestTarget = authoritativeBase.getOrNull(targetIndex)
+                                                    as? LibraryItem.Bundle
+                                                if (latestSource == null || latestTarget == null) {
+                                                    replaceMutableItems(authoritativeBase)
+                                                } else {
+                                                    val optimisticItems = authoritativeBase.toMutableList()
+                                                    optimisticItems[targetIndex] = latestTarget.copy(
+                                                        bundle = latestTarget.bundle.copy(
+                                                            books = latestTarget.bundle.books + latestSource.book,
+                                                        ),
+                                                    )
+                                                    optimisticItems.removeAt(sourceIndex)
+                                                    replaceMutableItems(optimisticItems)
 
-                                    when {
-                                        isInCancelZone -> {
-                                            // 取消 → 恢复拖拽前顺序
-                                            mutableItems.clear()
-                                            mutableItems.addAll(items)
-                                        }
-                                        dwellTargetKey.isNotEmpty() -> {
-                                            // dwell 完成 → 建组
-                                            val dragItem = mutableItems.firstOrNull { it.key == dragItemKey }
-                                            val targetItem = mutableItems.firstOrNull { it.key == dwellTargetKey }
-                                            if (dragItem is LibraryItem.Single) {
-                                                when (targetItem) {
-                                                    is LibraryItem.Bundle -> onMoveToGroup(dragItem.book.id, targetItem.bundle.name)
-                                                    is LibraryItem.Single -> {
-                                                        // 自动以第一本书名建组，不弹对话框
-                                                        onMoveToGroup(dragItem.book.id, dragItem.book.title)
-                                                        onMoveToGroup(targetItem.book.id, dragItem.book.title)
+                                                    val mutationStartRevision = itemsRevision
+                                                    shelfMutationInFlight = true
+                                                    onMoveToGroup(
+                                                        latestSource.book.id,
+                                                        latestTarget.bundle.id,
+                                                    ) { succeeded ->
+                                                        val authoritativeChanged = itemsRevision != mutationStartRevision
+                                                        pendingItemsSnapshot = null
+                                                        if (!succeeded || authoritativeChanged) {
+                                                            replaceMutableItems(latestItemsSnapshot)
+                                                        }
+                                                        shelfMutationInFlight = false
                                                     }
-                                                    else -> {}
                                                 }
                                             }
+                                            is LibraryItem.Single -> {
+                                                beginSettling(sourceKey, startOrder)
+                                                groupSourceId = source.book.id
+                                                groupTargetItem = target
+                                                groupName = target.book.title
+                                            }
                                         }
-                                        reorderPreviewActive -> {
-                                            // 换位预览中松手 → 提交当前顺序
-                                            onReorder(mutableItems.toList())
-                                        }
-                                        currentInsertIndex >= 0 -> {
-                                            // 兜底：手指在间隙区但 preview 未激活 → 仍提交
-                                            onReorder(mutableItems.toList())
+                                    } else {
+                                        val finalOrder = mutableItems.toList()
+                                        beginSettling(sourceKey, finalOrder)
+                                        if (finalOrder != startOrder) {
+                                            val hadPendingSnapshot = pendingItemsSnapshot != null
+                                            val mutationStartRevision = itemsRevision
+                                            shelfMutationInFlight = true
+                                            onReorder(finalOrder) { succeeded ->
+                                                val authoritativeChanged = itemsRevision != mutationStartRevision
+                                                pendingItemsSnapshot = null
+                                                if (!succeeded || hadPendingSnapshot || authoritativeChanged) {
+                                                    replaceMutableItems(latestItemsSnapshot)
+                                                }
+                                                shelfMutationInFlight = false
+                                            }
                                         }
                                     }
-
-                                    // 重置
-                                    dragItemKey = ""
-                                    dragOffset = Offset.Zero
-                                    dragInitialItemOffset = Offset.Zero
-                                    currentHoverKey = ""
-                                    currentInsertIndex = -1
-                                    currentZone = DragZone.GAP_BELOW
-                                    dwellTargetKey = ""
-                                    dwellProgress = 0f
-                                    reorderPreviewActive = false
-                                    isInCancelZone = false
-                                    dragGeneration++
+                                    resetDragState()
                                 },
                                 onDragCancel = {
-                                    dwellJob?.cancel()
-                                    autoScrollJob?.cancel()
-                                    // 恢复拖拽前顺序
-                                    mutableItems.clear()
-                                    mutableItems.addAll(items)
-                                    dragItemKey = ""
-                                    dragOffset = Offset.Zero
-                                    dragInitialItemOffset = Offset.Zero
-                                    currentHoverKey = ""
-                                    currentInsertIndex = -1
-                                    currentZone = DragZone.GAP_BELOW
-                                    dwellTargetKey = ""
-                                    dwellProgress = 0f
-                                    reorderPreviewActive = false
-                                    isInCancelZone = false
-                                    dragGeneration++
-                                },  // onDragCancel
-                            )  // detectDragGesturesAfterLongPress
+                                    val sourceKey = dragItemKey
+                                    val startOrder = dragStartOrder.ifEmpty { items }
+                                    mutableItems = startOrder
+                                    beginSettling(sourceKey, startOrder)
+                                    resetDragState()
+                                },
+                            )
                         },
                 ) {
                     // ── 封面 + ⋮ 菜单按钮 ──
@@ -571,51 +635,28 @@ fun BookGrid(
                     ) {
                         when (item) {
                             is LibraryItem.Single -> {
-                                if (isDwellTarget && dragItemKey.isNotEmpty()) {
-                                    val dragged = mutableItems.firstOrNull { it.key == dragItemKey }
-                                    if (dragged is LibraryItem.Single) {
-                                        BundleStack(
-                                            bundle = dev.readflow.core.model.BookBundle(
-                                                item.book.title,
-                                                listOf(dragged.book, item.book),
-                                            ),
-                                            modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
-                                        )
-                                    } else {
-                                        BookCover(
-                                            book = item.book,
-                                            modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
-                                        )
-                                    }
+                                if (isMergeTarget && draggedSingle != null) {
+                                    BundleStack(
+                                        bundle = dev.readflow.core.model.BookBundle(
+                                            id = "preview:${item.book.id}:${draggedSingle.book.id}",
+                                            name = item.book.title,
+                                            books = listOf(item.book, draggedSingle.book),
+                                        ),
+                                        modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
+                                    )
                                 } else {
                                     BookCover(
                                         book = item.book,
                                         modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
                                     )
-                                    if (item.book.lastReadAt != null && item.book.progress > 0f) {
-                                        PaperBookmark(
-                                            book = item.book,
-                                            modifier = Modifier
-                                                .align(Alignment.TopEnd)
-                                                .padding(end = 8.dp),
-                                        )
-                                    }
                                 }
                             }
                             is LibraryItem.Bundle -> {
-                                if (isDwellTarget && dragItemKey.isNotEmpty()) {
-                                    val dragged = mutableItems.firstOrNull { it.key == dragItemKey }
-                                    if (dragged is LibraryItem.Single) {
-                                        BundleStack(
-                                            bundle = item.bundle.copy(books = item.bundle.books + dragged.book),
-                                            modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
-                                        )
-                                    } else {
-                                        BundleStack(
-                                            bundle = item.bundle,
-                                            modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
-                                        )
-                                    }
+                                if (isMergeTarget && draggedSingle != null) {
+                                    BundleStack(
+                                        bundle = item.bundle.copy(books = item.bundle.books + draggedSingle.book),
+                                        modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
+                                    )
                                 } else {
                                     BundleStack(
                                         bundle = item.bundle,
@@ -625,32 +666,46 @@ fun BookGrid(
                             }
                         }
 
-                        // dwell 进度环（书本区停留计时）
-                        if (currentHoverKey == item.key && currentZone == DragZone.BOOK &&
-                            dragItemKey.isNotEmpty() && dragItemKey != item.key && dwellTargetKey.isEmpty()) {
-                            val ringColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
-                            Canvas(modifier = Modifier.fillMaxSize().padding(2.dp)) {
-                                val stroke = 6.dp.toPx()
-                                val arcSize = Size(size.width - stroke, size.height - stroke)
-                                val topLeft = Offset(stroke / 2, stroke / 2)
-                                drawArc(
-                                    color = ringColor,
-                                    startAngle = -90f,
-                                    sweepAngle = dwellProgress * 360f,
-                                    useCenter = false,
-                                    topLeft = topLeft,
-                                    size = arcSize,
-                                    style = Stroke(width = stroke, cap = StrokeCap.Round),
+                        if (isMergeTarget) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .border(
+                                        width = 2.dp,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        shape = RoundedCornerShape(Dimens.coverCorner),
+                                    )
+                                    .clearAndSetSemantics {},
+                            )
+                        }
+                        if (isDragging && mergeTargetKey.isNotEmpty()) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.94f),
+                                contentColor = MaterialTheme.colorScheme.onPrimary,
+                                shape = CircleShape,
+                                shadowElevation = 4.dp,
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .padding(bottom = 10.dp)
+                                    .clearAndSetSemantics {},
+                            ) {
+                                Text(
+                                    text = "松手建组",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
                                 )
                             }
                         }
 
-                        // 48dp hit target with a quiet visual anchor, kept clear of the top-right bookmark.
-                        if (!isDragging) {
+                        // 48dp 触摸目标；拖动期间统一隐藏，避免目标卡片仍像可点击控件。
+                        if (dragItemKey.isEmpty() &&
+                            settlingItemKey.isEmpty() &&
+                            !shelfMutationInFlight
+                        ) {
                             IconButton(
                                 onClick = {
                                     contextItem = item
-                                    contextMenuAnchor = index
+                                    contextMenuAnchorKey = item.key
                                 },
                                 modifier = Modifier
                                     .align(Alignment.TopStart)
@@ -674,12 +729,12 @@ fun BookGrid(
                             }
 
                             // ── Context menu ──
-                            if (contextMenuAnchor == index) {
+                            if (contextMenuAnchorKey == item.key) {
                                 DropdownMenu(
                                     expanded = true,
                                     onDismissRequest = {
                                         contextItem = null
-                                        contextMenuAnchor = null
+                                        contextMenuAnchorKey = null
                                     },
                                 ) {
                                     when (item) {
@@ -690,7 +745,7 @@ fun BookGrid(
                                                     renameText = item.book.title
                                                     renameItem = item
                                                     contextItem = null
-                                                    contextMenuAnchor = null
+                                                    contextMenuAnchorKey = null
                                                 },
                                                 leadingIcon = { Icon(Icons.Default.Edit, null) },
                                             )
@@ -701,7 +756,7 @@ fun BookGrid(
                                                     groupTargetItem = null
                                                     groupName = ""
                                                     contextItem = null
-                                                    contextMenuAnchor = null
+                                                    contextMenuAnchorKey = null
                                                 },
                                                 leadingIcon = { Icon(Icons.Default.Add, null) },
                                             )
@@ -711,7 +766,7 @@ fun BookGrid(
                                                     onClick = {
                                                         onRemoveDownload(item.book.id)
                                                         contextItem = null
-                                                        contextMenuAnchor = null
+                                                        contextMenuAnchorKey = null
                                                     },
                                                     leadingIcon = { Icon(Icons.Default.Close, null) },
                                                 )
@@ -720,10 +775,11 @@ fun BookGrid(
                                                 text = { Text("删除") },
                                                 onClick = {
                                                     deleteConfirmId = item.book.id
+                                                    deleteConfirmIsBundle = false
                                                     deleteMode = BookRemovalMode.REMOVE_FROM_SHELF
                                                     deleteConfirmLabel = "《${item.book.title}》"
                                                     contextItem = null
-                                                    contextMenuAnchor = null
+                                                    contextMenuAnchorKey = null
                                                 },
                                                 leadingIcon = {
                                                     Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
@@ -735,28 +791,31 @@ fun BookGrid(
                                                 text = { Text("改名") },
                                                 onClick = {
                                                     renameText = item.bundle.name
-                                                    renameBundleOldName = item.bundle.name
-                                                    contextItem = null; contextMenuAnchor = null
+                                                    renameBundleId = item.bundle.id
+                                                    renameBundleName = item.bundle.name
+                                                    contextItem = null; contextMenuAnchorKey = null
                                                 },
                                                 leadingIcon = { Icon(Icons.Default.Edit, null) },
                                             )
                                             DropdownMenuItem(
                                                 text = { Text("拆组") },
                                                 onClick = {
+                                                    ungroupConfirmId = item.bundle.id
                                                     ungroupConfirmName = item.bundle.name
                                                     contextItem = null
-                                                    contextMenuAnchor = null
+                                                    contextMenuAnchorKey = null
                                                 },
                                                 leadingIcon = { Icon(Icons.Default.Close, null) },
                                             )
                                             DropdownMenuItem(
                                                 text = { Text("删除") },
                                                 onClick = {
-                                                    deleteConfirmId = "bundle:${item.bundle.name}"
+                                                    deleteConfirmId = item.bundle.id
+                                                    deleteConfirmIsBundle = true
                                                     deleteMode = BookRemovalMode.REMOVE_FROM_SHELF
                                                     deleteConfirmLabel = "《${item.bundle.name}》(${item.bundle.books.size}本)"
                                                     contextItem = null
-                                                    contextMenuAnchor = null
+                                                    contextMenuAnchorKey = null
                                                 },
                                                 leadingIcon = {
                                                     Icon(Icons.Default.Delete, null, tint = MaterialTheme.colorScheme.error)
@@ -771,61 +830,33 @@ fun BookGrid(
 
                     Text(
                         text = title,
-                        modifier = Modifier.padding(horizontal = 2.dp),
+                        modifier = Modifier
+                            .padding(horizontal = 2.dp)
+                            .graphicsLayer { alpha = draggedMetadataAlpha },
                         style = ReadflowType.bookTitle,
                         color = palette.ink,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = when (item) {
-                            is LibraryItem.Single -> buildString {
-                                if (item.book.progress > 0f) {
-                                    append("${(item.book.progress.coerceIn(0f, 1f) * 100).toInt()}%")
-                                    append(" · ")
-                                }
-                                append(item.book.author.ifBlank { "未知作者" })
-                            }
-                            is LibraryItem.Bundle -> "${item.bundle.books.size} 本合集"
-                        },
-                        modifier = Modifier.padding(horizontal = 2.dp),
-                        style = ReadflowType.meta,
-                        color = palette.inkSoft,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    if (item is LibraryItem.Bundle) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "${item.bundle.books.size} 本合集",
+                            modifier = Modifier.padding(horizontal = 2.dp),
+                            style = ReadflowType.meta,
+                            color = palette.inkSoft,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
-            }
-        }
-
-        // ── 取消区 Overlay ──
-        if (dragItemKey.isNotEmpty()) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .height(cancelZoneHeight)
-                    .background(
-                        if (isInCancelZone) MaterialTheme.colorScheme.error.copy(alpha = 0.7f)
-                        else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                    ),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = if (isInCancelZone) "松手取消移位" else "拖到此处取消",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (isInCancelZone) MaterialTheme.colorScheme.onError
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
             }
         }
     }
 
-    // ── Dialogs (unchanged) ─────────────────────────────────────────────────
+    // ── Dialogs ──────────────────────────────────────────────────────────────
 
     deleteConfirmId?.let { did ->
-        val isBundleDelete = did.startsWith("bundle:")
         AlertDialog(
             onDismissRequest = { deleteConfirmId = null },
             title = { Text("确认删除") },
@@ -874,14 +905,8 @@ fun BookGrid(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        // Save bundle books before removal
-                        val bundleBooksForDelete = if (isBundleDelete) {
-                            val bundleName = did.removePrefix("bundle:")
-                            items.filterIsInstance<LibraryItem.Bundle>()
-                                .firstOrNull { it.bundle.name == bundleName }?.bundle?.books ?: emptyList()
-                        } else emptyList()
-                        if (isBundleDelete) {
-                            bundleBooksForDelete.forEach { onDelete(it.id, deleteMode) }
+                        if (deleteConfirmIsBundle) {
+                            onDeleteBundle(did, deleteMode)
                         } else {
                             onDelete(did, deleteMode)
                         }
@@ -896,27 +921,19 @@ fun BookGrid(
         )
     }
 
-    ungroupConfirmName?.let { name ->
+    ungroupConfirmId?.let { collectionId ->
         AlertDialog(
-            onDismissRequest = { ungroupConfirmName = null },
+            onDismissRequest = { ungroupConfirmId = null },
             title = { Text("拆组") },
-            text = { Text("确定要拆散《${name}》吗？\n组内书籍将恢复为单本显示。") },
+            text = { Text("确定要拆散《${ungroupConfirmName}》吗？\n组内书籍将恢复为单本显示。") },
             confirmButton = {
                 TextButton(onClick = {
-                    // Optimistic: expand bundle to singles immediately
-                    val idx = mutableItems.indexOfFirst { it is LibraryItem.Bundle && it.bundle.name == name }
-                    if (idx >= 0) {
-                        val bundle = mutableItems[idx] as LibraryItem.Bundle
-                        mutableItems.removeAt(idx)
-                        bundle.bundle.books.forEachIndexed { offset, book ->
-                            mutableItems.add(idx + offset, LibraryItem.Single(book))
-                        }
-                    }
-                    onUngroup(name); ungroupConfirmName = null
+                    ungroupConfirmId = null
+                    onUngroup(collectionId) { }
                 }) { Text("拆组") }
             },
             dismissButton = {
-                TextButton(onClick = { ungroupConfirmName = null }) { Text("取消") }
+                TextButton(onClick = { ungroupConfirmId = null }) { Text("取消") }
             },
         )
     }
@@ -937,7 +954,7 @@ fun BookGrid(
                 TextButton(onClick = {
                     val bookId = ri.book.id
                     // Optimistic: rename in UI immediately
-                    mutableItems.replaceAll { item ->
+                    mutableItems = mutableItems.map { item ->
                         if (item is LibraryItem.Single && item.book.id == bookId)
                             item.copy(book = item.book.copy(title = renameText))
                         else item
@@ -952,9 +969,9 @@ fun BookGrid(
     }
 
     // Bundle rename dialog
-    renameBundleOldName?.let { old ->
+    renameBundleId?.let { collectionId ->
         AlertDialog(
-            onDismissRequest = { renameBundleOldName = null },
+            onDismissRequest = { renameBundleId = null },
             title = { Text("重命名书组") },
             text = {
                 OutlinedTextField(
@@ -967,21 +984,16 @@ fun BookGrid(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        if (renameText.isNotBlank()) {
-                            // Optimistic: rename in UI immediately
-                            mutableItems.replaceAll { item ->
-                                if (item is LibraryItem.Bundle && item.bundle.name == old)
-                                    item.copy(bundle = item.bundle.copy(name = renameText))
-                                else item
-                            }
-                            onRenameBundle(old, renameText)
+                        val cleanName = renameText.trim()
+                        if (cleanName.isNotEmpty() && cleanName != renameBundleName) {
+                            onRenameBundle(collectionId, cleanName) { }
                         }
-                        renameBundleOldName = null
+                        renameBundleId = null
                     },
                 ) { Text("确定") }
             },
             dismissButton = {
-                TextButton(onClick = { renameBundleOldName = null }) { Text("取消") }
+                TextButton(onClick = { renameBundleId = null }) { Text("取消") }
             },
         )
     }
@@ -989,14 +1001,18 @@ fun BookGrid(
     if (groupSourceId.isNotEmpty()) {
         if (groupTargetItem == null) {
             AlertDialog(
-                onDismissRequest = { groupSourceId = "" },
+                onDismissRequest = { groupSourceId = ""; groupName = "" },
                 title = { Text("建组") },
-                text = { Text("建组需要两本书。\n请长按拖动本书到目标书上，\n停留片刻即可建组。") },
+                text = { Text("长按拖动本书并与目标封面对齐。\n出现“松手建组”预览后松手即可。") },
                 confirmButton = { TextButton(onClick = { groupSourceId = "" }) { Text("知道了") } },
             )
         } else {
             AlertDialog(
-                onDismissRequest = { groupSourceId = ""; groupTargetItem = null },
+                onDismissRequest = {
+                    groupSourceId = ""
+                    groupTargetItem = null
+                    groupName = ""
+                },
                 title = { Text("建组") },
                 text = {
                     Column {
@@ -1016,18 +1032,25 @@ fun BookGrid(
                 },
                 confirmButton = {
                     TextButton(
+                        enabled = groupName.isNotBlank(),
                         onClick = {
-                            if (groupName.isNotBlank()) {
-                                onMoveToGroup(groupSourceId, groupName)
-                                groupTargetItem?.let { onMoveToGroup(it.book.id, groupName) }
+                            val target = groupTargetItem
+                            val cleanName = groupName.trim()
+                            if (cleanName.isNotEmpty() && target != null) {
+                                onCreateGroup(groupSourceId, target.book.id, cleanName)
                             }
                             groupSourceId = ""
                             groupTargetItem = null
+                            groupName = ""
                         },
                     ) { Text("确定") }
                 },
                 dismissButton = {
-                    TextButton(onClick = { groupSourceId = ""; groupTargetItem = null }) { Text("取消") }
+                    TextButton(onClick = {
+                        groupSourceId = ""
+                        groupTargetItem = null
+                        groupName = ""
+                    }) { Text("取消") }
                 },
             )
         }

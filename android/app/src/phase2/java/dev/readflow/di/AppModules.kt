@@ -23,6 +23,7 @@ import dev.readflow.core.database.LinReadsBackupRestorer
 import dev.readflow.core.database.NotesMarkdownExportStore
 import dev.readflow.core.database.NotesMarkdownFileExporter
 import dev.readflow.core.database.ReadflowDatabase
+import dev.readflow.core.database.MIGRATION_4_5
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.BookAssetOperationCoordinator
 import dev.readflow.core.sync.NoOpSyncBackend
@@ -68,7 +69,7 @@ val coreModule = module {
 val databaseModule = module {
     single {
         Room.databaseBuilder(androidContext(), ReadflowDatabase::class.java, "readflow.db")
-            .fallbackToDestructiveMigration(dropAllTables = true)
+            .addMigrations(MIGRATION_4_5)
             .build()
     }
     single { get<ReadflowDatabase>().bookDao() }

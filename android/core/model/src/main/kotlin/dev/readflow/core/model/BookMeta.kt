@@ -50,15 +50,17 @@ data class BookMeta(
     val downloadStatus: DownloadStatus = DownloadStatus.NOT_DOWNLOADED,
     val localUri: String? = null,
     val lastReadAt: Long? = null,
-    /** Optional collection/folder grouping name; books sharing one form a [BookBundle]. */
+    /** Optional collection/folder display name; identity is carried by [collectionId]. */
     val collectionName: String? = null,
     /** Whole-book reading progress [0,1], mirrored from reading_progress for shelf display. */
     val progress: Float = 0f,
+    /** Stable collection identity; [collectionName] is display-only and may be duplicated. */
+    val collectionId: String? = null,
 )
 
 /**
  * A shelf entry: either a single [BookMeta] or a [BookBundle] (a stack of books
- * sharing one collection name). The library lays these out in one aligned grid
+ * sharing one stable collection identity). The library lays these out in one aligned grid
  * (设计文档 §2.1 / §2.1.2).
  */
 sealed interface LibraryItem {
@@ -67,11 +69,13 @@ sealed interface LibraryItem {
 }
 
 /**
- * A group of books combined under one collection name, shown as a stack of covers
+ * A group of books combined under one stable identity, shown as a stack of covers
  * (设计文档 §2.1.2). [topBooks] is ordered most-recent-first; the UI reveals up to
  * the first 4 covers' edges, no "N 本" text — stack thickness conveys count.
  */
 data class BookBundle(
+    /** Stable shelf identity. */
+    val id: String,
     val name: String,
     val books: List<BookMeta>,
 ) {

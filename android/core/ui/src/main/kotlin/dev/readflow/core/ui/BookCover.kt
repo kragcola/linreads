@@ -2,10 +2,10 @@ package dev.readflow.core.ui
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
@@ -18,17 +18,25 @@ import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.font.FontWeight
 import coil3.compose.AsyncImage
 import dev.readflow.core.model.BookMeta
+import kotlin.math.roundToInt
 
 /**
  * 封面朝外（设计文档 §2.1）。有 coverUrl → 加载图 + 磨损暗角；无封面 → 素封面
- * （旧布/纸底色 + 居中烫印书名作者 + 边缘暗角，§2.1.1）。底部一道细墨进度条
- * （§2.1：进度=封面底部细进度条，不占额外行）。圆角 2dp（书近方角）。
+ * （旧布/纸底色 + 居中烫印书名 + 边缘暗角，§2.1.1）。阅读进度使用封面右下角
+ * 的紧凑圆形百分比，避免在卡片文字区重复显示。圆角保持接近纸书的克制比例。
  */
 @Composable
 fun BookCover(
@@ -71,31 +79,78 @@ fun BookCover(
         }
 
         if (showProgress && book.progress > 0f) {
-            Box(
+            BookProgressGauge(
+                progress = book.progress,
                 modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .fillMaxWidth()
-                    .height(3.dp)
-                    .drawBehind {
-                        drawRect(Color.Black.copy(alpha = 0.62f))
-                        drawRect(
-                            color = ReadflowColors.EvergreenNight,
-                            size = size.copy(width = size.width * book.progress.coerceIn(0f, 1f)),
-                        )
-                    },
+                    .align(Alignment.BottomEnd)
+                    .padding(8.dp),
             )
         }
     }
 }
 
-/** 无封面 fallback：旧布底色 + 居中烫印书名/作者，看上去是朴素精装本（§2.1.1）。 */
+@Composable
+private fun BookProgressGauge(
+    progress: Float,
+    modifier: Modifier = Modifier,
+) {
+    val safeProgress = progress.coerceIn(0f, 1f)
+    val percent = (safeProgress * 100f).roundToInt()
+    Box(
+        modifier = modifier
+            .size(34.dp)
+            .shadow(2.dp, CircleShape)
+            .drawBehind {
+                drawCircle(Color(0xC91B201D))
+                val inset = 3.dp.toPx()
+                val strokeWidth = 2.4.dp.toPx()
+                val arcSize = Size(
+                    width = size.width - inset * 2f,
+                    height = size.height - inset * 2f,
+                )
+                val arcTopLeft = Offset(inset, inset)
+                val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+                drawArc(
+                    color = Color.White.copy(alpha = 0.24f),
+                    startAngle = -90f,
+                    sweepAngle = 360f,
+                    useCenter = false,
+                    topLeft = arcTopLeft,
+                    size = arcSize,
+                    style = stroke,
+                )
+                drawArc(
+                    color = ReadflowColors.EvergreenNight,
+                    startAngle = -90f,
+                    sweepAngle = safeProgress * 360f,
+                    useCenter = false,
+                    topLeft = arcTopLeft,
+                    size = arcSize,
+                    style = stroke,
+                )
+            }
+            .clearAndSetSemantics {
+                contentDescription = "阅读进度 $percent%"
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = "$percent%",
+            color = Color.White,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+        )
+    }
+}
+
+/** 无封面 fallback：旧布底色 + 居中烫印书名，看上去是朴素精装本（§2.1.1）。 */
 @Composable
 private fun PlainStampedCover(
     book: BookMeta,
     clothColor: Color,
 ) {
     val titleStamp = ReadflowColors.InkNight.copy(alpha = 0.92f)
-    val authorStamp = ReadflowColors.InkNight.copy(alpha = 0.90f)
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -123,16 +178,6 @@ private fun PlainStampedCover(
                 textAlign = TextAlign.Center,
             )
         }
-        Text(
-            text = book.author,
-            style = ReadflowType.meta.copy(color = authorStamp),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 10.dp, start = 8.dp, end = 8.dp),
-        )
     }
 }
 
