@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -16,13 +17,25 @@ interface BookDao {
         SELECT b.*, COALESCE(p.totalProgression, 0.0) AS progress
         FROM books b
         LEFT JOIN reading_progress p ON p.bookId = b.id
-        ORDER BY b.sortOrder ASC, b.lastReadAt IS NULL, b.lastReadAt DESC, b.title COLLATE NOCASE
+        ORDER BY b.sortOrder ASC, b.title COLLATE NOCASE, b.id COLLATE NOCASE
         """,
     )
     fun observeShelf(): Flow<List<BookWithProgress>>
 
     @Query("SELECT COUNT(*) FROM books")
     suspend fun count(): Int
+
+    @Query("SELECT MAX(sortOrder) FROM books")
+    suspend fun maxSortOrder(): Int?
+
+    @Query(
+        """
+        SELECT * FROM books
+        ORDER BY sortOrder ASC, lastReadAt IS NULL, lastReadAt DESC,
+            title COLLATE NOCASE, id COLLATE NOCASE
+        """,
+    )
+    suspend fun shelfRowsForOrderNormalization(): List<BookEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(book: BookEntity)
@@ -34,7 +47,7 @@ interface BookDao {
     suspend fun getById(id: String): BookEntity?
 
     @Query("UPDATE books SET lastReadAt = :ts WHERE id = :id")
-    suspend fun updateLastReadAt(id: String, ts: Long)
+    suspend fun setLastReadAt(id: String, ts: Long)
 
     @Query(
         """
@@ -70,6 +83,24 @@ interface BookDao {
 
     @Query("UPDATE books SET sortOrder = :order WHERE id = :id")
     suspend fun updateSortOrder(id: String, order: Int)
+
+    @Transaction
+    suspend fun normalizeShelfOrderIfNeeded() {
+        val rows = shelfRowsForOrderNormalization()
+        if (rows.map(BookEntity::sortOrder).distinct().size == rows.size) return
+        rows.forEachIndexed { order, book -> updateSortOrder(book.id, order) }
+    }
+
+    @Transaction
+    suspend fun updateLastReadAt(id: String, ts: Long) {
+        normalizeShelfOrderIfNeeded()
+        setLastReadAt(id, ts)
+    }
+
+    @Transaction
+    suspend fun replaceShelfOrder(ids: List<String>) {
+        ids.forEachIndexed { order, id -> updateSortOrder(id, order) }
+    }
 }
 
 @Dao

@@ -164,7 +164,7 @@ class TxtS7SearchBookmarkAnnotationRuntimeSmokeTest {
         }
 
         ActivityScenario.launch<MainActivity>(launcherIntent()).use { reopened ->
-            waitForObject(By.desc("打开 $title")).click()
+            waitForObject(By.descStartsWith("打开 $title，")).click()
             waitForObject(By.desc(TXT_READER_DESC))
             ensureChromeVisible()
             openBottomPanel("书签", "书签")

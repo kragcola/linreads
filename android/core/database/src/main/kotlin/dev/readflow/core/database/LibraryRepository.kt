@@ -6,7 +6,11 @@ import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 interface LibraryStore {
     fun observeShelf(): Flow<List<LibraryItem>>
@@ -20,7 +24,7 @@ interface LibraryStore {
     suspend fun setCollection(id: String, name: String?)
     suspend fun renameBundle(oldName: String, newName: String)
     suspend fun ungroupBundle(name: String)
-    suspend fun updateSortOrder(id: String, order: Int)
+    suspend fun updateShelfOrder(ids: List<String>)
 }
 
 class LibraryRepository(
@@ -29,22 +33,44 @@ class LibraryRepository(
     private val completeBookDeletionStore: CompleteBookDeletionStore? = null,
 ) : LibraryStore {
 
-    override fun observeShelf(): Flow<List<LibraryItem>> =
-        bookDao.observeShelf().map { rows -> groupIntoItems(rows.map { it.toMeta() }) }
+    private val shelfWriteMutex = Mutex()
+
+    override fun observeShelf(): Flow<List<LibraryItem>> = flow {
+        shelfWriteMutex.withLock { bookDao.normalizeShelfOrderIfNeeded() }
+        emitAll(
+            bookDao.observeShelf().map { rows ->
+                groupIntoItems(rows.stableShelfOrder().map { it.toMeta() })
+            },
+        )
+    }
 
     override suspend fun count(): Int = bookDao.count()
     override suspend fun upsertBook(book: BookMeta) {
-        val existing = bookDao.getById(book.id)
-        val entity = book.toEntity().preserveShelfStateFrom(existing)
-        bookDao.upsert(entity)
+        shelfWriteMutex.withLock {
+            bookDao.normalizeShelfOrderIfNeeded()
+            val existing = bookDao.getById(book.id)
+            val entity = book.toEntity().preserveShelfStateFrom(existing)
+            val ordered = if (existing == null) {
+                entity.copy(sortOrder = (bookDao.maxSortOrder() ?: -1) + 1)
+            } else {
+                entity
+            }
+            bookDao.upsert(ordered)
+        }
         trimCacheIfDownloadedRemote(book)
     }
 
     override suspend fun upsertAll(books: List<BookMeta>) {
-        val entities = books.map { book ->
-            book.toEntity().preserveShelfStateFrom(bookDao.getById(book.id))
+        shelfWriteMutex.withLock {
+            bookDao.normalizeShelfOrderIfNeeded()
+            var nextSortOrder = (bookDao.maxSortOrder() ?: -1) + 1
+            val entities = books.map { book ->
+                val existing = bookDao.getById(book.id)
+                val entity = book.toEntity().preserveShelfStateFrom(existing)
+                if (existing == null) entity.copy(sortOrder = nextSortOrder++) else entity
+            }
+            bookDao.upsertAll(entities)
         }
-        bookDao.upsertAll(entities)
         books.lastOrNull { it.isDownloadedRemoteCacheBook() }?.let { downloadedBookCache.trim(it.id) }
     }
     override suspend fun deleteBook(id: String) = bookDao.deleteById(id)
@@ -53,11 +79,18 @@ class LibraryRepository(
     }
     override suspend fun removeDownloadedAsset(id: String): Boolean =
         downloadedBookCache.removeDownloadedAsset(id) != null
-    override suspend fun renameBook(id: String, title: String) = bookDao.updateTitle(id, title)
+    override suspend fun renameBook(id: String, title: String) {
+        shelfWriteMutex.withLock {
+            bookDao.normalizeShelfOrderIfNeeded()
+            bookDao.updateTitle(id, title)
+        }
+    }
     override suspend fun setCollection(id: String, name: String?) = bookDao.updateCollectionName(id, name)
     override suspend fun renameBundle(oldName: String, newName: String) = bookDao.renameCollection(oldName, newName)
     override suspend fun ungroupBundle(name: String) = bookDao.clearCollection(name)
-    override suspend fun updateSortOrder(id: String, order: Int) = bookDao.updateSortOrder(id, order)
+    override suspend fun updateShelfOrder(ids: List<String>) {
+        shelfWriteMutex.withLock { bookDao.replaceShelfOrder(ids) }
+    }
 
     private fun groupIntoItems(books: List<BookMeta>): List<LibraryItem> {
         val items = mutableListOf<LibraryItem>()
@@ -104,14 +137,22 @@ private fun BookMeta.toEntity() = BookEntity(
 )
 
 private fun BookEntity.preserveShelfStateFrom(existing: BookEntity?): BookEntity =
-    if (existing == null || !id.startsWith("local-")) {
+    if (existing == null) {
         this
     } else {
+        val preserveImportedMetadata = id.startsWith("local-")
         copy(
-            title = existing.title,
-            author = existing.author,
+            title = if (preserveImportedMetadata) existing.title else title,
+            author = if (preserveImportedMetadata) existing.author else author,
             lastReadAt = existing.lastReadAt,
             collectionName = existing.collectionName,
             sortOrder = existing.sortOrder,
         )
     }
+
+private fun List<BookWithProgress>.stableShelfOrder(): List<BookWithProgress> =
+    sortedWith(
+        compareBy<BookWithProgress> { it.book.sortOrder }
+            .thenBy(String.CASE_INSENSITIVE_ORDER) { it.book.title }
+            .thenBy(String.CASE_INSENSITIVE_ORDER) { it.book.id },
+    )

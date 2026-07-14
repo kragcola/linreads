@@ -1550,6 +1550,8 @@ class ReaderSavedStateHandleTest {
         override fun observeAll(): Flow<List<BookEntity>> = MutableStateFlow(books.values.toList())
         override fun observeShelf(): Flow<List<BookWithProgress>> = MutableStateFlow(emptyList())
         override suspend fun count(): Int = books.size
+        override suspend fun maxSortOrder(): Int? = books.values.maxOfOrNull { it.sortOrder }
+        override suspend fun shelfRowsForOrderNormalization(): List<BookEntity> = books.values.toList()
         override suspend fun upsert(book: BookEntity) {
             books[book.id] = book
         }
@@ -1560,7 +1562,7 @@ class ReaderSavedStateHandleTest {
             getByIdCalls += 1
             return books[id]
         }
-        override suspend fun updateLastReadAt(id: String, ts: Long) = Unit
+        override suspend fun setLastReadAt(id: String, ts: Long) = Unit
         override suspend fun downloadedRemoteCacheBooks(
             remotePrefix: String,
             downloadedStatus: String,

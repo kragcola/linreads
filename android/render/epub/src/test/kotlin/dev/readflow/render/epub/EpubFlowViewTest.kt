@@ -20,6 +20,8 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.ui.readerPaperBackground
+import io.noties.markwon.image.AsyncDrawable
+import io.noties.markwon.image.AsyncDrawableSpan
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -34,6 +36,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executors
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -517,38 +520,38 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `boundary up before preview ready cancels and late preview cannot revive the gesture`() {
+    fun `committed boundary drag keeps its intent until a late preview arrives`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
+        val commits = mutableListOf<Any>()
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SIMULATION,
             onTapZone = tapZones::add,
         )
+        view.installBoundaryCommitRecorderForTest(commits)
         view.goToLastPage()
-        val startPage = view.currentPageIndex()
-        val startTop = view.scrollY
         val downX = view.width * 0.75f
         val moveX = view.width * 0.10f
         val y = view.height * 0.10f
         val downTime = SystemClock.uptimeMillis()
 
-        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
-        view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
-        view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
-        val latePreview = view.offerReadyBoundaryPreviewForTest(forward = true, token = 3L)
-        shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
 
-        assertEquals("UP-before-ready must keep the outgoing logical page", startPage, view.currentPageIndex())
-        assertEquals("UP-before-ready must keep the outgoing page anchor", startTop, view.scrollY)
-        assertTrue("UP-before-ready and late readiness must not request navigation", tapZones.isEmpty())
-        assertNull(
-            "a preview arriving after ACTION_UP must not create a detached software curl",
-            view.privateField("curlDrawable"),
-        )
-        if (!latePreview.isRecycled) latePreview.recycle()
+            assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
+            view.offerReadyBoundaryPreviewForTest(forward = true, token = 3L)
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals("the retained drag must publish exactly one boundary commit", 1, commits.size)
+            assertTrue("the retained drag must not re-enter tap navigation", tapZones.isEmpty())
+        } finally {
+            view.dispose()
+        }
     }
 
     @Test
-    fun `NONE boundary swipe released before preview arrives cannot auto commit`() {
+    fun `NONE boundary swipe keeps the same late preview intent as an in chapter hard turn`() {
         lateinit var view: EpubFlowView
         val commits = mutableListOf<Any>()
         view = pagedFlowView(
@@ -559,31 +562,27 @@ class EpubFlowViewTest {
         )
         view.installBoundaryCommitRecorderForTest(commits)
         view.goToLastPage()
-        val startPage = view.currentPageIndex()
-        val startTop = view.scrollY
         val downX = view.width * 0.85f
         val moveX = view.width * 0.05f
         val y = view.height * 0.10f
         val downTime = SystemClock.uptimeMillis()
 
-        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
-        view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
-        assertEquals(
-            "BOUNDARY_WAITING",
-            view.privateField("interactiveTurnState").toString(),
-        )
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+            assertEquals("BOUNDARY_WAITING", view.privateField("interactiveTurnState").toString())
 
-        view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
-        val latePreview = view.offerReadyBoundaryPreviewForTest(forward = true, token = 99L)
-        shadowOf(Looper.getMainLooper()).idle()
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
+            assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
+            view.offerReadyBoundaryPreviewForTest(forward = true, token = 99L)
+            shadowOf(Looper.getMainLooper()).idle()
 
-        assertEquals("NONE", view.privateField("interactiveTurnState").toString())
-        assertEquals(startPage, view.currentPageIndex())
-        assertEquals(startTop, view.scrollY)
-        assertTrue(commits.isEmpty())
-        assertNull(view.privateField("conversionSnapshotDrawable"))
-        assertFalse("the late result remains cached for a later explicit input", latePreview.isRecycled)
-        if (!latePreview.isRecycled) latePreview.recycle()
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertEquals(1, commits.size)
+            assertNotNull(view.privateField("conversionSnapshotDrawable"))
+        } finally {
+            view.dispose()
+        }
     }
 
     @Test
@@ -2978,6 +2977,51 @@ class EpubFlowViewTest {
         } finally {
             if (retryStarted) view.endInteractiveCurl(velocityX = 0f)
             shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `quick side swipe keeps its chapter boundary turn intent until preview arrives`() {
+        val commits = mutableListOf<Any>()
+        val previewRequests = mutableListOf<Pair<Boolean, Long>>()
+        val cancelledRequests = mutableListOf<Boolean>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE).apply {
+            installBoundaryCommitRecorderForTest(commits)
+            onBoundaryPreviewNeeded = { forward, generation -> previewRequests += forward to generation }
+            onBoundaryPreviewRequestCancelled = cancelledRequests::add
+        }
+        view.goToLastPage()
+        val startX = view.width * 0.85f
+        val startY = view.height * 0.85f
+        val moveY = view.height * 0.65f
+        val releaseY = view.height * 0.50f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, startX, startY))
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, startX, moveY),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, startX, releaseY),
+            )
+
+            assertEquals(listOf(true to view.boundaryPreviewGenerationToken()), previewRequests)
+            assertEquals(
+                "a fast released swipe must remain a discrete boundary intent instead of cancelling cold work",
+                "BOUNDARY_DISCRETE_WAITING",
+                view.privateField("interactiveTurnState").toString(),
+            )
+            assertTrue("the in-flight adjacent preview must not be cancelled on finger-up", cancelledRequests.isEmpty())
+
+            val preview = view.newBoundaryPreviewForTest(forward = true, token = 55L)
+            assertTrue(view.offerBoundaryPreviewForTest(preview))
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals("the retained short swipe must commit exactly once", 1, commits.size)
+            assertTrue(cancelledRequests.isEmpty())
+        } finally {
             view.dispose()
         }
     }
@@ -5395,7 +5439,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `inner center horizontal drag is consumed without page turn`() {
+    fun `inner center horizontal drag follows the paged turn path`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val view = pagedFlowView(onTapZone = tapZones::add)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -5423,7 +5467,11 @@ class EpubFlowViewTest {
             ),
         )
 
-        assertEquals("inner center horizontal drag must not trigger a paged tap/flip", emptyList<EpubFlowTapZone>(), tapZones)
+        assertEquals(
+            "horizontal intent must turn from the middle without stealing the vertical temporary-scroll zone",
+            listOf(EpubFlowTapZone.NEXT),
+            tapZones,
+        )
         assertEquals(0, view.currentPageIndex())
         assertEquals(0, view.scrollY)
     }
@@ -5944,6 +5992,121 @@ class EpubFlowViewTest {
             layout.getLineStart(imageLine),
             view.topLayoutOffset(),
         )
+    }
+
+    @Test
+    fun `free rest inside a regular async image keeps its visible slice`() {
+        val imageColor = 0xFF1A8F5D.toInt()
+        val builder = SpannableString("A\n\uFFFC\n" + (1..30).joinToString("\n") { "Tail line $it" })
+        val executor = Executors.newSingleThreadExecutor()
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { null },
+            executor = executor,
+            columnWidthPx = 360,
+            pageHeightProvider = { 120 },
+            inlineMaxHeightPx = 80,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = 360, height = 80) },
+        )
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = 360,
+            pageHeightProvider = { 120 },
+            inlineMaxHeightPx = 80,
+            fullPageHrefs = emptySet(),
+        )
+        val asyncDrawable = AsyncDrawable("inline.png", loader, resolver, null).apply {
+            result = ColorDrawable(imageColor).apply { setBounds(0, 0, 360, 80) }
+            setBounds(0, 0, 360, 80)
+        }
+        builder.setSpan(
+            AsyncDrawableSpan(
+                io.noties.markwon.core.MarkwonTheme.create(RuntimeEnvironment.getApplication()),
+                asyncDrawable,
+                AsyncDrawableSpan.ALIGN_CENTER,
+                false,
+            ),
+            2,
+            3,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        val view = pagedFlowView(spannable = builder)
+        val layout = requireNotNull(view.textView.layout)
+        val imageLine = 1
+        val imageLineTop = layout.getLineTop(imageLine)
+        val imageLineBottom = layout.getLineBottom(imageLine)
+        assertTrue("fixture requires a regular image shorter than the viewport", imageLineBottom - imageLineTop < view.height)
+        val freeRest = imageLineTop + 20
+        assertTrue(freeRest in (imageLineTop + 1) until imageLineBottom)
+
+        try {
+            view.scrollTo(0, freeRest)
+            view.setPrivateField("pageClipActive", true)
+
+            assertEquals(
+                "a partially scrolled image is an indivisible visual line and must not be clipped from the top",
+                freeRest,
+                view.pageClipTopForTest(),
+            )
+            assertEquals(
+                "page-shot capture must retain the same partially visible image slice",
+                freeRest,
+                view.snapshotClipTopForTest(freeRest),
+            )
+            val live = view.drawToBitmapForTest()
+            val snapshot = requireNotNull(view.snapshotPageAt(freeRest))
+            try {
+                assertEquals(imageColor, live.getPixel(view.width / 2, 10))
+                assertEquals(imageColor, snapshot.getPixel(view.width / 2, 10))
+            } finally {
+                live.recycle()
+                snapshot.recycle()
+            }
+        } finally {
+            view.dispose()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `regular image crossing the page bottom keeps its visible strip`() {
+        val imageColor = 0xFF1A8F5D.toInt()
+        val prefix = (1..10).joinToString("\n") { "Head line $it" }
+        val builder = SpannableString("$prefix\n\uFFFC\nTail")
+        val imageOffset = prefix.length + 1
+        builder.setSpan(
+            ImageSpan(
+                ColorDrawable(imageColor).apply { setBounds(0, 0, 360, 80) },
+                ImageSpan.ALIGN_BOTTOM,
+            ),
+            imageOffset,
+            imageOffset + 1,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        val view = pagedFlowView(spannable = builder)
+        val layout = requireNotNull(view.textView.layout)
+        val imageLine = layout.getLineForOffset(imageOffset)
+        val imageTop = layout.getLineTop(imageLine)
+        val freeRest = imageTop - (view.height - 30)
+        assertTrue("fixture must expose only the top strip at the page bottom", freeRest > 0)
+
+        try {
+            view.scrollTo(0, freeRest)
+            view.setPrivateField("pageClipActive", true)
+            val liveClipBottom = view.pageClipBottomForTest()
+            assertTrue(
+                "the live clip must reach the viewport bottom instead of backing off to the image top; " +
+                    "line=${layout.getLineTop(imageLine)}..${layout.getLineBottom(imageLine)} " +
+                    "rest=$freeRest clipBottom=$liveClipBottom",
+                liveClipBottom == null || liveClipBottom >= view.height,
+            )
+            assertEquals(
+                "the page shot must preserve the same visible image strip at the viewport bottom",
+                freeRest + view.height,
+                view.snapshotClipBottomForTest(freeRest),
+            )
+        } finally {
+            view.dispose()
+        }
     }
 
     private fun pagedFlowView(

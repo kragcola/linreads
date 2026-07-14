@@ -195,13 +195,14 @@ class LibraryViewModel(
 
     fun reorder(items: List<LibraryItem>) {
         viewModelScope.launch {
-            items.forEachIndexed { idx, item ->
-                val ids = when (item) {
+            val completeItems = mergeVisibleShelfOrder(allShelfItems, items) ?: return@launch
+            val ids = completeItems.flatMap { item ->
+                when (item) {
                     is LibraryItem.Single -> listOf(item.book.id)
                     is LibraryItem.Bundle -> item.bundle.books.map { it.id }
                 }
-                ids.forEach { repository.updateSortOrder(it, idx) }
             }
+            repository.updateShelfOrder(ids)
         }
     }
 
@@ -333,6 +334,30 @@ class LibraryViewModel(
             offlineCount = allShelfItems.offlineReadableCount(),
         )
     }
+}
+
+private fun mergeVisibleShelfOrder(
+    allItems: List<LibraryItem>,
+    reorderedVisibleItems: List<LibraryItem>,
+): List<LibraryItem>? {
+    if (allItems.isEmpty()) return reorderedVisibleItems
+    val reorderedKeys = reorderedVisibleItems.map(LibraryItem::shelfIdentity)
+    if (reorderedKeys.distinct().size != reorderedKeys.size) return null
+
+    val fullItemsByKey = allItems.associateBy(LibraryItem::shelfIdentity)
+    val reorderedFullItems = reorderedKeys.mapNotNull(fullItemsByKey::get)
+    if (reorderedFullItems.size != reorderedKeys.size) return null
+
+    val reorderedKeySet = reorderedKeys.toSet()
+    val replacements = reorderedFullItems.iterator()
+    return allItems.map { item ->
+        if (item.shelfIdentity() in reorderedKeySet) replacements.next() else item
+    }
+}
+
+private fun LibraryItem.shelfIdentity(): String = when (this) {
+    is LibraryItem.Single -> "book:${book.id}"
+    is LibraryItem.Bundle -> "bundle:${bundle.name}"
 }
 
 private fun List<LibraryItem>.filterFor(filter: LibraryFilter): List<LibraryItem> =

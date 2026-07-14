@@ -512,7 +512,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
             device.waitForIdle()
             assertTrue(
                 "system Back should return from Reader to the shelf",
-                device.wait(Until.findObject(By.desc("打开 $title")), UI_TIMEOUT_MS) != null,
+                device.wait(Until.findObject(By.descStartsWith("打开 $title，")), UI_TIMEOUT_MS) != null,
             )
 
             var persistedProgress = latestProgress(book.id)
@@ -589,7 +589,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
         ActivityScenario.launch<MainActivity>(mainIntent()).use { shelf ->
             dismissBlockingDialogs()
             val activity = shelf.withActivity { it }
-            val shelfItem = waitForObject(By.desc("打开 $title"))
+            val shelfItem = waitForObject(By.descStartsWith("打开 $title，"))
             val bounds = shelfItem.visibleBounds
             injectScreenTap(bounds.centerX(), bounds.centerY())
 
@@ -663,7 +663,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
         settings.setPageFlipStyle(PageFlipStyle.SLIDE)
         ActivityScenario.launch<MainActivity>(mainIntent()).use { shelf ->
             dismissBlockingDialogs()
-            val shelfItem = waitForObject(By.desc("打开 $title"))
+            val shelfItem = waitForObject(By.descStartsWith("打开 $title，"))
             val shelfBounds = shelfItem.visibleBounds
             device.click(shelfBounds.centerX(), shelfBounds.centerY())
 

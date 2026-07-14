@@ -772,17 +772,25 @@ class EpubReflowEngine private constructor(
         val view = flowView ?: return
         val required = view.boundaryPreviewIsRequired(forward)
         if ((pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) && !required) return
-        val book = lazyBook ?: return
-        val host = flowHost ?: return
+        val book = lazyBook ?: return view.rejectBoundaryPreview(forward, sourceChapterGeneration)
+        val host = flowHost ?: return view.rejectBoundaryPreview(forward, sourceChapterGeneration)
         if (
             _pagingKind.value != PagingKind.PAGED ||
-            view.boundaryPreviewGenerationToken() != sourceChapterGeneration ||
-            boundaryPreviewJobs.containsKey(forward) ||
-            boundaryPreviewSessions.containsKey(forward)
-        ) return
+            view.boundaryPreviewGenerationToken() != sourceChapterGeneration
+        ) {
+            view.rejectBoundaryPreview(forward, sourceChapterGeneration)
+            return
+        }
+        if (boundaryPreviewJobs.containsKey(forward) || boundaryPreviewSessions.containsKey(forward)) return
         val sourceSpine = flowSpineIndex
-        val targetSpine = adjacentSpine(sourceSpine, if (forward) 1 else -1) ?: return
-        if (!view.preparePageShotBudgetForBoundaryPreview(forward, required)) return
+        val targetSpine = adjacentSpine(sourceSpine, if (forward) 1 else -1) ?: run {
+            view.rejectBoundaryPreview(forward, sourceChapterGeneration)
+            return
+        }
+        if (!view.preparePageShotBudgetForBoundaryPreview(forward, required)) {
+            view.rejectBoundaryPreview(forward, sourceChapterGeneration)
+            return
+        }
         val generation = boundaryPreviewGeneration
         val blocks = book.layoutBlocks().filter {
             paras.getOrNull(it.paragraphIndex)?.spineIndex == targetSpine
@@ -796,7 +804,7 @@ class EpubReflowEngine private constructor(
                 boundaryPreviewJobs.remove(forward)
                 boundaryPreviewJobTokens.remove(forward)
                 if (targetFlow == null) {
-                    view.releasePageShotBudgetForBoundaryPreview(forward)
+                    view.rejectBoundaryPreview(forward, sourceChapterGeneration)
                     return@post
                 }
                 if (
@@ -811,7 +819,7 @@ class EpubReflowEngine private constructor(
                             !view.boundaryPreviewIsRequired(forward)
                         )
                 ) {
-                    view.releasePageShotBudgetForBoundaryPreview(forward)
+                    view.rejectBoundaryPreview(forward, sourceChapterGeneration)
                     return@post
                 }
                 installBoundaryPreviewRenderer(
@@ -836,7 +844,7 @@ class EpubReflowEngine private constructor(
     ) {
         val liveView = flowView ?: return
         val host = flowHost ?: run {
-            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+            liveView.rejectBoundaryPreview(forward, sourceChapterGeneration)
             return
         }
         if (
@@ -844,11 +852,11 @@ class EpubReflowEngine private constructor(
             (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) &&
             !liveView.boundaryPreviewIsRequired(forward)
         ) {
-            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+            liveView.rejectBoundaryPreview(forward, sourceChapterGeneration)
             return
         }
         if (liveView.width <= 0 || liveView.height <= 0) {
-            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+            liveView.rejectBoundaryPreview(forward, sourceChapterGeneration)
             return
         }
         boundaryPreviewSessions.remove(forward)?.let(::disposeBoundaryPreviewSession)
@@ -907,7 +915,7 @@ class EpubReflowEngine private constructor(
         ) ?: run {
             host.removeView(previewView)
             previewView.dispose()
-            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+            liveView.rejectBoundaryPreview(forward, sourceChapterGeneration)
             return
         }
         val session = BoundaryPreviewRenderSession(
@@ -925,7 +933,7 @@ class EpubReflowEngine private constructor(
                 if (stale?.view === previewView && stale.generation == generation) {
                     boundaryPreviewSessions.remove(forward)
                     disposeBoundaryPreviewSession(stale)
-                    flowView?.releasePageShotBudgetForBoundaryPreview(forward)
+                    flowView?.rejectBoundaryPreview(forward, stale.sourceChapterGeneration)
                 }
             }
         session.timeoutRunnable = timeout
@@ -950,7 +958,7 @@ class EpubReflowEngine private constructor(
         boundaryPreviewSessions.remove(forward)
         disposeBoundaryPreviewSession(session)
         if (bitmap == null) {
-            flowView?.releasePageShotBudgetForBoundaryPreview(forward)
+            flowView?.rejectBoundaryPreview(forward, session.sourceChapterGeneration)
             return
         }
         val liveView = flowView
@@ -967,7 +975,7 @@ class EpubReflowEngine private constructor(
         ) {
             pageShotBudget.release(bitmap)
             bitmap.recycle()
-            liveView?.releasePageShotBudgetForBoundaryPreview(forward)
+            liveView?.rejectBoundaryPreview(forward, session.sourceChapterGeneration)
             return
         }
         val token = ++nextBoundaryPreviewToken
@@ -988,7 +996,7 @@ class EpubReflowEngine private constructor(
         )
         if (!accepted) {
             boundaryPreviewTargets.remove(token)
-            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+            liveView.rejectBoundaryPreview(forward, session.sourceChapterGeneration)
         }
     }
 

@@ -143,12 +143,13 @@ class CalibreGroupedRuntimeSmokeTest {
 
             waitForObject(By.text("关闭")).click()
             waitForObject(By.text("Remote EPUB Smoke"))
-            val shelfCoverDescription = waitForObject(By.desc("Remote EPUB Smoke 封面")).contentDescription
+            val shelfCardDescription =
+                waitForObject(By.desc("打开 Remote EPUB Smoke，Calibre")).contentDescription
             dumpHierarchy("shelf-after-download.xml")
 
             shutdownFakeCalibreServer()
 
-            waitForObject(By.textContains("离线可读")).click()
+            waitForObject(By.text("离线")).click()
             waitForObject(By.text("Remote EPUB Smoke"))
             takeScreenshot("offline-filter.png")
 
@@ -183,7 +184,7 @@ class CalibreGroupedRuntimeSmokeTest {
                     appendLine("downloadedStatusBeforeRemove=${downloadedBook.downloadStatus}")
                     appendLine("downloadedLocalUriBeforeRemove=${downloadedBook.localUri}")
                     appendLine("downloadedFileExistsBeforeRemove=$downloadedFileExistsBeforeRemove")
-                    appendLine("shelfCoverDescription=$shelfCoverDescription")
+                    appendLine("shelfCardDescription=$shelfCardDescription")
                     appendLine("fakeCalibreEventsBeforeOffline=$calibreEventsBeforeOffline")
                     appendLine("offlineOpenParagraph=Calibre smoke paragraph proves offline reader opening after download.")
                     appendLine("removedStatusAfterRemove=${removedBook.downloadStatus}")

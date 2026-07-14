@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Settings
@@ -28,7 +27,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -43,7 +41,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.Surface
-import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -55,6 +55,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.readflow.core.model.BookMeta
@@ -113,6 +115,12 @@ fun LibraryScreen(
             is dev.readflow.core.model.LibraryItem.Bundle -> item.bundle.books.size
         }
     }
+    val shelfSummary = when {
+        state.filter == LibraryFilter.OFFLINE -> "$visibleBookCount 本离线可读"
+        visibleBookCount == 0 -> "尚未添加书籍"
+        state.offlineCount == 0 -> "共 $visibleBookCount 本"
+        else -> "共 $visibleBookCount 本 · ${state.offlineCount} 本可离线"
+    }
 
     PaperSurface {
         Scaffold(
@@ -140,27 +148,20 @@ fun LibraryScreen(
                                     color = MaterialTheme.colorScheme.onBackground,
                                 )
                                 Text(
-                                    text = if (visibleBookCount == 0) {
-                                        "让下一本书从这里开始"
-                                    } else {
-                                        "$visibleBookCount 本藏书 · 随时继续阅读"
-                                    },
+                                    text = shelfSummary,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Box {
-                                    Surface(
-                                        color = MaterialTheme.colorScheme.surfaceVariant,
-                                        shape = CircleShape,
+                            Row(horizontalArrangement = Arrangement.spacedBy(Dimens.spaceSm)) {
+                                Box {
+                                    IconButton(
+                                        onClick = { showAddMenu = true },
+                                        modifier = Modifier.size(Dimens.touchTarget),
                                     ) {
-                                        IconButton(
-                                            onClick = { showAddMenu = true },
-                                            modifier = Modifier.size(Dimens.touchTarget),
-                                        ) {
-                                            Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
-                                        }
+                                        Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
                                     }
                                     DropdownMenu(expanded = showAddMenu, onDismissRequest = { showAddMenu = false }) {
                                         DropdownMenuItem(
@@ -177,16 +178,11 @@ fun LibraryScreen(
                                         )
                                     }
                                 }
-                                Surface(
-                                    color = MaterialTheme.colorScheme.surfaceVariant,
-                                    shape = CircleShape,
+                                IconButton(
+                                    onClick = onSettings,
+                                    modifier = Modifier.size(Dimens.touchTarget),
                                 ) {
-                                    IconButton(
-                                        onClick = onSettings,
-                                        modifier = Modifier.size(Dimens.touchTarget),
-                                    ) {
-                                        Icon(Icons.Outlined.Settings, contentDescription = "设置")
-                                    }
+                                    Icon(Icons.Outlined.Settings, contentDescription = "设置")
                                 }
                             }
                         }
@@ -282,31 +278,28 @@ private fun LibraryFilterBar(
     offlineCount: Int,
     onFilterChange: (LibraryFilter) -> Unit,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        FilterChip(
-            selected = filter == LibraryFilter.ALL,
-            onClick = { onFilterChange(LibraryFilter.ALL) },
-            label = { Text("全部") },
-            modifier = Modifier.heightIn(min = Dimens.touchTarget),
-            colors = FilterChipDefaults.filterChipColors(
-                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
-            ),
-        )
-        FilterChip(
-            selected = filter == LibraryFilter.OFFLINE,
-            onClick = { onFilterChange(LibraryFilter.OFFLINE) },
-            label = { Text("离线可读 $offlineCount") },
-            modifier = Modifier.heightIn(min = Dimens.touchTarget),
-            colors = FilterChipDefaults.filterChipColors(
-                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
-            ),
-        )
+    val options = listOf(
+        Triple(LibraryFilter.ALL, "全部", "全部书籍"),
+        Triple(LibraryFilter.OFFLINE, "离线", "离线可读 $offlineCount"),
+    )
+    SingleChoiceSegmentedButtonRow {
+        options.forEachIndexed { index, (option, label, description) ->
+            SegmentedButton(
+                selected = filter == option,
+                onClick = { onFilterChange(option) },
+                shape = SegmentedButtonDefaults.itemShape(index, options.size),
+                modifier = Modifier
+                    .heightIn(min = Dimens.touchTarget)
+                    .semantics { contentDescription = description },
+                icon = {},
+            ) {
+                Text(
+                    text = label,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
     }
 }
 

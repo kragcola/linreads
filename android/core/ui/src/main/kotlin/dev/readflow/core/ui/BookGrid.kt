@@ -38,7 +38,9 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
@@ -65,6 +67,10 @@ private val BookMeta.canRemoveDownload: Boolean
     get() = id.startsWith("calibre-") &&
         downloadStatus == DownloadStatus.DOWNLOADED &&
         localUri != null
+
+private val BookMeta.isOfflineReadable: Boolean
+    get() = localUri != null &&
+        (!id.startsWith("calibre-") || downloadStatus == DownloadStatus.DOWNLOADED)
 
 private const val LibraryExpandedGapMinWidthDp = 1_020f
 
@@ -288,8 +294,18 @@ fun BookGrid(
                     is LibraryItem.Bundle -> item.bundle.name
                 }
                 val openDescription = when (item) {
-                    is LibraryItem.Single -> "打开 ${item.book.title}"
+                    is LibraryItem.Single ->
+                        "打开 ${item.book.title}，${item.book.author.ifBlank { "未知作者" }}"
                     is LibraryItem.Bundle -> "打开书组 ${item.bundle.name}，共 ${item.bundle.books.size} 本"
+                }
+                val itemStateDescription = when (item) {
+                    is LibraryItem.Single -> buildList {
+                        if (item.book.progress > 0f) {
+                            add("阅读进度 ${(item.book.progress.coerceIn(0f, 1f) * 100).toInt()}%")
+                        }
+                        if (item.book.isOfflineReadable) add("可离线")
+                    }.joinToString("，").ifBlank { null }
+                    is LibraryItem.Bundle -> null
                 }
                 val menuDescription = when (item) {
                     is LibraryItem.Single -> "${item.book.title} 的菜单"
@@ -317,8 +333,11 @@ fun BookGrid(
                             }
                         }
                         .then(if (!isDragging) Modifier.animateItem() else Modifier)
-                        .semantics { contentDescription = openDescription }
-                        .clickable { onItemClick(item) }
+                        .semantics {
+                            contentDescription = openDescription
+                            itemStateDescription?.let { stateDescription = it }
+                        }
+                        .clickable(role = Role.Button) { onItemClick(item) }
                         .pointerInput(item.key, dragGeneration) {
                             var dwellLocalStart = 0L
 
@@ -560,12 +579,19 @@ fun BookGrid(
                                                 item.book.title,
                                                 listOf(dragged.book, item.book),
                                             ),
+                                            modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
                                         )
                                     } else {
-                                        BookCover(book = item.book, modifier = Modifier.fillMaxSize())
+                                        BookCover(
+                                            book = item.book,
+                                            modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
+                                        )
                                     }
                                 } else {
-                                    BookCover(book = item.book, modifier = Modifier.fillMaxSize())
+                                    BookCover(
+                                        book = item.book,
+                                        modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
+                                    )
                                     if (item.book.lastReadAt != null && item.book.progress > 0f) {
                                         PaperBookmark(
                                             book = item.book,
@@ -580,12 +606,21 @@ fun BookGrid(
                                 if (isDwellTarget && dragItemKey.isNotEmpty()) {
                                     val dragged = mutableItems.firstOrNull { it.key == dragItemKey }
                                     if (dragged is LibraryItem.Single) {
-                                        BundleStack(bundle = item.bundle.copy(books = item.bundle.books + dragged.book))
+                                        BundleStack(
+                                            bundle = item.bundle.copy(books = item.bundle.books + dragged.book),
+                                            modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
+                                        )
                                     } else {
-                                        BundleStack(bundle = item.bundle)
+                                        BundleStack(
+                                            bundle = item.bundle,
+                                            modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
+                                        )
                                     }
                                 } else {
-                                    BundleStack(bundle = item.bundle)
+                                    BundleStack(
+                                        bundle = item.bundle,
+                                        modifier = Modifier.fillMaxSize().clearAndSetSemantics {},
+                                    )
                                 }
                             }
                         }
@@ -610,7 +645,7 @@ fun BookGrid(
                             }
                         }
 
-                        // ⋮ 菜单按钮（双层描边图标：暗底描边 + 白顶，任何封面可见）
+                        // 48dp hit target with a quiet visual anchor, kept clear of the top-right bookmark.
                         if (!isDragging) {
                             IconButton(
                                 onClick = {
@@ -618,21 +653,21 @@ fun BookGrid(
                                     contextMenuAnchor = index
                                 },
                                 modifier = Modifier
-                                    .align(Alignment.TopEnd)
+                                    .align(Alignment.TopStart)
                                     .zIndex(2f)
                                     .size(Dimens.touchTarget),
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
                                     Surface(
-                                        color = Color.Black.copy(alpha = 0.56f),
+                                        color = Color.Black.copy(alpha = 0.46f),
                                         shape = CircleShape,
-                                        modifier = Modifier.size(32.dp),
+                                        modifier = Modifier.size(28.dp),
                                     ) {
                                         Icon(
                                             imageVector = Icons.Default.MoreVert,
                                             contentDescription = menuDescription,
                                             tint = Color.White,
-                                            modifier = Modifier.padding(6.dp),
+                                            modifier = Modifier.padding(5.dp),
                                         )
                                     }
                                 }
@@ -746,11 +781,11 @@ fun BookGrid(
                     Text(
                         text = when (item) {
                             is LibraryItem.Single -> buildString {
-                                append(item.book.author.ifBlank { "未知作者" })
                                 if (item.book.progress > 0f) {
-                                    append(" · ")
                                     append("${(item.book.progress.coerceIn(0f, 1f) * 100).toInt()}%")
+                                    append(" · ")
                                 }
+                                append(item.book.author.ifBlank { "未知作者" })
                             }
                             is LibraryItem.Bundle -> "${item.bundle.books.size} 本合集"
                         },

@@ -1223,6 +1223,39 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `absolute book edge rejects a required boundary preview without locking input`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("absolute-book-edge.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>The only chapter.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue(flowView.startDiscreteBoundaryTurn(1))
+
+        assertEquals(
+            "the missing next spine must release the turn synchronously instead of waiting three seconds",
+            "NONE",
+            flowView.privateField("interactiveTurnState").toString(),
+        )
+        assertTrue("a second input must be accepted immediately", flowView.startDiscreteBoundaryTurn(1))
+        assertEquals("NONE", flowView.privateField("interactiveTurnState").toString())
+        engine.close()
+    }
+
+    @Test
     fun `multi page chapter requests forward preview only after an in chapter turn settles at the boundary`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("boundary-preview-viewport-scoped.epub")

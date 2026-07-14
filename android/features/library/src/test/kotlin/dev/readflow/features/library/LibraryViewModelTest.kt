@@ -273,6 +273,58 @@ class LibraryViewModelTest {
         assertEquals(listOf(localBook.id), bundle.bundle.books.map { it.id })
     }
 
+    @Test
+    fun reorderPersistsOneFlattenedShelfOrder() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val first = localBook("first", "First")
+        val groupedA = localBook("group-a", "Group A")
+        val groupedB = localBook("group-b", "Group B")
+        val store = FakeLibraryStore()
+        val viewModel = viewModel(store = store)
+
+        viewModel.reorder(
+            listOf(
+                LibraryItem.Single(first),
+                LibraryItem.Bundle(BookBundle("Group", listOf(groupedA, groupedB))),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(listOf(listOf("first", "group-a", "group-b")), store.savedShelfOrders)
+    }
+
+    @Test
+    fun offlineReorderPersistsHiddenBooksBetweenReorderedVisibleSlots() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val offlineA = localBook("offline-a", "Offline A")
+        val hiddenRemote = remoteBook("hidden-remote", "Hidden Remote")
+        val offlineB = localBook("offline-b", "Offline B")
+        val store = FakeLibraryStore(
+            initialItems = listOf(
+                LibraryItem.Single(offlineA),
+                LibraryItem.Single(hiddenRemote),
+                LibraryItem.Single(offlineB),
+            ),
+        )
+        val viewModel = viewModel(store = store)
+        advanceUntilIdle()
+
+        viewModel.setLibraryFilter(LibraryFilter.OFFLINE)
+        advanceUntilIdle()
+        viewModel.reorder(
+            listOf(
+                LibraryItem.Single(offlineB),
+                LibraryItem.Single(offlineA),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(listOf("offline-b", "hidden-remote", "offline-a")),
+            store.savedShelfOrders,
+        )
+    }
+
     private fun viewModel(
         store: FakeLibraryStore = FakeLibraryStore(),
         settings: FakeSettingsRepository = FakeSettingsRepository(),
@@ -296,6 +348,7 @@ class LibraryViewModelTest {
         val removedDownloadedAssetIds = mutableListOf<String>()
         val removedFromShelfIds = mutableListOf<String>()
         val deletedCompletelyIds = mutableListOf<String>()
+        val savedShelfOrders = mutableListOf<List<String>>()
 
         override fun observeShelf(): Flow<List<LibraryItem>> = shelf
         override suspend fun count(): Int = upsertedBooks.size
@@ -319,7 +372,9 @@ class LibraryViewModelTest {
         override suspend fun setCollection(id: String, name: String?) = Unit
         override suspend fun renameBundle(oldName: String, newName: String) = Unit
         override suspend fun ungroupBundle(name: String) = Unit
-        override suspend fun updateSortOrder(id: String, order: Int) = Unit
+        override suspend fun updateShelfOrder(ids: List<String>) {
+            savedShelfOrders += ids
+        }
 
         fun emitShelf(items: List<LibraryItem>) {
             shelf.value = items

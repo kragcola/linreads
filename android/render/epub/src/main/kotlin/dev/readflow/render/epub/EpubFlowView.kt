@@ -12,6 +12,8 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.drawable.Drawable
 import android.text.Layout
+import android.text.Spanned
+import android.text.style.ImageSpan
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.VelocityTracker
@@ -22,6 +24,7 @@ import android.widget.FrameLayout
 import android.widget.ScrollView
 import dev.readflow.render.api.SelectionAwareTextView
 import dev.readflow.render.api.R as RenderApiR
+import io.noties.markwon.image.AsyncDrawableSpan
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -32,9 +35,9 @@ import kotlin.math.roundToInt
  *
  * Touch is owned end-to-end (审计 H4/H5), mirroring Moon+ Reader / FBReader: a [GestureDetector]
  * classifies tap / long-press / scroll; selection is gated behind long-press so it never fights
- * page turns. PAGED: edge tap or non-center drag can flip a page (animated curl); the center
- * 1/3 x 1/3 box is a no-curl dead zone, and only its inner 1/5 x 1/5 box can become temporary
- * scroll on vertical drag. SCROLL: free scroll throughout.
+ * page turns. PAGED: edge taps and horizontal drags can flip a page; vertical drags keep the
+ * center 1/3 x 1/3 as a no-turn zone, with its inner 1/5 x 1/5 available for temporary continuous
+ * scrolling. SCROLL: free scroll throughout.
  *
  * The resume anchor is always the char offset of the top-visible line (font-size stable), never a
  * page index.
@@ -1182,7 +1185,7 @@ internal class EpubFlowView(
         val viewportTopInLayout = (scrollY - textView.paddingTop).coerceAtLeast(0)
         var line = layout.getLineForVertical(viewportTopInLayout)
         if (layout.getLineTop(line) < viewportTopInLayout) {
-            if (isOversizedLine(layout, line)) return scrollY
+            if (keepsPartialViewportSlice(layout, line)) return scrollY
             line++
         }
         if (line >= layout.lineCount) return scrollY + height
@@ -1214,12 +1217,19 @@ internal class EpubFlowView(
         // guard (审计: 满页图被 clip 退到上一页 → 整屏裁空 → 图闪一下后消失).
         val viewportTopInLayout = (scrollY - textView.paddingTop).coerceAtLeast(0)
         var firstLine = layout.getLineForVertical(viewportTopInLayout)
-        if (layout.getLineTop(firstLine) < viewportTopInLayout && !isOversizedLine(layout, firstLine)) firstLine++
+        if (
+            layout.getLineTop(firstLine) < viewportTopInLayout &&
+            !keepsPartialViewportSlice(layout, firstLine)
+        ) firstLine++
         if (firstLine >= layout.lineCount) return 0
         var line = layout.getLineForVertical(pageBottom - 1)
         // Step back off a line whose bottom spills past the viewport — that partial line belongs to the
         // next page. Leaves a blank gap at the bottom rather than a half-line (Moon+ accepts the gap).
-        if (line > firstLine && layout.getLineBottom(line) > pageBottom) line--
+        if (
+            line > firstLine &&
+            layout.getLineBottom(line) > pageBottom &&
+            !keepsPartialViewportSlice(layout, line)
+        ) line--
         val clip = layout.getLineBottom(line) - scrollY
         // A single line taller than the usable band is an indivisible image/block: keep its viewport
         // slice instead of clipping the whole page away. Ordinary full pages still need the clip so the
@@ -1549,6 +1559,23 @@ internal class EpubFlowView(
     fun boundaryPreviewIsRequired(forward: Boolean): Boolean =
         (boundaryWaiting && waitingBoundaryForward == forward) ||
             (boundaryDiscreteWaiting && waitingDiscreteBoundaryForward == forward)
+
+    /** Releases a required turn immediately when the engine proves that no preview can be produced. */
+    fun rejectBoundaryPreview(forward: Boolean, sourceChapterGeneration: Long) {
+        if (sourceChapterGeneration != boundaryPreviewGeneration) return
+        when {
+            boundaryWaiting && waitingBoundaryForward == forward -> {
+                cancelWaitingBoundaryTurn(invalidateRequest = false)
+                flipped = true
+            }
+            boundaryDiscreteWaiting && waitingDiscreteBoundaryForward == forward -> {
+                removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
+                interactiveTurnState = InteractiveTurnState.NONE
+                releasePageShotBudgetForBoundaryPreview(forward)
+            }
+            else -> releasePageShotBudgetForBoundaryPreview(forward)
+        }
+    }
 
     /** Gives a boundary target the directional slot when a third full-screen shot is too expensive. */
     fun preparePageShotBudgetForBoundaryPreview(forward: Boolean, required: Boolean): Boolean {
@@ -2280,6 +2307,17 @@ internal class EpubFlowView(
     private fun isOversizedLine(layout: Layout, line: Int): Boolean =
         layout.getLineBottom(line) - layout.getLineTop(line) > usablePageHeightPx()
 
+    private fun keepsPartialViewportSlice(layout: Layout, line: Int): Boolean =
+        isOversizedLine(layout, line) || isImageLine(layout, line)
+
+    private fun isImageLine(layout: Layout, line: Int): Boolean {
+        val text = layout.text as? Spanned ?: return false
+        val start = layout.getLineStart(line)
+        val end = layout.getLineEnd(line)
+        return text.getSpans(start, end, ImageSpan::class.java).isNotEmpty() ||
+            text.getSpans(start, end, AsyncDrawableSpan::class.java).isNotEmpty()
+    }
+
     private fun lastFullyVisibleLine(layout: Layout, topPx: Int): Int {
         val bottomInLayout = topPx + usablePageHeightPx()
         var line = layout.getLineForVertical((bottomInLayout - 1).coerceAtLeast(0))
@@ -2595,7 +2633,7 @@ internal class EpubFlowView(
         val viewportTopInLayout = (topPx - textView.paddingTop).coerceAtLeast(0)
         var line = layout.getLineForVertical(viewportTopInLayout)
         if (layout.getLineTop(line) < viewportTopInLayout) {
-            if (isOversizedLine(layout, line)) return topPx
+            if (keepsPartialViewportSlice(layout, line)) return topPx
             line++
         }
         if (line >= layout.lineCount) return topPx + height
@@ -2615,10 +2653,17 @@ internal class EpubFlowView(
         val pageBottom = topPx + usablePageHeightPx()
         val viewportTopInLayout = (topPx - textView.paddingTop).coerceAtLeast(0)
         var firstLine = layout.getLineForVertical(viewportTopInLayout)
-        if (layout.getLineTop(firstLine) < viewportTopInLayout && !isOversizedLine(layout, firstLine)) firstLine++
+        if (
+            layout.getLineTop(firstLine) < viewportTopInLayout &&
+            !keepsPartialViewportSlice(layout, firstLine)
+        ) firstLine++
         if (firstLine >= layout.lineCount) return topPx
         var line = layout.getLineForVertical(pageBottom - 1)
-        if (line > firstLine && layout.getLineBottom(line) > pageBottom) line--
+        if (
+            line > firstLine &&
+            layout.getLineBottom(line) > pageBottom &&
+            !keepsPartialViewportSlice(layout, line)
+        ) line--
         val rawClipBottom = layout.getLineBottom(line) - topPx
         if (line == firstLine && rawClipBottom > usablePageHeightPx()) return topPx + height
         val clipBottom = rawClipBottom.coerceIn(0, height)
@@ -3658,7 +3703,7 @@ internal class EpubFlowView(
         var line = layout.getLineForVertical(topInLayout)
         if (
             mode == Mode.PAGED && pageClipActive && layout.getLineTop(line) < topInLayout &&
-            !isOversizedLine(layout, line)
+            !keepsPartialViewportSlice(layout, line)
         ) line++
         return layout.getLineStart(line.coerceAtMost(layout.lineCount - 1))
     }
@@ -3674,9 +3719,9 @@ internal class EpubFlowView(
     // ---- Touch FSM (owned end-to-end; selection gated behind long-press) ----------------------
 
     /**
-     * MoonReader-inspired PAGED routing: center 1/3 x 1/3 is a no-curl dead zone, and only the
-     * inner 1/5 x 1/5 box can become temporary scroll. Everything outside that center square stays
-     * available for the existing page-turn gesture path.
+     * MoonReader-inspired PAGED routing: horizontal drags turn from anywhere. For vertical drags,
+     * center 1/3 x 1/3 is a no-turn zone and only the inner 1/5 x 1/5 box can become temporary scroll;
+     * everything outside that center square stays on the page-turn path.
      */
     private fun pagedTouchZoneAtDown(): EpubPagedTouchZone =
         EpubPagedTouchZones.classify(width, height, downX, downY)
@@ -3769,6 +3814,7 @@ internal class EpubFlowView(
                     freeScrolling = mode == Mode.SCROLL ||
                         (verticalDominant && pagedZone == EpubPagedTouchZone.TemporaryScroll)
                     centerDeadGesture = mode == Mode.PAGED &&
+                        verticalDominant &&
                         !freeScrolling &&
                         pagedZone != EpubPagedTouchZone.PageTurn
                     // Inner-center temporary scroll is continuous; drop the page clip so the reader can
@@ -3820,6 +3866,7 @@ internal class EpubFlowView(
                     freeScrolling = mode == Mode.SCROLL ||
                         (verticalDominant && pagedZone == EpubPagedTouchZone.TemporaryScroll)
                     centerDeadGesture = mode == Mode.PAGED &&
+                        verticalDominant &&
                         !freeScrolling &&
                         pagedZone != EpubPagedTouchZone.PageTurn
                     if (freeScrolling && mode == Mode.PAGED) {
@@ -3839,7 +3886,7 @@ internal class EpubFlowView(
                 } else if (localShotsWaiting) {
                     cancelPendingLocalPageShotHandoff(consumeGesture = false)
                 } else if (boundaryWaiting) {
-                    cancelWaitingBoundaryTurn()
+                    releaseWaitingBoundaryTurn(ev, computeTurnVelocity(waitingBoundaryAxis))
                 } else if (freeScrolling) {
                     if (mode == Mode.PAGED) {
                         releaseTemporaryScroll(computeVerticalVelocity())
@@ -3880,6 +3927,32 @@ internal class EpubFlowView(
         waitingBoundaryY = 0f
         if (invalidateRequest) onBoundaryPreviewRequestCancelled?.invoke(forward)
         releasePageShotBudgetForBoundaryPreview(forward)
+    }
+
+    private fun releaseWaitingBoundaryTurn(ev: MotionEvent, velocity: Float) {
+        val coordinate = if (waitingBoundaryAxis == InteractiveTurnAxis.HORIZONTAL) ev.x else ev.y
+        val extent = if (waitingBoundaryAxis == InteractiveTurnAxis.HORIZONTAL) width else height
+        val travel = if (waitingBoundaryForward) {
+            waitingBoundaryAnchor - coordinate
+        } else {
+            coordinate - waitingBoundaryAnchor
+        }
+        val progress = if (extent > 0) (travel / extent.toFloat()).coerceIn(0f, 1f) else 0f
+        val flung = if (waitingBoundaryForward) {
+            velocity < -flipFlingThresholdPxPerSec
+        } else {
+            velocity > flipFlingThresholdPxPerSec
+        }
+        if (pageTurnAnimated && progress < 0.5f && !flung) {
+            cancelWaitingBoundaryTurn()
+            return
+        }
+        waitingDiscreteBoundaryForward = waitingBoundaryForward
+        interactiveTurnState = InteractiveTurnState.BOUNDARY_DISCRETE_WAITING
+        waitingBoundaryX = 0f
+        waitingBoundaryY = 0f
+        removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
+        postDelayed(boundaryDiscreteWaitTimeoutRunnable, BOUNDARY_DISCRETE_WAIT_TIMEOUT_MS)
     }
 
     private fun applyClassifiedMove(ev: MotionEvent) {
@@ -3988,10 +4061,10 @@ internal class EpubFlowView(
         vt.addMovement(ev)
     }
 
-    private fun computeTurnVelocity(): Float {
+    private fun computeTurnVelocity(axis: InteractiveTurnAxis = curlAxis): Float {
         val vt = velocityTracker ?: return 0f
         vt.computeCurrentVelocity(1000) // px per second
-        return if (curlAxis == InteractiveTurnAxis.HORIZONTAL) vt.xVelocity else vt.yVelocity
+        return if (axis == InteractiveTurnAxis.HORIZONTAL) vt.xVelocity else vt.yVelocity
     }
 
     private fun computeVerticalVelocity(): Float {

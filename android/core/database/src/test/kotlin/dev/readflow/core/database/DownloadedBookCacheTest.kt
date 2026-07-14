@@ -6,6 +6,7 @@ import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -173,6 +174,105 @@ class DownloadedBookCacheTest {
     }
 
     @Test
+    fun shelfOrderDoesNotChangeWhenLastReadTimestampChanges() = runTest {
+        val dao = FakeBookDao()
+        val repository = LibraryRepository(dao, RecordingCache())
+        dao.upsert(shelfEntity(id = "alpha", title = "Alpha", lastReadAt = 100L))
+        dao.upsert(shelfEntity(id = "beta", title = "Beta", lastReadAt = 200L))
+
+        val before = repository.observeShelf().first().singleBookIds()
+        dao.updateLastReadAt("alpha", 300L)
+        val after = repository.observeShelf().first().singleBookIds()
+
+        assertEquals("opening and closing a book must not move neighboring shelf items", before, after)
+    }
+
+    @Test
+    fun repositoryFreezesLegacyTiedRowsInTheirPreviouslyVisibleOrder() = runTest {
+        val dao = FakeBookDao()
+        val repository = LibraryRepository(dao, RecordingCache())
+        dao.upsert(shelfEntity(id = "older", title = "A older", lastReadAt = 100L))
+        dao.upsert(shelfEntity(id = "recent", title = "Z recent", lastReadAt = 200L))
+
+        val visibleIds = repository.observeShelf().first().singleBookIds()
+
+        assertEquals(listOf("recent", "older"), visibleIds)
+        assertEquals(0, dao.book("recent")?.sortOrder)
+        assertEquals(1, dao.book("older")?.sortOrder)
+    }
+
+    @Test
+    fun lastReadWriteFreezesLegacyOrderBeforeChangingTheTimestamp() = runTest {
+        val dao = FakeBookDao()
+        val repository = LibraryRepository(dao, RecordingCache())
+        dao.upsert(shelfEntity(id = "older", title = "A older", lastReadAt = 100L))
+        dao.upsert(shelfEntity(id = "recent", title = "Z recent", lastReadAt = 200L))
+
+        dao.updateLastReadAt("older", 300L)
+
+        assertEquals(
+            listOf("recent", "older"),
+            repository.observeShelf().first().singleBookIds(),
+        )
+    }
+
+    @Test
+    fun repositoryPreservesRemoteShelfPositionWhenMetadataRefreshes() = runTest {
+        val dao = FakeBookDao()
+        val repository = LibraryRepository(dao, RecordingCache())
+        dao.upsert(
+            shelfEntity(
+                id = "calibre-42",
+                title = "Old metadata",
+                lastReadAt = 1234L,
+                collectionName = "Favorites",
+                sortOrder = 7,
+            ),
+        )
+        dao.upsert(shelfEntity(id = "neighbor", title = "Middle", lastReadAt = 5678L, sortOrder = 8))
+        val orderBeforeRefresh = repository.observeShelf().first().bookIdsInShelfOrder()
+
+        repository.upsertBook(
+            BookMeta(
+                id = "calibre-42",
+                title = "Fresh metadata",
+                author = "Updated author",
+                format = BookFormat.EPUB,
+                downloadStatus = DownloadStatus.DOWNLOADED,
+                localUri = "file:///books/calibre-42.epub",
+            ),
+        )
+
+        val book = dao.book("calibre-42")
+        assertEquals("Fresh metadata", book?.title)
+        assertEquals("Updated author", book?.author)
+        assertEquals(1234L, book?.lastReadAt)
+        assertEquals("Favorites", book?.collectionName)
+        assertEquals(7, book?.sortOrder)
+        assertEquals(orderBeforeRefresh, repository.observeShelf().first().bookIdsInShelfOrder())
+    }
+
+    @Test
+    fun repositoryAppendsANewBookAfterExistingManualOrder() = runTest {
+        val dao = FakeBookDao()
+        val repository = LibraryRepository(dao, RecordingCache())
+        dao.upsert(shelfEntity(id = "existing", title = "Existing", lastReadAt = null, sortOrder = 5))
+
+        repository.upsertBook(
+            BookMeta(
+                id = "new-book",
+                title = "New book",
+                author = "Author",
+                format = BookFormat.EPUB,
+                downloadStatus = DownloadStatus.DOWNLOADED,
+                localUri = "file:///books/new.epub",
+            ),
+        )
+
+        assertEquals(6, dao.book("new-book")?.sortOrder)
+    }
+
+    @Test
     fun repositoryRemovesDownloadedAssetThroughCache() = runTest {
         val dao = FakeBookDao()
         val cache = RecordingCache()
@@ -211,9 +311,25 @@ class DownloadedBookCacheTest {
         private val books = mutableMapOf<String, BookEntity>()
         override fun observeAll(): Flow<List<BookEntity>> = MutableStateFlow(books.values.toList())
         override fun observeShelf(): Flow<List<BookWithProgress>> = MutableStateFlow(
-            books.values.map { BookWithProgress(it, progress = 0f) },
+            books.values
+                .sortedWith(
+                    compareBy<BookEntity> { it.sortOrder }
+                        .thenBy { it.lastReadAt == null }
+                        .thenByDescending { it.lastReadAt }
+                        .thenBy { it.title.lowercase() },
+                )
+                .map { BookWithProgress(it, progress = 0f) },
         )
         override suspend fun count(): Int = books.size
+        override suspend fun maxSortOrder(): Int? = books.values.maxOfOrNull { it.sortOrder }
+        override suspend fun shelfRowsForOrderNormalization(): List<BookEntity> = books.values
+            .sortedWith(
+                compareBy<BookEntity> { it.sortOrder }
+                    .thenBy { it.lastReadAt == null }
+                    .thenByDescending { it.lastReadAt }
+                    .thenBy { it.title.lowercase() }
+                    .thenBy { it.id.lowercase() },
+            )
         override suspend fun upsert(book: BookEntity) {
             books[book.id] = book
         }
@@ -221,7 +337,7 @@ class DownloadedBookCacheTest {
             books.forEach { upsert(it) }
         }
         override suspend fun getById(id: String): BookEntity? = books[id]
-        override suspend fun updateLastReadAt(id: String, ts: Long) {
+        override suspend fun setLastReadAt(id: String, ts: Long) {
             books[id]?.let { books[id] = it.copy(lastReadAt = ts) }
         }
         override suspend fun downloadedRemoteCacheBooks(
@@ -257,4 +373,32 @@ class DownloadedBookCacheTest {
         }
         fun book(id: String): BookEntity? = books[id]
     }
+
+    private fun shelfEntity(
+        id: String,
+        title: String,
+        lastReadAt: Long?,
+        collectionName: String? = null,
+        sortOrder: Int = 0,
+    ) = BookEntity(
+        id = id,
+        title = title,
+        author = "Author",
+        format = BookFormat.EPUB.name,
+        downloadStatus = DownloadStatus.DOWNLOADED.name,
+        lastReadAt = lastReadAt,
+        collectionName = collectionName,
+        sortOrder = sortOrder,
+    )
+
+    private fun List<LibraryItem>.singleBookIds(): List<String> =
+        map { (it as LibraryItem.Single).book.id }
+
+    private fun List<LibraryItem>.bookIdsInShelfOrder(): List<String> =
+        flatMap { item ->
+            when (item) {
+                is LibraryItem.Single -> listOf(item.book.id)
+                is LibraryItem.Bundle -> item.bundle.books.map { it.id }
+            }
+        }
 }

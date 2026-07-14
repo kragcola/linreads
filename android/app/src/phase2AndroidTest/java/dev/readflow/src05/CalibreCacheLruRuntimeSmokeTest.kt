@@ -125,7 +125,7 @@ class CalibreCacheLruRuntimeSmokeTest {
             copyDatabaseSnapshot("after-lru-trim")
             shutdownFakeCalibreServer()
 
-            waitForObject(By.text("离线可读 5")).click()
+            waitForObject(By.text("离线")).click()
             val protectedTitle = scrollToObject(By.text("LRU Remote 06"))
             takeScreenshot("offline-filter-after-trim.png")
 
@@ -150,7 +150,7 @@ class CalibreCacheLruRuntimeSmokeTest {
                     appendLine("protectedStatus=${protectedBook.downloadStatus}")
                     appendLine("protectedLocalUri=${protectedBook.localUri}")
                     appendLine("keptBooks=${listOf(kept101, kept102, kept103, kept104, protectedBook).joinToString(",") { it.id }}")
-                    appendLine("offlineFilterLabel=离线可读 5")
+                    appendLine("offlineFilterLabel=离线")
                     appendLine("offlineProtectedParagraph=LRU runtime paragraph 06 proves cached remote reading after download.")
                 },
             )
