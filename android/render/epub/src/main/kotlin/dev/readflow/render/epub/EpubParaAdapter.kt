@@ -8,10 +8,15 @@ import android.text.Spanned
 import android.text.TextPaint
 import android.text.method.LinkMovementMethod
 import android.text.style.RelativeSizeSpan
+import android.text.style.BackgroundColorSpan
+import android.text.style.ForegroundColorSpan
+import android.text.style.LeadingMarginSpan
+import android.text.style.StrikethroughSpan
 import android.text.style.StyleSpan
 import android.text.style.SubscriptSpan
 import android.text.style.SuperscriptSpan
 import android.text.style.TypefaceSpan
+import android.text.style.UnderlineSpan
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -128,9 +133,20 @@ internal class EpubParaAdapter(
     private fun bindText(holder: TextVH, block: EpubDisplayBlock.Text) {
         val density = holder.tv.resources.displayMetrics.density
         val horizontalPadding = (24 * density).toInt()
-        val leadingPadding = horizontalPadding + (block.indentLevel * 24 * density).toInt() +
-            if (block.kind == EpubTextKind.Blockquote) (18 * density).toInt() else 0
-        val headingBoost = when (block.headingLevel) {
+        val cssMarginLeft = block.blockStyle.margin.left.toViewPx(holder.tv, fontSizeSp)
+        val cssMarginRight = block.blockStyle.margin.right.toViewPx(holder.tv, fontSizeSp)
+        val cssPaddingLeft = block.blockStyle.padding.left.toViewPx(holder.tv, fontSizeSp)
+        val cssPaddingRight = block.blockStyle.padding.right.toViewPx(holder.tv, fontSizeSp)
+        val cssTop = (block.blockStyle.margin.top.toViewPx(holder.tv, fontSizeSp) +
+            block.blockStyle.padding.top.toViewPx(holder.tv, fontSizeSp)).coerceAtLeast(0)
+        val cssBottom = (block.blockStyle.margin.bottom.toViewPx(holder.tv, fontSizeSp) +
+            block.blockStyle.padding.bottom.toViewPx(holder.tv, fontSizeSp)).coerceAtLeast(0)
+        val hasCssLeading = cssMarginLeft > 0 || cssPaddingLeft > 0
+        val leadingPadding = horizontalPadding + cssMarginLeft + cssPaddingLeft +
+            (block.indentLevel * 24 * density).toInt() +
+            if (block.kind == EpubTextKind.Blockquote && !hasCssLeading) (18 * density).toInt() else 0
+        val trailingPadding = horizontalPadding + cssMarginRight + cssPaddingRight
+        val headingBoost = if (block.blockStyle.headingStyleResolved) 0f else when (block.headingLevel) {
             1 -> 5f
             2 -> 3f
             3 -> 1.5f
@@ -141,27 +157,38 @@ internal class EpubParaAdapter(
             val codePaddingPx = (8 * density).toInt()
             holder.tv.setPadding(codePaddingPx, codePaddingPx, codePaddingPx, codePaddingPx)
             holder.tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp * 0.9f)
-            holder.tv.setLineSpacing(0f, lineSpacingMultiplier)
+            holder.tv.setLineSpacing(0f, block.blockStyle.lineHeightMultiplier ?: lineSpacingMultiplier)
             holder.tv.setTextColor(inkColor)
             holder.tv.typeface = Typeface.MONOSPACE
             holder.tv.setHorizontallyScrolling(true)
             holder.tv.isHorizontalScrollBarEnabled = true
             holder.tv.setBackgroundColor(codeBlockBgColor)
-            holder.tv.text = block.text.replace("\t", "    ")
+            holder.tv.gravity = block.blockStyle.textAlign.toGravity()
+            holder.tv.text = block.toSpannableText(density)
         } else {
-            holder.tv.setPadding(leadingPadding, (10 * density).toInt(), horizontalPadding, (10 * density).toInt())
+            holder.tv.setPadding(
+                leadingPadding,
+                (10 * density).toInt() + cssTop,
+                trailingPadding,
+                (10 * density).toInt() + cssBottom,
+            )
             holder.tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp + headingBoost)
-            holder.tv.setLineSpacing(0f, lineSpacingMultiplier)
+            holder.tv.setLineSpacing(0f, block.blockStyle.lineHeightMultiplier ?: lineSpacingMultiplier)
             holder.tv.setTextColor(inkColor)
             holder.tv.typeface = when {
                 block.kind == EpubTextKind.Preformatted || block.kind == EpubTextKind.Table -> Typeface.MONOSPACE
-                block.headingLevel != null -> Typeface.DEFAULT_BOLD
+                block.headingLevel != null && !block.blockStyle.headingStyleResolved -> Typeface.DEFAULT_BOLD
                 else -> Typeface.SERIF
             }
             holder.tv.setHorizontallyScrolling(block.kind == EpubTextKind.Preformatted)
             holder.tv.isHorizontalScrollBarEnabled = block.kind == EpubTextKind.Preformatted
-            holder.tv.setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            holder.tv.text = block.toSpannableText().withTextHighlightSpans(
+            holder.tv.gravity = block.blockStyle.textAlign.toGravity(
+                fallback = if (block.headingLevel != null) Gravity.CENTER_HORIZONTAL else Gravity.START,
+            )
+            holder.tv.setBackgroundColor(
+                epubSafeCssBackground(block.blockStyle.backgroundColor, inkColor) ?: android.graphics.Color.TRANSPARENT,
+            )
+            holder.tv.text = block.toSpannableText(density).withTextHighlightSpans(
                 highlightRangesProvider(block.paragraphIndex),
             )
         }
@@ -177,13 +204,27 @@ internal class EpubParaAdapter(
         val bitmap = imageLoader(block.href)
         holder.image.setImageBitmap(bitmap)
 
+        val metrics = holder.image.resources.displayMetrics
+        val availableWidth = (metrics.widthPixels - 48 * metrics.density).toInt().coerceAtLeast(1)
+        val availableHeight = (760 * metrics.density).toInt()
+        val params = holder.image.layoutParams as FrameLayout.LayoutParams
+        params.gravity = block.style.alignment.toGravity(Gravity.CENTER_HORIZONTAL)
+        params.width = block.style.width.toImageViewPx(holder.image, fontSizeSp, availableWidth)
+            ?: FrameLayout.LayoutParams.MATCH_PARENT
+        params.height = block.style.height.toImageViewPx(holder.image, fontSizeSp, availableHeight)
+            ?: FrameLayout.LayoutParams.WRAP_CONTENT
+        holder.image.layoutParams = params
+        holder.image.maxHeight = block.style.maxHeight.toImageViewPx(holder.image, fontSizeSp, availableHeight)
+            ?: availableHeight
+
         if (bitmap != null) {
-            val newMaxWidth = calculateImageMaxWidth(
+            val intrinsicMaxWidth = calculateImageMaxWidth(
                 holder.itemView.context,
                 bitmap.width,
                 bitmap.height
             )
-            holder.image.maxWidth = newMaxWidth
+            holder.image.maxWidth = block.style.maxWidth.toImageViewPx(holder.image, fontSizeSp, availableWidth)
+                ?: intrinsicMaxWidth
         }
     }
 
@@ -263,12 +304,38 @@ internal class EpubParaAdapter(
     private fun blockAt(position: Int): EpubDisplayBlock =
         blockProvider(position) ?: EpubDisplayBlock.Break(paragraphIndex = 0)
 
-    private fun EpubDisplayBlock.Text.toSpannableText(): CharSequence {
-        if (links.isEmpty() && styleSpans.isEmpty()) return text
+    private fun EpubDisplayBlock.Text.toSpannableText(density: Float): CharSequence {
+        val textIndentPx = blockStyle.textIndent.toViewPxOrNull(fontSizeSp, 680, density)
+        if (links.isEmpty() && styleSpans.isEmpty() && textIndentPx == null) return text
         val spannable = SpannableString(text)
+        textIndentPx?.let { indent ->
+            spannable.setSpan(
+                LeadingMarginSpan.Standard(indent, 0),
+                0,
+                text.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
         styleSpans.forEach { span ->
             if (span.start < 0 || span.end > text.length || span.start >= span.end) return@forEach
-            span.toAndroidSpans().forEach { androidSpan ->
+            val pairedBackground = styleSpans.lastOrNull {
+                it.style == EpubTextStyle.BackgroundColor && it.start == span.start && it.end == span.end
+            }?.color ?: blockStyle.backgroundColor
+            val pairedForeground = styleSpans.lastOrNull {
+                it.style == EpubTextStyle.ForegroundColor && it.start == span.start && it.end == span.end
+            }?.color
+            val safeColors = epubResolveSafeCssColors(pairedForeground, pairedBackground, inkColor)
+            val safeForeground = if (span.style == EpubTextStyle.ForegroundColor) {
+                safeColors.foreground
+            } else {
+                null
+            }
+            val safeBackground = if (span.style == EpubTextStyle.BackgroundColor) {
+                safeColors.background
+            } else {
+                null
+            }
+            span.toAndroidSpans(safeForeground, safeBackground).forEach { androidSpan ->
                 spannable.setSpan(androidSpan, span.start, span.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
         }
@@ -294,12 +361,46 @@ internal class EpubParaAdapter(
         return spannable
     }
 
-    private fun EpubTextStyleSpan.toAndroidSpans(): List<Any> =
+    private fun EpubTextStyleSpan.toAndroidSpans(safeForeground: Int?, safeBackground: Int?): List<Any> =
         when (style) {
             EpubTextStyle.Bold -> listOf(StyleSpan(Typeface.BOLD))
             EpubTextStyle.Italic -> listOf(StyleSpan(Typeface.ITALIC))
             EpubTextStyle.Code -> listOf(TypefaceSpan("monospace"))
             EpubTextStyle.Superscript -> listOf(SuperscriptSpan(), RelativeSizeSpan(0.8f))
             EpubTextStyle.Subscript -> listOf(SubscriptSpan(), RelativeSizeSpan(0.8f))
+            EpubTextStyle.Underline -> listOf(UnderlineSpan())
+            EpubTextStyle.Strikethrough -> listOf(StrikethroughSpan())
+            EpubTextStyle.ForegroundColor -> safeForeground?.let { listOf(ForegroundColorSpan(it)) }.orEmpty()
+            EpubTextStyle.BackgroundColor -> safeBackground?.let { listOf(BackgroundColorSpan(it)) }.orEmpty()
+            EpubTextStyle.RelativeSize -> scale?.let { listOf(RelativeSizeSpan(it)) }.orEmpty()
+        }
+
+    private fun EpubTextAlign?.toGravity(fallback: Int = Gravity.START): Int =
+        when (this) {
+            EpubTextAlign.Start, EpubTextAlign.Justify -> Gravity.START
+            EpubTextAlign.Center -> Gravity.CENTER_HORIZONTAL
+            EpubTextAlign.End -> Gravity.END
+            null -> fallback
+        }
+
+    private fun EpubCssLength?.toViewPx(view: View, fontSizeSp: Float): Int =
+        toViewPxOrNull(fontSizeSp, view.width.takeIf { it > 0 } ?: view.resources.displayMetrics.widthPixels) ?: 0
+
+    private fun EpubCssLength?.toImageViewPx(
+        view: View,
+        fontSizeSp: Float,
+        percentageBasisPx: Int,
+    ): Int? = toViewPxOrNull(fontSizeSp, percentageBasisPx, view.resources.displayMetrics.density)
+
+    private fun EpubCssLength?.toViewPxOrNull(
+        fontSizeSp: Float,
+        percentageBasisPx: Int,
+        density: Float = 1f,
+    ): Int? =
+        when (this?.unit) {
+            EpubCssUnit.Px -> (value * density).toInt()
+            EpubCssUnit.Em -> (value * fontSizeSp * density).toInt()
+            EpubCssUnit.Percent -> (value / 100f * percentageBasisPx).toInt()
+            null -> null
         }
 }

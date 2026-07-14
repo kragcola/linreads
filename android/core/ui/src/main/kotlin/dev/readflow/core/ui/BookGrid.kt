@@ -407,15 +407,6 @@ fun BookGrid(
                     animationSpec = tween(durationMillis = 140, easing = FastOutSlowInEasing),
                     label = "shelf-drag-scale",
                 )
-                val draggedMetadataAlpha by animateFloatAsState(
-                    targetValue = if (isDragging && mergeTargetKey.isNotEmpty()) 0f else 1f,
-                    animationSpec = tween(durationMillis = 140, easing = FastOutSlowInEasing),
-                    label = "shelf-drag-metadata-alpha",
-                )
-                val title = when (item) {
-                    is LibraryItem.Single -> item.book.title
-                    is LibraryItem.Bundle -> item.bundle.name
-                }
                 val openDescription = when (item) {
                     is LibraryItem.Single -> "打开 ${item.book.title}"
                     is LibraryItem.Bundle -> "打开书组 ${item.bundle.name}，共 ${item.bundle.books.size} 本"
@@ -600,7 +591,9 @@ fun BookGrid(
                                         }
                                     } else {
                                         val finalOrder = mutableItems.toList()
-                                        beginSettling(sourceKey, finalOrder)
+                                        if (shouldAnimateDropSettlement(startOrder, finalOrder)) {
+                                            beginSettling(sourceKey, finalOrder)
+                                        }
                                         if (finalOrder != startOrder) {
                                             val hadPendingSnapshot = pendingItemsSnapshot != null
                                             val mutationStartRevision = itemsRevision
@@ -630,8 +623,7 @@ fun BookGrid(
                     // ── 封面 + ⋮ 菜单按钮 ──
                     Box(
                         modifier = Modifier
-                            .aspectRatio(Dimens.coverAspectRatio)
-                            .padding(bottom = Dimens.spaceSm),
+                            .aspectRatio(Dimens.coverAspectRatio),
                     ) {
                         when (item) {
                             is LibraryItem.Single -> {
@@ -693,6 +685,26 @@ fun BookGrid(
                                     text = "松手建组",
                                     style = MaterialTheme.typography.labelMedium,
                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                )
+                            }
+                        }
+
+                        if (item is LibraryItem.Bundle && !isDragging) {
+                            Surface(
+                                color = Color.Black.copy(alpha = 0.62f),
+                                contentColor = Color.White,
+                                shape = RoundedCornerShape(4.dp),
+                                modifier = Modifier
+                                    .align(Alignment.BottomStart)
+                                    .padding(8.dp)
+                                    .clearAndSetSemantics {},
+                            ) {
+                                Text(
+                                    text = "${item.bundle.name} · ${item.bundle.books.size} 本",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
                                 )
                             }
                         }
@@ -828,27 +840,6 @@ fun BookGrid(
                         }
                     }
 
-                    Text(
-                        text = title,
-                        modifier = Modifier
-                            .padding(horizontal = 2.dp)
-                            .graphicsLayer { alpha = draggedMetadataAlpha },
-                        style = ReadflowType.bookTitle,
-                        color = palette.ink,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    if (item is LibraryItem.Bundle) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "${item.bundle.books.size} 本合集",
-                            modifier = Modifier.padding(horizontal = 2.dp),
-                            style = ReadflowType.meta,
-                            color = palette.inkSoft,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
                 }
             }
         }

@@ -14,6 +14,7 @@ internal sealed interface EpubDisplayBlock {
         val fragmentIds: List<String> = emptyList(),
         val isCodeBlock: Boolean = false,
         val language: String = "",
+        val blockStyle: EpubBlockStyle = EpubBlockStyle(),
     ) : EpubDisplayBlock
 
     data class Image(
@@ -21,6 +22,7 @@ internal sealed interface EpubDisplayBlock {
         val altText: String?,
         override val paragraphIndex: Int,
         val fragmentIds: List<String> = emptyList(),
+        val style: EpubImageStyle = EpubImageStyle(),
     ) : EpubDisplayBlock
 
     data class Break(
@@ -43,6 +45,7 @@ internal fun epubDisplayBlocks(items: List<EpubReaderItem>): List<EpubDisplayBlo
                             links = item.links,
                             styleSpans = item.styleSpans,
                             fragmentIds = item.fragmentIds,
+                            blockStyle = item.blockStyle,
                         ),
                     )
                 }
@@ -59,6 +62,7 @@ internal fun epubDisplayBlocks(items: List<EpubReaderItem>): List<EpubDisplayBlo
                             fragmentIds = item.fragmentIds,
                             isCodeBlock = item.isCodeBlock,
                             language = item.language,
+                            blockStyle = item.blockStyle,
                         ),
                     )
                 }
@@ -68,6 +72,7 @@ internal fun epubDisplayBlocks(items: List<EpubReaderItem>): List<EpubDisplayBlo
                         altText = item.altText,
                         paragraphIndex = paragraphIndex,
                         fragmentIds = item.fragmentIds,
+                        style = item.style,
                     ),
                 )
                 is EpubReaderItem.Break -> add(EpubDisplayBlock.Break(paragraphIndex))

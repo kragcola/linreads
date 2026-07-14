@@ -1,7 +1,9 @@
 package dev.readflow.render.epub
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertInstanceOf
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class EpubReaderItemParserTest {
@@ -263,6 +265,258 @@ class EpubReaderItemParserTest {
             ),
             text.styleSpans,
         )
+    }
+
+    @Test
+    fun `external embedded and inline css cascade by importance specificity and source order`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html>
+                  <head>
+                    <link rel="stylesheet" href="../styles/book.css"/>
+                    <style>
+                      p.lead { color: #224466; font-style: italic; text-decoration: underline; }
+                      #target {
+                        text-align: right;
+                        text-indent: 2em;
+                        margin: 1em 2em;
+                        padding: 0.5em;
+                        background-color: #ffeecc;
+                        border-bottom: 1px solid #333333;
+                      }
+                      .accent { color: #008000 !important; text-transform: uppercase; }
+                    </style>
+                  </head>
+                  <body>
+                    <p id="target" class="lead"><span class="accent" style="color: #ff0000">Hello world</span></p>
+                  </body>
+                </html>
+            """.trimIndent(),
+            resourceBaseDir = "OEBPS/text",
+            resourceTextLoader = { path ->
+                if (path == "OEBPS/styles/book.css") {
+                    "p { color: #111111; font-weight: bold; } .lead { text-align: center; }"
+                } else {
+                    null
+                }
+            },
+        )
+
+        val text = assertInstanceOf(EpubReaderItem.Text::class.java, items.single())
+        assertEquals("HELLO WORLD", text.text)
+        assertTrue(text.styleSpans.any { it.style == EpubTextStyle.Bold })
+        assertTrue(text.styleSpans.any { it.style == EpubTextStyle.Italic })
+        assertTrue(text.styleSpans.any { it.style == EpubTextStyle.Underline })
+        assertTrue(
+            text.styleSpans.any {
+                it.style == EpubTextStyle.ForegroundColor && it.color == 0xFF008000.toInt()
+            },
+        )
+        assertFalse(
+            text.styleSpans.any {
+                it.style == EpubTextStyle.ForegroundColor && it.color == 0xFFFF0000.toInt()
+            },
+        )
+        assertEquals(
+            EpubBlockStyle(
+                textAlign = EpubTextAlign.End,
+                textIndent = EpubCssLength(2f, EpubCssUnit.Em),
+                margin = EpubCssInsets(
+                    top = EpubCssLength(1f, EpubCssUnit.Em),
+                    right = EpubCssLength(2f, EpubCssUnit.Em),
+                    bottom = EpubCssLength(1f, EpubCssUnit.Em),
+                    left = EpubCssLength(2f, EpubCssUnit.Em),
+                ),
+                padding = EpubCssInsets.all(EpubCssLength(0.5f, EpubCssUnit.Em)),
+                backgroundColor = 0xFFFFEECC.toInt(),
+                borders = EpubCssBorders(
+                    bottom = EpubCssBorder(
+                        width = EpubCssLength(1f, EpubCssUnit.Px),
+                        style = EpubCssBorderStyle.Solid,
+                        color = 0xFF333333.toInt(),
+                    ),
+                ),
+            ),
+            text.blockStyle,
+        )
+    }
+
+    @Test
+    fun `css inheritance semantic overrides whitespace and hidden content are respected`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html>
+                  <head>
+                    <style>
+                      body { color: rgb(17, 34, 51); font-style: italic; }
+                      .preline { white-space: pre-line; text-transform: uppercase; }
+                      .hidden { display: none; }
+                    </style>
+                  </head>
+                  <body>
+                    <p class="preline">alpha   beta
+                      gamma</p>
+                    <p><strong style="font-weight: normal; text-decoration: line-through">Plain</strong> <u>Under</u></p>
+                    <p class="hidden">Must not render</p>
+                  </body>
+                </html>
+            """.trimIndent(),
+        )
+
+        assertEquals(2, items.size)
+        val preLine = assertInstanceOf(EpubReaderItem.Text::class.java, items[0])
+        assertEquals("ALPHA BETA\nGAMMA", preLine.text)
+        assertTrue(preLine.styleSpans.any { it.style == EpubTextStyle.Italic })
+        assertTrue(
+            preLine.styleSpans.any {
+                it.style == EpubTextStyle.ForegroundColor && it.color == 0xFF112233.toInt()
+            },
+        )
+
+        val overrides = assertInstanceOf(EpubReaderItem.Text::class.java, items[1])
+        assertEquals("Plain Under", overrides.text)
+        assertFalse(overrides.styleSpans.any { it.style == EpubTextStyle.Bold && it.start == 0 && it.end == 5 })
+        assertTrue(overrides.styleSpans.any { it.style == EpubTextStyle.Strikethrough && it.start == 0 && it.end == 5 })
+        assertTrue(overrides.styleSpans.any { it.style == EpubTextStyle.Underline && it.start == 6 && it.end == 11 })
+    }
+
+    @Test
+    fun `css image dimensions and centered block alignment are retained`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html>
+                  <head>
+                    <style>
+                      img.hero {
+                        display: block;
+                        width: 50%;
+                        max-height: 12em;
+                        margin-left: auto;
+                        margin-right: auto;
+                      }
+                    </style>
+                  </head>
+                  <body><img class="hero" src="../images/plate.jpg" alt="Plate"/></body>
+                </html>
+            """.trimIndent(),
+            resourceBaseDir = "OEBPS/text",
+        )
+
+        val image = assertInstanceOf(EpubReaderItem.Image::class.java, items.single())
+        assertEquals(
+            EpubImageStyle(
+                width = EpubCssLength(50f, EpubCssUnit.Percent),
+                maxHeight = EpubCssLength(12f, EpubCssUnit.Em),
+                alignment = EpubTextAlign.Center,
+            ),
+            image.style,
+        )
+    }
+
+    @Test
+    fun `nested inline content inherits one relative font size and css alpha hex uses rgba order`() {
+        val item = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = "<html><body><p><small><span>Small</span></small></p></body></html>",
+        ).single() as EpubReaderItem.Text
+
+        assertTrue(
+            item.styleSpans.any {
+                it.style == EpubTextStyle.RelativeSize && it.scale == 0.8f && it.start == 0 && it.end == 5
+            },
+        )
+        assertFalse(item.styleSpans.any { it.style == EpubTextStyle.RelativeSize && it.scale == 0.64f })
+        assertEquals(0xDDAABBCC.toInt(), parseCssColor("#abcd"))
+        assertEquals(0x44112233, parseCssColor("#11223344"))
+    }
+
+    @Test
+    fun `relative font size inherits the computed scale without compounding through descendants`() {
+        val item = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = "<html><body style=\"font-size: 1.2em\"><p><span><em>Deep</em></span></p></body></html>",
+        ).single() as EpubReaderItem.Text
+
+        assertTrue(item.styleSpans.any { it.style == EpubTextStyle.RelativeSize && it.scale == 1.2f })
+        assertFalse(item.styleSpans.any { it.style == EpubTextStyle.RelativeSize && it.scale == 1.44f })
+    }
+
+    @Test
+    fun `author css can override heading user agent size weight and alignment`() {
+        val heading = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><head><style>h1 { font-size: 1em; font-weight: normal !important; text-align: left; }</style></head>
+                <body><h1>Plain heading</h1></body></html>
+            """.trimIndent(),
+        ).single() as EpubReaderItem.Heading
+
+        assertFalse(heading.styleSpans.any { it.style == EpubTextStyle.Bold })
+        assertFalse(heading.styleSpans.any { it.style == EpubTextStyle.RelativeSize })
+        assertEquals(EpubTextAlign.Start, heading.blockStyle.textAlign)
+        assertTrue(heading.blockStyle.headingStyleResolved)
+    }
+
+    @Test
+    fun `heading user agent style preserves the existing default without author css`() {
+        val heading = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = "<html><body><h1>Default heading</h1></body></html>",
+        ).single() as EpubReaderItem.Heading
+
+        assertTrue(heading.styleSpans.any { it.style == EpubTextStyle.Bold })
+        assertTrue(heading.styleSpans.any { it.style == EpubTextStyle.RelativeSize && it.scale == 1.5f })
+        assertEquals(EpubTextAlign.Center, heading.blockStyle.textAlign)
+    }
+
+    @Test
+    fun `display none suppresses body and block images without splitting visible paragraph text`() {
+        val visible = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body><p>Before<img style="display:none" src="hidden.png"/>After</p>
+                <div><img class="hidden" src="also-hidden.png"/></div>
+                <style>.hidden { display: none; }</style></body></html>
+            """.trimIndent(),
+        )
+        assertEquals(listOf("BeforeAfter"), visible.filterIsInstance<EpubReaderItem.Text>().map { it.text })
+        assertEquals(0, visible.count { it is EpubReaderItem.Image })
+
+        val hiddenBody = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = "<html><head><style>body { display: none; }</style></head><body><p>Hidden</p></body></html>",
+        )
+        assertEquals(emptyList<EpubReaderItem>(), hiddenBody)
+    }
+
+    @Test
+    fun `stylesheet loading stops once the global rule limit is full`() {
+        val loaded = mutableListOf<String>()
+        val fullSheet = (0 until 4_096).joinToString("\n") { index -> ".r$index { color: black; }" }
+
+        parseReaderItemsFromHtml(
+            spineIndex = 0,
+            resourceBaseDir = "OEBPS/text",
+            html = """
+                <html><head>
+                  <link rel="stylesheet" href="../styles/full.css"/>
+                  <link rel="stylesheet" href="../styles/unused.css"/>
+                </head><body><p>Body</p></body></html>
+            """.trimIndent(),
+            resourceTextLoader = { path ->
+                loaded += path
+                when (path) {
+                    "OEBPS/styles/full.css" -> fullSheet
+                    "OEBPS/styles/unused.css" -> ".unused { color: red; }"
+                    else -> null
+                }
+            },
+        )
+
+        assertEquals(listOf("OEBPS/styles/full.css"), loaded)
     }
 
     @Test

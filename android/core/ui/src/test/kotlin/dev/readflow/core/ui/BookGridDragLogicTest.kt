@@ -7,6 +7,24 @@ import org.junit.jupiter.api.Test
 class BookGridDragLogicTest {
 
     @Test
+    fun `committed reorder uses the live preview without a second settlement animation`() {
+        assertEquals(
+            false,
+            shouldAnimateDropSettlement(
+                startOrder = listOf("A", "B", "C"),
+                finalOrder = listOf("B", "A", "C"),
+            ),
+        )
+        assertEquals(
+            true,
+            shouldAnimateDropSettlement(
+                startOrder = listOf("A", "B", "C"),
+                finalOrder = listOf("A", "B", "C"),
+            ),
+        )
+    }
+
+    @Test
     fun `moving penultimate item to terminal insertion slot makes it last`() {
         val items = listOf("A", "B", "C", "D")
 

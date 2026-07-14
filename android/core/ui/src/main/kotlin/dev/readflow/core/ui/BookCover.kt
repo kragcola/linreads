@@ -43,13 +43,15 @@ fun BookCover(
     book: BookMeta,
     modifier: Modifier = Modifier,
     showProgress: Boolean = true,
+    showMaterialDepth: Boolean = true,
 ) {
     val clothColor = remember(book.id) { clothColorFor(book.id) }
+    val textureSeed = remember(book.id) { book.id.hashCode() and Int.MAX_VALUE }
 
     Box(
         modifier = modifier
             .shadow(
-                elevation = 8.dp,
+                elevation = if (showMaterialDepth) 8.dp else 0.dp,
                 shape = RoundedCornerShape(Dimens.coverCorner),
                 ambientColor = Color.Black.copy(alpha = 0.16f),
                 spotColor = Color.Black.copy(alpha = 0.20f),
@@ -63,6 +65,56 @@ fun BookCover(
                         center = Offset(size.width / 2f, size.height / 2f),
                         radius = size.maxDimension * 0.72f,
                     ),
+                )
+                if (!showMaterialDepth) return@drawWithContent
+                val spineWidth = size.width * 0.075f
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        colors = listOf(
+                            Color.Black.copy(alpha = 0.34f),
+                            Color.Black.copy(alpha = 0.08f),
+                            Color.Transparent,
+                        ),
+                        endX = spineWidth,
+                    ),
+                    size = Size(spineWidth, size.height),
+                )
+                drawLine(
+                    color = Color.White.copy(alpha = 0.14f),
+                    start = Offset(spineWidth, 0f),
+                    end = Offset(spineWidth, size.height),
+                    strokeWidth = 0.7.dp.toPx(),
+                )
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        colors = listOf(
+                            Color.White.copy(alpha = 0.10f),
+                            Color.Transparent,
+                            Color.Black.copy(alpha = 0.11f),
+                        ),
+                    ),
+                )
+                repeat(6) { index ->
+                    val fraction = ((textureSeed ushr (index * 3)) and 0x1f) / 31f
+                    val x = size.width * ((index + fraction) / 6f)
+                    drawLine(
+                        color = Color.White.copy(alpha = 0.025f),
+                        start = Offset(x, 0f),
+                        end = Offset((x + size.width * 0.025f).coerceAtMost(size.width), size.height),
+                        strokeWidth = 0.45.dp.toPx(),
+                    )
+                }
+                drawLine(
+                    color = Color.White.copy(alpha = 0.16f),
+                    start = Offset(0f, 0.6.dp.toPx()),
+                    end = Offset(size.width, 0.6.dp.toPx()),
+                    strokeWidth = 0.8.dp.toPx(),
+                )
+                drawLine(
+                    color = Color.Black.copy(alpha = 0.24f),
+                    start = Offset(0f, size.height - 0.8.dp.toPx()),
+                    end = Offset(size.width, size.height - 0.8.dp.toPx()),
+                    strokeWidth = 0.8.dp.toPx(),
                 )
             },
         contentAlignment = Alignment.Center,

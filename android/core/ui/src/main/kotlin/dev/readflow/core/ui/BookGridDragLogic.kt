@@ -20,6 +20,11 @@ internal data class GridDropCandidate(
     val rect: GridDragRect,
 )
 
+internal fun <T> shouldAnimateDropSettlement(
+    startOrder: List<T>,
+    finalOrder: List<T>,
+): Boolean = startOrder == finalOrder
+
 internal fun <T> moveItemToInsertionSlot(
     items: List<T>,
     sourceIndex: Int,

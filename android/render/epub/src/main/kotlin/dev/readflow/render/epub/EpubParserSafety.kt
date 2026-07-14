@@ -7,6 +7,7 @@ import java.util.zip.ZipFile
 internal const val EPUB_MAX_PACKAGE_ENTRY_BYTES = 512 * 1024
 internal const val EPUB_MAX_TOC_ENTRY_BYTES = 512 * 1024
 internal const val EPUB_MAX_SPINE_ENTRY_BYTES = 2 * 1024 * 1024
+internal const val EPUB_MAX_STYLESHEET_ENTRY_BYTES = 1024 * 1024
 internal const val EPUB_MAX_ZIP_ENTRIES = 10_000
 internal const val EPUB_MAX_DOM_DEPTH = 96
 

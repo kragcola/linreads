@@ -1,0 +1,76 @@
+package dev.readflow.render.epub
+
+import java.io.File
+import java.nio.file.Path
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.io.TempDir
+
+class EpubParserCssTest {
+
+    @TempDir
+    lateinit var tempDir: Path
+
+    @Test
+    fun `eager and lazy parsing load linked stylesheets relative to the spine document`() {
+        val epub = tempDir.resolve("css.epub").toFile()
+        writeEpub(epub)
+
+        val parser = EpubParser()
+        val eagerItem = parser.parseBook(epub).items.single() as EpubReaderItem.Text
+        val lazyBlock = parser.parseLazyBook(epub).blockAt(0) as EpubDisplayBlock.Text
+
+        listOf(eagerItem.styleSpans, lazyBlock.styleSpans).forEach { spans ->
+            assertTrue(spans.any { it.style == EpubTextStyle.Bold })
+            assertTrue(
+                spans.any {
+                    it.style == EpubTextStyle.ForegroundColor && it.color == 0xFF13579B.toInt()
+                },
+            )
+        }
+        assertEquals(EpubTextAlign.Center, eagerItem.blockStyle.textAlign)
+        assertEquals(EpubTextAlign.Center, lazyBlock.blockStyle.textAlign)
+    }
+
+    private fun writeEpub(file: File) {
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, content: String) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(content.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+
+            add(
+                "META-INF/container.xml",
+                """
+                    <container><rootfiles>
+                      <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                    </rootfiles></container>
+                """.trimIndent(),
+            )
+            add(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="c1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="css" href="styles/book.css" media-type="text/css"/>
+                      </manifest>
+                      <spine><itemref idref="c1"/></spine>
+                    </package>
+                """.trimIndent(),
+            )
+            add(
+                "OEBPS/text/ch1.xhtml",
+                """
+                    <html><head><link rel="stylesheet" href="../styles/book.css"/></head>
+                    <body><p class="chapter">Styled chapter</p></body></html>
+                """.trimIndent(),
+            )
+            add("OEBPS/styles/book.css", ".chapter { color: #13579b; font-weight: 700; text-align: center; }")
+        }
+    }
+}

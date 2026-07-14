@@ -27,12 +27,19 @@ internal enum class EpubTextStyle {
     Code,
     Superscript,
     Subscript,
+    Underline,
+    Strikethrough,
+    ForegroundColor,
+    BackgroundColor,
+    RelativeSize,
 }
 
 internal data class EpubTextStyleSpan(
     val start: Int,
     val end: Int,
     val style: EpubTextStyle,
+    val color: Int? = null,
+    val scale: Float? = null,
 )
 
 internal sealed interface EpubReaderItem {
@@ -48,6 +55,7 @@ internal sealed interface EpubReaderItem {
         val fragmentIds: List<String> = emptyList(),
         val isCodeBlock: Boolean = false,
         val language: String = "",
+        val blockStyle: EpubBlockStyle = EpubBlockStyle(),
     ) : EpubReaderItem
 
     data class Heading(
@@ -57,6 +65,7 @@ internal sealed interface EpubReaderItem {
         val links: List<EpubTextLink> = emptyList(),
         val styleSpans: List<EpubTextStyleSpan> = emptyList(),
         val fragmentIds: List<String> = emptyList(),
+        val blockStyle: EpubBlockStyle = EpubBlockStyle(),
     ) : EpubReaderItem
 
     data class Image(
@@ -64,6 +73,7 @@ internal sealed interface EpubReaderItem {
         val href: String,
         val altText: String?,
         val fragmentIds: List<String> = emptyList(),
+        val style: EpubImageStyle = EpubImageStyle(),
     ) : EpubReaderItem
 
     data class Break(

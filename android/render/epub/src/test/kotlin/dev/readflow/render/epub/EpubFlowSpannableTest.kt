@@ -2,7 +2,9 @@ package dev.readflow.render.epub
 
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.Color
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Looper
 import java.io.File
@@ -24,7 +26,9 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import io.noties.markwon.image.AsyncDrawable
+import io.noties.markwon.image.AsyncDrawableLoader
 import io.noties.markwon.image.AsyncDrawableSpan
+import io.noties.markwon.image.ImageSize
 
 /**
  * The load-bearing invariant of the continuous-flow rewrite (审计 C2/L12): the styled Spannable's
@@ -735,6 +739,145 @@ class EpubFlowSpannableTest {
         val sb = build(flow, style().copy(firstLineIndentPx = 0)) { null } as android.text.Spanned
         val margins = sb.getSpans(0, sb.length, android.text.style.LeadingMarginSpan.Standard::class.java)
         assertEquals(0, margins.size)
+    }
+
+    @Test
+    fun `computed css reaches alignment text spans indentation and block box rendering`() {
+        val block = EpubDisplayBlock.Text(
+            text = "Styled paragraph",
+            headingLevel = null,
+            paragraphIndex = 0,
+            styleSpans = listOf(
+                EpubTextStyleSpan(0, 6, EpubTextStyle.ForegroundColor, color = 0xFF13579B.toInt()),
+                EpubTextStyleSpan(7, 16, EpubTextStyle.Underline),
+            ),
+            blockStyle = EpubBlockStyle(
+                textAlign = EpubTextAlign.End,
+                textIndent = EpubCssLength(2f, EpubCssUnit.Em),
+                margin = EpubCssInsets(
+                    top = EpubCssLength(0.5f, EpubCssUnit.Em),
+                    left = EpubCssLength(1f, EpubCssUnit.Em),
+                    bottom = EpubCssLength(0.5f, EpubCssUnit.Em),
+                ),
+                padding = EpubCssInsets.all(EpubCssLength(0.25f, EpubCssUnit.Em)),
+                backgroundColor = 0xFFFFEECC.toInt(),
+                borders = EpubCssBorders(
+                    bottom = EpubCssBorder(
+                        EpubCssLength(1f, EpubCssUnit.Px),
+                        EpubCssBorderStyle.Solid,
+                        0xFF333333.toInt(),
+                    ),
+                ),
+            ),
+        )
+        val flow = epubBuildChapterFlow(0, listOf(block))
+        val sb = build(flow) { null } as android.text.Spanned
+
+        val alignment = sb.getSpans(0, sb.length, android.text.style.AlignmentSpan.Standard::class.java).single()
+        assertEquals(android.text.Layout.Alignment.ALIGN_OPPOSITE, alignment.alignment)
+        val margin = sb.getSpans(0, sb.length, android.text.style.LeadingMarginSpan.Standard::class.java).single()
+        assertTrue(margin.getLeadingMargin(true) > margin.getLeadingMargin(false))
+        assertTrue(margin.getLeadingMargin(false) > 0)
+        assertEquals(
+            0xFF13579B.toInt(),
+            sb.getSpans(0, 6, android.text.style.ForegroundColorSpan::class.java).single().foregroundColor,
+        )
+        assertEquals(1, sb.getSpans(7, 16, android.text.style.UnderlineSpan::class.java).size)
+        val box = sb.getSpans(0, sb.length, EpubBlockBoxSpan::class.java).single()
+        assertEquals(0xFFFFEECC.toInt(), box.backgroundColor)
+        assertEquals(0xFF333333.toInt(), box.borders.bottom?.color)
+        assertTrue(box.verticalInsetPx > 0)
+    }
+
+    @Test
+    fun `computed image css reaches async drawable dimensions and paragraph alignment`() {
+        val block = EpubDisplayBlock.Image(
+            href = "plate.png",
+            altText = "Plate",
+            paragraphIndex = 0,
+            style = EpubImageStyle(
+                width = EpubCssLength(50f, EpubCssUnit.Percent),
+                height = EpubCssLength(4f, EpubCssUnit.Em),
+                maxHeight = EpubCssLength(6f, EpubCssUnit.Em),
+                alignment = EpubTextAlign.Center,
+            ),
+        )
+        val flow = epubBuildChapterFlow(0, listOf(block))
+        val sb = build(flow) { null } as android.text.Spanned
+
+        val drawable = sb.getSpans(0, sb.length, AsyncDrawableSpan::class.java).single().drawable
+        val imageSize = requireNotNull(drawable.imageSize)
+        assertEquals(50f, imageSize.width.value)
+        assertEquals("%", imageSize.width.unit)
+        assertEquals(4f, imageSize.height.value)
+        assertEquals("em", imageSize.height.unit)
+        val alignment = sb.getSpans(0, sb.length, android.text.style.AlignmentSpan.Standard::class.java).single()
+        assertEquals(android.text.Layout.Alignment.ALIGN_CENTER, alignment.alignment)
+    }
+
+    @Test
+    fun `css width placeholder preserves bounds aspect ratio before decode`() {
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = 800,
+            pageHeightProvider = { 1200 },
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = emptySet(),
+        )
+        val drawable = AsyncDrawable(
+            "placeholder.png",
+            AsyncDrawableLoader.noOp(),
+            resolver,
+            ImageSize(ImageSize.Dimension(50f, "%"), null),
+        ).apply {
+            initWithKnownDimensions(800, 20f)
+            setResult(ColorDrawable(Color.GRAY).apply { setBounds(0, 0, 600, 300) })
+        }
+
+        assertEquals(Rect(0, 0, 400, 200), resolver.resolveImageSize(drawable))
+    }
+
+    @Test
+    fun `unsafe css colors and negative vertical margins degrade without harming reader layout`() {
+        assertEquals(0xFFE8E6E1.toInt(), epubSafeCssForeground(0xFF000000.toInt(), null, 0xFFE8E6E1.toInt()))
+        assertNull(epubSafeCssBackground(0xFF202020.toInt(), 0xFF000000.toInt()))
+
+        val block = EpubDisplayBlock.Text(
+            text = "Body",
+            headingLevel = null,
+            paragraphIndex = 0,
+            blockStyle = EpubBlockStyle(
+                margin = EpubCssInsets(
+                    top = EpubCssLength(-2f, EpubCssUnit.Em),
+                    bottom = EpubCssLength(-1f, EpubCssUnit.Em),
+                ),
+            ),
+        )
+        val sb = build(epubBuildChapterFlow(0, listOf(block))) { null } as android.text.Spanned
+        assertEquals(0, sb.getSpans(0, sb.length, EpubBlockBoxSpan::class.java).size)
+    }
+
+    @Test
+    fun `css foreground only trusts a background that survives the reader contrast filter`() {
+        val inlineBlock = EpubDisplayBlock.Text(
+            text = "Text",
+            headingLevel = null,
+            paragraphIndex = 0,
+            styleSpans = listOf(
+                EpubTextStyleSpan(0, 4, EpubTextStyle.ForegroundColor, color = Color.WHITE),
+                EpubTextStyleSpan(0, 4, EpubTextStyle.BackgroundColor, color = Color.BLACK),
+            ),
+        )
+        val inline = build(epubBuildChapterFlow(0, listOf(inlineBlock))) { null } as android.text.Spanned
+        assertEquals(Color.BLACK, inline.getSpans(0, 4, android.text.style.ForegroundColorSpan::class.java).single().foregroundColor)
+        assertEquals(0, inline.getSpans(0, 4, android.text.style.BackgroundColorSpan::class.java).size)
+
+        val blockBackground = inlineBlock.copy(
+            styleSpans = listOf(EpubTextStyleSpan(0, 4, EpubTextStyle.ForegroundColor, color = Color.WHITE)),
+            blockStyle = EpubBlockStyle(backgroundColor = Color.BLACK),
+        )
+        val block = build(epubBuildChapterFlow(0, listOf(blockBackground))) { null } as android.text.Spanned
+        assertEquals(Color.BLACK, block.getSpans(0, 4, android.text.style.ForegroundColorSpan::class.java).single().foregroundColor)
+        assertEquals(0, block.getSpans(0, 4, EpubBlockBoxSpan::class.java).size)
     }
 
     private fun imageLoader(

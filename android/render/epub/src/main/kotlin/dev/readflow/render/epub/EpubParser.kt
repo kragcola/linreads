@@ -113,6 +113,9 @@ internal class EpubParser {
                 html = html,
                 resourceBaseDir = epubParentDir(item.path),
                 documentPath = item.path,
+                resourceTextLoader = { path ->
+                    readEpubZipText(zip, path, EPUB_MAX_STYLESHEET_ENTRY_BYTES, sanitizeXml = false)
+                },
             )
         }
     }

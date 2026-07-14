@@ -125,6 +125,9 @@ internal class EpubLazyBook(
                     html = html,
                     resourceBaseDir = epubParentDir(ref.path),
                     documentPath = ref.path,
+                    resourceTextLoader = { path ->
+                        readEpubZipText(zip, path, EPUB_MAX_STYLESHEET_ENTRY_BYTES, sanitizeXml = false)
+                    },
                 )
             }
         }

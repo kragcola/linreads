@@ -41,4 +41,27 @@ class EpubDisplayBlockTest {
             blocks,
         )
     }
+
+    @Test
+    fun `display blocks preserve computed css styles`() {
+        val blockStyle = EpubBlockStyle(
+            textAlign = EpubTextAlign.Justify,
+            textIndent = EpubCssLength(2f, EpubCssUnit.Em),
+            backgroundColor = 0xFFFAEBD7.toInt(),
+        )
+        val imageStyle = EpubImageStyle(
+            width = EpubCssLength(60f, EpubCssUnit.Percent),
+            alignment = EpubTextAlign.Center,
+        )
+
+        val blocks = epubDisplayBlocks(
+            listOf(
+                EpubReaderItem.Text(EpubItemLocator(0, 0), text = "Body", blockStyle = blockStyle),
+                EpubReaderItem.Image(EpubItemLocator(0, 1), href = "plate.jpg", altText = null, style = imageStyle),
+            ),
+        )
+
+        assertEquals(blockStyle, (blocks[0] as EpubDisplayBlock.Text).blockStyle)
+        assertEquals(imageStyle, (blocks[1] as EpubDisplayBlock.Image).style)
+    }
 }

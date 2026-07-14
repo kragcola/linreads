@@ -320,8 +320,11 @@ internal class EpubFlowImageSizeResolver(
 
     override fun resolveImageSize(drawable: AsyncDrawable): Rect {
         val result = drawable.result ?: return Rect(0, 0, 1, 1)
-        result.bounds.takeUnless { it.isEmpty }?.let { return Rect(it) }
-        return epubFlowImageTargetSize(
+        val requested = drawable.imageSize
+        if (requested == null) {
+            result.bounds.takeUnless { it.isEmpty }?.let { return Rect(it) }
+        }
+        val fallback = epubFlowImageTargetSize(
             href = drawable.destination,
             intrinsicWidth = result.intrinsicWidth,
             intrinsicHeight = result.intrinsicHeight,
@@ -330,5 +333,60 @@ internal class EpubFlowImageSizeResolver(
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
         )
+        requested ?: return fallback
+        val sourceWidth = result.intrinsicWidth.takeIf { it > 0 }
+            ?: result.bounds.width().takeIf { it > 0 }
+            ?: fallback.width().coerceAtLeast(1)
+        val sourceHeight = result.intrinsicHeight.takeIf { it > 0 }
+            ?: result.bounds.height().takeIf { it > 0 }
+            ?: fallback.height().coerceAtLeast(1)
+        val ratio = sourceWidth.toFloat() / sourceHeight
+        val width = requested.width?.resolveCssImageDimension(columnWidthPx, drawable.lastKnowTextSize)
+        val height = requested.height?.resolveCssImageDimension(pageHeightProvider(), drawable.lastKnowTextSize)
+        val requestedWidth: Int
+        val requestedHeight: Int
+        when {
+            width != null && height != null -> {
+                requestedWidth = width
+                requestedHeight = height
+            }
+            width != null -> {
+                requestedWidth = width
+                requestedHeight = (width / ratio).toInt().coerceAtLeast(1)
+            }
+            height != null -> {
+                requestedHeight = height
+                requestedWidth = (height * ratio).toInt().coerceAtLeast(1)
+            }
+            else -> return fallback
+        }
+        val maxWidth = columnWidthPx.coerceAtLeast(1)
+        val maxHeight = if (drawable.destination in fullPageHrefs) {
+            pageHeightProvider().coerceAtLeast(1)
+        } else {
+            inlineMaxHeightPx.coerceAtLeast(1)
+        }
+        val scale = minOf(
+            1f,
+            maxWidth.toFloat() / requestedWidth,
+            maxHeight.toFloat() / requestedHeight,
+        )
+        return Rect(
+            0,
+            0,
+            (requestedWidth * scale).toInt().coerceAtLeast(1),
+            (requestedHeight * scale).toInt().coerceAtLeast(1),
+        )
     }
 }
+
+private fun io.noties.markwon.image.ImageSize.Dimension.resolveCssImageDimension(
+    percentageBasisPx: Int,
+    textSizePx: Float,
+): Int? =
+    when (unit) {
+        "%" -> (percentageBasisPx * value / 100f).toInt()
+        "em" -> (textSizePx * value).toInt()
+        "" -> value.toInt()
+        else -> null
+    }?.coerceAtLeast(1)

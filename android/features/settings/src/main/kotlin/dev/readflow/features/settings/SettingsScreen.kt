@@ -11,22 +11,41 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.Notes
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.FileUpload
+import androidx.compose.material.icons.outlined.FontDownload
+import androidx.compose.material.icons.outlined.FormatLineSpacing
+import androidx.compose.material.icons.outlined.ImportExport
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.Link
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material.icons.outlined.SystemUpdate
+import androidx.compose.material.icons.outlined.TextFields
+import androidx.compose.material.icons.outlined.ViewCarousel
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -59,7 +78,6 @@ fun SettingsScreen(
     val theme by vm.themeMode.collectAsStateWithLifecycle()
     val lineSpacing by vm.lineSpacing.collectAsStateWithLifecycle()
     val readingMode by vm.readingMode.collectAsStateWithLifecycle()
-    val useSourceHanFont by vm.useSourceHanFont.collectAsStateWithLifecycle()
     val txtEncoding by vm.txtEncoding.collectAsStateWithLifecycle()
     val fontChoice by vm.fontChoice.collectAsStateWithLifecycle()
     val syncStatus by vm.syncStatus.collectAsStateWithLifecycle()
@@ -184,7 +202,7 @@ fun SettingsScreen(
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text("设置", style = MaterialTheme.typography.titleLarge) },
+                title = { Text("设置", style = MaterialTheme.typography.titleMedium) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
@@ -196,23 +214,21 @@ fun SettingsScreen(
             )
         },
     ) { padding ->
-        Box(
+        SettingsPageLayout(
             modifier = Modifier
                 .padding(padding)
                 .fillMaxSize(),
-        ) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .widthIn(max = 840.dp)
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
+            primaryColumn = {
             SettingsSection(
                 title = "书源连接",
+                description = "连接局域网中的 Calibre 内容服务器。",
             ) {
+            SettingItemHeader(
+                icon = Icons.Outlined.Link,
+                title = "Calibre 服务器",
+                currentValue = if (url.isNullOrBlank()) "未配置" else "已配置",
+                description = "输入完整地址，或从主机地址探测常用端口。",
+            )
             OutlinedTextField(
                 value = urlDraft,
                 onValueChange = {
@@ -229,6 +245,7 @@ fun SettingsScreen(
                 },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
+                shape = MaterialTheme.shapes.extraSmall,
             )
 
             FlowRow(
@@ -238,13 +255,26 @@ fun SettingsScreen(
                 OutlinedButton(
                     onClick = { vm.testCalibreConnection(urlDraft) },
                     enabled = connectionState !is CalibreConnectionUiState.Checking,
-                ) { Text("测试连接") }
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Outlined.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("测试连接")
+                }
                 OutlinedButton(
                     onClick = { vm.probeCalibreConnection(urlDraft) },
                     enabled = connectionState !is CalibreConnectionUiState.Checking,
-                ) { Text("探测常用端口") }
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Outlined.Link, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("探测常用端口")
+                }
                 if (urlDraft != (url ?: "")) {
-                    TextButton(onClick = { vm.setCalibreUrl(urlDraft) }) { Text("仅保存") }
+                    TextButton(
+                        onClick = { vm.setCalibreUrl(urlDraft) },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("仅保存") }
                 }
             }
             when (val state = connectionState) {
@@ -271,8 +301,14 @@ fun SettingsScreen(
 
             SettingsSection(
                 title = "阅读体验",
+                description = "调整排版、翻页方式、字体与文本解析。",
             ) {
-            Text("字号：${fontSize}sp", style = MaterialTheme.typography.bodyMedium)
+            SettingItemHeader(
+                icon = Icons.Outlined.TextFields,
+                title = "正文字号",
+                currentValue = "${fontSize}sp",
+                description = "跟随系统显示缩放，并即时应用到阅读器。",
+            )
             AccessibleSlider(
                 value = ReaderTypography.clampFontSp(fontSize.toFloat()),
                 onValueChange = { vm.setFontSize(it.toInt()) },
@@ -280,12 +316,30 @@ fun SettingsScreen(
                 steps = ReaderTypography.FONT_SLIDER_STEPS,
                 label = "字号",
                 valueDescription = "${fontSize}sp",
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp),
             )
-            Text("这是 ${fontSize}sp 的正文效果。The quick brown fox.",
-                fontSize = fontSize.sp, color = MaterialTheme.colorScheme.onBackground)
+            Text(
+                text = "这是 ${fontSize}sp 的正文效果。The quick brown fox.",
+                fontSize = fontSize.sp,
+                lineHeight = (fontSize * 1.7f).sp,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        shape = MaterialTheme.shapes.extraSmall,
+                    )
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            )
 
-            Text("行距：${"%.2f".format(lineSpacing)}x", style = MaterialTheme.typography.bodyMedium)
+            SettingItemHeader(
+                icon = Icons.Outlined.FormatLineSpacing,
+                title = "正文行距",
+                currentValue = "${"%.2f".format(lineSpacing)}x",
+                description = "增加行间留白可减轻长时间阅读疲劳。",
+            )
             AccessibleSlider(
                 value = ReaderTypography.clampLineSpacing(lineSpacing),
                 onValueChange = { vm.setLineSpacing(it) },
@@ -293,11 +347,24 @@ fun SettingsScreen(
                 steps = ReaderTypography.LINE_SPACING_SLIDER_STEPS,
                 label = "行距",
                 valueDescription = "${"%.2f".format(lineSpacing)}倍",
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp),
             )
 
-            Text("阅读模式", style = MaterialTheme.typography.bodyMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SettingItemHeader(
+                icon = Icons.Outlined.ViewCarousel,
+                title = "阅读模式",
+                currentValue = readingMode.label(),
+                description = "在连续滚动与分页阅读之间切换。",
+            )
+            FlowRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .selectableGroup(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 ReaderReadingMode.entries.forEach { mode ->
                     FilterChip(
                         selected = readingMode == mode,
@@ -308,34 +375,57 @@ fun SettingsScreen(
                 }
             }
 
-            Text("正文字体", style = MaterialTheme.typography.bodyMedium)
             var customFonts by remember { mutableStateOf(emptyList<String>()) }
             // key 于 fontChoice：导入成功会更新 fontChoice，从而刷新列表显示新字体
             LaunchedEffect(fontChoice) {
                 customFonts = FontProvider.listCustomFonts(context.applicationContext)
             }
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            SettingItemHeader(
+                icon = Icons.Outlined.FontDownload,
+                title = "正文字体",
+                currentValue = fontChoice.label(),
+                description = "使用内置字体、系统字体或导入本地字体文件。",
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .selectableGroup(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     FilterChip(selected = fontChoice == FontChoice.System, onClick = { vm.setFontChoice(FontChoice.System) },
                         label = { Text("系统宋体") }, modifier = Modifier.heightIn(min = 48.dp))
                     FilterChip(selected = fontChoice == FontChoice.SourceHan, onClick = { vm.setFontChoice(FontChoice.SourceHan) },
                         label = { Text("思源宋体（内置）") }, modifier = Modifier.heightIn(min = 48.dp))
+                    customFonts.forEach { name ->
+                        val c = FontChoice.Custom(name)
+                        FilterChip(selected = fontChoice == c, onClick = { vm.setFontChoice(c) },
+                            label = { Text(name) }, modifier = Modifier.heightIn(min = 48.dp))
+                    }
                 }
-                customFonts.forEach { name ->
-                    val c = FontChoice.Custom(name)
-                    FilterChip(selected = fontChoice == c, onClick = { vm.setFontChoice(c) },
-                        label = { Text(name) }, modifier = Modifier.heightIn(min = 48.dp))
-                }
-                OutlinedButton(onClick = {
-                    fontImportLauncher.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream"))
-                    // Refresh list after import (simplified: on next recomposition)
-                }) {
-                    Text("＋ 导入字体")
+                OutlinedButton(
+                    onClick = {
+                        fontImportLauncher.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream"))
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("导入字体")
                 }
             }
 
-            Text("TXT 编码", style = MaterialTheme.typography.bodyMedium)
+            SettingItemHeader(
+                icon = Icons.Outlined.Code,
+                title = "TXT 编码",
+                currentValue = txtEncoding.label(),
+                description = "自动识别失败时，可手动指定文本编码。",
+            )
             FlowRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .selectableGroup(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
@@ -345,8 +435,16 @@ fun SettingsScreen(
                 }
             }
 
-            Text("主题", style = MaterialTheme.typography.bodyMedium)
+            SettingItemHeader(
+                icon = Icons.Outlined.Palette,
+                title = "界面主题",
+                currentValue = theme.readerThemeLabel(),
+                description = "可跟随系统，或固定使用日间、夜间与护眼主题。",
+            )
             FlowRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .selectableGroup(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
@@ -356,10 +454,19 @@ fun SettingsScreen(
                 }
             }
             }
+            },
+            secondaryColumn = {
 
             SettingsSection(
                 title = "同步与备份",
+                description = "查看同步状态，并迁移本机阅读数据。",
             ) {
+            SettingItemHeader(
+                icon = Icons.Outlined.Sync,
+                title = "阅读数据同步",
+                currentValue = if (syncStatus.isRemoteSyncEnabled) "已启用" else "仅本机",
+                description = "进度、书签与标注的当前保存范围。",
+            )
             ConnectionResultText(
                 title = syncStatus.title,
                 detail = syncStatus.detail,
@@ -367,7 +474,12 @@ fun SettingsScreen(
             )
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            Text("完整备份", style = MaterialTheme.typography.titleSmall)
+            SettingItemHeader(
+                icon = Icons.Outlined.ImportExport,
+                title = "完整备份",
+                currentValue = "ZIP",
+                description = "导出或合并进度、书签和标注。",
+            )
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -375,8 +487,9 @@ fun SettingsScreen(
                 OutlinedButton(
                     onClick = { backupLauncher.launch("LinReads Backup.zip") },
                     enabled = !isBackupBusy,
+                    modifier = Modifier.heightIn(min = 48.dp),
                 ) {
-                    Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                    Icon(Icons.Outlined.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("导出备份")
                 }
@@ -391,8 +504,9 @@ fun SettingsScreen(
                         )
                     },
                     enabled = !isBackupBusy,
+                    modifier = Modifier.heightIn(min = 48.dp),
                 ) {
-                    Icon(Icons.Outlined.FileUpload, contentDescription = null)
+                    Icon(Icons.Outlined.FileUpload, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("恢复备份")
                 }
@@ -441,13 +555,20 @@ fun SettingsScreen(
 
             SettingsSection(
                 title = "数据与主题",
+                description = "导出笔记，或在设备间复用排版方案。",
             ) {
-            Text("阅读笔记", style = MaterialTheme.typography.titleSmall)
+            SettingItemHeader(
+                icon = Icons.AutoMirrored.Outlined.Notes,
+                title = "阅读笔记",
+                currentValue = "Markdown",
+                description = "按书籍导出书签与标注，便于归档和检索。",
+            )
             OutlinedButton(
                 onClick = { notesExportLauncher.launch("LinReads 笔记.md") },
                 enabled = notesExportState !is BackupExportUiState.Exporting,
+                modifier = Modifier.heightIn(min = 48.dp),
             ) {
-                Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                Icon(Icons.Outlined.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
                 Text("导出阅读笔记")
             }
@@ -474,7 +595,12 @@ fun SettingsScreen(
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
-            Text("主题方案", style = MaterialTheme.typography.titleSmall)
+            SettingItemHeader(
+                icon = Icons.Outlined.Palette,
+                title = "主题方案",
+                currentValue = "JSON",
+                description = "导出当前排版，或从其他设备导入。",
+            )
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -482,16 +608,18 @@ fun SettingsScreen(
                 OutlinedButton(
                     onClick = { themeExportLauncher.launch("LinReads 主题.json") },
                     enabled = themeExportState !is BackupExportUiState.Exporting,
+                    modifier = Modifier.heightIn(min = 48.dp),
                 ) {
-                    Icon(Icons.Outlined.FileDownload, contentDescription = null)
+                    Icon(Icons.Outlined.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("导出主题")
                 }
                 OutlinedButton(
                     onClick = { themeImportLauncher.launch(arrayOf("application/json")) },
                     enabled = themeImportState !is BackupRestoreUiState.Restoring,
+                    modifier = Modifier.heightIn(min = 48.dp),
                 ) {
-                    Icon(Icons.Outlined.FileUpload, contentDescription = null)
+                    Icon(Icons.Outlined.FileUpload, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("导入主题")
                 }
@@ -540,13 +668,13 @@ fun SettingsScreen(
 
             SettingsSection(
                 title = "关于与更新",
+                description = "版本信息、更新记录与安装状态。",
             ) {
-            val buildNum = buildTag.removePrefix("dev-").substringBefore("-").takeIf { it.all { c -> c.isDigit() } }
-            val tagDisplay = if (buildNum != null) "构建 #$buildNum" else buildTag
-            Text(
-                text = tagDisplay,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            SettingItemHeader(
+                icon = Icons.Outlined.Info,
+                title = "LinReads Android",
+                currentValue = buildTag.displayBuildLabel().ifBlank { "开发版本" },
+                description = "本机安装版本。",
             )
             // 始终显示缓存的更新日志（中文 commit message）
             if (cachedNotes.isNotBlank()) {
@@ -557,8 +685,8 @@ fun SettingsScreen(
                     color = MaterialTheme.colorScheme.onSurface,
                 )
                 Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
-                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    shape = MaterialTheme.shapes.extraSmall,
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                 ) {
                     Text(
@@ -569,18 +697,32 @@ fun SettingsScreen(
                 }
             }
 
+            SettingItemHeader(
+                icon = Icons.Outlined.SystemUpdate,
+                title = "应用更新",
+                currentValue = updateState.label(),
+                description = "从已配置的发布源检查并安装新版本。",
+            )
+
             when (val s = updateState) {
-                UpdateState.Idle -> Button(onClick = {
-                    scope.launch {
-                        updateState = UpdateState.Checking
-                        runCatching { onCheckForUpdate(context) }
-                            .onSuccess { result ->
-                                updateState = if (result != null) UpdateState.Available(result.first, result.second)
-                                else UpdateState.UpToDate
-                            }
-                            .onFailure { updateState = UpdateState.Error(it.message ?: "检查失败") }
-                    }
-                }) { Text("检查更新") }
+                UpdateState.Idle -> Button(
+                    onClick = {
+                        scope.launch {
+                            updateState = UpdateState.Checking
+                            runCatching { onCheckForUpdate(context) }
+                                .onSuccess { result ->
+                                    updateState = if (result != null) UpdateState.Available(result.first, result.second)
+                                    else UpdateState.UpToDate
+                                }
+                                .onFailure { updateState = UpdateState.Error(it.message ?: "检查失败") }
+                        }
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Outlined.SystemUpdate, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("检查更新")
+                }
 
                 UpdateState.Checking -> Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -590,7 +732,11 @@ fun SettingsScreen(
                     Text("检查中…", style = MaterialTheme.typography.bodyMedium)
                 }
 
-                UpdateState.UpToDate -> Text("✓ 已是最新版本", style = MaterialTheme.typography.bodyMedium)
+                UpdateState.UpToDate -> ConnectionResultText(
+                    title = "已是最新版本",
+                    detail = "当前无需更新。",
+                    isError = false,
+                )
 
                 is UpdateState.Available -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("发现新版本，点击下载安装", style = MaterialTheme.typography.bodyMedium)
@@ -614,8 +760,13 @@ fun SettingsScreen(
                                 startUpdateDownload(s)
                             }
                         },
-                        enabled = true
-                    ) { Text("下载并安装") }
+                        enabled = true,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) {
+                        Icon(Icons.Outlined.FileDownload, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("下载并安装")
+                    }
                 }
 
                 is UpdateState.Downloading -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -630,7 +781,8 @@ fun SettingsScreen(
                         onClick = {
                             context.clearDownloadState()
                             updateState = UpdateState.Idle
-                        }
+                        },
+                        modifier = Modifier.heightIn(min = 48.dp),
                     ) { Text("取消下载") }
                 }
 
@@ -639,44 +791,170 @@ fun SettingsScreen(
                     Button(onClick = {
                         launchInstaller(context, s.uri)
                         context.clearDownloadState()
-                    }) { Text("安装") }
+                    }, modifier = Modifier.heightIn(min = 48.dp)) { Text("安装") }
                 }
 
-                is UpdateState.Error -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("✗ ${s.msg}", style = MaterialTheme.typography.bodyMedium)
-                    TextButton(onClick = { updateState = UpdateState.Idle }) { Text("重试") }
+                is UpdateState.Error -> Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Outlined.ErrorOutline,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.error,
+                    )
+                    Text(
+                        text = s.msg,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(
+                        onClick = { updateState = UpdateState.Idle },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    ) { Text("重试") }
                 }
             }
             }
             Spacer(Modifier.height(12.dp))
-            }
-        }
+            },
+        )
     }
 }
 
 @Composable
 private fun SettingsSection(
     title: String,
+    description: String,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onBackground,
-            modifier = Modifier.padding(horizontal = 4.dp),
-        )
-        Surface(
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(
             modifier = Modifier.fillMaxWidth(),
-            shape = MaterialTheme.shapes.small,
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 1.dp,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                content = content,
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.semantics { heading() },
+            )
+            Text(
+                text = description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            content = content,
+        )
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+    }
+}
+
+@Composable
+private fun SettingsPageLayout(
+    modifier: Modifier = Modifier,
+    primaryColumn: @Composable ColumnScope.() -> Unit,
+    secondaryColumn: @Composable ColumnScope.() -> Unit,
+) {
+    BoxWithConstraints(modifier = modifier) {
+        val layoutMode = settingsLayoutMode(maxWidth.value)
+        val horizontalPadding = if (layoutMode == SettingsLayoutMode.TWO_COLUMNS) 24.dp else 16.dp
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .widthIn(max = 1080.dp)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = horizontalPadding, vertical = 12.dp),
+        ) {
+            if (layoutMode == SettingsLayoutMode.TWO_COLUMNS) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(24.dp),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(24.dp),
+                        content = primaryColumn,
+                    )
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(24.dp),
+                        content = secondaryColumn,
+                    )
+                }
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(24.dp),
+                ) {
+                    primaryColumn()
+                    secondaryColumn()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingItemHeader(
+    icon: ImageVector,
+    title: String,
+    currentValue: String? = null,
+    description: String? = null,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .semantics(mergeDescendants = true) {
+                currentValue?.let { stateDescription = "当前值：$it" }
+            },
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(
+            modifier = Modifier.size(width = 28.dp, height = 48.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+                tint = MaterialTheme.colorScheme.primary,
+            )
+        }
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            description?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        currentValue?.let {
+            Text(
+                text = it,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.widthIn(max = 144.dp),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -685,17 +963,33 @@ private fun SettingsSection(
 @Composable
 private fun ConnectionResultText(title: String, detail: String, isError: Boolean) {
     val color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.bodyMedium,
-            color = color,
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {
+                stateDescription = if (isError) "需要处理" else "状态正常"
+            },
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Icon(
+            imageVector = if (isError) Icons.Outlined.ErrorOutline else Icons.Outlined.CheckCircle,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier.size(20.dp),
         )
-        Text(
-            text = detail,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = color,
+            )
+            Text(
+                text = detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
@@ -783,6 +1077,22 @@ private sealed interface UpdateState {
     data class Downloading(val progress: Float, val dlId: Long) : UpdateState
     data class ReadyToInstall(val uri: Uri) : UpdateState
     data class Error(val msg: String) : UpdateState
+}
+
+private fun UpdateState.label(): String = when (this) {
+    UpdateState.Idle -> "未检查"
+    UpdateState.Checking -> "检查中"
+    UpdateState.UpToDate -> "已是最新"
+    is UpdateState.Available -> "有新版本"
+    is UpdateState.Downloading -> if (progress < 0f) "下载中" else "下载 ${(progress * 100).toInt()}%"
+    is UpdateState.ReadyToInstall -> "待安装"
+    is UpdateState.Error -> "需要处理"
+}
+
+private fun FontChoice.label(): String = when (this) {
+    FontChoice.System -> "系统宋体"
+    FontChoice.SourceHan -> "思源宋体"
+    is FontChoice.Custom -> fileName
 }
 
 private fun ReaderReadingMode.label() = when (this) {
