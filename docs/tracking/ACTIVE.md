@@ -1,22 +1,23 @@
 # Active Work
 
-_最后更新：2026-07-12_
+_最后更新：2026-07-14_
 
-Mode: `none`
-Objective: 无（Android 平板比例与 Reader 菜单卡顿已按 AVD fallback 验收收口）
-Active tracker: none
+Mode: `task-bug`
+Objective: 修复 Android EPUB 分页模式 FREE_REST 临时滚动与上下边缘半行裁切
+Active tracker: [android-epub-free-rest-pagination-2026-07-13.md](android-epub-free-rest-pagination-2026-07-13.md)
 Last completed tracker: [android-tablet-scale-reader-menu-jank-2026-07-12.md](android-tablet-scale-reader-menu-jank-2026-07-12.md)
 v4lite 执行文档: [../android-v4lite-plan.md](../android-v4lite-plan.md)
 纯阅读缺口验收表: [android-v4-pure-reading-gap-checklist.md](android-v4-pure-reading-gap-checklist.md)
 未完成项回填总表: [android-v4-pure-reading-unfinished-backfill.md](android-v4-pure-reading-unfinished-backfill.md)
 静读天下对比协议: [../research/moonreader-linreads-extreme-reading-comparison.md](../research/moonreader-linreads-extreme-reading-comparison.md)
 静读天下手感借鉴 backlog: [../research/moonreader-handfeel-borrowing-backlog-2026-07-02.md](../research/moonreader-handfeel-borrowing-backlog-2026-07-02.md)
-Test ledger: [android-tablet-scale-reader-menu-jank-2026-07-12.md#test-ledger](android-tablet-scale-reader-menu-jank-2026-07-12.md#test-ledger)
+Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](android-epub-free-rest-pagination-2026-07-13.md#test-ledger)
 
 > ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
 ## 当前状态
 
+- 2026-07-14 Android EPUB FREE_REST pagination / full-line clipping / cold-cache B / A1 page-shot memory 已收口。用户选择 A1：始终 `ARGB_8888`，低内存只降低 speculative prewarm。local 与 hidden boundary renderer 共享按 memoryClass/low-RAM 计算的 byte budget，reservation 后按 `allocationByteCount` 计费；PINNED active pair 可越软字节预算，但所有 kind/reservation 合计最多三个 distinct identity。settle 后 front/target 按 identity 重标复用，离散跨章复用 warmed outgoing；continuity cover、active boundary token、direction owner、trim/backoff、waiting retry 与 speculative-session→required promotion 已闭环。EPUB 强制全量 441 tests / 0 failures / 0 errors / 2 skipped；Reader 83/83、Animate 13/13、lint 0 errors、AndroidTest compile、debug assemble 的 434-task 门通过；Android 16 AVD 三条关键 runtime `OK (3 tests)` / `41.85s`，critical logcat 0。两轮独立复审 Critical/Important 均为 0；仅保留无 production caller 的裸 Bitmap lease API Minor。当前仍未提交、未推送、未发布 OTA，物理设备继续 deferred。
 - 2026-07-12 tablet scale / reader menu jank（已收口，2026-07-13 获 OTA 发布授权）：360/800/1280dp 主页恢复 2/5/7 列与旧版多设备比例，设置密度收回且完整可见交互节点保持 48dp。Reader 采用固定 base chrome + sibling panel、150ms/12dp alpha+translation-only；退出内容保留、空白触摸拦截、横向 navigation inset 与共同退出短位移全部闭环。最终 598-task 门、Reader 83/83、独立复审无 P0/P1/P2；AVD 五类 panel 下 base bounds 最大差 0px，静态接缝 y=2166，157 个 Reader 交互节点均 >=48dp，空白不穿透。最终 chrome-open P95 155.75ms，较 baseline 231.76ms 改善 32.8%，但与 motion-only 155.94ms 持平且六类绝对 24ms 门均未过；明确归因 ANGLE/SwiftShader post-Sync 瓶颈，不宣称额外帧时收益。Reader critical log 0。边界：仅 AVD、gesture-nav 竖屏；三键侧栏/横屏 Reader、专用 panel-close 高帧率证据和物理设备手感未覆盖。未改阅读内核、翻页算法、locator 或正文手势路由；本批次随当前实现 commit 推送 `main` 并触发 `Android Dev Release`，发布身份以 workflow commit / BUILD_TAG / `dev-latest` 资产为准。
 - 2026-07-12 Android Contemporary Editorial UI redesign 已收口：书架改为 2/3/4/5 响应式网格并在 1120dp 限宽，阅读 chrome 压为可即时隐藏的顶部浮条 + 底部单一控制面，设置页重组为 5 个分组并在 840dp 限宽；Light/Dark/Sepia 容器色阶、低纸纹、无封面封套、底边进度和衬线/无衬线层级统一落地。无障碍复核闭环首次引导 TalkBack `ACTION_CLICK`、五个单一 48dp `SeekBar` + `ACTION_SET_PROGRESS`、TOC stale node、封面文字/进度对比、护眼黄 outline 与“纯黑”标签兼容。复审新增的限宽 Modifier 顺序和无封面作者暗角对比两项 P2 已修复；360dp、800dp 与 1280dp AVD 无溢出，最终 598-task 静态门 `BUILD SUCCESSFUL in 23s`，独立代码/视觉复审无 P0-P2，Design Audit 19/20。未修改阅读内核、翻页算法、locator 或正文手势路由；按用户要求未做实机，当前未提交、未推送、未发布 OTA。
 - 2026-07-12 A2 PAPER implementation：用户选择 A2 后，`PageCurlDrawable` 已从整页 `Camera.rotateY` 重写为 CoolReader `PAGE_ANIMATION_PAPER` 同源的三阶段局部正弦条带：可见弯曲带上限 30%，约 5px 等角度条带，1024 项 sin/asin/src/dst 预计算表，16 级预建高光/阴影，MOVE 不创建 Bitmap/Rect/Paint/Shader。SIMULATION 的拖动、点击/按键、章内与跨章已统一走该 2D renderer；`EpubReflowEngine` 不再创建 GL child，`EpubFlowView` 的 GL 状态机/timeout/conversion-owner/copy seam 已删除。章内缓存扩为 current+prev+next，方向确定时零复制转移当前页和目标页并回收未选侧；离散翻页同样消费缓存，静默 park 后仅在 settle 发布 locator，取消恢复原页。最终 review 已闭环 30% 临界闪帧、跨章首 MOVE 截图、失败销毁 target preview 三项 P1，以及重复 precache 覆盖/泄漏 P2；pending+generation 会合并重复任务并阻止 stale posted work 写回。phase-2 AndroidTest 已移除纯 GL retained-buffer/first-frame 用例，并迁移离散/rapid/Window/vertical/cold-first/direction 到 `PageCurlDrawable` + no legacy GL child。验证：EPUB 370 tests / 0 failures / 0 errors / 2 skipped；Reader 80/80；Animate 13/13；EPUB lint、AndroidTest Kotlin compile、debug APK assemble 和 `git diff --check` 成功；修正 baseline 前后 TextView 测试状态不一致的 flake 后，严格 Window+cold-first 连续 3 轮 6/6，完整 A2 targeted AVD `OK (6 tests)` / `73.19s`，关键 logcat 为空且无残留触摸。最终生产复核无 P0-P3；物理设备手感按用户要求未验证。A2 已提交为 `4cee1a3` 并推送 `main`，`Android Dev Release` run #202 成功发布且远端 OTA 身份、SHA-256、ZIP、包名、v2 签名、证书与内嵌 BUILD_TAG 全部验证通过。

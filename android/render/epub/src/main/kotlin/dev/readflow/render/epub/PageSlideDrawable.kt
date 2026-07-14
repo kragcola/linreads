@@ -33,6 +33,9 @@ internal class PageSlideDrawable(
     private val viewportH: Int,
     private val forward: Boolean,
     private val density: Float,
+    private val bitmapRecycler: (Bitmap) -> Unit = { bitmap ->
+        if (!bitmap.isRecycled) bitmap.recycle()
+    },
 ) : Drawable() {
 
     private var frontBitmap: Bitmap? = frontBitmap
@@ -130,13 +133,21 @@ internal class PageSlideDrawable(
         return bitmap?.takeUnless { it.isRecycled }
     }
 
+    /** Transfers the outgoing page to the caller without copying it. */
+    fun takeFrontBitmap(): Bitmap? {
+        val bitmap = frontBitmap
+        frontBitmap = null
+        if (revealedBitmap === bitmap) revealedBitmap = null
+        return bitmap?.takeUnless { it.isRecycled }
+    }
+
     fun recycle() {
         val front = frontBitmap
         val revealed = revealedBitmap
         frontBitmap = null
         revealedBitmap = null
-        if (front != null && !front.isRecycled) front.recycle()
-        if (revealed != null && revealed !== front && !revealed.isRecycled) revealed.recycle()
+        if (front != null) bitmapRecycler(front)
+        if (revealed != null && revealed !== front) bitmapRecycler(revealed)
     }
 
     override fun setAlpha(alpha: Int) {}

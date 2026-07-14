@@ -1,9 +1,12 @@
 package dev.readflow.render.epub
 
+import android.app.ActivityManager
+import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Bitmap
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
@@ -237,6 +240,43 @@ class EpubReflowEngine private constructor(
     private var flowAppliedPalette: ReaderPalette? = null
     private val flowExecutor: ExecutorService by lazy { Executors.newFixedThreadPool(2) }
     private val flowMainHandler = Handler(Looper.getMainLooper())
+    private val pageShotApplicationContext = context.applicationContext
+    private val pageShotBudget = run {
+        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        PageShotBudget(
+            pageShotBudgetCapacityBytes(
+                memoryClassMiB = activityManager?.memoryClass ?: DEFAULT_MEMORY_CLASS_MIB,
+                isLowRamDevice = activityManager?.isLowRamDevice == true,
+            ),
+        )
+    }
+    private var pageShotMemoryCallbacksRegistered = false
+    private var pageShotSpeculationPaused = false
+    private var pageShotBackgroundPaused = false
+    private var pageShotSevereMemoryBackoff = false
+    private val pageShotMemoryCallbacks = object : ComponentCallbacks2 {
+        override fun onConfigurationChanged(newConfig: Configuration) = Unit
+
+        override fun onLowMemory() {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                flowMainHandler.post(::handleSeverePageShotMemoryPressure)
+            }
+        }
+
+        override fun onTrimMemory(level: Int) {
+            val runningPressure =
+                level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+                    level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
+            if (
+                level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN ||
+                level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+            ) {
+                flowMainHandler.post(::handleBackgroundPageShotTrim)
+            } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE && runningPressure) {
+                flowMainHandler.post(::handleSeverePageShotMemoryPressure)
+            }
+        }
+    }
     private var liveFlowImageLoader: EpubFlowImageLoader? = null
     private var boundaryPreviewGeneration = 0L
     private var nextBoundaryPreviewToken = 0L
@@ -446,13 +486,61 @@ class EpubReflowEngine private constructor(
 
     // ---- Continuous-flow rendering (方案 C) ----------------------------------------------------
 
+    private fun ensurePageShotMemoryCallbacksRegistered() {
+        if (pageShotMemoryCallbacksRegistered) return
+        pageShotApplicationContext.registerComponentCallbacks(pageShotMemoryCallbacks)
+        pageShotMemoryCallbacksRegistered = true
+    }
+
+    private fun unregisterPageShotMemoryCallbacks() {
+        if (!pageShotMemoryCallbacksRegistered) return
+        pageShotApplicationContext.unregisterComponentCallbacks(pageShotMemoryCallbacks)
+        pageShotMemoryCallbacksRegistered = false
+    }
+
+    private fun onPageShotOutOfMemory() {
+        flowMainHandler.post(::handleSeverePageShotMemoryPressure)
+    }
+
+    private fun handleBackgroundPageShotTrim() {
+        pageShotBackgroundPaused = true
+        pauseAndTrimPageShots()
+    }
+
+    private fun handleSeverePageShotMemoryPressure() {
+        pageShotSevereMemoryBackoff = true
+        pauseAndTrimPageShots()
+    }
+
+    private fun pauseAndTrimPageShots() {
+        pageShotSpeculationPaused = true
+        pageShotBudget.pauseSpeculativeAdmission()
+        trimBoundaryPreviewStatePreservingActiveTurn()
+        flowView?.pausePageShotSpeculationAndTrim()
+        pageShotBudget.evictEvictable().forEach { identity ->
+            (identity as? Bitmap)?.let { if (!it.isRecycled) it.recycle() }
+        }
+    }
+
+    private fun resumePageShotsAfterForeground() {
+        if (!pageShotBackgroundPaused || pageShotSevereMemoryBackoff) return
+        pageShotBackgroundPaused = false
+        pageShotSpeculationPaused = false
+        pageShotBudget.resumeSpeculativeAdmission()
+        flowView?.resumePageShotSpeculation()
+        prewarmBoundaryPreviews()
+    }
+
     private fun createFlowView(): View {
+        ensurePageShotMemoryCallbacksRegistered()
         val palette = paletteFor(themeMode, context.resources.configuration)
         val view = EpubFlowView(
             context = context,
             onTapZone = ::handleFlowTapZone,
             onTopOffsetChanged = ::handleFlowTopOffsetChanged,
             onSelectionRange = { start, end -> updateFlowSelection(start, end) },
+            pageShotBudget = pageShotBudget,
+            onPageShotOutOfMemory = ::onPageShotOutOfMemory,
         ).also { configureFlowView(it, palette) }
         view.onBoundaryPreviewNeeded = ::requestBoundaryPreview
         view.onBoundaryPreviewConfigurationChanged = {
@@ -461,6 +549,10 @@ class EpubReflowEngine private constructor(
         view.canCommitBoundaryTurn = ::canCommitBoundaryPreview
         view.onBoundaryTurnCommitted = ::commitBoundaryPreview
         view.onBoundaryTurnDiscarded = ::discardBoundaryPreview
+        view.onBoundaryPreviewEvicted = { preview -> boundaryPreviewTargets.remove(preview.token) }
+        view.onBoundaryPreviewRequestCancelled = ::cancelBoundaryPreviewRequest
+        view.onPageShotForeground = ::resumePageShotsAfterForeground
+        view.onPageSettled = ::prewarmBoundaryPreviews
         view.onChapterStable = {
             if (flowView === view && flowSpineIndex >= 0) prewarmBoundaryPreviews()
         }
@@ -665,14 +757,21 @@ class EpubReflowEngine private constructor(
 
     private fun prewarmBoundaryPreviews() {
         val view = flowView ?: return
+        if (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) return
         if (_pagingKind.value != PagingKind.PAGED || flowSpineIndex < 0) return
         val sourceGeneration = view.boundaryPreviewGenerationToken()
-        requestBoundaryPreview(forward = false, sourceChapterGeneration = sourceGeneration)
-        requestBoundaryPreview(forward = true, sourceChapterGeneration = sourceGeneration)
+        if (view.shouldPrewarmBoundaryPreview(forward = true)) {
+            requestBoundaryPreview(forward = true, sourceChapterGeneration = sourceGeneration)
+        }
+        if (view.shouldPrewarmBoundaryPreview(forward = false)) {
+            requestBoundaryPreview(forward = false, sourceChapterGeneration = sourceGeneration)
+        }
     }
 
     private fun requestBoundaryPreview(forward: Boolean, sourceChapterGeneration: Long) {
         val view = flowView ?: return
+        val required = view.boundaryPreviewIsRequired(forward)
+        if ((pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) && !required) return
         val book = lazyBook ?: return
         val host = flowHost ?: return
         if (
@@ -683,6 +782,7 @@ class EpubReflowEngine private constructor(
         ) return
         val sourceSpine = flowSpineIndex
         val targetSpine = adjacentSpine(sourceSpine, if (forward) 1 else -1) ?: return
+        if (!view.preparePageShotBudgetForBoundaryPreview(forward, required)) return
         val generation = boundaryPreviewGeneration
         val blocks = book.layoutBlocks().filter {
             paras.getOrNull(it.paragraphIndex)?.spineIndex == targetSpine
@@ -695,14 +795,25 @@ class EpubReflowEngine private constructor(
                 if (boundaryPreviewJobTokens[forward] != requestId) return@post
                 boundaryPreviewJobs.remove(forward)
                 boundaryPreviewJobTokens.remove(forward)
-                if (targetFlow == null) return@post
+                if (targetFlow == null) {
+                    view.releasePageShotBudgetForBoundaryPreview(forward)
+                    return@post
+                }
                 if (
                     generation != boundaryPreviewGeneration ||
                     flowView !== view ||
                     flowHost !== host ||
                     flowSpineIndex != sourceSpine ||
-                    view.boundaryPreviewGenerationToken() != sourceChapterGeneration
-                ) return@post
+                    view.boundaryPreviewGenerationToken() != sourceChapterGeneration ||
+                    !view.boundaryPreviewBudgetAllows(forward) ||
+                    (
+                        (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) &&
+                            !view.boundaryPreviewIsRequired(forward)
+                        )
+                ) {
+                    view.releasePageShotBudgetForBoundaryPreview(forward)
+                    return@post
+                }
                 installBoundaryPreviewRenderer(
                     generation = generation,
                     forward = forward,
@@ -723,9 +834,23 @@ class EpubReflowEngine private constructor(
         targetSpine: Int,
         targetFlow: EpubChapterFlow,
     ) {
-        val host = flowHost ?: return
         val liveView = flowView ?: return
-        if (liveView.width <= 0 || liveView.height <= 0) return
+        val host = flowHost ?: run {
+            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+            return
+        }
+        if (
+            !liveView.boundaryPreviewBudgetAllows(forward) ||
+            (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) &&
+            !liveView.boundaryPreviewIsRequired(forward)
+        ) {
+            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+            return
+        }
+        if (liveView.width <= 0 || liveView.height <= 0) {
+            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+            return
+        }
         boundaryPreviewSessions.remove(forward)?.let(::disposeBoundaryPreviewSession)
         val palette = paletteFor(themeMode, context.resources.configuration)
         val previewView = EpubFlowView(
@@ -733,6 +858,11 @@ class EpubReflowEngine private constructor(
             onTapZone = {},
             onTopOffsetChanged = {},
             onSelectionRange = { _, _ -> },
+            pageShotBudget = pageShotBudget,
+            onPageShotOutOfMemory = ::onPageShotOutOfMemory,
+            onPinnedPageShotAdmissionNeeded = {
+                flowView?.evictSpeculativePageShotsForPinnedAllocation(forward)
+            },
         ).also {
             configureFlowView(it, palette)
             it.animateChapterReveal = false
@@ -777,6 +907,7 @@ class EpubReflowEngine private constructor(
         ) ?: run {
             host.removeView(previewView)
             previewView.dispose()
+            liveView.releasePageShotBudgetForBoundaryPreview(forward)
             return
         }
         val session = BoundaryPreviewRenderSession(
@@ -794,6 +925,7 @@ class EpubReflowEngine private constructor(
                 if (stale?.view === previewView && stale.generation == generation) {
                     boundaryPreviewSessions.remove(forward)
                     disposeBoundaryPreviewSession(stale)
+                    flowView?.releasePageShotBudgetForBoundaryPreview(forward)
                 }
             }
         session.timeoutRunnable = timeout
@@ -807,18 +939,35 @@ class EpubReflowEngine private constructor(
     ) {
         val session = boundaryPreviewSessions[forward] ?: return
         if (session.generation != generation || session.view !== previewView) return
-        val bitmap = previewView.snapshotBoundaryLandingPage(landOnLast = !forward)
+        val bitmap = previewView.snapshotBoundaryLandingPage(
+            landOnLast = !forward,
+            // A speculative renderer may become the user's active wait while its chapter/image is
+            // still settling. Admission priority must follow the live transaction at capture time;
+            // otherwise a stale EVICTABLE snapshot can be rejected at the three-shot ceiling without
+            // invoking owner-aware eviction, leaving the finger/tap waiting until timeout.
+            required = flowView?.boundaryPreviewIsRequired(forward) == true,
+        )
         boundaryPreviewSessions.remove(forward)
         disposeBoundaryPreviewSession(session)
-        if (bitmap == null) return
+        if (bitmap == null) {
+            flowView?.releasePageShotBudgetForBoundaryPreview(forward)
+            return
+        }
         val liveView = flowView
         if (
             generation != boundaryPreviewGeneration ||
             liveView == null ||
             flowSpineIndex != session.sourceSpine ||
-            liveView.boundaryPreviewGenerationToken() != session.sourceChapterGeneration
+            liveView.boundaryPreviewGenerationToken() != session.sourceChapterGeneration ||
+            !liveView.boundaryPreviewBudgetAllows(forward) ||
+            (
+                (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) &&
+                    !liveView.boundaryPreviewIsRequired(forward)
+                )
         ) {
+            pageShotBudget.release(bitmap)
             bitmap.recycle()
+            liveView?.releasePageShotBudgetForBoundaryPreview(forward)
             return
         }
         val token = ++nextBoundaryPreviewToken
@@ -837,7 +986,10 @@ class EpubReflowEngine private constructor(
                 bitmap = bitmap,
             ),
         )
-        if (!accepted) boundaryPreviewTargets.remove(token)
+        if (!accepted) {
+            boundaryPreviewTargets.remove(token)
+            liveView.releasePageShotBudgetForBoundaryPreview(forward)
+        }
     }
 
     private fun commitBoundaryPreview(preview: BoundaryPagePreview) {
@@ -865,9 +1017,36 @@ class EpubReflowEngine private constructor(
         boundaryPreviewTargets.remove(preview.token)
         val view = flowView ?: return
         view.post {
-            if (flowView === view && flowSpineIndex >= 0) {
+            if (
+                flowView === view &&
+                flowSpineIndex >= 0 &&
+                !pageShotSpeculationPaused &&
+                !pageShotBudget.isSpeculativeAdmissionPaused
+            ) {
                 requestBoundaryPreview(preview.forward, view.boundaryPreviewGenerationToken())
             }
+        }
+    }
+
+    private fun cancelBoundaryPreviewRequest(forward: Boolean) {
+        boundaryPreviewJobTokens.remove(forward)
+        boundaryPreviewJobs.remove(forward)?.cancel(true)
+        boundaryPreviewSessions.remove(forward)?.let(::disposeBoundaryPreviewSession)
+        boundaryPreviewTargets.entries.removeAll { (_, target) -> target.forward == forward }
+    }
+
+    private fun trimBoundaryPreviewStatePreservingActiveTurn() {
+        val activeToken = flowView?.activeBoundaryPreviewToken()
+        val activeTarget = activeToken?.let(boundaryPreviewTargets::get)
+        boundaryPreviewGeneration++
+        boundaryPreviewJobs.values.forEach { it.cancel(true) }
+        boundaryPreviewJobs.clear()
+        boundaryPreviewJobTokens.clear()
+        boundaryPreviewSessions.values.toList().forEach(::disposeBoundaryPreviewSession)
+        boundaryPreviewSessions.clear()
+        boundaryPreviewTargets.clear()
+        if (activeToken != null && activeTarget != null) {
+            boundaryPreviewTargets[activeToken] = activeTarget.copy(generation = boundaryPreviewGeneration)
         }
     }
 
@@ -977,6 +1156,7 @@ class EpubReflowEngine private constructor(
         _currentLocator.value = epubLocatorForOffset(paras, paragraphIndex, paraOffset)
         updateChapterInfo(paragraphIndex)
         _pageCount.value = flowView?.pageCount() ?: _pageCount.value
+        prewarmBoundaryPreviews()
     }
 
     private fun updateFlowSelection(start: Int, end: Int) {
@@ -1699,6 +1879,7 @@ class EpubReflowEngine private constructor(
         epubHighlightRanges(paras, paragraphIndex, textAnnotations)
 
     override suspend fun close() {
+        unregisterPageShotMemoryCallbacks()
         invalidateBoundaryPreviewState(clearViewSlots = false)
         flowMainHandler.removeCallbacksAndMessages(null)
         liveFlowImageLoader?.releaseAll()
@@ -2496,6 +2677,7 @@ class EpubReflowEngine private constructor(
         const val INLINE_IMAGE_MAX_HEIGHT_DP = 360
         const val INLINE_IMAGE_VERTICAL_PADDING_DP = 24
         const val BOUNDARY_PREVIEW_TIMEOUT_MS = 10_000L
+        const val DEFAULT_MEMORY_CLASS_MIB = 256
         // Intrinsic-pixel gate for full-page placement. Light-novel illustrations/彩插/covers run
         // ~800px+ on the long side; inline avatars (~142px) and icons (~300-400px) sit well below.
         const val FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX = 600

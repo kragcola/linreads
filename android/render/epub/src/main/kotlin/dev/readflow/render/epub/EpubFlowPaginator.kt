@@ -56,38 +56,87 @@ internal fun epubPaginateFlow(
     val pages = ArrayList<EpubFlowPage>()
     var startLine = 0
     while (startLine < lineCount) {
-        val pageTop = geometry.getLineTop(startLine)
-        val pageBottom = pageTop + pageH
-
-        // 1) Last line whose top is within the viewport.
-        var lastLine = geometry.getLineForVertical(pageBottom - 1).coerceIn(startLine, lineCount - 1)
-        // 2) Back off a line clipped by the page bottom (#1 StaticLayout pagination bug).
-        if (lastLine > startLine && geometry.getLineBottom(lastLine) > pageBottom) {
-            lastLine -= 1
-        }
-        // 3) Oversized-line guard: a single line taller than the page (e.g. full-page image) must
-        //    still occupy one page rather than loop forever.
-        if (lastLine < startLine) lastLine = startLine
-
-        // 4) Fragmentation adjustments — only when there is a following line to push to.
-        if (lastLine < lineCount - 1 && lastLine > startLine) {
-            lastLine = applyFragmentationRules(
-                geometry, startLine, lastLine, lineCount, isHeadingLine, paragraphLineRange,
-            )
-        }
-
-        val endLineExclusive = lastLine + 1
-        pages += EpubFlowPage(
+        val page = epubPageFromStartLine(
+            geometry = geometry,
             startLine = startLine,
-            endLineExclusive = endLineExclusive,
-            startOffset = geometry.getLineStart(startLine),
-            endOffset = geometry.getLineEnd(lastLine),
-            topPx = pageTop,
-            bottomPx = geometry.getLineBottom(lastLine),
-        )
-        startLine = endLineExclusive
+            pageHeightPx = pageH,
+            isHeadingLine = isHeadingLine,
+            paragraphLineRange = paragraphLineRange,
+        ) ?: break
+        pages += page
+        startLine = page.endLineExclusive
     }
     return pages
+}
+
+/**
+ * Builds one complete-line page beginning at [startLine]. This is also the forward-turn primitive
+ * used after an arbitrary FREE_REST viewport: navigation starts after its last fully visible line,
+ * then applies exactly the same bottom fragmentation policy as canonical pagination.
+ */
+internal fun epubPageFromStartLine(
+    geometry: LineGeometry,
+    startLine: Int,
+    pageHeightPx: Int,
+    isHeadingLine: (Int) -> Boolean = { false },
+    paragraphLineRange: (Int) -> IntRange = { it..it },
+): EpubFlowPage? {
+    val lineCount = geometry.lineCount
+    if (lineCount <= 0 || startLine !in 0 until lineCount) return null
+    val pageTop = geometry.getLineTop(startLine)
+    val pageBottom = pageTop + pageHeightPx.coerceAtLeast(1)
+
+    // Last line whose top is in the viewport, minus a bottom-clipped ordinary line.
+    var lastLine = geometry.getLineForVertical(pageBottom - 1).coerceIn(startLine, lineCount - 1)
+    if (lastLine > startLine && geometry.getLineBottom(lastLine) > pageBottom) lastLine--
+
+    // A line taller than the viewport (normally an image/block span) is indivisible.
+    if (lastLine < startLine) lastLine = startLine
+    if (lastLine < lineCount - 1 && lastLine > startLine) {
+        lastLine = applyFragmentationRules(
+            geometry = geometry,
+            startLine = startLine,
+            rawLastLine = lastLine,
+            lineCount = lineCount,
+            isHeadingLine = isHeadingLine,
+            paragraphLineRange = paragraphLineRange,
+        )
+    }
+    return geometry.pageForLineRange(startLine, lastLine + 1)
+}
+
+/**
+ * Builds the previous complete-line page whose fixed lower boundary is [endLineExclusive]. The end
+ * stays fixed so a backward turn from FREE_REST lands immediately before the line intersecting the
+ * old viewport top; the start expands upward only while every selected line fits completely.
+ */
+internal fun epubPageEndingAtLine(
+    geometry: LineGeometry,
+    endLineExclusive: Int,
+    pageHeightPx: Int,
+): EpubFlowPage? {
+    val lineCount = geometry.lineCount
+    if (lineCount <= 0 || endLineExclusive !in 1..lineCount) return null
+    val lastLine = endLineExclusive - 1
+    val fixedBottom = geometry.getLineBottom(lastLine)
+    val pageH = pageHeightPx.coerceAtLeast(1)
+    var startLine = lastLine
+    while (startLine > 0 && fixedBottom - geometry.getLineTop(startLine - 1) <= pageH) {
+        startLine--
+    }
+    return geometry.pageForLineRange(startLine, endLineExclusive)
+}
+
+private fun LineGeometry.pageForLineRange(startLine: Int, endLineExclusive: Int): EpubFlowPage {
+    val lastLine = endLineExclusive - 1
+    return EpubFlowPage(
+        startLine = startLine,
+        endLineExclusive = endLineExclusive,
+        startOffset = getLineStart(startLine),
+        endOffset = getLineEnd(lastLine),
+        topPx = getLineTop(startLine),
+        bottomPx = getLineBottom(lastLine),
+    )
 }
 
 /**

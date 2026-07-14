@@ -62,6 +62,70 @@ class EpubFlowPaginatorTest {
     }
 
     @Test
+    fun `page from an arbitrary start line fills forward and preserves break policy`() {
+        val page = epubPageFromStartLine(
+            geometry = UniformGeometry(lineCount = 8),
+            startLine = 2,
+            pageHeightPx = 30,
+            isHeadingLine = { it == 4 },
+            paragraphLineRange = { line -> if (line == 4) 4..5 else line..line },
+        )
+
+        assertEquals(
+            EpubFlowPage(
+                startLine = 2,
+                endLineExclusive = 4,
+                startOffset = 10,
+                endOffset = 20,
+                topPx = 20,
+                bottomPx = 40,
+            ),
+            page,
+        )
+    }
+
+    @Test
+    fun `page ending at a fixed line takes the earliest complete lines that fit`() {
+        val page = epubPageEndingAtLine(
+            geometry = UniformGeometry(lineCount = 8),
+            endLineExclusive = 6,
+            pageHeightPx = 25,
+        )
+
+        assertEquals(
+            EpubFlowPage(
+                startLine = 4,
+                endLineExclusive = 6,
+                startOffset = 20,
+                endOffset = 30,
+                topPx = 40,
+                bottomPx = 60,
+            ),
+            page,
+        )
+    }
+
+    @Test
+    fun `measured vertical padding is excluded before computing full line page bounds`() {
+        val measuredViewportHeight = 45
+        val measuredPaddingTop = 7
+        val measuredPaddingBottom = 8
+        val measuredContentHeight = measuredViewportHeight - measuredPaddingTop - measuredPaddingBottom
+
+        val pages = epubPaginateFlow(
+            geometry = UniformGeometry(lineCount = 7),
+            pageHeightPx = measuredContentHeight,
+        )
+
+        assertEquals("three complete 10px lines fit inside the measured 30px content band", 3, pages[0].endLineExclusive)
+        assertEquals(3, pages[1].startLine)
+        assertTrue(
+            "every ordinary page must stay inside the measured content band",
+            pages.all { page -> page.bottomPx - page.topPx <= measuredContentHeight },
+        )
+    }
+
+    @Test
     fun `oversized image line still occupies its own page`() {
         // line1 is 100px tall, page is 30px. It cannot fit but must not loop forever.
         val pages = epubPaginateFlow(VariableGeometry(intArrayOf(10, 100, 10)), pageHeightPx = 30)

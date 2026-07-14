@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-07-14
+
+### Android EPUB A1 page-shot budget and owner hardening
+- 决策：按用户选择执行 A1，所有翻页 page-shot 保持 `ARGB_8888`；low-RAM/内存压力只减少或关闭预热，不引入 RGB_565 画质降级。normal budget 为 `min(memoryClass / 8, 48 MiB)`，low-RAM 为 `min(memoryClass / 10, 24 MiB)`
+- 预算：新增 session 级 `PageShotBudget`，分配前 reservation、commit 后按 `allocationByteCount` 计费；live 与 hidden boundary renderer 共用同一 owner。PINNED active 帧可以越软字节预算，确保“一张软预算”仍能形成两工作帧并跟手动画；所有 lease/reservation 合计最多三个 distinct identity，第四张先触发 owner-aware speculative eviction，再决定拒绝
+- owner/lifecycle：boundary preview 在 outgoing/conversion allocation 前即标记 active，失败先撤 active 再恢复原 token；continuity cover 存在时 cold handoff 提前逐出 inactive boundary，峰值保持 cover+target+front 三张。interactive settle 原位重标 front/target identity；无 drawable settle 清理旧 `curlOrigin/curlTargetWindow`；waiting start 失败退出 view waiting 但保留可重试 token
+- 跨章：已经运行的 speculative hidden renderer 不再固化旧 `required=false`，capture 时动态读取 live waiting 状态；三槽满时转 PINNED admission，先逐出 live speculative owners并在同次 allocation 重试，避免边界等待到 3 秒超时。background trim 可恢复，OOM/severe pressure 保持 session backoff，active boundary token/方向与 continuity cover 不被误删
+- RED/GREEN：覆盖 warmed interactive identity rotation、one-shot soft budget active pair、active boundary owner、waiting retry、no-drawable lifecycle、第四 identity ceiling、continuity cover 四帧峰值与 speculative-session→required promotion。完整 EPUB 强制重跑 441 tests / 0 failures / 0 errors / 2 skipped；Reader 83/83、Animate 13/13、EPUB lint 0 errors、AndroidTest compile、debug APK assemble 的 434-task 门通过
+- AVD：安装 debug/test APK 到 Android 16 `readflow_test(AVD)`，短章节边界点击、跨章 continuity cover、cold handoff 分帧同手势续接三条 runtime 为 `OK (3 tests)` / `41.85s`；清空后 logcat 对 crash/ANR/OOM/recycled bitmap/AssertionError 无匹配。该证据不是物理设备
+- 复审/状态：owner replacement 与 completion code review 均无 Critical/Important；`git diff --check` clean。保留一个无 production caller 的 test-facing 裸 Bitmap lease API Minor，后续可收窄或增加 budget-aware release。当前未提交、未推送、未发布 OTA；HarmonyOS/Web N/A（本轮为 Android EPUB renderer 内存与动画 owner 修复）
+
+---
+
+## 2026-07-13
+
+### Android EPUB FREE_REST pagination and full-line clipping
+- 范围：只修改 Android EPUB flow paginator/view、对应 JVM/AndroidTest 与连续性文档；不改 HarmonyOS/Web，不触碰工作树中的服务器/Minecraft 未跟踪文件。用户暂不做物理设备验证，本批未提交、未推送、未发布 OTA
+- 手感：分页模式中区临时滚动从手写无惯性位移改为原生 fling；慢速松手停在精确 viewport，快速松手保留惯性，均不立即吸附。下一次翻页才进入 `ALIGN_AND_TURN`，以前后动态完整行窗口决定目标，状态链为 `ALIGNED -> DRAGGING_FREE -> FLING_FREE -> FREE_REST -> ALIGN_AND_TURN`
+- 裁切：live draw、page snapshot、texture key 与 active window 统一按 TextView padding 计算上下边界；普通文本页不再显示半行。oversized image/block 作为不可分割例外使用 pixel slice；尾页目标超过 canonical last top 时扩展真实 scroll extent，使原始完整行顶可达
+- 事务与生命周期：取消翻页恢复事务开始时的精确 viewport，提交结束后才发布 locator；模式切换、换章、resize 与显式导航在 interrupted fling 后统一 rebase，旧 scroller 不再覆盖新目标。`DRAGGING_FREE` 延迟 async reflow；dispose、layout/reflow/resize/precache 与 locator 发布均由 generation/disposed gate 隔离
+- 性能：新增带 layout generation/章节/宽高/行数/page height 校验的 `PageLayoutMetadata`；段落区间和页表改为二分查找，已排队 precache 时在计算动态窗口前退出。512 segments / 341 pages 的 warmed 回归从旧 `2061/2379` 次访问降到复杂度门内，不再整章线性扫描
+- RED/GREEN：动态尾页旧值 `targetTop=2765` 被截到 `2730`；拖动中 reflow 把 `scrollY 159 -> 105`；dispose 动画错误发布 locator `[60]`；oversized live/snapshot 底部相差 `11px`；warmed 页表访问超门。五项均由确定性回归锁住并转 GREEN
+- 最终证据：EPUB 强制重跑 397 tests / 0 failures / 0 errors / 2 skipped；Reader/Animate tests、EPUB lint、AndroidTest compile、debug APK 联合 434 actionable tasks 通过；Android 16 AVD 两条 FREE_REST runtime 的 terminal checkpoint 为 `OK (2 tests)` / `24.387s`，live TestRunner log 佐证两用例完成且 critical 签名为 0；`git diff --check` clean；fixes-only 独立复核无 actionable P0-P3
+- cold-cache 方案 B：用户已选择分帧 page-shot + ready 后续接当前手势。foreground target/front 与后台 front/target/previous 每帧最多一张；request/token 阻止迟到 callback 操作 replacement owner，完整 staged pair 按 identity 转交，partial 在 fallback draw 前回收。held/released settle、视觉 invalidator、goTo/mode/resize/chapter/dispose 与 boundary pre-clear 已统一 locator/bitmap ownership；确定性 RED→GREEN 与最终独立复审无 P0-P2
+- 当日待决策项已于 2026-07-14 选择并实现 A1：统一 byte budget + 三 identity 硬上限 + 低内存关闭预热，保持 ARGB_8888；bitmap pool 继续不作为独立解法
+
+---
+
 ## 2026-07-10
 
 ### Android full audit hardening and release review

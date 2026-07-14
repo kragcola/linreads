@@ -40,7 +40,7 @@ import java.util.concurrent.TimeUnit
 class EpubFlowViewTest {
 
     @Test
-    fun `page turn from temporary scroll starts at nearest canonical page anchor`() {
+    fun `next page from free rest starts with the first line not fully visible in the viewport`() {
         val view = pagedFlowView()
         assertTrue(
             "pageCount=${view.pageCount()} textView=${view.textView.width}x${view.textView.height} " +
@@ -49,33 +49,69 @@ class EpubFlowViewTest {
         )
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
-        requireNotNull(view.pageTopPxAt(3))
-        val nearPageTwo = pageOneTop + ((pageTwoTop - pageOneTop) * 3 / 4)
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.75f)
 
-        view.scrollTo(0, nearPageTwo)
+        view.scrollTo(0, freeRest)
+        val before = fullLineRangeInViewport(view)
 
-        view.goToAdjacentPage(1)
+        assertTrue(view.goToAdjacentPage(1))
+        val after = fullLineRangeInViewport(view)
 
-        assertEquals(3, view.currentPageIndex())
-        assertEquals(view.pageTopPxAt(3), view.scrollY)
+        assertEquals(
+            "forward turn must neither repeat nor skip a full line from the free-rest viewport",
+            before.last + 1,
+            after.first,
+        )
+        assertEquals(
+            "the turned page must settle on its first complete line top",
+            requireNotNull(view.textView.layout).getLineTop(after.first),
+            view.scrollY,
+        )
     }
 
     @Test
-    fun `cancelled interactive turn restores normalized from page anchor`() {
+    fun `previous page from padded free rest ends before the line intersecting the painted top edge`() {
+        val view = pagedFlowView(textPaddingTop = 12, textPaddingBottom = 9)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.75f)
+
+        view.scrollTo(0, freeRest)
+        val layout = requireNotNull(view.textView.layout)
+        val viewportTopInLayout = (view.scrollY - view.textView.paddingTop).coerceAtLeast(0)
+        val topIntersectingLine = layout.getLineForVertical(viewportTopInLayout)
+        assertTrue(
+            "test requires a painted line cut by FREE_REST's visual top edge",
+            layout.getLineTop(topIntersectingLine) < viewportTopInLayout,
+        )
+
+        assertTrue(view.goToAdjacentPage(-1))
+        val after = fullLineRangeInViewport(view)
+
+        assertEquals(
+            "backward turn must end immediately before the line intersecting FREE_REST's top edge",
+            topIntersectingLine - 1,
+            after.last,
+        )
+    }
+
+    @Test
+    fun `cancelled interactive turn restores the exact free rest viewport`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
-        val nearPageTwo = pageOneTop + ((pageTwoTop - pageOneTop) * 3 / 4)
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.75f)
 
-        view.scrollTo(0, nearPageTwo)
+        view.scrollTo(0, freeRest)
 
         assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
         view.updateInteractiveCurl(x = view.width * 0.75f)
         view.endInteractiveCurl(velocityX = 0f)
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
 
-        assertEquals(2, view.currentPageIndex())
-        assertEquals(pageTwoTop, view.scrollY)
+        assertEquals("a cancelled turn must restore the viewport that was under the finger", freeRest, view.scrollY)
     }
 
     @Test
@@ -101,26 +137,30 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `committed interactive turn lands on adjacent page from normalized anchor`() {
+    fun `committed interactive turn continues after the last full line at free rest`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
-        val pageThreeTop = requireNotNull(view.pageTopPxAt(3))
-        val nearPageTwo = pageOneTop + ((pageTwoTop - pageOneTop) * 3 / 4)
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.75f)
 
-        view.scrollTo(0, nearPageTwo)
+        view.scrollTo(0, freeRest)
+        val before = fullLineRangeInViewport(view)
 
         assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
         view.updateInteractiveCurl(x = view.width * 0.25f)
         view.endInteractiveCurl(velocityX = 0f)
+        val after = fullLineRangeInViewport(view)
 
-        assertEquals(3, view.currentPageIndex())
-        assertEquals(pageThreeTop, view.scrollY)
+        assertEquals(
+            "interactive commit must reveal the first line after the outgoing viewport's last full line",
+            before.last + 1,
+            after.first,
+        )
     }
 
     @Test
-    fun `clearing previews during committed interactive settle publishes the parked target once`() {
+    fun `clearing boundary previews lets a committed local settle finish naturally`() {
         val reportedOffsets = mutableListOf<Int>()
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SLIDE,
@@ -137,12 +177,86 @@ class EpubFlowViewTest {
         assertTrue("the committed gesture must park an adjacent target", targetPage > 0)
         assertTrue("the target stays silent until settle", reportedOffsets.isEmpty())
 
+        val animator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertTrue("fixture needs a running local settle", animator.isRunning)
         view.clearBoundaryPreviews()
-        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue("clearing boundary-owned previews must not cancel a local settle", animator.isRunning)
+        assertEquals("SOFTWARE_SETTLING", view.privateField("interactiveTurnState").toString())
+        assertNotNull("the local overlay must remain until its own settle ends", view.privateField("slideDrawable"))
+        assertTrue("preview invalidation must not publish the local target early", reportedOffsets.isEmpty())
+
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
 
         assertEquals(targetPage, view.currentPageIndex())
         assertEquals(listOf(targetOffset), reportedOffsets)
         assertNull(view.privateField("slideDrawable"))
+    }
+
+    @Test
+    fun `boundary clear followed by external navigation publishes only the external locator`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        reportedOffsets.clear()
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        view.updateInteractiveCurl(x = view.width * 0.25f)
+        view.endInteractiveCurl(velocityX = 0f)
+
+        val parkedTargetOffset = view.topLayoutOffset()
+        val oldAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertTrue("fixture needs a silently parked local commit", oldAnimator.isRunning && reportedOffsets.isEmpty())
+
+        view.clearBoundaryPreviews()
+        view.goToPage(2)
+        val externalOffset = view.topLayoutOffset()
+
+        assertTrue("the external destination must differ from the silently parked local target", externalOffset != parkedTargetOffset)
+        assertTrue(
+            "clearBoundaryPreviews must not publish before external navigation takes ownership; " +
+                "parked=$parkedTargetOffset external=$externalOffset reports=$reportedOffsets",
+            reportedOffsets == listOf(externalOffset),
+        )
+        assertFalse("external navigation must synchronously retire the old animator", oldAnimator.isRunning)
+        assertNull("external navigation must synchronously clear the old slide", view.privateField("slideDrawable"))
+        assertNull("external navigation must synchronously clear the old origin", view.privateField("curlOrigin"))
+        assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+        assertEquals("late settle work must not publish another locator", listOf(externalOffset), reportedOffsets)
+        assertEquals(2, view.currentPageIndex())
+    }
+
+    @Test
+    fun `dispose cancelling a committed interactive settle publishes no locator`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        reportedOffsets.clear()
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        view.updateInteractiveCurl(x = 0f)
+        view.endInteractiveCurl(velocityX = 0f)
+        val parkedPage = view.currentPageIndex()
+        val animator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertTrue("fixture needs a committed target parked under a running settle", parkedPage > 0 && animator.isRunning)
+        assertTrue("the committed target must stay silent before settle", reportedOffsets.isEmpty())
+        val reportsBeforeDispose = reportedOffsets.toList()
+
+        view.dispose()
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+        assertEquals(
+            "dispose-driven animator cancellation must not publish the parked target locator",
+            reportsBeforeDispose,
+            reportedOffsets,
+        )
     }
 
     @Test
@@ -229,6 +343,82 @@ class EpubFlowViewTest {
                 background.boundsTops,
             background.boundsTops.isEmpty(),
         )
+    }
+
+    @Test
+    fun `committed warmed turn rekeys existing page shot identities into the next cache`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.preCachePageTexturesForTest()
+        val oldFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+        val oldRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+
+        assertTrue(view.goToAdjacentPage(1))
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+        val newFront = view.privateField("cachedFrontBitmap") as Bitmap?
+        val newForward = view.privateField("cachedRevealedBitmap") as Bitmap?
+        val newBackward = view.privateField("cachedBackwardBitmap") as Bitmap?
+        assertTrue(
+            "commit must rekey the revealed frame as current and retain the old current as a neighbor; " +
+                "oldFront=$oldFront recycled=${oldFront.isRecycled} " +
+                "oldRevealed=$oldRevealed recycled=${oldRevealed.isRecycled} " +
+                "new=[$newBackward,$newFront,$newForward]",
+            newFront === oldRevealed &&
+                !oldRevealed.isRecycled &&
+                !oldFront.isRecycled &&
+                (newBackward === oldFront || newForward === oldFront),
+        )
+    }
+
+    @Test
+    fun `committed warmed interactive turn rekeys active identities into the next cache`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.preCachePageTexturesForTest()
+        val oldFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+        val oldRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        val activeSlide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+        assertTrue(activeSlide.privateBitmap("frontBitmap") === oldFront)
+        assertTrue(activeSlide.privateBitmap("revealedBitmap") === oldRevealed)
+        view.updateInteractiveCurl(x = view.width * 0.10f)
+        view.endInteractiveCurl(velocityX = 0f)
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+        val newFront = view.privateField("cachedFrontBitmap") as Bitmap?
+        val newBackward = view.privateField("cachedBackwardBitmap") as Bitmap?
+        assertTrue(
+            "interactive commit must transfer the revealed identity into current and the old front " +
+                "into the backward neighbor without recycling or replacing either; " +
+                "oldFront=$oldFront recycled=${oldFront.isRecycled} " +
+                "oldRevealed=$oldRevealed recycled=${oldRevealed.isRecycled} " +
+                "newBackward=$newBackward newFront=$newFront",
+            newFront === oldRevealed &&
+                newBackward === oldFront &&
+                !oldRevealed.isRecycled &&
+                !oldFront.isRecycled,
+        )
+    }
+
+    @Test
+    fun `settle without an active drawable clears stale local lifecycle anchors`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        val detachedSlide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+        assertNotNull("fixture requires an active local origin", view.privateField("curlOrigin"))
+        assertNotNull("fixture requires an active local target window", view.privateField("curlTargetWindow"))
+        view.overlay.remove(detachedSlide)
+        detachedSlide.recycle()
+        view.setPrivateField("slideDrawable", null)
+
+        view.endInteractiveCurl(velocityX = 0f)
+
+        assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+        assertNull("a no-drawable settle must retire the stale local target window", view.privateField("curlTargetWindow"))
+        assertNull("a no-drawable settle must retire the matching origin", view.privateField("curlOrigin"))
+        view.dispose()
     }
 
     @Test
@@ -452,6 +642,89 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `warmed discrete boundary turn transfers outgoing identity without viewport recapture`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        view.goToLastPage()
+        val background = RecordingBoundsTopDrawable()
+        view.background = background
+        view.preCachePageTexturesForTest()
+        val warmedOutgoing = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+        val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+        val leasedBeforeTurn = budget.leasedBytes
+        background.boundsTops.clear()
+        view.offerReadyBoundaryPreviewForTest(forward = true, token = 51L)
+
+        try {
+            assertTrue(view.startDiscreteBoundaryTurn(1))
+
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            assertTrue(
+                "a warmed boundary tap must transfer the existing current-page owner by identity",
+                slide.privateBitmap("frontBitmap") === warmedOutgoing,
+            )
+            assertTrue(
+                "the warmed discrete path must not call snapshotViewport or draw the live page again: " +
+                    background.boundsTops,
+                background.boundsTops.isEmpty(),
+            )
+            assertTrue(
+                "taking the warmed outgoing owner must not add another page-shot lease: " +
+                    "before=$leasedBeforeTurn after=${budget.leasedBytes}",
+                budget.leasedBytes <= leasedBeforeTurn,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `page shot trim clears stable and inactive owners but preserves continuity cover`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        view.goToPage(1)
+        view.preCachePageTexturesForTest()
+        val continuityCover = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+        val inactiveBoundary = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+        view.detachCachedTextureOwnerForTest(continuityCover)
+        view.detachCachedTextureOwnerForTest(inactiveBoundary)
+        val stableShots = listOfNotNull(
+            view.privateField("cachedFrontBitmap") as Bitmap?,
+            view.privateField("cachedRevealedBitmap") as Bitmap?,
+            view.privateField("cachedBackwardBitmap") as Bitmap?,
+        )
+        assertTrue("fixture requires one remaining stable local page-shot owner", stableShots.isNotEmpty())
+        val preview = view.newBoundaryPreviewForTest(
+            forward = true,
+            token = 52L,
+            bitmapOverride = inactiveBoundary,
+        )
+        assertTrue(view.offerBoundaryPreviewForTest(preview))
+        view.showConversionSnapshotForTest(continuityCover)
+        val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+
+        try {
+            view.pausePageShotSpeculationAndTrim()
+            budget.evictEvictable().forEach { identity ->
+                (identity as? Bitmap)?.let { if (!it.isRecycled) it.recycle() }
+            }
+
+            assertNull(view.privateField("cachedFrontBitmap"))
+            assertNull(view.privateField("cachedRevealedBitmap"))
+            assertNull(view.privateField("cachedBackwardBitmap"))
+            assertTrue("trim must recycle every stable local owner", stableShots.all(Bitmap::isRecycled))
+            assertNull("trim must clear the inactive boundary slot", view.privateField("forwardBoundaryPreview"))
+            assertTrue("trim must recycle the inactive boundary frame", inactiveBoundary.isRecycled)
+            val installedCover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+            assertTrue(
+                "the visible continuity owner must remain the exact pinned bitmap",
+                installedCover.privateBitmap("bitmap") === continuityCover,
+            )
+            assertFalse("the visible continuity owner must survive speculative eviction", continuityCover.isRecycled)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `discrete simulation boundary uses local paper renderer and transfers target once`() {
         val commits = mutableListOf<Any>()
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
@@ -649,59 +922,109 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `cancelled discrete paper turn restores normalized from page anchor`() {
+    fun `width resize and highlight refresh invalidate warmed local texture owners`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        view.preCachePageTexturesForTest()
+        val originalFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+        val originalTarget = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+        val originalFrontKey = checkNotNull(view.privateField("cachedFromTextureKey"))
+        val originalTargetKey = checkNotNull(view.privateField("cachedTargetTextureKey"))
+
+        view.measure(exactly(420), exactly(120))
+        view.layout(0, 0, 420, 120)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.preCachePageTexturesForTest()
+
+        val resizedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+        val resizedTarget = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+        val resizedFrontKey = checkNotNull(view.privateField("cachedFromTextureKey"))
+        val resizedTargetKey = checkNotNull(view.privateField("cachedTargetTextureKey"))
+        assertTrue("width-only resize must recycle the old front texture", originalFront.isRecycled)
+        assertTrue("width-only resize must recycle the old target texture", originalTarget.isRecycled)
+        assertTrue("width-only resize must allocate a new front texture owner", resizedFront !== originalFront)
+        assertTrue("width-only resize must allocate a new target texture owner", resizedTarget !== originalTarget)
+        assertTrue("width-only resize must not preserve the old front key", resizedFrontKey != originalFrontKey)
+        assertTrue("width-only resize must not preserve the old target key", resizedTargetKey != originalTargetKey)
+
+        view.refreshHighlights(emptyList())
+
+        assertTrue("highlight refresh must recycle the current front texture", resizedFront.isRecycled)
+        assertTrue("highlight refresh must recycle the current target texture", resizedTarget.isRecycled)
+        assertNull("highlight refresh must clear the current front key", view.privateField("cachedFromTextureKey"))
+        assertNull("highlight refresh must clear the current target key", view.privateField("cachedTargetTextureKey"))
+        view.preCachePageTexturesForTest()
+        assertTrue(
+            "highlight refresh must rebuild a new front bitmap before the next local turn",
+            checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) !== resizedFront,
+        )
+        assertTrue(
+            "highlight refresh must rebuild a new target bitmap before the next local turn",
+            checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) !== resizedTarget,
+        )
+    }
+
+    @Test
+    fun `cancelled discrete paper turn restores the exact free rest viewport`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
-        val nearPageTwo = pageOneTop + ((pageTwoTop - pageOneTop) * 3 / 4)
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.75f)
 
-        view.scrollTo(0, nearPageTwo)
+        view.scrollTo(0, freeRest)
 
         assertTrue(view.goToAdjacentPage(1))
         (view.privateField("flipAnimator") as android.animation.ValueAnimator).cancel()
 
-        assertEquals(2, view.currentPageIndex())
-        assertEquals(pageTwoTop, view.scrollY)
+        assertEquals("cancel must restore the original free-rest pixels", freeRest, view.scrollY)
     }
 
     @Test
-    fun `committed discrete paper turn lands on adjacent page from normalized anchor`() {
+    fun `committed discrete paper turn continues after the last full line at free rest`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
-        val pageThreeTop = requireNotNull(view.pageTopPxAt(3))
-        val nearPageTwo = pageOneTop + ((pageTwoTop - pageOneTop) * 3 / 4)
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.75f)
 
-        view.scrollTo(0, nearPageTwo)
+        view.scrollTo(0, freeRest)
+        val before = fullLineRangeInViewport(view)
 
         assertTrue(view.goToAdjacentPage(1))
         shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+        val after = fullLineRangeInViewport(view)
 
-        assertEquals(3, view.currentPageIndex())
-        assertEquals(pageThreeTop, view.scrollY)
+        assertEquals(
+            "discrete commit must reveal the first line after the outgoing viewport's last full line",
+            before.last + 1,
+            after.first,
+        )
     }
 
     @Test
-    fun `discrete paper turn snapshots clamped final page at canonical visual top`() {
+    fun `discrete paper turn reaches and snapshots the final page raw line top`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
-        val maxScroll = (view.getChildAt(0).height - view.height).coerceAtLeast(0)
-        val target = (0 until view.pageCount()).firstOrNull { index ->
-            requireNotNull(view.pageTopPxAt(index)) > maxScroll
-        } ?: error("test requires a short final page whose raw top exceeds maxScroll=$maxScroll")
-        assertTrue("test target must have a previous page", target > 0)
+        val target = view.pageCount() - 1
         val rawTargetTop = requireNotNull(view.pageTopPxAt(target))
+        val naturalMaxScroll = (view.textView.height - view.height).coerceAtLeast(0)
+        assertTrue(
+            "test requires tail extent beyond the chapter's natural max scroll",
+            rawTargetTop > naturalMaxScroll,
+        )
         val from = target - 1
         view.goToPage(from)
         val fromVisualTop = view.scrollY
 
         assertEquals(fromVisualTop, view.textureTopPxForPageForTest(from))
-        assertEquals(maxScroll, view.textureTopPxForPageForTest(target))
-        assertTrue(rawTargetTop != view.textureTopPxForPageForTest(target))
+        assertEquals(
+            "tail extent must make the last paginator line-top a real scroll and texture coordinate",
+            rawTargetTop,
+            view.textureTopPxForPageForTest(target),
+        )
 
         assertTrue(view.goToAdjacentPage(1))
+        assertEquals("the live final page must park on its raw line top", rawTargetTop, view.scrollY)
 
         val paper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?)
         assertEquals(view.width, paper.privateBitmap("frontBitmap").width)
@@ -709,29 +1032,130 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `page turn snapshots use the same padding clip as paged rendering`() {
-        val view = pagedFlowView(textPaddingTop = 12)
+    fun `settled live and snapshot pages share measured padding aware full line bounds`() {
+        val view = pagedFlowView(textPaddingTop = 12, textPaddingBottom = 9)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
         val layout = requireNotNull(view.textView.layout)
-        val topLine = layout.getLineForVertical(pageOneTop)
-        assertEquals("test must use a canonical line-top page", pageOneTop, layout.getLineTop(topLine))
-
-        val pageBottom = pageOneTop + view.height
-        var bottomLine = layout.getLineForVertical(pageBottom - 1)
-        if (bottomLine > 0 && layout.getLineBottom(bottomLine) > pageBottom) bottomLine--
-        val unpaddedClipBottom = (layout.getLineBottom(bottomLine) - pageOneTop).coerceIn(0, view.height)
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.40f)
+        view.scrollTo(0, freeRest)
+        view.setPrivateField("pageClipActive", true)
+        val fullLines = fullLineRangeInViewport(view)
+        val expectedTop = layout.getLineTop(fullLines.first) + view.textView.paddingTop
+        val expectedBottom = layout.getLineBottom(fullLines.last) + view.textView.paddingTop
 
         assertEquals(
-            "snapshot top clip must drop the same padding strip as dispatchDraw",
-            pageOneTop + view.textView.paddingTop,
-            view.snapshotClipTopForTest(pageOneTop),
+            "settled live rendering must exclude the partial line above the padded content band",
+            expectedTop,
+            view.pageClipTopForTest(),
         )
         assertEquals(
-            "snapshot bottom clip must include TextView padding just like dispatchDraw",
-            minOf(pageOneTop + unpaddedClipBottom + view.textView.paddingTop, pageOneTop + view.height),
-            view.snapshotClipBottomForTest(pageOneTop),
+            "snapshot top must use the same first complete line as live rendering",
+            expectedTop,
+            view.snapshotClipTopForTest(freeRest),
         )
+        assertEquals(
+            "settled live rendering must stop at the last line above measured bottom padding",
+            expectedBottom,
+            freeRest + requireNotNull(view.pageClipBottomForTest()) + view.textView.paddingTop,
+        )
+        assertEquals(
+            "snapshot bottom must use the same last complete line as live rendering",
+            expectedBottom,
+            view.snapshotClipBottomForTest(freeRest),
+        )
+    }
+
+    @Test
+    fun `padding aware free rest top keeps a line whose painted top is below the viewport edge`() {
+        val view = pagedFlowView(textPaddingTop = 12, textPaddingBottom = 9)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val layout = requireNotNull(view.textView.layout)
+        val line = layout.getLineForVertical(requireNotNull(view.pageTopPxAt(1)))
+        val lineTop = layout.getLineTop(line)
+        val paintedLineTop = lineTop + view.textView.paddingTop
+        val freeRest = lineTop + view.textView.paddingTop / 2
+        assertTrue(
+            "the selected line must be fully visible because TextView paints it below FREE_REST's top edge",
+            paintedLineTop >= freeRest,
+        )
+
+        view.scrollTo(0, freeRest)
+        view.setPrivateField("pageClipActive", true)
+
+        assertEquals(
+            "live clipping must keep the first line whose painted top is inside the viewport",
+            paintedLineTop,
+            view.pageClipTopForTest(),
+        )
+        assertEquals(
+            "snapshot clipping must keep the same fully visible line as live rendering",
+            paintedLineTop,
+            view.snapshotClipTopForTest(freeRest),
+        )
+    }
+
+    @Test
+    fun `aligned page with padding taller than a line clips exactly at its window painted top`() {
+        val view = pagedFlowView(textPaddingTop = 48)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val layout = requireNotNull(view.textView.layout)
+        val firstLineHeight = layout.getLineBottom(0) - layout.getLineTop(0)
+        assertTrue("test requires top padding taller than one line", view.textView.paddingTop > firstLineHeight)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+
+        view.goToPage(1)
+
+        val activeWindow = checkNotNull(view.privateField("activePageWindow") as EpubFlowPage?)
+        assertEquals("test must park the aligned window at page one", pageOneTop, activeWindow.topPx)
+        val expectedPaintedTop = activeWindow.topPx + view.textView.paddingTop
+        assertEquals(
+            "aligned live clipping must never expose an earlier complete line through oversized top padding",
+            expectedPaintedTop,
+            view.pageClipTopForTest(),
+        )
+        assertEquals(
+            "aligned snapshot clipping must start at the exact same painted window top",
+            expectedPaintedTop,
+            view.snapshotClipTopForTest(activeWindow.topPx),
+        )
+    }
+
+    @Test
+    fun `free rest locator starts at the first fully visible painted line`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            onTopOffsetChanged = reportedOffsets::add,
+            textPaddingTop = 12,
+            textPaddingBottom = 9,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val freeRest = ((pageOneTop + 1) until pageTwoTop).first { y ->
+            val viewportTopInLayout = (y - view.textView.paddingTop).coerceAtLeast(0)
+            val intersectingLine = layout.getLineForVertical(viewportTopInLayout)
+            val firstFullLine = (intersectingLine + 1).coerceAtMost(layout.lineCount - 1)
+            layout.getLineTop(intersectingLine) < viewportTopInLayout &&
+                layout.getLineForVertical(y) != firstFullLine
+        }
+        val viewportTopInLayout = (freeRest - view.textView.paddingTop).coerceAtLeast(0)
+        val intersectingLine = layout.getLineForVertical(viewportTopInLayout)
+        val firstFullLine = (intersectingLine + 1).coerceAtMost(layout.lineCount - 1)
+        val expectedOffset = layout.getLineStart(firstFullLine)
+
+        view.scrollTo(0, freeRest)
+        reportedOffsets.clear()
+        view.settleTemporaryScrollAnchorForTest()
+
+        assertEquals(
+            "FREE_REST locator must match the same first complete line selected by the painted top clip",
+            expectedOffset,
+            view.topLayoutOffset(),
+        )
+        assertEquals("FREE_REST release must publish that complete-line locator", listOf(expectedOffset), reportedOffsets)
     }
 
     @Test
@@ -990,6 +1414,1434 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `one shot soft budget still admits an interactive working pair`() {
+        val oneShotBytes = 360L * 120L * 4L
+        val budget = PageShotBudget(oneShotBytes)
+        var pinnedAdmissionRequests = 0
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            pageShotBudget = budget,
+            onPinnedPageShotAdmissionNeeded = { pinnedAdmissionRequests += 1 },
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+
+        try {
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val front = slide.privateBitmap("frontBitmap")
+            val revealed = slide.privateBitmap("revealedBitmap")
+            assertTrue("the active working frames must have distinct owners", front !== revealed)
+            assertFalse("the outgoing working frame must remain live", front.isRecycled)
+            assertFalse("the target working frame must remain live", revealed.isRecycled)
+            assertEquals(
+                "a one-shot soft limit may be exceeded only by the two pinned working frames",
+                oneShotBytes * 2L,
+                budget.leasedBytes,
+            )
+            assertEquals(
+                "the second working frame must exercise over-cap pinned admission",
+                1,
+                pinnedAdmissionRequests,
+            )
+
+            view.updateInteractiveCurl(x = view.width * 0.25f)
+            assertEquals(
+                "the admitted pair must remain finger-animatable",
+                0.75f,
+                slide.progress,
+                0.001f,
+            )
+        } finally {
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `active boundary preview survives pinned outgoing admission eviction`() {
+        val budget = PageShotBudget(1L)
+        val cancelledDirections = mutableListOf<Boolean>()
+        val evictedPreviews = mutableListOf<BoundaryPagePreview>()
+        var pinnedAdmissionRequests = 0
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            pageShotBudget = budget,
+            onPinnedPageShotAdmissionNeeded = { pinnedAdmissionRequests += 1 },
+        ).apply {
+            onBoundaryPreviewRequestCancelled = cancelledDirections::add
+            onBoundaryPreviewEvicted = evictedPreviews::add
+        }
+        view.goToLastPage()
+        assertTrue(view.preparePageShotBudgetForBoundaryPreview(forward = true, required = true))
+        val target = view.offerReadyBoundaryPreviewForTest(forward = true, token = 53L)
+
+        try {
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val active = checkNotNull(view.privateField("activeBoundaryPreview") as BoundaryPagePreview?)
+            assertTrue("the boundary turn must retain the offered target owner", active.bitmap === target)
+            assertFalse("the active boundary target must remain live", target.isRecycled)
+            assertEquals("the outgoing shot must force owner-aware pinned admission", 1, pinnedAdmissionRequests)
+            assertTrue(
+                "pinned outgoing admission must preserve the direction already owned by the active target; " +
+                    "cancelled=$cancelledDirections evicted=${evictedPreviews.map(BoundaryPagePreview::token)} " +
+                    "budgetDirection=${view.privateField("boundaryPreviewBudgetDirection")}",
+                cancelledDirections.isEmpty() &&
+                    evictedPreviews.isEmpty() &&
+                    view.privateField("boundaryPreviewBudgetDirection") == true,
+            )
+        } finally {
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `deferred local pair evicts inactive boundary before a fourth shot while cover stays visible`() {
+        val shotBytes = 360L * 120L * 4L
+        val budget = PageShotBudget(shotBytes * 3L)
+        val evictedTokens = mutableListOf<Long>()
+        val chargedSamples = mutableListOf<Long>()
+        var coverAliveWhenBoundaryEvicted = false
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            pageShotBudget = budget,
+        )
+        view.goToPage(1)
+        view.recycleCachedTexturesForTest()
+        val cover = requireNotNull(view.snapshotPageAt(view.scrollY))
+        view.showConversionSnapshotForTest(cover)
+        val inactiveBoundaryBitmap = requireNotNull(view.snapshotPageAt(view.scrollY))
+        val inactiveBoundary = BoundaryPagePreview(
+            token = 55L,
+            forward = true,
+            sourceChapterGeneration = view.boundaryPreviewGenerationToken(),
+            bitmap = inactiveBoundaryBitmap,
+        )
+        view.onBoundaryPreviewEvicted = { preview ->
+            evictedTokens += preview.token
+            chargedSamples += budget.chargedBytes
+            val installedCover = view.privateField("conversionSnapshotDrawable")
+            coverAliveWhenBoundaryEvicted =
+                installedCover != null &&
+                installedCover.privateBitmap("bitmap") === cover &&
+                !cover.isRecycled
+        }
+        assertTrue(view.offerBoundaryPreviewForTest(inactiveBoundary))
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.55f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+            assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
+            chargedSamples += budget.chargedBytes
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            val staged = checkNotNull(view.privateField("pendingLocalPageShotHandoff"))
+            val stagedTarget = checkNotNull(staged.reflectedField("targetBitmap") as Bitmap?)
+            chargedSamples += budget.chargedBytes
+            assertFalse("the deferred target must remain live", stagedTarget.isRecycled)
+            assertFalse("the visible cover must remain installed during target preparation", cover.isRecycled)
+            assertEquals("target admission must evict the inactive boundary first", listOf(inactiveBoundary.token), evictedTokens)
+            assertTrue("inactive-boundary eviction must observe the visible cover still alive", coverAliveWhenBoundaryEvicted)
+            assertTrue("the inactive boundary must leave before the local working pair completes", inactiveBoundaryBitmap.isRecycled)
+            assertNull(view.privateField("forwardBoundaryPreview"))
+            assertTrue(budget.leasedBytes <= shotBytes * 3L)
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            chargedSamples += budget.chargedBytes
+
+            assertEquals(listOf(inactiveBoundary.token), evictedTokens)
+            assertNotNull("the deferred pair must become the active local renderer", view.privateField("slideDrawable"))
+            assertTrue(
+                "cover + inactive boundary + deferred pair must never charge a fourth full-screen identity: " +
+                    chargedSamples,
+                chargedSamples.all { it <= shotBytes * 3L },
+            )
+        } finally {
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `warmed forward turn from free rest transfers dynamic page shots without live recapture`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.40f)
+        val canonicalTops = (0 until view.pageCount()).mapNotNull(view::pageTopPxAt).toSet()
+
+        view.scrollTo(0, freeRest)
+        val outgoingFullLines = fullLineRangeInViewport(view)
+        val dynamicTargetTop = requireNotNull(view.textView.layout).getLineTop(outgoingFullLines.last + 1)
+        assertTrue("test requires a non-canonical FREE_REST", freeRest !in canonicalTops)
+        assertTrue("test requires a non-canonical dynamic forward target", dynamicTargetTop !in canonicalTops)
+
+        val background = RecordingBoundsTopDrawable()
+        view.background = background
+        view.preCachePageTexturesForTest()
+        val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) {
+            "FREE_REST precache must warm the arbitrary outgoing viewport"
+        }
+        val cachedRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) {
+            "FREE_REST precache must warm its dynamic forward target"
+        }
+        background.boundsTops.clear()
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+
+        try {
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val frontTransferred = slide.privateBitmap("frontBitmap") === cachedFront
+            val targetTransferred = slide.privateBitmap("revealedBitmap") === cachedRevealed
+            val liveDrawBounds = background.boundsTops.toList()
+            assertTrue(
+                "the first interactive frame must transfer both warmed FREE_REST shots by identity " +
+                    "without live recapture; frontTransferred=$frontTransferred " +
+                    "targetTransferred=$targetTransferred liveDrawBounds=$liveDrawBounds",
+                frontTransferred && targetTransferred && liveDrawBounds.isEmpty(),
+            )
+        } finally {
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `cold free rest simulation drag resumes at latest held move after split page shot preparation`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.40f)
+        view.scrollTo(0, freeRest)
+        val outgoingFullLines = fullLineRangeInViewport(view)
+        val targetLine = outgoingFullLines.last + 1
+        val layout = requireNotNull(view.textView.layout)
+        val targetTop = layout.getLineTop(targetLine)
+        val targetOffset = layout.getLineStart(targetLine)
+        val startPage = view.currentPageIndex()
+        val background = RecordingBoundsTopDrawable()
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.boundsTops.clear()
+        reportedOffsets.clear()
+
+        val downX = view.width * 0.85f
+        val firstCrossingX = view.width * 0.55f
+        val latestHeldX = view.width * 0.10f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+        var released = false
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, firstCrossingX, y),
+                ),
+            )
+            view.onTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_MOVE, latestHeldX, y),
+            )
+
+            assertTrue(
+                "a cold threshold MOVE must enqueue page-shot work instead of synchronously drawing or turning; " +
+                    "draws=${background.boundsTops} curl=${view.privateField("curlDrawable")} " +
+                    "page=${view.currentPageIndex()} scrollY=${view.scrollY} reports=$reportedOffsets",
+                background.boundsTops.isEmpty() &&
+                    view.privateField("curlDrawable") == null &&
+                    view.currentPageIndex() == startPage &&
+                    view.scrollY == freeRest &&
+                    reportedOffsets.isEmpty(),
+            )
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            assertEquals("the first preparation frame must capture only the target page", 1, background.boundsTops.size)
+            assertNull("the target-only frame must not install an overlay", view.privateField("curlDrawable"))
+            assertEquals("preparation must not park the target page", startPage, view.currentPageIndex())
+            assertEquals("preparation must not move the live viewport", freeRest, view.scrollY)
+            assertTrue("preparation must remain locator-silent", reportedOffsets.isEmpty())
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            assertEquals("the second preparation frame must capture the visible outgoing page", 2, background.boundsTops.size)
+            val paper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?)
+            val expectedProgress = (downX - latestHeldX) / view.width.toFloat()
+            assertEquals(
+                "once both shots are ready the held gesture must resume at the latest MOVE without another event",
+                expectedProgress,
+                paper.progress,
+                0.001f,
+            )
+            assertTrue("resuming under the held finger must remain locator-silent", reportedOffsets.isEmpty())
+
+            view.onTouchEvent(
+                motionEvent(downTime, downTime + 600L, MotionEvent.ACTION_UP, latestHeldX, y),
+            )
+            released = true
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "release without another MOVE must commit from the latest held coordinate, not the first sub-threshold progress",
+                targetTop,
+                view.scrollY,
+            )
+            assertEquals(listOf(targetOffset), reportedOffsets)
+        } finally {
+            if (!released) {
+                view.onTouchEvent(
+                    motionEvent(downTime, downTime + 600L, MotionEvent.ACTION_CANCEL, latestHeldX, y),
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            }
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `up after first cold target frame cancels handoff and retires late front work`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val background = RecordingTargetBitmapDrawable()
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        reportedOffsets.clear()
+        val startPage = view.currentPageIndex()
+        val startTop = view.scrollY
+        val startOffset = view.topLayoutOffset()
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.10f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val partialTarget = background.targetBitmaps.single()
+            val overlayBeforeUp =
+                view.privateField("curlDrawable") != null || view.privateField("slideDrawable") != null
+
+            view.onTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y),
+            )
+            val stateAfterUp = view.privateField("interactiveTurnState").toString()
+            val pageAfterUp = view.currentPageIndex()
+            val scrollAfterUp = view.scrollY
+            val offsetAfterUp = view.topLayoutOffset()
+            val reportsAfterUp = reportedOffsets.toList()
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val drawsAfterLateFront = background.targetBitmaps.toList()
+            val curlAfterLateFront = view.privateField("curlDrawable")
+            val slideAfterLateFront = view.privateField("slideDrawable")
+            val stateAfterLateFront = view.privateField("interactiveTurnState").toString()
+            val pageAfterLateFront = view.currentPageIndex()
+            val scrollAfterLateFront = view.scrollY
+            val offsetAfterLateFront = view.topLayoutOffset()
+            val reportsAfterLateFront = reportedOffsets.toList()
+
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+
+            val finalCurl = view.privateField("curlDrawable")
+            val finalSlide = view.privateField("slideDrawable")
+            val finalState = view.privateField("interactiveTurnState").toString()
+
+            assertTrue(
+                "UP before the front frame must retire the partial target and make late work inert; " +
+                    "draws=${background.targetBitmaps.size} partialTarget=$partialTarget " +
+                    "partialRecycled=${partialTarget.isRecycled} " +
+                    "overlayBeforeUp=$overlayBeforeUp finalCurl=$finalCurl finalSlide=$finalSlide " +
+                    "stateAfterUp=$stateAfterUp pageAfterUp=$pageAfterUp scrollAfterUp=$scrollAfterUp " +
+                    "offsetAfterUp=$offsetAfterUp reportsAfterUp=$reportsAfterUp " +
+                    "drawsAfterLateFront=$drawsAfterLateFront curlAfterLateFront=$curlAfterLateFront " +
+                    "slideAfterLateFront=$slideAfterLateFront stateAfterLateFront=$stateAfterLateFront " +
+                    "pageAfterLateFront=$pageAfterLateFront scrollAfterLateFront=$scrollAfterLateFront " +
+                    "offsetAfterLateFront=$offsetAfterLateFront reportsAfterLateFront=$reportsAfterLateFront " +
+                    "page=${view.currentPageIndex()} startPage=$startPage " +
+                    "scrollY=${view.scrollY} startTop=$startTop " +
+                    "offset=${view.topLayoutOffset()} startOffset=$startOffset " +
+                    "state=$finalState reports=$reportedOffsets",
+                background.targetBitmaps.size == 1 && partialTarget.isRecycled &&
+                    !overlayBeforeUp && finalCurl == null && finalSlide == null &&
+                    stateAfterUp == "NONE" && pageAfterUp == startPage && scrollAfterUp == startTop &&
+                    offsetAfterUp == startOffset && reportsAfterUp.isEmpty() &&
+                    drawsAfterLateFront.size == 1 && curlAfterLateFront == null && slideAfterLateFront == null &&
+                    stateAfterLateFront == "NONE" && pageAfterLateFront == startPage &&
+                    scrollAfterLateFront == startTop && offsetAfterLateFront == startOffset &&
+                    reportsAfterLateFront.isEmpty() &&
+                    view.currentPageIndex() == startPage &&
+                    view.scrollY == startTop &&
+                    view.topLayoutOffset() == startOffset &&
+                    finalState == "NONE" &&
+                    reportedOffsets.isEmpty(),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `new down supersedes a target-only cold handoff and only the replacement gesture resumes`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(2)
+        val background = RecordingTargetBitmapDrawable()
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        reportedOffsets.clear()
+
+        val y = view.height * 0.10f
+        val aDownX = view.width * 0.85f
+        val aMoveX = view.width * 0.55f
+        val aDownTime = SystemClock.uptimeMillis()
+        val bDownX = view.width * 0.15f
+        val bFirstMoveX = view.width * 0.45f
+        val bLatestMoveX = view.width * 0.90f
+        val bDownTime = aDownTime + 100L
+        val expectedBProgress = (bLatestMoveX - bDownX) / view.width.toFloat()
+
+        try {
+            view.dispatchTouchEvent(motionEvent(aDownTime, aDownTime, MotionEvent.ACTION_DOWN, aDownX, y))
+            assertTrue(
+                "gesture A must enter the cold forward handoff",
+                view.onInterceptTouchEvent(
+                    motionEvent(aDownTime, aDownTime + 24L, MotionEvent.ACTION_MOVE, aMoveX, y),
+                ),
+            )
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val aTarget = background.targetBitmaps.single()
+            assertNull("gesture A target-only frame must not install curl", view.privateField("curlDrawable"))
+            assertNull("gesture A target-only frame must not install slide", view.privateField("slideDrawable"))
+
+            view.dispatchTouchEvent(motionEvent(bDownTime, bDownTime, MotionEvent.ACTION_DOWN, bDownX, y))
+            val bOriginPage = view.currentPageIndex()
+            val bOriginTop = view.scrollY
+            val bOriginOffset = view.topLayoutOffset()
+
+            assertTrue(
+                "a new DOWN must synchronously retire gesture A before gesture B is classified; " +
+                    "aTargetRecycled=${aTarget.isRecycled} state=${view.privateField("interactiveTurnState")} " +
+                    "curl=${view.privateField("curlDrawable")} slide=${view.privateField("slideDrawable")} " +
+                    "reports=$reportedOffsets",
+                aTarget.isRecycled &&
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                    view.privateField("curlDrawable") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    reportedOffsets.isEmpty(),
+            )
+
+            assertTrue(
+                "gesture B must classify an opposite backward turn from its own anchor",
+                view.onInterceptTouchEvent(
+                    motionEvent(bDownTime, bDownTime + 24L, MotionEvent.ACTION_MOVE, bFirstMoveX, y),
+                ),
+            )
+            view.onTouchEvent(
+                motionEvent(bDownTime, bDownTime + 48L, MotionEvent.ACTION_MOVE, bLatestMoveX, y),
+            )
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            assertTrue(
+                "the first replacement frame must belong to B's target, not A's late front callback; " +
+                    "draws=${background.targetBitmaps.size} state=${view.privateField("interactiveTurnState")} " +
+                    "curl=${view.privateField("curlDrawable")} slide=${view.privateField("slideDrawable")}",
+                background.targetBitmaps.size == 2 &&
+                    view.privateField("interactiveTurnState").toString() == "LOCAL_SHOTS_WAITING" &&
+                    view.privateField("curlDrawable") == null &&
+                    view.privateField("slideDrawable") == null,
+            )
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val bPaper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?) {
+                "gesture B's second frame must install the SIMULATION overlay"
+            }
+            val bPaperForward = bPaper.javaClass.getDeclaredField("forward")
+                .apply { isAccessible = true }
+                .getBoolean(bPaper)
+            assertNull("gesture B must not degrade to a slide", view.privateField("slideDrawable"))
+            assertEquals("only B's two shots may follow A's retired target", 3, background.targetBitmaps.size)
+            assertFalse("the surviving overlay must use gesture B's backward direction", bPaperForward)
+            assertEquals(
+                "the surviving overlay must resume from gesture B's latest MOVE and anchor",
+                expectedBProgress,
+                bPaper.progress,
+                0.001f,
+            )
+            assertTrue("the replacement handoff must remain locator-silent", reportedOffsets.isEmpty())
+
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            assertTrue(
+                "draining stale and replacement frame work must leave exactly B's overlay and progress; " +
+                    "draws=${background.targetBitmaps.size} curl=${view.privateField("curlDrawable")} " +
+                    "progress=${bPaper.progress} reports=$reportedOffsets",
+                background.targetBitmaps.size == 3 &&
+                    view.privateField("curlDrawable") === bPaper &&
+                    view.privateField("slideDrawable") == null &&
+                    !bPaperForward &&
+                    kotlin.math.abs(bPaper.progress - expectedBProgress) < 0.001f &&
+                    reportedOffsets.isEmpty(),
+            )
+
+            view.onTouchEvent(
+                motionEvent(bDownTime, bDownTime + 72L, MotionEvent.ACTION_CANCEL, bLatestMoveX, y),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "CANCEL must restore gesture B's origin without letting A publish or revive; " +
+                    "origin=[$bOriginPage,$bOriginTop,$bOriginOffset] " +
+                    "final=[${view.currentPageIndex()},${view.scrollY},${view.topLayoutOffset()}] " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "curl=${view.privateField("curlDrawable")} slide=${view.privateField("slideDrawable")} " +
+                    "reports=$reportedOffsets",
+                view.currentPageIndex() == bOriginPage &&
+                    view.scrollY == bOriginTop &&
+                    view.topLayoutOffset() == bOriginOffset &&
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                    view.privateField("curlDrawable") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    reportedOffsets.isEmpty(),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `dequeued local target callback cannot overwrite the replacement handoff target`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(2)
+        val background = RecordingTargetBitmapDrawable()
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        reportedOffsets.clear()
+
+        val y = view.height * 0.10f
+        val aDownX = view.width * 0.85f
+        val aMoveX = view.width * 0.55f
+        val aDownTime = SystemClock.uptimeMillis()
+        val bDownX = view.width * 0.15f
+        val bMoveX = view.width * 0.75f
+        val bDownTime = aDownTime + 100L
+
+        try {
+            view.dispatchTouchEvent(motionEvent(aDownTime, aDownTime, MotionEvent.ACTION_DOWN, aDownX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(aDownTime, aDownTime + 24L, MotionEvent.ACTION_MOVE, aMoveX, y),
+                ),
+            )
+            val dequeuedATarget = view.privateField("capturePendingLocalTargetRunnable") as Runnable
+
+            view.dispatchTouchEvent(motionEvent(bDownTime, bDownTime, MotionEvent.ACTION_DOWN, bDownX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(bDownTime, bDownTime + 24L, MotionEvent.ACTION_MOVE, bMoveX, y),
+                ),
+            )
+            val bRequest = checkNotNull(view.privateField("pendingLocalPageShotHandoff"))
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val bTarget = checkNotNull(bRequest.reflectedField("targetBitmap") as Bitmap?)
+            val drawsBeforeLateA = background.targetBitmaps.toList()
+
+            dequeuedATarget.run()
+
+            assertTrue(
+                "an already-dequeued A target callback must not read or overwrite replacement B; " +
+                    "sameOwner=${view.privateField("pendingLocalPageShotHandoff") === bRequest} " +
+                    "sameTarget=${bRequest.reflectedField("targetBitmap") === bTarget} " +
+                    "drawsBefore=$drawsBeforeLateA drawsAfter=${background.targetBitmaps} " +
+                    "targetRecycled=${bTarget.isRecycled} state=${view.privateField("interactiveTurnState")} " +
+                    "curl=${view.privateField("curlDrawable")} slide=${view.privateField("slideDrawable")} " +
+                    "reports=$reportedOffsets",
+                view.privateField("pendingLocalPageShotHandoff") === bRequest &&
+                    bRequest.reflectedField("targetBitmap") === bTarget &&
+                    background.targetBitmaps == drawsBeforeLateA &&
+                    !bTarget.isRecycled &&
+                    view.privateField("interactiveTurnState").toString() == "LOCAL_SHOTS_WAITING" &&
+                    view.privateField("curlDrawable") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    reportedOffsets.isEmpty(),
+            )
+        } finally {
+            view.onTouchEvent(
+                motionEvent(bDownTime, bDownTime + 48L, MotionEvent.ACTION_CANCEL, bMoveX, y),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `local snapshot invalidated during draw cannot retire its replacement handoff`() {
+        lateinit var view: EpubFlowView
+        var armed = false
+        var replaced = false
+        var replacementIntercepted = false
+        var replacementRequest: Any? = null
+        var allocatedByA: Bitmap? = null
+        val y = 12f
+        val aDownX = 306f
+        val aMoveX = 198f
+        val bDownX = 54f
+        val bMoveX = 270f
+        val aDownTime = SystemClock.uptimeMillis()
+        val bDownTime = aDownTime + 100L
+        val background = RecordingTargetBitmapDrawable {
+            if (armed && !replaced) {
+                replaced = true
+                view.dispatchTouchEvent(
+                    motionEvent(bDownTime, bDownTime, MotionEvent.ACTION_DOWN, bDownX, y),
+                )
+                replacementIntercepted = view.onInterceptTouchEvent(
+                    motionEvent(bDownTime, bDownTime + 24L, MotionEvent.ACTION_MOVE, bMoveX, y),
+                )
+                replacementRequest = view.privateField("pendingLocalPageShotHandoff")
+            }
+        }
+        view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(2)
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        armed = true
+
+        try {
+            view.dispatchTouchEvent(
+                motionEvent(aDownTime, aDownTime, MotionEvent.ACTION_DOWN, aDownX, y),
+            )
+            assertTrue(
+                "fixture must queue handoff A's target snapshot",
+                view.onInterceptTouchEvent(
+                    motionEvent(aDownTime, aDownTime + 24L, MotionEvent.ACTION_MOVE, aMoveX, y),
+                ),
+            )
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            allocatedByA = background.targetBitmaps.single()
+            val requestB = checkNotNull(replacementRequest)
+
+            assertTrue("callback must establish replacement handoff B", replaced && replacementIntercepted)
+            assertTrue(
+                "the stale foreground snapshot allocated by A must be recycled before its callback returns",
+                allocatedByA!!.isRecycled,
+            )
+            assertTrue(
+                "A returning from snapshot draw must not clear or mutate replacement B; " +
+                    "owner=${view.privateField("pendingLocalPageShotHandoff")} requestB=$requestB " +
+                    "targetB=${requestB.reflectedField("targetBitmap")} " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "callback=${view.privateField("capturePendingLocalTargetRunnable")}",
+                view.privateField("pendingLocalPageShotHandoff") === requestB &&
+                    requestB.reflectedField("targetBitmap") == null &&
+                    view.privateField("interactiveTurnState").toString() == "LOCAL_SHOTS_WAITING" &&
+                    view.privateField("capturePendingLocalTargetRunnable") != null &&
+                    view.privateField("curlDrawable") == null &&
+                    view.privateField("slideDrawable") == null,
+            )
+        } finally {
+            allocatedByA?.let { if (!it.isRecycled) it.recycle() }
+            view.onTouchEvent(
+                motionEvent(bDownTime, bDownTime + 48L, MotionEvent.ACTION_CANCEL, bMoveX, y),
+            )
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `target-only cold handoff is retired by every visual and layout invalidator`() {
+        data class Scenario(
+            val name: String,
+            val disposesView: Boolean = false,
+            val invalidate: (EpubFlowView) -> Unit,
+        )
+
+        val replacementText = (1..40).joinToString("\n") { "Replacement chapter line $it." }
+        val replacementFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(replacementText, headingLevel = null, paragraphIndex = 0)),
+        )
+        val scenarios = listOf(
+            Scenario("background replacement") { view ->
+                view.background = ColorDrawable(0xFFF1E8D8.toInt())
+            },
+            Scenario("highlight refresh") { view ->
+                view.refreshHighlights(emptyList())
+            },
+            Scenario("flip style change") { view ->
+                view.flipStyle = PageFlipStyle.SLIDE
+            },
+            Scenario("mode change") { view ->
+                view.mode = EpubFlowView.Mode.SCROLL
+            },
+            Scenario("resize") { view ->
+                view.measure(exactly(420), exactly(140))
+                view.layout(0, 0, 420, 140)
+            },
+            Scenario("chapter replacement") { view ->
+                view.setChapter(replacementFlow, replacementFlow.text, pageHeightPx = view.height)
+                view.measure(exactly(360), exactly(120))
+                view.layout(0, 0, 360, 120)
+            },
+            Scenario("dispose", disposesView = true) { view ->
+                view.dispose()
+            },
+        )
+
+        scenarios.forEach { scenario ->
+            val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+            val background = RecordingTargetBitmapDrawable()
+            view.background = background
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            background.targetBitmaps.clear()
+            val downX = view.width * 0.85f
+            val moveX = view.width * 0.10f
+            val y = view.height * 0.10f
+            val downTime = SystemClock.uptimeMillis()
+
+            try {
+                view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+                assertTrue(
+                    "${scenario.name}: fixture must classify the cold local turn",
+                    view.onInterceptTouchEvent(
+                        motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                    ),
+                )
+                shadowOf(Looper.getMainLooper()).runOneTask()
+                val partialTarget = background.targetBitmaps.single()
+                assertNull("${scenario.name}: target-only checkpoint must not install curl", view.privateField("curlDrawable"))
+                assertNull("${scenario.name}: target-only checkpoint must not install slide", view.privateField("slideDrawable"))
+
+                scenario.invalidate(view)
+                val stateImmediately = view.privateField("interactiveTurnState").toString()
+                val curlImmediately = view.privateField("curlDrawable")
+                val slideImmediately = view.privateField("slideDrawable")
+                val lateTrace = buildList {
+                    repeat(8) {
+                        shadowOf(Looper.getMainLooper()).runOneTask()
+                        add(
+                            Triple(
+                                view.privateField("interactiveTurnState").toString(),
+                                view.privateField("curlDrawable"),
+                                view.privateField("slideDrawable"),
+                            ),
+                        )
+                    }
+                }
+                shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+                val finalState = view.privateField("interactiveTurnState").toString()
+                val finalCurl = view.privateField("curlDrawable")
+                val finalSlide = view.privateField("slideDrawable")
+                val lateWorkStayedRetired = scenario.disposesView || lateTrace.all { (state, curl, slide) ->
+                    state == "NONE" && curl == null && slide == null
+                }
+
+                assertTrue(
+                    "${scenario.name}: invalidation must retire the target-only cold handoff; " +
+                        "targetRecycled=${partialTarget.isRecycled} " +
+                        "immediate=[$stateImmediately,$curlImmediately,$slideImmediately] " +
+                        "lateTrace=$lateTrace final=[$finalState,$finalCurl,$finalSlide]",
+                    partialTarget.isRecycled &&
+                        stateImmediately == "NONE" && curlImmediately == null && slideImmediately == null &&
+                        lateWorkStayedRetired &&
+                        finalState == "NONE" && finalCurl == null && finalSlide == null,
+                )
+            } finally {
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
+    fun `programmatic navigation during target-only cold handoff owns the final viewport`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val navigationPage = 2
+        val navigationTop = requireNotNull(view.pageTopPxAt(navigationPage))
+        val background = RecordingTargetBitmapDrawable()
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        reportedOffsets.clear()
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.10f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val partialTarget = background.targetBitmaps.single()
+            assertNull("target-only checkpoint must not install curl", view.privateField("curlDrawable"))
+            assertNull("target-only checkpoint must not install slide", view.privateField("slideDrawable"))
+
+            view.goToPage(navigationPage)
+            val navigationOffset = view.topLayoutOffset()
+            val reportsAfterNavigation = reportedOffsets.toList()
+            val stateAfterNavigation = view.privateField("interactiveTurnState").toString()
+
+            val lateTrace = buildList {
+                repeat(8) {
+                    shadowOf(Looper.getMainLooper()).runOneTask()
+                    add(
+                        Triple(
+                            view.currentPageIndex() to view.scrollY,
+                            view.privateField("interactiveTurnState").toString(),
+                            view.privateField("curlDrawable") to view.privateField("slideDrawable"),
+                        ),
+                    )
+                }
+            }
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+            val finalState = view.privateField("interactiveTurnState").toString()
+            val finalCurl = view.privateField("curlDrawable")
+            val finalSlide = view.privateField("slideDrawable")
+
+            assertTrue(
+                "programmatic navigation must retire the target-only handoff and own the final viewport; " +
+                    "targetRecycled=${partialTarget.isRecycled} " +
+                    "navigation=[$navigationPage,$navigationTop,$navigationOffset] " +
+                    "stateAfterNavigation=$stateAfterNavigation reportsAfterNavigation=$reportsAfterNavigation " +
+                    "lateTrace=$lateTrace final=[${view.currentPageIndex()},${view.scrollY}," +
+                    "${view.topLayoutOffset()},$finalState,$finalCurl,$finalSlide] reports=$reportedOffsets",
+                partialTarget.isRecycled &&
+                    stateAfterNavigation == "NONE" &&
+                    reportsAfterNavigation == listOf(navigationOffset) &&
+                    lateTrace.all { (viewport, state, overlays) ->
+                        viewport.first == navigationPage && viewport.second == navigationTop &&
+                            state == "NONE" && overlays.first == null && overlays.second == null
+                    } &&
+                    view.currentPageIndex() == navigationPage &&
+                    view.scrollY == navigationTop &&
+                    view.topLayoutOffset() == navigationOffset &&
+                    finalState == "NONE" && finalCurl == null && finalSlide == null &&
+                    reportedOffsets == reportsAfterNavigation,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `external viewport mutations retire a held software gesture before late cancel`() {
+        data class Scenario(
+            val name: String,
+            val mutate: (EpubFlowView, Int) -> Unit,
+        )
+
+        val scenarios = listOf(
+            Scenario("goToPage") { view, _ -> view.goToPage(2) },
+            Scenario("goToOffset") { view, targetOffset -> view.goToOffset(targetOffset) },
+            Scenario("mode") { view, targetOffset ->
+                view.setModeAnchored(EpubFlowView.Mode.SCROLL, targetOffset)
+            },
+            Scenario("resize") { view, _ ->
+                view.measure(exactly(420), exactly(140))
+                view.layout(0, 0, 420, 140)
+            },
+        )
+        val failures = mutableListOf<String>()
+
+        scenarios.forEach { scenario ->
+            val reportedOffsets = mutableListOf<Int>()
+            val view = pagedFlowView(
+                flipStyle = PageFlipStyle.SIMULATION,
+                onTopOffsetChanged = reportedOffsets::add,
+            )
+            assertTrue("${scenario.name}: pageCount=${view.pageCount()}", view.pageCount() > 3)
+            val targetOffset = (view.privateField("paged") as List<EpubFlowPage>)[2].startOffset
+            reportedOffsets.clear()
+            val heldX = view.width * 0.65f
+            val y = view.height * 0.10f
+            val downTime = SystemClock.uptimeMillis()
+
+            try {
+                assertTrue(
+                    "${scenario.name}: fixture must start a ready software turn",
+                    view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()),
+                )
+                view.updateInteractiveCurl(x = heldX)
+                assertTrue(
+                    "${scenario.name}: fixture requires a held overlay before mutation",
+                    view.privateField("curlDrawable") != null || view.privateField("slideDrawable") != null,
+                )
+
+                scenario.mutate(view, targetOffset)
+                shadowOf(Looper.getMainLooper()).idle()
+
+                val retiredImmediately =
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        view.privateField("curlOrigin") == null
+                val mutationMode = view.mode
+                val mutationPage = view.currentPageIndex()
+                val mutationTop = view.scrollY
+                val mutationOffset = view.topLayoutOffset()
+                val reportsAfterMutation = reportedOffsets.toList()
+
+                view.onTouchEvent(
+                    motionEvent(downTime, downTime + 72L, MotionEvent.ACTION_CANCEL, heldX, y),
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+                val finalOwnedByMutation =
+                    view.mode == mutationMode &&
+                        view.currentPageIndex() == mutationPage &&
+                        view.scrollY == mutationTop &&
+                        view.topLayoutOffset() == mutationOffset &&
+                        view.privateField("interactiveTurnState").toString() == "NONE" &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        reportedOffsets == reportsAfterMutation
+                if (!retiredImmediately || !finalOwnedByMutation) {
+                    failures +=
+                        "${scenario.name}: retired=$retiredImmediately " +
+                            "mutation=[$mutationMode,$mutationPage,$mutationTop,$mutationOffset,$reportsAfterMutation] " +
+                            "final=[${view.mode},${view.currentPageIndex()},${view.scrollY}," +
+                            "${view.topLayoutOffset()},${view.privateField("interactiveTurnState")}," +
+                            "${view.privateField("curlDrawable")},${view.privateField("slideDrawable")}," +
+                            "$reportedOffsets]"
+                }
+            } finally {
+                view.dispose()
+            }
+        }
+
+        assertTrue(
+            "external navigation/layout ownership must retire the held gesture and make late CANCEL inert: $failures",
+            failures.isEmpty(),
+        )
+    }
+
+    @Test
+    fun `visual only invalidators restore a held software origin without publishing`() {
+        data class Scenario(
+            val name: String,
+            val invalidate: (EpubFlowView) -> Unit,
+        )
+
+        val scenarios = listOf(
+            Scenario("background replacement") { view ->
+                view.background = ColorDrawable(0xFFF1E8D8.toInt())
+            },
+            Scenario("highlight refresh") { view ->
+                view.refreshHighlights(emptyList())
+            },
+            Scenario("flip style change") { view ->
+                view.flipStyle = PageFlipStyle.SLIDE
+            },
+        )
+        val failures = mutableListOf<String>()
+
+        scenarios.forEach { scenario ->
+            val reportedOffsets = mutableListOf<Int>()
+            val view = pagedFlowView(
+                flipStyle = PageFlipStyle.SIMULATION,
+                onTopOffsetChanged = reportedOffsets::add,
+            )
+            assertTrue("${scenario.name}: pageCount=${view.pageCount()}", view.pageCount() > 3)
+            val originPage = view.currentPageIndex()
+            val originTop = view.scrollY
+            val originOffset = view.topLayoutOffset()
+            val heldX = view.width * 0.65f
+            val y = view.height * 0.10f
+            val downTime = SystemClock.uptimeMillis()
+            reportedOffsets.clear()
+
+            try {
+                assertTrue(
+                    "${scenario.name}: fixture must start a ready held turn",
+                    view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()),
+                )
+                view.updateInteractiveCurl(x = heldX)
+                assertTrue(
+                    "${scenario.name}: target must be silently parked beneath a held overlay",
+                    view.currentPageIndex() != originPage &&
+                        view.privateField("curlDrawable") != null &&
+                        reportedOffsets.isEmpty(),
+                )
+
+                scenario.invalidate(view)
+
+                val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+                val restoredImmediately =
+                    view.currentPageIndex() == originPage &&
+                        view.scrollY == originTop &&
+                        view.topLayoutOffset() == originOffset &&
+                        view.privateField("interactiveTurnState").toString() == "NONE" &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        view.privateField("curlOrigin") == null &&
+                        animator?.isRunning != true &&
+                        reportedOffsets.isEmpty()
+
+                view.onTouchEvent(
+                    motionEvent(downTime, downTime + 72L, MotionEvent.ACTION_CANCEL, heldX, y),
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+                val lateCancelStayedInert =
+                    view.currentPageIndex() == originPage &&
+                        view.scrollY == originTop &&
+                        view.topLayoutOffset() == originOffset &&
+                        view.privateField("interactiveTurnState").toString() == "NONE" &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        reportedOffsets.isEmpty()
+                if (!restoredImmediately || !lateCancelStayedInert) {
+                    failures +=
+                        "${scenario.name}: immediate=$restoredImmediately late=$lateCancelStayedInert " +
+                            "origin=[$originPage,$originTop,$originOffset] " +
+                            "final=[${view.currentPageIndex()},${view.scrollY},${view.topLayoutOffset()}," +
+                            "${view.privateField("interactiveTurnState")},${view.privateField("curlDrawable")}," +
+                            "${view.privateField("slideDrawable")},$reportedOffsets]"
+                }
+            } finally {
+                view.dispose()
+            }
+        }
+
+        assertTrue(
+            "visual-only invalidation must synchronously restore the held origin without locator publication: " +
+                failures,
+            failures.isEmpty(),
+        )
+    }
+
+    @Test
+    fun `external viewport mutations supersede a committed local settle without stale publication`() {
+        data class Scenario(
+            val name: String,
+            val mutate: (EpubFlowView) -> Int?,
+        )
+
+        val replacementText = (1..40).joinToString("\n") { "Replacement chapter line $it." }
+        val replacementFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(replacementText, headingLevel = null, paragraphIndex = 0)),
+        )
+        val scenarios = listOf(
+            Scenario("goToPage") { view ->
+                view.goToPage(2)
+                view.topLayoutOffset()
+            },
+            Scenario("setChapter") { view ->
+                view.setChapter(replacementFlow, replacementFlow.text, pageHeightPx = view.height)
+                null
+            },
+        )
+        val failures = mutableListOf<String>()
+
+        scenarios.forEach { scenario ->
+            val reportedOffsets = mutableListOf<Int>()
+            val view = pagedFlowView(
+                flipStyle = PageFlipStyle.SIMULATION,
+                onTopOffsetChanged = reportedOffsets::add,
+            )
+            assertTrue("${scenario.name}: pageCount=${view.pageCount()}", view.pageCount() > 3)
+            reportedOffsets.clear()
+
+            try {
+                assertTrue(
+                    "${scenario.name}: fixture must start a ready local turn",
+                    view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()),
+                )
+                view.updateInteractiveCurl(x = view.width * 0.25f)
+                view.endInteractiveCurl(velocityX = 0f)
+
+                val parkedTargetPage = view.currentPageIndex()
+                val parkedTargetOffset = view.topLayoutOffset()
+                val oldAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+                assertTrue(
+                    "${scenario.name}: fixture needs a silently parked commit under a running settle",
+                    parkedTargetPage > 0 && oldAnimator.isRunning && reportedOffsets.isEmpty(),
+                )
+
+                val expectedMutationOffset = scenario.mutate(view)
+                val expectedImmediateReports = expectedMutationOffset?.let(::listOf).orEmpty()
+                val immediateRetirement =
+                    !oldAnimator.isRunning &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        view.privateField("curlOrigin") == null &&
+                        reportedOffsets == expectedImmediateReports &&
+                        parkedTargetOffset !in reportedOffsets
+
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+                val finalReports = reportedOffsets.toList()
+                val stayedOwnedByMutation =
+                    !oldAnimator.isRunning &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        view.privateField("curlOrigin") == null &&
+                        parkedTargetOffset !in finalReports &&
+                        (expectedMutationOffset == null || finalReports == listOf(expectedMutationOffset))
+
+                if (!immediateRetirement || !stayedOwnedByMutation) {
+                    failures +=
+                        "${scenario.name}: target=[$parkedTargetPage,$parkedTargetOffset] " +
+                            "expectedImmediate=$expectedImmediateReports immediate=$immediateRetirement " +
+                            "animatorRunning=${oldAnimator.isRunning} " +
+                            "overlay=[${view.privateField("curlDrawable")},${view.privateField("slideDrawable")}] " +
+                            "origin=${view.privateField("curlOrigin")} reports=$finalReports"
+                }
+            } finally {
+                view.dispose()
+            }
+        }
+
+        assertTrue(
+            "an external viewport owner must synchronously retire the released settle without " +
+                "publishing its silently parked target: $failures",
+            failures.isEmpty(),
+        )
+    }
+
+    @Test
+    fun `visual invalidators resolve released local settles by the release decision`() {
+        data class Invalidation(
+            val name: String,
+            val apply: (EpubFlowView) -> Unit,
+        )
+
+        val invalidations = listOf(
+            Invalidation("background replacement") { view ->
+                view.background = ColorDrawable(0xFFF1E8D8.toInt())
+            },
+            Invalidation("highlight refresh") { view ->
+                view.refreshHighlights(emptyList())
+            },
+            Invalidation("flip style change") { view ->
+                view.flipStyle = PageFlipStyle.SLIDE
+            },
+        )
+        val failures = mutableListOf<String>()
+
+        listOf(false, true).forEach { commit ->
+            invalidations.forEach { invalidation ->
+                val reportedOffsets = mutableListOf<Int>()
+                val view = pagedFlowView(
+                    flipStyle = PageFlipStyle.SIMULATION,
+                    onTopOffsetChanged = reportedOffsets::add,
+                )
+                val originPage = view.currentPageIndex()
+                val originTop = view.scrollY
+                val originOffset = view.topLayoutOffset()
+                reportedOffsets.clear()
+
+                try {
+                    assertTrue(
+                        "${invalidation.name}/commit=$commit: fixture must start a ready local turn",
+                        view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()),
+                    )
+                    val targetPage = view.currentPageIndex()
+                    val targetTop = view.scrollY
+                    val targetOffset = view.topLayoutOffset()
+                    view.updateInteractiveCurl(x = view.width * if (commit) 0.25f else 0.75f)
+                    view.endInteractiveCurl(velocityX = 0f)
+                    val oldAnimator = checkNotNull(
+                        view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+                    )
+                    assertTrue(
+                        "${invalidation.name}/commit=$commit: fixture needs a released running settle",
+                        oldAnimator.isRunning && reportedOffsets.isEmpty(),
+                    )
+
+                    invalidation.apply(view)
+
+                    val expectedPage = if (commit) targetPage else originPage
+                    val expectedTop = if (commit) targetTop else originTop
+                    val expectedOffset = if (commit) targetOffset else originOffset
+                    val expectedReports = if (commit) listOf(targetOffset) else emptyList()
+                    val immediateResolution =
+                        view.currentPageIndex() == expectedPage &&
+                            view.scrollY == expectedTop &&
+                            view.topLayoutOffset() == expectedOffset &&
+                            !oldAnimator.isRunning &&
+                            view.privateField("curlDrawable") == null &&
+                            view.privateField("slideDrawable") == null &&
+                            view.privateField("curlOrigin") == null &&
+                            reportedOffsets == expectedReports
+
+                    shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+                    val stayedResolved =
+                        view.currentPageIndex() == expectedPage &&
+                            view.scrollY == expectedTop &&
+                            view.topLayoutOffset() == expectedOffset &&
+                            !oldAnimator.isRunning &&
+                            view.privateField("curlDrawable") == null &&
+                            view.privateField("slideDrawable") == null &&
+                            view.privateField("curlOrigin") == null &&
+                            reportedOffsets == expectedReports
+
+                    if (!immediateResolution || !stayedResolved) {
+                        failures +=
+                            "${invalidation.name}/commit=$commit: immediate=$immediateResolution " +
+                                "stayed=$stayedResolved expected=[$expectedPage,$expectedTop,$expectedOffset," +
+                                "$expectedReports] final=[${view.currentPageIndex()},${view.scrollY}," +
+                                "${view.topLayoutOffset()},${oldAnimator.isRunning}," +
+                                "${view.privateField("curlDrawable")},${view.privateField("slideDrawable")}," +
+                                "${view.privateField("curlOrigin")},$reportedOffsets]"
+                    }
+                } finally {
+                    view.dispose()
+                }
+            }
+        }
+
+        assertTrue(
+            "visual invalidation must finish a released commit exactly once or retire a released cancel " +
+                "at its origin: $failures",
+            failures.isEmpty(),
+        )
+    }
+
+    @Test
+    fun `cold handoff tracks latest move across canonical free rest and axis matrix`() {
+        data class Scenario(
+            val name: String,
+            val freeRest: Boolean,
+            val vertical: Boolean,
+            val forward: Boolean,
+        )
+
+        val scenarios = listOf(
+            Scenario("canonical forward horizontal", freeRest = false, vertical = false, forward = true),
+            Scenario("FREE_REST backward horizontal", freeRest = true, vertical = false, forward = false),
+            Scenario("canonical forward vertical", freeRest = false, vertical = true, forward = true),
+        )
+
+        scenarios.forEach { scenario ->
+            val reportedOffsets = mutableListOf<Int>()
+            val view = pagedFlowView(
+                flipStyle = PageFlipStyle.SIMULATION,
+                onTopOffsetChanged = reportedOffsets::add,
+            )
+            assertTrue("${scenario.name}: pageCount=${view.pageCount()}", view.pageCount() > 3)
+            if (scenario.freeRest) {
+                val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+                val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+                view.scrollTo(0, nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.40f))
+            }
+            val originPage = view.currentPageIndex()
+            val originTop = view.scrollY
+            val originOffset = view.topLayoutOffset()
+            val background = RecordingBoundsTopDrawable()
+            view.background = background
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            background.boundsTops.clear()
+            reportedOffsets.clear()
+
+            val downX = when {
+                scenario.vertical -> view.width * 0.85f
+                scenario.forward -> view.width * 0.85f
+                else -> view.width * 0.15f
+            }
+            val downY = if (scenario.vertical) view.height * 0.75f else view.height * 0.10f
+            val firstX = when {
+                scenario.vertical -> downX
+                scenario.forward -> view.width * 0.55f
+                else -> view.width * 0.45f
+            }
+            val firstY = if (scenario.vertical) view.height * 0.45f else downY
+            val latestX = when {
+                scenario.vertical -> downX
+                scenario.forward -> view.width * 0.10f
+                else -> view.width * 0.90f
+            }
+            val latestY = if (scenario.vertical) view.height * 0.05f else downY
+            val expectedProgress = if (scenario.vertical) {
+                (downY - latestY) / view.height.toFloat()
+            } else if (scenario.forward) {
+                (downX - latestX) / view.width.toFloat()
+            } else {
+                (latestX - downX) / view.width.toFloat()
+            }
+            val downTime = SystemClock.uptimeMillis()
+
+            try {
+                view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, downY))
+                assertTrue(
+                    "${scenario.name}: first threshold MOVE must be intercepted",
+                    view.onInterceptTouchEvent(
+                        motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, firstX, firstY),
+                    ),
+                )
+                view.onTouchEvent(
+                    motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_MOVE, latestX, latestY),
+                )
+
+                assertTrue(
+                    "${scenario.name}: synchronous MOVE stage must remain shot- and locator-silent; " +
+                        "draws=${background.boundsTops} curl=${view.privateField("curlDrawable")} " +
+                        "slide=${view.privateField("slideDrawable")} reports=$reportedOffsets",
+                    background.boundsTops.isEmpty() &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        reportedOffsets.isEmpty(),
+                )
+
+                shadowOf(Looper.getMainLooper()).runOneTask()
+                assertTrue(
+                    "${scenario.name}: target frame must not install an incomplete overlay",
+                    background.boundsTops.size == 1 &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        reportedOffsets.isEmpty(),
+                )
+
+                shadowOf(Looper.getMainLooper()).runOneTask()
+                val paper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?) {
+                    "${scenario.name}: second frame must install the SIMULATION renderer"
+                }
+                assertNull("${scenario.name}: SIMULATION must not degrade to slide", view.privateField("slideDrawable"))
+                assertEquals(
+                    "${scenario.name}: ready handoff must resume from the latest coordinate on its classified axis",
+                    expectedProgress,
+                    paper.progress,
+                    0.001f,
+                )
+                assertTrue("${scenario.name}: ready handoff must remain locator-silent", reportedOffsets.isEmpty())
+
+                view.onTouchEvent(
+                    motionEvent(downTime, downTime + 72L, MotionEvent.ACTION_CANCEL, latestX, latestY),
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+                assertTrue(
+                    "${scenario.name}: ACTION_CANCEL must restore the exact origin without publishing; " +
+                        "origin=[$originPage,$originTop,$originOffset] " +
+                        "final=[${view.currentPageIndex()},${view.scrollY},${view.topLayoutOffset()}] " +
+                        "state=${view.privateField("interactiveTurnState")} " +
+                        "curl=${view.privateField("curlDrawable")} slide=${view.privateField("slideDrawable")} " +
+                        "reports=$reportedOffsets",
+                    (scenario.freeRest || view.currentPageIndex() == originPage) &&
+                        view.scrollY == originTop &&
+                        view.topLayoutOffset() == originOffset &&
+                        view.privateField("interactiveTurnState").toString() == "NONE" &&
+                        view.privateField("curlDrawable") == null &&
+                        view.privateField("slideDrawable") == null &&
+                        reportedOffsets.isEmpty(),
+                )
+            } finally {
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
+    fun `warmed free rest forward turn avoids chapter and page table scans`() {
+        val blocks = (0 until 512).map { paragraphIndex ->
+            EpubDisplayBlock.Text(
+                text = "Segment $paragraphIndex marker text for deterministic pagination.",
+                headingLevel = null,
+                paragraphIndex = paragraphIndex,
+            )
+        }
+        val sourceFlow = epubBuildChapterFlow(spineIndex = 0, blocks = blocks)
+        val countedSegments = CountingList(sourceFlow.segments)
+        val countedFlow = sourceFlow.copy(segments = countedSegments)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.NONE)
+        view.setChapter(countedFlow, countedFlow.text, pageHeightPx = view.height)
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        assertTrue("fixture needs a long paged chapter", view.pageCount() > 64)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
+        val freeRest = nonLineTopBetween(view, pageOneTop, pageTwoTop, fraction = 0.40f)
+        view.scrollTo(0, freeRest)
+        val before = fullLineRangeInViewport(view)
+        val layout = requireNotNull(view.textView.layout)
+        val targetLine = before.last + 1
+        val targetTop = layout.getLineTop(targetLine)
+        val targetOffset = layout.getLineStart(targetLine)
+        view.recycleCachedTexturesForTest()
+        view.setPrivateField("pageTexturePrecachePending", true)
+        @Suppress("UNCHECKED_CAST")
+        val originalPages = view.privateField("paged") as List<EpubFlowPage>
+        val countedPages = CountingList(originalPages)
+        view.setPrivateField("paged", countedPages)
+        countedSegments.reset()
+        countedPages.reset()
+
+        val accepted = view.goToAdjacentPage(1)
+        val finalY = view.scrollY
+        val visibleOffset = view.topLayoutOffset()
+
+        assertTrue(
+            "a warmed FREE_REST turn must use indexed chapter and page metadata; " +
+                "segmentCount=${countedSegments.size} segmentAccesses=${countedSegments.elementAccesses} " +
+                "pageCount=${countedPages.size} pageAccesses=${countedPages.elementAccesses} " +
+                "targetTop=$targetTop finalY=$finalY targetOffset=$targetOffset visibleOffset=$visibleOffset",
+            accepted && finalY == targetTop && visibleOffset == targetOffset &&
+                countedSegments.elementAccesses <= 16 &&
+                countedPages.elementAccesses <= 64,
+        )
+    }
+
+    @Test
     fun `warmed middle page serves a backward drag without live recapture`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -1056,6 +2908,78 @@ class EpubFlowViewTest {
         assertTrue("a later healthy gesture must reuse the restored target", view.beginInteractiveCurl(true, view.width.toFloat()))
         view.endInteractiveCurl(velocityX = 0f)
         shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+    }
+
+    @Test
+    fun `waiting boundary rejection restores retry token without cancelling request on up`() {
+        lateinit var view: EpubFlowView
+        val budget = PageShotBudget(0L)
+        val previewRequests = mutableListOf<Pair<Boolean, Long>>()
+        val cancelledRequests = mutableListOf<Boolean>()
+        val discardedTokens = mutableListOf<Long>()
+        val evictedTokens = mutableListOf<Long>()
+        var forceFirstPinnedDrawFailure = true
+        view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            pageShotBudget = budget,
+            onPinnedPageShotAdmissionNeeded = {
+                if (forceFirstPinnedDrawFailure) {
+                    forceFirstPinnedDrawFailure = false
+                    view.background = CaptureTargetBitmapThenThrowDrawable()
+                }
+            },
+        ).apply {
+            onBoundaryPreviewNeeded = { forward, generation ->
+                previewRequests += forward to generation
+                assertTrue(preparePageShotBudgetForBoundaryPreview(forward, required = true))
+            }
+            onBoundaryPreviewRequestCancelled = cancelledRequests::add
+            onBoundaryTurnDiscarded = { discardedTokens += it.token }
+            onBoundaryPreviewEvicted = { evictedTokens += it.token }
+        }
+        view.goToLastPage()
+        val originalBackground = view.background
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.10f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+        val preview = view.newBoundaryPreviewForTest(forward = true, token = 54L)
+        var retryStarted = false
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+            assertEquals("BOUNDARY_WAITING", view.privateField("interactiveTurnState").toString())
+            assertEquals(1, previewRequests.size)
+
+            assertTrue(view.offerBoundaryPreviewForTest(preview))
+            val stateAfterRejectedResume = view.privateField("interactiveTurnState").toString()
+            val restoredBeforeUp = view.privateField("forwardBoundaryPreview") as BoundaryPagePreview?
+
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
+            view.background = originalBackground
+            retryStarted = view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat())
+            val activeRetry = view.privateField("activeBoundaryPreview") as BoundaryPagePreview?
+
+            assertTrue(
+                "a rejected waiting resume must leave an idle gesture while preserving the same engine token; " +
+                    "stateAfterReject=$stateAfterRejectedResume restored=${restoredBeforeUp?.token} " +
+                    "cancelled=$cancelledRequests discarded=$discardedTokens evicted=$evictedTokens " +
+                    "retryStarted=$retryStarted activeRetry=${activeRetry?.token}",
+                stateAfterRejectedResume == "NONE" &&
+                    restoredBeforeUp?.token == preview.token &&
+                    restoredBeforeUp.bitmap === preview.bitmap &&
+                    cancelledRequests.isEmpty() &&
+                    discardedTokens.isEmpty() &&
+                    evictedTokens.isEmpty() &&
+                    retryStarted &&
+                    activeRetry?.token == preview.token,
+            )
+        } finally {
+            if (retryStarted) view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
     }
 
     @Test
@@ -1154,24 +3078,106 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `next page from clamped final page reports chapter boundary`() {
+    fun `next page from raw final line top reports chapter boundary without moving`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
-        val maxScroll = (view.getChildAt(0).height - view.height).coerceAtLeast(0)
-        val finalPage = (0 until view.pageCount()).lastOrNull { index ->
-            requireNotNull(view.pageTopPxAt(index)) > maxScroll
-        } ?: error("test requires a short final page whose raw top exceeds maxScroll=$maxScroll")
+        val finalPage = view.pageCount() - 1
+        val rawFinalTop = requireNotNull(view.pageTopPxAt(finalPage))
+        val naturalMaxScroll = (view.textView.height - view.height).coerceAtLeast(0)
+        assertTrue("test requires a short tail page", rawFinalTop > naturalMaxScroll)
 
         view.goToPage(finalPage)
 
-        assertEquals("final page should be visually clamped to maxScroll", maxScroll, view.scrollY)
-        assertEquals("final page index should be retained after clamped goToPage", finalPage, view.currentPageIndex())
+        assertEquals("tail extent must keep the final raw line top reachable", rawFinalTop, view.scrollY)
+        assertEquals("final page index should be retained at its raw top", finalPage, view.currentPageIndex())
 
         val moved = view.goToAdjacentPage(1)
 
         assertEquals("next from final page must return false for cross-spine advance", false, moved)
         assertEquals(finalPage, view.currentPageIndex())
-        assertEquals(maxScroll, view.scrollY)
+        assertEquals(rawFinalTop, view.scrollY)
+    }
+
+    @Test
+    fun `dynamic tail page beyond canonical last top remains reachable then reports boundary`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val layout = requireNotNull(view.textView.layout)
+        val canonicalLastIndex = view.pageCount() - 1
+        val canonicalLastTop = requireNotNull(view.pageTopPxAt(canonicalLastIndex))
+        val canonicalPreviousTop = requireNotNull(view.pageTopPxAt(canonicalLastIndex - 1))
+        var freeRest: Int? = null
+        var targetLine: Int? = null
+        for (candidateY in (canonicalLastTop - 1) downTo (canonicalPreviousTop + 1)) {
+            val viewportTopInLayout = (candidateY - view.textView.paddingTop).coerceAtLeast(0)
+            val intersectingLine = layout.getLineForVertical(viewportTopInLayout)
+            if (layout.getLineTop(intersectingLine) >= viewportTopInLayout) continue
+            view.scrollTo(0, candidateY)
+            val candidateTargetLine = fullLineRangeInViewport(view).last + 1
+            if (candidateTargetLine >= layout.lineCount) continue
+            if (layout.getLineTop(candidateTargetLine) <= canonicalLastTop) continue
+            freeRest = candidateY
+            targetLine = candidateTargetLine
+            break
+        }
+        val freeRestY = checkNotNull(freeRest) {
+            "test needs a FREE_REST tail viewport before canonicalLastTop=$canonicalLastTop"
+        }
+        val dynamicTargetLine = checkNotNull(targetLine)
+        val targetTop = layout.getLineTop(dynamicTargetLine)
+        val targetOffset = layout.getLineStart(dynamicTargetLine)
+        view.scrollTo(0, freeRestY)
+
+        val firstAccepted = view.goToAdjacentPage(1)
+        val finalY = view.scrollY
+        val visibleOffset = view.topLayoutOffset()
+        val secondAccepted = view.goToAdjacentPage(1)
+        val boundaryY = view.scrollY
+
+        assertTrue(
+            "the dynamic tail page must own its raw line top before the next turn reaches the boundary; " +
+                "canonicalLastTop=$canonicalLastTop targetTop=$targetTop finalY=$finalY boundaryY=$boundaryY " +
+                "targetOffset=$targetOffset visibleOffset=$visibleOffset " +
+                "firstAccepted=$firstAccepted secondAccepted=$secondAccepted",
+            targetTop > canonicalLastTop &&
+                firstAccepted && finalY == targetTop && visibleOffset == targetOffset &&
+                !secondAccepted && boundaryY == targetTop,
+        )
+    }
+
+    @Test
+    fun `cold land on last reaches the raw final line top before tail extent is remeasured`() {
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val view = EpubFlowView(
+            context = context,
+            onTapZone = {},
+            onTopOffsetChanged = {},
+            onSelectionRange = { _, _ -> },
+        )
+        activity.addContentView(view, ViewGroup.LayoutParams(360, 120))
+        view.textView.textSize = 18f
+        val chapterText = (1..80).joinToString("\n") { "Cold line $it marker text." }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(EpubDisplayBlock.Text(chapterText, headingLevel = null, paragraphIndex = 0)),
+        )
+        view.textView.text = flow.text
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+
+        view.setChapter(flow, flow.text, pageHeightPx = 120, landOnLast = true)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue("test requires several cold-paginated pages", view.pageCount() > 3)
+        val rawLastTop = requireNotNull(view.pageTopPxAt(view.pageCount() - 1))
+        val oldNaturalMaxScroll = (view.textView.height - view.height).coerceAtLeast(0)
+        assertTrue("test requires the raw final top beyond the old natural child max", rawLastTop > oldNaturalMaxScroll)
+        assertEquals(
+            "cold landOnLast must reach the paginator's raw last line top without waiting for a second measure",
+            rawLastTop,
+            view.scrollY,
+        )
     }
 
     @Test
@@ -1920,9 +3926,209 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `free fling defers reflow and chapter or mode replacement stops its old trajectory`() {
+        val reflowView = pagedFlowView()
+        reflowView.goToPage(1)
+        reflowView.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        assertEquals("FLING_FREE", reflowView.privateEnumName("pagedMotionState"))
+        val liveLayoutHeight = requireNotNull(reflowView.textView.layout).height
+        val stalePaginatedHeight = liveLayoutHeight - 1
+        reflowView.setPrivateField("paginatedLayoutHeight", stalePaginatedHeight)
+
+        reflowView.runReflowRunnable(idlePostedWork = false)
+
+        val reflowDeferred = reflowView.privateEnumName("pagedMotionState") == "FLING_FREE" &&
+            reflowView.privateInt("paginatedLayoutHeight") == stalePaginatedHeight
+
+        val chapterView = pagedFlowView()
+        chapterView.goToPage(1)
+        chapterView.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        val chapterFlow = chapterView.privateField("flow") as EpubChapterFlow
+        val chapterText = chapterView.textView.text
+        chapterView.setChapter(chapterFlow, chapterText, pageHeightPx = chapterView.height)
+        val chapterStartY = chapterView.scrollY
+        val chapterTrace = chapterView.computeScrollTraceWithoutPostedWork()
+
+        val modeView = pagedFlowView()
+        modeView.goToPage(1)
+        modeView.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        modeView.mode = EpubFlowView.Mode.SCROLL
+        val modeStartY = modeView.scrollY
+        val modeTrace = modeView.computeScrollTraceWithoutPostedWork()
+
+        assertTrue(
+            "FLING_FREE reflow must defer, and chapter/mode replacement must abort the old trajectory; " +
+                "reflowDeferred=$reflowDeferred reflowState=${reflowView.privateEnumName("pagedMotionState")} " +
+                "paginatedHeight=${reflowView.privateInt("paginatedLayoutHeight")} staleHeight=$stalePaginatedHeight " +
+                "chapterStartY=$chapterStartY chapterTrace=$chapterTrace " +
+                "modeStartY=$modeStartY modeTrace=$modeTrace",
+            reflowDeferred &&
+                chapterTrace.all { it == chapterStartY } &&
+                modeTrace.all { it == modeStartY },
+        )
+    }
+
+    @Test
+    fun `text reflow waits for dragging free finger ownership to release`() {
+        val view = pagedFlowView()
+        view.goToPage(1)
+        val x = view.width * 0.50f
+        val downY = view.height * 0.60f
+        val dragY = view.height * 0.15f
+        val downTime = SystemClock.uptimeMillis()
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, downY))
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 300L, MotionEvent.ACTION_MOVE, x, dragY))
+        assertEquals("DRAGGING_FREE", view.privateEnumName("pagedMotionState"))
+        val fingerOwnedY = view.scrollY
+        val oldPaginatedHeight = view.privateInt("paginatedLayoutHeight")
+
+        view.textView.text = view.textView.text.toString() + "\n" +
+            (81..120).joinToString("\n") { "Late reflow line $it marker text." }
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        val liveLayoutHeight = requireNotNull(view.textView.layout).height
+        assertTrue(
+            "fixture needs text layout height to change; old=$oldPaginatedHeight live=$liveLayoutHeight",
+            liveLayoutHeight != oldPaginatedHeight,
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(300L, TimeUnit.MILLISECONDS)
+        val duringDragY = view.scrollY
+        val paginatedDuringDrag = view.privateInt("paginatedLayoutHeight")
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 1_100L, MotionEvent.ACTION_UP, x, dragY))
+        shadowOf(Looper.getMainLooper()).idleFor(300L, TimeUnit.MILLISECONDS)
+        val paginatedAfterRelease = view.privateInt("paginatedLayoutHeight")
+
+        assertTrue(
+            "layout debounce must preserve the exact finger-owned viewport until release, then accept reflow; " +
+                "fingerOwnedY=$fingerOwnedY duringDragY=$duringDragY " +
+                "oldPaginatedHeight=$oldPaginatedHeight liveLayoutHeight=$liveLayoutHeight " +
+                "paginatedDuringDrag=$paginatedDuringDrag paginatedAfterRelease=$paginatedAfterRelease " +
+                "state=${view.privateEnumName("pagedMotionState")}",
+            duringDragY == fingerOwnedY &&
+                paginatedDuringDrag == oldPaginatedHeight &&
+                paginatedAfterRelease == liveLayoutHeight,
+        )
+    }
+
+    @Test
+    fun `deferred size reanchor during free fling owns its aligned viewport`() {
+        val chapterText = (1..80).joinToString("\n") { line ->
+            "Line $line has enough marker text to wrap differently when the viewport width changes."
+        }
+        val view = pagedFlowView(text = chapterText)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(2)
+        val oldFlingY = view.scrollY
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        assertEquals("FLING_FREE", view.privateEnumName("pagedMotionState"))
+        SystemClock.sleep(16L)
+        view.computeScroll()
+        val offsetAtResize = view.topLayoutOffset()
+
+        view.measure(exactly(240), exactly(120))
+        view.layout(0, 0, 240, 120)
+        shadowOf(Looper.getMainLooper()).idle()
+        repeat(160) {
+            if (view.privateEnumName("pagedMotionState") != "FLING_FREE") return@repeat
+            SystemClock.sleep(16L)
+            view.computeScroll()
+        }
+        assertEquals("ALIGNED", view.privateEnumName("pagedMotionState"))
+        val reanchoredY = view.scrollY
+        val reanchoredOffset = view.topLayoutOffset()
+
+        shadowOf(Looper.getMainLooper()).idle()
+        val finalY = view.scrollY
+        val trace = view.computeScrollTraceWithoutPostedWork()
+
+        assertTrue(
+            "the deferred size reanchor must retire the pre-resize free-fling trajectory; " +
+                "oldFlingY=$oldFlingY offsetAtResize=$offsetAtResize " +
+                "reanchoredY=$reanchoredY reanchoredOffset=$reanchoredOffset " +
+                "finalY=$finalY trace=$trace visibleOffset=${view.topLayoutOffset()}",
+            trace.all { it == finalY } &&
+                view.topLayoutOffset() == reanchoredOffset,
+        )
+    }
+
+    @Test
+    fun `dispose prevents text clear layout and queued work from reviving reflow or texture owners`() {
+        val view = pagedFlowView()
+        view.recycleCachedTexturesForTest()
+        view.preCachePageTexturesForTest(idlePostedWork = false)
+        assertTrue("fixture must leave one old texture callback queued", view.privateBool("pageTexturePrecachePending"))
+        val layoutGenerationAtDispose = view.privateField("pageLayoutGeneration") as Long
+        val paginatedHeightAtDispose = view.privateInt("paginatedLayoutHeight")
+
+        view.dispose()
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        assertEquals(
+            "disposed text clear and its layout callback must not repaginate the retired chapter",
+            layoutGenerationAtDispose,
+            view.privateField("pageLayoutGeneration") as Long,
+        )
+        assertEquals(
+            "disposed queued work must not replace the retired pagination geometry",
+            paginatedHeightAtDispose,
+            view.privateInt("paginatedLayoutHeight"),
+        )
+        assertFalse("disposed queued work must not leave texture work pending", view.privateBool("pageTexturePrecachePending"))
+        assertNull("disposed queued work must not recreate a front texture", view.privateField("cachedFrontBitmap"))
+        assertNull("disposed queued work must not recreate a target texture", view.privateField("cachedRevealedBitmap"))
+        assertNull("disposed queued work must not recreate a backward texture", view.privateField("cachedBackwardBitmap"))
+    }
+
+    @Test
+    fun `dispose silences queued size reanchor and pending boundary navigation`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val reportedOffsets = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTapZone = tapZones::add,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        view.goToLastPage()
+        view.layout(0, 0, 360, 0)
+        view.setPrivateField("awaitingReveal", true)
+        view.setPrivateField("pendingLandOnLast", true)
+        view.setPrivateField("pendingInitialPageTurnDelta", null)
+        assertTrue(view.goToAdjacentPage(1))
+        assertEquals(1, view.privateInt("pendingInitialPageTurnDelta"))
+        assertTrue("the boundary callback must still be pending before size settles", tapZones.isEmpty())
+
+        view.measure(exactly(420), exactly(120))
+        view.layout(0, 0, 420, 120)
+        assertEquals(
+            "the size-change settle must still own the queued boundary request before posted work drains",
+            1,
+            view.privateInt("pendingInitialPageTurnDelta"),
+        )
+        reportedOffsets.clear()
+        tapZones.clear()
+
+        view.dispose()
+        val retiredY = view.scrollY
+        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+
+        assertTrue(
+            "posted size reanchor work must be inert after dispose; " +
+                "retiredY=$retiredY finalY=${view.scrollY} " +
+                "reportedOffsets=$reportedOffsets tapZones=$tapZones",
+            view.scrollY == retiredY &&
+                reportedOffsets.isEmpty() &&
+                tapZones.isEmpty(),
+        )
+    }
+
+    @Test
     fun `discrete paper turn recycles stale cached textures when top keys mismatch`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.recycleCachedTexturesForTest()
         val pageZeroTop = requireNotNull(view.pageTopPxAt(0))
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val staleFront = Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565)
@@ -1949,6 +4155,7 @@ class EpubFlowViewTest {
     fun `discrete paper turn ignores recycled cached textures and snapshots live pages`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.recycleCachedTexturesForTest()
         val pageZeroTop = requireNotNull(view.pageTopPxAt(0))
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val recycledFront = Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565).apply { recycle() }
@@ -1973,6 +4180,7 @@ class EpubFlowViewTest {
     fun `discrete paper turn treats partial cached textures as stale and snapshots live pages`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.recycleCachedTexturesForTest()
         val pageZeroTop = requireNotNull(view.pageTopPxAt(0))
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val partialRevealed = Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565)
@@ -1997,6 +4205,7 @@ class EpubFlowViewTest {
     fun `precache refreshes recycled cached textures even when top keys match`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.recycleCachedTexturesForTest()
         val pageZeroTop = requireNotNull(view.pageTopPxAt(0))
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
         val recycledFront = Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565).apply { recycle() }
@@ -2041,17 +4250,279 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `dequeued precache front callback cannot overwrite the replacement request front`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        val background = RecordingTargetBitmapDrawable()
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+
+        try {
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            val dequeuedAFront = view.privateField("capturePrecacheFrontRunnable") as Runnable
+
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            val bRequest = checkNotNull(view.privateField("pendingPageTexturePrecache"))
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val bFront = checkNotNull(bRequest.reflectedField("frontBitmap") as Bitmap?)
+            val drawsBeforeLateA = background.targetBitmaps.toList()
+
+            dequeuedAFront.run()
+
+            assertTrue(
+                "an already-dequeued A precache callback must not read or overwrite replacement B; " +
+                    "sameOwner=${view.privateField("pendingPageTexturePrecache") === bRequest} " +
+                    "sameFront=${bRequest.reflectedField("frontBitmap") === bFront} " +
+                    "drawsBefore=$drawsBeforeLateA drawsAfter=${background.targetBitmaps} " +
+                    "frontRecycled=${bFront.isRecycled} pending=${view.privateBool("pageTexturePrecachePending")} " +
+                    "committed=[${view.privateField("cachedFrontBitmap")}," +
+                    "${view.privateField("cachedBackwardBitmap")},${view.privateField("cachedRevealedBitmap")} ]",
+                view.privateField("pendingPageTexturePrecache") === bRequest &&
+                    bRequest.reflectedField("frontBitmap") === bFront &&
+                    background.targetBitmaps == drawsBeforeLateA &&
+                    !bFront.isRecycled &&
+                    view.privateBool("pageTexturePrecachePending") &&
+                    view.privateField("cachedFrontBitmap") == null &&
+                    view.privateField("cachedBackwardBitmap") == null &&
+                    view.privateField("cachedRevealedBitmap") == null,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `precache snapshot invalidated during draw recycles A without touching replacement B`() {
+        lateinit var view: EpubFlowView
+        var armed = false
+        var replaced = false
+        var replacementRequest: Any? = null
+        var allocatedByA: Bitmap? = null
+        var requestA: Any? = null
+        val background = RecordingTargetBitmapDrawable {
+            if (armed && !replaced) {
+                replaced = true
+                view.recycleCachedTexturesForTest()
+                view.preCachePageTexturesForTest(idlePostedWork = false)
+                replacementRequest = view.privateField("pendingPageTexturePrecache")
+            }
+        }
+        view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        armed = true
+
+        try {
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            requestA = checkNotNull(view.privateField("pendingPageTexturePrecache"))
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            allocatedByA = background.targetBitmaps.single()
+            val requestB = checkNotNull(replacementRequest)
+
+            assertTrue("callback must replace precache request A with B", replaced && requestB !== requestA)
+            assertTrue(
+                "A returning from snapshot draw must not clear or populate replacement B; " +
+                    "owner=${view.privateField("pendingPageTexturePrecache")} requestB=$requestB " +
+                    "frontB=${requestB.reflectedField("frontBitmap")} " +
+                    "targetB=${requestB.reflectedField("targetBitmap")} " +
+                    "previousB=${requestB.reflectedField("previousBitmap")} " +
+                    "pending=${view.privateBool("pageTexturePrecachePending")}",
+                view.privateField("pendingPageTexturePrecache") === requestB &&
+                    requestB.reflectedField("frontBitmap") == null &&
+                    requestB.reflectedField("targetBitmap") == null &&
+                    requestB.reflectedField("previousBitmap") == null &&
+                    view.privateBool("pageTexturePrecachePending") &&
+                    view.privateField("capturePrecacheFrontRunnable") != null &&
+                    view.privateField("cachedFrontBitmap") == null &&
+                    view.privateField("cachedRevealedBitmap") == null &&
+                    view.privateField("cachedBackwardBitmap") == null,
+            )
+            assertTrue(
+                "the stale background snapshot allocated by A must be recycled before its callback returns",
+                allocatedByA!!.isRecycled,
+            )
+        } finally {
+            allocatedByA?.let { if (!it.isRecycled) it.recycle() }
+            (requestA?.reflectedField("frontBitmap") as Bitmap?)?.let { if (!it.isRecycled) it.recycle() }
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `staged precache is transferred or recycled before direct and discrete page shots`() {
+        data class Scenario(
+            val name: String,
+            val direct: Boolean,
+            val forward: Boolean,
+            val stagedFrames: Int,
+        )
+
+        val scenarios = listOf(
+            Scenario("complete forward discrete", direct = false, forward = true, stagedFrames = 2),
+            Scenario("complete forward direct", direct = true, forward = true, stagedFrames = 2),
+            Scenario("incomplete backward direct", direct = true, forward = false, stagedFrames = 1),
+        )
+        val failures = mutableListOf<String>()
+
+        scenarios.forEach { scenario ->
+            var stagedFront: Bitmap? = null
+            val partialRecycleStateBeforeFallbackDraw = mutableListOf<Boolean>()
+            val background = RecordingTargetBitmapDrawable {
+                stagedFront?.let { partialRecycleStateBeforeFallbackDraw += it.isRecycled }
+            }
+            val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+            assertTrue("${scenario.name}: pageCount=${view.pageCount()}", view.pageCount() > 3)
+            view.goToPage(1)
+            view.background = background
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            background.targetBitmaps.clear()
+
+            try {
+                view.preCachePageTexturesForTest(idlePostedWork = false)
+                repeat(scenario.stagedFrames) { shadowOf(Looper.getMainLooper()).runOneTask() }
+                val staged = background.targetBitmaps.toList()
+                stagedFront = staged.first()
+                val started = if (scenario.direct) {
+                    view.beginInteractiveCurl(
+                        forward = scenario.forward,
+                        anchorX = if (scenario.forward) view.width.toFloat() else 0f,
+                    )
+                } else {
+                    view.goToAdjacentPage(if (scenario.forward) 1 else -1)
+                }
+                val paper = view.privateField("curlDrawable") as PageCurlDrawable?
+                val pending = view.privateField("pendingPageTexturePrecache")
+                val pendingFlag = view.privateBool("pageTexturePrecachePending")
+
+                val ownerWasResolvedBeforeForegroundCapture = if (scenario.stagedFrames == 2) {
+                    val stagedTarget = staged[1]
+                    started && paper != null &&
+                        background.targetBitmaps.size == 2 &&
+                        pending == null && !pendingFlag &&
+                        paper.privateBitmap("frontBitmap") === stagedFront &&
+                        paper.privateBitmap("revealedBitmap") === stagedTarget &&
+                        !stagedFront!!.isRecycled && !stagedTarget.isRecycled
+                } else {
+                    started && paper != null &&
+                        background.targetBitmaps.size == 3 &&
+                        pending == null && !pendingFlag &&
+                        stagedFront!!.isRecycled &&
+                        partialRecycleStateBeforeFallbackDraw.size == 2 &&
+                        partialRecycleStateBeforeFallbackDraw.all { it }
+                }
+
+                if (!ownerWasResolvedBeforeForegroundCapture) {
+                    failures +=
+                        "${scenario.name}: started=$started staged=${staged.size} " +
+                            "draws=${background.targetBitmaps.size} pending=$pending pendingFlag=$pendingFlag " +
+                            "stagedFrontRecycled=${stagedFront!!.isRecycled} " +
+                            "recycledBeforeFallback=$partialRecycleStateBeforeFallbackDraw " +
+                            "paperFront=${paper?.runCatching { privateBitmap("frontBitmap") }?.getOrNull()} " +
+                            "paperTarget=${paper?.runCatching { privateBitmap("revealedBitmap") }?.getOrNull()}"
+                }
+            } finally {
+                view.dispose()
+            }
+        }
+
+        assertTrue(
+            "a turn must transfer a complete staged pair or recycle an incomplete owner before fallback: $failures",
+            failures.isEmpty(),
+        )
+    }
+
+    @Test
+    fun `large viewport precache keeps current and forward target without opposite owner`() {
+        val view = pagedFlowView(
+            text = (1..800).joinToString("\n") { "Line $it marker text." },
+            viewportWidth = 1_600,
+            viewportHeight = 2_560,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        view.recycleCachedTexturesForTest()
+
+        view.preCachePageTexturesForTest()
+
+        val current = view.privateField("cachedFrontBitmap") as Bitmap?
+        val forward = view.privateField("cachedRevealedBitmap") as Bitmap?
+        val opposite = view.privateField("cachedBackwardBitmap") as Bitmap?
+        assertTrue(
+            "a 1600x2560 ARGB_8888 viewport exceeds the page-shot budget at three owners; " +
+                "current=$current forward=$forward opposite=$opposite " +
+                "configs=${listOf(current?.config, forward?.config, opposite?.config)}",
+            current?.config == Bitmap.Config.ARGB_8888 &&
+                forward?.config == Bitmap.Config.ARGB_8888 &&
+                opposite == null,
+        )
+    }
+
+    @Test
+    fun `middle page precache captures one shot per frame and commits all three atomically`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        val background = RecordingBoundsTopDrawable()
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.boundsTops.clear()
+
+        fun cacheOwners(): List<Bitmap?> = listOf(
+            view.privateField("cachedFrontBitmap") as Bitmap?,
+            view.privateField("cachedBackwardBitmap") as Bitmap?,
+            view.privateField("cachedRevealedBitmap") as Bitmap?,
+        )
+
+        try {
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val drawsAfterFirst = background.boundsTops.size
+            val cacheAfterFirst = cacheOwners()
+            val pendingAfterFirst = view.privateBool("pageTexturePrecachePending")
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val drawsAfterSecond = background.boundsTops.size
+            val cacheAfterSecond = cacheOwners()
+            val pendingAfterSecond = view.privateBool("pageTexturePrecachePending")
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val drawsAfterThird = background.boundsTops.size
+            val cacheAfterThird = cacheOwners()
+            val pendingAfterThird = view.privateBool("pageTexturePrecachePending")
+
+            assertTrue(
+                "middle-page precache must capture one page shot per frame and publish only a complete triple; " +
+                    "draws=[$drawsAfterFirst,$drawsAfterSecond,$drawsAfterThird] " +
+                    "cacheAfterFirst=$cacheAfterFirst cacheAfterSecond=$cacheAfterSecond " +
+                    "cacheAfterThird=$cacheAfterThird " +
+                    "pending=[$pendingAfterFirst,$pendingAfterSecond,$pendingAfterThird]",
+                drawsAfterFirst == 1 && cacheAfterFirst.all { it == null } && pendingAfterFirst &&
+                    drawsAfterSecond == 2 && cacheAfterSecond.all { it == null } && pendingAfterSecond &&
+                    drawsAfterThird == 3 && cacheAfterThird.all { it != null && !it.isRecycled } &&
+                    !pendingAfterThird,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `precache skips hidden initial reveal layer`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
-        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
-        view.setPrivateField("cachedFrontBitmap", null)
-        view.setPrivateField("cachedRevealedBitmap", null)
-        view.setPrivateField("cachedFromPage", -1)
-        view.setPrivateField("cachedTargetPage", -1)
-        view.setPrivateField("cachedFromTopPx", -1)
-        view.setPrivateField("cachedTargetTopPx", -1)
+        view.recycleCachedTexturesForTest()
         view.getChildAt(0).alpha = 0f
 
         view.preCachePageTexturesForTest()
@@ -2064,14 +4535,7 @@ class EpubFlowViewTest {
     fun `precache discards partial texture pair when revealed snapshot fails`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
-        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
-        view.setPrivateField("cachedFrontBitmap", null)
-        view.setPrivateField("cachedRevealedBitmap", null)
-        view.setPrivateField("cachedFromPage", -1)
-        view.setPrivateField("cachedTargetPage", -1)
-        view.setPrivateField("cachedFromTopPx", -1)
-        view.setPrivateField("cachedTargetTopPx", -1)
+        view.recycleCachedTexturesForTest()
         view.background = ThrowOnSecondDrawDrawable()
 
         view.preCachePageTexturesForTest()
@@ -2088,14 +4552,7 @@ class EpubFlowViewTest {
     fun `pending precache does not commit while discrete paper turn is active`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
-        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
-        view.setPrivateField("cachedFrontBitmap", null)
-        view.setPrivateField("cachedRevealedBitmap", null)
-        view.setPrivateField("cachedFromPage", -1)
-        view.setPrivateField("cachedTargetPage", -1)
-        view.setPrivateField("cachedFromTopPx", -1)
-        view.setPrivateField("cachedTargetTopPx", -1)
+        view.recycleCachedTexturesForTest()
 
         view.preCachePageTexturesForTest(idlePostedWork = false)
         assertTrue(view.goToAdjacentPage(1))
@@ -2118,14 +4575,7 @@ class EpubFlowViewTest {
             onTopOffsetChanged = reportedOffsets::add,
         )
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
-        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
-        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
-        view.setPrivateField("cachedFrontBitmap", null)
-        view.setPrivateField("cachedRevealedBitmap", null)
-        view.setPrivateField("cachedFromPage", -1)
-        view.setPrivateField("cachedTargetPage", -1)
-        view.setPrivateField("cachedFromTopPx", -1)
-        view.setPrivateField("cachedTargetTopPx", -1)
+        view.recycleCachedTexturesForTest()
         reportedOffsets.clear()
         assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
         view.updateInteractiveCurl(x = view.width * 0.55f)
@@ -2173,12 +4623,7 @@ class EpubFlowViewTest {
     fun `precache waits until pending image decodes finish`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
-        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
-        view.setPrivateField("cachedFrontBitmap", null)
-        view.setPrivateField("cachedRevealedBitmap", null)
-        view.setPrivateField("cachedFromPage", -1)
-        view.setPrivateField("cachedTargetPage", -1)
+        view.recycleCachedTexturesForTest()
         view.pendingDecodesProvider = { true }
 
         view.preCachePageTexturesForTest()
@@ -2191,12 +4636,7 @@ class EpubFlowViewTest {
     fun `precache waits until image reflow pagination matches the live layout`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        (view.privateField("cachedFrontBitmap") as Bitmap?)?.recycle()
-        (view.privateField("cachedRevealedBitmap") as Bitmap?)?.recycle()
-        view.setPrivateField("cachedFrontBitmap", null)
-        view.setPrivateField("cachedRevealedBitmap", null)
-        view.setPrivateField("cachedFromPage", -1)
-        view.setPrivateField("cachedTargetPage", -1)
+        view.recycleCachedTexturesForTest()
         val layoutHeight = requireNotNull(view.textView.layout).height
         view.setPrivateField("paginatedLayoutHeight", layoutHeight - 1)
 
@@ -2248,7 +4688,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `temporary scroll release does not trigger tap zone`() {
+    fun `slow temporary scroll release keeps its exact non canonical free rest`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val view = pagedFlowView(onTapZone = tapZones::add)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -2260,7 +4700,7 @@ class EpubFlowViewTest {
         view.dispatchTouchEvent(
             motionEvent(
                 downTime,
-                downTime + 24L,
+                downTime + 300L,
                 MotionEvent.ACTION_MOVE,
                 startX,
                 view.height * 0.30f,
@@ -2269,16 +4709,20 @@ class EpubFlowViewTest {
         view.dispatchTouchEvent(
             motionEvent(
                 downTime,
-                downTime + 48L,
+                downTime + 700L,
                 MotionEvent.ACTION_MOVE,
                 startX,
                 view.height * 0.10f,
             ),
         )
+        val canonicalTops = (0 until view.pageCount()).mapNotNull { view.pageTopPxAt(it) }.toSet()
+        while (view.scrollY in canonicalTops) view.scrollTo(0, view.scrollY + 1)
+        val releasedAt = view.scrollY
+        assertTrue("test must release between canonical page tops", releasedAt !in canonicalTops)
         view.dispatchTouchEvent(
             motionEvent(
                 downTime,
-                downTime + 72L,
+                downTime + 1_100L,
                 MotionEvent.ACTION_UP,
                 startX,
                 view.height * 0.10f,
@@ -2286,33 +4730,301 @@ class EpubFlowViewTest {
         )
 
         assertEquals("temporary-scroll UP must not be treated as a clean tap", emptyList<EpubFlowTapZone>(), tapZones)
-        val canonicalTops = (0 until view.pageCount()).mapNotNull { view.textureTopPxForPageForTest(it) }.toSet()
+        assertEquals(
+            "a slow UP must retain the arbitrary viewport instead of snapping to a paginator anchor",
+            releasedAt,
+            view.scrollY,
+        )
+        assertTrue("FREE_REST must re-arm full-line clipping", view.privateBool("pageClipActive"))
+    }
+
+    @Test
+    fun `fast temporary scroll release continues with native fling without snapping`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
+        view.goToPage(1)
+        val x = view.width * 0.50f
+        val downY = view.height * 0.50f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, downY))
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime + 16L, MotionEvent.ACTION_MOVE, x, view.height * 0.35f),
+        )
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime + 32L, MotionEvent.ACTION_MOVE, x, view.height * 0.15f),
+        )
+        val canonicalTops = (0 until view.pageCount()).mapNotNull { view.pageTopPxAt(it) }.toSet()
+        while (view.scrollY in canonicalTops) view.scrollTo(0, view.scrollY + 1)
+        val releasedAt = view.scrollY
+        assertTrue("test must release between canonical page tops", releasedAt !in canonicalTops)
+
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime + 40L, MotionEvent.ACTION_UP, x, view.height * 0.10f),
+        )
+
+        assertEquals("UP must not synchronously snap away from the finger's release pixel", releasedAt, view.scrollY)
+        val stateAfterUp = (view.privateField("pagedMotionState") as Enum<*>).name
+        val clipAfterUp = view.privateBool("pageClipActive")
+        val childHeight = view.getChildAt(0).height
+        val scrollRange = (childHeight - view.height).coerceAtLeast(0)
+        val scrollTrace = mutableListOf(view.scrollY)
+        val stateTrace = mutableListOf(stateAfterUp)
+        repeat(4) {
+            shadowOf(Looper.getMainLooper()).idleFor(16L, TimeUnit.MILLISECONDS)
+            view.computeScroll()
+            scrollTrace += view.scrollY
+            stateTrace += (view.privateField("pagedMotionState") as Enum<*>).name
+        }
         assertTrue(
-            "temporary-scroll UP should settle on a canonical paged anchor, scrollY=${view.scrollY}, pages=$canonicalTops",
-            view.scrollY in canonicalTops,
+            "a fast upward release must keep advancing after the finger lifts; " +
+                "stateAfterUp=$stateAfterUp clipAfterUp=$clipAfterUp childHeight=$childHeight " +
+                "viewportHeight=${view.height} scrollRange=$scrollRange releasedAt=$releasedAt " +
+                "scrollTrace=$scrollTrace stateTrace=$stateTrace",
+            view.scrollY > releasedAt,
+        )
+        assertTrue("kinetic FREE_REST must not quantize onto a paginator anchor", view.scrollY !in canonicalTops)
+    }
+
+    @Test
+    fun `stationary tap during free fling only stops inertia without firing a tap zone`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val view = pagedFlowView(onTapZone = tapZones::add)
+        view.goToPage(1)
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        assertEquals("FLING_FREE", view.privateEnumName("pagedMotionState"))
+        val x = view.width * 0.50f
+        val y = view.height * 0.50f
+        val downTime = SystemClock.uptimeMillis()
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, y))
+        val stoppedAt = view.scrollY
+        view.dispatchTouchEvent(motionEvent(downTime, downTime + 16L, MotionEvent.ACTION_UP, x, y))
+        val stoppedTrace = view.computeScrollTraceWithoutPostedWork()
+
+        assertTrue(
+            "a no-displacement tap may stop inertia but must not navigate or toggle chrome; " +
+                "tapZones=$tapZones stoppedAt=$stoppedAt trace=$stoppedTrace",
+            tapZones.isEmpty() && stoppedTrace.all { it == stoppedAt },
         )
     }
 
     @Test
-    fun `temporary scroll release normalizes to canonical page anchor`() {
-        val view = pagedFlowView()
-        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
-        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
-        val pageTwoTop = requireNotNull(view.pageTopPxAt(2))
-        val layout = requireNotNull(view.textView.layout)
-        val midLineTop = (layout.getLineForVertical(pageOneTop + 1) + 1 until layout.lineCount)
-            .map { layout.getLineTop(it) }
-            .first { it in (pageOneTop + 1) until pageTwoTop }
-        view.scrollTo(0, midLineTop)
+    fun `stationary fling stop consumes host tap and does not activate a clickable span`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        var linkClicks = 0
+        val text = "Open linked chapter without activating it while stopping inertia.\n" +
+            (1..80).joinToString("\n") { "Line $it marker text." }
+        val linkStart = text.indexOf("linked")
+        val spannable = SpannableString(text).apply {
+            setSpan(
+                object : ClickableSpan() {
+                    override fun onClick(widget: View) {
+                        linkClicks += 1
+                    }
+                },
+                linkStart,
+                linkStart + "linked".length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val view = pagedFlowView(onTapZone = tapZones::add, spannable = spannable, text = text)
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        assertEquals("FLING_FREE", view.privateEnumName("pagedMotionState"))
+        val linkPoint = view.pointForTextOffset(linkStart + 1)
+        val downTime = SystemClock.uptimeMillis()
 
-        view.settleTemporaryScrollAnchorForTest()
-
-        val canonicalTops = (0 until view.pageCount()).mapNotNull { view.textureTopPxForPageForTest(it) }.toSet()
-        assertTrue(
-            "temporary scroll release must land on a real paged anchor, scrollY=${view.scrollY}, pages=$canonicalTops",
-            view.scrollY in canonicalTops,
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, linkPoint.first, linkPoint.second),
         )
-        assertEquals("current page should describe the parked canonical anchor", view.pageTopPxAt(view.currentPageIndex()), view.scrollY)
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime + 16L, MotionEvent.ACTION_UP, linkPoint.first, linkPoint.second),
+        )
+
+        val consumedId = dev.readflow.render.api.R.id.selection_aware_interactive_tap_consumed
+        assertTrue(
+            "a fling-stop tap must be visibly consumed by both host surfaces without activating content; " +
+                "viewConsumed=${view.getTag(consumedId)} textConsumed=${view.textView.getTag(consumedId)} " +
+                "linkClicks=$linkClicks tapZones=$tapZones",
+            view.getTag(consumedId) == true &&
+                view.textView.getTag(consumedId) == true &&
+                linkClicks == 0 && tapZones.isEmpty(),
+        )
+    }
+
+    @Test
+    fun `free fling publishes only after two computed stable frames and not after a dropped frame`() {
+        val reports = mutableListOf<Int>()
+        val view = pagedFlowView(onTopOffsetChanged = reports::add)
+        view.goToPage(1)
+        reports.clear()
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        view.setPrivateField("freeFlingStartedAtMs", SystemClock.uptimeMillis() - 100L)
+
+        SystemClock.sleep(16L)
+        val beforeMovingCompute = view.scrollY
+        view.computeScroll()
+        val afterMovingCompute = view.scrollY
+        val stateAfterMovingCompute = view.privateEnumName("pagedMotionState")
+        val reportsAfterMovingCompute = reports.toList()
+
+        view.fling(0)
+        view.setPrivateField("freeFlingStableFrames", 0)
+        view.computeScroll()
+        val stateAfterFirstStable = view.privateEnumName("pagedMotionState")
+        val reportsAfterFirstStable = reports.toList()
+        SystemClock.sleep(120L)
+        val stateAfterDroppedFrame = view.privateEnumName("pagedMotionState")
+        val reportsAfterDroppedFrame = reports.toList()
+        view.computeScroll()
+
+        assertTrue(
+            "fling settle must observe movement after super.computeScroll and require two computed stable frames; " +
+                "beforeMoving=$beforeMovingCompute afterMoving=$afterMovingCompute " +
+                "stateAfterMoving=$stateAfterMovingCompute reportsAfterMoving=$reportsAfterMovingCompute " +
+                "stateAfterFirstStable=$stateAfterFirstStable reportsAfterFirstStable=$reportsAfterFirstStable " +
+                "stateAfterDropped=$stateAfterDroppedFrame reportsAfterDropped=$reportsAfterDroppedFrame " +
+                "finalState=${view.privateEnumName("pagedMotionState")} finalReports=$reports",
+            afterMovingCompute > beforeMovingCompute &&
+                stateAfterMovingCompute == "FLING_FREE" && reportsAfterMovingCompute.isEmpty() &&
+                stateAfterFirstStable == "FLING_FREE" && reportsAfterFirstStable.isEmpty() &&
+                stateAfterDroppedFrame == "FLING_FREE" && reportsAfterDroppedFrame.isEmpty() &&
+                view.privateEnumName("pagedMotionState") == "FREE_REST" && reports.size == 1,
+        )
+    }
+
+    @Test
+    fun `natural free fling settle terminates its trajectory before publishing rest`() {
+        val reports = mutableListOf<Int>()
+        val view = pagedFlowView(onTopOffsetChanged = reports::add)
+        view.goToPage(1)
+        reports.clear()
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        val movingTrace = mutableListOf<Int>()
+
+        repeat(160) {
+            if (view.privateEnumName("pagedMotionState") != "FLING_FREE") return@repeat
+            SystemClock.sleep(16L)
+            view.computeScroll()
+            movingTrace += view.scrollY
+        }
+
+        assertEquals(
+            "the real scroller must reach FREE_REST within the deterministic frame budget; traceTail=${movingTrace.takeLast(8)}",
+            "FREE_REST",
+            view.privateEnumName("pagedMotionState"),
+        )
+        val settledY = view.scrollY
+        val reportsAtSettle = reports.toList()
+        val postSettleTrace = buildList {
+            repeat(12) {
+                SystemClock.sleep(16L)
+                view.computeScroll()
+                add(view.scrollY)
+            }
+        }
+
+        assertTrue(
+            "once FREE_REST publishes, no residual native trajectory may move content or report again; " +
+                "settledY=$settledY postSettleTrace=$postSettleTrace " +
+                "reportsAtSettle=$reportsAtSettle finalReports=$reports",
+            postSettleTrace.all { it == settledY } &&
+                reportsAtSettle.size == 1 && reports == reportsAtSettle,
+        )
+    }
+
+    @Test
+    fun `programmatic same chapter navigation aborts the old free fling trajectory`() {
+        val reports = mutableListOf<Int>()
+        val view = pagedFlowView(onTopOffsetChanged = reports::add)
+        view.goToPage(1)
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        assertEquals("FLING_FREE", view.privateEnumName("pagedMotionState"))
+        val targetTop = requireNotNull(view.pageTopPxAt(0))
+        val layout = requireNotNull(view.textView.layout)
+        val targetOffset = layout.getLineStart(layout.getLineForVertical(targetTop))
+        reports.clear()
+
+        view.goToOffset(targetOffset)
+        val trace = view.computeScrollTraceWithoutPostedWork()
+
+        assertTrue(
+            "public same-chapter navigation must own the final viewport after aborting the old scroller; " +
+                "targetTop=$targetTop trace=$trace state=${view.privateEnumName("pagedMotionState")} " +
+                "targetOffset=$targetOffset visibleOffset=${view.topLayoutOffset()} reports=$reports",
+            trace.all { it == targetTop } &&
+                view.privateEnumName("pagedMotionState") == "ALIGNED" &&
+                view.topLayoutOffset() == targetOffset &&
+                reports.lastOrNull() == targetOffset,
+        )
+    }
+
+    @Test
+    fun `anchored paged to scroll replacement during free fling owns the target viewport`() {
+        val view = pagedFlowView()
+        view.goToPage(1)
+        val oldFlingY = view.scrollY
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        assertEquals("FLING_FREE", view.privateEnumName("pagedMotionState"))
+        val layout = requireNotNull(view.textView.layout)
+        val targetOffset = layout.getLineStart(0)
+        val targetY = layout.getLineTop(0)
+        assertTrue("fixture needs a replacement target away from the old fling viewport", targetY != oldFlingY)
+
+        view.setModeAnchored(EpubFlowView.Mode.SCROLL, targetOffset)
+        val trace = listOf(view.scrollY) + view.computeScrollTraceWithoutPostedWork()
+
+        assertTrue(
+            "the anchored mode target must retire the old free-fling trajectory; " +
+                "oldFlingY=$oldFlingY targetY=$targetY trace=$trace " +
+                "visibleOffset=${view.topLayoutOffset()} targetOffset=$targetOffset",
+            trace.all { it == targetY } &&
+                view.topLayoutOffset() == targetOffset,
+        )
+    }
+
+    @Test
+    fun `new chapter restore after posted settle retires the old free fling trajectory`() {
+        val view = pagedFlowView()
+        view.goToPage(1)
+        val oldFlingY = view.scrollY
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        assertEquals("FLING_FREE", view.privateEnumName("pagedMotionState"))
+        val incomingText = (1..100).joinToString("\n") { "Replacement chapter line $it owns this viewport." }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+        val restoreOffset = incomingFlow.offsetForParagraph(
+            0,
+            incomingText.indexOf("Replacement chapter line 40"),
+        )
+
+        view.setChapter(
+            incomingFlow,
+            incomingFlow.text,
+            pageHeightPx = view.height,
+            restoreOffset = restoreOffset,
+        )
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.measure(exactly(360), exactly(120))
+        view.layout(0, 0, 360, 120)
+        shadowOf(Looper.getMainLooper()).idle()
+        val restoredY = view.scrollY
+        val restoredOffset = view.topLayoutOffset()
+        assertTrue("fixture needs the new chapter restore away from the old fling viewport", restoredY != oldFlingY)
+
+        val trace = view.computeScrollTraceWithoutPostedWork()
+
+        assertTrue(
+            "the settled replacement chapter must keep ownership after later computeScroll calls; " +
+                "oldFlingY=$oldFlingY restoredY=$restoredY trace=$trace " +
+                "restoredOffset=$restoredOffset visibleOffset=${view.topLayoutOffset()}",
+            trace.all { it == restoredY } &&
+                view.topLayoutOffset() == restoredOffset,
+        )
     }
 
     @Test
@@ -3143,6 +5855,97 @@ class EpubFlowViewTest {
         }
     }
 
+    @Test
+    fun `bottom padded oversized image keeps the same live and snapshot bottom strip`() {
+        val imageColor = 0xFF1A8F5D.toInt()
+        val builder = SpannableString("A\n￼\nB")
+        val imageDrawable = ColorDrawable(imageColor).apply {
+            setBounds(0, 0, 360, 300)
+        }
+        builder.setSpan(
+            ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
+            2,
+            3,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        val view = pagedFlowView(
+            spannable = builder,
+            textPaddingBottom = 11,
+        )
+        val layout = requireNotNull(view.textView.layout)
+        val imageLineTop = layout.getLineTop(1)
+        assertTrue("fixture needs one oversized line", layout.getLineBottom(1) - imageLineTop > view.height)
+        view.setPrivateField("pageClipActive", true)
+        view.scrollTo(0, imageLineTop)
+        val liveClipBottom = view.pageClipBottomForTest()
+        val liveVisibleBottom = liveClipBottom?.let { clipBottom ->
+            imageLineTop + clipBottom + view.textView.paddingTop
+        } ?: (imageLineTop + view.height)
+        val snapshotVisibleBottom = view.snapshotClipBottomForTest(imageLineTop)
+        val live = view.drawToBitmapForTest()
+        val snapshot = requireNotNull(view.snapshotPageAt(imageLineTop))
+        try {
+            val liveBottomPixel = live.getPixel(view.width / 2, view.height - 1)
+            val snapshotBottomPixel = snapshot.getPixel(view.width / 2, view.height - 1)
+            val expectedVisibleBottom = imageLineTop + view.height
+            assertTrue(
+                "bottom padding must not remove a pixel strip from an indivisible oversized line; " +
+                    "paddingBottom=${view.textView.paddingBottom} liveClipBottom=$liveClipBottom " +
+                    "liveVisibleBottom=$liveVisibleBottom snapshotVisibleBottom=$snapshotVisibleBottom " +
+                    "expectedVisibleBottom=$expectedVisibleBottom " +
+                    "liveBottomPixel=$liveBottomPixel snapshotBottomPixel=$snapshotBottomPixel imageColor=$imageColor",
+                liveVisibleBottom == expectedVisibleBottom &&
+                    snapshotVisibleBottom == expectedVisibleBottom &&
+                    liveBottomPixel == imageColor && snapshotBottomPixel == imageColor,
+            )
+        } finally {
+            live.recycle()
+            snapshot.recycle()
+        }
+    }
+
+    @Test
+    fun `free rest inside an oversized image keeps that line visible and locatable`() {
+        val tallImageHeight = 300
+        val builder = SpannableString("A\n￼\nB")
+        val imageDrawable = ColorDrawable(0xFF1A8F5D.toInt()).apply {
+            setBounds(0, 0, 360, tallImageHeight)
+        }
+        builder.setSpan(
+            ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
+            2,
+            3,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        val view = pagedFlowView(spannable = builder)
+        val layout = requireNotNull(view.textView.layout)
+        val imageLine = 1
+        val imageLineTop = layout.getLineTop(imageLine)
+        val imageLineBottom = layout.getLineBottom(imageLine)
+        assertTrue("test requires one indivisible line taller than the viewport", imageLineBottom - imageLineTop > view.height)
+        val freeRest = imageLineTop + 50
+        assertTrue("FREE_REST must stay inside the oversized image line", freeRest in (imageLineTop + 1) until imageLineBottom)
+
+        view.scrollTo(0, freeRest)
+        view.setPrivateField("pageClipActive", true)
+
+        assertEquals(
+            "live top clipping inside an oversized line must keep its visible viewport slice",
+            freeRest,
+            view.pageClipTopForTest(),
+        )
+        assertEquals(
+            "snapshot top clipping inside an oversized line must keep the same viewport slice",
+            freeRest,
+            view.snapshotClipTopForTest(freeRest),
+        )
+        assertEquals(
+            "FREE_REST locator inside an oversized line must remain on that indivisible line",
+            layout.getLineStart(imageLine),
+            view.topLayoutOffset(),
+        )
+    }
+
     private fun pagedFlowView(
         flipStyle: PageFlipStyle = PageFlipStyle.NONE,
         onTapZone: (EpubFlowTapZone) -> Unit = {},
@@ -3150,6 +5953,11 @@ class EpubFlowViewTest {
         spannable: CharSequence? = null,
         text: String? = null,
         textPaddingTop: Int = 0,
+        textPaddingBottom: Int = 0,
+        viewportWidth: Int = 360,
+        viewportHeight: Int = 120,
+        pageShotBudget: PageShotBudget = PageShotBudget(48L * 1024L * 1024L),
+        onPinnedPageShotAdmissionNeeded: (() -> Unit)? = null,
     ): EpubFlowView {
         val context = RuntimeEnvironment.getApplication() as Application
         val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
@@ -3158,26 +5966,59 @@ class EpubFlowViewTest {
             onTapZone = onTapZone,
             onTopOffsetChanged = onTopOffsetChanged,
             onSelectionRange = { _, _ -> },
+            pageShotBudget = pageShotBudget,
+            onPinnedPageShotAdmissionNeeded = onPinnedPageShotAdmissionNeeded,
         )
-        activity.addContentView(view, ViewGroup.LayoutParams(360, 120))
+        activity.addContentView(view, ViewGroup.LayoutParams(viewportWidth, viewportHeight))
         view.flipStyle = flipStyle
         view.textView.textSize = 18f
-        view.textView.setPadding(0, textPaddingTop, 0, 0)
+        view.textView.setPadding(0, textPaddingTop, 0, textPaddingBottom)
         val chapterText = text ?: (1..80).joinToString("\n") { "Line $it marker text." }
         val block = EpubDisplayBlock.Text(chapterText, headingLevel = null, paragraphIndex = 0)
         val flow = epubBuildChapterFlow(spineIndex = 0, blocks = listOf(block))
 
-        view.measure(exactly(360), exactly(120))
-        view.layout(0, 0, 360, 120)
-        view.setChapter(flow, spannable ?: flow.text, pageHeightPx = 120)
-        view.measure(exactly(360), exactly(120))
-        view.layout(0, 0, 360, 120)
+        view.measure(exactly(viewportWidth), exactly(viewportHeight))
+        view.layout(0, 0, viewportWidth, viewportHeight)
+        view.setChapter(flow, spannable ?: flow.text, pageHeightPx = viewportHeight)
+        view.measure(exactly(viewportWidth), exactly(viewportHeight))
+        view.layout(0, 0, viewportWidth, viewportHeight)
         shadowOf(Looper.getMainLooper()).idle()
-        view.measure(exactly(360), exactly(120))
-        view.layout(0, 0, 360, 120)
+        view.measure(exactly(viewportWidth), exactly(viewportHeight))
+        view.layout(0, 0, viewportWidth, viewportHeight)
         shadowOf(Looper.getMainLooper()).idle()
         shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
         return view
+    }
+
+    private fun nonLineTopBetween(
+        view: EpubFlowView,
+        startExclusive: Int,
+        endExclusive: Int,
+        fraction: Float,
+    ): Int {
+        val layout = requireNotNull(view.textView.layout)
+        val preferred = startExclusive + ((endExclusive - startExclusive) * fraction).toInt()
+        return ((startExclusive + 1) until endExclusive)
+            .filter { y ->
+                val viewportTopInLayout = (y - view.textView.paddingTop).coerceAtLeast(0)
+                layout.getLineTop(layout.getLineForVertical(viewportTopInLayout)) < viewportTopInLayout
+            }
+            .minByOrNull { y -> kotlin.math.abs(y - preferred) }
+            ?: error("test needs a scroll position cutting a painted line between $startExclusive and $endExclusive")
+    }
+
+    private fun fullLineRangeInViewport(view: EpubFlowView): IntRange {
+        val layout = requireNotNull(view.textView.layout)
+        val viewportTop = view.scrollY
+        val viewportTopInLayout = (viewportTop - view.textView.paddingTop).coerceAtLeast(0)
+        val layoutBottomLimit = (
+            viewportTop + view.height - view.textView.paddingTop - view.textView.paddingBottom
+        ).coerceAtLeast(viewportTopInLayout + 1)
+        var first = layout.getLineForVertical(viewportTopInLayout)
+        if (layout.getLineTop(first) < viewportTopInLayout && first < layout.lineCount - 1) first++
+        var last = layout.getLineForVertical(layoutBottomLimit - 1)
+        while (last > first && layout.getLineBottom(last) > layoutBottomLimit) last--
+        return first..last.coerceAtLeast(first)
     }
 
     private fun exactly(size: Int): Int =
@@ -3227,6 +6068,7 @@ class EpubFlowViewTest {
     private fun EpubFlowView.newBoundaryPreviewForTest(
         forward: Boolean,
         token: Long,
+        bitmapOverride: Bitmap? = null,
     ): BoundaryPagePreview {
         val previewClass = runCatching {
             Class.forName("dev.readflow.render.epub.BoundaryPagePreview")
@@ -3249,7 +6091,7 @@ class EpubFlowViewTest {
             "BoundaryPagePreview must expose token, direction, source generation, and target frame",
             constructor,
         )
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+        val bitmap = bitmapOverride ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
             val paperColor = 0xFFF3EFE5.toInt()
             val contentColor = 0xFF26352D.toInt()
             eraseColor(paperColor)
@@ -3308,6 +6150,26 @@ class EpubFlowViewTest {
             .invoke(this, velocityX)
     }
 
+    private fun EpubFlowView.settleTemporaryScrollAnchorForTest() {
+        javaClass.getDeclaredMethod("settleTemporaryScrollAnchor")
+            .apply { isAccessible = true }
+            .invoke(this)
+    }
+
+    private fun EpubFlowView.releaseTemporaryScrollForTest(fingerVelocityY: Float) {
+        javaClass.getDeclaredMethod("releaseTemporaryScroll", Float::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+            .invoke(this, fingerVelocityY)
+    }
+
+    private fun EpubFlowView.computeScrollTraceWithoutPostedWork(): List<Int> = buildList {
+        repeat(4) {
+            SystemClock.sleep(16L)
+            computeScroll()
+            add(scrollY)
+        }
+    }
+
     private fun EpubFlowView.runReflowRunnable(idlePostedWork: Boolean = true) {
         (privateField("reflowRunnable") as Runnable).run()
         if (idlePostedWork) shadowOf(Looper.getMainLooper()).idle()
@@ -3324,6 +6186,12 @@ class EpubFlowViewTest {
         javaClass.getDeclaredMethod("recycleCachedTextures")
             .apply { isAccessible = true }
             .invoke(this)
+    }
+
+    private fun EpubFlowView.detachCachedTextureOwnerForTest(bitmap: Bitmap) {
+        javaClass.getDeclaredMethod("detachCachedTextureOwner", Bitmap::class.java)
+            .apply { isAccessible = true }
+            .invoke(this, bitmap)
     }
 
     private fun EpubFlowView.snapshotViewportForTest(): Bitmap? =
@@ -3412,15 +6280,18 @@ class EpubFlowViewTest {
             .invoke(this, topPx) as Int
 
     private fun EpubFlowView.snapshotClipBottomForTest(topPx: Int): Int =
-        javaClass.getDeclaredMethod("snapshotClipBottomFor", Int::class.javaPrimitiveType)
+        javaClass.getDeclaredMethod(
+            "snapshotClipBottomFor",
+            Int::class.javaPrimitiveType,
+            EpubFlowPage::class.java,
+        )
             .apply { isAccessible = true }
-            .invoke(this, topPx) as Int
+            .invoke(this, topPx, null) as Int
 
-    private fun EpubFlowView.settleTemporaryScrollAnchorForTest() {
-        javaClass.getDeclaredMethod("settleTemporaryScrollAnchor")
+    private fun EpubFlowView.pageClipTopForTest(): Int =
+        javaClass.getDeclaredMethod("pageClipTopInViewport")
             .apply { isAccessible = true }
-            .invoke(this)
-    }
+            .invoke(this) as Int
 
     private fun EpubFlowView.pageClipBottomForTest(): Int? =
         javaClass.getDeclaredMethod("pageClipBottomInViewport")
@@ -3433,6 +6304,9 @@ class EpubFlowViewTest {
     private fun EpubFlowView.privateBool(name: String): Boolean =
         privateField(name) as Boolean
 
+    private fun EpubFlowView.privateEnumName(name: String): String =
+        (privateField(name) as Enum<*>).name
+
     private fun EpubFlowView.setPrivateField(name: String, value: Any?) {
         javaClass.getDeclaredField(name)
             .apply { isAccessible = true }
@@ -3440,6 +6314,11 @@ class EpubFlowViewTest {
     }
 
     private fun EpubFlowView.privateField(name: String): Any? =
+        javaClass.getDeclaredField(name)
+            .apply { isAccessible = true }
+            .get(this)
+
+    private fun Any.reflectedField(name: String): Any? =
         javaClass.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this)
@@ -3453,6 +6332,25 @@ class EpubFlowViewTest {
         javaClass.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this) as Int
+
+    private class CountingList<T>(
+        private val delegate: List<T>,
+    ) : AbstractList<T>() {
+        var elementAccesses: Int = 0
+            private set
+
+        override val size: Int
+            get() = delegate.size
+
+        override fun get(index: Int): T {
+            elementAccesses += 1
+            return delegate[index]
+        }
+
+        fun reset() {
+            elementAccesses = 0
+        }
+    }
 
     private class ThrowWhenBoundsTopDrawable(
         private val failingTop: Int,
@@ -3510,6 +6408,27 @@ class EpubFlowViewTest {
 
         override fun draw(canvas: Canvas) {
             boundsTops += bounds.top
+        }
+
+        override fun setAlpha(alpha: Int) = Unit
+
+        override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+    }
+
+    private class RecordingTargetBitmapDrawable(
+        private val beforeDraw: (() -> Unit)? = null,
+    ) : Drawable() {
+        val targetBitmaps = mutableListOf<Bitmap>()
+
+        override fun draw(canvas: Canvas) {
+            beforeDraw?.invoke()
+            val targetBitmapField = org.robolectric.shadows.ShadowLegacyCanvas::class.java
+                .getDeclaredField("targetBitmap")
+                .apply { isAccessible = true }
+            targetBitmaps += targetBitmapField.get(shadowOf(canvas)) as Bitmap
         }
 
         override fun setAlpha(alpha: Int) = Unit

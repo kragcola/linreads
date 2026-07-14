@@ -20,6 +20,7 @@ import android.graphics.PointF
 import android.text.Spanned
 import android.text.style.ClickableSpan
 import android.view.InputDevice
+import android.view.Choreographer
 import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -127,7 +128,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     @Test
-    fun epubFlowTurnAfterTemporaryScrollUsesNearestCanonicalAnchorRuntime() {
+    fun epubFlowTurnAfterFreeRestContinuesAtTheNextFullLineRuntime() {
         val title = "flow-anchor-${UUID.randomUUID().toString().take(8)}"
         val uri = createEpubUri("$title.epub")
 
@@ -142,24 +143,36 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     if (pageCount <= 4) return@withActivity null
                     val pageOneTop = view.reflectNullableInt("pageTopPxAt", 1) ?: return@withActivity null
                     val pageTwoTop = view.reflectNullableInt("pageTopPxAt", 2) ?: return@withActivity null
-                    val pageThreeTop = view.reflectNullableInt("pageTopPxAt", 3) ?: return@withActivity null
-                    FlowAnchorBaseline(view, pageCount, pageOneTop, pageTwoTop, pageThreeTop)
+                    FlowAnchorBaseline(view, pageCount, pageOneTop, pageTwoTop)
                 }
             }
             assertTrue("expected at least 5 pages, got ${baseline.pageCount}", baseline.pageCount > 4)
-            val nearPageTwo = baseline.pageOneTop + ((baseline.pageTwoTop - baseline.pageOneTop) * 3 / 4)
 
             val result = scenario.withActivity {
-                baseline.view.scrollTo(0, nearPageTwo)
+                val freeRest = baseline.view.nonLineTopBetween(
+                    baseline.pageOneTop,
+                    baseline.pageTwoTop,
+                    fraction = 0.75f,
+                )
+                baseline.view.scrollTo(0, freeRest)
+                val before = baseline.view.fullLineRangeInViewport()
                 baseline.view.reflectBoolean("goToAdjacentPage", 1)
+                val after = baseline.view.fullLineRangeInViewport()
+                val layout = checkNotNull(baseline.view.reflectTextView().layout)
                 FlowAnchorResult(
-                    currentPage = baseline.view.reflectInt("currentPageIndex"),
+                    outgoingLastFullLine = before.last,
+                    incomingFirstFullLine = after.first,
+                    incomingLineTop = layout.getLineTop(after.first),
                     scrollY = baseline.view.scrollY,
                 )
             }
 
-            assertEquals(3, result.currentPage)
-            assertEquals(baseline.pageThreeTop, result.scrollY)
+            assertEquals(
+                "runtime forward turn must neither repeat nor skip a complete line",
+                result.outgoingLastFullLine + 1,
+                result.incomingFirstFullLine,
+            )
+            assertEquals("runtime turned page must park on the incoming full-line top", result.incomingLineTop, result.scrollY)
         }
     }
 
@@ -218,8 +231,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 innerResult.duringDragY > innerResult.startY,
             )
             assertEquals("inner center temporary-scroll should disable clip while dragging", false, innerResult.duringDragClip)
-            assertEquals("inner center temporary-scroll should re-settle to page 0", 0, innerResult.currentPage)
-            assertEquals("inner center temporary-scroll release should normalize to the page anchor", 0, innerResult.afterReleaseY)
+            assertEquals(
+                "slow inner-center UP should retain the arbitrary FREE_REST viewport",
+                innerResult.duringDragY,
+                innerResult.afterReleaseY,
+            )
+            assertEquals("slow inner-center UP should re-arm full-line clipping", true, innerResult.afterReleaseClip)
 
             val cancelResult = scenario.withActivity {
                 view.scrollTo(0, 0)
@@ -263,12 +280,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 false,
                 innerBoundaryResult.duringDragClip,
             )
-            assertEquals("inner center boundary should re-settle to page 0", 0, innerBoundaryResult.currentPage)
             assertEquals(
-                "inner center boundary release should normalize to the page anchor",
-                0,
+                "slow inner-center boundary UP should retain the arbitrary FREE_REST viewport",
+                innerBoundaryResult.duringDragY,
                 innerBoundaryResult.afterReleaseY,
             )
+            assertEquals("slow inner-center boundary UP should re-arm full-line clipping", true, innerBoundaryResult.afterReleaseClip)
 
             val innerHorizontalResult = scenario.withActivity {
                 view.scrollTo(0, 0)
@@ -2812,6 +2829,161 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
     @Test
     @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowColdHandoffSplitsShotsAcrossRealFramesAndResumesLatestMoveRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        val title = "flow-cold-handoff-frames-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+            val baseline = waitForConditionResult("expected stable flow view for cold handoff frame test") {
+                scenario.withActivity { activity ->
+                    val view = activity.findEpubFlowView() ?: return@withActivity null
+                    val pageCount = view.reflectInt("pageCount")
+                    val pageOneTop = view.reflectNullableInt("pageTopPxAt", 1)
+                    val pageTwoTop = view.reflectNullableInt("pageTopPxAt", 2)
+                    if (
+                        pageCount <= 4 || pageOneTop == null || pageTwoTop == null ||
+                        view.width <= 0 || view.height <= 0 || view.flowContentAlpha() < 1f ||
+                        view.reflectPrivateAny("conversionSnapshotDrawable") != null ||
+                        view.reflectPrivateAny("flipStyle")?.toString() != PageFlipStyle.SIMULATION.name
+                    ) return@withActivity null
+                    FlowAnchorBaseline(view, pageCount, pageOneTop, pageTwoTop)
+                }
+            }
+
+            data class FrameState(
+                val motionState: String,
+                val hasCurl: Boolean,
+                val progress: Float?,
+                val reportedOffset: Any?,
+            )
+
+            val states = mutableListOf<FrameState>()
+            val callbackFailure = arrayOfNulls<Throwable>(1)
+            val ready = CountDownLatch(1)
+            val downTime = SystemClock.uptimeMillis()
+            val down = PointF(baseline.view.width * 0.85f, baseline.view.height * 0.10f)
+            val firstMove = PointF(baseline.view.width * 0.55f, down.y)
+            val latestMove = PointF(baseline.view.width * 0.10f, down.y)
+            val expectedProgress = (down.x - latestMove.x) / baseline.view.width.toFloat()
+            var previousPrecacheEnabled: Any? = null
+            var gestureActive = false
+
+            try {
+                val immediate = scenario.withActivity {
+                    val view = baseline.view
+                    val freeRest = view.nonLineTopBetween(
+                        baseline.pageOneTop,
+                        baseline.pageTwoTop,
+                        fraction = 0.40f,
+                    )
+                    view.scrollTo(0, freeRest)
+                    previousPrecacheEnabled = view.swapPrivateField("pageTexturePrecacheEnabled", false)
+                    view.invokeNoArgCompat("recycleCachedTextures")
+                    dispatchTouchEvent(view, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down))
+                    gestureActive = true
+                    dispatchTouchEvent(
+                        view,
+                        motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, firstMove),
+                    )
+                    dispatchTouchEvent(
+                        view,
+                        motionEvent(downTime, downTime + EVENT_STEP_MS * 2, MotionEvent.ACTION_MOVE, latestMove),
+                    )
+                    val initial = FrameState(
+                        motionState = view.reflectPrivateAny("interactiveTurnState").toString(),
+                        hasCurl = view.reflectPrivateAny("curlDrawable") != null,
+                        progress = null,
+                        reportedOffset = view.reflectPrivateAny("lastReportedTopOffset"),
+                    )
+                    val initialReportedOffset = initial.reportedOffset
+                    val choreographer = Choreographer.getInstance()
+                    choreographer.postFrameCallback {
+                        try {
+                            states += FrameState(
+                                motionState = view.reflectPrivateAny("interactiveTurnState").toString(),
+                                hasCurl = view.reflectPrivateAny("curlDrawable") != null,
+                                progress = null,
+                                reportedOffset = view.reflectPrivateAny("lastReportedTopOffset"),
+                            )
+                            choreographer.postFrameCallback {
+                                try {
+                                    val curl = view.reflectPrivateAny("curlDrawable")
+                                    val progress = curl?.javaClass?.getDeclaredField("progress")
+                                        ?.apply { isAccessible = true }
+                                        ?.getFloat(curl)
+                                    states += FrameState(
+                                        motionState = view.reflectPrivateAny("interactiveTurnState").toString(),
+                                        hasCurl = curl != null,
+                                        progress = progress,
+                                        reportedOffset = view.reflectPrivateAny("lastReportedTopOffset"),
+                                    )
+                                    check(states.all { it.reportedOffset == initialReportedOffset }) {
+                                        "cold handoff must remain locator-silent across preparation frames: $states"
+                                    }
+                                } catch (failure: Throwable) {
+                                    callbackFailure[0] = failure
+                                } finally {
+                                    ready.countDown()
+                                }
+                            }
+                        } catch (failure: Throwable) {
+                            callbackFailure[0] = failure
+                            ready.countDown()
+                        }
+                    }
+                    initial
+                }
+
+                assertEquals("LOCAL_SHOTS_WAITING", immediate.motionState)
+                assertFalse("threshold MOVE must not synchronously install curl", immediate.hasCurl)
+                assertTrue("two real Choreographer frames must complete", ready.await(5L, TimeUnit.SECONDS))
+                callbackFailure[0]?.let { throw AssertionError("cold handoff frame callback failed", it) }
+                assertEquals("expected target frame then visible-front frame", 2, states.size)
+                assertEquals("LOCAL_SHOTS_WAITING", states[0].motionState)
+                assertFalse("target-only frame must not install curl", states[0].hasCurl)
+                assertEquals("SOFTWARE", states[1].motionState)
+                assertTrue("visible-front frame must install curl", states[1].hasCurl)
+                assertEquals(expectedProgress, checkNotNull(states[1].progress), 0.02f)
+            } finally {
+                if (gestureActive) {
+                    scenario.withActivity {
+                        dispatchTouchEvent(
+                            baseline.view,
+                            motionEvent(
+                                downTime,
+                                SystemClock.uptimeMillis(),
+                                MotionEvent.ACTION_CANCEL,
+                                latestMove,
+                            ),
+                        )
+                    }
+                    gestureActive = false
+                }
+                waitForConditionResult("expected cold handoff cancel to retire overlay") {
+                    scenario.withActivity {
+                        val animatorRunning =
+                            (baseline.view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                        if (
+                            baseline.view.reflectPrivateAny("curlDrawable") == null &&
+                            baseline.view.reflectPrivateAny("slideDrawable") == null &&
+                            !animatorRunning
+                        ) true else null
+                    }
+                }
+                scenario.withActivity {
+                    previousPrecacheEnabled?.let {
+                        baseline.view.swapPrivateField("pageTexturePrecacheEnabled", it)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
     fun epubFlowSimulationColdFirstDragStartsA2CurlWithoutLegacyGlChildRuntime() = runBlocking {
         settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
         val title = "flow-software-curl-first-drag-${UUID.randomUUID().toString().take(8)}"
@@ -3659,6 +3831,33 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private fun View.reflectTextView(): TextView =
         javaClass.getDeclaredField("textView").apply { isAccessible = true }.get(this) as TextView
 
+    private fun View.nonLineTopBetween(startExclusive: Int, endExclusive: Int, fraction: Float): Int {
+        val textView = reflectTextView()
+        val layout = checkNotNull(textView.layout)
+        val preferred = startExclusive + ((endExclusive - startExclusive) * fraction).toInt()
+        return ((startExclusive + 1) until endExclusive)
+            .filter { y ->
+                val viewportTopInLayout = (y - textView.paddingTop).coerceAtLeast(0)
+                layout.getLineTop(layout.getLineForVertical(viewportTopInLayout)) < viewportTopInLayout
+            }
+            .minByOrNull { y -> abs(y - preferred) }
+            ?: error("runtime smoke needs a scroll position cutting a painted line between $startExclusive and $endExclusive")
+    }
+
+    private fun View.fullLineRangeInViewport(): IntRange {
+        val textView = reflectTextView()
+        val layout = checkNotNull(textView.layout)
+        val viewportTopInLayout = (scrollY - textView.paddingTop).coerceAtLeast(0)
+        val layoutBottomLimit = (
+            scrollY + height - textView.paddingTop - textView.paddingBottom
+        ).coerceAtLeast(viewportTopInLayout + 1)
+        var first = layout.getLineForVertical(viewportTopInLayout)
+        if (layout.getLineTop(first) < viewportTopInLayout && first < layout.lineCount - 1) first++
+        var last = layout.getLineForVertical(layoutBottomLimit - 1)
+        while (last > first && layout.getLineBottom(last) > layoutBottomLimit) last--
+        return first..last.coerceAtLeast(first)
+    }
+
     private fun View.invokeSetModeAnchoredPaged(layoutOffset: Int) {
         invokeSetModeAnchored("PAGED", layoutOffset)
     }
@@ -3723,19 +3922,20 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val scrolledMove = PointF(down.x, target.height * 0.10f)
         val downTime = SystemClock.uptimeMillis()
         dispatchTouchEvent(target, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down))
-        dispatchTouchEvent(target, motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, armMove))
+        dispatchTouchEvent(target, motionEvent(downTime, downTime + 300L, MotionEvent.ACTION_MOVE, armMove))
         dispatchTouchEvent(
             target,
-            motionEvent(downTime, downTime + EVENT_STEP_MS * 2, MotionEvent.ACTION_MOVE, scrolledMove),
+            motionEvent(downTime, downTime + 700L, MotionEvent.ACTION_MOVE, scrolledMove),
         )
         val duringDragY = target.scrollY
         val duringDragClip = target.reflectPrivateBoolean("pageClipActive")
-        dispatchTouchEvent(target, motionEvent(downTime, downTime + EVENT_STEP_MS * 3, MotionEvent.ACTION_UP, scrolledMove))
+        dispatchTouchEvent(target, motionEvent(downTime, downTime + 1_100L, MotionEvent.ACTION_UP, scrolledMove))
         return FlowTemporaryScrollResult(
             startY = startY,
             duringDragY = duringDragY,
             afterReleaseY = target.scrollY,
             duringDragClip = duringDragClip,
+            afterReleaseClip = target.reflectPrivateBoolean("pageClipActive"),
             currentPage = target.reflectInt("currentPageIndex"),
         )
     }
@@ -4213,11 +4413,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val pageCount: Int,
         val pageOneTop: Int,
         val pageTwoTop: Int,
-        val pageThreeTop: Int,
     )
 
     private data class FlowAnchorResult(
-        val currentPage: Int,
+        val outgoingLastFullLine: Int,
+        val incomingFirstFullLine: Int,
+        val incomingLineTop: Int,
         val scrollY: Int,
     )
 
@@ -4237,6 +4438,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val duringDragY: Int,
         val afterReleaseY: Int,
         val duringDragClip: Boolean,
+        val afterReleaseClip: Boolean,
         val currentPage: Int,
     )
 

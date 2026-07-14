@@ -41,6 +41,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -1177,6 +1178,15 @@ class EpubReflowEngineTest {
         host.measure(exactly(360), exactly(140))
         host.layout(0, 0, 360, 140)
 
+        awaitCondition("the middle chapter must finish multi-page pagination") {
+            flowView.pageCount() > 1
+        }
+        flowView.goToLastPage()
+        assertEquals(
+            "forward preview is eligible only after the current viewport reaches the chapter end",
+            flowView.pageCount() - 1,
+            flowView.currentPageIndex(),
+        )
         val forward = awaitBoundaryPreview(flowView, forward = true)
         val forwardCommit = requireNotNull(flowView.takeBoundaryPreviewForTest(forward = true))
         assertEquals(forward.token, forwardCommit.token)
@@ -1210,6 +1220,314 @@ class EpubReflowEngineTest {
         if (!forwardCommit.bitmap.isRecycled) forwardCommit.bitmap.recycle()
         if (!backwardCommit.bitmap.isRecycled) backwardCommit.bitmap.recycle()
         engine.close()
+    }
+
+    @Test
+    fun `multi page chapter requests forward preview only after an in chapter turn settles at the boundary`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("boundary-preview-viewport-scoped.epub")
+        val middleChapter = (1..260).joinToString("") { index ->
+            "<p>middle-$index has enough text to occupy its own line.</p>"
+        }
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Previous chapter.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body>$middleChapter</body></html>",
+            "OEBPS/ch3.xhtml" to "<html><body><p>Next chapter.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setInitialLocator(
+            Locator(
+                LocatorStrategy.Section(spineIndex = 1, elementIndex = 130, charOffset = 0),
+                totalProgression = 0.5f,
+            ),
+        )
+        engine.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+
+        awaitCondition("fixture must settle on a middle page of the current chapter") {
+            flowView.pageCount() > 2 &&
+                flowView.currentPageIndex() in 1 until flowView.pageCount() - 1
+        }
+        shadowOf(Looper.getMainLooper()).idleFor(500L, TimeUnit.MILLISECONDS)
+        @Suppress("UNCHECKED_CAST")
+        val middleSessions = engine.privateField("boundaryPreviewSessions") as Map<Boolean, Any>
+        val middleHasForward =
+            middleSessions.containsKey(true) || flowView.privateField("forwardBoundaryPreview") != null
+        val middleHasBackward =
+            middleSessions.containsKey(false) || flowView.privateField("backwardBoundaryPreview") != null
+
+        assertFalse(
+            "a stable middle page must not prewarm either adjacent chapter: " +
+                "sessions=${middleSessions.keys}, forwardSlot=$middleHasForward, backwardSlot=$middleHasBackward",
+            middleHasForward || middleHasBackward,
+        )
+
+        val lastPage = flowView.pageCount() - 1
+        flowView.goToPage(lastPage - 1)
+        awaitCondition("fixture must settle on the penultimate page before the normal turn") {
+            flowView.currentPageIndex() == lastPage - 1
+        }
+
+        engine.goToAdjacentPage(1)
+        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+        awaitCondition("the in-chapter turn must settle on the final page") {
+            val animator = flowView.privateField("flipAnimator") as? android.animation.ValueAnimator
+            flowView.currentPageIndex() == lastPage && animator?.isRunning != true
+        }
+        val forward = awaitBoundaryPreview(flowView, forward = true)
+
+        assertFalse("the boundary preview must contain a live bitmap", forward.bitmap.isRecycled)
+        engine.close()
+    }
+
+    @Test
+    fun `memory pressure blocks late boundary discard retry from repopulating preview state`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("boundary-preview-memory-pressure-gate.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Source chapter at its boundary.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Speculative target must stay discarded.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+
+        val offered = awaitBoundaryPreview(flowView, forward = true)
+        assertFalse("fixture requires a live inactive boundary preview", offered.bitmap.isRecycled)
+
+        try {
+            EpubReflowEngine::class.java.getDeclaredMethod("handleSeverePageShotMemoryPressure")
+                .apply { isAccessible = true }
+                .invoke(engine)
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+
+            assertTrue("memory pressure must pause engine speculation", engine.privateField("pageShotSpeculationPaused") as Boolean)
+            assertTrue("the discarded preview bitmap must be retired", offered.bitmap.isRecycled)
+            assertNull("the live view must not regain a forward preview", flowView.privateField("forwardBoundaryPreview"))
+            assertTrue(
+                "a discard callback posted before trim completed must not start a late boundary job",
+                (engine.privateField("boundaryPreviewJobs") as Map<*, *>).isEmpty(),
+            )
+            assertTrue(
+                "a late retry must not install another hidden preview renderer",
+                (engine.privateField("boundaryPreviewSessions") as Map<*, *>).isEmpty(),
+            )
+            assertTrue(
+                "memory pressure must retire token-to-target ownership",
+                (engine.privateField("boundaryPreviewTargets") as Map<*, *>).isEmpty(),
+            )
+        } finally {
+            engine.close()
+        }
+    }
+
+    @Test
+    fun `foreground resumes background page shot trim but not severe memory backoff`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("page-shot-foreground-resume.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Foreground lifecycle page-shot fixture.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        shadowOf(Looper.getMainLooper()).idle()
+        val budget = checkNotNull(engine.privateField("pageShotBudget") as PageShotBudget?)
+        val foreground = requireNotNull(flowView.onPageShotForeground)
+
+        try {
+            EpubReflowEngine::class.java.getDeclaredMethod("handleBackgroundPageShotTrim")
+                .apply { isAccessible = true }
+                .invoke(engine)
+
+            assertTrue(engine.privateField("pageShotBackgroundPaused") as Boolean)
+            assertTrue(engine.privateField("pageShotSpeculationPaused") as Boolean)
+            assertTrue(flowView.privateField("pageShotSpeculationPaused") as Boolean)
+            assertTrue(budget.isSpeculativeAdmissionPaused)
+
+            foreground.invoke()
+
+            assertFalse("a visible foreground callback must release background-only pause", engine.privateField("pageShotBackgroundPaused") as Boolean)
+            assertFalse("background-only trim must resume engine speculation", engine.privateField("pageShotSpeculationPaused") as Boolean)
+            assertFalse("background-only trim must resume the live view cache", flowView.privateField("pageShotSpeculationPaused") as Boolean)
+            assertFalse("background-only trim must reopen speculative admission", budget.isSpeculativeAdmissionPaused)
+
+            EpubReflowEngine::class.java.getDeclaredMethod("handleSeverePageShotMemoryPressure")
+                .apply { isAccessible = true }
+                .invoke(engine)
+            foreground.invoke()
+
+            assertTrue("severe pressure must retain its session backoff", engine.privateField("pageShotSevereMemoryBackoff") as Boolean)
+            assertTrue("foreground must not clear severe engine pause", engine.privateField("pageShotSpeculationPaused") as Boolean)
+            assertTrue("foreground must not restart live-view speculation after severe pressure", flowView.privateField("pageShotSpeculationPaused") as Boolean)
+            assertTrue("foreground must not reopen budget admission after severe pressure", budget.isSpeculativeAdmissionPaused)
+        } finally {
+            engine.close()
+        }
+    }
+
+    @Test
+    fun `background trim preserves active boundary token generation through commit`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("active-boundary-trim-commit.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Outgoing active boundary chapter.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Incoming chapter survives active trim.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        val offered = awaitBoundaryPreview(flowView, forward = true)
+
+        try {
+            assertTrue(flowView.startDiscreteBoundaryTurn(1))
+            val active = checkNotNull(flowView.privateField("activeBoundaryPreview") as BoundaryPagePreview?)
+            assertEquals(offered.token, active.token)
+            assertTrue("fixture requires a committable active boundary token", requireNotNull(flowView.canCommitBoundaryTurn).invoke(active))
+            assertTrue(
+                "fixture requires an active boundary settle",
+                (flowView.privateField("flipAnimator") as? android.animation.ValueAnimator)?.isRunning == true,
+            )
+
+            EpubReflowEngine::class.java.getDeclaredMethod("handleBackgroundPageShotTrim")
+                .apply { isAccessible = true }
+                .invoke(engine)
+
+            val engineGeneration = engine.privateField("boundaryPreviewGeneration") as Long
+            @Suppress("UNCHECKED_CAST")
+            val targets = engine.privateField("boundaryPreviewTargets") as Map<Long, Any>
+            val preservedTarget = checkNotNull(targets[active.token])
+            val targetGeneration = preservedTarget.javaClass.getDeclaredField("generation")
+                .apply { isAccessible = true }
+                .getLong(preservedTarget)
+            assertEquals("trim must rekey the active token into the new engine generation", engineGeneration, targetGeneration)
+            assertTrue("trim must preserve the active preview object", flowView.privateField("activeBoundaryPreview") === active)
+            assertFalse("trim must preserve the active target bitmap", active.bitmap.isRecycled)
+            assertTrue("the rekeyed token must remain committable", requireNotNull(flowView.canCommitBoundaryTurn).invoke(active))
+
+            awaitCondition("the preserved active boundary turn must still commit and settle") {
+                val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+                strategy?.spineIndex == 1 &&
+                    flowView.textView.text.toString().contains("Incoming chapter survives active trim.")
+            }
+        } finally {
+            engine.close()
+        }
+    }
+
+    @Test
+    fun `large local turn cancels an in flight directional boundary preview`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("large-local-turn-cancels-boundary-job.epub")
+        val middleChapter = (1..1_200).joinToString("") { index ->
+            "<p>middle-$index provides deterministic large-viewport pagination.</p>"
+        }
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Previous boundary target.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body>$middleChapter</body></html>",
+            "OEBPS/ch3.xhtml" to "<html><body><p>Stale boundary target must not be offered.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activityManager = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        shadowOf(activityManager).setMemoryClass(384)
+        shadowOf(activityManager).setIsLowRamDevice(false)
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setInitialLocator(
+            Locator(
+                LocatorStrategy.Section(spineIndex = 1, elementIndex = 600, charOffset = 0),
+                totalProgression = 0.5f,
+            ),
+        )
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(1_600, 2_560))
+        host.measure(exactly(1_600), exactly(2_560))
+        host.layout(0, 0, 1_600, 2_560)
+
+        awaitCondition("fixture must settle away from both chapter boundaries") {
+            flowView.pageCount() > 2 &&
+                flowView.currentPageIndex() in 1 until flowView.pageCount() - 1
+        }
+        val sourceGeneration = flowView.boundaryPreviewGenerationToken()
+        EpubReflowEngine::class.java.getDeclaredMethod(
+            "requestBoundaryPreview",
+            Boolean::class.javaPrimitiveType,
+            Long::class.javaPrimitiveType,
+        ).apply { isAccessible = true }.invoke(engine, true, sourceGeneration)
+
+        @Suppress("UNCHECKED_CAST")
+        val jobsBeforeTurn = engine.privateField("boundaryPreviewJobs") as Map<Boolean, Any>
+        assertTrue("fixture requires a forward boundary job awaiting its main-thread result", jobsBeforeTurn.containsKey(true))
+        assertEquals(true, flowView.privateField("boundaryPreviewBudgetDirection"))
+
+        try {
+            assertTrue(flowView.goToAdjacentPage(1))
+            assertNotNull("the local request must own an active page-shot pair", flowView.privateField("slideDrawable"))
+            assertNull("local working-pair admission must release the boundary direction", flowView.privateField("boundaryPreviewBudgetDirection"))
+            assertTrue(
+                "local working-pair admission must synchronously cancel the directional boundary job",
+                (engine.privateField("boundaryPreviewJobs") as Map<*, *>).isEmpty(),
+            )
+            assertTrue(
+                "the cancelled request token must leave with its job",
+                (engine.privateField("boundaryPreviewJobTokens") as Map<*, *>).isEmpty(),
+            )
+
+            (flowView.privateField("flipAnimator") as android.animation.ValueAnimator).cancel()
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+
+            assertNull("the cancelled job's late result must not fill the forward slot", flowView.privateField("forwardBoundaryPreview"))
+            assertTrue(
+                "the cancelled job's late result must not install a hidden renderer",
+                (engine.privateField("boundaryPreviewSessions") as Map<*, *>).isEmpty(),
+            )
+            assertTrue(
+                "the cancelled job's late result must not publish token ownership",
+                (engine.privateField("boundaryPreviewTargets") as Map<*, *>).isEmpty(),
+            )
+        } finally {
+            engine.close()
+        }
     }
 
     @Test
@@ -1360,6 +1678,78 @@ class EpubReflowEngineTest {
         val offered = awaitBoundaryPreview(flowView, forward = true)
         assertFalse("the eventually offered preview must contain a live bitmap", offered.bitmap.isRecycled)
         engine.close()
+    }
+
+    @Test
+    fun `required boundary wait promotes an existing speculative renderer before shot admission`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("boundary-preview-required-promotion.epub")
+        writeBoundaryImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+
+        val previewView = awaitBoundaryPreviewSession(engine, forward = true)
+        previewView.pendingDecodesProvider = { true }
+        EpubFlowView::class.java.getDeclaredMethod("recycleCachedTextures")
+            .apply { isAccessible = true }
+            .invoke(flowView)
+        val liveOwners = List(3) {
+            requireNotNull(flowView.snapshotPageAt(flowView.scrollY))
+        }
+        flowView.setPrivateField("cachedFrontBitmap", liveOwners[0])
+        flowView.setPrivateField("cachedRevealedBitmap", liveOwners[1])
+        flowView.setPrivateField("cachedBackwardBitmap", liveOwners[2])
+
+        try {
+            engine.goToAdjacentPage(1)
+            assertTrue(
+                "the user turn must promote the already-running speculative direction to required",
+                flowView.boundaryPreviewIsRequired(forward = true),
+            )
+
+            previewView.pendingDecodesProvider = { false }
+            previewView.onAsyncImageDecodeFinished()
+            previewView.viewTreeObserver.dispatchOnPreDraw()
+            runCatching {
+                awaitCondition("the promoted required preview must start or commit the waiting boundary turn") {
+                    val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+                    flowView.privateField("activeBoundaryPreview") is BoundaryPagePreview ||
+                        (strategy?.spineIndex == 1 && flowView.textView.text.toString().contains("Image target begins."))
+                }
+            }.getOrElse { failure ->
+                val budget = checkNotNull(engine.privateField("pageShotBudget") as PageShotBudget?)
+                fail(
+                    "${failure.message}; required=${flowView.boundaryPreviewIsRequired(true)} " +
+                        "state=${flowView.privateField("interactiveTurnState")} " +
+                        "sessions=${(engine.privateField("boundaryPreviewSessions") as Map<*, *>).keys} " +
+                        "targets=${(engine.privateField("boundaryPreviewTargets") as Map<*, *>).keys} " +
+                        "slot=${flowView.privateField("forwardBoundaryPreview")} " +
+                        "active=${flowView.privateField("activeBoundaryPreview")} " +
+                        "ownersRecycled=${liveOwners.map(Bitmap::isRecycled)} " +
+                        "charged=${budget.chargedBytes} leased=${budget.leasedBytes}",
+                )
+            }
+            val offered = flowView.privateField("activeBoundaryPreview") as BoundaryPagePreview?
+
+            offered?.let {
+                assertFalse("an in-flight promoted required target must remain live", it.bitmap.isRecycled)
+            }
+            assertTrue(
+                "required PINNED admission must evict the three speculative live owners first",
+                liveOwners.all(Bitmap::isRecycled),
+            )
+        } finally {
+            engine.close()
+        }
     }
 
     @Test
@@ -3082,6 +3472,12 @@ class EpubReflowEngineTest {
         EpubFlowView::class.java.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this)
+
+    private fun EpubFlowView.setPrivateField(name: String, value: Any?) {
+        EpubFlowView::class.java.getDeclaredField(name)
+            .apply { isAccessible = true }
+            .set(this, value)
+    }
 
     private fun EpubFlowView.takeBoundaryPreviewForTest(forward: Boolean): BoundaryPagePreview? =
         EpubFlowView::class.java.getDeclaredMethod(
