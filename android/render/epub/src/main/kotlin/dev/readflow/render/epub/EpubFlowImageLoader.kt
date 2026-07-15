@@ -345,10 +345,18 @@ internal class EpubFlowImageLoader(
                             try {
                                 if (installed) {
                                     drawable.invalidateSelf()
-                                    installedResult?.let { onImageResultChanged?.invoke(it) }
+                                    val result = installedResult
+                                    if (result != null && onImageResultChanged != null) {
+                                        // Successful install: the host (PIXELS_ONLY / GEOMETRY_CHANGED)
+                                        // owns reveal/precache wake so far-page PIXELS_ONLY can
+                                        // suppress it. Do not dual-fire onDecodeFinished.
+                                        onImageResultChanged.invoke(result)
+                                        decodeFinishedNotified = true
+                                    }
+                                    // No result callback: finally falls through to onDecodeFinished once.
                                 }
                             } finally {
-                                if (!released) {
+                                if (!decodeFinishedNotified && !released) {
                                     decodeFinishedNotified = true
                                     onDecodeFinished?.invoke()
                                 }

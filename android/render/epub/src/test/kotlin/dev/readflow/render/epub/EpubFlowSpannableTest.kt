@@ -411,6 +411,72 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `PIXELS_ONLY successful install notifies result once and never dual fires decode finished`() {
+        // Locks the host-wake contract: result callback present → exactly one onImageResultChanged,
+        // zero onDecodeFinished; result callback absent → exactly one onDecodeFinished fallback.
+        val epub = createImageEpub("pixels-only-notify-once")
+        val executor = QueuedExecutorService()
+        try {
+            val withResultRefreshes = AtomicInteger(0)
+            val withResultCompletions = AtomicInteger(0)
+            val withResultKinds = mutableListOf<EpubAsyncImageResultKind>()
+            val withResultLoader = imageLoader(
+                epub = epub,
+                executor = executor,
+                imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+                onImageResultChanged = { result ->
+                    withResultKinds += result.kind
+                    withResultRefreshes.incrementAndGet()
+                },
+                onDecodeFinished = { withResultCompletions.incrementAndGet() },
+            )
+            val withResultDrawable = asyncDrawable(withResultLoader)
+            withResultDrawable.setCallback2(attachedDrawableCallback)
+            assertEquals(1, executor.queuedTaskCount)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue(withResultDrawable.result is BitmapDrawable)
+            assertFalse("successful install must clear pending decode", withResultLoader.hasPendingDecodes())
+            assertEquals(
+                "successful PIXELS_ONLY install must fire onImageResultChanged exactly once",
+                1,
+                withResultRefreshes.get(),
+            )
+            assertEquals(listOf(EpubAsyncImageResultKind.PIXELS_ONLY), withResultKinds)
+            assertEquals(
+                "result callback must suppress the fallback onDecodeFinished path",
+                0,
+                withResultCompletions.get(),
+            )
+
+            val fallbackCompletions = AtomicInteger(0)
+            val fallbackLoader = imageLoader(
+                epub = epub,
+                executor = executor,
+                imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+                onDecodeFinished = { fallbackCompletions.incrementAndGet() },
+            )
+            val fallbackDrawable = asyncDrawable(fallbackLoader)
+            fallbackDrawable.setCallback2(attachedDrawableCallback)
+            assertEquals(1, executor.queuedTaskCount)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue(fallbackDrawable.result is BitmapDrawable)
+            assertFalse(fallbackLoader.hasPendingDecodes())
+            assertEquals(
+                "callback-absent successful install must fall back to exactly one onDecodeFinished",
+                1,
+                fallbackCompletions.get(),
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `hasRelevantPendingDecodes ignores far page layout starts`() {
         val epub = createImageEpub("relevant-far-page")
         val executor = QueuedExecutorService()
@@ -1375,6 +1441,7 @@ class EpubFlowSpannableTest {
         executor: QueuedExecutorService,
         fullPage: Boolean = false,
         pageHeightProvider: () -> Int = { 8 },
+        imageBoundsProvider: (String) -> EpubImageBounds? = { null },
         onImageResultChanged: ((EpubAsyncImageResult) -> Unit)? = null,
         onDecodeFinished: (() -> Unit)? = null,
     ) = EpubFlowImageLoader(
@@ -1384,6 +1451,7 @@ class EpubFlowSpannableTest {
         pageHeightProvider = pageHeightProvider,
         inlineMaxHeightPx = 8,
         fullPageHrefs = if (fullPage) setOf(TEST_IMAGE_HREF) else emptySet(),
+        imageBoundsProvider = imageBoundsProvider,
         onImageResultChanged = onImageResultChanged,
         onDecodeFinished = onDecodeFinished,
     )

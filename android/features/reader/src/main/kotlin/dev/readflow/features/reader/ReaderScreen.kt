@@ -1587,24 +1587,28 @@ private class ReaderTapContainer(
         }
 
     init {
+        // Paper surface full-bleeds behind status/nav bars. Readable content safety is applied
+        // to the document child (margins), never as padding on this paper owner.
+        clipToPadding = false
         ViewCompat.setOnApplyWindowInsetsListener(this) { view, insets ->
             val safeInsets = insets.getInsets(
                 WindowInsetsCompat.Type.systemBars() or
                     WindowInsetsCompat.Type.displayCutout(),
             )
             if (
-                view.paddingLeft != safeInsets.left ||
-                view.paddingTop != safeInsets.top ||
-                view.paddingRight != safeInsets.right ||
-                view.paddingBottom != safeInsets.bottom
+                view.paddingLeft != 0 ||
+                view.paddingTop != 0 ||
+                view.paddingRight != 0 ||
+                view.paddingBottom != 0
             ) {
-                view.setPadding(
-                    safeInsets.left,
-                    safeInsets.top,
-                    safeInsets.right,
-                    safeInsets.bottom,
-                )
+                view.setPadding(0, 0, 0, 0)
             }
+            applyDocumentContentInsets(
+                left = safeInsets.left,
+                top = safeInsets.top,
+                right = safeInsets.right,
+                bottom = safeInsets.bottom,
+            )
             insets
         }
         isFocusable = true
@@ -1616,6 +1620,24 @@ private class ReaderTapContainer(
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         ViewCompat.requestApplyInsets(this)
+    }
+
+    /**
+     * Inset only the engine document host so first-line / edge content clears system icons.
+     * Paper stays on this FrameLayout and continues edge-to-edge under the bars.
+     */
+    private fun applyDocumentContentInsets(left: Int, top: Int, right: Int, bottom: Int) {
+        val child = documentView ?: return
+        val lp = child.layoutParams as? LayoutParams ?: return
+        if (
+            lp.leftMargin != left ||
+            lp.topMargin != top ||
+            lp.rightMargin != right ||
+            lp.bottomMargin != bottom
+        ) {
+            lp.setMargins(left, top, right, bottom)
+            child.layoutParams = lp
+        }
     }
 
     private fun refreshContentDescription() {
@@ -1646,6 +1668,8 @@ private class ReaderTapContainer(
             ),
         )
         documentView = view
+        // Document host changed — re-apply content-layer insets without padding the paper.
+        ViewCompat.requestApplyInsets(this)
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {

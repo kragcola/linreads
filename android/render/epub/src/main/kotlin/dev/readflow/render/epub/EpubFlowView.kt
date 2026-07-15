@@ -148,27 +148,8 @@ internal class EpubFlowView(
      * pages. Used by [pendingDecodesProvider] for relevance-aware decode gating so far-page work
      * does not hold reveal or nearby page-shot precache.
      */
-    fun relevantPendingDecodeLayoutRanges(): List<IntRange> {
-        if (paged.isEmpty()) return emptyList()
-        val aligned = activePageWindow?.takeIf { it.topPx == scrollY }
-        val index = when {
-            aligned != null -> {
-                val exact = paged.indexOfFirst {
-                    it.topPx == aligned.topPx &&
-                        it.startOffset == aligned.startOffset &&
-                        it.endOffset == aligned.endOffset
-                }
-                if (exact >= 0) exact else canonicalFloorPageIndexForTopPx(scrollY)
-            }
-            else -> canonicalFloorPageIndexForTopPx(scrollY)
-        }.coerceIn(0, paged.lastIndex)
-        val windows = buildList {
-            paged.getOrNull(index - 1)?.let(::add)
-            add(paged[index])
-            paged.getOrNull(index + 1)?.let(::add)
-        }
-        return windows.map { it.startOffset until it.endOffset }
-    }
+    fun relevantPendingDecodeLayoutRanges(): List<IntRange> =
+        relevantPageWindows().map { it.startOffset until it.endOffset }
     private var asyncImageWakeObserver: android.view.ViewTreeObserver? = null
     private var asyncImageWakeListener: android.view.ViewTreeObserver.OnPreDrawListener? = null
     private var asyncImageRefreshPending = false
@@ -1446,22 +1427,35 @@ internal class EpubFlowView(
 
     private fun applyAsyncImagePixelRefresh(layoutOffsets: Collection<Int>) {
         if (layoutOffsets.isEmpty()) return
+        // Far-page PIXELS_ONLY must not touch the live viewport's warm shots or restart nearby
+        // precache. Continuation-dependent pages (heading that synthetically previews a next-page
+        // image) count as nearby even when the image layout offset sits past the page endOffset.
+        val nearbyOffsets = layoutOffsets.filter { pageShotDependsOnImageOffset(it) }
+        if (nearbyOffsets.isEmpty()) {
+            return
+        }
         val pendingPrecache = pendingPageTexturePrecache
         if (
             pendingPrecache != null &&
-            layoutOffsets.any { offset ->
-                pendingPrecache.fromWindow?.containsLayoutOffset(offset) == true ||
-                    pendingPrecache.previousWindow?.containsLayoutOffset(offset) == true ||
-                    pendingPrecache.targetWindow?.containsLayoutOffset(offset) == true
+            nearbyOffsets.any { offset ->
+                pageWindowDependsOnImageOffset(pendingPrecache.fromWindow, offset) ||
+                    pageWindowDependsOnImageOffset(pendingPrecache.previousWindow, offset) ||
+                    pageWindowDependsOnImageOffset(pendingPrecache.targetWindow, offset)
             }
         ) {
             discardPendingPageTexturePrecache(pendingPrecache)
         }
         val bitmapsToRecycle = LinkedHashSet<Bitmap>()
-        layoutOffsets.forEach { offset ->
-            if (pageContainsLayoutOffset(cachedFromPage, offset)) cachedFrontBitmap?.let(bitmapsToRecycle::add)
-            if (pageContainsLayoutOffset(cachedTargetPage, offset)) cachedRevealedBitmap?.let(bitmapsToRecycle::add)
-            if (pageContainsLayoutOffset(cachedBackwardPage, offset)) cachedBackwardBitmap?.let(bitmapsToRecycle::add)
+        nearbyOffsets.forEach { offset ->
+            if (pageShotSlotDependsOnImageOffset(cachedFromPage, offset)) {
+                cachedFrontBitmap?.let(bitmapsToRecycle::add)
+            }
+            if (pageShotSlotDependsOnImageOffset(cachedTargetPage, offset)) {
+                cachedRevealedBitmap?.let(bitmapsToRecycle::add)
+            }
+            if (pageShotSlotDependsOnImageOffset(cachedBackwardPage, offset)) {
+                cachedBackwardBitmap?.let(bitmapsToRecycle::add)
+            }
         }
         bitmapsToRecycle.forEach { bitmap ->
             detachCachedTextureOwner(bitmap)
@@ -1470,7 +1464,77 @@ internal class EpubFlowView(
         textView.invalidate()
         container.invalidate()
         invalidate()
+        // Nearby pixel completion: wake reveal/precache after the next pre-draw. Far-page results
+        // never reach here. Successful installs notify via onImageResultChanged only (loader
+        // suppresses the dual onDecodeFinished wake) so far-page PIXELS_ONLY stays silent.
         onAsyncImageDecodeFinished()
+    }
+
+    /**
+     * True when a PIXELS_ONLY completion at [layoutOffset] can affect a currently held warm page
+     * shot, a pending nearby precache window, or the current/adjacent page neighborhood (including
+     * a heading-page synthetic continuation preview of an image that starts on a later page).
+     */
+    private fun pageShotDependsOnImageOffset(layoutOffset: Int): Boolean {
+        if (pageShotSlotDependsOnImageOffset(cachedFromPage, layoutOffset)) return true
+        if (pageShotSlotDependsOnImageOffset(cachedTargetPage, layoutOffset)) return true
+        if (pageShotSlotDependsOnImageOffset(cachedBackwardPage, layoutOffset)) return true
+        val pending = pendingPageTexturePrecache
+        if (
+            pending != null &&
+            (
+                pageWindowDependsOnImageOffset(pending.fromWindow, layoutOffset) ||
+                    pageWindowDependsOnImageOffset(pending.previousWindow, layoutOffset) ||
+                    pageWindowDependsOnImageOffset(pending.targetWindow, layoutOffset)
+                )
+        ) {
+            return true
+        }
+        return relevantPageWindows().any { pageWindowDependsOnImageOffset(it, layoutOffset) }
+    }
+
+    private fun pageShotSlotDependsOnImageOffset(pageIndex: Int, layoutOffset: Int): Boolean =
+        pageWindowDependsOnImageOffset(paged.getOrNull(pageIndex), layoutOffset)
+
+    private fun pageWindowDependsOnImageOffset(page: EpubFlowPage?, layoutOffset: Int): Boolean {
+        if (page == null) return false
+        if (page.containsLayoutOffset(layoutOffset)) return true
+        return pageHasHeadingContinuationForImage(page, layoutOffset)
+    }
+
+    private fun pageHasHeadingContinuationForImage(page: EpubFlowPage, imageLayoutStart: Int): Boolean {
+        val layout = textView.layout ?: return false
+        val chapter = flow ?: return false
+        val continuations = pageLayoutMetadataFor(layout)?.headingImageContinuations
+            ?: headingImageContinuations(layout, chapter)
+        return continuations.any { item ->
+            item.imageLayoutStart == imageLayoutStart &&
+                item.headingFirstLine >= page.startLine &&
+                item.headingEndLineExclusive <= page.endLineExclusive &&
+                item.imageLine >= page.endLineExclusive
+        }
+    }
+
+    /** Current page plus previous/next when those windows exist (same neighborhood as decode gating). */
+    private fun relevantPageWindows(): List<EpubFlowPage> {
+        if (paged.isEmpty()) return emptyList()
+        val aligned = activePageWindow?.takeIf { it.topPx == scrollY }
+        val index = when {
+            aligned != null -> {
+                val exact = paged.indexOfFirst {
+                    it.topPx == aligned.topPx &&
+                        it.startOffset == aligned.startOffset &&
+                        it.endOffset == aligned.endOffset
+                }
+                if (exact >= 0) exact else canonicalFloorPageIndexForTopPx(scrollY)
+            }
+            else -> canonicalFloorPageIndexForTopPx(scrollY)
+        }.coerceIn(0, paged.lastIndex)
+        return buildList {
+            paged.getOrNull(index - 1)?.let(::add)
+            add(paged[index])
+            paged.getOrNull(index + 1)?.let(::add)
+        }
     }
 
     private fun pageContainsLayoutOffset(pageIndex: Int, layoutOffset: Int): Boolean =

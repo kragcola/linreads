@@ -10,6 +10,7 @@ import org.junit.Test
  *
  * Document host (AndroidView / ReaderTapContainer paper) must not be inset away from
  * statusBars/systemBars by itself. Top chrome may still pad for status-bar safety.
+ * Readable content safety lives on the document child (margins), not paper padding.
  *
  * Pattern matches [LibraryScreenVisualContractTest]: source-level contract when the module
  * has no Compose UI test host for layout assertions.
@@ -43,16 +44,37 @@ class ReaderScreenPaperInsetsVisualContractTest {
             "top floating chrome must remain status-bar safe",
             topChromeSurface.contains("windowInsetsPadding(WindowInsets.statusBars)"),
         )
+
+        val tapContainerBlock = readerTapContainerBlock(source)
         assertTrue(
-            "ReaderTapContainer must apply system-bar insets to its document content",
-            source.contains("ViewCompat.setOnApplyWindowInsetsListener(this)") &&
-                source.contains("WindowInsetsCompat.Type.systemBars()") &&
-                source.contains("WindowInsetsCompat.Type.displayCutout()") &&
-                source.contains("view.setPadding("),
+            "ReaderTapContainer must listen for system-bar / cutout insets",
+            tapContainerBlock.contains("ViewCompat.setOnApplyWindowInsetsListener(this)") &&
+                tapContainerBlock.contains("WindowInsetsCompat.Type.systemBars()") &&
+                tapContainerBlock.contains("WindowInsetsCompat.Type.displayCutout()"),
         )
         assertFalse(
             "document inset application must not consume bars needed by Compose chrome",
-            source.contains("WindowInsetsCompat.CONSUMED"),
+            tapContainerBlock.contains("WindowInsetsCompat.CONSUMED"),
+        )
+        assertFalse(
+            "paper owner must not pad itself with system-bar top inset " +
+                "(that pushes engine paper below the status bar)",
+            tapContainerBlock.contains("view.setPadding(\n                    safeInsets.left"),
+        )
+        assertFalse(
+            "paper owner must not assign safeInsets.top as its own paddingTop",
+            tapContainerBlock.contains("safeInsets.top") &&
+                tapContainerBlock.contains("view.setPadding(") &&
+                !tapContainerBlock.contains("view.setPadding(0, 0, 0, 0)"),
+        )
+        assertTrue(
+            "paper owner keeps zero padding so paper full-bleeds under status icons",
+            tapContainerBlock.contains("view.setPadding(0, 0, 0, 0)"),
+        )
+        assertTrue(
+            "content-layer safety must margin the document child, not the paper FrameLayout",
+            tapContainerBlock.contains("applyDocumentContentInsets") &&
+                tapContainerBlock.contains("lp.setMargins(left, top, right, bottom)"),
         )
         assertTrue(
             "the full-screen fallback must use the reader paper palette instead of Material background",
@@ -91,6 +113,13 @@ class ReaderScreenPaperInsetsVisualContractTest {
         val shapeIdx = source.indexOf("shape =", modifierIdx)
         require(shapeIdx > modifierIdx) { "top chrome Surface shape = not found after modifier" }
         return source.substring(modifierIdx, shapeIdx)
+    }
+
+    private fun readerTapContainerBlock(source: String): String {
+        val classIdx = source.indexOf("private class ReaderTapContainer")
+        require(classIdx >= 0) { "ReaderTapContainer class not found in ReaderScreen.kt" }
+        // Bound the block to the class body start through a generous window covering init + helpers.
+        return source.substring(classIdx)
     }
 
     private fun readerScreenSource(): String {

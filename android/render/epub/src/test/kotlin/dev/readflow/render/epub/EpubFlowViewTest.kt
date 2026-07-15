@@ -5267,6 +5267,378 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `PIXELS_ONLY on next page invalidates image shot and heading continuation shot`() {
+        // Extra leading body lines so page 0 is unrelated text while heading sits on a later page.
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        try {
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+            assertEquals(
+                "precache revealed slot is the immediate next page after the heading; " +
+                    "heading=${fixture.headingPageIndex} image=${fixture.imagePageIndex} pages=${pages.size}",
+                fixture.headingPageIndex + 1,
+                fixture.imagePageIndex,
+            )
+            assertTrue(
+                "fixture needs an unrelated page before the heading continuation pair; " +
+                    "heading=${fixture.headingPageIndex} image=${fixture.imagePageIndex} pages=${pages.size}",
+                fixture.headingPageIndex > 0,
+            )
+            assertTrue(
+                "production-faithful warm shots require precache enabled",
+                view.pageTexturePrecacheEnabled,
+            )
+
+            // Park on the heading page so front=heading, revealed=image, backward=unrelated prior page.
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+
+            // Drive the real precache path (split-frame capture) so warm owners carry production
+            // tops + PageTextureKey values — not keyless manual injection.
+            view.preCachePageTexturesForTest()
+            val headingShot = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) {
+                "precache must warm the heading-page front shot"
+            }
+            val imageShot = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) {
+                "precache must warm the image-page revealed shot"
+            }
+            val unrelatedShot = checkNotNull(view.privateField("cachedBackwardBitmap") as Bitmap?) {
+                "precache must warm the unrelated previous-page shot"
+            }
+            assertEquals(fixture.headingPageIndex, view.privateInt("cachedFromPage"))
+            assertEquals(fixture.imagePageIndex, view.privateInt("cachedTargetPage"))
+            assertEquals(fixture.headingPageIndex - 1, view.privateInt("cachedBackwardPage"))
+            assertEquals(
+                requireNotNull(view.pageTopPxAt(fixture.headingPageIndex)),
+                view.privateInt("cachedFromTopPx"),
+            )
+            assertEquals(
+                requireNotNull(view.pageTopPxAt(fixture.imagePageIndex)),
+                view.privateInt("cachedTargetTopPx"),
+            )
+            assertEquals(
+                requireNotNull(view.pageTopPxAt(fixture.headingPageIndex - 1)),
+                view.privateInt("cachedBackwardTopPx"),
+            )
+            val headingKey = checkNotNull(view.privateField("cachedFromTextureKey"))
+            val imageKey = checkNotNull(view.privateField("cachedTargetTextureKey"))
+            val unrelatedKey = checkNotNull(view.privateField("cachedBackwardTextureKey"))
+            assertFalse(headingShot.isRecycled)
+            assertFalse(imageShot.isRecycled)
+            assertFalse(unrelatedShot.isRecycled)
+
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+            // Drain pre-draw wake + the full split-frame precache lifecycle that rebuilds retired slots.
+            shadowOf(Looper.getMainLooper()).idle()
+            view.invalidate()
+            shadowOf(Looper.getMainLooper()).idle()
+            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "image-page shot must retire when its async pixels arrive",
+                imageShot.isRecycled,
+            )
+            assertTrue(
+                "heading-page shot that synthetically previews the next-page image must also retire",
+                headingShot.isRecycled,
+            )
+            assertFalse(
+                "unrelated warm page shot must stay alive after the full lifecycle",
+                unrelatedShot.isRecycled,
+            )
+            assertTrue(
+                "unrelated owner must remain the same cached instance",
+                view.privateField("cachedBackwardBitmap") === unrelatedShot,
+            )
+            assertTrue(
+                "unrelated texture key must stay consistent for the retained previous shot",
+                view.privateField("cachedBackwardTextureKey") === unrelatedKey ||
+                    view.privateField("cachedBackwardTextureKey") == unrelatedKey,
+            )
+            assertEquals(
+                requireNotNull(view.pageTopPxAt(fixture.headingPageIndex - 1)),
+                view.privateInt("cachedBackwardTopPx"),
+            )
+
+            // Affected slots are retired then rebuilt by the production precache wake.
+            val newHeading = view.privateField("cachedFrontBitmap") as Bitmap?
+            val newImage = view.privateField("cachedRevealedBitmap") as Bitmap?
+            assertTrue(
+                "heading slot must be replaced with a fresh warm shot after lifecycle drain; " +
+                    "new=$newHeading recycled=${newHeading?.isRecycled}",
+                newHeading != null && !newHeading.isRecycled && newHeading !== headingShot,
+            )
+            assertTrue(
+                "image slot must be replaced with a fresh warm shot after lifecycle drain; " +
+                    "new=$newImage recycled=${newImage?.isRecycled}",
+                newImage != null && !newImage.isRecycled && newImage !== imageShot,
+            )
+            assertEquals(fixture.headingPageIndex, view.privateInt("cachedFromPage"))
+            assertEquals(fixture.imagePageIndex, view.privateInt("cachedTargetPage"))
+            assertEquals(
+                requireNotNull(view.pageTopPxAt(fixture.headingPageIndex)),
+                view.privateInt("cachedFromTopPx"),
+            )
+            assertEquals(
+                requireNotNull(view.pageTopPxAt(fixture.imagePageIndex)),
+                view.privateInt("cachedTargetTopPx"),
+            )
+            val newHeadingKey = checkNotNull(view.privateField("cachedFromTextureKey")) {
+                "rebuilt heading warm shot must carry a PageTextureKey"
+            }
+            val newImageKey = checkNotNull(view.privateField("cachedTargetTextureKey")) {
+                "rebuilt image warm shot must carry a PageTextureKey"
+            }
+            // Same geometry: rebuilt keys match the pre-invalidation page identity values.
+            assertEquals(headingKey, newHeadingKey)
+            assertEquals(imageKey, newImageKey)
+            assertFalse(
+                "split-frame precache must not remain pending after lifecycle drain",
+                view.privateBool("pageTexturePrecachePending"),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `PIXELS_ONLY AsyncDrawable paints heading continuation crop after transparent placeholder`() {
+        val viewportWidth = 360
+        val viewportHeight = 240
+        val imageColor = 0xFFE11D48.toInt()
+        val imageHeight = viewportHeight + 120
+        val bodyText = (1..2).joinToString("\n") { "前置正文 $it 把标题推到页底附近。" }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Text(bodyText, headingLevel = null, paragraphIndex = 0),
+                EpubDisplayBlock.Text("图版标题", headingLevel = 2, paragraphIndex = 1),
+                EpubDisplayBlock.Image(
+                    href = "plate-async.png",
+                    altText = "async plate",
+                    paragraphIndex = 2,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+        val imageSegment = flow.segments.single { it.isImage }
+        val headingSegment = flow.segments.single {
+            val block = it.block
+            block is EpubDisplayBlock.Text && block.headingLevel != null
+        }
+        val placeholder = ColorDrawable(android.graphics.Color.TRANSPARENT).apply {
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val asyncDrawable = AsyncDrawable(
+            "plate-async.png",
+            AsyncDrawableLoader.noOp(),
+            EpubFlowImageSizeResolver(
+                columnWidthPx = viewportWidth,
+                pageHeightProvider = { viewportHeight },
+                inlineMaxHeightPx = viewportHeight,
+                fullPageHrefs = emptySet(),
+            ),
+            null,
+        ).apply {
+            // Transparent same-size placeholder → PIXELS_ONLY when real pixels arrive.
+            setResult(placeholder)
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val spannable = SpannableString(flow.text).apply {
+            setSpan(
+                AsyncDrawableSpan(
+                    io.noties.markwon.core.MarkwonTheme.create(RuntimeEnvironment.getApplication()),
+                    asyncDrawable,
+                    AsyncDrawableSpan.ALIGN_CENTER,
+                    false,
+                ),
+                imageSegment.layoutStart,
+                imageSegment.layoutEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val view = pagedFlowView(
+            flow = flow,
+            spannable = spannable,
+            viewportWidth = viewportWidth,
+            viewportHeight = viewportHeight,
+        )
+        try {
+            assertTrue(
+                "cached-shot contract requires production precache enabled",
+                view.pageTexturePrecacheEnabled,
+            )
+            val layout = requireNotNull(view.textView.layout)
+            val headingLine = layout.getLineForOffset(headingSegment.layoutStart)
+            val imageLine = layout.getLineForOffset(imageSegment.layoutStart)
+            assertTrue(
+                "fixture needs an oversized following image for continuation crop",
+                layout.getLineBottom(imageLine) - layout.getLineTop(imageLine) > viewportHeight,
+            )
+            val headingPageIndex = (0 until view.pageCount()).firstOrNull { pageIndex ->
+                val top = requireNotNull(view.pageTopPxAt(pageIndex))
+                val nextTop = view.pageTopPxAt(pageIndex + 1) ?: (layout.height + 1)
+                layout.getLineTop(headingLine) in top until nextTop
+            } ?: error("heading must land on a paged window")
+            view.goToPage(headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+
+            // Warm page shots while the placeholder is still transparent (cached-shot path, not only live draw).
+            view.preCachePageTexturesForTest()
+            val staleHeadingShot = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) {
+                "precache must warm the heading page while the placeholder is transparent"
+            }
+            val staleHeadingKey = checkNotNull(view.privateField("cachedFromTextureKey"))
+            assertFalse(staleHeadingShot.isRecycled)
+
+            val headingBottomOnPage =
+                layout.getLineBottom(headingLine) - requireNotNull(view.pageTopPxAt(headingPageIndex))
+            val sampleLeft = viewportWidth / 4
+            val sampleTop = (headingBottomOnPage + 4).coerceAtMost(viewportHeight - 2)
+            val sampleRight = (viewportWidth * 3) / 4
+            val sampleBottom = viewportHeight - 2
+            val warmHitsBefore = sampleImagePatternHits(
+                bitmap = staleHeadingShot,
+                left = sampleLeft,
+                top = sampleTop,
+                right = sampleRight,
+                bottom = sampleBottom,
+                stripeA = imageColor,
+                stripeB = imageColor,
+            )
+            assertEquals(
+                "warm heading shot must not already contain decoded image pixels",
+                0,
+                warmHitsBefore,
+            )
+
+            val decoded = ColorDrawable(imageColor).apply {
+                setBounds(0, 0, viewportWidth, imageHeight)
+            }
+            asyncDrawable.setResult(decoded)
+            asyncDrawable.setBounds(0, 0, viewportWidth, imageHeight)
+            view.onAsyncImagePixelsChanged(imageSegment.layoutStart)
+            // Drain pre-draw wake + split-frame precache so the warm heading slot is rebuilt with pixels.
+            shadowOf(Looper.getMainLooper()).idle()
+            view.invalidate()
+            shadowOf(Looper.getMainLooper()).idle()
+            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "stale heading continuation warm shot must retire after PIXELS_ONLY",
+                staleHeadingShot.isRecycled,
+            )
+            val rebuiltHeading = view.privateField("cachedFrontBitmap") as Bitmap?
+            val livePixels = view.drawToBitmapForTest()
+            try {
+                val warmHits = rebuiltHeading
+                    ?.takeUnless { it.isRecycled }
+                    ?.let {
+                        sampleImagePatternHits(
+                            bitmap = it,
+                            left = sampleLeft,
+                            top = sampleTop,
+                            right = sampleRight,
+                            bottom = sampleBottom,
+                            stripeA = imageColor,
+                            stripeB = imageColor,
+                        )
+                    } ?: 0
+                val liveHits = sampleImagePatternHits(
+                    bitmap = livePixels,
+                    left = sampleLeft,
+                    top = sampleTop,
+                    right = sampleRight,
+                    bottom = sampleBottom,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue(
+                    "heading continuation crop must show decoded pixels on warm shot and/or live render; " +
+                        "warmHits=$warmHits liveHits=$liveHits " +
+                        "rebuilt=${rebuiltHeading != null && rebuiltHeading !== staleHeadingShot} " +
+                        "headingBottomOnPage=$headingBottomOnPage",
+                    warmHits > 0 || liveHits > 0,
+                )
+                if (rebuiltHeading != null && !rebuiltHeading.isRecycled) {
+                    assertTrue(
+                        "rebuilt warm heading must be a new owner, not the transparent-era shot",
+                        rebuiltHeading !== staleHeadingShot,
+                    )
+                    assertNotNull(
+                        "rebuilt warm heading must keep a valid PageTextureKey",
+                        view.privateField("cachedFromTextureKey"),
+                    )
+                    // Same geometry: key identity values remain consistent with the pre-decode page.
+                    assertEquals(staleHeadingKey, view.privateField("cachedFromTextureKey"))
+                }
+            } finally {
+                livePixels.recycle()
+            }
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `far page PIXELS_ONLY does not invalidate warm shots or restart nearby precache`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        // Park on page 0 so relevant neighborhood is pages 0/1 (and no previous).
+        view.goToPage(0)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+
+        val front = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+        val revealed = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+        val backward = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+        view.setPrivateField("cachedFrontBitmap", front)
+        view.setPrivateField("cachedRevealedBitmap", revealed)
+        view.setPrivateField("cachedBackwardBitmap", backward)
+        view.setPrivateField("cachedFromPage", 0)
+        view.setPrivateField("cachedTargetPage", 1)
+        view.setPrivateField("cachedBackwardPage", 2)
+        view.setPrivateField("cachedFromTopPx", pages[0].topPx)
+        view.setPrivateField("cachedTargetTopPx", pages[1].topPx)
+        view.setPrivateField("cachedBackwardTopPx", pages[2].topPx)
+
+        val genBefore = view.privateField("pageTexturePrecacheGeneration") as Long
+        val wakeBefore = view.privateField("asyncImageWakeListener")
+        val farOffset = pages.last().startOffset
+        assertFalse(
+            "far offset must sit outside current/adjacent layout ranges",
+            view.relevantPendingDecodeLayoutRanges().any { farOffset in it },
+        )
+
+        view.onAsyncImagePixelsChanged(farOffset)
+        shadowOf(Looper.getMainLooper()).idle()
+        // Drain any preDraw wake scheduled by a buggy far-page path.
+        shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+
+        assertFalse("current warm front must stay", front.isRecycled)
+        assertFalse("adjacent warm revealed must stay", revealed.isRecycled)
+        assertFalse("nearby warm previous must stay", backward.isRecycled)
+        assertTrue(view.privateField("cachedFrontBitmap") === front)
+        assertTrue(view.privateField("cachedRevealedBitmap") === revealed)
+        assertTrue(view.privateField("cachedBackwardBitmap") === backward)
+        assertEquals(
+            "far-page PIXELS_ONLY must not bump the precache generation",
+            genBefore,
+            view.privateField("pageTexturePrecacheGeneration") as Long,
+        )
+        assertTrue(
+            "far-page PIXELS_ONLY must not install a new async-image wake listener; " +
+                "before=$wakeBefore after=${view.privateField("asyncImageWakeListener")}",
+            view.privateField("asyncImageWakeListener") == null ||
+                view.privateField("asyncImageWakeListener") === wakeBefore,
+        )
+        view.dispose()
+    }
+
+    @Test
     fun `switching out of paged mode recycles cached turn textures`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -7260,6 +7632,123 @@ class EpubFlowViewTest {
         )
         assertEquals(0f, view.getChildAt(0).alpha)
         view.dispose()
+    }
+
+    private data class HeadingImageContinuationFixture(
+        val view: EpubFlowView,
+        val imageLayoutStart: Int,
+        val headingPageIndex: Int,
+        val imagePageIndex: Int,
+    )
+
+    /**
+     * Heading + oversized following image fixture used by continuation-aware invalidation tests.
+     *
+     * Page roles match production ownership ([EpubFlowPage] startOffset/endOffset windows and
+     * [EpubFlowView] precache adjacency: front = heading, revealed = next window, backward = prev).
+     * Line-top heuristics are intentionally not used: an oversized image line can sit past a
+     * separator-only intermediate window even when its line top falls in a later page band.
+     */
+    private fun headingImageContinuationFixture(
+        leadingBodyLines: Int = 2,
+    ): HeadingImageContinuationFixture {
+        // Prefer the requested leading count; if that yields a non-adjacent intermediate window
+        // (separator-only page between a bottom-parked heading and the complete image page), search
+        // nearby counts so the production next-page target owns the image offset.
+        val lineCandidates = linkedSetOf(leadingBodyLines).apply {
+            for (delta in 1..32) {
+                add(leadingBodyLines + delta)
+                if (leadingBodyLines - delta >= 1) add(leadingBodyLines - delta)
+            }
+        }
+        var lastDiagnostics: String? = null
+        for (lines in lineCandidates) {
+            val fixture = buildHeadingImageContinuationFixture(leadingBodyLines = lines)
+            val pages = fixture.view.privateField("paged") as List<EpubFlowPage>
+            val productCase =
+                fixture.headingPageIndex > 0 &&
+                    fixture.imagePageIndex == fixture.headingPageIndex + 1 &&
+                    fixture.imagePageIndex < pages.size
+            if (productCase) return fixture
+            lastDiagnostics =
+                "lines=$lines heading=${fixture.headingPageIndex} image=${fixture.imagePageIndex} " +
+                    "pages=${pages.size} " +
+                    pages.mapIndexed { index, page ->
+                        "#$index[${page.startOffset},${page.endOffset}) lines=${page.startLine}..${page.endLineExclusive}"
+                    }.joinToString(" ")
+            fixture.view.dispose()
+        }
+        error(
+            "unable to place heading + immediate image page for continuation fixture; last=$lastDiagnostics",
+        )
+    }
+
+    /**
+     * Builds one heading/image continuation geometry and resolves page roles from production
+     * offset ownership (`layoutOffset ∈ [startOffset, endOffset)`), not line-top bands.
+     */
+    private fun buildHeadingImageContinuationFixture(
+        leadingBodyLines: Int,
+    ): HeadingImageContinuationFixture {
+        val viewportWidth = 360
+        val viewportHeight = 240
+        val imageHeight = viewportHeight + 120
+        val bodyText = (1..leadingBodyLines).joinToString("\n") { "前置正文 $it 把标题推到页底附近。" }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Text(bodyText, headingLevel = null, paragraphIndex = 0),
+                EpubDisplayBlock.Text("图版标题", headingLevel = 2, paragraphIndex = 1),
+                EpubDisplayBlock.Image(
+                    href = "plate-pattern.png",
+                    altText = "patterned plate",
+                    paragraphIndex = 2,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+        val imageSegment = flow.segments.single { it.isImage }
+        val headingSegment = flow.segments.single {
+            val block = it.block
+            block is EpubDisplayBlock.Text && block.headingLevel != null
+        }
+        val imageDrawable = ColorDrawable(0xFFE11D48.toInt()).apply {
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val spannable = SpannableString(flow.text).apply {
+            setSpan(
+                ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
+                imageSegment.layoutStart,
+                imageSegment.layoutEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val view = pagedFlowView(
+            flow = flow,
+            spannable = spannable,
+            viewportWidth = viewportWidth,
+            viewportHeight = viewportHeight,
+        )
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        // Production: pageWindowDependsOnImageOffset / containsLayoutOffset — offset window, not line top.
+        val headingPageIndex = pages.indexOfFirst { page ->
+            headingSegment.layoutStart >= page.startOffset &&
+                headingSegment.layoutStart < page.endOffset
+        }.takeIf { it >= 0 } ?: error(
+            "heading layout offset ${headingSegment.layoutStart} must land in a paged window; pages=$pages",
+        )
+        val imagePageIndex = pages.indexOfFirst { page ->
+            imageSegment.layoutStart >= page.startOffset &&
+                imageSegment.layoutStart < page.endOffset
+        }.takeIf { it >= 0 } ?: error(
+            "image layout offset ${imageSegment.layoutStart} must land in a paged window; pages=$pages",
+        )
+        return HeadingImageContinuationFixture(
+            view = view,
+            imageLayoutStart = imageSegment.layoutStart,
+            headingPageIndex = headingPageIndex,
+            imagePageIndex = imagePageIndex,
+        )
     }
 
     private fun pagedFlowView(
