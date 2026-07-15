@@ -10,6 +10,8 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
+import dev.readflow.features.settings.createUpdateDownloadFileName
+import dev.readflow.features.settings.createUpdateInstallIntent
 
 /** Handles "install update" tap and DownloadManager completion. */
 class UpdateInstallReceiver : BroadcastReceiver() {
@@ -40,7 +42,8 @@ class UpdateInstallReceiver : BroadcastReceiver() {
         if (prevId != -1L) {
             val dm = context.getSystemService(DownloadManager::class.java)
             if (!reusableDownload) {
-                dm.remove(prevId)
+                // A completed APK may still be open in Package Installer. Clear its identity and
+                // download the replacement to a different file instead of deleting the source URI.
                 prefs.edit().remove("dl_id").remove("dl_url").remove("dl_tag").apply()
             } else {
                 val q = dm.query(DownloadManager.Query().setFilterById(prevId))
@@ -89,7 +92,11 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                 setDescription("正在下载新版本…")
                 setMimeType("application/vnd.android.package-archive")
                 setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                setDestinationInExternalFilesDir(context, null, "update.apk")
+                setDestinationInExternalFilesDir(
+                    context,
+                    null,
+                    createUpdateDownloadFileName(),
+                )
             }
         )
         prefs.edit()
@@ -100,10 +107,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
     }
 
     private fun launchInstaller(context: Context, uri: Uri) {
-        context.startActivity(Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        })
+        context.startActivity(createUpdateInstallIntent(uri, launchInNewTask = true))
     }
 
     private fun onDownloadComplete(context: Context, intent: Intent) {
@@ -121,10 +125,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
         // Also post a notification as a fallback if auto-install doesn't trigger
         val installIntent = PendingIntent.getActivity(
             context, 0,
-            Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(apkUri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-            },
+            createUpdateInstallIntent(apkUri, launchInNewTask = true),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val nm = context.getSystemService(NotificationManager::class.java)

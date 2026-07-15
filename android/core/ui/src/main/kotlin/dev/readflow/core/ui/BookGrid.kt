@@ -41,6 +41,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -62,6 +63,11 @@ private val LibraryItem.key: String
         is LibraryItem.Single -> "book:${book.id}"
         is LibraryItem.Bundle -> "bundle:${bundle.id}"
     }
+
+internal fun libraryItemLabel(item: LibraryItem): String? = when (item) {
+    is LibraryItem.Single -> null
+    is LibraryItem.Bundle -> item.bundle.name
+}
 
 internal fun retainContextMenuAnchor(
     anchorKey: String?,
@@ -85,6 +91,9 @@ private fun libraryGridGapDp(widthDp: Float): Float = when {
     else -> Dimens.gridGapExpanded.value
 }
 
+private fun libraryCoverMinWidthDp(widthDp: Float): Float =
+    if (widthDp < 600f) Dimens.coverMinWidthCompact.value else Dimens.coverMinWidth.value
+
 internal data class LibraryGridLayout(
     val effectiveWidthDp: Float,
     val gapDp: Float,
@@ -96,9 +105,9 @@ internal fun libraryGridLayout(widthDp: Float): LibraryGridLayout {
     val effectiveWidth = widthDp.coerceAtMost(Dimens.maxContentWidth.value)
     val gap = libraryGridGapDp(effectiveWidth)
     val usableWidth = (effectiveWidth - Dimens.screenEdge.value * 2f).coerceAtLeast(0f)
-    val columns = floor((usableWidth + gap) / (Dimens.coverMinWidth.value + gap))
+    val columns = floor((usableWidth + gap) / (libraryCoverMinWidthDp(effectiveWidth) + gap))
         .toInt()
-        .coerceAtLeast(1)
+        .coerceAtLeast(2)
     val coverWidth = (usableWidth - gap * (columns - 1)) / columns
     return LibraryGridLayout(
         effectiveWidthDp = effectiveWidth,
@@ -381,7 +390,7 @@ fun BookGrid(
                 bottom = Dimens.spaceXl,
             ),
             horizontalArrangement = Arrangement.spacedBy(gridLayout.gapDp.dp),
-            verticalArrangement = Arrangement.spacedBy(Dimens.spaceXl),
+            verticalArrangement = Arrangement.spacedBy(Dimens.gridRowGap),
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .widthIn(max = Dimens.maxContentWidth)
@@ -689,26 +698,6 @@ fun BookGrid(
                             }
                         }
 
-                        if (item is LibraryItem.Bundle && !isDragging) {
-                            Surface(
-                                color = Color.Black.copy(alpha = 0.62f),
-                                contentColor = Color.White,
-                                shape = RoundedCornerShape(4.dp),
-                                modifier = Modifier
-                                    .align(Alignment.BottomStart)
-                                    .padding(8.dp)
-                                    .clearAndSetSemantics {},
-                            ) {
-                                Text(
-                                    text = "${item.bundle.name} · ${item.bundle.books.size} 本",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-                                )
-                            }
-                        }
-
                         // 48dp 触摸目标；拖动期间统一隐藏，避免目标卡片仍像可点击控件。
                         if (dragItemKey.isEmpty() &&
                             settlingItemKey.isEmpty() &&
@@ -840,6 +829,24 @@ fun BookGrid(
                         }
                     }
 
+                    libraryItemLabel(item)?.let { label ->
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = palette.ink,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(
+                                    start = Dimens.spaceXs,
+                                    top = Dimens.spaceSm,
+                                    end = Dimens.spaceXs,
+                                )
+                                .clearAndSetSemantics {},
+                        )
+                    }
                 }
             }
         }

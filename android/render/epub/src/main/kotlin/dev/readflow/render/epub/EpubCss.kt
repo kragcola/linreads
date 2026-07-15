@@ -789,7 +789,7 @@ private val INHERITED_PROPERTIES = setOf(
 private val MONOSPACE_TAGS = setOf("code", "kbd", "samp", "tt", "pre")
 private val HEADING_TAGS = setOf("h1", "h2", "h3", "h4", "h5", "h6")
 private val CSS_COMMENTS = Regex("/\\*[\\s\\S]*?\\*/")
-private val CSS_RULE = Regex("([^{}]+)\\{([^{}]*)}")
+private val CSS_RULE = Regex("([^{}]+)\\{([^{}]*)\\}")
 private val CSS_IMPORT = Regex(
     "@import\\s+(?:url\\(\\s*['\"]?([^'\")\\s]+)['\"]?\\s*\\)|['\"]([^'\"]+)['\"])\\s*[^;]*;",
     RegexOption.IGNORE_CASE,

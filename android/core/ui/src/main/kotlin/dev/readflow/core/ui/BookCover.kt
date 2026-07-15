@@ -4,19 +4,18 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.StrokeCap
@@ -36,7 +35,7 @@ import kotlin.math.roundToInt
 /**
  * 封面朝外（设计文档 §2.1）。有 coverUrl → 加载图 + 磨损暗角；无封面 → 素封面
  * （旧布/纸底色 + 居中烫印书名 + 边缘暗角，§2.1.1）。阅读进度使用封面右下角
- * 的紧凑圆形百分比，避免在卡片文字区重复显示。圆角保持接近纸书的克制比例。
+ * 的紧凑圆形百分比，避免在卡片文字区重复显示。直角书脊、页边与底边阴影提供纸书质感。
  */
 @Composable
 fun BookCover(
@@ -46,33 +45,24 @@ fun BookCover(
     showMaterialDepth: Boolean = true,
 ) {
     val clothColor = remember(book.id) { clothColorFor(book.id) }
-    val textureSeed = remember(book.id) { book.id.hashCode() and Int.MAX_VALUE }
 
     Box(
         modifier = modifier
             .shadow(
-                elevation = if (showMaterialDepth) 8.dp else 0.dp,
-                shape = RoundedCornerShape(Dimens.coverCorner),
-                ambientColor = Color.Black.copy(alpha = 0.16f),
-                spotColor = Color.Black.copy(alpha = 0.20f),
+                elevation = if (showMaterialDepth) 3.dp else 0.dp,
+                shape = RectangleShape,
+                ambientColor = Color.Black.copy(alpha = 0.12f),
+                spotColor = Color.Black.copy(alpha = 0.16f),
             )
-            .clip(RoundedCornerShape(Dimens.coverCorner))
             .drawWithContent {
                 drawContent()
-                drawRect(
-                    brush = Brush.radialGradient(
-                        colors = listOf(Color.Transparent, Color(0x20000000)),
-                        center = Offset(size.width / 2f, size.height / 2f),
-                        radius = size.maxDimension * 0.72f,
-                    ),
-                )
                 if (!showMaterialDepth) return@drawWithContent
-                val spineWidth = size.width * 0.075f
+                val spineWidth = size.width * 0.06f
                 drawRect(
                     brush = Brush.horizontalGradient(
                         colors = listOf(
-                            Color.Black.copy(alpha = 0.34f),
-                            Color.Black.copy(alpha = 0.08f),
+                            Color.Black.copy(alpha = 0.30f),
+                            Color.Black.copy(alpha = 0.07f),
                             Color.Transparent,
                         ),
                         endX = spineWidth,
@@ -80,38 +70,30 @@ fun BookCover(
                     size = Size(spineWidth, size.height),
                 )
                 drawLine(
-                    color = Color.White.copy(alpha = 0.14f),
+                    color = Color.White.copy(alpha = 0.12f),
                     start = Offset(spineWidth, 0f),
                     end = Offset(spineWidth, size.height),
-                    strokeWidth = 0.7.dp.toPx(),
+                    strokeWidth = 0.6.dp.toPx(),
                 )
                 drawRect(
-                    brush = Brush.verticalGradient(
+                    brush = Brush.linearGradient(
                         colors = listOf(
-                            Color.White.copy(alpha = 0.10f),
+                            Color.White.copy(alpha = 0.07f),
                             Color.Transparent,
-                            Color.Black.copy(alpha = 0.11f),
+                            Color.Black.copy(alpha = 0.06f),
                         ),
+                        start = Offset.Zero,
+                        end = Offset(size.width, size.height),
                     ),
                 )
-                repeat(6) { index ->
-                    val fraction = ((textureSeed ushr (index * 3)) and 0x1f) / 31f
-                    val x = size.width * ((index + fraction) / 6f)
-                    drawLine(
-                        color = Color.White.copy(alpha = 0.025f),
-                        start = Offset(x, 0f),
-                        end = Offset((x + size.width * 0.025f).coerceAtMost(size.width), size.height),
-                        strokeWidth = 0.45.dp.toPx(),
-                    )
-                }
                 drawLine(
-                    color = Color.White.copy(alpha = 0.16f),
-                    start = Offset(0f, 0.6.dp.toPx()),
-                    end = Offset(size.width, 0.6.dp.toPx()),
-                    strokeWidth = 0.8.dp.toPx(),
+                    color = Color.White.copy(alpha = 0.18f),
+                    start = Offset(size.width - 0.6.dp.toPx(), 0f),
+                    end = Offset(size.width - 0.6.dp.toPx(), size.height),
+                    strokeWidth = 0.7.dp.toPx(),
                 )
                 drawLine(
-                    color = Color.Black.copy(alpha = 0.24f),
+                    color = Color.Black.copy(alpha = 0.28f),
                     start = Offset(0f, size.height - 0.8.dp.toPx()),
                     end = Offset(size.width, size.height - 0.8.dp.toPx()),
                     strokeWidth = 0.8.dp.toPx(),

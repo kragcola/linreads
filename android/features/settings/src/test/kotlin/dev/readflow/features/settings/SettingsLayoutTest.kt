@@ -23,4 +23,17 @@ class SettingsLayoutTest {
     fun leavesMissingBuildTagBlank() {
         assertEquals("", "".displayBuildLabel())
     }
+
+    @Test
+    fun ordersSettingsByDailyUseBeforeMaintenance() {
+        assertEquals(
+            listOf(
+                SettingsCategory.READING,
+                SettingsCategory.SOURCE,
+                SettingsCategory.DATA,
+                SettingsCategory.ABOUT,
+            ),
+            settingsCategoryOrder(),
+        )
+    }
 }

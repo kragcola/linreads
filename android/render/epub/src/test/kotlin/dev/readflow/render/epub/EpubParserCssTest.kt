@@ -15,6 +15,31 @@ class EpubParserCssTest {
     lateinit var tempDir: Path
 
     @Test
+    fun `css rule regex escapes both braces for Android runtime`() {
+        val field = Class.forName("dev.readflow.render.epub.EpubCssKt")
+            .getDeclaredField("CSS_RULE")
+            .apply { isAccessible = true }
+        val pattern = (field.get(null) as Regex).pattern
+
+        assertEquals("([^{}]+)\\{([^{}]*)\\}", pattern)
+    }
+
+    @Test
+    fun `legacy short multi-spine epub remains readable after css initialization`() {
+        val epub = tempDir.resolve("legacy-short-boundary.epub").toFile()
+        writeLegacyShortBoundaryEpub(epub)
+
+        val parser = EpubParser()
+        val eager = parser.parseBook(epub)
+        val lazy = parser.parseLazyBook(epub)
+
+        assertTrue(epub.length() < 1024L, "fixture should stay representative of the sub-1 KiB legacy EPUB")
+        assertEquals(listOf("Chapter one end.", "Chapter two start."), eager.paras.map(EpubPara::text))
+        assertEquals("Chapter one end.", lazy.paragraphAt(0)?.text)
+        assertEquals("Chapter two start.", lazy.paragraphAt(1)?.text)
+    }
+
+    @Test
     fun `eager and lazy parsing load linked stylesheets relative to the spine document`() {
         val epub = tempDir.resolve("css.epub").toFile()
         writeEpub(epub)
@@ -71,6 +96,58 @@ class EpubParserCssTest {
                 """.trimIndent(),
             )
             add("OEBPS/styles/book.css", ".chapter { color: #13579b; font-weight: 700; text-align: center; }")
+        }
+    }
+
+    private fun writeLegacyShortBoundaryEpub(file: File) {
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, content: String) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(content.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+
+            add(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            add(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+                      </manifest>
+                      <spine>
+                        <itemref idref="ch1"/>
+                        <itemref idref="ch2"/>
+                      </spine>
+                    </package>
+                """.trimIndent(),
+            )
+            add(
+                "OEBPS/ch1.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body><p>Chapter one end.</p></body>
+                    </html>
+                """.trimIndent(),
+            )
+            add(
+                "OEBPS/ch2.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body><p>Chapter two start.</p></body>
+                    </html>
+                """.trimIndent(),
+            )
         }
     }
 }

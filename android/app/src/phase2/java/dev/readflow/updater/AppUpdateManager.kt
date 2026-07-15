@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import dev.readflow.BuildConfig
+import dev.readflow.features.settings.UpdatePackageInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -76,14 +77,18 @@ object AppUpdateManager {
         }
     }
 
-    /** Returns (apkUrl, notes) if newer build available, null otherwise. */
-    suspend fun checkForUpdate(context: Context): Pair<String, String>? {
+    /** Returns the downloadable update identity if a newer build is available. */
+    suspend fun checkForUpdate(context: Context): UpdatePackageInfo? {
         val info = checker.check() ?: return null
         val notes = extractNotes(info.notes)
         // Cache notes for always-visible display
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putString(KEY_CACHED_NOTES, notes).apply()
-        return info.apkUrl to notes
+        return UpdatePackageInfo(
+            apkUrl = info.apkUrl,
+            notes = notes,
+            buildTag = info.buildTag,
+        )
     }
 
     /** Get the last cached update notes (survives app restart). */

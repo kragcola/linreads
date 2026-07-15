@@ -15,10 +15,10 @@ object Dimens {
     val spaceXl = 24.dp
 
     /** 屏幕边距。 */
-    val screenEdge = 20.dp
+    val screenEdge = 16.dp
 
-    /** 封面圆角（书近乎方角，大圆角=塑料感）。 */
-    val coverCorner = 8.dp
+    /** 纸书封面使用直角。 */
+    val coverCorner = 0.dp
 
     /** 卡片/纸面圆角。 */
     val surfaceCorner = 20.dp
@@ -26,19 +26,23 @@ object Dimens {
     /** 触摸目标下限。 */
     val touchTarget = 48.dp
 
-    /** 书架自适应网格允许的最小封面宽。 */
-    val coverMinWidth = 116.dp
+    /** 紧凑屏幕允许的最小封面宽，确保横屏手机可增加列数。 */
+    val coverMinWidthCompact = 144.dp
+
+    /** 中大屏允许的最小封面宽，避免平板封面反而小于手机。 */
+    val coverMinWidth = 160.dp
 
     /** 封面宽高比固定 2:3。 */
     const val coverAspectRatio = 2f / 3f
 
-    // 网格间距随断点放松（§3.2，透气优先）
-    val gridGapCompact = 20.dp
-    val gridGapMedium = 24.dp
-    val gridGapExpanded = 28.dp
+    // Moon+ 的网格卡片净空约 8–12dp；宽屏逐档放松但不牺牲封面尺寸。
+    val gridGapCompact = 12.dp
+    val gridGapMedium = 16.dp
+    val gridGapExpanded = 20.dp
+    val gridRowGap = 20.dp
 
     /** Expanded 下书架内容区限宽居中（§3.2）。 */
-    val maxContentWidth = 1120.dp
+    val maxContentWidth = 1200.dp
 }
 
 /** 当前主题下的纸/墨语义色（设计文档 §1.2）。日间纸+墨，夜间暖褐纸+暖白墨。 */

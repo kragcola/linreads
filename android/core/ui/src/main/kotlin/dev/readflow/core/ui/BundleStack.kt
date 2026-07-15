@@ -5,18 +5,23 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import dev.readflow.core.model.BookBundle
 
+internal fun bundleCoverFraction(layerCount: Int): Float = when (layerCount.coerceIn(1, 4)) {
+    1 -> 1.0f
+    2 -> 0.94f
+    3 -> 0.90f
+    else -> 0.86f
+}
+
 /**
  * 合订文件夹：顶层封面正面朝外，底层渐暗并向右下错开。
- * 1本=填满；2本=88%+12%露边；3本=84%+8%；4本=80%+6.7%。
+ * 1本=填满；2本=94%+6%露边；3本=90%+5%；4本=86%+4.7%。
  * 尺寸基于容器百分比，平板/手机效果一致。
  */
 @Composable
@@ -27,12 +32,7 @@ fun BundleStack(
     val layerCount = minOf(bundle.count, 4)
 
     // coverFraction: 顶层封面占容器的比例；剩余空间均分给底层露边偏移
-    val coverFraction = when (layerCount) {
-        1 -> 1.0f
-        2 -> 0.88f
-        3 -> 0.84f
-        else -> 0.80f
-    }
+    val coverFraction = bundleCoverFraction(layerCount)
 
     BoxWithConstraints(modifier = modifier) {
         val w = maxWidth
@@ -56,7 +56,6 @@ fun BundleStack(
                 modifier = Modifier
                     .offset(x = xOff, y = yOff)
                     .size(coverW, coverH)
-                    .clip(RoundedCornerShape(Dimens.coverCorner))
                     .drawWithContent {
                         drawContent()
                         if (shadowAlpha > 0f) drawRect(Color.Black.copy(alpha = shadowAlpha))

@@ -14,12 +14,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
@@ -41,9 +41,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.Surface
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -57,6 +54,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.readflow.core.model.BookMeta
@@ -109,6 +107,7 @@ fun LibraryScreen(
     }
 
     var showAddMenu by remember { mutableStateOf(false) }
+    var showShelfMenu by remember { mutableStateOf(false) }
     val visibleBookCount = state.items.sumOf { item ->
         when (item) {
             is dev.readflow.core.model.LibraryItem.Single -> 1
@@ -120,6 +119,10 @@ fun LibraryScreen(
         visibleBookCount == 0 -> "尚未添加书籍"
         state.offlineCount == 0 -> "共 $visibleBookCount 本"
         else -> "共 $visibleBookCount 本 · ${state.offlineCount} 本可离线"
+    }
+    val activeFilterLabel = when (state.filter) {
+        LibraryFilter.ALL -> "全部书籍"
+        LibraryFilter.OFFLINE -> "离线可读"
     }
 
     PaperSurface {
@@ -178,6 +181,57 @@ fun LibraryScreen(
                                         )
                                     }
                                 }
+                                Box {
+                                    IconButton(
+                                        onClick = { showShelfMenu = true },
+                                        modifier = Modifier
+                                            .size(Dimens.touchTarget)
+                                            .semantics {
+                                                contentDescription = "书架筛选，当前$activeFilterLabel"
+                                            },
+                                    ) {
+                                        Icon(Icons.Default.MoreVert, contentDescription = null)
+                                    }
+                                    DropdownMenu(
+                                        expanded = showShelfMenu,
+                                        onDismissRequest = { showShelfMenu = false },
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("全部书籍") },
+                                            onClick = {
+                                                showShelfMenu = false
+                                                viewModel.setLibraryFilter(LibraryFilter.ALL)
+                                            },
+                                            modifier = Modifier.semantics {
+                                                if (state.filter == LibraryFilter.ALL) {
+                                                    stateDescription = "当前筛选"
+                                                }
+                                            },
+                                            trailingIcon = {
+                                                if (state.filter == LibraryFilter.ALL) {
+                                                    Text("当前", style = MaterialTheme.typography.labelSmall)
+                                                }
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("离线可读 (${state.offlineCount})") },
+                                            onClick = {
+                                                showShelfMenu = false
+                                                viewModel.setLibraryFilter(LibraryFilter.OFFLINE)
+                                            },
+                                            modifier = Modifier.semantics {
+                                                if (state.filter == LibraryFilter.OFFLINE) {
+                                                    stateDescription = "当前筛选"
+                                                }
+                                            },
+                                            trailingIcon = {
+                                                if (state.filter == LibraryFilter.OFFLINE) {
+                                                    Text("当前", style = MaterialTheme.typography.labelSmall)
+                                                }
+                                            },
+                                        )
+                                    }
+                                }
                                 IconButton(
                                     onClick = onSettings,
                                     modifier = Modifier.size(Dimens.touchTarget),
@@ -186,12 +240,6 @@ fun LibraryScreen(
                                 }
                             }
                         }
-                        Spacer(Modifier.height(12.dp))
-                        LibraryFilterBar(
-                            filter = state.filter,
-                            offlineCount = state.offlineCount,
-                            onFilterChange = viewModel::setLibraryFilter,
-                        )
                     }
                 }
             },
@@ -270,37 +318,6 @@ fun LibraryScreen(
                 onDownload = viewModel::downloadCalibreBook,
                 onDismiss = { showCalibreSearch = false },
             )
-        }
-    }
-}
-
-@Composable
-private fun LibraryFilterBar(
-    filter: LibraryFilter,
-    offlineCount: Int,
-    onFilterChange: (LibraryFilter) -> Unit,
-) {
-    val options = listOf(
-        Triple(LibraryFilter.ALL, "全部", "全部书籍"),
-        Triple(LibraryFilter.OFFLINE, "离线", "离线可读 $offlineCount"),
-    )
-    SingleChoiceSegmentedButtonRow {
-        options.forEachIndexed { index, (option, label, description) ->
-            SegmentedButton(
-                selected = filter == option,
-                onClick = { onFilterChange(option) },
-                shape = SegmentedButtonDefaults.itemShape(index, options.size),
-                modifier = Modifier
-                    .heightIn(min = Dimens.touchTarget)
-                    .semantics { contentDescription = description },
-                icon = {},
-            ) {
-                Text(
-                    text = label,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
         }
     }
 }

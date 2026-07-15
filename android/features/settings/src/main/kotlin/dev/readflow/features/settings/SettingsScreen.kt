@@ -12,6 +12,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.verticalScroll
@@ -37,14 +38,16 @@ import androidx.compose.material.icons.outlined.TextFields
 import androidx.compose.material.icons.outlined.ViewCarousel
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -65,7 +68,7 @@ import org.koin.androidx.compose.koinViewModel
 @Composable
 fun SettingsScreen(
     onBack: () -> Unit,
-    onCheckForUpdate: suspend (Context) -> Pair<String, String>? = { null },
+    onCheckForUpdate: suspend (Context) -> UpdatePackageInfo? = { null },
     cachedNotes: String = "",
     authToken: String = "",
     buildTag: String = "",
@@ -89,11 +92,12 @@ fun SettingsScreen(
     val context = LocalContext.current
 
     var urlDraft by remember(url) { mutableStateOf(url ?: "") }
+    var selectedCategory by rememberSaveable { mutableStateOf(SettingsCategory.READING) }
     val scope = rememberCoroutineScope()
     var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
     var pendingUpdateDownload by remember { mutableStateOf<UpdateState.Available?>(null) }
     fun startUpdateDownload(update: UpdateState.Available) {
-        val dlId = context.startFreshDownload(update.apkUrl, authToken)
+        val dlId = context.startFreshDownload(update.packageInfo, authToken)
         updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
     }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -185,7 +189,9 @@ fun SettingsScreen(
                 when (status) {
                     DownloadManager.STATUS_SUCCESSFUL -> {
                         val uri = dm.getUriForDownloadedFile(dlId)
-                        if (uri != null) { launchInstaller(context, uri); updateState = UpdateState.ReadyToInstall(uri) }
+                        if (uri != null && context.launchUpdateInstaller(uri)) {
+                            updateState = UpdateState.ReadyToInstall(uri)
+                        }
                         else updateState = UpdateState.Error("安装包丢失")
                         break
                     }
@@ -218,16 +224,16 @@ fun SettingsScreen(
             modifier = Modifier
                 .padding(padding)
                 .fillMaxSize(),
-            primaryColumn = {
+            selectedCategory = selectedCategory,
+            onCategorySelected = { selectedCategory = it },
+            sourceContent = {
             SettingsSection(
                 title = "书源连接",
-                description = "连接局域网中的 Calibre 内容服务器。",
             ) {
             SettingItemHeader(
                 icon = Icons.Outlined.Link,
                 title = "Calibre 服务器",
                 currentValue = if (url.isNullOrBlank()) "未配置" else "已配置",
-                description = "输入完整地址，或从主机地址探测常用端口。",
             )
             OutlinedTextField(
                 value = urlDraft,
@@ -298,16 +304,15 @@ fun SettingsScreen(
                 )
             }
             }
-
+            },
+            readingContent = {
             SettingsSection(
                 title = "阅读体验",
-                description = "调整排版、翻页方式、字体与文本解析。",
             ) {
             SettingItemHeader(
                 icon = Icons.Outlined.TextFields,
                 title = "正文字号",
                 currentValue = "${fontSize}sp",
-                description = "跟随系统显示缩放，并即时应用到阅读器。",
             )
             AccessibleSlider(
                 value = ReaderTypography.clampFontSp(fontSize.toFloat()),
@@ -338,7 +343,6 @@ fun SettingsScreen(
                 icon = Icons.Outlined.FormatLineSpacing,
                 title = "正文行距",
                 currentValue = "${"%.2f".format(lineSpacing)}x",
-                description = "增加行间留白可减轻长时间阅读疲劳。",
             )
             AccessibleSlider(
                 value = ReaderTypography.clampLineSpacing(lineSpacing),
@@ -356,7 +360,6 @@ fun SettingsScreen(
                 icon = Icons.Outlined.ViewCarousel,
                 title = "阅读模式",
                 currentValue = readingMode.label(),
-                description = "在连续滚动与分页阅读之间切换。",
             )
             FlowRow(
                 modifier = Modifier
@@ -384,7 +387,6 @@ fun SettingsScreen(
                 icon = Icons.Outlined.FontDownload,
                 title = "正文字体",
                 currentValue = fontChoice.label(),
-                description = "使用内置字体、系统字体或导入本地字体文件。",
             )
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 FlowRow(
@@ -420,7 +422,6 @@ fun SettingsScreen(
                 icon = Icons.Outlined.Code,
                 title = "TXT 编码",
                 currentValue = txtEncoding.label(),
-                description = "自动识别失败时，可手动指定文本编码。",
             )
             FlowRow(
                 modifier = Modifier
@@ -439,7 +440,6 @@ fun SettingsScreen(
                 icon = Icons.Outlined.Palette,
                 title = "界面主题",
                 currentValue = theme.readerThemeLabel(),
-                description = "可跟随系统，或固定使用日间、夜间与护眼主题。",
             )
             FlowRow(
                 modifier = Modifier
@@ -455,17 +455,15 @@ fun SettingsScreen(
             }
             }
             },
-            secondaryColumn = {
+            dataContent = {
 
             SettingsSection(
                 title = "同步与备份",
-                description = "查看同步状态，并迁移本机阅读数据。",
             ) {
             SettingItemHeader(
                 icon = Icons.Outlined.Sync,
                 title = "阅读数据同步",
                 currentValue = if (syncStatus.isRemoteSyncEnabled) "已启用" else "仅本机",
-                description = "进度、书签与标注的当前保存范围。",
             )
             ConnectionResultText(
                 title = syncStatus.title,
@@ -478,7 +476,6 @@ fun SettingsScreen(
                 icon = Icons.Outlined.ImportExport,
                 title = "完整备份",
                 currentValue = "ZIP",
-                description = "导出或合并进度、书签和标注。",
             )
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -555,13 +552,11 @@ fun SettingsScreen(
 
             SettingsSection(
                 title = "数据与主题",
-                description = "导出笔记，或在设备间复用排版方案。",
             ) {
             SettingItemHeader(
                 icon = Icons.AutoMirrored.Outlined.Notes,
                 title = "阅读笔记",
                 currentValue = "Markdown",
-                description = "按书籍导出书签与标注，便于归档和检索。",
             )
             OutlinedButton(
                 onClick = { notesExportLauncher.launch("LinReads 笔记.md") },
@@ -599,7 +594,6 @@ fun SettingsScreen(
                 icon = Icons.Outlined.Palette,
                 title = "主题方案",
                 currentValue = "JSON",
-                description = "导出当前排版，或从其他设备导入。",
             )
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -665,16 +659,15 @@ fun SettingsScreen(
                 )
             }
             }
-
+            },
+            aboutContent = {
             SettingsSection(
                 title = "关于与更新",
-                description = "版本信息、更新记录与安装状态。",
             ) {
             SettingItemHeader(
                 icon = Icons.Outlined.Info,
                 title = "LinReads Android",
                 currentValue = buildTag.displayBuildLabel().ifBlank { "开发版本" },
-                description = "本机安装版本。",
             )
             // 始终显示缓存的更新日志（中文 commit message）
             if (cachedNotes.isNotBlank()) {
@@ -701,7 +694,6 @@ fun SettingsScreen(
                 icon = Icons.Outlined.SystemUpdate,
                 title = "应用更新",
                 currentValue = updateState.label(),
-                description = "从已配置的发布源检查并安装新版本。",
             )
 
             when (val s = updateState) {
@@ -711,7 +703,7 @@ fun SettingsScreen(
                             updateState = UpdateState.Checking
                             runCatching { onCheckForUpdate(context) }
                                 .onSuccess { result ->
-                                    updateState = if (result != null) UpdateState.Available(result.first, result.second)
+                                    updateState = if (result != null) UpdateState.Available(result)
                                     else UpdateState.UpToDate
                                 }
                                 .onFailure { updateState = UpdateState.Error(it.message ?: "检查失败") }
@@ -779,7 +771,7 @@ fun SettingsScreen(
                     }
                     TextButton(
                         onClick = {
-                            context.clearDownloadState()
+                            context.applyUpdateArtifactEvent(UpdateArtifactEvent.DownloadCancelled)
                             updateState = UpdateState.Idle
                         },
                         modifier = Modifier.heightIn(min = 48.dp),
@@ -789,8 +781,9 @@ fun SettingsScreen(
                 is UpdateState.ReadyToInstall -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text("下载完成", style = MaterialTheme.typography.bodyMedium)
                     Button(onClick = {
-                        launchInstaller(context, s.uri)
-                        context.clearDownloadState()
+                        if (!context.launchUpdateInstaller(s.uri)) {
+                            updateState = UpdateState.Error("无法打开系统安装器，请重新下载")
+                        }
                     }, modifier = Modifier.heightIn(min = 48.dp)) { Text("安装") }
                 }
 
@@ -816,7 +809,6 @@ fun SettingsScreen(
                 }
             }
             }
-            Spacer(Modifier.height(12.dp))
             },
         )
     }
@@ -825,80 +817,153 @@ fun SettingsScreen(
 @Composable
 private fun SettingsSection(
     title: String,
-    description: String,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.semantics { heading() },
+        )
         Column(
             modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.semantics { heading() },
-            )
-            Text(
-                text = description,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
             content = content,
         )
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsPageLayout(
     modifier: Modifier = Modifier,
-    primaryColumn: @Composable ColumnScope.() -> Unit,
-    secondaryColumn: @Composable ColumnScope.() -> Unit,
+    selectedCategory: SettingsCategory,
+    onCategorySelected: (SettingsCategory) -> Unit,
+    readingContent: @Composable ColumnScope.() -> Unit,
+    sourceContent: @Composable ColumnScope.() -> Unit,
+    dataContent: @Composable ColumnScope.() -> Unit,
+    aboutContent: @Composable ColumnScope.() -> Unit,
 ) {
     BoxWithConstraints(modifier = modifier) {
         val layoutMode = settingsLayoutMode(maxWidth.value)
-        val horizontalPadding = if (layoutMode == SettingsLayoutMode.TWO_COLUMNS) 24.dp else 16.dp
-        Column(
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .widthIn(max = 1080.dp)
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = horizontalPadding, vertical = 12.dp),
-        ) {
-            if (layoutMode == SettingsLayoutMode.TWO_COLUMNS) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(24.dp),
-                    verticalAlignment = Alignment.Top,
-                ) {
-                    Column(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(24.dp),
-                        content = primaryColumn,
-                    )
-                    Column(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(24.dp),
-                        content = secondaryColumn,
-                    )
-                }
-            } else {
+        val content: @Composable ColumnScope.() -> Unit = when (selectedCategory) {
+            SettingsCategory.READING -> readingContent
+            SettingsCategory.SOURCE -> sourceContent
+            SettingsCategory.DATA -> dataContent
+            SettingsCategory.ABOUT -> aboutContent
+        }
+        if (layoutMode == SettingsLayoutMode.TWO_COLUMNS) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .widthIn(max = 960.dp)
+                    .fillMaxSize(),
+            ) {
                 Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(24.dp),
+                    modifier = Modifier
+                        .width(196.dp)
+                        .fillMaxHeight()
+                        .padding(12.dp)
+                        .selectableGroup(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    primaryColumn()
-                    secondaryColumn()
+                    settingsCategoryOrder().forEach { category ->
+                        SettingsCategoryItem(
+                            category = category,
+                            selected = selectedCategory == category,
+                            onClick = { onCategorySelected(category) },
+                        )
+                    }
                 }
+                VerticalDivider(modifier = Modifier.fillMaxHeight())
+                SettingsDetailPane(
+                    modifier = Modifier.weight(1f),
+                    content = content,
+                )
+            }
+        } else {
+            Column(modifier = Modifier.fillMaxSize()) {
+                PrimaryTabRow(
+                    selectedTabIndex = settingsCategoryOrder().indexOf(selectedCategory),
+                ) {
+                    settingsCategoryOrder().forEach { category ->
+                        Tab(
+                            selected = selectedCategory == category,
+                            onClick = { onCategorySelected(category) },
+                            text = { Text(category.label, style = MaterialTheme.typography.labelMedium) },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        )
+                    }
+                }
+                SettingsDetailPane(
+                    modifier = Modifier.weight(1f),
+                    content = content,
+                )
             }
         }
     }
+}
+
+@Composable
+private fun SettingsDetailPane(
+    modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        content = content,
+    )
+}
+
+@Composable
+private fun SettingsCategoryItem(
+    category: SettingsCategory,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val contentColor = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .background(
+                color = if (selected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent,
+                shape = MaterialTheme.shapes.extraSmall,
+            )
+            .selectable(
+                selected = selected,
+                role = Role.Tab,
+                onClick = onClick,
+            )
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(
+            imageVector = category.icon(),
+            contentDescription = null,
+            tint = contentColor,
+            modifier = Modifier.size(20.dp),
+        )
+        Text(
+            text = category.label,
+            style = MaterialTheme.typography.labelLarge,
+            color = contentColor,
+        )
+    }
+}
+
+private fun SettingsCategory.icon(): ImageVector = when (this) {
+    SettingsCategory.READING -> Icons.Outlined.TextFields
+    SettingsCategory.SOURCE -> Icons.Outlined.Link
+    SettingsCategory.DATA -> Icons.Outlined.ImportExport
+    SettingsCategory.ABOUT -> Icons.Outlined.Info
 }
 
 @Composable
@@ -906,7 +971,6 @@ private fun SettingItemHeader(
     icon: ImageVector,
     title: String,
     currentValue: String? = null,
-    description: String? = null,
 ) {
     Row(
         modifier = Modifier
@@ -929,31 +993,19 @@ private fun SettingItemHeader(
                 tint = MaterialTheme.colorScheme.primary,
             )
         }
-        Column(
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurface,
             modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(2.dp),
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-            description?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
+        )
         currentValue?.let {
             Text(
                 text = it,
                 style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.widthIn(max = 144.dp),
-                maxLines = 2,
+                modifier = Modifier.widthIn(max = 132.dp),
+                maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
@@ -996,57 +1048,61 @@ private fun ConnectionResultText(title: String, detail: String, isError: Boolean
 /**
  * Always start a fresh download — GitHub release URL never changes between builds
  * so we cannot rely on URL comparison for version detection.
- * Cleans up any previous download before starting a new one.
- * After installation, caller should call clearDownloadState() to wipe all download identity metadata.
+ * Clears the previous download identity before starting a new one.
+ * The completed APK is retained after launching the installer so a cancelled or misrouted install
+ * can be retried. Replacement downloads use a separate file so they cannot invalidate an installer
+ * that is still reading the previous DownloadManager URI.
  */
-private fun Context.startFreshDownload(apkUrl: String, authToken: String): Long {
+private fun Context.startFreshDownload(update: UpdatePackageInfo, authToken: String): Long {
+    applyUpdateArtifactEvent(UpdateArtifactEvent.ReplacedByNewDownload)
+    val metadata = updateDownloadMetadata(update)
     val prefs = getSharedPreferences("update", Context.MODE_PRIVATE)
     val dm = getSystemService(DownloadManager::class.java)
 
-    // 清理所有旧下载记录和文件
-    val oldId = prefs.getLong("dl_id", -1L)
-    if (oldId != -1L) {
-        dm.remove(oldId)
-    }
-
     val dlId = dm.enqueue(
-        DownloadManager.Request(Uri.parse(apkUrl)).apply {
+        DownloadManager.Request(Uri.parse(metadata.apkUrl)).apply {
             if (authToken.isNotEmpty()) addRequestHeader("Authorization", "Bearer $authToken")
             setTitle("LinReads 更新下载中")
             setDescription("正在下载新版本…")
             setMimeType("application/vnd.android.package-archive")
             setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalFilesDir(this@startFreshDownload, null, "update.apk")
+            setDestinationInExternalFilesDir(
+                this@startFreshDownload,
+                null,
+                createUpdateDownloadFileName(),
+            )
         }
     )
     prefs.edit()
         .putLong("dl_id", dlId)
-        .putString("dl_url", apkUrl)
-        .remove("dl_tag")
+        .putString("dl_url", metadata.apkUrl)
+        .putString("dl_tag", metadata.buildTag)
         .apply()
     return dlId
 }
 
-/** 安装完成后调用，清除下载状态防止下次误用旧包 */
-fun Context.clearDownloadState() {
+private fun Context.applyUpdateArtifactEvent(event: UpdateArtifactEvent) {
+    val action = updateArtifactAction(event)
+    if (!action.removeDownload && !action.clearMetadata) return
     val prefs = getSharedPreferences("update", Context.MODE_PRIVATE)
     val oldId = prefs.getLong("dl_id", -1L)
-    if (oldId != -1L) {
+    if (action.removeDownload && oldId != -1L) {
         getSystemService(DownloadManager::class.java).remove(oldId)
     }
-    prefs.edit()
-        .remove("dl_id")
-        .remove("dl_url")
-        .remove("dl_tag")
-        .apply()
+    if (action.clearMetadata) {
+        prefs.edit()
+            .remove("dl_id")
+            .remove("dl_url")
+            .remove("dl_tag")
+            .apply()
+    }
 }
 
-private fun launchInstaller(context: Context, uri: Uri) {
-    context.startActivity(Intent(Intent.ACTION_VIEW).apply {
-        setDataAndType(uri, "application/vnd.android.package-archive")
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-    })
-}
+private fun Context.launchUpdateInstaller(uri: Uri): Boolean =
+    runCatching {
+        startActivity(createUpdateInstallIntent(uri, launchInNewTask = false))
+        applyUpdateArtifactEvent(UpdateArtifactEvent.InstallerLaunched)
+    }.isSuccess
 
 private fun Context.openUnknownAppSourcesSettings() {
     startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
@@ -1073,7 +1129,9 @@ private sealed interface UpdateState {
     data object Idle : UpdateState
     data object Checking : UpdateState
     data object UpToDate : UpdateState
-    data class Available(val apkUrl: String, val notes: String = "") : UpdateState
+    data class Available(val packageInfo: UpdatePackageInfo) : UpdateState {
+        val notes: String get() = packageInfo.notes
+    }
     data class Downloading(val progress: Float, val dlId: Long) : UpdateState
     data class ReadyToInstall(val uri: Uri) : UpdateState
     data class Error(val msg: String) : UpdateState
