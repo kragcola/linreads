@@ -29,8 +29,8 @@ object Dimens {
     /** 书架自适应网格允许的最小封面宽。 */
     val coverMinWidth = 116.dp
 
-    /** 封面宽高比固定 2:3。 */
-    const val coverAspectRatio = 2f / 3f
+    /** 封面宽高比固定 70:100（Moon+），即 0.7f。 */
+    const val coverAspectRatio = 0.7f
 
     // 网格间距随断点放松，手机保持紧凑，平板避免封面过度放大。
     val gridGapCompact = 20.dp

@@ -20,6 +20,19 @@ internal fun bundleCoverFraction(layerCount: Int): Float = when (layerCount.coer
 }
 
 /**
+ * Semantic stack depth for [topBooks] index.
+ * Depth 0 = front (offset 0, no scrim). Higher depth = farther back.
+ * Supported layers: 1..4. Draw loop still paints high depth first, then index 0 last.
+ */
+internal fun bundleLayerDepth(topBookIndex: Int, layerCount: Int): Int {
+    val n = layerCount.coerceIn(1, 4)
+    return topBookIndex.coerceIn(0, n - 1)
+}
+
+/** Full-rect black scrim alpha for a stack layer; coefficient 0.18 per back layer. */
+internal fun bundleLayerScrimAlpha(layerDepth: Int): Float = layerDepth * 0.18f
+
+/**
  * 合订文件夹：顶层封面正面朝外，底层渐暗并向右下错开。
  * 1本=填满；2本=94%+6%露边；3本=90%+5%；4本=86%+4.7%。
  * 尺寸基于容器百分比，平板/手机效果一致。
@@ -46,11 +59,11 @@ fun BundleStack(
         // 底层 → 顶层（index=0为顶层，最后绘制）
         for (i in (layerCount - 1) downTo 0) {
             val book = bundle.topBooks.getOrNull(i) ?: continue
-            val layerDepth = layerCount - 1 - i   // 0=顶层, layerCount-1=最底层
+            val layerDepth = bundleLayerDepth(topBookIndex = i, layerCount = layerCount)
             val xOff = stepW * layerDepth
             val yOff = stepH * layerDepth
             // 越底层越暗
-            val shadowAlpha = layerDepth * 0.18f
+            val shadowAlpha = bundleLayerScrimAlpha(layerDepth)
 
             Box(
                 modifier = Modifier
