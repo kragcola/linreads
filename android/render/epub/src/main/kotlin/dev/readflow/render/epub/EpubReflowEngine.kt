@@ -61,6 +61,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ChapterInfo
+import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.readerPaletteFor
@@ -82,14 +83,20 @@ import io.noties.markwon.image.AsyncDrawableScheduler
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Collections
@@ -169,6 +176,8 @@ class EpubReflowEngine private constructor(
     // Continuous-flow path toggle (方案 C). Defaults to the production const; the internal test
     // constructor can force the legacy slice-pack path for legacy-behavior tests.
     private val flowEngineEnabled: Boolean,
+    private val epubParserFactory: () -> EpubParser,
+    private val fullIndexDispatcher: CoroutineDispatcher,
     @Suppress("UNUSED_PARAMETER") private val constructorMarker: Unit?,
 ) : PagedReaderEngine,
     SelfPagingReaderEngine,
@@ -176,19 +185,54 @@ class EpubReflowEngine private constructor(
     TextAnnotatableReaderEngine,
     InitialLocatorAwareReaderEngine {
 
-    constructor(context: Context) : this(context, pageLineMeasurer = null, flowEngineEnabled = EPUB_FLOW_ENGINE_ENABLED, constructorMarker = null)
+    constructor(context: Context) : this(
+        context = context,
+        pageLineMeasurer = null,
+        flowEngineEnabled = EPUB_FLOW_ENGINE_ENABLED,
+        epubParserFactory = { EpubParser() },
+        fullIndexDispatcher = Dispatchers.IO,
+        constructorMarker = null,
+    )
 
     internal constructor(
         context: Context,
         pageLineMeasurer: EpubPageLineMeasurer,
         flowEngineEnabled: Boolean = false,
-    ) : this(context, pageLineMeasurer = pageLineMeasurer, flowEngineEnabled = flowEngineEnabled, constructorMarker = null)
+    ) : this(
+        context = context,
+        pageLineMeasurer = pageLineMeasurer,
+        flowEngineEnabled = flowEngineEnabled,
+        epubParserFactory = { EpubParser() },
+        fullIndexDispatcher = Dispatchers.IO,
+        constructorMarker = null,
+    )
 
     /** Test-only: exercise the legacy slice-pack path (or force flow) without a custom measurer. */
     internal constructor(
         context: Context,
         flowEngineEnabled: Boolean,
-    ) : this(context, pageLineMeasurer = null, flowEngineEnabled = flowEngineEnabled, constructorMarker = null)
+    ) : this(
+        context = context,
+        pageLineMeasurer = null,
+        flowEngineEnabled = flowEngineEnabled,
+        epubParserFactory = { EpubParser() },
+        fullIndexDispatcher = Dispatchers.IO,
+        constructorMarker = null,
+    )
+
+    internal constructor(
+        context: Context,
+        flowEngineEnabled: Boolean,
+        epubParserFactory: () -> EpubParser,
+        fullIndexDispatcher: CoroutineDispatcher,
+    ) : this(
+        context = context,
+        pageLineMeasurer = null,
+        flowEngineEnabled = flowEngineEnabled,
+        epubParserFactory = epubParserFactory,
+        fullIndexDispatcher = fullIndexDispatcher,
+        constructorMarker = null,
+    )
 
     override val id = "epub-reflow"
     override val format = BookFormat.EPUB
@@ -215,18 +259,24 @@ class EpubReflowEngine private constructor(
     override val currentTextSelection: StateFlow<ReaderTextSelection?> = _currentTextSelection.asStateFlow()
 
     private var paras: List<EpubPara> = emptyList()
+    @Volatile
     private var lazyBook: EpubLazyBook? = null
+    @Volatile
+    private var startupSession: EpubStartupSession? = null
+    private var fullIndexDeferred: Deferred<EpubLazyBook>? = null
     private var displayBlockCount: Int = 0
     private var epubFile: File? = null
     private var internalLinkTargetIndexes: Map<String, EpubTargetPosition> = emptyMap()
     private var spineCharCounts: List<Int> = emptyList()
     private var pagedSlices: List<EpubPageSlice> = emptyList()
+    private val legacyPagedSlicesLock = Any()
+    private val bookGeneration = AtomicLong(0L)
     private var chapterBoundaries: List<ChapterBoundary> = emptyList()
     private var fontSizeSp: Float = 18f
-    private var lineSpacingMultiplier: Float = 1.3f
+    private var lineSpacingMultiplier: Float = 1.0f
     private var flipStyle: dev.readflow.core.model.PageFlipStyle = dev.readflow.core.model.PageFlipStyle.SLIDE
-    private var useSourceHan: Boolean = true
-    private var currentFontId: String = "source_han"
+    private var useSourceHan: Boolean = false
+    private var currentFontId: String = "system_serif"
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
     private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
     private var recyclerView: RecyclerView? = null
@@ -371,6 +421,7 @@ class EpubReflowEngine private constructor(
         val requestedInitialLocator = pendingInitialLocator
         pendingInitialLocator = null
         resetBookStateForOpen()
+        val openGeneration = bookGeneration.get()
         return withContext(Dispatchers.IO) {
             val tmp = File(context.cacheDir, "epub_${uri.hashCode()}.epub")
             if (!tmp.exists()) {
@@ -378,25 +429,77 @@ class EpubReflowEngine private constructor(
                     tmp.outputStream().use { dst -> src.copyTo(dst) }
                 }
             }
-            epubFile = tmp
-            imageBoundsCache.clear()
-            cacheJob?.cancel()
-            cacheJob = SupervisorJob()
-            cacheScope = CoroutineScope(cacheJob!! + Dispatchers.IO)
-            val book = EpubParser().parseLazyBook(tmp)
-            lazyBook = book
-            paras = book.paras
-            internalLinkTargetIndexes = epubInternalLinkTargetIndexes(book.spinePaths, paras, book.fragmentTargetIndexes)
-            spineCharCounts = epubSpineCharCounts(paras)
-            val initialGuessIndex = initialPrefetchIndex(requestedInitialLocator)
+            if (openGeneration != bookGeneration.get()) {
+                throw CancellationException("EPUB open was superseded")
+            }
+            val parser = epubParserFactory()
+            val startup = if (
+                flowEngineEnabled &&
+                (requestedInitialLocator == null || requestedInitialLocator.strategy is LocatorStrategy.Section)
+            ) {
+                val packageIndex = parser.parsePackageIndex(tmp)
+                buildStartupOpenState(tmp, packageIndex, parser, requestedInitialLocator)
+            } else {
+                null
+            }
+            if (startup != null) {
+                withContext(Dispatchers.Main) {
+                    if (openGeneration != bookGeneration.get()) {
+                        startup.session.close()
+                        throw CancellationException("EPUB open was superseded")
+                    }
+                    installBookRuntime(tmp)
+                    installStartupOpenState(startup)
+                    launchFullIndex(tmp, openGeneration)
+                    updatePageCount()
+                    updateChapterInfo(startup.initialParagraphIndex)
+                    _tableOfContents.value = emptyList()
+                    _currentLocator.value = startup.initialLocator
+                }
+                return@withContext startup.initialLocator
+            }
+
+            val book = parser.parseLazyBook(tmp)
+            if (openGeneration != bookGeneration.get()) {
+                book.close()
+                throw CancellationException("EPUB open was superseded")
+            }
+            val indexedParas = book.paras
+            val indexedLinkTargets = epubInternalLinkTargetIndexes(
+                book.spinePaths,
+                indexedParas,
+                book.fragmentTargetIndexes,
+            )
+            val indexedSpineCharCounts = epubSpineCharCounts(indexedParas)
+            val initialGuessIndex = initialPrefetchIndex(requestedInitialLocator, indexedParas)
             book.prefetchAroundParagraph(initialGuessIndex)
-            pagedSlices = buildPagedSlices()
-            chapterBoundaries = buildChapterBoundaries(paras)
-            displayBlockCount = book.blockCount
-            val initial = resolveInitialOpenLocator(requestedInitialLocator)
-            val initialIndex = epubIndexFromLocator(initial, paras.size)
+            // The production chapter-flow view paginates only the active spine. Building the retired
+            // whole-book page table here blocks first paint on every paragraph and image merely to keep
+            // old Page locators compatible. Pay that cost only when an old Page locator actually needs it.
+            val indexedPages = if (
+                !flowEngineEnabled || requestedInitialLocator?.strategy is LocatorStrategy.Page
+            ) {
+                buildPagedSlices(indexedParas, book.layoutBlocks(), tmp)
+            } else {
+                emptyList()
+            }
+            val indexedChapterBoundaries = buildChapterBoundaries(indexedParas)
+            val initial = resolveInitialOpenLocator(requestedInitialLocator, indexedParas, indexedPages)
+            val initialIndex = epubIndexFromLocator(initial, indexedParas.size)
             book.prefetchAroundParagraph(initialIndex)
             withContext(Dispatchers.Main) {
+                if (openGeneration != bookGeneration.get()) {
+                    book.close()
+                    throw CancellationException("EPUB open was superseded")
+                }
+                installBookRuntime(tmp)
+                lazyBook = book
+                paras = indexedParas
+                internalLinkTargetIndexes = indexedLinkTargets
+                spineCharCounts = indexedSpineCharCounts
+                pagedSlices = indexedPages
+                chapterBoundaries = indexedChapterBoundaries
+                displayBlockCount = book.blockCount
                 updatePageCount()
                 updateChapterInfo(initialIndex)
                 _tableOfContents.value = book.tableOfContents.ifEmpty { buildToc(chapterBoundaries, paras.size) }
@@ -406,55 +509,237 @@ class EpubReflowEngine private constructor(
         }
     }
 
-    private fun resolveInitialOpenLocator(locator: Locator?): Locator {
-        if (paras.isEmpty()) return Locator(LocatorStrategy.Unknown)
-        return when (val strategy = locator?.strategy) {
-            is LocatorStrategy.Page -> resolveLegacyPageLocator(locator)
-            is LocatorStrategy.Section -> {
-                val paragraphIndex = epubIndexFromLocator(locator, paras.size)
-                val paragraphOffset =
-                    (strategy.charOffset - (paras.getOrNull(paragraphIndex)?.spineCharStart ?: 0)).coerceAtLeast(0)
-                epubLocatorForOffset(paras, paragraphIndex, paragraphOffset)
+    private fun installBookRuntime(file: File) {
+        epubFile = file
+        imageBoundsCache.clear()
+        cacheJob?.cancel()
+        cacheJob = SupervisorJob()
+        cacheScope = CoroutineScope(cacheJob!! + Dispatchers.IO)
+    }
+
+    private data class StartupOpenState(
+        val session: EpubStartupSession,
+        val initialLocator: Locator,
+        val initialParagraphIndex: Int,
+        val initialSpine: EpubParsedSpine,
+    )
+
+    private fun buildStartupOpenState(
+        file: File,
+        packageIndex: EpubPackageIndex,
+        parser: EpubParser,
+        requested: Locator?,
+    ): StartupOpenState? {
+        if (packageIndex.spineItems.isEmpty()) return null
+        val section = when (val strategy = requested?.strategy) {
+            null -> LocatorStrategy.Section(spineIndex = 0, elementIndex = 0, charOffset = 0)
+            is LocatorStrategy.Section -> strategy
+            else -> return null
+        }
+        if (section.spineIndex !in packageIndex.spineItems.indices) return null
+        if (startupZeroOffsetIsAmbiguous(section, requested, packageIndex)) return null
+        val parsed = parser.parseSpine(file, packageIndex, section.spineIndex)
+        if (parsed.paras.isEmpty()) return null
+        val resolved = resolveProvisionalSection(section, parsed.paras) ?: return null
+        val session = EpubStartupSession(packageIndex) { spineIndex ->
+            epubParserFactory().parseSpine(file, packageIndex, spineIndex)
+        }
+        if (!session.installInitial(parsed, resolved.globalParagraphBase)) return null
+        val globalIndex = resolved.globalParagraphBase + resolved.anchor.localParagraphIndex
+        val para = parsed.paras[resolved.anchor.localParagraphIndex]
+        val charOffset = para.spineCharStart + resolved.anchor.paragraphOffset
+        val spineFraction = if (parsed.charCount > 0) {
+            charOffset.toFloat() / parsed.charCount
+        } else {
+            0f
+        }
+        val approximateProgression = requested?.totalProgression
+            ?: requested?.progression
+            ?: session.approximateProgression(section.spineIndex, spineFraction)
+        val initial = Locator(
+            strategy = LocatorStrategy.Section(
+                spineIndex = section.spineIndex,
+                elementIndex = globalIndex,
+                charOffset = charOffset,
+            ),
+            progression = approximateProgression,
+            totalProgression = approximateProgression,
+        )
+        return StartupOpenState(
+            session = session,
+            initialLocator = initial,
+            initialParagraphIndex = globalIndex,
+            initialSpine = parsed,
+        )
+    }
+
+    private fun startupZeroOffsetIsAmbiguous(
+        section: LocatorStrategy.Section,
+        requested: Locator?,
+        packageIndex: EpubPackageIndex,
+    ): Boolean {
+        if (section.charOffset != 0 || section.elementIndex == 0) return false
+        if (section.elementIndex == section.spineIndex) return false
+        if (section.spineIndex == 0) return true
+        val savedProgression = requested?.totalProgression ?: requested?.progression ?: return true
+        val weights = packageIndex.spineEntryWeights
+        val totalWeight = weights.sum().coerceAtLeast(1L)
+        val spineStart = weights.take(section.spineIndex).sum().toFloat() / totalWeight
+        return kotlin.math.abs(savedProgression - spineStart) > STARTUP_SPINE_START_TOLERANCE
+    }
+
+    private fun installStartupOpenState(state: StartupOpenState) {
+        startupSession = state.session
+        lazyBook = null
+        paras = state.session.parasSnapshot()
+        val initialSpineIndex = state.initialSpine.spineIndex
+        val initialBase = state.session.globalBase(initialSpineIndex) ?: state.initialParagraphIndex
+        internalLinkTargetIndexes = buildMap {
+            state.session.packageIndex.spinePaths.getOrNull(initialSpineIndex)?.let { path ->
+                put(epubNormalizePath(path), EpubTargetPosition(initialBase))
             }
-            null -> epubLocatorForIndex(paras, 0)
-            else -> epubLocatorForIndex(paras, epubIndexFromLocator(locator, paras.size))
+            putAll(state.session.fragmentTargetsForSpine(initialSpineIndex))
+        }
+        spineCharCounts = MutableList(state.session.packageIndex.spineItems.size) { 0 }.also { counts ->
+            counts[initialSpineIndex] = state.initialSpine.charCount
+        }
+        pagedSlices = emptyList()
+        chapterBoundaries = emptyList()
+        displayBlockCount = state.initialSpine.blocks.size
+    }
+
+    private fun launchFullIndex(file: File, generation: Long) {
+        val scope = cacheScope ?: return
+        val deferred = scope.async(fullIndexDispatcher) {
+            epubParserFactory().parseLazyBook(file)
+        }
+        fullIndexDeferred = deferred
+        scope.launch {
+            val book = deferred.await()
+            withContext(Dispatchers.Main) {
+                promoteFullIndex(generation, book)
+            }
         }
     }
 
-    private fun resolveLegacyPageLocator(locator: Locator): Locator {
+    private fun promoteFullIndex(generation: Long, book: EpubLazyBook) {
+        if (generation != bookGeneration.get() || startupSession == null || book.paras.isEmpty()) return
+        val currentSection = _currentLocator.value.strategy as? LocatorStrategy.Section
+        val canonicalIndex = currentSection?.let { canonicalParagraphIndex(it, book.paras) } ?: 0
+        val canonicalPara = book.paras.getOrNull(canonicalIndex)
+        val paragraphOffset = if (currentSection != null && canonicalPara != null) {
+            (currentSection.charOffset - canonicalPara.spineCharStart)
+                .coerceIn(0, (canonicalPara.spineCharEnd - canonicalPara.spineCharStart).coerceAtLeast(0))
+        } else {
+            0
+        }
+        lazyBook = book
+        paras = book.paras
+        internalLinkTargetIndexes = epubInternalLinkTargetIndexes(
+            book.spinePaths,
+            paras,
+            book.fragmentTargetIndexes,
+        )
+        spineCharCounts = epubSpineCharCounts(paras)
+        chapterBoundaries = buildChapterBoundaries(paras)
+        displayBlockCount = book.blockCount
+        pagedSlices = emptyList()
+        startupSession?.close()
+        startupSession = null
+        fullIndexDeferred = null
+        val canonical = epubLocatorForOffset(paras, canonicalIndex, paragraphOffset)
+        _currentLocator.value = canonical
+        updateChapterInfo(canonicalIndex)
+        _tableOfContents.value = book.tableOfContents.ifEmpty { buildToc(chapterBoundaries, paras.size) }
+        _pageCount.value = if (flowEngineEnabled) flowView?.pageCount() ?: 0 else when (_pagingKind.value) {
+            PagingKind.CONTINUOUS -> paras.size
+            PagingKind.PAGED -> pagedSlices.size
+        }
+        prewarmBoundaryPreviews()
+    }
+
+    private fun canonicalParagraphIndex(
+        section: LocatorStrategy.Section,
+        indexedParas: List<EpubPara>,
+    ): Int {
+        val sameSpine = indexedParas.indices.filter { indexedParas[it].spineIndex == section.spineIndex }
+        val containing = sameSpine.firstOrNull { index ->
+            val para = indexedParas[index]
+            section.charOffset in para.spineCharStart until para.spineCharEnd
+        }
+        if (containing != null) return containing
+        sameSpine.lastOrNull { indexedParas[it].spineCharEnd == section.charOffset }?.let { return it }
+        indexedParas.getOrNull(section.elementIndex)?.let { para ->
+            if (para.spineIndex == section.spineIndex) return section.elementIndex
+        }
+        return sameSpine.firstOrNull() ?: 0
+    }
+
+    private fun resolveInitialOpenLocator(
+        locator: Locator?,
+        indexedParas: List<EpubPara> = paras,
+        indexedPages: List<EpubPageSlice>? = null,
+    ): Locator {
+        if (indexedParas.isEmpty()) return Locator(LocatorStrategy.Unknown)
+        return when (val strategy = locator?.strategy) {
+            is LocatorStrategy.Page -> resolveLegacyPageLocator(locator, indexedParas, indexedPages)
+            is LocatorStrategy.Section -> {
+                val paragraphIndex = epubIndexFromLocator(locator, indexedParas.size)
+                val paragraphOffset =
+                    (strategy.charOffset - (indexedParas.getOrNull(paragraphIndex)?.spineCharStart ?: 0))
+                        .coerceAtLeast(0)
+                epubLocatorForOffset(indexedParas, paragraphIndex, paragraphOffset)
+            }
+            null -> epubLocatorForIndex(indexedParas, 0)
+            else -> epubLocatorForIndex(indexedParas, epubIndexFromLocator(locator, indexedParas.size))
+        }
+    }
+
+    private fun resolveLegacyPageLocator(
+        locator: Locator,
+        indexedParas: List<EpubPara> = paras,
+        indexedPages: List<EpubPageSlice>? = null,
+    ): Locator {
         val page = locator.strategy as? LocatorStrategy.Page ?: return locator
-        legacyPageIndexFromLocator(locator)?.let { index ->
-            pagedSlices.getOrNull(index)?.let { return epubLocatorForPageSlice(paras, it) }
+        val pages = indexedPages ?: ensureLegacyPagedSlices()
+        legacyPageIndexFromLocator(locator, pages)?.let { index ->
+            pages.getOrNull(index)?.let { return epubLocatorForPageSlice(indexedParas, it) }
         }
-        return pagedSlices
-            .getOrNull(page.index.coerceIn(0, (pagedSlices.size - 1).coerceAtLeast(0)))
-            ?.let { epubLocatorForPageSlice(paras, it) }
-            ?: epubLocatorForIndex(paras, epubIndexFromLocator(locator, paras.size))
+        return pages
+            .getOrNull(page.index.coerceIn(0, (pages.size - 1).coerceAtLeast(0)))
+            ?.let { epubLocatorForPageSlice(indexedParas, it) }
+            ?: epubLocatorForIndex(indexedParas, epubIndexFromLocator(locator, indexedParas.size))
     }
 
-    private fun initialPrefetchIndex(locator: Locator?): Int {
-        if (paras.isEmpty()) return 0
+    private fun initialPrefetchIndex(
+        locator: Locator?,
+        indexedParas: List<EpubPara> = paras,
+    ): Int {
+        if (indexedParas.isEmpty()) return 0
         val page = locator?.strategy as? LocatorStrategy.Page
         if (page != null) {
             val total = page.total.coerceAtLeast(1)
             val progression = locator.totalProgression
                 ?: locator.progression
                 ?: (page.index.toFloat() / total)
-            val targetDocumentOffset = (progression.coerceIn(0f, 1f) * epubTotalChars(paras)).toInt()
-            return paras.indexOfLast { para -> para.documentCharStart <= targetDocumentOffset }
+            val targetDocumentOffset = (progression.coerceIn(0f, 1f) * epubTotalChars(indexedParas)).toInt()
+            return indexedParas.indexOfLast { para -> para.documentCharStart <= targetDocumentOffset }
                 .takeIf { it >= 0 }
                 ?: 0
         }
-        return locator?.let { epubIndexFromLocator(it, paras.size) } ?: 0
+        return locator?.let { epubIndexFromLocator(it, indexedParas.size) } ?: 0
     }
 
-    private fun legacyPageIndexFromLocator(locator: Locator): Int? {
+    private fun legacyPageIndexFromLocator(
+        locator: Locator,
+        pages: List<EpubPageSlice> = pagedSlices,
+    ): Int? {
         val page = locator.strategy as? LocatorStrategy.Page ?: return null
         val progression = locator.totalProgression ?: locator.progression ?: return null
-        val estimatedIndex = (progression.coerceIn(0f, 1f) * pagedSlices.size).toInt()
-        return estimatedIndex.coerceIn(0, pagedSlices.lastIndex.coerceAtLeast(0))
-            .takeIf { pagedSlices.isNotEmpty() }
-            ?: page.index.coerceIn(0, (pagedSlices.size - 1).coerceAtLeast(0))
+        val estimatedIndex = (progression.coerceIn(0f, 1f) * pages.size).toInt()
+        return estimatedIndex.coerceIn(0, pages.lastIndex.coerceAtLeast(0))
+            .takeIf { pages.isNotEmpty() }
+            ?: page.index.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
     }
 
     override fun createView(): View {
@@ -640,10 +925,8 @@ class EpubReflowEngine private constructor(
         reportPositionAfterStableReveal: Boolean = false,
     ) {
         val view = flowView ?: return
-        val book = lazyBook ?: return
-        val blocks = book.layoutBlocks().filter {
-            paras.getOrNull(it.paragraphIndex)?.spineIndex == spineIndex
-        }
+        val blocks = blocksForSpine(spineIndex)
+        if (blocks.isEmpty()) return
         val flow = epubBuildChapterFlow(spineIndex, blocks)
         liveFlowImageLoader?.releaseAll()
         liveFlowImageLoader = installFlowChapter(
@@ -659,6 +942,12 @@ class EpubReflowEngine private constructor(
         flowSpineIndex = spineIndex
         flowCurrentFlow = flow
     }
+
+    private fun blocksForSpine(spineIndex: Int): List<EpubDisplayBlock> =
+        startupSession?.blocksForSpine(spineIndex)?.takeIf { it.isNotEmpty() }
+            ?: lazyBook?.layoutBlocks()?.filter { block ->
+                paras.getOrNull(block.paragraphIndex)?.spineIndex == spineIndex
+            }.orEmpty()
 
     private fun installFlowChapter(
         view: EpubFlowView,
@@ -779,7 +1068,12 @@ class EpubReflowEngine private constructor(
         val view = flowView ?: return
         val required = view.boundaryPreviewIsRequired(forward)
         if ((pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) && !required) return
-        val book = lazyBook ?: return view.rejectBoundaryPreview(forward, sourceChapterGeneration)
+        val book = lazyBook
+        val session = startupSession
+        if (book == null && session == null) {
+            view.rejectBoundaryPreview(forward, sourceChapterGeneration)
+            return
+        }
         val host = flowHost ?: return view.rejectBoundaryPreview(forward, sourceChapterGeneration)
         if (
             _pagingKind.value != PagingKind.PAGED ||
@@ -799,13 +1093,30 @@ class EpubReflowEngine private constructor(
             return
         }
         val generation = boundaryPreviewGeneration
-        val blocks = book.layoutBlocks().filter {
-            paras.getOrNull(it.paragraphIndex)?.spineIndex == targetSpine
-        }
         val requestId = ++nextBoundaryPreviewRequestId
         boundaryPreviewJobTokens[forward] = requestId
         boundaryPreviewJobs[forward] = flowExecutor.submit {
+            var startupSpine: EpubStartupSpine? = null
+            fun blocksFrom(indexedBook: EpubLazyBook): List<EpubDisplayBlock> =
+                indexedBook.layoutBlocks().filter { block ->
+                    indexedBook.paras.getOrNull(block.paragraphIndex)?.spineIndex == targetSpine
+                }
+            var blocks = when {
+                book != null -> blocksFrom(book)
+                session != null -> session.ensureAdjacent(sourceSpine, targetSpine)
+                    ?.also { startupSpine = it }
+                    ?.globalBlocks
+                    .orEmpty()
+                else -> emptyList()
+            }
+            if (session != null && startupSession !== session) {
+                lazyBook?.let { promotedBook ->
+                    startupSpine = null
+                    blocks = blocksFrom(promotedBook)
+                }
+            }
             val targetFlow = runCatching { epubBuildChapterFlow(targetSpine, blocks) }.getOrNull()
+                ?.takeIf { blocks.isNotEmpty() }
             flowMainHandler.post {
                 if (boundaryPreviewJobTokens[forward] != requestId) return@post
                 boundaryPreviewJobs.remove(forward)
@@ -829,6 +1140,10 @@ class EpubReflowEngine private constructor(
                     view.rejectBoundaryPreview(forward, sourceChapterGeneration)
                     return@post
                 }
+                val parsedStartupSpine = startupSpine
+                if (parsedStartupSpine != null && session != null && startupSession === session) {
+                    refreshStartupSessionSpine(session, parsedStartupSpine)
+                }
                 installBoundaryPreviewRenderer(
                     generation = generation,
                     forward = forward,
@@ -838,6 +1153,27 @@ class EpubReflowEngine private constructor(
                     targetFlow = targetFlow,
                 )
             }
+        }
+    }
+
+    private fun refreshStartupSessionSpine(
+        session: EpubStartupSession,
+        startupSpine: EpubStartupSpine,
+    ) {
+        if (startupSession !== session) return
+        paras = session.parasSnapshot()
+        val spineIndex = startupSpine.parsed.spineIndex
+        spineCharCounts = spineCharCounts.toMutableList().also { counts ->
+            if (spineIndex in counts.indices) counts[spineIndex] = startupSpine.parsed.charCount
+        }
+        internalLinkTargetIndexes = internalLinkTargetIndexes.toMutableMap().also { targets ->
+            session.packageIndex.spinePaths.getOrNull(spineIndex)?.let { path ->
+                targets[epubNormalizePath(path)] = EpubTargetPosition(startupSpine.globalParagraphBase)
+            }
+            targets.putAll(session.fragmentTargetsForSpine(spineIndex))
+        }
+        displayBlockCount = session.packageIndex.spineItems.indices.sumOf { index ->
+            session.blocksForSpine(index).size
         }
     }
 
@@ -1143,7 +1479,8 @@ class EpubReflowEngine private constructor(
 
     /** The spine indices that actually carry layout content, in reading order. */
     private fun flowSpineOrder(): List<Int> =
-        paras.map { it.spineIndex }.distinct().sorted()
+        startupSession?.packageIndex?.spineItems?.indices?.toList()
+            ?: paras.map { it.spineIndex }.distinct().sorted()
 
     /** Spine adjacent to [spineIndex] in [delta] direction, or null past the book boundary. */
     private fun adjacentSpine(spineIndex: Int, delta: Int): Int? {
@@ -1155,7 +1492,8 @@ class EpubReflowEngine private constructor(
     }
 
     private fun firstParagraphOfSpine(spineIndex: Int): Int =
-        paras.indexOfFirst { it.spineIndex == spineIndex }.coerceAtLeast(0)
+        startupSession?.globalBase(spineIndex)
+            ?: paras.indexOfFirst { it.spineIndex == spineIndex }.coerceAtLeast(0)
 
     /**
      * Turns one page in [delta] direction. Within a chapter the flow view scrolls; at a chapter
@@ -1173,7 +1511,7 @@ class EpubReflowEngine private constructor(
         val flow = flowCurrentFlow ?: return
         val (paragraphIndex, paraOffset) = flow.paragraphAtOffset(layoutOffset) ?: return
         warmCacheAround(paragraphIndex)
-        _currentLocator.value = epubLocatorForOffset(paras, paragraphIndex, paraOffset)
+        _currentLocator.value = runtimeLocatorForOffset(paragraphIndex, paraOffset)
         updateChapterInfo(paragraphIndex)
         _pageCount.value = flowView?.pageCount() ?: _pageCount.value
         prewarmBoundaryPreviews()
@@ -1184,8 +1522,8 @@ class EpubReflowEngine private constructor(
         if (start == end) { _currentTextSelection.value = null; return }
         val (sPara, sOff) = flow.paragraphAtOffset(minOf(start, end)) ?: return
         val (ePara, eOff) = flow.paragraphAtOffset(maxOf(start, end)) ?: return
-        val startLoc = epubLocatorForOffset(paras, sPara, sOff)
-        val endLoc = epubLocatorForOffset(paras, ePara, eOff)
+        val startLoc = runtimeLocatorForOffset(sPara, sOff)
+        val endLoc = runtimeLocatorForOffset(ePara, eOff)
         val selectedText = flow.text.substring(
             minOf(start, end).coerceIn(0, flow.text.length),
             maxOf(start, end).coerceIn(0, flow.text.length),
@@ -1198,7 +1536,7 @@ class EpubReflowEngine private constructor(
     }
 
     override fun createPageView(pageIndex: Int): View {
-        val pages = pagedSlices.ifEmpty { buildPagedSlices().also { pagedSlices = it } }
+        val pages = ensureLegacyPagedSlices()
         val total = pages.size.coerceAtLeast(1)
         val safePageIndex = pageIndex.coerceIn(0, total - 1)
         val slice = pages.getOrNull(safePageIndex) ?: EpubPageSlice(paragraphIndex = 0, startOffset = 0, endOffset = 0)
@@ -1522,6 +1860,23 @@ class EpubReflowEngine private constructor(
     }
 
     private fun updateChapterInfo(paraIndex: Int) {
+        startupSession?.let { session ->
+            val para = paras.getOrNull(paraIndex) ?: return
+            val base = session.globalBase(para.spineIndex) ?: return
+            val content = session.startupSpine(para.spineIndex)?.parsed ?: return
+            val localIndex = (paraIndex - base).coerceIn(0, (content.paras.size - 1).coerceAtLeast(0))
+            _chapterInfo.value = ChapterInfo(
+                currentIndex = para.spineIndex,
+                totalChapters = session.packageIndex.spineItems.size.coerceAtLeast(1),
+                currentTitle = "第${para.spineIndex + 1}章",
+                progressInChapter = if (content.paras.isNotEmpty()) {
+                    localIndex.toFloat() / content.paras.size
+                } else {
+                    0f
+                },
+            )
+            return
+        }
         val chapter = chapterBoundaries.firstOrNull { paraIndex in it.startInclusive until it.endExclusive }
             ?: chapterBoundaries.firstOrNull() ?: return
         val chapterIdx = chapterBoundaries.indexOf(chapter)
@@ -1537,7 +1892,41 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun goToAdjacentChapter(delta: Int) {
+        val session = startupSession
+        if (session != null) {
+            val sourceSpine = (_currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex
+                ?: flowSpineIndex.takeIf { it >= 0 }
+                ?: 0
+            val targetSpine = adjacentSpine(sourceSpine, delta) ?: return
+            val target = withContext(Dispatchers.IO) {
+                session.ensureAdjacent(sourceSpine, targetSpine)
+            }
+            if (target != null) {
+                val remainsProvisional = withContext(Dispatchers.Main) {
+                    if (startupSession !== session) return@withContext false
+                    refreshStartupSessionSpine(session, target)
+                    true
+                }
+                if (remainsProvisional) {
+                    val charOffset = target.parsed.paras.firstOrNull()?.spineCharStart ?: 0
+                    goToFlow(
+                        Locator(
+                            strategy = LocatorStrategy.Section(
+                                spineIndex = targetSpine,
+                                elementIndex = target.globalParagraphBase,
+                                charOffset = charOffset,
+                            ),
+                            progression = session.approximateProgression(targetSpine, 0f),
+                            totalProgression = session.approximateProgression(targetSpine, 0f),
+                        ),
+                    )
+                    return
+                }
+            }
+            awaitFullIndexBook()
+        }
         val info = _chapterInfo.value
+        if (chapterBoundaries.isEmpty()) return
         val targetIdx = (info.currentIndex + delta).coerceIn(0, chapterBoundaries.lastIndex)
         if (targetIdx == info.currentIndex) return
         val target = chapterBoundaries[targetIdx]
@@ -1574,7 +1963,36 @@ class EpubReflowEngine private constructor(
     }
 
     private suspend fun goToFlow(locator: Locator) {
-        val resolved = resolveLegacyPageLocator(locator)
+        val provisionalSession = startupSession
+        val requestedSection = locator.strategy as? LocatorStrategy.Section
+        if (provisionalSession != null && requestedSection != null) {
+            val startupTarget = withContext(Dispatchers.IO) {
+                val resolved = provisionalSession.ensureSection(requestedSection) ?: return@withContext null
+                val spine = provisionalSession.startupSpine(requestedSection.spineIndex)
+                    ?: return@withContext null
+                resolved to spine
+            }
+            if (startupTarget != null) {
+                val (resolved, spine) = startupTarget
+                val remainsProvisional = withContext(Dispatchers.Main) {
+                    if (startupSession !== provisionalSession) return@withContext false
+                    refreshStartupSessionSpine(provisionalSession, spine)
+                    navigateFlowOnMain(
+                        index = resolved.globalParagraphIndex,
+                        paragraphOffset = resolved.anchor.paragraphOffset,
+                        targetSpine = requestedSection.spineIndex,
+                    )
+                    true
+                }
+                if (remainsProvisional) return
+            }
+        }
+        if (startupSession != null) awaitFullIndexBook()
+        val resolved = if (locator.strategy is LocatorStrategy.Page && pagedSlices.isEmpty()) {
+            withContext(Dispatchers.IO) { resolveLegacyPageLocator(locator) }
+        } else {
+            resolveLegacyPageLocator(locator)
+        }
         val idx = epubIndexFromLocator(resolved, paras.size).coerceIn(0, (paras.size - 1).coerceAtLeast(0))
         val paraOffset = when (val s = resolved.strategy) {
             is LocatorStrategy.Section -> (s.charOffset - (paras.getOrNull(idx)?.spineCharStart ?: 0)).coerceAtLeast(0)
@@ -1583,23 +2001,61 @@ class EpubReflowEngine private constructor(
         val targetSpine = spineIndexForParagraph(idx)
         withContext(Dispatchers.IO) { lazyBook?.prefetchAroundParagraph(idx) }
         withContext(Dispatchers.Main) {
-            invalidateBoundaryPreviewState(clearViewSlots = true)
-            val view = flowView
-            if (view == null) {
-                _currentLocator.value = epubLocatorForOffset(paras, idx, paraOffset)
-                updateChapterInfo(idx)
-                return@withContext
-            }
-            if (targetSpine != flowSpineIndex) {
-                loadFlowChapter(targetSpine, restoreToParagraph = idx, restoreToParagraphOffset = paraOffset)
-            } else {
-                val offset = flowCurrentFlow?.offsetForParagraph(idx, paraOffset) ?: 0
-                view.goToOffset(offset)
-                prewarmBoundaryPreviews()
-            }
-            _currentLocator.value = epubLocatorForOffset(paras, idx, paraOffset)
-            updateChapterInfo(idx)
+            navigateFlowOnMain(idx, paraOffset, targetSpine)
         }
+    }
+
+    private suspend fun awaitFullIndexBook(): EpubLazyBook? {
+        lazyBook?.let { return it }
+        val deferred = fullIndexDeferred ?: return null
+        val book = runCatching { deferred.await() }.getOrNull() ?: return null
+        return withContext(Dispatchers.Main) {
+            if (fullIndexDeferred === deferred && lazyBook == null) {
+                promoteFullIndex(bookGeneration.get(), book)
+            }
+            lazyBook
+        }
+    }
+
+    private fun navigateFlowOnMain(
+        index: Int,
+        paragraphOffset: Int,
+        targetSpine: Int,
+    ) {
+        invalidateBoundaryPreviewState(clearViewSlots = true)
+        val view = flowView
+        if (view == null) {
+            _currentLocator.value = runtimeLocatorForOffset(index, paragraphOffset)
+            updateChapterInfo(index)
+            return
+        }
+        if (targetSpine != flowSpineIndex) {
+            loadFlowChapter(
+                targetSpine,
+                restoreToParagraph = index,
+                restoreToParagraphOffset = paragraphOffset,
+            )
+        } else {
+            val offset = flowCurrentFlow?.offsetForParagraph(index, paragraphOffset) ?: 0
+            view.goToOffset(offset)
+            prewarmBoundaryPreviews()
+        }
+        _currentLocator.value = runtimeLocatorForOffset(index, paragraphOffset)
+        updateChapterInfo(index)
+    }
+
+    private fun runtimeLocatorForOffset(paragraphIndex: Int, paragraphOffset: Int): Locator {
+        val locator = epubLocatorForOffset(paras, paragraphIndex, paragraphOffset)
+        val session = startupSession ?: return locator
+        val section = locator.strategy as? LocatorStrategy.Section ?: return locator
+        val spineCharCount = spineCharCounts.getOrNull(section.spineIndex) ?: 0
+        val spineFraction = if (spineCharCount > 0) {
+            section.charOffset.toFloat() / spineCharCount
+        } else {
+            0f
+        }
+        val progression = session.approximateProgression(section.spineIndex, spineFraction)
+        return locator.copy(progression = progression, totalProgression = progression)
     }
 
     override suspend fun goTo(locator: Locator) {
@@ -1645,8 +2101,13 @@ class EpubReflowEngine private constructor(
         }
     }
 
-    override suspend fun search(query: String): List<Locator> = withContext(Dispatchers.IO) {
-        epubSearchLocators(paras, query) { index -> lazyBook?.paragraphAt(index) }
+    override suspend fun search(query: String): List<Locator> {
+        if (query.isBlank()) return emptyList()
+        return withContext(Dispatchers.IO) {
+            val indexedBook = if (startupSession != null) awaitFullIndexBook() else lazyBook
+            val indexedParas = indexedBook?.paras ?: paras
+            epubSearchLocators(indexedParas, query) { index -> indexedBook?.paragraphAt(index) }
+        }
     }
 
     override fun clearTextSelection() {
@@ -1837,22 +2298,12 @@ class EpubReflowEngine private constructor(
     }
 
     private fun locatorForTextSelectionOffset(paragraphIndex: Int, paragraphOffset: Int): Locator? {
-        val para = paras.getOrNull(paragraphIndex) ?: return null
-        val totalChars = epubTotalChars(paras).coerceAtLeast(1).toFloat()
-        val documentOffset = para.documentCharStart + paragraphOffset
-        val totalProgression = (documentOffset.toFloat() / totalChars).coerceIn(0f, 1f)
-        return Locator(
-            strategy = LocatorStrategy.Section(
-                spineIndex = para.spineIndex,
-                elementIndex = paragraphIndex,
-                charOffset = para.spineCharStart + paragraphOffset,
-            ),
-            progression = totalProgression,
-            totalProgression = totalProgression,
-        )
+        if (paragraphIndex !in paras.indices) return null
+        return runtimeLocatorForOffset(paragraphIndex, paragraphOffset)
     }
 
     private fun resetBookStateForOpen() {
+        bookGeneration.incrementAndGet()
         invalidateBoundaryPreviewState(clearViewSlots = false)
         flowMainHandler.removeCallbacksAndMessages(null)
         liveFlowImageLoader?.releaseAll()
@@ -1877,6 +2328,9 @@ class EpubReflowEngine private constructor(
         activePagedTextPages.clear()
         activePagedImagePages.clear()
         activePagedCompositePages.clear()
+        startupSession?.close()
+        startupSession = null
+        fullIndexDeferred = null
         lazyBook?.close()
         lazyBook = null
         recyclerView = null
@@ -1899,6 +2353,7 @@ class EpubReflowEngine private constructor(
         epubHighlightRanges(paras, paragraphIndex, textAnnotations)
 
     override suspend fun close() {
+        bookGeneration.incrementAndGet()
         unregisterPageShotMemoryCallbacks()
         invalidateBoundaryPreviewState(clearViewSlots = false)
         flowMainHandler.removeCallbacksAndMessages(null)
@@ -1927,6 +2382,9 @@ class EpubReflowEngine private constructor(
         activePagedTextPages.clear()
         activePagedImagePages.clear()
         activePagedCompositePages.clear()
+        startupSession?.close()
+        startupSession = null
+        fullIndexDeferred = null
         lazyBook?.close()
         lazyBook = null
         imageBoundsCache.clear()
@@ -1980,9 +2438,9 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {
-        val targetFontId = if (useSourceHan) "source_han" else "system"
-        if (this.useSourceHan == useSourceHan && currentFontId == targetFontId) return
-        this.useSourceHan = useSourceHan
+        val targetFontId = "system_serif"
+        if (currentFontId == targetFontId) return
+        this.useSourceHan = false
         currentFontId = targetFontId
         if (flowEngineEnabled) { rebuildFlowChapter(); return }
         // Rebind active Compose text pages to pick up new fontFamily
@@ -1994,9 +2452,10 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun setFont(fontId: String) {
-        if (currentFontId == fontId) return
-        currentFontId = fontId
-        useSourceHan = fontId == "source_han"
+        val normalizedFontId = FontChoice.parse(fontId).serialize()
+        if (currentFontId == normalizedFontId) return
+        currentFontId = normalizedFontId
+        useSourceHan = false
         if (flowEngineEnabled) { rebuildFlowChapter(); return }
         withContext(Dispatchers.Main) {
             activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
@@ -2054,21 +2513,29 @@ class EpubReflowEngine private constructor(
         }
         if (targetKind == _pagingKind.value) return
         if (flowEngineEnabled) {
+            if (targetKind == PagingKind.PAGED && flowView == null && startupSession != null) {
+                awaitFullIndexBook()
+                withContext(Dispatchers.IO) { ensureLegacyPagedSlices() }
+            }
             withContext(Dispatchers.Main) {
                 invalidateBoundaryPreviewState(clearViewSlots = true)
                 _pagingKind.value = targetKind
-                flowView?.let { view ->
+                val view = flowView
+                view?.let {
                     val offset = flowCurrentFlow?.let { flow ->
-                        view.topLayoutOffset().coerceIn(0, flow.text.length)
+                        it.topLayoutOffset().coerceIn(0, flow.text.length)
                     } ?: run {
                         val (anchor, anchorOffset) = flowAnchorFromLocator(_currentLocator.value)
                         flowCurrentFlow?.offsetForParagraph(anchor, anchorOffset) ?: 0
                     }
-                    view.setModeAnchored(
+                    it.setModeAnchored(
                         if (targetKind == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL,
                         offset,
                     )
-                    _pageCount.value = view.pageCount()
+                    _pageCount.value = it.pageCount()
+                }
+                if (view == null) {
+                    _pageCount.value = if (targetKind == PagingKind.PAGED) pagedSlices.size else paras.size
                 }
             }
             return
@@ -2124,7 +2591,19 @@ class EpubReflowEngine private constructor(
     private fun goToInternalLink(href: String) {
         val key = epubInternalLinkTargetKey(href)
         if (key.isEmpty()) return
-        val targetPosition = internalLinkTargetIndexes[key] ?: return
+        val targetPosition = internalLinkTargetIndexes[key]
+        if (targetPosition == null) {
+            if (flowEngineEnabled && startupSession != null) {
+                cacheScope?.launch {
+                    awaitFullIndexBook() ?: return@launch
+                    val indexedTarget = internalLinkTargetIndexes[key] ?: return@launch
+                    val target = epubLocatorForTarget(paras, indexedTarget)
+                    withContext(Dispatchers.Main) { clearTextSelection() }
+                    goToFlow(target)
+                }
+            }
+            return
+        }
         val target = epubLocatorForTarget(paras, targetPosition)
         if (flowEngineEnabled && flowView != null) {
             clearTextSelection()
@@ -2147,28 +2626,69 @@ class EpubReflowEngine private constructor(
         }
     }
 
-    private fun buildPagedSlices(): List<EpubPageSlice> =
-        currentPageLineMeasurer().let { measurer ->
+    private fun buildPagedSlices(
+        indexedParas: List<EpubPara> = paras,
+        indexedBlocks: List<EpubDisplayBlock> = lazyBook?.layoutBlocks().orEmpty(),
+        indexedFile: File? = epubFile,
+    ): List<EpubPageSlice> {
+        val localImageBounds = mutableMapOf<String, EpubImageBoundsCacheEntry>()
+        val indexedTextByParagraph = indexedBlocks
+            .filterIsInstance<EpubDisplayBlock.Text>()
+            .associate { block -> block.paragraphIndex to block.text }
+        fun indexedImageBounds(href: String): EpubImageBounds? {
+            localImageBounds[href]?.let { return it.value }
+            val bounds = indexedFile?.let { decodeEpubImageBounds(it, href) }
+            localImageBounds[href] = EpubImageBoundsCacheEntry(bounds)
+            return bounds
+        }
+        return currentPageLineMeasurer().let { measurer ->
             val metrics = currentPageMetrics()
             epubPagedLayoutWithBlocks(
-                paras = paras,
-                textProvider = { index -> lazyBook?.cachedParagraphAt(index)?.text.orEmpty() },
-                blockProvider = { lazyBook?.layoutBlocks().orEmpty() },
+                paras = indexedParas,
+                // The startup index already owns exact text blocks. Legacy Page conversion must not
+                // depend on whichever three runtime spines happen to be resident in the LRU.
+                textProvider = { index -> indexedTextByParagraph[index].orEmpty() },
+                blockProvider = { indexedBlocks },
                 metrics = metrics,
                 lineBreaker = { text, contentWidth, textStyle ->
                     measurer.measure(text, contentWidth, textStyle)
                 },
                 measurement = measurer.measurement,
-                inlineImageLineCost = { href -> inlineImageLineCost(href, metrics) },
+                inlineImageLineCost = { href -> inlineImageLineCost(href, metrics, ::indexedImageBounds) },
             )
         }
+    }
+
+    private fun ensureLegacyPagedSlices(): List<EpubPageSlice> = synchronized(legacyPagedSlicesLock) {
+        if (lazyBook == null) {
+            val deferred = fullIndexDeferred
+            if (deferred != null) {
+                val book = runBlocking { deferred.await() }
+                if (fullIndexDeferred === deferred && startupSession != null) {
+                    promoteFullIndex(bookGeneration.get(), book)
+                }
+            }
+        }
+        pagedSlices.takeIf { it.isNotEmpty() } ?: run {
+            val generation = bookGeneration.get()
+            val pages = buildPagedSlices()
+            if (generation != bookGeneration.get()) {
+                throw CancellationException("EPUB book changed while legacy pagination was building")
+            }
+            pages.also { pagedSlices = it }
+        }
+    }
 
     // "非必要不分页": small (inline-class) images flow with text on a shared page. Return the image's
     // estimated rendered height as a count of text-line units so the packer can budget it; return
     // null for large (full-page) images, which keep their own standalone page. Undecodable bounds →
     // null (treated full-page) to preserve the safe legacy behavior.
-    private fun inlineImageLineCost(href: String, metrics: EpubPageMetrics): Int? {
-        val bounds = epubImageBoundsFor(href) ?: return null
+    private fun inlineImageLineCost(
+        href: String,
+        metrics: EpubPageMetrics,
+        imageBoundsProvider: (String) -> EpubImageBounds?,
+    ): Int? {
+        val bounds = imageBoundsProvider(href) ?: return null
         if (maxOf(bounds.width, bounds.height) >= FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX) return null
         val density = context.resources.displayMetrics.density
         val contentWidthPx = (metrics.viewportWidthPx - metrics.horizontalPaddingPx).coerceAtLeast(1)
@@ -2698,6 +3218,7 @@ class EpubReflowEngine private constructor(
         const val INLINE_IMAGE_VERTICAL_PADDING_DP = 24
         const val BOUNDARY_PREVIEW_TIMEOUT_MS = 10_000L
         const val DEFAULT_MEMORY_CLASS_MIB = 256
+        const val STARTUP_SPINE_START_TOLERANCE = 0.08f
         // Intrinsic-pixel gate for full-page placement. Light-novel illustrations/彩插/covers run
         // ~800px+ on the long side; inline avatars (~142px) and icons (~300-400px) sit well below.
         const val FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX = 600

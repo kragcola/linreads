@@ -21,6 +21,7 @@ import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.FontChoice
+import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.EngineStateStore
@@ -65,8 +66,9 @@ data class ReaderUiState(
     val loadingState: LoadingState = LoadingState.Idle,
     val engine: ReaderEngine? = null,
     val bookTitle: String = "",
-    val fontSizeSp: Float = 16f,
-    val lineSpacing: Float = 1.3f,
+    val fontSizeSp: Float = ReaderTypography.DEFAULT_FONT_SP.toFloat(),
+    val lineSpacing: Float = ReaderTypography.DEFAULT_LINE_SPACING,
+    val fontChoice: FontChoice = FontChoice.System,
     val readingMode: ReadingMode = ReadingMode.SCROLL,
     val supportedModes: Set<ReadingMode> = setOf(ReadingMode.SCROLL),
     val pageFlipStyle: PageFlipStyle = PageFlipStyle.SLIDE,
@@ -130,6 +132,7 @@ class ReaderViewModel(
         is ReaderIntent.PreviewFontSize -> previewFontSize(intent.sp)
         is ReaderIntent.PreviewZoom -> previewZoom(intent.scale)
         is ReaderIntent.SetLineSpacing -> setLineSpacing(intent.multiplier)
+        is ReaderIntent.SetFontChoice -> setFontChoice(intent.choice)
         is ReaderIntent.SetMode -> setMode(intent.mode)
         is ReaderIntent.SetPageFlipStyle -> setPageFlipStyle(intent.style)
         is ReaderIntent.SetTheme -> setTheme(intent.theme)
@@ -176,7 +179,7 @@ class ReaderViewModel(
         val lineSpacing: Float,
         val theme: ThemeMode,
         val useSourceHanFont: Boolean,
-        val fontId: String,
+        val fontChoice: FontChoice,
         val flipStyle: PageFlipStyle,
         val txtEncodingCharsetName: String?,
         val readingMode: ReadingMode?,
@@ -323,6 +326,7 @@ class ReaderViewModel(
                     bookTitle = title,
                     fontSizeSp = openSettings.fontSize,
                     lineSpacing = openSettings.lineSpacing,
+                    fontChoice = openSettings.fontChoice,
                     readingMode = engine.pagingKind.value.toReadingMode(),
                     supportedModes = engine.supportedModes,
                     pageFlipStyle = openSettings.flipStyle,
@@ -372,7 +376,7 @@ class ReaderViewModel(
             lineSpacing = clampedReaderLineSpacing(restoredForBook?.lineSpacing ?: settings.lineSpacing.first()),
             theme = restoredForBook?.theme ?: settings.themeMode.first(),
             useSourceHanFont = settings.useSourceHanFont.first(),
-            fontId = settings.fontChoice.first().serialize(),
+            fontChoice = FontChoice.parse(settings.fontChoice.first().serialize()),
             flipStyle = settings.pageFlipStyle.first(),
             txtEncodingCharsetName = settings.txtEncoding.first().charsetName,
             readingMode = requestedMode,
@@ -387,7 +391,7 @@ class ReaderViewModel(
         engine.setLineSpacing(openSettings.lineSpacing)
         engine.setTheme(openSettings.theme)
         engine.setSerifFont(openSettings.useSourceHanFont)
-        engine.setFont(openSettings.fontId)
+        engine.setFont(openSettings.fontChoice.serialize())
         engine.setPageFlipStyle(openSettings.flipStyle)
         if (openSettings.txtEncodingCharsetName != null) {
             engine.setTxtEncodingOverride(openSettings.txtEncodingCharsetName)
@@ -517,11 +521,16 @@ class ReaderViewModel(
         settingsFontJob = viewModelScope.launch {
             var firstEmission = true
             settings.fontChoice.collect { choice ->
+                val canonical = FontChoice.parse(choice.serialize())
                 if (firstEmission) {
                     firstEmission = false
+                    _uiState.update { it.copy(fontChoice = canonical) }
                     return@collect
                 }
-                engine.setFont(choice.serialize())
+                if (canonical != _uiState.value.fontChoice) {
+                    _uiState.update { it.copy(fontChoice = canonical) }
+                    engine.setFont(canonical.serialize())
+                }
             }
         }
         settingsLineSpacingJob?.cancel()
@@ -779,6 +788,16 @@ class ReaderViewModel(
         viewModelScope.launch {
             engine.setLineSpacing(clamped)
             settings.setLineSpacing(clamped)
+        }
+    }
+
+    private fun setFontChoice(choice: FontChoice) {
+        val canonical = FontChoice.parse(choice.serialize())
+        val engine = _uiState.value.engine
+        updateUiStateAndPersist { it.copy(fontChoice = canonical) }
+        viewModelScope.launch {
+            engine?.setFont(canonical.serialize())
+            settings.setFontChoice(canonical)
         }
     }
 

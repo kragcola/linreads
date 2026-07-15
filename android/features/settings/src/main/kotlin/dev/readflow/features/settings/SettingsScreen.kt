@@ -328,7 +328,10 @@ fun SettingsScreen(
             Text(
                 text = "这是 ${fontSize}sp 的正文效果。The quick brown fox.",
                 fontSize = fontSize.sp,
-                lineHeight = (fontSize * 1.7f).sp,
+                lineHeight = (fontSize * ReaderTypography.clampLineSpacing(lineSpacing)).sp,
+                fontFamily = remember(fontChoice) {
+                    FontProvider.fontFamilyFor(context.applicationContext, fontChoice.serialize())
+                },
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -386,7 +389,7 @@ fun SettingsScreen(
             SettingItemHeader(
                 icon = Icons.Outlined.FontDownload,
                 title = "正文字体",
-                currentValue = fontChoice.label(),
+                currentValue = FontProvider.label(fontChoice),
             )
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 FlowRow(
@@ -396,14 +399,21 @@ fun SettingsScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    FilterChip(selected = fontChoice == FontChoice.System, onClick = { vm.setFontChoice(FontChoice.System) },
-                        label = { Text("系统宋体") }, modifier = Modifier.heightIn(min = 48.dp))
-                    FilterChip(selected = fontChoice == FontChoice.SourceHan, onClick = { vm.setFontChoice(FontChoice.SourceHan) },
-                        label = { Text("思源宋体（内置）") }, modifier = Modifier.heightIn(min = 48.dp))
-                    customFonts.forEach { name ->
-                        val c = FontChoice.Custom(name)
-                        FilterChip(selected = fontChoice == c, onClick = { vm.setFontChoice(c) },
-                            label = { Text(name) }, modifier = Modifier.heightIn(min = 48.dp))
+                    FontProvider.availableChoices(customFonts).forEach { choice ->
+                        FilterChip(
+                            selected = fontChoice == choice,
+                            onClick = { vm.setFontChoice(choice) },
+                            label = {
+                                Text(
+                                    text = FontProvider.label(choice),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            },
+                            modifier = Modifier
+                                .widthIn(max = 220.dp)
+                                .heightIn(min = 48.dp),
+                        )
                     }
                 }
                 OutlinedButton(
@@ -1145,12 +1155,6 @@ private fun UpdateState.label(): String = when (this) {
     is UpdateState.Downloading -> if (progress < 0f) "下载中" else "下载 ${(progress * 100).toInt()}%"
     is UpdateState.ReadyToInstall -> "待安装"
     is UpdateState.Error -> "需要处理"
-}
-
-private fun FontChoice.label(): String = when (this) {
-    FontChoice.System -> "系统宋体"
-    FontChoice.SourceHan -> "思源宋体"
-    is FontChoice.Custom -> fileName
 }
 
 private fun ReaderReadingMode.label() = when (this) {

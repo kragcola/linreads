@@ -21,7 +21,28 @@ internal data class EpubBook(
  * Reads container.xml → OPF → spine → per-item HTML → jsoup extraction.
  * No CFI / WebView dependency.
  */
-internal class EpubParser {
+internal class EpubParser(
+    private val onSpineRead: (Int) -> Unit = {},
+) {
+
+    fun parsePackageIndex(file: File): EpubPackageIndex = epubParserGuard(EpubPackageIndex.empty()) {
+        ZipFile(file).use { zip ->
+            if (zip.size() > EPUB_MAX_ZIP_ENTRIES) return@use EpubPackageIndex.empty()
+            parsePackage(zip, findOpfPath(zip))
+        }
+    }
+
+    fun parseSpine(file: File, packageIndex: EpubPackageIndex, spineIndex: Int): EpubParsedSpine =
+        epubParserGuard(EpubParsedSpine.empty(spineIndex)) {
+            val spineItem = packageIndex.spineItems.getOrNull(spineIndex)
+                ?: return@epubParserGuard EpubParsedSpine.empty(spineIndex)
+            ZipFile(file).use { zip ->
+                if (zip.size() > EPUB_MAX_ZIP_ENTRIES) {
+                    return@use EpubParsedSpine.empty(spineIndex, spineItem.path)
+                }
+                parseSpine(zip, packageIndex, spineIndex, spineItem.manifestItem)
+            }
+        }
 
     fun parse(file: File): List<EpubPara> = parseBook(file).paras
 
@@ -37,7 +58,7 @@ internal class EpubParser {
             EpubBook(
                 items = items,
                 paras = paras,
-                tableOfContents = parseTableOfContents(zip, pkg, paras, fragmentTargets),
+                tableOfContents = parseTableOfContents(pkg, paras, fragmentTargets),
                 spinePaths = spinePaths,
                 fragmentTargetIndexes = fragmentTargets,
                 isFixedLayout = pkg.isFixedLayout,
@@ -56,7 +77,7 @@ internal class EpubParser {
                     file = file,
                     spineRefs = index.spineRefs,
                     paras = index.paras,
-                    tableOfContents = parseTableOfContents(zip, pkg, index.paras, index.fragmentTargetIndexes),
+                    tableOfContents = parseTableOfContents(pkg, index.paras, index.fragmentTargetIndexes),
                     spinePaths = pkg.spineItems.map { it.path },
                     fragmentTargetIndexes = index.fragmentTargetIndexes,
                     isFixedLayout = pkg.isFixedLayout,
@@ -88,25 +109,14 @@ internal class EpubParser {
         val fragmentTargetIndexes: Map<String, EpubTargetPosition>,
     )
 
-    private data class EpubPackage(
-        val spineItems: List<ManifestItem>,
-        val navItem: ManifestItem?,
-        val ncxItem: ManifestItem?,
-        val isFixedLayout: Boolean,
-    )
+    private fun parseItems(zip: ZipFile, pkg: EpubPackageIndex): List<EpubReaderItem> =
+        pkg.spineItems.flatMapIndexed { spineIndex, item ->
+            parseSpineItems(zip, spineIndex, item.manifestItem)
+        }
 
-    private data class ManifestItem(
-        val id: String,
-        val path: String,
-        val mediaType: String,
-        val properties: Set<String>,
-    )
-
-    private fun parseItems(zip: ZipFile, pkg: EpubPackage): List<EpubReaderItem> =
-        pkg.spineItems.flatMapIndexed { spineIndex, item -> parseSpineItems(zip, spineIndex, item) }
-
-    private fun parseSpineItems(zip: ZipFile, spineIndex: Int, item: ManifestItem): List<EpubReaderItem> {
+    private fun parseSpineItems(zip: ZipFile, spineIndex: Int, item: EpubManifestItem): List<EpubReaderItem> {
         val html = readEpubZipText(zip, item.path, EPUB_MAX_SPINE_ENTRY_BYTES) ?: return emptyList()
+        epubParserGuard(Unit) { onSpineRead(spineIndex) }
         return epubParserGuard(emptyList()) {
             parseReaderItemsFromHtml(
                 spineIndex = spineIndex,
@@ -120,7 +130,27 @@ internal class EpubParser {
         }
     }
 
-    private fun buildLazyBookIndex(zip: ZipFile, pkg: EpubPackage): EpubLazyBookIndex {
+    private fun parseSpine(
+        zip: ZipFile,
+        packageIndex: EpubPackageIndex,
+        spineIndex: Int,
+        item: EpubManifestItem,
+    ): EpubParsedSpine {
+        val items = parseSpineItems(zip, spineIndex, item)
+        if (items.isEmpty()) return EpubParsedSpine.empty(spineIndex, item.path)
+        val paras = epubParasFromReaderItems(items)
+        return EpubParsedSpine(
+            spineIndex = spineIndex,
+            path = item.path,
+            items = items,
+            paras = paras,
+            blocks = epubDisplayBlocks(items),
+            fragmentTargetIndexes = epubFragmentTargetIndexes(packageIndex.spinePaths, items),
+            charCount = paras.maxOfOrNull(EpubPara::spineCharEnd) ?: 0,
+        )
+    }
+
+    private fun buildLazyBookIndex(zip: ZipFile, pkg: EpubPackageIndex): EpubLazyBookIndex {
         val spineRefs = mutableListOf<EpubSpineRef>()
         val paras = mutableListOf<EpubPara>()
         val paragraphBlockIndexes = mutableListOf<Int>()
@@ -130,7 +160,8 @@ internal class EpubParser {
         var documentOffset = 0
         val fragmentTargetIndexes = mutableMapOf<String, EpubTargetPosition>()
 
-        pkg.spineItems.forEachIndexed { spineIndex, item ->
+        pkg.spineItems.forEachIndexed { spineIndex, spineItem ->
+            val item = spineItem.manifestItem
             val items = parseSpineItems(zip, spineIndex, item)
             val localParas = epubParasFromReaderItems(items)
             val blocks = epubDisplayBlocks(items)
@@ -203,18 +234,18 @@ internal class EpubParser {
             ?: "OEBPS/content.opf"
     }
 
-    private fun parsePackage(zip: ZipFile, opfPath: String): EpubPackage {
+    private fun parsePackage(zip: ZipFile, opfPath: String): EpubPackageIndex {
         val opfText = readEpubZipText(zip, opfPath, EPUB_MAX_PACKAGE_ENTRY_BYTES)
-            ?: return emptyPackage()
+            ?: return EpubPackageIndex.empty()
         val baseDir = epubParentDir(opfPath)
         val opf = epubParserGuard(null) { Jsoup.parse(opfText, "", Parser.xmlParser()) }
-            ?: return emptyPackage()
+            ?: return EpubPackageIndex.empty()
         val manifestItems = opf.select("manifest item").mapNotNull { item ->
             val id = item.attr("id").trim()
             val href = item.attr("href").trim()
             if (id.isEmpty() || href.isEmpty()) return@mapNotNull null
             val path = epubSafeResolvePath(baseDir, href) ?: return@mapNotNull null
-            ManifestItem(
+            EpubManifestItem(
                 id = id,
                 path = path,
                 mediaType = item.attr("media-type").trim(),
@@ -232,14 +263,27 @@ internal class EpubParser {
             ?.mapNotNull { manifestById[it.attr("idref")] }
             .orEmpty()
         val spineTocId = spine?.attr("toc")?.trim()?.takeIf { it.isNotEmpty() }
-        return EpubPackage(
-            spineItems = spineItems,
-            navItem = manifestItems.firstOrNull { "nav" in it.properties },
-            ncxItem = spineTocId?.let { manifestById[it] }
-                ?: manifestItems.firstOrNull {
-                    it.mediaType.equals("application/x-dtbncx+xml", ignoreCase = true) ||
-                        it.path.endsWith(".ncx", ignoreCase = true)
-                },
+        val navItem = manifestItems.firstOrNull { "nav" in it.properties }
+        val ncxItem = spineTocId?.let { manifestById[it] }
+            ?: manifestItems.firstOrNull {
+                it.mediaType.equals("application/x-dtbncx+xml", ignoreCase = true) ||
+                    it.path.endsWith(".ncx", ignoreCase = true)
+            }
+        return EpubPackageIndex(
+            opfPath = opfPath,
+            manifestItems = manifestById,
+            spineItems = spineItems.map { item ->
+                EpubPackageSpineItem(
+                    manifestItem = item,
+                    uncompressedSizeBytes = zip.getEntry(item.path)
+                        ?.takeUnless { it.isDirectory }
+                        ?.size
+                        ?.coerceAtLeast(0L)
+                        ?: 0L,
+                )
+            },
+            navDocument = navItem?.let { parseTocDocument(zip, it, ::parseNavTocEntries) },
+            ncxDocument = ncxItem?.let { parseTocDocument(zip, it, ::parseNcxTocEntries) },
             isFixedLayout = hasFixedLayoutMetadata(opf) ||
                 manifestItems.any { "rendition:layout-pre-paginated" in it.properties } ||
                 opf.select("spine itemref").any { itemRef ->
@@ -250,13 +294,16 @@ internal class EpubParser {
         )
     }
 
-    private fun emptyPackage(): EpubPackage =
-        EpubPackage(
-            spineItems = emptyList(),
-            navItem = null,
-            ncxItem = null,
-            isFixedLayout = false,
-        )
+    private fun parseTocDocument(
+        zip: ZipFile,
+        item: EpubManifestItem,
+        parser: (String) -> List<EpubParsedTocEntry>,
+    ): EpubPackageTocDocument? {
+        val text = readEpubZipText(zip, item.path, EPUB_MAX_TOC_ENTRY_BYTES) ?: return null
+        return epubParserGuard(null) {
+            EpubPackageTocDocument(path = item.path, entries = parser(text))
+        }
+    }
 
     private fun hasFixedLayoutMetadata(opf: org.jsoup.nodes.Document): Boolean =
         opf.select("metadata meta").any { meta ->
@@ -267,21 +314,18 @@ internal class EpubParser {
         }
 
     private fun parseTableOfContents(
-        zip: ZipFile,
-        pkg: EpubPackage,
+        pkg: EpubPackageIndex,
         paras: List<EpubPara>,
         fragmentTargets: Map<String, EpubTargetPosition>,
     ): List<TocEntry> {
-        val spinePaths = pkg.spineItems.map { it.path }
-        val navToc = pkg.navItem?.let { item ->
-            val html = readEpubZipText(zip, item.path, EPUB_MAX_TOC_ENTRY_BYTES) ?: return@let emptyList()
-            buildEpubToc(parseNavTocEntries(html), item.path, spinePaths, paras, fragmentTargets)
+        val spinePaths = pkg.spinePaths
+        val navToc = pkg.navDocument?.let { document ->
+            buildEpubToc(document.entries, document.path, spinePaths, paras, fragmentTargets)
         }.orEmpty()
         if (navToc.isNotEmpty()) return navToc
 
-        return pkg.ncxItem?.let { item ->
-            val xml = readEpubZipText(zip, item.path, EPUB_MAX_TOC_ENTRY_BYTES) ?: return@let emptyList()
-            buildEpubToc(parseNcxTocEntries(xml), item.path, spinePaths, paras, fragmentTargets)
+        return pkg.ncxDocument?.let { document ->
+            buildEpubToc(document.entries, document.path, spinePaths, paras, fragmentTargets)
         }.orEmpty()
     }
 }

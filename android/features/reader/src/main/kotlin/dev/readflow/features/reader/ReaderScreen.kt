@@ -25,6 +25,8 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
@@ -36,6 +38,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
@@ -62,6 +65,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -72,9 +76,11 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.shape.CircleShape
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.LoadingState
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
@@ -83,6 +89,7 @@ import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.readerThemeLabel
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.ui.AccessibleSlider
+import dev.readflow.core.ui.FontProvider
 import dev.readflow.core.ui.ReadflowColors
 import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.render.api.PagingKind
@@ -92,6 +99,7 @@ import dev.readflow.render.api.SelfPagingReaderEngine
 import dev.readflow.render.api.ZoomableReaderEngine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 /**
  * 阅读器菜单功能项 — debug 阶段全部默认显示。
@@ -328,6 +336,7 @@ fun ReaderScreen(
                         panel = state.activePanel.takeIf { state.isUiVisible },
                         fontSizeSp = state.fontSizeSp,
                         lineSpacing = state.lineSpacing,
+                        fontChoice = state.fontChoice,
                         readingMode = state.readingMode,
                         supportedModes = state.supportedModes,
                         pageFlipStyle = state.pageFlipStyle,
@@ -344,6 +353,7 @@ fun ReaderScreen(
                         onSearchClear = { viewModel.onIntent(ReaderIntent.ClearSearch) },
                         onFontSizeChange = { viewModel.onIntent(ReaderIntent.SetFontSize(it)) },
                         onLineSpacingChange = { viewModel.onIntent(ReaderIntent.SetLineSpacing(it)) },
+                        onFontChoiceChange = { viewModel.onIntent(ReaderIntent.SetFontChoice(it)) },
                         onModeChange = { viewModel.onIntent(ReaderIntent.SetMode(it)) },
                         onPageFlipStyleChange = { viewModel.onIntent(ReaderIntent.SetPageFlipStyle(it)) },
                         onThemeChange = { viewModel.onIntent(ReaderIntent.SetTheme(it)) },
@@ -527,6 +537,7 @@ private fun ReaderControlPanel(
     panel: ReaderPanel?,
     fontSizeSp: Float,
     lineSpacing: Float,
+    fontChoice: FontChoice,
     readingMode: ReadingMode,
     supportedModes: Set<ReadingMode>,
     pageFlipStyle: dev.readflow.core.model.PageFlipStyle,
@@ -543,6 +554,7 @@ private fun ReaderControlPanel(
     onSearchClear: () -> Unit,
     onFontSizeChange: (Float) -> Unit,
     onLineSpacingChange: (Float) -> Unit,
+    onFontChoiceChange: (FontChoice) -> Unit,
     onModeChange: (ReadingMode) -> Unit,
     onPageFlipStyleChange: (dev.readflow.core.model.PageFlipStyle) -> Unit,
     onThemeChange: (ThemeMode) -> Unit,
@@ -609,14 +621,16 @@ private fun ReaderControlPanel(
                         onResultClick = onSearchResultClick,
                         onClear = onSearchClear,
                     )
-                    ReaderPanel.FONT -> FontPanel(
+                    ReaderPanel.FONT -> ReaderTypographyPanel(
                         fontSizeSp = fontSizeSp,
                         lineSpacing = lineSpacing,
+                        fontChoice = fontChoice,
                         readingMode = readingMode,
                         supportedModes = supportedModes,
                         pageFlipStyle = pageFlipStyle,
                         onFontSizeChange = onFontSizeChange,
                         onLineSpacingChange = onLineSpacingChange,
+                        onFontChoiceChange = onFontChoiceChange,
                         onModeChange = onModeChange,
                         onPageFlipStyleChange = onPageFlipStyleChange,
                     )
@@ -1023,105 +1037,389 @@ internal fun readerCurrentTocIndex(tocEntries: List<TocEntry>, currentProgressio
 }
 
 @Composable
-private fun FontPanel(
+private fun ReaderTypographyPanel(
     fontSizeSp: Float,
     lineSpacing: Float,
+    fontChoice: FontChoice,
     readingMode: ReadingMode,
     supportedModes: Set<ReadingMode>,
     pageFlipStyle: dev.readflow.core.model.PageFlipStyle,
     onFontSizeChange: (Float) -> Unit,
     onLineSpacingChange: (Float) -> Unit,
+    onFontChoiceChange: (FontChoice) -> Unit,
     onModeChange: (ReadingMode) -> Unit,
     onPageFlipStyleChange: (dev.readflow.core.model.PageFlipStyle) -> Unit,
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
+    val clampedFontSize = ReaderTypography.clampFontSp(fontSizeSp)
+    val clampedLineSpacing = ReaderTypography.clampLineSpacing(lineSpacing)
+    val fontValue = readerFontSizeText(clampedFontSize)
+    val lineSpacingValue = readerLineSpacingText(clampedLineSpacing)
+    val context = LocalContext.current
+    val availableFonts = remember(fontChoice) {
+        FontProvider.availableChoices(FontProvider.listCustomFonts(context.applicationContext))
+    }
+
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val useExpandedLayout = maxWidth >= 600.dp
+        Column(
+            modifier = Modifier
+                .widthIn(max = 840.dp)
+                .heightIn(max = maxHeight)
+                .align(Alignment.TopCenter)
+                .verticalScroll(rememberScrollState())
+                .padding(
+                    horizontal = if (useExpandedLayout) 24.dp else 16.dp,
+                    vertical = 10.dp,
+                ),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("排版", style = MaterialTheme.typography.titleSmall)
-            Text("${fontSizeSp.toInt()}sp", style = MaterialTheme.typography.labelLarge)
-        }
-        AccessibleSlider(
-            value = ReaderTypography.clampFontSp(fontSizeSp),
-            onValueChange = onFontSizeChange,
-            valueRange = ReaderTypography.MIN_FONT_SP..ReaderTypography.MAX_FONT_SP,
-            steps = ReaderTypography.FONT_SLIDER_STEPS,
-            label = "字号",
-            valueDescription = "${fontSizeSp.toInt()}sp",
-            modifier = Modifier.fillMaxWidth(),
-        )
-        // 固定字号的说明标签（不随阅读字号缩放），下方才是真正按字号缩放的正文样张
-        Text(
-            text = "正文预览",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Text(
-            text = "海上生明月，天涯共此时。",
-            fontSize = ReaderTypography.clampFontSp(fontSizeSp).sp,
-            lineHeight = (ReaderTypography.clampFontSp(fontSizeSp) * 1.7f).sp,
-            color = MaterialTheme.colorScheme.onBackground,
-            maxLines = 2,
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("行距", style = MaterialTheme.typography.labelLarge)
-            Text("${"%.2f".format(lineSpacing)}x", style = MaterialTheme.typography.labelLarge)
-        }
-        AccessibleSlider(
-            value = ReaderTypography.clampLineSpacing(lineSpacing),
-            onValueChange = onLineSpacingChange,
-            valueRange = ReaderTypography.MIN_LINE_SPACING..ReaderTypography.MAX_LINE_SPACING,
-            steps = ReaderTypography.LINE_SPACING_SLIDER_STEPS,
-            label = "行距",
-            valueDescription = "${"%.2f".format(lineSpacing)}倍",
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            ReadingMode.entries.forEach { mode ->
-                FilterChip(
-                    selected = readingMode == mode,
-                    enabled = mode in supportedModes,
-                    onClick = { onModeChange(mode) },
-                    label = { Text(mode.readerLabel(), maxLines = 1) },
-                    modifier = Modifier.weight(1f),
-                )
-            }
-        }
-        // 翻页动画（仅分页模式生效，静读天下「翻页方式」）
-        if (readingMode == ReadingMode.PAGED) {
-            Text(
-                text = "翻页动画",
-                style = MaterialTheme.typography.labelLarge,
-            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                dev.readflow.core.model.PageFlipStyle.entries.forEach { style ->
-                    FilterChip(
-                        selected = pageFlipStyle == style,
-                        onClick = { onPageFlipStyleChange(style) },
-                        label = { Text(style.readerLabel(), maxLines = 1) },
-                        modifier = Modifier.weight(1f),
+                Text("排版", style = MaterialTheme.typography.titleSmall)
+                Text(
+                    text = "$fontValue · ${lineSpacingValue.removeSuffix("倍")}x",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            if (useExpandedLayout) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(20.dp),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    TypographyControls(
+                        fontSizeSp = clampedFontSize,
+                        lineSpacing = clampedLineSpacing,
+                        fontChoice = fontChoice,
+                        availableFonts = availableFonts,
+                        onFontSizeChange = onFontSizeChange,
+                        onLineSpacingChange = onLineSpacingChange,
+                        onFontChoiceChange = onFontChoiceChange,
+                        modifier = Modifier.weight(1.3f),
                     )
+                    TypographyPreview(
+                        fontSizeSp = clampedFontSize,
+                        lineSpacing = clampedLineSpacing,
+                        fontChoice = fontChoice,
+                        modifier = Modifier.weight(0.7f),
+                    )
+                }
+            } else {
+                TypographyControls(
+                    fontSizeSp = clampedFontSize,
+                    lineSpacing = clampedLineSpacing,
+                    fontChoice = fontChoice,
+                    availableFonts = availableFonts,
+                    onFontSizeChange = onFontSizeChange,
+                    onLineSpacingChange = onLineSpacingChange,
+                    onFontChoiceChange = onFontChoiceChange,
+                )
+                TypographyPreview(
+                    fontSizeSp = clampedFontSize,
+                    lineSpacing = clampedLineSpacing,
+                    fontChoice = fontChoice,
+                )
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+            ReaderOptionRow(label = "阅读模式") {
+                ReadingMode.entries.forEach { mode ->
+                    FilterChip(
+                        selected = readingMode == mode,
+                        enabled = mode in supportedModes,
+                        onClick = { onModeChange(mode) },
+                        label = { Text(mode.readerLabel(), maxLines = 1) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 48.dp),
+                    )
+                }
+            }
+
+            if (readingMode == ReadingMode.PAGED) {
+                ReaderOptionRow(label = "翻页动画") {
+                    dev.readflow.core.model.PageFlipStyle.entries.forEach { style ->
+                        FilterChip(
+                            selected = pageFlipStyle == style,
+                            onClick = { onPageFlipStyleChange(style) },
+                            label = { Text(style.readerLabel(), maxLines = 1) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp),
+                        )
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun TypographyControls(
+    fontSizeSp: Float,
+    lineSpacing: Float,
+    fontChoice: FontChoice,
+    availableFonts: List<FontChoice>,
+    onFontSizeChange: (Float) -> Unit,
+    onLineSpacingChange: (Float) -> Unit,
+    onFontChoiceChange: (FontChoice) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        TypographyValueControl(
+            label = "字号",
+            value = fontSizeSp,
+            valueText = readerFontSizeText(fontSizeSp),
+            valueDescription = readerFontSizeText(fontSizeSp),
+            valueRange = ReaderTypography.MIN_FONT_SP..ReaderTypography.MAX_FONT_SP,
+            steps = ReaderTypography.FONT_SLIDER_STEPS,
+            onValueChange = onFontSizeChange,
+            onDecrease = { onFontSizeChange(steppedReaderFontSize(fontSizeSp, -1)) },
+            onIncrease = { onFontSizeChange(steppedReaderFontSize(fontSizeSp, 1)) },
+            decreaseEnabled = fontSizeSp > ReaderTypography.MIN_FONT_SP,
+            increaseEnabled = fontSizeSp < ReaderTypography.MAX_FONT_SP,
+        )
+        TypographyValueControl(
+            label = "行距",
+            value = lineSpacing,
+            valueText = "${readerLineSpacingText(lineSpacing).removeSuffix("倍")}x",
+            valueDescription = readerLineSpacingText(lineSpacing),
+            valueRange = ReaderTypography.MIN_LINE_SPACING..ReaderTypography.MAX_LINE_SPACING,
+            steps = ReaderTypography.LINE_SPACING_SLIDER_STEPS,
+            onValueChange = onLineSpacingChange,
+            onDecrease = { onLineSpacingChange(steppedReaderLineSpacing(lineSpacing, -1)) },
+            onIncrease = { onLineSpacingChange(steppedReaderLineSpacing(lineSpacing, 1)) },
+            decreaseEnabled = lineSpacing > ReaderTypography.MIN_LINE_SPACING,
+            increaseEnabled = lineSpacing < ReaderTypography.MAX_LINE_SPACING,
+        )
+        ReaderFontSelector(
+            fontChoice = fontChoice,
+            availableFonts = availableFonts,
+            onFontChoiceChange = onFontChoiceChange,
+        )
+    }
+}
+
+@Composable
+private fun ReaderFontSelector(
+    fontChoice: FontChoice,
+    availableFonts: List<FontChoice>,
+    onFontChoiceChange: (FontChoice) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("字体", style = MaterialTheme.typography.labelLarge)
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            availableFonts.forEach { choice ->
+                val label = FontProvider.label(choice)
+                val selected = fontChoice == choice
+                FilterChip(
+                    selected = selected,
+                    onClick = { onFontChoiceChange(choice) },
+                    label = {
+                        Text(
+                            text = label,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
+                    modifier = Modifier
+                        .widthIn(max = 220.dp)
+                        .heightIn(min = 48.dp)
+                        .semantics {
+                            contentDescription = "正文字体，$label"
+                            stateDescription = if (selected) "已选择" else "未选择"
+                        },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TypographyValueControl(
+    label: String,
+    value: Float,
+    valueText: String,
+    valueDescription: String,
+    valueRange: ClosedFloatingPointRange<Float>,
+    steps: Int,
+    onValueChange: (Float) -> Unit,
+    onDecrease: () -> Unit,
+    onIncrease: () -> Unit,
+    decreaseEnabled: Boolean,
+    increaseEnabled: Boolean,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(label, style = MaterialTheme.typography.labelLarge)
+            TypographyStepper(
+                label = label,
+                valueText = valueText,
+                valueDescription = valueDescription,
+                onDecrease = onDecrease,
+                onIncrease = onIncrease,
+                decreaseEnabled = decreaseEnabled,
+                increaseEnabled = increaseEnabled,
+            )
+        }
+        AccessibleSlider(
+            value = value,
+            onValueChange = onValueChange,
+            valueRange = valueRange,
+            steps = steps,
+            label = label,
+            valueDescription = valueDescription,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+private fun TypographyStepper(
+    label: String,
+    valueText: String,
+    valueDescription: String,
+    onDecrease: () -> Unit,
+    onIncrease: () -> Unit,
+    decreaseEnabled: Boolean,
+    increaseEnabled: Boolean,
+) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        IconButton(
+            onClick = onDecrease,
+            enabled = decreaseEnabled,
+            modifier = Modifier
+                .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                .semantics {
+                    contentDescription = readerTypographyStepDescription(label, valueDescription, increase = false)
+                },
+        ) {
+            Text("−", style = MaterialTheme.typography.titleLarge)
+        }
+        Text(
+            text = valueText,
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier
+                .widthIn(min = 56.dp)
+                .heightIn(min = 48.dp)
+                .wrapContentHeight(Alignment.CenterVertically)
+                .clearAndSetSemantics {
+                    contentDescription = "$label，当前 $valueDescription"
+                    stateDescription = valueDescription
+                },
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            maxLines = 1,
+        )
+        IconButton(
+            onClick = onIncrease,
+            enabled = increaseEnabled,
+            modifier = Modifier
+                .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                .semantics {
+                    contentDescription = readerTypographyStepDescription(label, valueDescription, increase = true)
+                },
+        ) {
+            Icon(Icons.Default.Add, contentDescription = null)
+        }
+    }
+}
+
+@Composable
+private fun TypographyPreview(
+    fontSizeSp: Float,
+    lineSpacing: Float,
+    fontChoice: FontChoice,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val fontFamily = remember(fontChoice, context) {
+        FontProvider.fontFamilyFor(context.applicationContext, fontChoice.serialize())
+    }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceContainerLow)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = "正文预览",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = "海上生明月，天涯共此时。\nReading begins in the details.",
+            fontSize = fontSizeSp.sp,
+            lineHeight = readerTypographyPreviewLineHeightSp(fontSizeSp, lineSpacing).sp,
+            fontFamily = fontFamily,
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 2,
+        )
+    }
+}
+
+@Composable
+private fun ReaderOptionRow(
+    label: String,
+    content: @Composable RowScope.() -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.widthIn(min = 64.dp),
+        )
+        Row(
+            modifier = Modifier.weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            content = content,
+        )
+    }
+}
+
+internal fun steppedReaderFontSize(currentSp: Float, direction: Int): Float {
+    val currentStep = ReaderTypography.clampFontSp(currentSp).roundToInt()
+    return ReaderTypography.clampFontSp((currentStep + direction.coerceIn(-1, 1)).toFloat())
+}
+
+internal fun steppedReaderLineSpacing(current: Float, direction: Int): Float {
+    val currentStep = (ReaderTypography.clampLineSpacing(current) * 10f).roundToInt()
+    return ReaderTypography.clampLineSpacing((currentStep + direction.coerceIn(-1, 1)) / 10f)
+}
+
+internal fun readerTypographyPreviewLineHeightSp(fontSizeSp: Float, lineSpacing: Float): Float =
+    ReaderTypography.clampFontSp(fontSizeSp) * ReaderTypography.clampLineSpacing(lineSpacing)
+
+internal fun readerTypographyStepDescription(label: String, value: String, increase: Boolean): String =
+    "${if (increase) "增大" else "减小"}$label，当前 $value"
+
+private fun readerFontSizeText(fontSizeSp: Float): String =
+    "${ReaderTypography.clampFontSp(fontSizeSp).roundToInt()}sp"
+
+private fun readerLineSpacingText(lineSpacing: Float): String {
+    val tenths = (ReaderTypography.clampLineSpacing(lineSpacing) * 10f).roundToInt()
+    return "${tenths / 10}.${tenths % 10}倍"
 }
 
 private fun dev.readflow.core.model.PageFlipStyle.readerLabel() = when (this) {

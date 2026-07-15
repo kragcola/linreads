@@ -16,6 +16,7 @@ import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
 import dev.readflow.core.prefs.SettingsRepository
+import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.sync.SyncBackend
 import java.io.File
 import java.io.InputStream
@@ -77,25 +78,25 @@ class SettingsViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     val fontSize = settings.fontSize
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 18)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ReaderTypography.DEFAULT_FONT_SP)
 
     val themeMode = settings.themeMode
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ThemeMode.SYSTEM)
 
     val lineSpacing = settings.lineSpacing
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 1.3f)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ReaderTypography.DEFAULT_LINE_SPACING)
 
     val readingMode = settings.readingMode
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ReaderReadingMode.SCROLL)
 
     val useSourceHanFont = settings.useSourceHanFont
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), true)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     val txtEncoding = settings.txtEncoding
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), TxtEncoding.AUTO)
 
     val fontChoice = settings.fontChoice
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), FontChoice.SourceHan)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), FontChoice.System)
 
     private val _calibreUrlError = MutableStateFlow<String?>(null)
     val calibreUrlError: StateFlow<String?> = _calibreUrlError.asStateFlow()

@@ -1,11 +1,7 @@
-# 内置字体目录
+# 字体资产目录
 
-放置思源宋体后正文字体生效；缺失时 FontProvider 自动回退系统 Serif。
+LinReads 当前不捆绑字体二进制。正文字体提供 Android 系统衬线、无衬线、等宽三种预设，
+并支持用户从设置页导入 TTF/OTF 文件。
 
-必需文件:
-- SourceHanSerifCN-Regular.otf  （思源宋体 简体中文 Regular）
-
-下载: https://github.com/adobe-fonts/source-han-serif/releases
-许可: SIL Open Font License 1.1（可随 APK 分发）
-
-放好后无需改代码，FontProvider.SOURCE_HAN_SERIF_ASSET 已指向该路径。
+如未来决定捆绑字体，必须同时提交字体文件、许可证文本和明确的 APK 体积评估，
+并在 `FontProvider` 中增加独立、可持久化的字体 ID。

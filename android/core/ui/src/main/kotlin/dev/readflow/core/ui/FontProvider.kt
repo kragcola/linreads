@@ -4,36 +4,30 @@ import android.content.Context
 import android.graphics.Typeface
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.Typeface as ComposeTypeface
+import dev.readflow.core.model.FontChoice
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
-/**
- * 内置字体统一加载入口。
- * 思源宋体打包在 assets/fonts/ 下；文件缺失时回退系统 Serif，保证恒可运行。
- */
+/** 系统字体与用户导入字体的统一目录和加载入口。 */
 object FontProvider {
-
-    private const val SOURCE_HAN_SERIF_ASSET = "fonts/SourceHanSerifCN-Regular.otf"
-
-    @Volatile
-    private var cachedSerif: Typeface? = null
 
     private val customCache = ConcurrentHashMap<String, Typeface>()
 
-    /** 思源宋体 Typeface（用于 View/Paint 路径）。缺失时回退 Typeface.SERIF。 */
-    fun sourceHanSerif(context: Context): Typeface {
-        cachedSerif?.let { return it }
-        val tf = runCatching {
-            Typeface.createFromAsset(context.assets, SOURCE_HAN_SERIF_ASSET)
-        }.getOrNull() ?: Typeface.SERIF
-        cachedSerif = tf
-        return tf
-    }
+    val builtInChoices: List<FontChoice> = listOf(
+        FontChoice.System,
+        FontChoice.SystemSans,
+        FontChoice.SystemMonospace,
+    )
 
-    /** 思源宋体 Compose FontFamily（用于 EPUB Compose 路径）。缺失时回退 FontFamily.Serif。 */
-    fun sourceHanSerifFamily(context: Context): FontFamily =
-        runCatching { FontFamily(ComposeTypeface(sourceHanSerif(context))) }
-            .getOrDefault(FontFamily.Serif)
+    fun availableChoices(customFontNames: List<String>): List<FontChoice> =
+        builtInChoices + customFontNames.map(FontChoice::Custom)
+
+    fun label(choice: FontChoice): String = when (choice) {
+        FontChoice.System -> "系统衬线"
+        FontChoice.SystemSans -> "系统无衬线"
+        FontChoice.SystemMonospace -> "系统等宽"
+        is FontChoice.Custom -> choice.fileName
+    }
 
     /** filesDir/fonts/ 下的自定义字体目录。 */
     fun customFontsDir(context: Context): File =
@@ -51,13 +45,13 @@ object FontProvider {
         return base
     }
 
-    /** 按 fontId 解析 Typeface（View/Paint 路径）。任何失败回退系统 Serif。 */
+    /** 按 fontId 解析 Typeface（View/Paint 路径）。旧 ID 和失败项都安全回退系统衬线。 */
     fun typefaceFor(context: Context, fontId: String): Typeface =
-        when {
-            fontId == "system" -> Typeface.SERIF
-            fontId == "source_han" -> sourceHanSerif(context)
-            fontId.startsWith("custom:") -> customTypeface(context, fontId.removePrefix("custom:"))
-            else -> sourceHanSerif(context)
+        when (val choice = FontChoice.parse(fontId)) {
+            FontChoice.System -> Typeface.SERIF
+            FontChoice.SystemSans -> Typeface.SANS_SERIF
+            FontChoice.SystemMonospace -> Typeface.MONOSPACE
+            is FontChoice.Custom -> customTypeface(context, choice.fileName)
         }
 
     private fun customTypeface(context: Context, raw: String): Typeface {

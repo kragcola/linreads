@@ -366,6 +366,7 @@ class SettingsViewModelTest {
         assertEquals(32, settings.fontSize.value)
         assertEquals(ThemeMode.DARK, settings.themeMode.value)
         assertEquals(ReaderReadingMode.PAGED, settings.readingMode.value)
+        assertEquals(FontChoice.System, settings.fontChoice.value)
     }
 
     @Test
@@ -409,7 +410,7 @@ class SettingsViewModelTest {
         override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
         override val useSourceHanFont = MutableStateFlow(true)
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
-        override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
+        override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.System)
         override val readerGuideShown = MutableStateFlow(false)
         override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
         var savedCalibreUrl: String? = null

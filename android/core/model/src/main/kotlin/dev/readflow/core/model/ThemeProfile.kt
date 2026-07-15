@@ -10,7 +10,7 @@ data class ThemeProfile(
     val fontSize: Int = ReaderTypographyRange.DEFAULT_FONT_SIZE,
     val lineSpacing: Float = ReaderTypographyRange.DEFAULT_LINE_SPACING,
     val themeMode: String = "SYSTEM",
-    val fontChoice: String = "source_han",
+    val fontChoice: String = "system_serif",
     val txtEncoding: String = "AUTO",
     val readingMode: String = "SCROLL",
 ) {

@@ -29,9 +29,12 @@ import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightRange
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -56,6 +59,8 @@ import org.robolectric.Shadows.shadowOf
 import java.io.File
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -68,6 +73,18 @@ class EpubReflowEngineTest {
     val tempDir = TemporaryFolder()
 
     private val dispatcher = StandardTestDispatcher()
+
+    @Test
+    fun `engine fallback typography matches the new install defaults`() {
+        val engine = EpubReflowEngine(
+            context = RuntimeEnvironment.getApplication() as Application,
+            flowEngineEnabled = true,
+        )
+
+        assertEquals(18f, engine.privateField("fontSizeSp") as Float, 0.001f)
+        assertEquals(1.0f, engine.privateField("lineSpacingMultiplier") as Float, 0.001f)
+        assertEquals("system_serif", engine.privateField("currentFontId"))
+    }
 
     @After
     fun tearDown() {
@@ -378,9 +395,10 @@ class EpubReflowEngineTest {
             2,
             strategy?.elementIndex,
         )
-        assertTrue(
-            "progression-based restore should prefetch and measure the target spine before resolving: $strategy",
-            (strategy?.charOffset ?: 0) > 0,
+        assertEquals(
+            "an exact 50-percent legacy position in four equal spines should land at the third spine head",
+            0,
+            strategy?.charOffset,
         )
     }
 
@@ -399,12 +417,648 @@ class EpubReflowEngineTest {
         val engine = EpubReflowEngine(context, flowEngineEnabled = true)
 
         engine.openBook(Uri.fromFile(epub))
+        engine.goTo(Locator(LocatorStrategy.Page(index = 0, total = 2)))
 
         val book = engine.lazyBookForTest()
         assertEquals("initial prefetch should load the opened spine", 1, book?.loadCount(0))
         assertEquals("initial prefetch may warm the next spine", 1, book?.loadCount(1))
         assertEquals("building page slices must not parse cold spine 3", 0, book?.loadCount(2))
         assertEquals("building page slices must not parse cold spine 4", 0, book?.loadCount(3))
+    }
+
+    @Test
+    fun `flow open defers legacy whole book pagination until a page locator needs it`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-defers-legacy-pagination.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one paragraph.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two paragraph.</p></body></html>",
+        )
+        var measuredParagraphs = 0
+        val measurer = EpubPageLineMeasurer.StaticLayout { text, _, _ ->
+            measuredParagraphs++
+            listOf(0 to text.length)
+        }
+        val engine = EpubReflowEngine(
+            context = RuntimeEnvironment.getApplication() as Application,
+            pageLineMeasurer = measurer,
+            flowEngineEnabled = true,
+        )
+        engine.setInitialLocator(
+            Locator(
+                LocatorStrategy.Section(
+                    spineIndex = 0,
+                    elementIndex = 0,
+                    charOffset = 0,
+                ),
+            ),
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+
+        assertEquals(
+            "the chapter-flow runtime must not measure the legacy whole-book page table during open",
+            0,
+            measuredParagraphs,
+        )
+
+        engine.goTo(Locator(LocatorStrategy.Page(index = 1, total = 2), totalProgression = 0.5f))
+
+        assertTrue(
+            "a legacy Page locator must still trigger compatible page-table translation on demand",
+            measuredParagraphs > 0,
+        )
+    }
+
+    @Test
+    fun `section open reads only the target spine before returning the flow view`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("startup-target-spine-only.epub")
+        writeEpub(
+            epub,
+            *Array(5) { spine ->
+                "OEBPS/ch${spine + 1}.xhtml" to
+                    "<html><body><p>Startup chapter ${spine + 1}</p></body></html>"
+            },
+        )
+        val reads = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val backgroundDispatcher = StandardTestDispatcher(TestCoroutineScheduler())
+        val engine = EpubReflowEngine(
+            context = RuntimeEnvironment.getApplication() as Application,
+            flowEngineEnabled = true,
+            epubParserFactory = { EpubParser(onSpineRead = reads::add) },
+            fullIndexDispatcher = backgroundDispatcher,
+        )
+        engine.setInitialLocator(Locator(LocatorStrategy.Section(3, 3, 0)))
+
+        val opened = engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+
+        assertEquals(
+            "openBook must not parse unrelated chapter bodies before first view creation",
+            listOf(3),
+            reads.toList(),
+        )
+        assertEquals(3, (opened.strategy as? LocatorStrategy.Section)?.spineIndex)
+        assertTrue(flowView.textView.text.contains("Startup chapter 4"))
+        engine.close()
+    }
+
+    @Test
+    fun `startup position callbacks keep whole book progression provisional until promotion`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("startup-provisional-progression.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to "<html><body><p>First weighted chapter.</p></body></html>",
+                "OEBPS/ch2.xhtml" to "<html><body><p>Second weighted chapter.</p></body></html>",
+                "OEBPS/ch3.xhtml" to "<html><body><p>Third weighted chapter.</p></body></html>",
+            )
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser() },
+                fullIndexDispatcher = StandardTestDispatcher(TestCoroutineScheduler()),
+            )
+            engine.setInitialLocator(
+                Locator(
+                    strategy = LocatorStrategy.Section(1, 1, 0),
+                    totalProgression = 0.5f,
+                ),
+            )
+            engine.openBook(Uri.fromFile(epub))
+            engine.createView()
+
+            EpubReflowEngine::class.java.getDeclaredMethod(
+                "handleFlowTopOffsetChanged",
+                Int::class.javaPrimitiveType,
+            ).apply { isAccessible = true }.invoke(engine, 0)
+
+            val reported = requireNotNull(engine.currentLocator.value.totalProgression)
+            assertTrue(
+                "a target-spine callback must not collapse whole-book progress to the provisional array start",
+                reported > 0.2f,
+            )
+            assertEquals(1, (engine.currentLocator.value.strategy as LocatorStrategy.Section).spineIndex)
+            engine.close()
+        }
+
+    @Test
+    fun `late startup open cannot publish after the engine is closed`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("late-startup-after-close.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Late startup content.</p></body></html>",
+        )
+        val parseStarted = CountDownLatch(1)
+        val releaseParse = CountDownLatch(1)
+        val engine = EpubReflowEngine(
+            context = RuntimeEnvironment.getApplication() as Application,
+            flowEngineEnabled = true,
+            epubParserFactory = {
+                EpubParser { spine ->
+                    if (spine == 0) {
+                        parseStarted.countDown()
+                        assertTrue(releaseParse.await(5, TimeUnit.SECONDS))
+                    }
+                }
+            },
+            fullIndexDispatcher = StandardTestDispatcher(TestCoroutineScheduler()),
+        )
+        val opening = async(Dispatchers.IO) { engine.openBook(Uri.fromFile(epub)) }
+        assertTrue(parseStarted.await(5, TimeUnit.SECONDS))
+
+        engine.close()
+        releaseParse.countDown()
+        runCatching { opening.await() }
+
+        assertTrue("the superseded open must finish as cancellation", opening.isCancelled)
+        assertTrue(engine.currentLocator.value.strategy is LocatorStrategy.Unknown)
+        assertNull(engine.privateField("startupSession"))
+        assertNull(engine.privateField("lazyBook"))
+    }
+
+    @Test
+    fun `close during input copy cannot recreate epub runtime state`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = tempDir.newFile("blocked-copy-source.epub")
+        writeEpub(
+            source,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Blocked copy content.</p></body></html>",
+        )
+        val copyStarted = CountDownLatch(1)
+        val releaseCopy = CountDownLatch(1)
+        val bytes = source.readBytes()
+        val input = object : java.io.InputStream() {
+            private val delegate = bytes.inputStream()
+            private var blocked = false
+
+            private fun awaitRelease() {
+                if (blocked) return
+                blocked = true
+                copyStarted.countDown()
+                assertTrue(releaseCopy.await(5, TimeUnit.SECONDS))
+            }
+
+            override fun read(): Int {
+                awaitRelease()
+                return delegate.read()
+            }
+
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                awaitRelease()
+                return delegate.read(buffer, offset, length)
+            }
+        }
+        val context = RuntimeEnvironment.getApplication() as Application
+        val uri = Uri.parse("content://readflow.test/blocked-${System.nanoTime()}.epub")
+        shadowOf(context.contentResolver).registerInputStream(uri, input)
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val opening = async(Dispatchers.IO) { engine.openBook(uri) }
+        assertTrue(copyStarted.await(5, TimeUnit.SECONDS))
+
+        engine.close()
+        releaseCopy.countDown()
+        runCatching { opening.await() }
+
+        assertTrue(opening.isCancelled)
+        assertNull(engine.privateField("epubFile"))
+        assertNull(engine.privateField("cacheJob"))
+        assertNull(engine.privateField("cacheScope"))
+        assertNull(engine.privateField("startupSession"))
+        assertNull(engine.privateField("lazyBook"))
+    }
+
+    @Test
+    fun `startup boundary preview parses only the adjacent spine without waiting for the full index`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("startup-adjacent-boundary.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to "<html><body><p>Visible startup chapter.</p></body></html>",
+                "OEBPS/ch2.xhtml" to "<html><body><p>Adjacent chapter preview.</p></body></html>",
+                "OEBPS/ch3.xhtml" to "<html><body><p>Cold unrelated chapter.</p></body></html>",
+            )
+            val reads = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser(onSpineRead = reads::add) },
+                fullIndexDispatcher = StandardTestDispatcher(TestCoroutineScheduler()),
+            )
+            engine.setMode(ReadingMode.PAGED)
+            engine.openBook(Uri.fromFile(epub))
+            val host = engine.createView() as FrameLayout
+            val flowView = host.getChildAt(0) as EpubFlowView
+            val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+            activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+            host.measure(exactly(360), exactly(140))
+            host.layout(0, 0, 360, 140)
+
+            assertEquals(listOf(0), reads.toList())
+            EpubReflowEngine::class.java.getDeclaredMethod(
+                "requestBoundaryPreview",
+                Boolean::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+            ).apply { isAccessible = true }.invoke(
+                engine,
+                true,
+                flowView.boundaryPreviewGenerationToken(),
+            )
+
+            val preview = awaitBoundaryPreview(flowView, forward = true)
+            assertFalse(preview.bitmap.isRecycled)
+            assertEquals(
+                "the cold full-book index must stay idle while the adjacent chapter is parsed on demand",
+                listOf(0, 1),
+                reads.toList(),
+            )
+            engine.close()
+        }
+
+    @Test
+    fun `boundary preview survives full index promotion during an adjacent parse`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("startup-boundary-promotion-race.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Promotion race source.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Promotion race target.</p></body></html>",
+        )
+        val parserInstances = AtomicInteger(0)
+        val adjacentParseStarted = CountDownLatch(1)
+        val releaseAdjacentParse = CountDownLatch(1)
+        val fullIndexScheduler = TestCoroutineScheduler()
+        val engine = EpubReflowEngine(
+            context = RuntimeEnvironment.getApplication() as Application,
+            flowEngineEnabled = true,
+            epubParserFactory = {
+                val instance = parserInstances.incrementAndGet()
+                EpubParser { spine ->
+                    if (instance == 2 && spine == 1) {
+                        adjacentParseStarted.countDown()
+                        while (true) {
+                            try {
+                                releaseAdjacentParse.await()
+                                break
+                            } catch (_: InterruptedException) {
+                                // Promotion closes the provisional session while the ZIP read unwinds.
+                            }
+                        }
+                    }
+                }
+            },
+            fullIndexDispatcher = StandardTestDispatcher(fullIndexScheduler),
+        )
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        EpubReflowEngine::class.java.getDeclaredMethod(
+            "requestBoundaryPreview",
+            Boolean::class.javaPrimitiveType,
+            Long::class.javaPrimitiveType,
+        ).apply { isAccessible = true }.invoke(
+            engine,
+            true,
+            flowView.boundaryPreviewGenerationToken(),
+        )
+        assertTrue(adjacentParseStarted.await(5, TimeUnit.SECONDS))
+
+        fullIndexScheduler.advanceUntilIdle()
+        awaitCondition("fixture must promote the canonical index first") {
+            runCurrent()
+            engine.privateField("startupSession") == null
+        }
+        releaseAdjacentParse.countDown()
+
+        val preview = awaitBoundaryPreview(flowView, forward = true)
+        assertFalse("promotion must not drop the pending cross-chapter turn", preview.bitmap.isRecycled)
+        engine.close()
+    }
+
+    @Test
+    fun `startup section jump parses the requested spine without waiting for the full index`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("startup-section-jump.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to "<html><body><p>Initial chapter.</p></body></html>",
+                "OEBPS/ch2.xhtml" to "<html><body><p>Skipped cold chapter.</p></body></html>",
+                "OEBPS/ch3.xhtml" to "<html><body><p>Direct section target.</p></body></html>",
+            )
+            val reads = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser(onSpineRead = reads::add) },
+                fullIndexDispatcher = StandardTestDispatcher(TestCoroutineScheduler()),
+            )
+            engine.openBook(Uri.fromFile(epub))
+            val host = engine.createView() as FrameLayout
+            val flowView = host.getChildAt(0) as EpubFlowView
+
+            engine.goTo(
+                Locator(
+                    strategy = LocatorStrategy.Section(
+                        spineIndex = 2,
+                        elementIndex = 2,
+                        charOffset = 0,
+                    ),
+                ),
+            )
+
+            assertEquals(listOf(0, 2), reads.toList())
+            assertEquals(2, (engine.currentLocator.value.strategy as LocatorStrategy.Section).spineIndex)
+            assertTrue(flowView.textView.text.contains("Direct section target."))
+            engine.close()
+        }
+
+    @Test
+    fun `startup adjacent chapter command loads the next spine without canonical boundaries`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("startup-adjacent-command.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to "<html><body><p>Chapter command source.</p></body></html>",
+                "OEBPS/ch2.xhtml" to "<html><body><p>Chapter command target.</p></body></html>",
+                "OEBPS/ch3.xhtml" to "<html><body><p>Still cold chapter.</p></body></html>",
+            )
+            val reads = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser(onSpineRead = reads::add) },
+                fullIndexDispatcher = StandardTestDispatcher(TestCoroutineScheduler()),
+            )
+            engine.openBook(Uri.fromFile(epub))
+            val host = engine.createView() as FrameLayout
+            val flowView = host.getChildAt(0) as EpubFlowView
+
+            engine.goToAdjacentChapter(1)
+
+            assertEquals(listOf(0, 1), reads.toList())
+            assertEquals(1, (engine.currentLocator.value.strategy as LocatorStrategy.Section).spineIndex)
+            assertTrue(flowView.textView.text.contains("Chapter command target."))
+            engine.close()
+        }
+
+    @Test
+    fun `startup full book search waits for the background index and finds cold spine text`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("startup-search-gate.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to "<html><body><p>Visible startup chapter.</p></body></html>",
+                "OEBPS/ch2.xhtml" to "<html><body><p>Unique cold search needle.</p></body></html>",
+            )
+            val fullIndexScheduler = TestCoroutineScheduler()
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser() },
+                fullIndexDispatcher = StandardTestDispatcher(fullIndexScheduler),
+            )
+            engine.openBook(Uri.fromFile(epub))
+
+            val pendingSearch = async { engine.search("Unique cold search needle") }
+            runCurrent()
+            Thread.sleep(100L)
+            assertFalse(
+                "full-book search must not publish a false empty result from provisional placeholders",
+                pendingSearch.isCompleted,
+            )
+
+            fullIndexScheduler.advanceUntilIdle()
+            awaitCondition("search must resume after the full index is promoted") {
+                runCurrent()
+                pendingSearch.isCompleted
+            }
+            val results = pendingSearch.await()
+            assertEquals(1, results.size)
+            assertEquals(1, (results.single().strategy as LocatorStrategy.Section).spineIndex)
+            engine.close()
+        }
+
+    @Test
+    fun `blank startup search returns immediately without waiting for the full index`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("startup-blank-search.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to "<html><body><p>Visible startup chapter.</p></body></html>",
+                "OEBPS/ch2.xhtml" to "<html><body><p>Cold chapter.</p></body></html>",
+            )
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser() },
+                fullIndexDispatcher = StandardTestDispatcher(TestCoroutineScheduler()),
+            )
+            engine.openBook(Uri.fromFile(epub))
+
+            val results = withTimeout(500L) { engine.search("  \n") }
+
+            assertTrue(results.isEmpty())
+            engine.close()
+        }
+
+    @Test
+    fun `startup cold internal link resumes after the background index is available`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("startup-internal-link-gate.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to
+                    "<html><body><p><a href=\"ch2.xhtml\">Open cold target</a></p></body></html>",
+                "OEBPS/ch2.xhtml" to "<html><body><p>Cold internal link target.</p></body></html>",
+            )
+            val fullIndexScheduler = TestCoroutineScheduler()
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser() },
+                fullIndexDispatcher = StandardTestDispatcher(fullIndexScheduler),
+            )
+            engine.openBook(Uri.fromFile(epub))
+            val host = engine.createView() as FrameLayout
+            val flowView = host.getChildAt(0) as EpubFlowView
+
+            EpubReflowEngine::class.java.getDeclaredMethod("goToInternalLink", String::class.java)
+                .apply { isAccessible = true }
+                .invoke(engine, "OEBPS/ch2.xhtml")
+            assertEquals(0, (engine.currentLocator.value.strategy as LocatorStrategy.Section).spineIndex)
+
+            fullIndexScheduler.advanceUntilIdle()
+            awaitCondition("cold internal link must navigate after full-index promotion") {
+                runCurrent()
+                val section = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+                section?.spineIndex == 1 && flowView.textView.text.contains("Cold internal link target.")
+            }
+            engine.close()
+        }
+
+    @Test
+    fun `full index promotion preserves the spine char anchor when element index is stale`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("startup-promotion-anchor.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to
+                    "<html><body><p>Prefix one.</p><p>Prefix two.</p></body></html>",
+                "OEBPS/ch2.xhtml" to
+                    "<html><body><p>Target first.</p><p>Target anchored paragraph.</p><p>Target last.</p></body></html>",
+            )
+            val parser = EpubParser()
+            val packageIndex = parser.parsePackageIndex(epub)
+            val parsedTarget = parser.parseSpine(epub, packageIndex, 1)
+            val anchoredPara = parsedTarget.paras[1]
+            val anchoredCharOffset = anchoredPara.spineCharStart + 3
+            val fullIndexScheduler = TestCoroutineScheduler()
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser() },
+                fullIndexDispatcher = StandardTestDispatcher(fullIndexScheduler),
+            )
+            engine.setInitialLocator(
+                Locator(
+                    strategy = LocatorStrategy.Section(
+                        spineIndex = 1,
+                        elementIndex = 4,
+                        charOffset = anchoredCharOffset,
+                    ),
+                    totalProgression = 0.8f,
+                ),
+            )
+            engine.openBook(Uri.fromFile(epub))
+            engine.createView()
+            val flowBeforePromotion = engine.privateField("flowCurrentFlow")
+            assertTrue(engine.tableOfContents.value.isEmpty())
+
+            fullIndexScheduler.advanceUntilIdle()
+            awaitCondition("full index must promote on Main") {
+                runCurrent()
+                engine.privateField("startupSession") == null
+            }
+
+            val promoted = engine.currentLocator.value
+            val section = promoted.strategy as LocatorStrategy.Section
+            assertEquals(1, section.spineIndex)
+            assertEquals(
+                "charOffset must win over a stale same-spine elementIndex",
+                3,
+                section.elementIndex,
+            )
+            assertEquals(anchoredCharOffset, section.charOffset)
+            assertTrue(promoted.totalProgression != 0.8f)
+            assertTrue(
+                "promotion must canonicalize metadata without rebuilding the visible chapter flow",
+                flowBeforePromotion === engine.privateField("flowCurrentFlow"),
+            )
+            assertEquals(2, engine.tableOfContents.value.size)
+            engine.close()
+        }
+
+    @Test
+    fun `legacy page translation measures cold spine text from the startup index`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("legacy-cold-spine-pagination.epub")
+        val chapters = (1..5).map { chapter ->
+            val marker = "CHAPTER_${chapter}_"
+            "OEBPS/ch$chapter.xhtml" to
+                "<html><body><p>$marker${"x".repeat(240)}</p></body></html>"
+        }.toTypedArray()
+        writeEpub(epub, *chapters)
+        val measuredText = mutableListOf<String>()
+        val engine = EpubReflowEngine(
+            context = RuntimeEnvironment.getApplication() as Application,
+            pageLineMeasurer = EpubPageLineMeasurer.StaticLayout { text, _, _ ->
+                measuredText += text
+                listOf(0 to text.length)
+            },
+            flowEngineEnabled = true,
+        )
+        engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, 0)))
+        engine.openBook(Uri.fromFile(epub))
+        assertTrue(measuredText.isEmpty())
+
+        engine.goTo(
+            Locator(
+                LocatorStrategy.Page(index = 9, total = 10),
+                totalProgression = 0.9f,
+            ),
+        )
+
+        assertTrue(
+            "legacy pagination must use indexed text even when the target spine was outside the LRU",
+            measuredText.any { it.startsWith("CHAPTER_5_") },
+        )
+    }
+
+    @Test
+    fun `late legacy pagination cannot publish into a replacement book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val oldBook = tempDir.newFile("legacy-pagination-old.epub")
+        val newBook = tempDir.newFile("legacy-pagination-new.epub")
+        writeEpub(
+            oldBook,
+            "OEBPS/old.xhtml" to "<html><body><p>OLD_${"x".repeat(800)}</p></body></html>",
+        )
+        writeEpub(
+            newBook,
+            "OEBPS/new.xhtml" to "<html><body><p>NEW</p></body></html>",
+        )
+        val buildStarted = CountDownLatch(1)
+        val releaseOldBuild = CountDownLatch(1)
+        val engine = EpubReflowEngine(
+            context = RuntimeEnvironment.getApplication() as Application,
+            pageLineMeasurer = EpubPageLineMeasurer.StaticLayout { text, _, _ ->
+                if (text.startsWith("OLD_")) {
+                    buildStarted.countDown()
+                    assertTrue("test must release the blocked old page build", releaseOldBuild.await(5, TimeUnit.SECONDS))
+                }
+                listOf(0 to text.length)
+            },
+            flowEngineEnabled = true,
+        )
+        engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, 0)))
+        engine.openBook(Uri.fromFile(oldBook))
+
+        val oldNavigation = async {
+            engine.goTo(
+                Locator(
+                    LocatorStrategy.Page(index = 1, total = 2),
+                    totalProgression = 0.5f,
+                ),
+            )
+        }
+        runCurrent()
+        assertTrue("old page-table build must start on IO", buildStarted.await(5, TimeUnit.SECONDS))
+
+        engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, 0)))
+        engine.openBook(Uri.fromFile(newBook))
+        releaseOldBuild.countDown()
+        runCatching { oldNavigation.await() }
+
+        val current = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        assertTrue("the superseded navigation must be cancelled", oldNavigation.isCancelled)
+        assertEquals("the replacement book must keep its own initial character offset", 0, current?.charOffset)
     }
 
     @Test

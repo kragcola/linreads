@@ -2,6 +2,7 @@ package dev.readflow.features.reader
 
 import android.net.Uri
 import dev.readflow.core.model.Locator
+import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.ReadingMode
@@ -17,6 +18,7 @@ sealed interface ReaderIntent {
     data class PreviewFontSize(val sp: Float) : ReaderIntent
     data class PreviewZoom(val scale: Float) : ReaderIntent
     data class SetLineSpacing(val multiplier: Float) : ReaderIntent
+    data class SetFontChoice(val choice: FontChoice) : ReaderIntent
     data class SetMode(val mode: ReadingMode) : ReaderIntent
     data class SetPageFlipStyle(val style: dev.readflow.core.model.PageFlipStyle) : ReaderIntent
     data class SetTheme(val theme: ThemeMode) : ReaderIntent

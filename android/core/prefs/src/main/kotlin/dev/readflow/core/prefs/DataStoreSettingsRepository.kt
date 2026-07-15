@@ -29,10 +29,10 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         context.dataStore.data.map { it[KEY_CALIBRE_URL] }
 
     override val fontSize: Flow<Int> =
-        context.dataStore.data.map { it[KEY_FONT_SIZE] ?: 18 }
+        context.dataStore.data.map { it[KEY_FONT_SIZE] ?: ReaderTypography.DEFAULT_FONT_SP }
 
     override val lineSpacing: Flow<Float> =
-        context.dataStore.data.map { it[KEY_LINE_SPACING] ?: ReaderTypography.DEFAULT_LINE_SPACING }
+        context.dataStore.data.map { resolvedLineSpacingPreference(it[KEY_LINE_SPACING]) }
 
     override val readingMode: Flow<ReaderReadingMode> =
         context.dataStore.data.map {
@@ -52,7 +52,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     override val engineOverrides: Flow<Map<BookFormat, String>> = flowOf(emptyMap())
 
     override val useSourceHanFont: Flow<Boolean> =
-        context.dataStore.data.map { it[KEY_USE_SOURCE_HAN] ?: true }
+        context.dataStore.data.map { it[KEY_USE_SOURCE_HAN] ?: false }
 
     override val txtEncoding: Flow<TxtEncoding> =
         context.dataStore.data.map {
@@ -144,3 +144,6 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_PAGE_FLIP_STYLE = stringPreferencesKey("page_flip_style")
     }
 }
+
+internal fun resolvedLineSpacingPreference(stored: Float?): Float =
+    stored ?: ReaderTypography.DEFAULT_LINE_SPACING

@@ -3030,6 +3030,75 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @Config(qualifiers = "xxhdpi")
+    fun `gentle short swipe commits equally within and across chapters on a dense screen`() {
+        fun dispatchGentleForwardSwipe(view: EpubFlowView) {
+            val downTime = SystemClock.uptimeMillis()
+            val x = view.width * 0.85f
+            val startY = view.height * 0.85f
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, startY))
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 100L, MotionEvent.ACTION_MOVE, x, view.height * 0.65f),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 200L, MotionEvent.ACTION_UP, x, view.height * 0.50f),
+            )
+        }
+
+        val local = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+        )
+        try {
+            local.preCachePageTexturesForTest()
+            dispatchGentleForwardSwipe(local)
+            val localStateAfterRelease = local.privateField("interactiveTurnState")
+            val localCommitAfterRelease = local.privateField("localSoftwareSettleCommit")
+            val localAnimatorAfterRelease = local.privateField("flipAnimator") as android.animation.ValueAnimator?
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+            assertTrue(
+                "a short light swipe must turn an ordinary page without density-scaled effort; " +
+                    "state=$localStateAfterRelease commit=$localCommitAfterRelease " +
+                    "animatorRunning=${localAnimatorAfterRelease?.isRunning} scrollY=${local.scrollY}",
+                local.scrollY > 0,
+            )
+        } finally {
+            local.dispose()
+        }
+
+        val commits = mutableListOf<Any>()
+        val cancellations = mutableListOf<Boolean>()
+        val boundary = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+        ).apply {
+            installBoundaryCommitRecorderForTest(commits)
+            onBoundaryPreviewRequestCancelled = cancellations::add
+        }
+        boundary.goToLastPage()
+        try {
+            dispatchGentleForwardSwipe(boundary)
+            assertEquals(
+                "the same light swipe must retain its cross-chapter intent while the preview is cold",
+                "BOUNDARY_DISCRETE_WAITING",
+                boundary.privateField("interactiveTurnState").toString(),
+            )
+            assertTrue("a valid light swipe must not cancel adjacent-chapter rendering", cancellations.isEmpty())
+
+            val preview = boundary.newBoundaryPreviewForTest(forward = true, token = 56L)
+            assertTrue(boundary.offerBoundaryPreviewForTest(preview))
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals("the retained cross-chapter light swipe must commit exactly once", 1, commits.size)
+            assertTrue(cancellations.isEmpty())
+        } finally {
+            boundary.dispose()
+        }
+    }
+
+    @Test
     fun `fast release settles sooner than a stationary release from the same progress`() {
         fun settleDuration(velocityX: Float): Long {
             val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)

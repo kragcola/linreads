@@ -967,7 +967,9 @@ internal class EpubFlowView(
     private var curlAnchor = 0f
     private var curlAxis = InteractiveTurnAxis.HORIZONTAL
     private var velocityTracker: VelocityTracker? = null
-    private val flipFlingThresholdPxPerSec = 700 * density
+    // VelocityTracker already reports physical screen pixels per second. Moon+ uses a raw ~600 px/s
+    // gate here; multiplying by density makes the same short swipe two to three times harder on tablets.
+    private val flipFlingThresholdPxPerSec = 600f
 
     /**
      * When true (PAGED, parked on a page), drawing is clipped to the current page's bottom so the
@@ -3503,9 +3505,12 @@ internal class EpubFlowView(
             curlTargetWindow = null
             return
         }
-        val flung = if (curlForward) velocity < -flipFlingThresholdPxPerSec
-            else velocity > flipFlingThresholdPxPerSec
-        val commit = !cancelled && (progressNow >= 0.5f || flung)
+        val commit = shouldCommitInteractiveTurn(
+            forward = curlForward,
+            progress = progressNow,
+            velocity = velocity,
+            cancelled = cancelled,
+        )
         if (activeBoundaryPreview == null) {
             interactiveTurnState = InteractiveTurnState.SOFTWARE_SETTLING
             localSoftwareSettleCommit = commit
@@ -3976,12 +3981,10 @@ internal class EpubFlowView(
             coordinate - waitingBoundaryAnchor
         }
         val progress = if (extent > 0) (travel / extent.toFloat()).coerceIn(0f, 1f) else 0f
-        val flung = if (waitingBoundaryForward) {
-            velocity < -flipFlingThresholdPxPerSec
-        } else {
-            velocity > flipFlingThresholdPxPerSec
-        }
-        if (pageTurnAnimated && progress < 0.5f && !flung) {
+        if (
+            pageTurnAnimated &&
+            !shouldCommitInteractiveTurn(waitingBoundaryForward, progress, velocity, cancelled = false)
+        ) {
             cancelWaitingBoundaryTurn()
             return
         }
@@ -3991,6 +3994,21 @@ internal class EpubFlowView(
         waitingBoundaryY = 0f
         removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
         postDelayed(boundaryDiscreteWaitTimeoutRunnable, BOUNDARY_DISCRETE_WAIT_TIMEOUT_MS)
+    }
+
+    private fun shouldCommitInteractiveTurn(
+        forward: Boolean,
+        progress: Float,
+        velocity: Float,
+        cancelled: Boolean,
+    ): Boolean {
+        if (cancelled) return false
+        val flung = if (forward) {
+            velocity < -flipFlingThresholdPxPerSec
+        } else {
+            velocity > flipFlingThresholdPxPerSec
+        }
+        return progress >= 0.5f || flung
     }
 
     private fun applyClassifiedMove(ev: MotionEvent) {

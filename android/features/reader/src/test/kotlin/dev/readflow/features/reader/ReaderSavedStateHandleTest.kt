@@ -409,16 +409,44 @@ class ReaderSavedStateHandleTest {
         assertEquals(
             "font must be applied once as part of the pre-open layout transaction, not replayed after load",
             1,
-            events.count { it == "setFont:system" },
+            events.count { it == "setFont:system_serif" },
         )
 
-        settings.setFontChoice(FontChoice.SourceHan)
+        settings.setFontChoice(FontChoice.SystemSans)
         advanceUntilIdle()
 
         assertTrue(
             "real user font changes after open must still reach the engine, events=$events",
-            "setFont:source_han" in events,
+            "setFont:system_sans" in events,
         )
+    }
+
+    @Test
+    fun `font choice intent updates reader settings and live engine together`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            useSourceHanFont.value = false
+            fontChoice.value = FontChoice.System
+        }
+        val events = mutableListOf<String>()
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = events,
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.SetFontChoice(FontChoice.SystemSans))
+        advanceUntilIdle()
+
+        assertEquals(FontChoice.SystemSans, viewModel.uiState.value.fontChoice)
+        assertEquals(FontChoice.SystemSans, settings.fontChoice.value)
+        assertTrue("events=$events", "setFont:system_sans" in events)
     }
 
     @Test
@@ -1004,7 +1032,7 @@ class ReaderSavedStateHandleTest {
                     "setLineSpacing:2.0",
                     "setTheme:DARK",
                     "setSerifFont:false",
-                    "setFont:system",
+                    "setFont:system_serif",
                     "setPageFlipStyle:SIMULATION",
                     "setMode:PAGED",
                 ).all { events.indexOf(it) in 0 until openIndex },
@@ -1702,7 +1730,7 @@ class ReaderSavedStateHandleTest {
         override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
         override val useSourceHanFont = MutableStateFlow(true)
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
-        override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
+        override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.System)
         override val readerGuideShown = MutableStateFlow(true)
         override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
 
