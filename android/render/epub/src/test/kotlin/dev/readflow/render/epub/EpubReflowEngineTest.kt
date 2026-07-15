@@ -1051,6 +1051,63 @@ class EpubReflowEngineTest {
         }
 
     @Test
+    fun `setMode to PAGED after full-index promotion without a flow view builds legacy pages`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("paged-after-promotion-no-flow.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to "<html><body><p>Chapter one for paged promotion race.</p></body></html>",
+                "OEBPS/ch2.xhtml" to "<html><body><p>Chapter two for paged promotion race.</p></body></html>",
+            )
+            val fullIndexScheduler = TestCoroutineScheduler()
+            val engine = EpubReflowEngine(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser() },
+                fullIndexDispatcher = StandardTestDispatcher(fullIndexScheduler),
+            )
+
+            // openBook only — no createView, so there is never a flow view for this session.
+            engine.openBook(Uri.fromFile(epub))
+
+            fullIndexScheduler.advanceUntilIdle()
+            awaitCondition("full index must promote on Main before setMode") {
+                runCurrent()
+                engine.privateField("startupSession") == null &&
+                    engine.tableOfContents.value.isNotEmpty()
+            }
+
+            // Precondition: promotion finished with no flow view before switching to PAGED.
+            assertNull(
+                "promotion must retire the startup session before setMode",
+                engine.privateField("startupSession"),
+            )
+            assertTrue(
+                "promotion must populate the table of contents before setMode",
+                engine.tableOfContents.value.isNotEmpty(),
+            )
+            assertNull(
+                "this race requires no flow view to have been created",
+                engine.privateField("flowView"),
+            )
+            assertEquals(
+                "pageCount must still be zero before setMode when no view has been built",
+                0,
+                engine.pageCount.value,
+            )
+
+            engine.setMode(ReadingMode.PAGED)
+            runCurrent()
+
+            assertTrue(
+                "switching to PAGED after full-index promotion with no flow view must build legacy paged slices",
+                engine.pageCount.value > 0,
+            )
+            engine.close()
+        }
+
+    @Test
     fun `legacy page translation measures cold spine text from the startup index`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("legacy-cold-spine-pagination.epub")

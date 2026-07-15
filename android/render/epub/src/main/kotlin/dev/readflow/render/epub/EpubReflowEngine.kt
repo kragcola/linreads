@@ -2524,8 +2524,12 @@ class EpubReflowEngine private constructor(
         }
         if (targetKind == _pagingKind.value) return
         if (flowEngineEnabled) {
-            if (targetKind == PagingKind.PAGED && flowView == null && startupSession != null) {
-                awaitFullIndexBook()
+            if (targetKind == PagingKind.PAGED && flowView == null) {
+                // No flow view: legacy paged slices own pageCount. Await full-index only while
+                // startupSession is still live; if promotion already retired it, still build slices.
+                if (startupSession != null) {
+                    awaitFullIndexBook()
+                }
                 withContext(Dispatchers.IO) { ensureLegacyPagedSlices() }
             }
             withContext(Dispatchers.Main) {
