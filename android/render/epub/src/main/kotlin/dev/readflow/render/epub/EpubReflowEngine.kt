@@ -1008,8 +1008,19 @@ class EpubReflowEngine private constructor(
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
             imageBoundsProvider = ::epubImageBoundsFor,
-            onImageResultChanged = {
-                if (isCurrent()) view.refreshAfterAsyncImageResult()
+            onImageResultChanged = { result ->
+                if (isCurrent()) {
+                    when (result.kind) {
+                        EpubAsyncImageResultKind.PIXELS_ONLY -> {
+                            if (result.layoutStart >= 0) {
+                                view.onAsyncImagePixelsChanged(result.layoutStart)
+                            } else {
+                                view.refreshAfterAsyncImageResult()
+                            }
+                        }
+                        EpubAsyncImageResultKind.GEOMETRY_CHANGED -> view.refreshAfterAsyncImageResult()
+                    }
+                }
             },
             onDecodeFinished = {
                 if (isCurrent()) view.onAsyncImageDecodeFinished()
@@ -1041,7 +1052,10 @@ class EpubReflowEngine private constructor(
         // that not-yet-scheduled window as pending too, or the stability gate can reveal/pre-cache the
         // transparent placeholders before loader.inFlight has a chance to become non-empty.
         var imageSchedulingPending = true
-        view.pendingDecodesProvider = { imageSchedulingPending || loader.hasPendingDecodes() }
+        view.pendingDecodesProvider = {
+            imageSchedulingPending ||
+                loader.hasRelevantPendingDecodes(view.relevantPendingDecodeLayoutRanges())
+        }
         view.setChapter(
             flow,
             spannable,

@@ -350,6 +350,7 @@ class EpubFlowSpannableTest {
         val ctx = RuntimeEnvironment.getApplication()
         val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
         val refreshes = AtomicInteger(0)
+        val results = mutableListOf<EpubAsyncImageResult>()
         try {
             val loader = EpubFlowImageLoader(
                 epubFileProvider = { epub },
@@ -361,7 +362,10 @@ class EpubFlowSpannableTest {
                 imageBoundsProvider = { href ->
                     if (href == "wide.png") EpubImageBounds(width = 1600, height = 400) else null
                 },
-                onImageResultChanged = { refreshes.incrementAndGet() },
+                onImageResultChanged = { result ->
+                    results += result
+                    refreshes.incrementAndGet()
+                },
             )
             val resolver = EpubFlowImageSizeResolver(
                 columnWidthPx = 800,
@@ -370,6 +374,7 @@ class EpubFlowSpannableTest {
                 fullPageHrefs = emptySet(),
             )
             val drawable = AsyncDrawable("wide.png", loader, resolver, null)
+            loader.registerOccurrence(drawable, layoutStart = 42)
             AsyncDrawableSpan(
                 io.noties.markwon.core.MarkwonTheme.create(ctx),
                 drawable,
@@ -390,9 +395,102 @@ class EpubFlowSpannableTest {
             assertTrue("async decode should replace the transparent placeholder", drawable.result is BitmapDrawable)
             assertEquals(Rect(0, 0, 800, 200), drawable.bounds)
             assertEquals(
-                "bounds-equal decode must ask the host TextView to rebuild spans so the bitmap is drawn",
+                "bounds-equal decode must notify the host so the bitmap is drawn",
                 1,
                 refreshes.get(),
+            )
+            val result = results.single()
+            assertEquals(42, result.layoutStart)
+            assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, result.kind)
+            assertEquals(Rect(0, 0, 800, 200), result.beforeBounds)
+            assertEquals(Rect(0, 0, 800, 200), result.afterBounds)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `hasRelevantPendingDecodes ignores far page layout starts`() {
+        val epub = createImageEpub("relevant-far-page")
+        val executor = QueuedExecutorService()
+        try {
+            val loader = imageLoader(epub = epub, executor = executor)
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 5_000)
+            drawable.setCallback2(attachedDrawableCallback)
+            assertTrue("fixture needs an in-flight decode", loader.hasPendingDecodes())
+
+            assertFalse(
+                "a far-page pending decode must not gate the current/adjacent windows",
+                loader.hasRelevantPendingDecodes(listOf(0 until 100, 100 until 200, 200 until 300)),
+            )
+            assertTrue(
+                "the same pending decode must still gate when its layoutStart is in range",
+                loader.hasRelevantPendingDecodes(listOf(4_900 until 5_100)),
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `hasRelevantPendingDecodes blocks current and adjacent layout starts`() {
+        val epub = createImageEpub("relevant-near-page")
+        val executor = QueuedExecutorService()
+        try {
+            val loader = imageLoader(epub = epub, executor = executor)
+            val current = asyncDrawable(loader)
+            loader.registerOccurrence(current, layoutStart = 150)
+            current.setCallback2(attachedDrawableCallback)
+
+            assertTrue(
+                "current-page pending decode must gate reveal/precache",
+                loader.hasRelevantPendingDecodes(listOf(0 until 100, 100 until 200, 200 until 300)),
+            )
+
+            loader.cancelAll()
+            val previous = asyncDrawable(loader)
+            loader.registerOccurrence(previous, layoutStart = 50)
+            previous.setCallback2(attachedDrawableCallback)
+            assertTrue(
+                "previous-page pending decode must gate reveal/precache",
+                loader.hasRelevantPendingDecodes(listOf(0 until 100, 100 until 200, 200 until 300)),
+            )
+
+            loader.cancelAll()
+            val next = asyncDrawable(loader)
+            loader.registerOccurrence(next, layoutStart = 250)
+            next.setCallback2(attachedDrawableCallback)
+            assertTrue(
+                "next-page pending decode must gate reveal/precache",
+                loader.hasRelevantPendingDecodes(listOf(0 until 100, 100 until 200, 200 until 300)),
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `hasRelevantPendingDecodes conservatively blocks unregistered occurrences`() {
+        val epub = createImageEpub("relevant-unknown")
+        val executor = QueuedExecutorService()
+        try {
+            val loader = imageLoader(epub = epub, executor = executor)
+            val drawable = asyncDrawable(loader)
+            // Intentionally skip registerOccurrence — layoutStart is unknown.
+            drawable.setCallback2(attachedDrawableCallback)
+            assertTrue(loader.hasPendingDecodes())
+
+            assertTrue(
+                "an unregistered pending decode must block so correctness is not lost",
+                loader.hasRelevantPendingDecodes(listOf(0 until 100, 100 until 200)),
+            )
+            assertTrue(
+                "empty relevant ranges must also block while any decode is pending",
+                loader.hasRelevantPendingDecodes(emptyList()),
             )
         } finally {
             executor.shutdownNow()
@@ -455,7 +553,7 @@ class EpubFlowSpannableTest {
             val loader = imageLoader(
                 epub = epub,
                 executor = executor,
-                onImageResultChanged = { refreshes.incrementAndGet() },
+                onImageResultChanged = { _ -> refreshes.incrementAndGet() },
                 onDecodeFinished = { completions.incrementAndGet() },
             )
             val drawable = asyncDrawable(loader)
@@ -486,7 +584,7 @@ class EpubFlowSpannableTest {
             val loader = imageLoader(
                 epub = epub,
                 executor = executor,
-                onImageResultChanged = { refreshes.incrementAndGet() },
+                onImageResultChanged = { _ -> refreshes.incrementAndGet() },
             )
             val retired = asyncDrawable(loader)
             retired.setCallback2(attachedDrawableCallback)
@@ -975,7 +1073,7 @@ class EpubFlowSpannableTest {
     }
 
     @Test
-    fun `heading image sizing does not contaminate a later occurrence of the same href`() {
+    fun `heading attached and later standalone occurrences of the same href keep full page bounds`() {
         val pageHeightPx = 1200
         val columnWidthPx = 800
         val sharedHref = "reused-plate.png"
@@ -1023,13 +1121,13 @@ class EpubFlowSpannableTest {
             }
 
             assertEquals(2, imageSpans.size)
-            assertTrue(
-                "the occurrence attached to the heading must reserve space for that heading; " +
-                    "actual=${imageSpans[0].drawable.bounds}",
-                imageSpans[0].drawable.bounds.height() < pageHeightPx,
+            assertEquals(
+                "a heading-attached occurrence stays full-size for cropped continuation preview",
+                Rect(0, 0, columnWidthPx, pageHeightPx),
+                imageSpans[0].drawable.bounds,
             )
             assertEquals(
-                "a standalone occurrence must retain full-page bounds even when its href was used after a heading",
+                "a later standalone occurrence keeps the same full-page policy",
                 Rect(0, 0, columnWidthPx, pageHeightPx),
                 imageSpans[1].drawable.bounds,
             )
@@ -1039,7 +1137,7 @@ class EpubFlowSpannableTest {
     }
 
     @Test
-    fun `large multiline h1 separator and attached image fit one page using measured layout height`() {
+    fun `large multiline h1 keeps a full sized attached image for continuation preview`() {
         val pageHeightPx = 720
         val columnWidthPx = 280
         val fontSizeSp = 32f
@@ -1103,12 +1201,26 @@ class EpubFlowSpannableTest {
             val imageLine = layout.getLineForOffset(imageSegment.layoutStart)
             val headingAndSeparatorHeightPx = layout.getLineTop(imageLine) - layout.getLineTop(firstHeadingLine)
             val completeGroupHeightPx = layout.getLineBottom(imageLine) - layout.getLineTop(firstHeadingLine)
+            val expectedImageBounds = epubFlowImageTargetSize(
+                intrinsicWidth = 800,
+                intrinsicHeight = 2400,
+                columnWidthPx = columnWidthPx,
+                pageHeightPx = pageHeightPx,
+                inlineMaxHeightPx = pageHeightPx,
+                isFullPage = true,
+            )
 
             assertTrue("the H1 precondition must exercise at least five measured lines", lastHeadingLine - firstHeadingLine + 1 >= 5)
             assertTrue("the heading and separator leave positive room for an attached image", headingAndSeparatorHeightPx in 1 until pageHeightPx)
+            assertEquals(
+                "the attached image must keep full-page FIT bounds instead of shrinking into residual heading room",
+                expectedImageBounds,
+                imageSpan.drawable.bounds,
+            )
             assertTrue(
-                "measured H1 + separator + image is ${completeGroupHeightPx}px, exceeding the ${pageHeightPx}px page",
-                completeGroupHeightPx <= pageHeightPx,
+                "full-size image after a tall H1 is allowed to overflow for cropped preview; " +
+                    "group=${completeGroupHeightPx}px page=${pageHeightPx}px",
+                completeGroupHeightPx > pageHeightPx,
             )
         } finally {
             bitmap.recycle()
@@ -1263,7 +1375,7 @@ class EpubFlowSpannableTest {
         executor: QueuedExecutorService,
         fullPage: Boolean = false,
         pageHeightProvider: () -> Int = { 8 },
-        onImageResultChanged: (() -> Unit)? = null,
+        onImageResultChanged: ((EpubAsyncImageResult) -> Unit)? = null,
         onDecodeFinished: (() -> Unit)? = null,
     ) = EpubFlowImageLoader(
         epubFileProvider = { epub },

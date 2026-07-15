@@ -1,6 +1,8 @@
 package dev.readflow.features.reader
 
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -67,6 +69,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -79,6 +82,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.shape.CircleShape
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.LoadingState
@@ -130,6 +136,34 @@ internal fun readerHostKindFor(engine: ReaderEngine, pagingKind: PagingKind): Re
         }
     }
 
+@Composable
+private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean) {
+    val view = LocalView.current
+    val lightBars = !readerPaletteFor(themeMode, systemNight).isNight
+    DisposableEffect(view, lightBars) {
+        val window = view.context.findActivity()?.window
+        if (window == null) {
+            onDispose { }
+        } else {
+            val controller = WindowCompat.getInsetsController(window, view)
+            val previousStatusBarAppearance = controller.isAppearanceLightStatusBars
+            val previousNavigationBarAppearance = controller.isAppearanceLightNavigationBars
+            controller.isAppearanceLightStatusBars = lightBars
+            controller.isAppearanceLightNavigationBars = lightBars
+            onDispose {
+                controller.isAppearanceLightStatusBars = previousStatusBarAppearance
+                controller.isAppearanceLightNavigationBars = previousNavigationBarAppearance
+            }
+        }
+    }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ReaderScreen(
@@ -140,11 +174,14 @@ fun ReaderScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    val systemNight = isSystemInDarkTheme()
+    val readerPaperColor = Color(readerPaletteFor(state.themeMode, systemNight).paper)
+    ReaderSystemBarAppearance(state.themeMode, systemNight)
 
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+            .background(readerPaperColor),
         contentAlignment = Alignment.Center,
     ) {
         when (state.loadingState) {
@@ -188,7 +225,6 @@ fun ReaderScreen(
                         zoomableEngine?.zoomScale ?: MutableStateFlow(1f)
                     }
                     val zoomScale by zoomScaleFlow.collectAsState()
-                    val systemNight = isSystemInDarkTheme()
                     val readerFocusRequester = remember { FocusRequester() }
                     fun handleReaderAction(action: ReaderTapZone) {
                         viewModel.onIntent(ReaderIntent.DismissGuide)
@@ -215,7 +251,6 @@ fun ReaderScreen(
                         AndroidView(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .windowInsetsPadding(WindowInsets.systemBars)
                                 .onPreviewKeyEvent { handleReaderKey(it.nativeKeyEvent) }
                                 .focusRequester(readerFocusRequester)
                                 .focusable(),
@@ -1552,10 +1587,35 @@ private class ReaderTapContainer(
         }
 
     init {
+        ViewCompat.setOnApplyWindowInsetsListener(this) { view, insets ->
+            val safeInsets = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or
+                    WindowInsetsCompat.Type.displayCutout(),
+            )
+            if (
+                view.paddingLeft != safeInsets.left ||
+                view.paddingTop != safeInsets.top ||
+                view.paddingRight != safeInsets.right ||
+                view.paddingBottom != safeInsets.bottom
+            ) {
+                view.setPadding(
+                    safeInsets.left,
+                    safeInsets.top,
+                    safeInsets.right,
+                    safeInsets.bottom,
+                )
+            }
+            insets
+        }
         isFocusable = true
         isFocusableInTouchMode = true
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_YES
         contentDescription = "阅读内容，捏合调整字号"
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        ViewCompat.requestApplyInsets(this)
     }
 
     private fun refreshContentDescription() {

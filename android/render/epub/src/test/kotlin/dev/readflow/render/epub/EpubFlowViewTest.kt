@@ -38,6 +38,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
 
@@ -5233,21 +5234,36 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `async image result invalidates same geometry turn textures`() {
+    fun `pixel only async image result invalidates only its page texture without text rebind`() {
         val view = pagedFlowView()
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        assertTrue("fixture needs adjacent pages", pages.size > 1)
         val cachedFront = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
         val cachedRevealed = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
         view.setPrivateField("cachedFrontBitmap", cachedFront)
         view.setPrivateField("cachedRevealedBitmap", cachedRevealed)
         view.setPrivateField("cachedFromPage", 0)
         view.setPrivateField("cachedTargetPage", 1)
+        val layoutBefore = requireNotNull(view.textView.layout)
+        val method = runCatching {
+            view.javaClass.getDeclaredMethod(
+                "onAsyncImagePixelsChanged",
+                Int::class.javaPrimitiveType,
+            ).apply { isAccessible = true }
+        }.getOrNull()
+        assertNotNull(
+            "pixel-only image completion needs a selective refresh API",
+            method,
+        )
 
-        view.refreshAfterAsyncImageResult()
+        method!!.invoke(view, pages[0].startOffset)
 
-        assertTrue("the placeholder front texture must be retired when image pixels arrive", cachedFront.isRecycled)
-        assertTrue("the placeholder revealed texture must be retired when image pixels arrive", cachedRevealed.isRecycled)
+        assertTrue("the containing page texture must be retired when image pixels arrive", cachedFront.isRecycled)
+        assertFalse("an unrelated adjacent page texture must stay warm", cachedRevealed.isRecycled)
         assertNull(view.privateField("cachedFrontBitmap"))
-        assertNull(view.privateField("cachedRevealedBitmap"))
+        assertTrue(view.privateField("cachedRevealedBitmap") === cachedRevealed)
+        assertTrue("same geometry must preserve the existing StaticLayout", view.textView.layout === layoutBefore)
+        assertFalse("same geometry must not request a TextView re-layout", view.textView.isLayoutRequested)
     }
 
     @Test
@@ -6767,10 +6783,490 @@ class EpubFlowViewTest {
         }
     }
 
+    @Test
+    fun `heading page shows cropped top of following large image while next page shows complete image`() {
+        val viewportWidth = 360
+        val viewportHeight = 240
+        val imageColor = 0xFFE11D48.toInt()
+        val sampleBandHeight = 24
+        val imageHeight = viewportHeight + 120
+        // Keep the ImageSpan near the first viewport: Robolectric does not reliably paint a plain
+        // DynamicDrawableSpan hundreds of pixels down a tall TextView, while device TextView does.
+        val bodyText = (1..2).joinToString("\n") { "前置正文 $it 把标题推到页底附近。" }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Text(bodyText, headingLevel = null, paragraphIndex = 0),
+                EpubDisplayBlock.Text("图版标题", headingLevel = 2, paragraphIndex = 1),
+                EpubDisplayBlock.Image(
+                    href = "plate-pattern.png",
+                    altText = "patterned plate",
+                    paragraphIndex = 2,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+        val imageSegment = flow.segments.single { it.isImage }
+        val headingSegment = flow.segments.single {
+            val block = it.block
+            block is EpubDisplayBlock.Text && block.headingLevel != null
+        }
+        val imageDrawable = ColorDrawable(imageColor).apply {
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val spannable = SpannableString(flow.text).apply {
+            setSpan(
+                ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
+                imageSegment.layoutStart,
+                imageSegment.layoutEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val view = pagedFlowView(
+            flow = flow,
+            spannable = spannable,
+            viewportWidth = viewportWidth,
+            viewportHeight = viewportHeight,
+        )
+        try {
+            val layout = requireNotNull(view.textView.layout)
+            val headingLine = layout.getLineForOffset(headingSegment.layoutStart)
+            val imageLine = layout.getLineForOffset(imageSegment.layoutStart)
+            val imageLineTop = layout.getLineTop(imageLine)
+            val imageLineBottom = layout.getLineBottom(imageLine)
+            assertTrue(
+                "fixture needs a non-inline image taller than the viewport",
+                imageLineBottom - imageLineTop > viewportHeight,
+            )
+
+            val headingPageIndex = (0 until view.pageCount()).firstOrNull { pageIndex ->
+                val top = requireNotNull(view.pageTopPxAt(pageIndex))
+                val nextTop = view.pageTopPxAt(pageIndex + 1) ?: (layout.height + 1)
+                layout.getLineTop(headingLine) in top until nextTop
+            } ?: error("heading must land on some paged window")
+            val headingPageTop = requireNotNull(view.pageTopPxAt(headingPageIndex))
+            val nextPageIndex = headingPageIndex + 1
+            assertTrue(
+                "fixture needs a page after the heading for the complete image",
+                nextPageIndex < view.pageCount(),
+            )
+            val nextPageTop = requireNotNull(view.pageTopPxAt(nextPageIndex))
+            assertEquals(
+                "the complete-image page must start at the source image line top",
+                imageLineTop,
+                nextPageTop,
+            )
+
+            assertTrue(
+                "heading line must start on the heading page",
+                layout.getLineTop(headingLine) >= headingPageTop,
+            )
+            val headingBottomOnPage = layout.getLineBottom(headingLine) - headingPageTop
+            assertTrue(
+                "heading itself must fit inside the viewport on its page",
+                headingBottomOnPage in 1 until viewportHeight,
+            )
+            assertTrue(
+                "complete image must not fit under the heading on the same page",
+                imageLineBottom - headingPageTop > viewportHeight,
+            )
+
+            view.goToPage(headingPageIndex)
+            val headingSnapshot = requireNotNull(view.snapshotPageAt(headingPageTop))
+            val snapshotRemainderSamples = sampleImagePatternHits(
+                bitmap = headingSnapshot,
+                left = viewportWidth / 4,
+                top = (headingBottomOnPage + 4).coerceAtMost(viewportHeight - 2),
+                right = (viewportWidth * 3) / 4,
+                bottom = viewportHeight - 2,
+                stripeA = imageColor,
+                stripeB = imageColor,
+            )
+            val headingPageShot = view.drawToBitmapForTest()
+            try {
+                assertTrue(
+                    "page-turn snapshot must include the same cropped image preview; " +
+                        "hits=$snapshotRemainderSamples",
+                    snapshotRemainderSamples > 0,
+                )
+                val remainderSamples = sampleImagePatternHits(
+                    bitmap = headingPageShot,
+                    left = viewportWidth / 4,
+                    top = (headingBottomOnPage + 4).coerceAtMost(viewportHeight - 2),
+                    right = (viewportWidth * 3) / 4,
+                    bottom = viewportHeight - 2,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue(
+                    "heading page must paint a cropped top preview of the following large image " +
+                        "in the otherwise blank remainder; hits=$remainderSamples " +
+                        "snapshotHits=$snapshotRemainderSamples " +
+                        "headingBottomOnPage=$headingBottomOnPage pageCount=${view.pageCount()} " +
+                        "headingPage=$headingPageIndex nextTop=$nextPageTop " +
+                        "pageClipActive=${view.privateBool("pageClipActive")} " +
+                        "activeWindow=${view.privateField("activePageWindow")}",
+                    remainderSamples > 0,
+                )
+            } finally {
+                headingPageShot.recycle()
+                headingSnapshot.recycle()
+            }
+
+            view.goToPage(nextPageIndex)
+            val completeImageShot = view.drawToBitmapForTest()
+            try {
+                val topBandHits = sampleImagePatternHits(
+                    bitmap = completeImageShot,
+                    left = viewportWidth / 4,
+                    top = 2,
+                    right = (viewportWidth * 3) / 4,
+                    bottom = sampleBandHeight,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                val fullPageHits = sampleImagePatternHits(
+                    bitmap = completeImageShot,
+                    left = viewportWidth / 4,
+                    top = 0,
+                    right = (viewportWidth * 3) / 4,
+                    bottom = viewportHeight,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue(
+                    "next page must render the complete image from its top; topBandHits=$topBandHits " +
+                        "fullPageHits=$fullPageHits nextPageTop=$nextPageTop imageLineTop=$imageLineTop " +
+                        "scrollY=${view.scrollY} currentPage=${view.currentPageIndex()}",
+                    topBandHits > 0,
+                )
+                assertEquals(
+                    "complete image page must start at the image's top pixels, not a mid-image crop",
+                    imageColor,
+                    completeImageShot.getPixel(viewportWidth / 2, 4),
+                )
+            } finally {
+                completeImageShot.recycle()
+            }
+
+            val flowAfter = view.privateField("flow") as EpubChapterFlow
+            assertEquals(1, flowAfter.segments.count { it.isImage })
+            assertEquals(2 to 0, flowAfter.paragraphAtOffset(imageSegment.layoutStart))
+            assertEquals(1 to 0, flowAfter.paragraphAtOffset(headingSegment.layoutStart))
+            assertEquals(1, flowAfter.text.count { it == EPUB_FLOW_IMAGE_CHAR })
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `async image result with unchanged geometry preserves active software slide turn`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.scrollTo(0, requireNotNull(view.pageTopPxAt(0)))
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        view.updateInteractiveCurl(x = view.width * 0.40f)
+        val slideBefore = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+        val progressBefore = slideBefore.progress
+        val originBefore = view.privateField("curlOrigin")
+        val scrollBefore = view.scrollY
+        assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+        assertTrue(progressBefore > 0.05f)
+
+        try {
+            view.refreshAfterAsyncImageResult()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val slideAfter = view.privateField("slideDrawable") as PageSlideDrawable?
+            assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+            assertTrue("the same overlay must remain installed", slideAfter === slideBefore)
+            assertEquals(progressBefore, requireNotNull(slideAfter).progress, 0.001f)
+            assertTrue(view.privateField("curlOrigin") === originBefore && originBefore != null)
+            assertEquals(scrollBefore, view.scrollY)
+        } finally {
+            if (view.privateField("interactiveTurnState").toString() != "NONE") {
+                view.endInteractiveCurl(velocityX = 0f)
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            }
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `multiple geometry changes during active turn coalesce into one post turn refresh`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.scrollTo(0, requireNotNull(view.pageTopPxAt(0)))
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        view.updateInteractiveCurl(x = view.width * 0.40f)
+        assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+
+        try {
+            val genAtTurnStart = view.privateField("pageTexturePrecacheGeneration") as Long
+
+            // Several GEOMETRY_CHANGED completions while the finger owns the turn.
+            view.refreshAfterAsyncImageResult()
+            view.refreshAfterAsyncImageResult()
+            view.refreshAfterAsyncImageResult()
+            // Debounce windows would have fired if not turn-gated; they must re-arm instead of applying.
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "coalesced geometry flag must stay armed for the whole turn",
+                view.privateBool("asyncImageRefreshPending"),
+            )
+            assertEquals(
+                "geometry completions must not apply a full refresh while the turn is active",
+                genAtTurnStart,
+                view.privateField("pageTexturePrecacheGeneration") as Long,
+            )
+
+            // Complete the settle; the deferred flag stays set until the debounced post-turn runnable runs.
+            view.endInteractiveCurl(velocityX = 0f)
+            val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+            if (animator != null && animator.isRunning) {
+                animator.end()
+            }
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertTrue(
+                "deferred flag must still be set until the post-turn refresh runnable runs",
+                view.privateBool("asyncImageRefreshPending"),
+            )
+            val genAtTurnEnd = view.privateField("pageTexturePrecacheGeneration") as Long
+
+            // Single coalesced apply (REFLOW_DEBOUNCE_MS = 80). Full refresh may bump generation more
+            // than once (recycle + precache restart); the contract is one apply, not +1 generation.
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+            assertFalse(
+                "the coalesced flag must clear after the single post-turn refresh",
+                view.privateBool("asyncImageRefreshPending"),
+            )
+            val genAfterFirstApply = view.privateField("pageTexturePrecacheGeneration") as Long
+            assertTrue(
+                "post-turn full refresh must run exactly once for the coalesced mid-turn batch",
+                genAfterFirstApply > genAtTurnEnd,
+            )
+
+            // No second geometry-driven full refresh is scheduled from the same batch.
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+            assertFalse(view.privateBool("asyncImageRefreshPending"))
+            assertEquals(
+                "a second full geometry refresh must not fire after the coalesced batch is drained",
+                genAfterFirstApply,
+                view.privateField("pageTexturePrecacheGeneration") as Long,
+            )
+        } finally {
+            if (view.privateField("interactiveTurnState").toString() != "NONE") {
+                view.endInteractiveCurl(velocityX = 0f)
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            }
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `setChapter drops deferred async image work owned by the previous chapter`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        view.updateInteractiveCurl(x = view.width * 0.40f)
+
+        view.refreshAfterAsyncImageResult()
+        view.onAsyncImagePixelsChanged(pages.first().startOffset)
+        assertTrue(view.privateBool("asyncImageRefreshPending"))
+        @Suppress("UNCHECKED_CAST")
+        val queuedOffsets = view.privateField("asyncImagePixelRefreshOffsets") as Set<Int>
+        assertTrue(queuedOffsets.isNotEmpty())
+
+        view.pageTexturePrecacheEnabled = false
+        view.setChapter(
+            view.privateField("flow") as EpubChapterFlow,
+            view.textView.text,
+            pageHeightPx = 120,
+            restoreOffset = pages.first().startOffset,
+        )
+
+        assertFalse(
+            "a new chapter must not inherit a geometry refresh posted by the previous chapter",
+            view.privateBool("asyncImageRefreshPending"),
+        )
+        assertTrue(
+            "a new chapter must not inherit pixel offsets from the previous chapter",
+            (view.privateField("asyncImagePixelRefreshOffsets") as Set<*>).isEmpty(),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+        assertFalse(view.privateBool("asyncImageRefreshPending"))
+        view.dispose()
+    }
+
+    @Test
+    fun `relevant pending decode ranges cover current and adjacent pages only`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        view.scrollTo(0, pages[1].topPx)
+        // Park on canonical page 1 so prev=0, current=1, next=2.
+        view.setPrivateField("activePageWindow", pages[1])
+        view.setPrivateField("currentPage", 1)
+
+        val ranges = view.relevantPendingDecodeLayoutRanges()
+        assertEquals(
+            "visible current plus previous/next must yield three layout-offset ranges",
+            3,
+            ranges.size,
+        )
+        assertTrue("previous page range", ranges.any { pages[0].startOffset in it && pages[0].endOffset - 1 in it })
+        assertTrue("current page range", ranges.any { pages[1].startOffset in it && pages[1].endOffset - 1 in it })
+        assertTrue("next page range", ranges.any { pages[2].startOffset in it && pages[2].endOffset - 1 in it })
+        assertFalse(
+            "far page offsets must not be included",
+            ranges.any { pages[3].startOffset in it },
+        )
+        view.dispose()
+    }
+
+    @Test
+    fun `far page pending decode does not block reveal or nearby precache`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val farStart = pages.last().startOffset
+        // Simulates loader.hasRelevantPendingDecodes: far layoutStart only blocks when in range.
+        var farPending = true
+        view.pendingDecodesProvider = {
+            farPending && view.relevantPendingDecodeLayoutRanges().any { farStart in it }
+        }
+
+        val restoreOffset = pages[0].startOffset
+        view.setChapter(
+            view.privateField("flow") as EpubChapterFlow,
+            view.textView.text,
+            pageHeightPx = 120,
+            restoreOffset = restoreOffset,
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(
+            "far-page pending decode must not hold the current-page reveal",
+            false,
+            view.privateBool("awaitingReveal"),
+        )
+        assertEquals(1f, view.getChildAt(0).alpha)
+
+        view.recycleCachedTexturesForTest()
+        view.preCachePageTexturesForTest()
+        assertNotNull(
+            "nearby page-shot precache must proceed while only a far-page decode is pending",
+            view.privateField("cachedFrontBitmap"),
+        )
+        farPending = false
+        view.dispose()
+    }
+
+    @Test
+    fun `real loader pending occurrences are gated by the view page neighborhood`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val epub = java.io.File.createTempFile("readflow-relevant-gate", ".epub")
+        val executor = Executors.newSingleThreadExecutor()
+        val workerStarted = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        executor.submit {
+            workerStarted.countDown()
+            releaseWorker.await()
+        }
+        assertTrue(workerStarted.await(2, TimeUnit.SECONDS))
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = executor,
+            columnWidthPx = view.width,
+            pageHeightProvider = { view.height },
+            inlineMaxHeightPx = view.height,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { null },
+        )
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = view.width,
+            pageHeightProvider = { view.height },
+            inlineMaxHeightPx = view.height,
+            fullPageHrefs = emptySet(),
+        )
+        view.pendingDecodesProvider = {
+            loader.hasRelevantPendingDecodes(view.relevantPendingDecodeLayoutRanges())
+        }
+
+        try {
+            val far = AsyncDrawable("far.png", loader, resolver, null)
+            loader.registerOccurrence(far, pages.last().startOffset)
+            loader.load(far)
+            assertFalse(
+                "a real far-page loader request must not block the current page neighborhood",
+                requireNotNull(view.pendingDecodesProvider).invoke(),
+            )
+
+            loader.cancelAll()
+            val current = AsyncDrawable("current.png", loader, resolver, null)
+            loader.registerOccurrence(current, pages.first().startOffset)
+            loader.load(current)
+            assertTrue(
+                "a real current-page loader request must still block",
+                requireNotNull(view.pendingDecodesProvider).invoke(),
+            )
+
+            loader.cancelAll()
+            val unknown = AsyncDrawable("unknown.png", loader, resolver, null)
+            loader.load(unknown)
+            assertTrue(
+                "an unregistered real loader request must block conservatively",
+                requireNotNull(view.pendingDecodesProvider).invoke(),
+            )
+        } finally {
+            loader.releaseAll()
+            releaseWorker.countDown()
+            executor.shutdownNow()
+            epub.delete()
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `current page pending decode still blocks reveal`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val currentStart = pages[0].startOffset
+        view.pendingDecodesProvider = {
+            view.relevantPendingDecodeLayoutRanges().any { currentStart in it }
+        }
+
+        view.setChapter(
+            view.privateField("flow") as EpubChapterFlow,
+            view.textView.text,
+            pageHeightPx = 120,
+            restoreOffset = currentStart,
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(
+            "current-page pending decode must still hold reveal",
+            true,
+            view.privateBool("awaitingReveal"),
+        )
+        assertEquals(0f, view.getChildAt(0).alpha)
+        view.dispose()
+    }
+
     private fun pagedFlowView(
         flipStyle: PageFlipStyle = PageFlipStyle.NONE,
         onTapZone: (EpubFlowTapZone) -> Unit = {},
         onTopOffsetChanged: (Int) -> Unit = {},
+        flow: EpubChapterFlow? = null,
         spannable: CharSequence? = null,
         text: String? = null,
         textPaddingTop: Int = 0,
@@ -6796,11 +7292,11 @@ class EpubFlowViewTest {
         view.textView.setPadding(0, textPaddingTop, 0, textPaddingBottom)
         val chapterText = text ?: (1..80).joinToString("\n") { "Line $it marker text." }
         val block = EpubDisplayBlock.Text(chapterText, headingLevel = null, paragraphIndex = 0)
-        val flow = epubBuildChapterFlow(spineIndex = 0, blocks = listOf(block))
+        val chapterFlow = flow ?: epubBuildChapterFlow(spineIndex = 0, blocks = listOf(block))
 
         view.measure(exactly(viewportWidth), exactly(viewportHeight))
         view.layout(0, 0, viewportWidth, viewportHeight)
-        view.setChapter(flow, spannable ?: flow.text, pageHeightPx = viewportHeight)
+        view.setChapter(chapterFlow, spannable ?: chapterFlow.text, pageHeightPx = viewportHeight)
         view.measure(exactly(viewportWidth), exactly(viewportHeight))
         view.layout(0, 0, viewportWidth, viewportHeight)
         shadowOf(Looper.getMainLooper()).idle()
@@ -7051,6 +7547,35 @@ class EpubFlowViewTest {
             canvas.translate(-scrollX.toFloat(), -scrollY.toFloat())
             draw(canvas)
         }
+
+    private fun sampleImagePatternHits(
+        bitmap: Bitmap,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int,
+        stripeA: Int,
+        stripeB: Int,
+    ): Int {
+        val l = left.coerceIn(0, bitmap.width - 1)
+        val t = top.coerceIn(0, bitmap.height - 1)
+        val r = right.coerceIn(l + 1, bitmap.width)
+        val b = bottom.coerceIn(t + 1, bitmap.height)
+        val stepX = ((r - l) / 8).coerceAtLeast(1)
+        val stepY = ((b - t) / 8).coerceAtLeast(1)
+        var hits = 0
+        var y = t
+        while (y < b) {
+            var x = l
+            while (x < r) {
+                val pixel = bitmap.getPixel(x, y)
+                if (pixel == stripeA || pixel == stripeB) hits++
+                x += stepX
+            }
+            y += stepY
+        }
+        return hits
+    }
 
     private fun assertSampledPixelsEqual(message: String, expected: Bitmap, actual: Bitmap) {
         assertEquals("$message: width", expected.width, actual.width)

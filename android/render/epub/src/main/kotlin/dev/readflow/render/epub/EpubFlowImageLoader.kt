@@ -113,6 +113,27 @@ private fun AsyncDrawable.constrainTarget(bounds: Rect): Rect =
  * covers fill the viewport regardless of that timing (审计 regression: a column-width cap left the
  * cover small with whitespace below it).
  */
+internal enum class EpubAsyncImageResultKind { PIXELS_ONLY, GEOMETRY_CHANGED }
+
+internal data class EpubAsyncImageResult(
+    val layoutStart: Int,
+    val destination: String,
+    val generation: Long,
+    val beforeBounds: Rect,
+    val afterBounds: Rect,
+    val isFullPage: Boolean,
+) {
+    val kind: EpubAsyncImageResultKind = if (
+        beforeBounds.isEmpty ||
+        beforeBounds.width() != afterBounds.width() ||
+        beforeBounds.height() != afterBounds.height()
+    ) {
+        EpubAsyncImageResultKind.GEOMETRY_CHANGED
+    } else {
+        EpubAsyncImageResultKind.PIXELS_ONLY
+    }
+}
+
 internal class EpubFlowImageLoader(
     private val epubFileProvider: () -> File?,
     private val executor: ExecutorService,
@@ -124,18 +145,43 @@ internal class EpubFlowImageLoader(
     private val imageBoundsProvider: (String) -> EpubImageBounds? = { href ->
         epubFileProvider()?.let { decodeEpubImageBounds(it, href) }
     },
-    private val onImageResultChanged: (() -> Unit)? = null,
+    private val onImageResultChanged: ((EpubAsyncImageResult) -> Unit)? = null,
     private val onDecodeFinished: (() -> Unit)? = null,
 ) : AsyncDrawableLoader() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val lifecycleLock = Any()
     private val inFlight = WeakHashMap<AsyncDrawable, DecodeRequest>()
+    private val layoutStartByDrawable = WeakHashMap<AsyncDrawable, Int>()
     private var lifecycleGeneration = 0L
     private var released = false
 
     /** Returns true while at least one async image decode is still in flight. */
     fun hasPendingDecodes(): Boolean = synchronized(lifecycleLock) { inFlight.isNotEmpty() }
+
+    /**
+     * Returns true when a pending decode is relevant to [layoutRanges] (current / previous / next
+     * page char windows). Unknown or unregistered occurrences ([layoutStart] missing or &lt; 0)
+     * conservatively return true so reveal/precache never paints transparent placeholders.
+     * An empty [layoutRanges] list also blocks while any decode is pending (no safe window).
+     */
+    fun hasRelevantPendingDecodes(layoutRanges: Collection<IntRange>): Boolean =
+        synchronized(lifecycleLock) {
+            if (inFlight.isEmpty()) return false
+            if (layoutRanges.isEmpty()) return true
+            for (drawable in inFlight.keys) {
+                val start = layoutStartByDrawable[drawable]
+                if (start == null || start < 0) return true
+                if (layoutRanges.any { start in it }) return true
+            }
+            return false
+        }
+
+    fun registerOccurrence(drawable: AsyncDrawable, layoutStart: Int) {
+        synchronized(lifecycleLock) {
+            if (!released) layoutStartByDrawable[drawable] = layoutStart
+        }
+    }
 
     override fun load(drawable: AsyncDrawable) {
         if (synchronized(lifecycleLock) { released }) return
@@ -256,12 +302,14 @@ internal class EpubFlowImageLoader(
         val posted = handler.post {
             var accepted = false
             var installed = false
+            var installedResult: EpubAsyncImageResult? = null
             var decodeFinishedNotified = false
             try {
                 synchronized(lifecycleLock) {
                     if (!isCurrentRequestLocked(drawable, request)) return@synchronized
                     accepted = true
                     if (bitmap != null && drawable.isAttached) {
+                        val beforeBounds = Rect(drawable.bounds)
                         val result = BitmapDrawable(null, bitmap).apply {
                             // Full-page images are fitted again against the measured viewport on the main thread.
                             val target = reservedBounds ?: drawable.constrainTarget(
@@ -279,6 +327,14 @@ internal class EpubFlowImageLoader(
                         if (drawable.isAttached) {
                             drawable.result = result
                             installed = true
+                            installedResult = EpubAsyncImageResult(
+                                layoutStart = layoutStartByDrawable[drawable] ?: -1,
+                                destination = drawable.destination,
+                                generation = request.generation,
+                                beforeBounds = beforeBounds,
+                                afterBounds = Rect(drawable.bounds),
+                                isFullPage = isFullPage,
+                            )
                         }
                     }
                     inFlight.remove(drawable)
@@ -289,7 +345,7 @@ internal class EpubFlowImageLoader(
                             try {
                                 if (installed) {
                                     drawable.invalidateSelf()
-                                    onImageResultChanged?.invoke()
+                                    installedResult?.let { onImageResultChanged?.invoke(it) }
                                 }
                             } finally {
                                 if (!released) {
@@ -335,6 +391,7 @@ internal class EpubFlowImageLoader(
         val (pending, generation) = synchronized(lifecycleLock) {
             lifecycleGeneration++
             if (permanently) released = true
+            if (permanently) layoutStartByDrawable.clear()
             inFlight.values.toList().also { inFlight.clear() } to lifecycleGeneration
         }
         pending.forEach { it.future?.cancel(true) }
