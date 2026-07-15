@@ -68,6 +68,7 @@ internal class EpubFlowImageLoader(
     private val epubFileProvider: () -> File?,
     private val executor: ExecutorService,
     private val columnWidthPx: Int,
+    private val columnWidthProvider: () -> Int = { columnWidthPx },
     private val pageHeightProvider: () -> Int,
     private val inlineMaxHeightPx: Int,
     private val fullPageHrefs: Set<String>,
@@ -100,12 +101,13 @@ internal class EpubFlowImageLoader(
         } catch (_: RuntimeException) {
             return
         }
+        val currentColumnWidthPx = currentColumnWidthPx()
         // Full-page images may be upscaled to fill the viewport, so decode them at the larger of the
         // two viewport dimensions to avoid blur; inline images never exceed the column width.
         val maxSide = if (href in fullPageHrefs) {
-            maxOf(columnWidthPx, pageHeightPx).coerceAtLeast(64)
+            maxOf(currentColumnWidthPx, pageHeightPx).coerceAtLeast(64)
         } else {
-            columnWidthPx.coerceAtLeast(64)
+            currentColumnWidthPx.coerceAtLeast(64)
         }
         // Inline images (avatars/icons/footnote glyphs) size independently of the page height, so their
         // pre-decode placeholder box is already final — reuse it to avoid a decode-time reflow. Full-page
@@ -184,7 +186,7 @@ internal class EpubFlowImageLoader(
             href = drawable.destination,
             intrinsicWidth = bounds.width,
             intrinsicHeight = bounds.height,
-            columnWidthPx = columnWidthPx,
+            columnWidthPx = currentColumnWidthPx(),
             pageHeightPx = pageHeightPx,
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
@@ -216,7 +218,7 @@ internal class EpubFlowImageLoader(
                                 href = href,
                                 intrinsicWidth = bitmap.width,
                                 intrinsicHeight = bitmap.height,
-                                columnWidthPx = columnWidthPx,
+                                columnWidthPx = currentColumnWidthPx(),
                                 pageHeightPx = pageHeightProvider().coerceAtLeast(1),
                                 inlineMaxHeightPx = inlineMaxHeightPx,
                                 fullPageHrefs = fullPageHrefs,
@@ -291,6 +293,13 @@ internal class EpubFlowImageLoader(
     private fun isCurrentRequestLocked(drawable: AsyncDrawable, request: DecodeRequest): Boolean =
         !released && request.generation == lifecycleGeneration && inFlight[drawable] === request
 
+    private fun currentColumnWidthPx(): Int =
+        try {
+            columnWidthProvider().coerceAtLeast(1)
+        } catch (_: RuntimeException) {
+            columnWidthPx.coerceAtLeast(1)
+        }
+
     private fun notifyDecodeFinished(generation: Long) {
         handler.post {
             synchronized(lifecycleLock) {
@@ -313,35 +322,40 @@ internal class EpubFlowImageLoader(
  */
 internal class EpubFlowImageSizeResolver(
     private val columnWidthPx: Int,
+    private val columnWidthProvider: () -> Int = { columnWidthPx },
     private val pageHeightProvider: () -> Int,
     private val inlineMaxHeightPx: Int,
     private val fullPageHrefs: Set<String>,
 ) : ImageSizeResolver() {
 
+    fun isFullPage(destination: String): Boolean = destination in fullPageHrefs
+
     override fun resolveImageSize(drawable: AsyncDrawable): Rect {
         val result = drawable.result ?: return Rect(0, 0, 1, 1)
         val requested = drawable.imageSize
-        if (requested == null) {
+        val isFullPage = isFullPage(drawable.destination)
+        if (!isFullPage && requested == null) {
             result.bounds.takeUnless { it.isEmpty }?.let { return Rect(it) }
         }
+        val sourceWidth = result.intrinsicWidth.takeIf { it > 0 }
+            ?: result.bounds.width().takeIf { it > 0 }
+            ?: 1
+        val sourceHeight = result.intrinsicHeight.takeIf { it > 0 }
+            ?: result.bounds.height().takeIf { it > 0 }
+            ?: 1
+        val currentColumnWidthPx = currentColumnWidthPx()
         val fallback = epubFlowImageTargetSize(
             href = drawable.destination,
-            intrinsicWidth = result.intrinsicWidth,
-            intrinsicHeight = result.intrinsicHeight,
-            columnWidthPx = columnWidthPx,
+            intrinsicWidth = sourceWidth,
+            intrinsicHeight = sourceHeight,
+            columnWidthPx = currentColumnWidthPx,
             pageHeightPx = pageHeightProvider().coerceAtLeast(1),
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
         )
-        requested ?: return fallback
-        val sourceWidth = result.intrinsicWidth.takeIf { it > 0 }
-            ?: result.bounds.width().takeIf { it > 0 }
-            ?: fallback.width().coerceAtLeast(1)
-        val sourceHeight = result.intrinsicHeight.takeIf { it > 0 }
-            ?: result.bounds.height().takeIf { it > 0 }
-            ?: fallback.height().coerceAtLeast(1)
+        if (isFullPage || requested == null) return fallback
         val ratio = sourceWidth.toFloat() / sourceHeight
-        val width = requested.width?.resolveCssImageDimension(columnWidthPx, drawable.lastKnowTextSize)
+        val width = requested.width?.resolveCssImageDimension(currentColumnWidthPx, drawable.lastKnowTextSize)
         val height = requested.height?.resolveCssImageDimension(pageHeightProvider(), drawable.lastKnowTextSize)
         val requestedWidth: Int
         val requestedHeight: Int
@@ -360,7 +374,7 @@ internal class EpubFlowImageSizeResolver(
             }
             else -> return fallback
         }
-        val maxWidth = columnWidthPx.coerceAtLeast(1)
+        val maxWidth = currentColumnWidthPx
         val maxHeight = if (drawable.destination in fullPageHrefs) {
             pageHeightProvider().coerceAtLeast(1)
         } else {
@@ -378,6 +392,13 @@ internal class EpubFlowImageSizeResolver(
             (requestedHeight * scale).toInt().coerceAtLeast(1),
         )
     }
+
+    private fun currentColumnWidthPx(): Int =
+        try {
+            columnWidthProvider().coerceAtLeast(1)
+        } catch (_: RuntimeException) {
+            columnWidthPx.coerceAtLeast(1)
+        }
 }
 
 private fun io.noties.markwon.image.ImageSize.Dimension.resolveCssImageDimension(

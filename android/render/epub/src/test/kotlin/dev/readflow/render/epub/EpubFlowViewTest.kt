@@ -6,6 +6,8 @@ import android.graphics.Canvas
 import android.graphics.ColorFilter
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Looper
@@ -21,6 +23,7 @@ import android.view.ViewGroup
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.ui.readerPaperBackground
 import io.noties.markwon.image.AsyncDrawable
+import io.noties.markwon.image.AsyncDrawableLoader
 import io.noties.markwon.image.AsyncDrawableSpan
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -6064,6 +6067,122 @@ class EpubFlowViewTest {
         } finally {
             view.dispose()
             executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `viewport resize refreshes existing full page async drawable bounds before repagination`() {
+        var view: EpubFlowView? = null
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = 800,
+            columnWidthProvider = { view?.width?.takeIf { it > 0 } ?: 800 },
+            pageHeightProvider = { view?.height?.takeIf { it > 0 } ?: 1200 },
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = setOf("plate.png"),
+        )
+        val bitmap = Bitmap.createBitmap(160, 90, Bitmap.Config.ARGB_8888)
+        val drawable = AsyncDrawable("plate.png", AsyncDrawableLoader.noOp(), resolver, null).apply {
+            initWithKnownDimensions(800, 20f)
+            setResult(BitmapDrawable(null, bitmap))
+        }
+        val spannable = SpannableString("\uFFFC").apply {
+            setSpan(
+                AsyncDrawableSpan(
+                    io.noties.markwon.core.MarkwonTheme.create(RuntimeEnvironment.getApplication()),
+                    drawable,
+                    AsyncDrawableSpan.ALIGN_CENTER,
+                    false,
+                ),
+                0,
+                1,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+
+        try {
+            val flowView = pagedFlowView(
+                spannable = spannable,
+                viewportWidth = 800,
+                viewportHeight = 1200,
+            )
+            view = flowView
+            assertEquals(Rect(0, 0, 800, 450), drawable.bounds)
+
+            flowView.layoutParams.width = 600
+            flowView.layoutParams.height = 800
+            flowView.measure(exactly(600), exactly(800))
+            flowView.layout(0, 0, 600, 800)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(Rect(0, 0, 600, 338), drawable.bounds)
+            assertEquals(600, requireNotNull(flowView.textView.layout).getLineWidth(0).toInt())
+        } finally {
+            view?.dispose()
+            bitmap.recycle()
+        }
+    }
+
+    @Test
+    fun `stale viewport resize posts do not mutate a replacement chapter`() {
+        val view = pagedFlowView(viewportWidth = 800, viewportHeight = 1200)
+        assertTrue(view.pageCount() > 2)
+        view.scrollTo(0, requireNotNull(view.pageTopPxAt(2)))
+        assertTrue(view.topLayoutOffset() > 0)
+
+        view.layoutParams.width = 600
+        view.layoutParams.height = 800
+        view.measure(exactly(600), exactly(800))
+        view.layout(0, 0, 600, 800)
+
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = 800,
+            columnWidthProvider = { view.width.coerceAtLeast(1) },
+            pageHeightProvider = { view.height.coerceAtLeast(1) },
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = setOf("new-plate.png"),
+        )
+        val result = ColorDrawable(0xFF336699.toInt()).apply { setBounds(0, 0, 320, 180) }
+        val drawable = AsyncDrawable("new-plate.png", AsyncDrawableLoader.noOp(), resolver, null).apply {
+            initWithKnownDimensions(600, 20f)
+            setResult(result)
+            result.setBounds(0, 0, 320, 180)
+            setBounds(0, 0, 320, 180)
+        }
+        val newFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(
+                EpubDisplayBlock.Image("new-plate.png", altText = null, paragraphIndex = 0),
+                EpubDisplayBlock.Text(
+                    text = (1..80).joinToString("\n") { "Replacement chapter line $it" },
+                    headingLevel = null,
+                    paragraphIndex = 1,
+                ),
+            ),
+        )
+        val newSpannable = SpannableString(newFlow.text).apply {
+            val imageSegment = newFlow.segments.first { it.isImage }
+            setSpan(
+                AsyncDrawableSpan(
+                    io.noties.markwon.core.MarkwonTheme.create(RuntimeEnvironment.getApplication()),
+                    drawable,
+                    AsyncDrawableSpan.ALIGN_CENTER,
+                    false,
+                ),
+                imageSegment.layoutStart,
+                imageSegment.layoutEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+
+        try {
+            view.setChapter(newFlow, newSpannable, pageHeightPx = 800, restoreOffset = 0)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(Rect(0, 0, 320, 180), drawable.bounds)
+            assertEquals(0, view.topLayoutOffset())
+            assertFalse(view.privateBool("awaitingReveal"))
+        } finally {
+            view.dispose()
         }
     }
 

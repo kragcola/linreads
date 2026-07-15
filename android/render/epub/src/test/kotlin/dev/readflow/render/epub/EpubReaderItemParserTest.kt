@@ -129,7 +129,7 @@ class EpubReaderItemParserTest {
             spineIndex = 0,
             html = """
                 <html><body>
-                  <p><img alt="image" src="../Images/image.jpeg"/><br/></p>
+                  <p><img alt="image" src="../Images/image.jpeg"/><br/><span style="display:none">Hidden</span></p>
                 </body></html>
             """.trimIndent(),
             resourceBaseDir = "OEBPS/Text",
@@ -138,6 +138,7 @@ class EpubReaderItemParserTest {
         val image = assertInstanceOf(EpubReaderItem.Image::class.java, items.single())
         assertEquals("OEBPS/Images/image.jpeg", image.href)
         assertEquals("image", image.altText)
+        assertFalse(image.isInlineContent)
     }
 
     @Test
@@ -154,7 +155,9 @@ class EpubReaderItemParserTest {
 
         assertEquals(3, items.size)
         assertEquals("Lead text", assertInstanceOf(EpubReaderItem.Text::class.java, items[0]).text)
-        assertEquals("OEBPS/Images/mid.png", assertInstanceOf(EpubReaderItem.Image::class.java, items[1]).href)
+        val image = assertInstanceOf(EpubReaderItem.Image::class.java, items[1])
+        assertEquals("OEBPS/Images/mid.png", image.href)
+        assertTrue(image.isInlineContent)
         assertEquals("tail text", assertInstanceOf(EpubReaderItem.Text::class.java, items[2]).text)
     }
 

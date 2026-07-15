@@ -285,9 +285,12 @@ private fun addParagraphWithImages(
     maxDomDepth: Int,
     css: EpubCssCascade,
 ) {
-    val hasDirectImage = element.children().any {
-        it.tagName().equals("img", ignoreCase = true) && !css.computedStyle(it).displayNone
-    }
+    fun isVisibleDirectImage(node: Node): Boolean =
+        node is Element &&
+            node.tagName().equals("img", ignoreCase = true) &&
+            !css.computedStyle(node).displayNone
+
+    val hasDirectImage = element.childNodes().any(::isVisibleDirectImage)
     if (!hasDirectImage) {
         addTextItem(
             spineIndex,
@@ -298,6 +301,13 @@ private fun addParagraphWithImages(
         )
         return
     }
+    val hasVisibleText = extractTextWithLinksFromNodes(
+        nodes = element.childNodes().filterNot(::isVisibleDirectImage),
+        resourceBaseDir = resourceBaseDir,
+        documentPath = documentPath,
+        maxDomDepth = maxDomDepth,
+        css = css,
+    ).text.isNotEmpty()
     val pendingNodes = mutableListOf<Node>()
     fun flushPendingText() {
         if (pendingNodes.isEmpty()) return
@@ -310,13 +320,16 @@ private fun addParagraphWithImages(
         pendingNodes.clear()
     }
     element.childNodes().forEach { node ->
-        if (
-            node is Element &&
-            node.tagName().equals("img", ignoreCase = true) &&
-            !css.computedStyle(node).displayNone
-        ) {
+        if (isVisibleDirectImage(node)) {
             flushPendingText()
-            addImageItem(spineIndex, items, node, resourceBaseDir, css)
+            addImageItem(
+                spineIndex = spineIndex,
+                items = items,
+                element = node as Element,
+                resourceBaseDir = resourceBaseDir,
+                css = css,
+                isInlineContent = hasVisibleText,
+            )
         } else {
             pendingNodes += node
         }
@@ -373,6 +386,7 @@ private fun addImageItem(
     element: Element,
     resourceBaseDir: String,
     css: EpubCssCascade,
+    isInlineContent: Boolean = false,
 ) {
     if (css.computedStyle(element).displayNone) return
     val href = element.attr("src").trim()
@@ -383,6 +397,7 @@ private fun addImageItem(
         altText = element.attr("alt").trim().takeIf { it.isNotEmpty() },
         fragmentIds = element.fragmentIds(),
         style = css.imageStyle(element),
+        isInlineContent = isInlineContent,
     )
 }
 

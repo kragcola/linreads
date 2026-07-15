@@ -672,7 +672,7 @@ class EpubReflowEngine private constructor(
     ): EpubFlowImageLoader? {
         val density = context.resources.displayMetrics.density
         val palette = paletteFor(themeMode, context.resources.configuration)
-        val measuredColumnWidth = (view.width - view.textView.paddingLeft - view.textView.paddingRight)
+        val initialColumnWidthPx = (view.width - view.textView.paddingLeft - view.textView.paddingRight)
             .takeIf { it > 0 }
             ?: flowColumnWidthPx()
         val style = EpubFlowStyle(
@@ -680,7 +680,7 @@ class EpubReflowEngine private constructor(
             lineSpacingMultiplier = lineSpacingMultiplier,
             inkColor = palette.ink,
             typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId),
-            columnWidthPx = measuredColumnWidth,
+            columnWidthPx = initialColumnWidthPx,
             imageMaxHeightPx = view.usablePageImageHeightPx().takeIf { it > 0 } ?: flowPageHeightPx(),
             density = density,
             firstLineIndentPx = flowFirstLineIndentPx(density),
@@ -688,17 +688,22 @@ class EpubReflowEngine private constructor(
         val theme = MarkwonTheme.create(context)
         val fullPageHrefs = flowFullPageImageHrefs(flow)
         val inlineMaxHeightPx = (INLINE_IMAGE_MAX_HEIGHT_DP * density).toInt()
-        // Full-page images must fit one MEASURED page; the view knows its real viewport (screen minus
-        // system bars + padding), the engine's screen estimate is ~100px too tall → cover spilled onto
-        // a blank 2nd page. Read it lazily at decode time, falling back to the estimate pre-measure.
+        // Full-page images must fit the current MEASURED viewport. Read both dimensions lazily so
+        // rotation/split-screen changes do not reuse install-time geometry; fall back before first measure.
         val pageHeightProvider = {
             view.usablePageImageHeightPx().takeIf { it > 0 } ?: flowPageHeightPx()
+        }
+        val columnWidthProvider = {
+            (view.width - view.textView.paddingLeft - view.textView.paddingRight)
+                .takeIf { it > 0 }
+                ?: initialColumnWidthPx
         }
         lateinit var loader: EpubFlowImageLoader
         loader = EpubFlowImageLoader(
             epubFileProvider = { epubFile },
             executor = flowExecutor,
-            columnWidthPx = measuredColumnWidth,
+            columnWidthPx = initialColumnWidthPx,
+            columnWidthProvider = columnWidthProvider,
             pageHeightProvider = pageHeightProvider,
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
@@ -711,7 +716,8 @@ class EpubReflowEngine private constructor(
             },
         )
         val resolver = EpubFlowImageSizeResolver(
-            columnWidthPx = measuredColumnWidth,
+            columnWidthPx = initialColumnWidthPx,
+            columnWidthProvider = columnWidthProvider,
             pageHeightProvider = pageHeightProvider,
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
@@ -725,6 +731,7 @@ class EpubReflowEngine private constructor(
             imageSizeResolver = resolver,
             onLinkClick = onLinkClick,
             highlightRanges = flowHighlightRanges(flow),
+            fullPageHrefs = fullPageHrefs,
         )
         val restoreOffset = restoreToParagraph?.let { flow.offsetForParagraph(it, restoreToParagraphOffset) }
         // setChapter posts its first settle before the Markwon scheduler attaches AsyncDrawables. Treat
@@ -1085,10 +1092,15 @@ class EpubReflowEngine private constructor(
      * stays inline and column-capped. Bounds come from the cache (decoded once, no pixel data).
      */
     private fun flowFullPageImageHrefs(flow: EpubChapterFlow): Set<String> {
+        val inlineHrefs = flow.segments.mapNotNullTo(HashSet()) { segment ->
+            (segment.block as? EpubDisplayBlock.Image)
+                ?.takeIf { it.isInlineContent }
+                ?.href
+        }
         val result = HashSet<String>()
         flow.segments.forEach { seg ->
             val block = seg.block
-            if (block is EpubDisplayBlock.Image) {
+            if (block is EpubDisplayBlock.Image && block.href !in inlineHrefs) {
                 val bounds = epubImageBoundsFor(block.href) ?: return@forEach
                 if (maxOf(bounds.width, bounds.height) >= FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX) {
                     result += block.href

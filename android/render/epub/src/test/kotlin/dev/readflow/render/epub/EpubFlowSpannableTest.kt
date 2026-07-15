@@ -67,6 +67,9 @@ class EpubFlowSpannableTest {
     private fun build(
         flow: EpubChapterFlow,
         style: EpubFlowStyle = style(),
+        fullPageHrefs: Set<String> = emptySet(),
+        pageHeightPx: Int = 1200,
+        inlineMaxHeightPx: Int = 720,
         decode: (String) -> android.graphics.Bitmap?,
     ): CharSequence {
         val ctx = RuntimeEnvironment.getApplication()
@@ -74,16 +77,16 @@ class EpubFlowSpannableTest {
         val loader = EpubFlowImageLoader(
             epubFileProvider = { java.io.File("/tmp/unused.epub") },
             executor = executor,
-            columnWidthPx = 800,
-            pageHeightProvider = { 1200 },
-            inlineMaxHeightPx = 720,
-            fullPageHrefs = emptySet(),
+            columnWidthPx = style.columnWidthPx,
+            pageHeightProvider = { pageHeightPx },
+            inlineMaxHeightPx = inlineMaxHeightPx,
+            fullPageHrefs = fullPageHrefs,
         )
         val resolver = EpubFlowImageSizeResolver(
-            columnWidthPx = 800,
-            pageHeightProvider = { 1200 },
-            inlineMaxHeightPx = 720,
-            fullPageHrefs = emptySet(),
+            columnWidthPx = style.columnWidthPx,
+            pageHeightProvider = { pageHeightPx },
+            inlineMaxHeightPx = inlineMaxHeightPx,
+            fullPageHrefs = fullPageHrefs,
         )
         return epubBuildFlowSpannable(
             context = ctx,
@@ -93,6 +96,7 @@ class EpubFlowSpannableTest {
             imageLoader = loader,
             imageSizeResolver = resolver,
             onLinkClick = {},
+            fullPageHrefs = fullPageHrefs,
         )
     }
 
@@ -837,6 +841,147 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `image resolver re-fits full page results after viewport size changes but keeps inline bounds`() {
+        var columnWidthPx = 800
+        var pageHeightPx = 1200
+        val fullPageResolver = EpubFlowImageSizeResolver(
+            columnWidthPx = columnWidthPx,
+            columnWidthProvider = { columnWidthPx },
+            pageHeightProvider = { pageHeightPx },
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = setOf("plate.png"),
+        )
+        val inlineResolver = EpubFlowImageSizeResolver(
+            columnWidthPx = columnWidthPx,
+            columnWidthProvider = { columnWidthPx },
+            pageHeightProvider = { pageHeightPx },
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = emptySet(),
+        )
+        val bitmap = android.graphics.Bitmap.createBitmap(160, 90, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            val fullPage = AsyncDrawable("plate.png", AsyncDrawableLoader.noOp(), fullPageResolver, null).apply {
+                initWithKnownDimensions(800, 20f)
+                setResult(BitmapDrawable(null, bitmap))
+            }
+            val inline = AsyncDrawable("inline.png", AsyncDrawableLoader.noOp(), inlineResolver, null).apply {
+                initWithKnownDimensions(800, 20f)
+                setResult(BitmapDrawable(null, bitmap))
+            }
+
+            assertEquals(Rect(0, 0, 800, 450), fullPageResolver.resolveImageSize(fullPage))
+            assertEquals(Rect(0, 0, 160, 90), inlineResolver.resolveImageSize(inline))
+
+            columnWidthPx = 600
+            pageHeightPx = 800
+
+            assertEquals(Rect(0, 0, 600, 338), fullPageResolver.resolveImageSize(fullPage))
+            assertEquals(Rect(0, 0, 160, 90), inlineResolver.resolveImageSize(inline))
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    @Test
+    fun `full page illustrations fit the usable viewport while inline images keep intrinsic size`() {
+        val viewportStyle = style().copy(
+            columnWidthPx = 760,
+            imageMaxHeightPx = 720,
+            density = 1f,
+        )
+        val fullPageHrefs = setOf("plain.png", "percent.png", "fixed.png", "landscape.png")
+
+        assertEquals(
+            Rect(0, 0, 728, 1040),
+            resolvedImageBounds(
+                href = "plain.png",
+                imageStyle = EpubImageStyle(),
+                intrinsicWidth = 1120,
+                intrinsicHeight = 1600,
+                flowStyle = viewportStyle,
+                pageHeightPx = 1040,
+                fullPageHrefs = fullPageHrefs,
+            ),
+        )
+        assertEquals(
+            Rect(0, 0, 728, 1040),
+            resolvedImageBounds(
+                href = "percent.png",
+                // CSS `height:auto` is represented by no explicit height dimension.
+                imageStyle = EpubImageStyle(width = EpubCssLength(100f, EpubCssUnit.Percent)),
+                intrinsicWidth = 1120,
+                intrinsicHeight = 1600,
+                flowStyle = viewportStyle,
+                pageHeightPx = 1040,
+                fullPageHrefs = fullPageHrefs,
+            ),
+        )
+        assertEquals(
+            Rect(0, 0, 728, 1040),
+            resolvedImageBounds(
+                href = "fixed.png",
+                imageStyle = EpubImageStyle(
+                    width = EpubCssLength(320f, EpubCssUnit.Px),
+                    height = EpubCssLength(400f, EpubCssUnit.Px),
+                ),
+                intrinsicWidth = 1120,
+                intrinsicHeight = 1600,
+                flowStyle = viewportStyle,
+                pageHeightPx = 1040,
+                fullPageHrefs = fullPageHrefs,
+            ),
+        )
+        assertEquals(
+            Rect(0, 0, 760, 428),
+            resolvedImageBounds(
+                href = "landscape.png",
+                imageStyle = EpubImageStyle(),
+                intrinsicWidth = 1600,
+                intrinsicHeight = 900,
+                flowStyle = viewportStyle,
+                pageHeightPx = 1040,
+                fullPageHrefs = fullPageHrefs,
+            ),
+        )
+        assertEquals(
+            Rect(0, 0, 142, 142),
+            resolvedImageBounds(
+                href = "avatar.png",
+                imageStyle = EpubImageStyle(),
+                intrinsicWidth = 142,
+                intrinsicHeight = 142,
+                flowStyle = viewportStyle,
+                pageHeightPx = 1040,
+                fullPageHrefs = fullPageHrefs,
+            ),
+        )
+        assertEquals(
+            Rect(0, 0, 560, 420),
+            resolvedImageBounds(
+                href = "inline-plate.png",
+                imageStyle = EpubImageStyle(),
+                intrinsicWidth = 560,
+                intrinsicHeight = 420,
+                flowStyle = viewportStyle,
+                pageHeightPx = 1040,
+                fullPageHrefs = fullPageHrefs,
+            ),
+        )
+        assertEquals(
+            Rect(0, 0, 380, 190),
+            resolvedImageBounds(
+                href = "inline-css.png",
+                imageStyle = EpubImageStyle(width = EpubCssLength(50f, EpubCssUnit.Percent)),
+                intrinsicWidth = 600,
+                intrinsicHeight = 300,
+                flowStyle = viewportStyle,
+                pageHeightPx = 1040,
+                fullPageHrefs = fullPageHrefs,
+            ),
+        )
+    }
+
+    @Test
     fun `unsafe css colors and negative vertical margins degrade without harming reader layout`() {
         assertEquals(0xFFE8E6E1.toInt(), epubSafeCssForeground(0xFF000000.toInt(), null, 0xFFE8E6E1.toInt()))
         assertNull(epubSafeCssBackground(0xFF202020.toInt(), 0xFF000000.toInt()))
@@ -909,6 +1054,48 @@ class EpubFlowSpannableTest {
         ),
         null,
     )
+
+    private fun resolvedImageBounds(
+        href: String,
+        imageStyle: EpubImageStyle,
+        intrinsicWidth: Int,
+        intrinsicHeight: Int,
+        flowStyle: EpubFlowStyle,
+        pageHeightPx: Int,
+        fullPageHrefs: Set<String>,
+    ): Rect {
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Image(
+                    href = href,
+                    altText = null,
+                    paragraphIndex = 0,
+                    style = imageStyle,
+                ),
+            ),
+        )
+        val spannable = build(
+            flow = flow,
+            style = flowStyle,
+            fullPageHrefs = fullPageHrefs,
+            pageHeightPx = pageHeightPx,
+            inlineMaxHeightPx = 720,
+        ) { null } as android.text.Spanned
+        val drawable = spannable.getSpans(0, spannable.length, AsyncDrawableSpan::class.java).single().drawable
+        val target = epubFlowImageTargetSize(
+            href = href,
+            intrinsicWidth = intrinsicWidth,
+            intrinsicHeight = intrinsicHeight,
+            columnWidthPx = flowStyle.columnWidthPx,
+            pageHeightPx = pageHeightPx,
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = fullPageHrefs,
+        )
+        drawable.initWithKnownDimensions(flowStyle.columnWidthPx, flowStyle.fontSizeSp * flowStyle.density)
+        drawable.setResult(ColorDrawable(Color.GRAY).apply { bounds = target })
+        return Rect(drawable.bounds)
+    }
 
     private fun createImageEpub(prefix: String): File {
         val epub = File.createTempFile(prefix, ".epub")

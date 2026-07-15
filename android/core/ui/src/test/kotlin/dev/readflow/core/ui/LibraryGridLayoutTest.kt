@@ -8,39 +8,39 @@ import org.junit.jupiter.api.Test
 class LibraryGridLayoutTest {
 
     @Test
-    fun `library grid keeps larger covers proportional from phone to tablet`() {
+    fun `library grid restores phone tablet and expanded proportions`() {
         assertEquals(2, libraryGridColumns(360f))
-        assertEquals(4, libraryGridColumns(800f))
-        assertEquals(6, libraryGridColumns(1_280f))
+        assertEquals(5, libraryGridColumns(800f))
+        assertEquals(7, libraryGridColumns(1_280f))
     }
 
     @Test
-    fun `grid grows covers while preserving compact and expanded breathing room`() {
-        assertEquals(158f, libraryGridLayout(360f).coverWidthDp, 0.001f)
-        assertEquals(180f, libraryGridLayout(800f).coverWidthDp, 0.001f)
-        assertEquals(178f, libraryGridLayout(1_280f).coverWidthDp, 0.001f)
+    fun `grid keeps covers near the accepted multi-device scale`() {
+        assertEquals(150f, libraryGridLayout(360f).coverWidthDp, 0.001f)
+        assertEquals(132.8f, libraryGridLayout(800f).coverWidthDp, 0.001f)
+        assertEquals(130.2857f, libraryGridLayout(1_280f).coverWidthDp, 0.001f)
 
-        assertEquals(12f, libraryGridLayout(360f).gapDp, 0.001f)
-        assertEquals(16f, libraryGridLayout(800f).gapDp, 0.001f)
-        assertEquals(20f, libraryGridLayout(1_280f).gapDp, 0.001f)
+        assertEquals(20f, libraryGridLayout(360f).gapDp, 0.001f)
+        assertEquals(24f, libraryGridLayout(800f).gapDp, 0.001f)
+        assertEquals(28f, libraryGridLayout(1_280f).gapDp, 0.001f)
     }
 
     @Test
     fun `expanded grid content width remains capped`() {
-        assertEquals(1_200f, libraryGridLayout(1_280f).effectiveWidthDp)
+        assertEquals(1_120f, libraryGridLayout(1_280f).effectiveWidthDp)
         assertEquals(Dimens.maxContentWidth.value, libraryGridLayout(1_600f).effectiveWidthDp)
     }
 
     @Test
-    fun `tablet and expanded covers stay within a stable readable band`() {
+    fun `tablet and expanded covers never become oversized`() {
         val oversizedWidths = (600..1_600 step 40)
             .map(Int::toFloat)
             .associateWith { libraryGridLayout(it).coverWidthDp }
-            .filterValues { it !in 160f..206f }
+            .filterValues { it > 156f }
 
         assertTrue(
             oversizedWidths.isEmpty(),
-            "Cover widths leave 160..206dp band: $oversizedWidths",
+            "Cover widths exceed 156dp: $oversizedWidths",
         )
     }
 

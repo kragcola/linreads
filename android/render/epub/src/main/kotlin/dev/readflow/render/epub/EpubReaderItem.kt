@@ -74,6 +74,7 @@ internal sealed interface EpubReaderItem {
         val altText: String?,
         val fragmentIds: List<String> = emptyList(),
         val style: EpubImageStyle = EpubImageStyle(),
+        val isInlineContent: Boolean = false,
     ) : EpubReaderItem
 
     data class Break(

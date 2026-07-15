@@ -11,6 +11,7 @@ import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Looper
 import android.os.SystemClock
+import android.text.Spanned
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -35,6 +36,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import io.noties.markwon.image.AsyncDrawableSpan
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -778,6 +780,35 @@ class EpubReflowEngineTest {
 
         assertNotNull(imageView)
         assertEquals(EpubImagePlacement.Inline, imageView?.getTag(R.id.epub_image_placement))
+    }
+
+    @Test
+    fun `flow runtime keeps a large mixed paragraph image inline while standalone plate stays full page`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-structural-image-sizing.epub")
+        writeFlowStructuralImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        val spans = (flowView.textView.text as Spanned).getSpans(
+            0,
+            flowView.textView.text.length,
+            AsyncDrawableSpan::class.java,
+        )
+        val shared = spans.filter { it.drawable.destination == "OEBPS/shared.png" }
+
+        assertEquals(2, shared.size)
+        assertTrue(
+            "inline use must win conservatively when the same 600x300 href is also used standalone",
+            shared.all { it.drawable.imageSize != null },
+        )
+        assertNull(
+            "the standalone large illustration must ignore authored fixed dimensions and fit the viewport",
+            spans.single { it.drawable.destination == "OEBPS/plate.png" }.drawable.imageSize,
+        )
     }
 
     @Test
@@ -3658,6 +3689,65 @@ class EpubReflowEngineTest {
                 """.trimIndent(),
             )
             add("OEBPS/image.png", imageBytes)
+        }
+    }
+
+    private fun writeFlowStructuralImageEpub(file: File) {
+        fun png(width: Int, height: Int, color: Int): ByteArray = ByteArrayOutputStream().use { output ->
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).let { bitmap ->
+                try {
+                    bitmap.eraseColor(color)
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                    output.toByteArray()
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+        }
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+
+            fun addText(path: String, content: String) = add(path, content.toByteArray(Charsets.UTF_8))
+
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="c0" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="shared" href="shared.png" media-type="image/png"/>
+                        <item id="plate" href="plate.png" media-type="image/png"/>
+                      </manifest>
+                      <spine><itemref idref="c0"/></spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                """
+                    <html><body>
+                      <p>Lead text<img src="shared.png" style="width:50%;height:auto"/>tail text</p>
+                      <p><img src="shared.png" style="width:50%;height:auto"/></p>
+                      <p><img src="plate.png" style="width:320px;height:400px"/></p>
+                    </body></html>
+                """.trimIndent(),
+            )
+            add("OEBPS/shared.png", png(600, 300, 0xFF336699.toInt()))
+            add("OEBPS/plate.png", png(1120, 1600, 0xFF663399.toInt()))
         }
     }
 

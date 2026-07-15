@@ -26,7 +26,7 @@ class BookGridPresentationTest {
     }
 
     @Test
-    fun `single books omit labels while bundles show only their group name`() {
+    fun `single books omit labels while bundles keep the accepted badge text`() {
         val book = BookMeta(
             id = "book-1",
             title = "Single title",
@@ -36,7 +36,7 @@ class BookGridPresentationTest {
 
         assertNull(libraryItemLabel(LibraryItem.Single(book)))
         assertEquals(
-            "Reading list",
+            "Reading list · 1 本",
             libraryItemLabel(
                 LibraryItem.Bundle(
                     BookBundle(

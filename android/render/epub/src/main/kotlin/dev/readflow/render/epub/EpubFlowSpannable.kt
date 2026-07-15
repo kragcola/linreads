@@ -65,12 +65,22 @@ internal fun epubBuildFlowSpannable(
     imageSizeResolver: ImageSizeResolver,
     onLinkClick: (EpubTextLink) -> Unit,
     highlightRanges: List<ReaderTextHighlightRange> = emptyList(),
+    fullPageHrefs: Set<String> = emptySet(),
 ): SpannableStringBuilder {
     val sb = SpannableStringBuilder(flow.text)
     flow.segments.forEach { seg ->
         when (val block = seg.block) {
             is EpubDisplayBlock.Text -> applyTextSpans(sb, seg, block, style, onLinkClick)
-            is EpubDisplayBlock.Image -> applyImageSpan(sb, seg, block, style, markwonTheme, imageLoader, imageSizeResolver)
+            is EpubDisplayBlock.Image -> applyImageSpan(
+                sb = sb,
+                seg = seg,
+                block = block,
+                style = style,
+                markwonTheme = markwonTheme,
+                imageLoader = imageLoader,
+                imageSizeResolver = imageSizeResolver,
+                isFullPage = block.href in fullPageHrefs,
+            )
             is EpubDisplayBlock.Break -> Unit
         }
     }
@@ -205,14 +215,20 @@ private fun applyImageSpan(
     markwonTheme: MarkwonTheme,
     imageLoader: AsyncDrawableLoader,
     imageSizeResolver: ImageSizeResolver,
+    isFullPage: Boolean,
 ) {
     val start = seg.layoutStart
     val end = seg.layoutEnd
     if (end <= start) return
     // Markwon AsyncDrawable: decodes async into the attached TextView, sized by the resolver. No
     // eager bitmap retention (审计 M7). Anchored on the single U+FFFC char — never changes length.
-    val styledResolver = EpubCssImageSizeResolver(imageSizeResolver, block.style, style)
-    val asyncDrawable = AsyncDrawable(block.href, imageLoader, styledResolver, block.style.toImageSize(style))
+    val styledResolver = if (isFullPage) {
+        imageSizeResolver
+    } else {
+        EpubCssImageSizeResolver(imageSizeResolver, block.style, style)
+    }
+    val imageSize = if (isFullPage) null else block.style.toImageSize(style)
+    val asyncDrawable = AsyncDrawable(block.href, imageLoader, styledResolver, imageSize)
     val span = AsyncDrawableSpan(markwonTheme, asyncDrawable, AsyncDrawableSpan.ALIGN_CENTER, false)
     sb.setSpan(span, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
     block.style.alignment?.toLayoutAlignment()?.let { alignment ->

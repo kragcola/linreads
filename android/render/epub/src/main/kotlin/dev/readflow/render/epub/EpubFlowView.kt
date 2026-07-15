@@ -1254,12 +1254,12 @@ internal class EpubFlowView(
         onBoundaryPreviewConfigurationChanged?.invoke()
         clearBoundaryPreviews()
         recycleCachedTextures()
+        val expectedChapterGeneration = chapterGeneration
         // Cold open: settleInitialPosition ran at height 0 (fallback) and deferred the reveal. Re-anchor
         // to the EXACT pending resume target (more accurate than the fallback-paginated top line), then
         // reveal — so the content fades in already at the resume page, with no visible scroll.
         if (awaitingReveal) {
-            textView.post {
-                if (disposed) return@post
+            postAfterViewportImageBoundsRefresh(expectedChapterGeneration) resize@{
                 repaginate(reposition = false)
                 if (pendingLandOnLast) {
                     scrollToPage(paged.lastIndex.coerceAtLeast(0), report = !reportPositionAfterStableReveal)
@@ -1270,15 +1270,14 @@ internal class EpubFlowView(
                         forceReport = !reportPositionAfterStableReveal,
                     )
                 }
-                if (consumePendingInitialPageTurn()) return@post
+                if (consumePendingInitialPageTurn()) return@resize
                 tryRevealWhenStable()
                 preCachePageTextures()
             }
             return
         }
         val anchorOffset = if (paged.isNotEmpty()) topLayoutOffset() else -1
-        textView.post {
-            if (disposed) return@post
+        postAfterViewportImageBoundsRefresh(expectedChapterGeneration) {
             // Re-anchor by offset does the only scroll; skip repaginate's own scrollTo (no double jump).
             repaginate(reposition = anchorOffset < 0)
             if (anchorOffset >= 0) {
@@ -1298,6 +1297,45 @@ internal class EpubFlowView(
                 preCachePageTextures()
             }
         }
+    }
+
+    private fun postAfterViewportImageBoundsRefresh(
+        expectedChapterGeneration: Long,
+        action: () -> Unit,
+    ) {
+        textView.post {
+            if (disposed || chapterGeneration != expectedChapterGeneration) return@post
+            val boundsChanged = refreshFullPageImageBoundsForViewport(expectedChapterGeneration)
+            if (disposed || chapterGeneration != expectedChapterGeneration) return@post
+            if (!boundsChanged) {
+                action()
+                return@post
+            }
+            if (chapterGeneration != expectedChapterGeneration) return@post
+            textView.text = textView.text
+            textView.requestLayout()
+            textView.post {
+                if (!disposed && chapterGeneration == expectedChapterGeneration) action()
+            }
+        }
+    }
+
+    private fun refreshFullPageImageBoundsForViewport(expectedChapterGeneration: Long): Boolean {
+        if (disposed || chapterGeneration != expectedChapterGeneration) return false
+        val text = textView.text as? Spanned ?: return false
+        var changed = false
+        text.getSpans(0, text.length, AsyncDrawableSpan::class.java).forEach { span ->
+            val drawable = span.drawable
+            val resolver = drawable.imageSizeResolver as? EpubFlowImageSizeResolver ?: return@forEach
+            if (!resolver.isFullPage(drawable.destination)) return@forEach
+            val result = drawable.result ?: return@forEach
+            val target = resolver.resolveImageSize(drawable)
+            if (target == drawable.bounds) return@forEach
+            result.bounds = target
+            drawable.bounds = target
+            changed = true
+        }
+        return changed
     }
 
     /**
