@@ -114,7 +114,7 @@ class EpubFlowViewTest {
 
         assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
         view.updateInteractiveCurl(x = view.width * 0.50f)
-        view.updateInteractiveCurl(x = view.width * 0.97f)
+        view.updateInteractiveCurl(x = view.width * 0.99f)
         view.endInteractiveCurl(velocityX = 0f)
         shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
 
@@ -144,10 +144,10 @@ class EpubFlowViewTest {
             )
             assertEquals("BOUNDARY_WAITING", view.privateField("interactiveTurnState").toString())
             view.dispatchTouchEvent(
-                motionEvent(downTime, downTime + 300L, MotionEvent.ACTION_MOVE, view.width * 0.82f, y),
+                motionEvent(downTime, downTime + 300L, MotionEvent.ACTION_MOVE, view.width * 0.84f, y),
             )
             view.dispatchTouchEvent(
-                motionEvent(downTime, downTime + 450L, MotionEvent.ACTION_UP, view.width * 0.82f, y),
+                motionEvent(downTime, downTime + 450L, MotionEvent.ACTION_UP, view.width * 0.84f, y),
             )
 
             assertEquals("NONE", view.privateField("interactiveTurnState").toString())
@@ -1804,7 +1804,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `up after first cold target frame cancels handoff and retires late front work`() {
+    fun `up after first cold target frame retains handoff and commits when late front arrives`() {
         val reportedOffsets = mutableListOf<Int>()
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SIMULATION,
@@ -1834,63 +1834,57 @@ class EpubFlowViewTest {
             )
             shadowOf(Looper.getMainLooper()).runOneTask()
             val partialTarget = background.targetBitmaps.single()
-            val overlayBeforeUp =
-                view.privateField("curlDrawable") != null || view.privateField("slideDrawable") != null
+            assertNull("the target-only frame must not install curl", view.privateField("curlDrawable"))
+            assertNull("the target-only frame must not install slide", view.privateField("slideDrawable"))
 
             view.onTouchEvent(
                 motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y),
             )
-            val stateAfterUp = view.privateField("interactiveTurnState").toString()
-            val pageAfterUp = view.currentPageIndex()
-            val scrollAfterUp = view.scrollY
-            val offsetAfterUp = view.topLayoutOffset()
-            val reportsAfterUp = reportedOffsets.toList()
+            assertEquals(
+                "a release past the commit threshold must retain the cold handoff until its front shot arrives",
+                "LOCAL_SHOTS_WAITING",
+                view.privateField("interactiveTurnState").toString(),
+            )
+            assertEquals(startPage, view.currentPageIndex())
+            assertEquals(startTop, view.scrollY)
+            assertEquals(startOffset, view.topLayoutOffset())
+            assertTrue("the retained handoff must remain locator-silent", reportedOffsets.isEmpty())
+            assertFalse("the prepared target must stay live while the front shot is pending", partialTarget.isRecycled)
 
             shadowOf(Looper.getMainLooper()).runOneTask()
-            val drawsAfterLateFront = background.targetBitmaps.toList()
-            val curlAfterLateFront = view.privateField("curlDrawable")
-            val slideAfterLateFront = view.privateField("slideDrawable")
-            val stateAfterLateFront = view.privateField("interactiveTurnState").toString()
-            val pageAfterLateFront = view.currentPageIndex()
-            val scrollAfterLateFront = view.scrollY
-            val offsetAfterLateFront = view.topLayoutOffset()
-            val reportsAfterLateFront = reportedOffsets.toList()
+            assertEquals("the late front callback must complete the two-shot working pair", 2, background.targetBitmaps.size)
+            val lateFront = background.targetBitmaps.last()
+            val paper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?)
+            assertNull("SIMULATION must not degrade to slide", view.privateField("slideDrawable"))
+            assertTrue("the resumed renderer must retain the prepared target identity", paper.privateBitmap("revealedBitmap") === partialTarget)
+            assertTrue("the resumed renderer must own the late outgoing identity", paper.privateBitmap("frontBitmap") === lateFront)
+            assertEquals("SOFTWARE_SETTLING", view.privateField("interactiveTurnState").toString())
+            assertEquals("the retained release must park exactly the adjacent page", startPage + 1, view.currentPageIndex())
+            assertTrue("the parked target must stay locator-silent until settle", reportedOffsets.isEmpty())
+
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertNull(view.privateField("curlDrawable"))
+            assertNull(view.privateField("slideDrawable"))
+            assertEquals("the retained release must commit only one local page", startPage + 1, view.currentPageIndex())
+            assertTrue("the committed viewport must leave its outgoing top", view.scrollY != startTop)
+            assertTrue("the committed locator must leave its outgoing offset", view.topLayoutOffset() != startOffset)
+            assertEquals("the committed target must publish exactly once", listOf(view.topLayoutOffset()), reportedOffsets)
+            assertTrue(
+                "settle must rekey the prepared target as current without recycling it",
+                view.privateField("cachedFrontBitmap") === partialTarget && !partialTarget.isRecycled,
+            )
+            assertTrue(
+                "settle must retain the outgoing frame as the backward neighbor",
+                view.privateField("cachedBackwardBitmap") === lateFront && !lateFront.isRecycled,
+            )
 
             shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
 
-            val finalCurl = view.privateField("curlDrawable")
-            val finalSlide = view.privateField("slideDrawable")
-            val finalState = view.privateField("interactiveTurnState").toString()
-
-            assertTrue(
-                "UP before the front frame must retire the partial target and make late work inert; " +
-                    "draws=${background.targetBitmaps.size} partialTarget=$partialTarget " +
-                    "partialRecycled=${partialTarget.isRecycled} " +
-                    "overlayBeforeUp=$overlayBeforeUp finalCurl=$finalCurl finalSlide=$finalSlide " +
-                    "stateAfterUp=$stateAfterUp pageAfterUp=$pageAfterUp scrollAfterUp=$scrollAfterUp " +
-                    "offsetAfterUp=$offsetAfterUp reportsAfterUp=$reportsAfterUp " +
-                    "drawsAfterLateFront=$drawsAfterLateFront curlAfterLateFront=$curlAfterLateFront " +
-                    "slideAfterLateFront=$slideAfterLateFront stateAfterLateFront=$stateAfterLateFront " +
-                    "pageAfterLateFront=$pageAfterLateFront scrollAfterLateFront=$scrollAfterLateFront " +
-                    "offsetAfterLateFront=$offsetAfterLateFront reportsAfterLateFront=$reportsAfterLateFront " +
-                    "page=${view.currentPageIndex()} startPage=$startPage " +
-                    "scrollY=${view.scrollY} startTop=$startTop " +
-                    "offset=${view.topLayoutOffset()} startOffset=$startOffset " +
-                    "state=$finalState reports=$reportedOffsets",
-                background.targetBitmaps.size == 1 && partialTarget.isRecycled &&
-                    !overlayBeforeUp && finalCurl == null && finalSlide == null &&
-                    stateAfterUp == "NONE" && pageAfterUp == startPage && scrollAfterUp == startTop &&
-                    offsetAfterUp == startOffset && reportsAfterUp.isEmpty() &&
-                    drawsAfterLateFront.size == 1 && curlAfterLateFront == null && slideAfterLateFront == null &&
-                    stateAfterLateFront == "NONE" && pageAfterLateFront == startPage &&
-                    scrollAfterLateFront == startTop && offsetAfterLateFront == startOffset &&
-                    reportsAfterLateFront.isEmpty() &&
-                    view.currentPageIndex() == startPage &&
-                    view.scrollY == startTop &&
-                    view.topLayoutOffset() == startOffset &&
-                    finalState == "NONE" &&
-                    reportedOffsets.isEmpty(),
-            )
+            assertEquals("late settle and cache work must not submit another page", startPage + 1, view.currentPageIndex())
+            assertEquals("late settle and cache work must not report again", 1, reportedOffsets.size)
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
         } finally {
             view.dispose()
         }
@@ -2680,7 +2674,7 @@ class EpubFlowViewTest {
                     val targetPage = view.currentPageIndex()
                     val targetTop = view.scrollY
                     val targetOffset = view.topLayoutOffset()
-                    view.updateInteractiveCurl(x = view.width * if (commit) 0.25f else 0.97f)
+                    view.updateInteractiveCurl(x = view.width * if (commit) 0.25f else 0.99f)
                     view.endInteractiveCurl(velocityX = 0f)
                     val oldAnimator = checkNotNull(
                         view.privateField("flipAnimator") as android.animation.ValueAnimator?,
@@ -3114,6 +3108,51 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @Config(qualifiers = "xxhdpi")
+    fun `fast five dp cold boundary swipe gives bounded feedback then commits once`() {
+        val commits = mutableListOf<Any>()
+        val previewRequests = mutableListOf<Pair<Boolean, Long>>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+        ).apply {
+            installBoundaryCommitRecorderForTest(commits)
+            onBoundaryPreviewNeeded = { forward, generation -> previewRequests += forward to generation }
+        }
+        view.goToLastPage()
+
+        try {
+            dispatchFiveDpForwardGesture(view, durationMs = 48L)
+
+            assertEquals(
+                "an accepted cold boundary swipe must wait for its requested target",
+                "BOUNDARY_DISCRETE_WAITING",
+                view.privateField("interactiveTurnState").toString(),
+            )
+            assertEquals(listOf(true to view.boundaryPreviewGenerationToken()), previewRequests)
+            val currentPage = view.getChildAt(0)
+            val immediateTranslationY = currentPage.translationY
+            assertTrue(
+                "the outgoing page must immediately follow the forward swipe upward without exceeding " +
+                    "the 15px finger travel; pageY=$immediateTranslationY",
+                immediateTranslationY < 0f && immediateTranslationY >= -15f,
+            )
+
+            val preview = view.newBoundaryPreviewForTest(forward = true, token = 58L)
+            assertTrue(view.offerBoundaryPreviewForTest(preview))
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals("the accepted cold swipe must publish exactly one boundary commit", 1, commits.size)
+            assertEquals("settled feedback must restore the outgoing page translation", 0f, currentPage.translationY, 0.01f)
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+            assertEquals("late settle work must not publish the same swipe twice", 1, commits.size)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `accepted boundary swipe survives the adjacent renderer completion window`() {
         val commits = mutableListOf<Any>()
         val cancellations = mutableListOf<Boolean>()
@@ -3225,6 +3264,90 @@ class EpubFlowViewTest {
             assertTrue(cancellations.isEmpty())
         } finally {
             boundary.dispose()
+        }
+    }
+
+    @Test
+    @Config(qualifiers = "xxhdpi")
+    fun `slow five dp drift does not turn an ordinary page`() {
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+        )
+
+        try {
+            view.preCachePageTexturesForTest()
+            dispatchFiveDpForwardGesture(view, durationMs = 450L)
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "a slow 5dp drift must not be admitted as a page turn",
+                0,
+                view.currentPageIndex(),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    @Config(qualifiers = "mdpi")
+    fun `rejected five dp micro drift consumes an existing edge tap candidate`() {
+        val tapZones = mutableListOf<EpubFlowTapZone>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE, onTapZone = tapZones::add)
+        val downTime = SystemClock.uptimeMillis()
+        val x = view.width * 0.85f
+        val y = view.height * 0.85f
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, y))
+            // Robolectric's GestureDetector slop does not follow the configured density. Preserve its
+            // clean-tap candidate while presenting the G1 recognizer with the real-device disagreement:
+            // a 5dp, zero-velocity release that is too slow to turn but too large to remain a tap.
+            view.setPrivateField(
+                "downY",
+                y + 5f * view.resources.displayMetrics.density,
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 150L, MotionEvent.ACTION_UP, x, y),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "a rejected micro drift must be consumed instead of falling back to the right-edge tap zone",
+                tapZones.isEmpty(),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    @Config(qualifiers = "xxhdpi")
+    fun `fast directional five dp swipe turns exactly one ordinary page`() {
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+        )
+
+        try {
+            view.preCachePageTexturesForTest()
+            dispatchFiveDpForwardGesture(view, durationMs = 48L)
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "a fast directional 5dp swipe must turn exactly one page; " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "classified=${view.privateField("classified")} flipped=${view.privateField("flipped")} " +
+                    "distanceGate=${view.privateField("turnIntentDistancePx")} " +
+                    "velocityGate=${view.privateField("flipFlingThresholdPxPerSec")}",
+                1,
+                view.currentPageIndex(),
+            )
+        } finally {
+            view.dispose()
         }
     }
 
@@ -6513,6 +6636,22 @@ class EpubFlowViewTest {
         y: Float,
     ): MotionEvent =
         MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
+
+    private fun dispatchFiveDpForwardGesture(view: EpubFlowView, durationMs: Long) {
+        val downTime = SystemClock.uptimeMillis()
+        val x = view.width * 0.85f
+        val startY = view.height * 0.85f
+        val travelPx = 5f * view.resources.displayMetrics.density
+        val halfwayY = startY - travelPx / 2f
+        val releaseY = startY - travelPx
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, startY))
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime + durationMs / 2L, MotionEvent.ACTION_MOVE, x, halfwayY),
+        )
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime + durationMs, MotionEvent.ACTION_UP, x, releaseY),
+        )
+    }
 
     private fun EpubFlowView.pointForTextOffset(offset: Int): Pair<Float, Float> {
         val layout = requireNotNull(textView.layout) { "TextView layout is required for hit testing" }

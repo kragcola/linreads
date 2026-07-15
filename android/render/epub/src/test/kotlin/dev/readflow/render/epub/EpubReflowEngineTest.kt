@@ -682,6 +682,80 @@ class EpubReflowEngineTest {
         }
 
     @Test
+    fun `completed boundary preview commits its prepared chapter flow`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("prepared-boundary-flow.epub")
+        val sourceChapter = (1..160).joinToString(
+            separator = "",
+            prefix = "<html><body>",
+            postfix = "</body></html>",
+        ) { index -> "<p>Outgoing chapter paragraph $index fills the source flow.</p>" }
+        val preparedTarget = "Prepared target chapter."
+        val replacementTarget = "Replacement target must not be rebuilt at commit."
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to sourceChapter,
+            "OEBPS/ch2.xhtml" to "<html><body><p>$preparedTarget</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val uri = Uri.fromFile(epub)
+        val fullIndexScheduler = TestCoroutineScheduler()
+        val engine = EpubReflowEngine(
+            context = context,
+            flowEngineEnabled = true,
+            epubParserFactory = { EpubParser() },
+            fullIndexDispatcher = StandardTestDispatcher(fullIndexScheduler),
+        )
+        engine.setPageFlipStyle(PageFlipStyle.NONE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(uri)
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+
+        awaitCondition("fixture must paginate the source well beyond the preview threshold") {
+            flowView.pageCount() > 5
+        }
+        flowView.goToPage(flowView.pageCount() - 3)
+        val preparedPreview = awaitBoundaryPreview(flowView, forward = true)
+        flowView.goToPage(0)
+        assertEquals("fixture must leave the preview warm while moving outside the prewarm window", 0, flowView.currentPageIndex())
+        val cachedEpub = File(context.cacheDir, "epub_${uri.hashCode()}.epub")
+        assertTrue("fixture must rewrite the engine's cached EPUB after preview preparation", cachedEpub.isFile)
+        writeEpub(
+            cachedEpub,
+            "OEBPS/ch1.xhtml" to sourceChapter,
+            "OEBPS/ch2.xhtml" to "<html><body><p>$replacementTarget</p></body></html>",
+        )
+        fullIndexScheduler.advanceUntilIdle()
+        awaitCondition("fixture must promote the replacement canonical index before commit") {
+            runCurrent()
+            engine.tableOfContents.value.size == 2
+        }
+
+        val canCommit = requireNotNull(flowView.canCommitBoundaryTurn)
+        assertTrue("the completed preview must remain committable after index promotion", canCommit(preparedPreview))
+        requireNotNull(flowView.onBoundaryTurnCommitted).invoke(preparedPreview)
+
+        awaitCondition("the prepared preview must settle in the adjacent chapter") {
+            (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1
+        }
+        val visibleText = flowView.textView.text.toString()
+        assertTrue(
+            "commit must install the chapter flow already prepared for the accepted preview: $visibleText",
+            visibleText.contains(preparedTarget),
+        )
+        assertFalse(
+            "commit must not rebuild the target from a later blocks snapshot: $visibleText",
+            visibleText.contains(replacementTarget),
+        )
+        engine.close()
+    }
+
+    @Test
     fun `boundary preview survives full index promotion during an adjacent parse`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("startup-boundary-promotion-race.epub")
@@ -1941,7 +2015,7 @@ class EpubReflowEngineTest {
     }
 
     @Test
-    fun `multi page chapter requests forward preview only after an in chapter turn settles at the boundary`() = runTest(dispatcher) {
+    fun `multi page chapter starts forward preview with two pages remaining`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("boundary-preview-viewport-scoped.epub")
         val middleChapter = (1..260).joinToString("") { index ->
@@ -1990,16 +2064,19 @@ class EpubReflowEngineTest {
         )
 
         val lastPage = flowView.pageCount() - 1
-        flowView.goToPage(lastPage - 1)
-        awaitCondition("fixture must settle on the penultimate page before the normal turn") {
-            flowView.currentPageIndex() == lastPage - 1
+        flowView.goToPage(lastPage - 2)
+        awaitCondition("fixture must settle with two pages remaining before the spine boundary") {
+            flowView.currentPageIndex() == lastPage - 2
         }
 
-        engine.goToAdjacentPage(1)
-        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
-        awaitCondition("the in-chapter turn must settle on the final page") {
-            val animator = flowView.privateField("flipAnimator") as? android.animation.ValueAnimator
-            flowView.currentPageIndex() == lastPage && animator?.isRunning != true
+        awaitCondition("forward adjacent-spine preparation must start before the final page") {
+            @Suppress("UNCHECKED_CAST")
+            val sessions = engine.privateField("boundaryPreviewSessions") as Map<Boolean, Any>
+            @Suppress("UNCHECKED_CAST")
+            val jobs = engine.privateField("boundaryPreviewJobs") as Map<Boolean, Any>
+            sessions.containsKey(true) ||
+                jobs.containsKey(true) ||
+                flowView.privateField("forwardBoundaryPreview") != null
         }
         val forward = awaitBoundaryPreview(flowView, forward = true)
 

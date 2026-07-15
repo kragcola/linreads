@@ -351,6 +351,7 @@ class EpubReflowEngine private constructor(
         val sourceSpine: Int,
         val sourceChapterGeneration: Long,
         val targetSpine: Int,
+        val targetFlow: EpubChapterFlow,
         val view: EpubFlowView,
         val loader: EpubFlowImageLoader,
         var timeoutRunnable: Runnable? = null,
@@ -362,6 +363,7 @@ class EpubReflowEngine private constructor(
         val sourcePreviewGeneration: Long,
         val targetSpine: Int,
         val forward: Boolean,
+        val targetFlow: EpubChapterFlow,
     )
 
     /** Start index (inclusive) and end index (exclusive) of each chapter in paras. */
@@ -923,11 +925,14 @@ class EpubReflowEngine private constructor(
         restoreToParagraphOffset: Int = 0,
         landOnLast: Boolean = false,
         reportPositionAfterStableReveal: Boolean = false,
+        preparedFlow: EpubChapterFlow? = null,
     ) {
         val view = flowView ?: return
-        val blocks = blocksForSpine(spineIndex)
-        if (blocks.isEmpty()) return
-        val flow = epubBuildChapterFlow(spineIndex, blocks)
+        val flow = preparedFlow?.takeIf { it.spineIndex == spineIndex } ?: run {
+            val blocks = blocksForSpine(spineIndex)
+            if (blocks.isEmpty()) return
+            epubBuildChapterFlow(spineIndex, blocks)
+        }
         liveFlowImageLoader?.releaseAll()
         liveFlowImageLoader = installFlowChapter(
             view = view,
@@ -1268,6 +1273,7 @@ class EpubReflowEngine private constructor(
             sourceSpine = sourceSpine,
             sourceChapterGeneration = sourceChapterGeneration,
             targetSpine = targetSpine,
+            targetFlow = targetFlow,
             view = previewView,
             loader = loader,
         )
@@ -1329,6 +1335,7 @@ class EpubReflowEngine private constructor(
             sourcePreviewGeneration = session.sourceChapterGeneration,
             targetSpine = session.targetSpine,
             forward = forward,
+            targetFlow = session.targetFlow,
         )
         val accepted = liveView.offerBoundaryPreview(
             BoundaryPagePreview(
@@ -1353,6 +1360,7 @@ class EpubReflowEngine private constructor(
             restoreToParagraph = if (target.forward) firstParagraphOfSpine(target.targetSpine) else null,
             landOnLast = !target.forward,
             reportPositionAfterStableReveal = true,
+            preparedFlow = target.targetFlow,
         )
     }
 
