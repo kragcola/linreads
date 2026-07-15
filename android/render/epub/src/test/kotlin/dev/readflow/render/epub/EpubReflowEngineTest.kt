@@ -43,6 +43,7 @@ import io.noties.markwon.image.AsyncDrawableSpan
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -1492,10 +1493,9 @@ class EpubReflowEngineTest {
     fun `paged runtime keeps inline marker images from being enlarged to full page`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("inline-marker-image-sizing.epub")
-        writeEpub(
-            epub,
-            "OEBPS/ch1.xhtml" to "<html><body><p>Scene text.</p><img src=\"images/marker.png\" alt=\"Marker\"/><p>More text.</p></body></html>",
-        )
+        // Real 12×12 PNG (under FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX): bounds-driven inline
+        // policy is deterministic instead of relying on a missing href + structural fallback.
+        writeImageEpub(epub)
         val context = RuntimeEnvironment.getApplication() as Application
         val engine = EpubReflowEngine(context)
 
@@ -1507,7 +1507,19 @@ class EpubReflowEngineTest {
         val imageView = findView(imagePage, ImageView::class.java)
 
         assertNotNull(imageView)
-        assertEquals(EpubImagePlacement.Inline, imageView?.getTag(R.id.epub_image_placement))
+        // Dedicated image pages set EpubImagePlacement.Inline; small images packed with text
+        // become composite stacks that are always capped inline (adjustViewBounds + maxHeight)
+        // and never carry FullPage placement.
+        val placement = imageView?.getTag(R.id.epub_image_placement) as? EpubImagePlacement
+        assertNotEquals(
+            "12x12 marker must not be enlarged to FullPage placement",
+            EpubImagePlacement.FullPage,
+            placement,
+        )
+        assertTrue(
+            "12x12 marker must stay inline via placement tag or composite inline constraints",
+            placement == EpubImagePlacement.Inline || imageView?.adjustViewBounds == true,
+        )
     }
 
     @Test
@@ -1521,17 +1533,20 @@ class EpubReflowEngineTest {
         engine.openBook(Uri.fromFile(epub))
         val host = engine.createView() as FrameLayout
         val flowView = host.getChildAt(0) as EpubFlowView
-        val spans = (flowView.textView.text as Spanned).getSpans(
-            0,
-            flowView.textView.text.length,
-            AsyncDrawableSpan::class.java,
-        )
-        val shared = spans.filter { it.drawable.destination == "OEBPS/shared.png" }
+        val text = flowView.textView.text as Spanned
+        val spans = text.getSpans(0, text.length, AsyncDrawableSpan::class.java)
+        val shared = spans
+            .filter { it.drawable.destination == "OEBPS/shared.png" }
+            .sortedBy { text.getSpanStart(it) }
 
         assertEquals(2, shared.size)
-        assertTrue(
-            "inline use must win conservatively when the same 600x300 href is also used standalone",
-            shared.all { it.drawable.imageSize != null },
+        assertNotNull(
+            "first shared.png occurrence (mixed paragraph inline) must keep authored imageSize",
+            shared[0].drawable.imageSize,
+        )
+        assertNull(
+            "second shared.png occurrence (standalone) must clear imageSize for full-page policy",
+            shared[1].drawable.imageSize,
         )
         assertNull(
             "the standalone large illustration must ignore authored fixed dimensions and fit the viewport",

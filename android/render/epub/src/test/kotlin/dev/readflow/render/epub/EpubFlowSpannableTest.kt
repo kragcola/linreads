@@ -234,6 +234,11 @@ class EpubFlowSpannableTest {
                 inlineMaxHeightPx = 720,
                 fullPageHrefs = setOf("cover.png"),
             )
+            val fullPageImageOffsets = flow.segments.mapNotNullTo(HashSet()) { segment ->
+                (segment.block as? EpubDisplayBlock.Image)
+                    ?.takeIf { !it.isInlineContent }
+                    ?.let { segment.layoutStart }
+            }
             val spannable = epubBuildFlowSpannable(
                 context = ctx,
                 flow = flow,
@@ -242,6 +247,8 @@ class EpubFlowSpannableTest {
                 imageLoader = loader,
                 imageSizeResolver = resolver,
                 onLinkClick = {},
+                fullPageHrefs = setOf("cover.png"),
+                fullPageImageOffsets = fullPageImageOffsets,
             )
             val textView = android.widget.TextView(ctx).apply {
                 textSize = 18f
