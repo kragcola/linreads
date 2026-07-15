@@ -1856,7 +1856,12 @@ class EpubReflowEngineTest {
         assertEquals("test fixture should start with a single short page", 1, flowView.pageCount())
 
         engine.goToAdjacentPage(1)
-        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
+        awaitCondition("the asynchronous boundary preview must commit and start the slide") {
+            val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+            strategy?.spineIndex == 1 &&
+                flowView.privateField("pendingBoundaryPageTurn") == null &&
+                flowView.privateField("flipAnimator") != null
+        }
 
         val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
         val animator = flowView.privateField("flipAnimator")
