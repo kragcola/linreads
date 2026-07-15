@@ -801,7 +801,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `boundary continuity cover blocks all input after safety reveal until one stable report`() {
+    fun `boundary continuity cover isolates input and replays one swipe after stable report`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val reportedOffsets = mutableListOf<Int>()
         var linkClicks = 0
@@ -905,6 +905,7 @@ class EpubFlowViewTest {
             shadowOf(Looper.getMainLooper()).idle()
 
             assertEquals("the stable target must publish its locator exactly once", 1, reportedOffsets.size)
+            assertEquals("the accepted covered swipe must run only after stability", 1, view.currentPageIndex())
             assertEquals("the stable handoff must retire the continuity cover", false, view.privateBool("boundaryContinuityCover"))
         } finally {
             view.pendingDecodesProvider = { false }
@@ -3153,6 +3154,151 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @Config(qualifiers = "xxhdpi")
+    fun `opposite page turn swipe begun under chapter cover never inherits the previous stream`() {
+        lateinit var view: EpubFlowView
+        val commits = mutableListOf<Boolean>()
+        val trace = mutableListOf<String>()
+        val violations = mutableListOf<String>()
+        val incomingText = (1..160).joinToString("\n") { "Incoming chapter line $it stays paged." }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+        view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+        )
+        val outgoingFlow = view.privateField("flow") as EpubChapterFlow
+        val outgoingText = view.textView.text
+
+        fun record(label: String, expectedScrollY: Int? = null) {
+            val state = view.privateField("interactiveTurnState").toString()
+            val free = view.privateBool("freeScrolling")
+            val clip = view.privateBool("pageClipActive")
+            val motion = view.privateEnumName("pagedMotionState")
+            val classified = view.privateBool("classified")
+            val stealing = view.privateBool("stealing")
+            val snapshot = "$label state=$state free=$free clip=$clip motion=$motion " +
+                "scrollY=${view.scrollY} page=${view.currentPageIndex()} commits=$commits " +
+                "classified=$classified stealing=$stealing"
+            trace += snapshot
+            if (free || !clip || motion == "DRAGGING_FREE" || motion == "FLING_FREE" || motion == "FREE_REST") {
+                violations += snapshot
+            }
+            if (expectedScrollY != null && view.scrollY != expectedScrollY) {
+                violations += "$snapshot expectedScrollY=$expectedScrollY"
+            }
+        }
+
+        fun layoutCurrentChapter() {
+            repeat(2) {
+                view.measure(exactly(1080), exactly(600))
+                view.layout(0, 0, 1080, 600)
+                shadowOf(Looper.getMainLooper()).idle()
+            }
+        }
+
+        view.pendingDecodesProvider = { true }
+        view.onBoundaryTurnCommitted = { preview ->
+            commits += preview.forward
+            if (preview.forward) {
+                view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            } else {
+                view.setChapter(outgoingFlow, outgoingText, pageHeightPx = view.height, landOnLast = true)
+            }
+        }
+        view.goToLastPage()
+        val firstOriginScrollY = view.scrollY
+        val x = view.width * 0.85f
+        val firstStartY = view.height * 0.85f
+        val firstEndY = firstStartY - 36f
+        val firstDownTime = SystemClock.uptimeMillis()
+
+        try {
+            assertEquals(
+                EpubPagedTouchZone.PageTurn,
+                EpubPagedTouchZones.classify(view.width, view.height, x, firstStartY),
+            )
+            view.offerReadyBoundaryPreviewForTest(forward = true, token = 59L)
+            view.dispatchTouchEvent(motionEvent(firstDownTime, firstDownTime, MotionEvent.ACTION_DOWN, x, firstStartY))
+            record("forward-down", firstOriginScrollY)
+            view.dispatchTouchEvent(
+                motionEvent(firstDownTime, firstDownTime + 24L, MotionEvent.ACTION_MOVE, x, firstEndY),
+            )
+            record("forward-move", firstOriginScrollY)
+            view.dispatchTouchEvent(
+                motionEvent(firstDownTime, firstDownTime + 48L, MotionEvent.ACTION_UP, x, firstEndY),
+            )
+            record("forward-up", firstOriginScrollY)
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+            layoutCurrentChapter()
+            record("incoming-hidden")
+
+            assertEquals(listOf(true), commits)
+            assertTrue("the incoming chapter must still be protected by the boundary cover", view.privateBool("boundaryContinuityCover"))
+            assertTrue("the incoming chapter must still be awaiting stability", view.privateBool("awaitingStableChapter"))
+            assertTrue("fixture needs a multi-page incoming chapter", view.pageCount() > 2)
+
+            val secondOriginScrollY = view.scrollY
+            val secondStartY = view.height * 0.15f
+            val secondEndY = secondStartY + 36f
+            val secondDownTime = SystemClock.uptimeMillis()
+            assertEquals(
+                EpubPagedTouchZone.PageTurn,
+                EpubPagedTouchZones.classify(view.width, view.height, x, secondStartY),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(secondDownTime, secondDownTime, MotionEvent.ACTION_DOWN, x, secondStartY),
+            )
+            record("backward-down-gated", secondOriginScrollY)
+
+            view.pendingDecodesProvider = { false }
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse("the target must reveal while the second finger remains down", view.privateBool("boundaryContinuityCover"))
+            view.offerReadyBoundaryPreviewForTest(forward = false, token = 60L)
+            record("backward-before-move", secondOriginScrollY)
+
+            view.dispatchTouchEvent(
+                motionEvent(secondDownTime, secondDownTime + 24L, MotionEvent.ACTION_MOVE, x, secondEndY),
+            )
+            record("backward-move", secondOriginScrollY)
+            view.dispatchTouchEvent(
+                motionEvent(secondDownTime, secondDownTime + 48L, MotionEvent.ACTION_UP, x, secondEndY),
+            )
+            record("backward-up", secondOriginScrollY)
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+            layoutCurrentChapter()
+            view.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            record("backward-settled")
+
+            assertTrue(
+                "non-center PageTurn streams must never enter temporary/free scroll or move the live viewport " +
+                    "before their single commit; violations=$violations trace=${trace.joinToString(" | ")}",
+                violations.isEmpty(),
+            )
+            assertEquals(
+                "the opposite short swipe must cross back exactly once after the forward chapter turn; " +
+                    "trace=${trace.joinToString(" | ")}",
+                listOf(true, false),
+                commits,
+            )
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertFalse(view.privateBool("freeScrolling"))
+            assertTrue(view.privateBool("pageClipActive"))
+            assertEquals("ALIGNED", view.privateEnumName("pagedMotionState"))
+        } finally {
+            view.pendingDecodesProvider = { false }
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `accepted boundary swipe survives the adjacent renderer completion window`() {
         val commits = mutableListOf<Any>()
         val cancellations = mutableListOf<Boolean>()
@@ -3765,6 +3911,77 @@ class EpubFlowViewTest {
         livePage.recycle()
         coverPixels.recycle()
         expected.recycle()
+    }
+
+    @Test
+    @Config(qualifiers = "xxhdpi")
+    fun `latest boundary swipe during conversion fade retires the cached cover intent`() {
+        val commits = mutableListOf<Boolean>()
+        val reports = mutableListOf<Int>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+            onTopOffsetChanged = reports::add,
+        ).apply {
+            onBoundaryTurnCommitted = { commits += it.forward }
+        }
+        assertTrue("fixture needs a backward chapter boundary", view.currentPageIndex() == 0)
+        reports.clear()
+        view.showConversionSnapshotForTest(markerBitmap(view.width, view.height))
+        view.setPrivateField("boundaryContinuityCover", true)
+        view.setPrivateField("awaitingReveal", true)
+        view.setPrivateField("awaitingStableChapter", true)
+        view.setPrivateField("pendingInitialPageTurnDelta", null)
+        view.getChildAt(0).alpha = 0f
+        view.pendingDecodesProvider = { false }
+
+        try {
+            dispatchFiveDpForwardGesture(view, durationMs = 48L)
+
+            assertEquals("the cover must cache gesture A in its single backpressure slot", 1, view.privateInt("pendingInitialPageTurnDelta"))
+            assertFalse(view.privateBool("coverConsumedGesture"))
+
+            view.tryRevealWhenStable()
+
+            val fade = checkNotNull(view.privateField("conversionFadeAnimator") as android.animation.ValueAnimator?)
+            assertTrue("stable reveal must enter the conversion snapshot fade window", fade.isRunning)
+            assertFalse(view.privateBool("awaitingStableChapter"))
+            assertEquals("gesture A must still be pending at fade start", 1, view.privateInt("pendingInitialPageTurnDelta"))
+            view.offerReadyBoundaryPreviewForTest(forward = false, token = 61L)
+
+            val downTime = SystemClock.uptimeMillis()
+            val x = view.width * 0.85f
+            val startY = view.height * 0.15f
+            val halfwayY = startY + 7.5f
+            val releaseY = startY + 15f
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, startY))
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, x, halfwayY),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, x, releaseY),
+            )
+
+            assertEquals("gesture B must take the warm backward boundary preview", "BOUNDARY_SOFTWARE", view.privateField("interactiveTurnState").toString())
+            assertFalse("gesture B must atomically retire the old reveal fade", fade.isRunning)
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+            val pendingAfterB = view.privateField("pendingInitialPageTurnDelta")
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
+
+            assertEquals("latest gesture B must be the only boundary commit", listOf(false), commits)
+            assertNull(
+                "gesture A must leave the single slot when later gesture B takes ownership; " +
+                    "pending=$pendingAfterB state=${view.privateField("interactiveTurnState")} " +
+                    "commits=$commits reports=$reports",
+                pendingAfterB,
+            )
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertEquals("late work must not replay gesture A or duplicate B", 1, commits.size)
+        } finally {
+            view.pendingDecodesProvider = { false }
+            view.dispose()
+        }
     }
 
     @Test

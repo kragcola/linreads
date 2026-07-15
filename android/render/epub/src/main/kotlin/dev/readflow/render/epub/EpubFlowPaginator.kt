@@ -42,12 +42,15 @@ internal const val EPUB_FLOW_ORPHANS = 2
  * @param isHeadingLine `true` if a line belongs to a heading block (for keep-with-next).
  * @param paragraphLineRange maps a line → the [first, lastExclusive) line range of its paragraph,
  *   used for widows/orphans. Lines not in any multi-line paragraph may return `line..line+1`.
+ * @param keepTogetherLineRange maps a line inside a heading/next-block group to that group's
+ *   [first, lastExclusive) range. A page break inside a group moves the complete group forward.
  */
 internal fun epubPaginateFlow(
     geometry: LineGeometry,
     pageHeightPx: Int,
     isHeadingLine: (Int) -> Boolean = { false },
     paragraphLineRange: (Int) -> IntRange = { it..it },
+    keepTogetherLineRange: (Int) -> IntRange? = { null },
 ): List<EpubFlowPage> {
     val pageH = pageHeightPx.coerceAtLeast(1)
     val lineCount = geometry.lineCount
@@ -62,6 +65,7 @@ internal fun epubPaginateFlow(
             pageHeightPx = pageH,
             isHeadingLine = isHeadingLine,
             paragraphLineRange = paragraphLineRange,
+            keepTogetherLineRange = keepTogetherLineRange,
         ) ?: break
         pages += page
         startLine = page.endLineExclusive
@@ -80,6 +84,7 @@ internal fun epubPageFromStartLine(
     pageHeightPx: Int,
     isHeadingLine: (Int) -> Boolean = { false },
     paragraphLineRange: (Int) -> IntRange = { it..it },
+    keepTogetherLineRange: (Int) -> IntRange? = { null },
 ): EpubFlowPage? {
     val lineCount = geometry.lineCount
     if (lineCount <= 0 || startLine !in 0 until lineCount) return null
@@ -100,6 +105,7 @@ internal fun epubPageFromStartLine(
             lineCount = lineCount,
             isHeadingLine = isHeadingLine,
             paragraphLineRange = paragraphLineRange,
+            keepTogetherLineRange = keepTogetherLineRange,
         )
     }
     return geometry.pageForLineRange(startLine, lastLine + 1)
@@ -150,8 +156,19 @@ private fun applyFragmentationRules(
     lineCount: Int,
     isHeadingLine: (Int) -> Boolean,
     paragraphLineRange: (Int) -> IntRange,
+    keepTogetherLineRange: (Int) -> IntRange?,
 ): Int {
     var lastLine = rawLastLine
+
+    // CSS break-inside:avoid equivalent for a heading followed by an indivisible image. The range
+    // includes layout separator lines, so a blank separator cannot strand the heading by itself.
+    keepTogetherLineRange(lastLine)?.let { range ->
+        val breakFallsInsideGroup = lastLine >= range.first && lastLine + 1 < range.last
+        if (breakFallsInsideGroup) {
+            val target = range.first - 1
+            if (target >= startLine) return target
+        }
+    }
 
     // keep-with-next: a heading at the very bottom (its paragraph's body would start next page) →
     // push the whole heading to the next page.

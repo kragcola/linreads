@@ -19,24 +19,23 @@ import kotlin.math.roundToInt
 
 /**
  * Computes the on-screen size for a flow image from its intrinsic pixels. Full-page illustrations
- * (covers/彩插, in [fullPageHrefs]) are FITTED to the whole viewport (column × page), preserving
+ * (covers/彩插, when [isFullPage]) are FITTED to the whole viewport (column × page), preserving
  * aspect ratio and UPSCALING when intrinsic pixels are smaller — so a cover fills the page like the
  * legacy paged renderer. Inline images keep intrinsic size capped at the column width and an inline
  * max height, so avatars/footnote glyphs stay small.
  */
 internal fun epubFlowImageTargetSize(
-    href: String,
     intrinsicWidth: Int,
     intrinsicHeight: Int,
     columnWidthPx: Int,
     pageHeightPx: Int,
     inlineMaxHeightPx: Int,
-    fullPageHrefs: Set<String>,
+    isFullPage: Boolean,
 ): Rect {
     val iw = intrinsicWidth.coerceAtLeast(1)
     val ih = intrinsicHeight.coerceAtLeast(1)
     val col = columnWidthPx.coerceAtLeast(1)
-    if (href in fullPageHrefs) {
+    if (isFullPage) {
         val page = pageHeightPx.coerceAtLeast(1)
         val scale = min(col.toFloat() / iw, page.toFloat() / ih)
         val w = (iw * scale).roundToInt().coerceIn(1, col)
@@ -51,6 +50,56 @@ internal fun epubFlowImageTargetSize(
     }
     return Rect(0, 0, w, h)
 }
+
+internal class EpubMaxHeightImageSizeResolver(
+    private val delegate: ImageSizeResolver,
+    private val maxHeightProvider: () -> Int,
+) : ImageSizeResolver() {
+    override fun resolveImageSize(drawable: AsyncDrawable): Rect =
+        constrain(delegate.resolveImageSize(drawable))
+
+    fun constrain(bounds: Rect): Rect {
+        val maxHeight = try {
+            maxHeightProvider().coerceAtLeast(1)
+        } catch (_: RuntimeException) {
+            bounds.height().coerceAtLeast(1)
+        }
+        if (bounds.height() <= maxHeight) return Rect(bounds)
+        val scale = maxHeight.toFloat() / bounds.height().coerceAtLeast(1)
+        return Rect(
+            0,
+            0,
+            (bounds.width() * scale).roundToInt().coerceAtLeast(1),
+            maxHeight,
+        )
+    }
+}
+
+internal class EpubOccurrenceImageSizeResolver(
+    private val delegate: ImageSizeResolver,
+    val isFullPage: Boolean,
+) : ImageSizeResolver() {
+    override fun resolveImageSize(drawable: AsyncDrawable): Rect =
+        if (delegate is EpubFlowImageSizeResolver) {
+            delegate.resolveImageSize(drawable, isFullPage)
+        } else {
+            delegate.resolveImageSize(drawable)
+        }
+
+    fun constrain(bounds: Rect): Rect =
+        (delegate as? EpubMaxHeightImageSizeResolver)?.constrain(bounds) ?: bounds
+}
+
+private fun AsyncDrawable.isFullPageOccurrence(fullPageHrefs: Set<String>): Boolean =
+    (imageSizeResolver as? EpubOccurrenceImageSizeResolver)?.isFullPage
+        ?: (destination in fullPageHrefs)
+
+private fun AsyncDrawable.constrainTarget(bounds: Rect): Rect =
+    when (val resolver = imageSizeResolver) {
+        is EpubOccurrenceImageSizeResolver -> resolver.constrain(bounds)
+        is EpubMaxHeightImageSizeResolver -> resolver.constrain(bounds)
+        else -> bounds
+    }
 
 /**
  * Markwon (Apache-2.0) async image loader for the continuous-flow surface. Decodes EPUB zip images
@@ -102,9 +151,10 @@ internal class EpubFlowImageLoader(
             return
         }
         val currentColumnWidthPx = currentColumnWidthPx()
+        val isFullPage = drawable.isFullPageOccurrence(fullPageHrefs)
         // Full-page images may be upscaled to fill the viewport, so decode them at the larger of the
         // two viewport dimensions to avoid blur; inline images never exceed the column width.
-        val maxSide = if (href in fullPageHrefs) {
+        val maxSide = if (isFullPage) {
             maxOf(currentColumnWidthPx, pageHeightPx).coerceAtLeast(64)
         } else {
             currentColumnWidthPx.coerceAtLeast(64)
@@ -115,7 +165,6 @@ internal class EpubFlowImageLoader(
         // screen estimate (~100px too tall → the cover overflowed one page and got clipped away). Re-fit
         // full-page images at decode time, when [pageHeightProvider] returns the MEASURED viewport (审:
         // 封面/彩插顶到边缘被裁 / 闪一下消失). Never reuse a full-page image's stale reserved box.
-        val isFullPage = href in fullPageHrefs
         val reservedBounds = if (isFullPage) {
             null
         } else {
@@ -135,7 +184,7 @@ internal class EpubFlowImageLoader(
                 try {
                     bitmap = decodeEpubImage(file, href, maxSide = maxSide)
                 } finally {
-                    postDecodeResult(drawable, request, href, reservedBounds, bitmap)
+                    postDecodeResult(drawable, request, isFullPage, reservedBounds, bitmap)
                 }
             }
         } catch (_: RuntimeException) {
@@ -182,14 +231,15 @@ internal class EpubFlowImageLoader(
         } catch (_: RuntimeException) {
             return null
         }
-        val target = epubFlowImageTargetSize(
-            href = drawable.destination,
-            intrinsicWidth = bounds.width,
-            intrinsicHeight = bounds.height,
-            columnWidthPx = currentColumnWidthPx(),
-            pageHeightPx = pageHeightPx,
-            inlineMaxHeightPx = inlineMaxHeightPx,
-            fullPageHrefs = fullPageHrefs,
+        val target = drawable.constrainTarget(
+            epubFlowImageTargetSize(
+                intrinsicWidth = bounds.width,
+                intrinsicHeight = bounds.height,
+                columnWidthPx = currentColumnWidthPx(),
+                pageHeightPx = pageHeightPx,
+                inlineMaxHeightPx = inlineMaxHeightPx,
+                isFullPage = drawable.isFullPageOccurrence(fullPageHrefs),
+            ),
         )
         return ColorDrawable(android.graphics.Color.TRANSPARENT).apply {
             setBounds(0, 0, target.width(), target.height())
@@ -199,7 +249,7 @@ internal class EpubFlowImageLoader(
     private fun postDecodeResult(
         drawable: AsyncDrawable,
         request: DecodeRequest,
-        href: String,
+        isFullPage: Boolean,
         reservedBounds: Rect?,
         bitmap: Bitmap?,
     ) {
@@ -214,14 +264,15 @@ internal class EpubFlowImageLoader(
                     if (bitmap != null && drawable.isAttached) {
                         val result = BitmapDrawable(null, bitmap).apply {
                             // Full-page images are fitted again against the measured viewport on the main thread.
-                            val target = reservedBounds ?: epubFlowImageTargetSize(
-                                href = href,
-                                intrinsicWidth = bitmap.width,
-                                intrinsicHeight = bitmap.height,
-                                columnWidthPx = currentColumnWidthPx(),
-                                pageHeightPx = pageHeightProvider().coerceAtLeast(1),
-                                inlineMaxHeightPx = inlineMaxHeightPx,
-                                fullPageHrefs = fullPageHrefs,
+                            val target = reservedBounds ?: drawable.constrainTarget(
+                                epubFlowImageTargetSize(
+                                    intrinsicWidth = bitmap.width,
+                                    intrinsicHeight = bitmap.height,
+                                    columnWidthPx = currentColumnWidthPx(),
+                                    pageHeightPx = pageHeightProvider().coerceAtLeast(1),
+                                    inlineMaxHeightPx = inlineMaxHeightPx,
+                                    isFullPage = isFullPage,
+                                ),
                             )
                             setBounds(0, 0, target.width(), target.height())
                         }
@@ -330,10 +381,12 @@ internal class EpubFlowImageSizeResolver(
 
     fun isFullPage(destination: String): Boolean = destination in fullPageHrefs
 
-    override fun resolveImageSize(drawable: AsyncDrawable): Rect {
+    override fun resolveImageSize(drawable: AsyncDrawable): Rect =
+        resolveImageSize(drawable, isFullPage(drawable.destination))
+
+    fun resolveImageSize(drawable: AsyncDrawable, isFullPage: Boolean): Rect {
         val result = drawable.result ?: return Rect(0, 0, 1, 1)
         val requested = drawable.imageSize
-        val isFullPage = isFullPage(drawable.destination)
         if (!isFullPage && requested == null) {
             result.bounds.takeUnless { it.isEmpty }?.let { return Rect(it) }
         }
@@ -345,13 +398,12 @@ internal class EpubFlowImageSizeResolver(
             ?: 1
         val currentColumnWidthPx = currentColumnWidthPx()
         val fallback = epubFlowImageTargetSize(
-            href = drawable.destination,
             intrinsicWidth = sourceWidth,
             intrinsicHeight = sourceHeight,
             columnWidthPx = currentColumnWidthPx,
             pageHeightPx = pageHeightProvider().coerceAtLeast(1),
             inlineMaxHeightPx = inlineMaxHeightPx,
-            fullPageHrefs = fullPageHrefs,
+            isFullPage = isFullPage,
         )
         if (isFullPage || requested == null) return fallback
         val ratio = sourceWidth.toFloat() / sourceHeight
@@ -375,7 +427,7 @@ internal class EpubFlowImageSizeResolver(
             else -> return fallback
         }
         val maxWidth = currentColumnWidthPx
-        val maxHeight = if (drawable.destination in fullPageHrefs) {
+        val maxHeight = if (isFullPage) {
             pageHeightProvider().coerceAtLeast(1)
         } else {
             inlineMaxHeightPx.coerceAtLeast(1)

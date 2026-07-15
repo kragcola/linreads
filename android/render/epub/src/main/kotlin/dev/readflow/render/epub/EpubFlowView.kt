@@ -185,6 +185,10 @@ internal class EpubFlowView(
         val firstLine: Int,
         val endLineExclusive: Int,
     )
+    private data class KeepTogetherLineInterval(
+        val firstLine: Int,
+        val endLineExclusive: Int,
+    )
     private data class PageLayoutMetadata(
         val pageGeneration: Long,
         val chapterGeneration: Long,
@@ -194,6 +198,7 @@ internal class EpubFlowView(
         val usablePageHeightPx: Int,
         val headingLines: Set<Int>,
         val paragraphIntervals: List<ParagraphLineInterval>,
+        val keepTogetherIntervals: List<KeepTogetherLineInterval>,
     )
     private var pageLayoutMetadata: PageLayoutMetadata? = null
 
@@ -219,6 +224,8 @@ internal class EpubFlowView(
     private var freeFlingStableFrames = 0
     private var interruptedFreeFlingNeedsRebase = false
     private var flingStopGesture = false
+    /** True when a chapter continuity cover owns DOWN; the whole stream is classified in isolation. */
+    private var coverConsumedGesture = false
 
     /**
      * Page-turn animation style (PAGED only). SLIDE = hardware overlay slide (default, GPU-composited);
@@ -1542,7 +1549,9 @@ internal class EpubFlowView(
             container.alpha = 1f
             if (consumePendingBoundaryPageTurn()) return
         }
-        if (stable) publishStableChapterPosition()
+        // A gesture recognized while the chapter was hidden owns the next visible position. Publishing
+        // the transient chapter top first would persist two locators and make the text appear to jump.
+        if (stable && pendingInitialPageTurnDelta == null) publishStableChapterPosition()
         val fadingCover = conversionSnapshotDrawable
         if (fadingCover != null) {
             // The stable live page becomes fully opaque under the frozen shot first. Fading both layers
@@ -1909,6 +1918,7 @@ internal class EpubFlowView(
                 pageHeightPx = effectivePageH,
                 isHeadingLine = nextMetadata.headingLines::contains,
                 paragraphLineRange = { nextMetadata.paragraphLineRange(layout, it) },
+                keepTogetherLineRange = { nextMetadata.keepTogetherLineRange(it) },
             )
         } else {
             emptyList()
@@ -1960,6 +1970,7 @@ internal class EpubFlowView(
                 for (line in firstLine..lastLine) headingLines += line
             }
         }
+        val keepTogetherIntervals = headingImageKeepTogetherIntervals(layout, f)
         return PageLayoutMetadata(
             pageGeneration = generation,
             chapterGeneration = chapterGeneration,
@@ -1969,8 +1980,32 @@ internal class EpubFlowView(
             usablePageHeightPx = usablePageHeightPx,
             headingLines = headingLines,
             paragraphIntervals = paragraphIntervals,
+            keepTogetherIntervals = keepTogetherIntervals,
         )
     }
+
+    private fun headingImageKeepTogetherIntervals(
+        layout: Layout,
+        f: EpubChapterFlow,
+    ): List<KeepTogetherLineInterval> = buildList {
+        f.segments.forEachIndexed { index, heading ->
+            val headingBlock = heading.block as? EpubDisplayBlock.Text ?: return@forEachIndexed
+            if (headingBlock.headingLevel == null || heading.layoutEnd <= heading.layoutStart) return@forEachIndexed
+            val nextContent = f.nextContentSegmentAfter(index) ?: return@forEachIndexed
+            val image = nextContent.block as? EpubDisplayBlock.Image ?: return@forEachIndexed
+            if (image.isInlineContent) return@forEachIndexed
+            add(
+                KeepTogetherLineInterval(
+                    firstLine = layout.getLineForOffset(heading.layoutStart),
+                    endLineExclusive = layout.getLineForOffset(nextContent.layoutEnd - 1) + 1,
+                ),
+            )
+        }
+    }
+
+    private fun PageLayoutMetadata.keepTogetherLineRange(line: Int): IntRange? =
+        keepTogetherIntervals.firstOrNull { line >= it.firstLine && line < it.endLineExclusive }
+            ?.let { it.firstLine..it.endLineExclusive }
 
     private fun PageLayoutMetadata.paragraphLineRange(layout: Layout, line: Int): IntRange {
         val offset = layout.getLineStart(line)
@@ -2019,6 +2054,11 @@ internal class EpubFlowView(
         val last = layout.getLineForOffset((seg.layoutEnd - 1).coerceAtLeast(seg.layoutStart))
         return first..(last + 1)
     }
+
+    private fun keepTogetherLineRange(layout: Layout, f: EpubChapterFlow, line: Int): IntRange? =
+        headingImageKeepTogetherIntervals(layout, f)
+            .firstOrNull { line >= it.firstLine && line < it.endLineExclusive }
+            ?.let { it.firstLine..it.endLineExclusive }
 
     fun pageCount(): Int = if (mode == Mode.PAGED) paged.size.coerceAtLeast(1) else 1
 
@@ -2341,6 +2381,13 @@ internal class EpubFlowView(
                 isHeadingLine = { it in headingLines },
                 paragraphLineRange = { line ->
                     metadata?.paragraphLineRange(layout, line) ?: paragraphLineRange(layout, f, line)
+                },
+                keepTogetherLineRange = { line ->
+                    if (metadata != null) {
+                        metadata.keepTogetherLineRange(line)
+                    } else {
+                        keepTogetherLineRange(layout, f, line)
+                    }
                 },
             )
         } else {
@@ -3812,8 +3859,44 @@ internal class EpubFlowView(
      */
     @SuppressLint("ClickableViewAccessibility")
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (coverConsumedGesture) {
+            pendingCleanTapX = null
+            trackVelocity(ev)
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                    val decision = releasedPageTurnDecision(ev)
+                    decision.intent?.let { intent ->
+                        if (boundaryContinuityCover && awaitingStableChapter) {
+                            // G1/R1: gesture recognition stays live while chapter execution is busy.
+                            // Keep one latest direction as backpressure; reveal consumes it atomically.
+                            pendingInitialPageTurnDelta = if (intent.forward) 1 else -1
+                        } else if (!turnInFlight) {
+                            startReleasedPageTurn(intent, decision.velocity, ev)
+                        }
+                    }
+                }
+                recycleTracker()
+                coverConsumedGesture = false
+            }
+            return true
+        }
         if (boundaryContinuityCover && awaitingStableChapter) {
             pendingCleanTapX = null
+            coverConsumedGesture = ev.actionMasked != MotionEvent.ACTION_UP && ev.actionMasked != MotionEvent.ACTION_CANCEL
+            classified = false
+            freeScrolling = false
+            centerDeadGesture = false
+            stealing = false
+            flingStopGesture = false
+            recycleTracker()
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+                downX = ev.x
+                downY = ev.y
+                lastY = ev.y
+                flipped = false
+                inSelectionMode = false
+                trackVelocity(ev)
+            }
             return true
         }
         if (releasedLocalIntentWaiting) return true
@@ -4088,21 +4171,27 @@ internal class EpubFlowView(
         return progress * extentPx >= turnIntentDistancePx || flung
     }
 
-    private fun tryStartReleasedMicroTurn(ev: MotionEvent): Boolean {
-        if (disposed || mode != Mode.PAGED || paged.isEmpty() || turnInFlight) return false
+    private data class ReleasedPageTurnDecision(
+        val handled: Boolean,
+        val intent: PageTurnIntent? = null,
+        val velocity: Float = 0f,
+    )
+
+    private fun releasedPageTurnDecision(ev: MotionEvent): ReleasedPageTurnDecision {
+        if (disposed || mode != Mode.PAGED || paged.isEmpty()) return ReleasedPageTurnDecision(handled = false)
         val dx = ev.x - downX
         val dy = ev.y - downY
         val horizontal = abs(dx) >= abs(dy)
         val primary = if (horizontal) abs(dx) else abs(dy)
         val cross = if (horizontal) abs(dy) else abs(dx)
-        if (primary < microTurnMinimumDistancePx) return false
+        if (primary < microTurnMinimumDistancePx) return ReleasedPageTurnDecision(handled = false)
         // GestureDetector may still call this a tap when the platform touch slop is larger than our
         // micro-turn floor. From this distance onward a rejected turn is drift, never an edge tap.
         classified = true
-        if (cross > primary * MICRO_TURN_MAX_CROSS_AXIS_RATIO) return true
+        if (cross > primary * MICRO_TURN_MAX_CROSS_AXIS_RATIO) return ReleasedPageTurnDecision(handled = true)
         val axis = if (horizontal) InteractiveTurnAxis.HORIZONTAL else InteractiveTurnAxis.VERTICAL
         if (axis == InteractiveTurnAxis.VERTICAL && pagedTouchZoneAtDown() != EpubPagedTouchZone.PageTurn) {
-            return true
+            return ReleasedPageTurnDecision(handled = true)
         }
         val forward = if (horizontal) dx < 0f else dy < 0f
         val velocity = computeTurnVelocity(axis)
@@ -4113,16 +4202,35 @@ internal class EpubFlowView(
         }
         val projectedTravel = primary + abs(velocity) * MICRO_TURN_PROJECTION_SECONDS
         val distanceAccepted = primary >= turnIntentDistancePx
-        if (!distanceAccepted && (!velocityMatches || projectedTravel < turnIntentDistancePx)) return true
+        if (!distanceAccepted && (!velocityMatches || projectedTravel < turnIntentDistancePx)) {
+            return ReleasedPageTurnDecision(handled = true)
+        }
 
         val anchor = if (horizontal) downX else downY
-        startPageTurnIntent(PageTurnIntent(forward, axis, anchor), ev)
+        return ReleasedPageTurnDecision(
+            handled = true,
+            intent = PageTurnIntent(forward, axis, anchor),
+            velocity = velocity,
+        )
+    }
+
+    private fun startReleasedPageTurn(intent: PageTurnIntent, velocity: Float, ev: MotionEvent) {
+        // A live gesture that reaches execution owns the single G1/R1 slot. Any intent buffered by
+        // the retiring chapter cover is older and must not survive a fade cancellation as ghost work.
+        pendingInitialPageTurnDelta = null
+        startPageTurnIntent(intent, ev)
         when {
             interactiveCurl -> endInteractiveCurl(velocity)
             localShotsWaiting -> releasePendingLocalPageShotHandoff(ev, velocity)
             boundaryWaiting -> releaseWaitingBoundaryTurn(ev, velocity)
         }
-        return true
+    }
+
+    private fun tryStartReleasedMicroTurn(ev: MotionEvent): Boolean {
+        if (turnInFlight) return false
+        val decision = releasedPageTurnDecision(ev)
+        decision.intent?.let { startReleasedPageTurn(it, decision.velocity, ev) }
+        return decision.handled
     }
 
     private fun applyClassifiedMove(ev: MotionEvent) {

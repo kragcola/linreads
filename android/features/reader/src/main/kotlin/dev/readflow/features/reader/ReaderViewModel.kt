@@ -61,6 +61,7 @@ import kotlinx.serialization.json.Json
 import java.util.UUID
 
 internal const val READER_STATE_SAVED_STATE_KEY = "reader_state_json"
+internal const val READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY = "reader_typography_baseline_version"
 
 data class ReaderUiState(
     val loadingState: LoadingState = LoadingState.Idle,
@@ -98,11 +99,27 @@ class ReaderViewModel(
     private val clock: () -> Long = System::currentTimeMillis,
 ) : ViewModel() {
 
-    private var restoredReaderState: ReaderState? = savedStateHandle.readerStateOrNull()
+    private val savedTypographyIsCurrent =
+        savedStateHandle.get<Int>(READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY) == ReaderTypography.BASELINE_VERSION
+    private var restoredReaderState: ReaderState? = savedStateHandle.readerStateOrNull()?.let { restored ->
+        if (savedTypographyIsCurrent) restored else restored.copy(
+            fontSize = ReaderTypography.DEFAULT_FONT_SP,
+            lineSpacing = ReaderTypography.DEFAULT_LINE_SPACING,
+        )
+    }
     private var currentBookId: String? = restoredReaderState?.bookId
 
     private val _uiState = MutableStateFlow(restoredReaderState.toReaderUiState())
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
+
+    init {
+        if (!savedTypographyIsCurrent) {
+            savedStateHandle[READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY] = ReaderTypography.BASELINE_VERSION
+            restoredReaderState?.let { migrated ->
+                savedStateHandle[READER_STATE_SAVED_STATE_KEY] = Json.encodeToString(migrated)
+            }
+        }
+    }
 
     private var progressJob: Job? = null
     private var fontPreviewPersistJob: Job? = null
@@ -368,6 +385,7 @@ class ReaderViewModel(
         restoredForBook: ReaderState?,
         engine: ReaderEngine,
     ): ReaderOpenSettings {
+        settings.ensureCurrentTypographyBaseline()
         val requestedMode = (restoredForBook?.readingMode ?: settings.readingMode.first())
             .toReadingMode()
             ?.takeIf { it in engine.supportedModes }

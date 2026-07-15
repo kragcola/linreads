@@ -34,6 +34,14 @@ internal data class EpubChapterFlow(
     val segments: List<EpubFlowSegment>,
 )
 
+internal fun EpubChapterFlow.nextContentSegmentAfter(index: Int): EpubFlowSegment? {
+    for (candidateIndex in (index + 1) until segments.size) {
+        val candidate = segments[candidateIndex]
+        if (candidate.layoutEnd > candidate.layoutStart) return candidate
+    }
+    return null
+}
+
 /** Builds the canonical flow text + offset map for one chapter's [blocks] (already in source order). */
 internal fun epubBuildChapterFlow(
     spineIndex: Int,

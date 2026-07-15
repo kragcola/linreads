@@ -16,6 +16,7 @@ import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
@@ -29,10 +30,10 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         context.dataStore.data.map { it[KEY_CALIBRE_URL] }
 
     override val fontSize: Flow<Int> =
-        context.dataStore.data.map { it[KEY_FONT_SIZE] ?: ReaderTypography.DEFAULT_FONT_SP }
+        typographyFlow { it[KEY_FONT_SIZE] ?: ReaderTypography.DEFAULT_FONT_SP }
 
     override val lineSpacing: Flow<Float> =
-        context.dataStore.data.map { resolvedLineSpacingPreference(it[KEY_LINE_SPACING]) }
+        typographyFlow { resolvedLineSpacingPreference(it[KEY_LINE_SPACING]) }
 
     override val readingMode: Flow<ReaderReadingMode> =
         context.dataStore.data.map {
@@ -73,6 +74,24 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
             runCatching { PageFlipStyle.valueOf(it[KEY_PAGE_FLIP_STYLE] ?: "") }
                 .getOrDefault(PageFlipStyle.SLIDE)
         }
+
+    override suspend fun ensureCurrentTypographyBaseline(): Boolean {
+        var installed = false
+        context.dataStore.edit { preferences ->
+            val current = resolvedTypographyBaseline(
+                storedFontSize = preferences[KEY_FONT_SIZE],
+                storedLineSpacing = preferences[KEY_LINE_SPACING],
+                storedVersion = preferences[KEY_TYPOGRAPHY_BASELINE_VERSION],
+            )
+            if (preferences[KEY_TYPOGRAPHY_BASELINE_VERSION] != current.version) {
+                preferences[KEY_FONT_SIZE] = current.fontSize
+                preferences[KEY_LINE_SPACING] = current.lineSpacing
+                preferences[KEY_TYPOGRAPHY_BASELINE_VERSION] = current.version
+                installed = true
+            }
+        }
+        return installed
+    }
 
     override suspend fun setCalibreBaseUrl(url: String) {
         context.dataStore.edit { it[KEY_CALIBRE_URL] = url }
@@ -130,6 +149,11 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         return value!!
     }
 
+    private fun <T> typographyFlow(transform: (Preferences) -> T): Flow<T> = flow {
+        ensureCurrentTypographyBaseline()
+        emitAll(context.dataStore.data.map(transform))
+    }
+
     private companion object {
         val KEY_CALIBRE_URL = stringPreferencesKey("calibre_url")
         val KEY_FONT_SIZE = intPreferencesKey("font_size")
@@ -142,8 +166,33 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_FONT_CHOICE = stringPreferencesKey("font_choice")
         val KEY_READER_GUIDE_SHOWN = booleanPreferencesKey("reader_guide_shown")
         val KEY_PAGE_FLIP_STYLE = stringPreferencesKey("page_flip_style")
+        val KEY_TYPOGRAPHY_BASELINE_VERSION = intPreferencesKey("typography_baseline_version")
     }
 }
 
 internal fun resolvedLineSpacingPreference(stored: Float?): Float =
     stored ?: ReaderTypography.DEFAULT_LINE_SPACING
+
+internal data class TypographyBaseline(
+    val fontSize: Int,
+    val lineSpacing: Float,
+    val version: Int,
+)
+
+internal fun resolvedTypographyBaseline(
+    storedFontSize: Int?,
+    storedLineSpacing: Float?,
+    storedVersion: Int?,
+): TypographyBaseline = if ((storedVersion ?: 0) < ReaderTypography.BASELINE_VERSION) {
+    TypographyBaseline(
+        fontSize = ReaderTypography.DEFAULT_FONT_SP,
+        lineSpacing = ReaderTypography.DEFAULT_LINE_SPACING,
+        version = ReaderTypography.BASELINE_VERSION,
+    )
+} else {
+    TypographyBaseline(
+        fontSize = storedFontSize ?: ReaderTypography.DEFAULT_FONT_SP,
+        lineSpacing = resolvedLineSpacingPreference(storedLineSpacing),
+        version = storedVersion ?: ReaderTypography.BASELINE_VERSION,
+    )
+}

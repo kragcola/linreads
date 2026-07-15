@@ -51,6 +51,8 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -132,13 +134,35 @@ fun LibraryScreen(
             snackbarHost = { SnackbarHost(snackbarHostState) },
             topBar = {
                 Surface(
-                    color = MaterialTheme.colorScheme.background,
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
                 ) {
+                    val fiberColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.035f)
+                    val edgeColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.72f)
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .windowInsetsPadding(WindowInsets.statusBars)
-                            .padding(start = 20.dp, top = 12.dp, end = 12.dp, bottom = 8.dp),
+                            .drawBehind {
+                                val fiberStep = 12.dp.toPx()
+                                val fiberStroke = 0.5.dp.toPx()
+                                var y = fiberStep / 2f
+                                while (y < size.height) {
+                                    drawLine(
+                                        color = fiberColor,
+                                        start = Offset(0f, y),
+                                        end = Offset(size.width, y),
+                                        strokeWidth = fiberStroke,
+                                    )
+                                    y += fiberStep
+                                }
+                                drawLine(
+                                    color = edgeColor,
+                                    start = Offset(0f, size.height - fiberStroke / 2f),
+                                    end = Offset(size.width, size.height - fiberStroke / 2f),
+                                    strokeWidth = fiberStroke,
+                                )
+                            }
+                            .padding(start = 20.dp, top = 6.dp, end = 12.dp, bottom = 6.dp),
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -147,7 +171,7 @@ fun LibraryScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
                                     text = "书架",
-                                    style = ReadflowType.display,
+                                    style = ReadflowType.title,
                                     color = MaterialTheme.colorScheme.onBackground,
                                 )
                                 Text(

@@ -980,7 +980,12 @@ class EpubReflowEngine private constructor(
             firstLineIndentPx = flowFirstLineIndentPx(density),
         )
         val theme = MarkwonTheme.create(context)
-        val fullPageHrefs = flowFullPageImageHrefs(flow)
+        val fullPageImageOffsets = flowFullPageImageOffsets(flow)
+        val fullPageHrefs = flow.segments.mapNotNullTo(HashSet()) { segment ->
+            (segment.block as? EpubDisplayBlock.Image)
+                ?.takeIf { segment.layoutStart in fullPageImageOffsets }
+                ?.href
+        }
         val inlineMaxHeightPx = (INLINE_IMAGE_MAX_HEIGHT_DP * density).toInt()
         // Full-page images must fit the current MEASURED viewport. Read both dimensions lazily so
         // rotation/split-screen changes do not reuse install-time geometry; fall back before first measure.
@@ -1026,6 +1031,9 @@ class EpubReflowEngine private constructor(
             onLinkClick = onLinkClick,
             highlightRanges = flowHighlightRanges(flow),
             fullPageHrefs = fullPageHrefs,
+            fullPageImageOffsets = fullPageImageOffsets,
+            pageHeightProvider = pageHeightProvider,
+            columnWidthProvider = columnWidthProvider,
         )
         val restoreOffset = restoreToParagraph?.let { flow.offsetForParagraph(it, restoreToParagraphOffset) }
         // setChapter posts its first settle before the Markwon scheduler attaches AsyncDrawables. Treat
@@ -1431,24 +1439,18 @@ class EpubReflowEngine private constructor(
     }
 
     /**
-     * Hrefs of the chapter's full-page illustrations (covers/彩插), by the same intrinsic-pixel gate
-     * the legacy paged path uses ([FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX]). The flow image loader/resolver
-     * fit these to the whole viewport (upscaling allowed) so a cover fills the page; everything else
-     * stays inline and column-capped. Bounds come from the cache (decoded once, no pixel data).
+     * Flow offsets of full-page illustration occurrences (covers/彩插), by the same intrinsic-pixel
+     * gate the legacy paged path uses ([FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX]). Occurrence identity keeps
+     * an inline and a standalone use of the same resource from affecting each other's sizing policy.
      */
-    private fun flowFullPageImageHrefs(flow: EpubChapterFlow): Set<String> {
-        val inlineHrefs = flow.segments.mapNotNullTo(HashSet()) { segment ->
-            (segment.block as? EpubDisplayBlock.Image)
-                ?.takeIf { it.isInlineContent }
-                ?.href
-        }
-        val result = HashSet<String>()
+    private fun flowFullPageImageOffsets(flow: EpubChapterFlow): Set<Int> {
+        val result = HashSet<Int>()
         flow.segments.forEach { seg ->
             val block = seg.block
-            if (block is EpubDisplayBlock.Image && block.href !in inlineHrefs) {
+            if (block is EpubDisplayBlock.Image && !block.isInlineContent) {
                 val bounds = epubImageBoundsFor(block.href) ?: return@forEach
                 if (maxOf(bounds.width, bounds.height) >= FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX) {
-                    result += block.href
+                    result += seg.layoutStart
                 }
             }
         }

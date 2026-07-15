@@ -883,6 +883,232 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `inline occurrence does not blacklist a later standalone occurrence of the same href`() {
+        val pageHeightPx = 1200
+        val columnWidthPx = 800
+        val inlineMaxHeightPx = 300
+        val sharedHref = "mixed-use-plate.png"
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                image(0, sharedHref).copy(isInlineContent = true),
+                text(1, "Body between inline and standalone uses"),
+                image(2, sharedHref).copy(isInlineContent = false),
+            ),
+        )
+        val fullPageImageOffsets = flow.segments.mapNotNullTo(HashSet()) { segment ->
+            (segment.block as? EpubDisplayBlock.Image)
+                ?.takeIf { !it.isInlineContent }
+                ?.let { segment.layoutStart }
+        }
+        val fullPageHrefs = setOf(sharedHref)
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = columnWidthPx,
+            pageHeightProvider = { pageHeightPx },
+            inlineMaxHeightPx = inlineMaxHeightPx,
+            fullPageHrefs = fullPageHrefs,
+        )
+        val executor = QueuedExecutorService()
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { null },
+            executor = executor,
+            columnWidthPx = columnWidthPx,
+            pageHeightProvider = { pageHeightPx },
+            inlineMaxHeightPx = inlineMaxHeightPx,
+            fullPageHrefs = fullPageHrefs,
+            imageBoundsProvider = { EpubImageBounds(columnWidthPx, pageHeightPx) },
+        )
+        val context = RuntimeEnvironment.getApplication()
+        val spannable = epubBuildFlowSpannable(
+            context = context,
+            flow = flow,
+            style = style().copy(columnWidthPx = columnWidthPx, imageMaxHeightPx = pageHeightPx),
+            markwonTheme = io.noties.markwon.core.MarkwonTheme.create(context),
+            imageLoader = loader,
+            imageSizeResolver = resolver,
+            onLinkClick = {},
+            fullPageHrefs = fullPageHrefs,
+            fullPageImageOffsets = fullPageImageOffsets,
+        )
+        val imageSpans = spannable.getSpans(0, spannable.length, AsyncDrawableSpan::class.java)
+            .sortedBy { spannable.getSpanStart(it) }
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            columnWidthPx,
+            pageHeightPx,
+            android.graphics.Bitmap.Config.ARGB_8888,
+        )
+        try {
+            assertEquals(
+                Rect(0, 0, 200, inlineMaxHeightPx),
+                requireNotNull(loader.placeholder(imageSpans[0].drawable)).bounds,
+            )
+            assertEquals(
+                Rect(0, 0, columnWidthPx, pageHeightPx),
+                requireNotNull(loader.placeholder(imageSpans[1].drawable)).bounds,
+            )
+            imageSpans.forEach { span ->
+                span.drawable.initWithKnownDimensions(columnWidthPx, 32f)
+                span.drawable.setResult(BitmapDrawable(null, bitmap))
+            }
+
+            assertEquals(2, imageSpans.size)
+            assertTrue(
+                "the mixed-content occurrence must retain inline capped bounds",
+                imageSpans[0].drawable.bounds.height() <= inlineMaxHeightPx,
+            )
+            assertEquals(
+                "the later standalone occurrence must still use the full page despite sharing an inline href",
+                Rect(0, 0, columnWidthPx, pageHeightPx),
+                imageSpans[1].drawable.bounds,
+            )
+        } finally {
+            bitmap.recycle()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `heading image sizing does not contaminate a later occurrence of the same href`() {
+        val pageHeightPx = 1200
+        val columnWidthPx = 800
+        val sharedHref = "reused-plate.png"
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                heading(0, "Illustration"),
+                image(1, sharedHref),
+                text(2, "Body between the two occurrences"),
+                image(3, sharedHref),
+            ),
+        )
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = columnWidthPx,
+            pageHeightProvider = { pageHeightPx },
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = setOf(sharedHref),
+        )
+        val spannable = epubBuildFlowSpannable(
+            context = RuntimeEnvironment.getApplication(),
+            flow = flow,
+            style = style().copy(
+                fontSizeSp = 32f,
+                lineSpacingMultiplier = 1.3f,
+                columnWidthPx = columnWidthPx,
+                density = 1f,
+            ),
+            markwonTheme = io.noties.markwon.core.MarkwonTheme.create(RuntimeEnvironment.getApplication()),
+            imageLoader = AsyncDrawableLoader.noOp(),
+            imageSizeResolver = resolver,
+            onLinkClick = {},
+            fullPageHrefs = setOf(sharedHref),
+        )
+        val imageSpans = spannable.getSpans(0, spannable.length, AsyncDrawableSpan::class.java)
+            .sortedBy { spannable.getSpanStart(it) }
+        val bitmap = android.graphics.Bitmap.createBitmap(
+            columnWidthPx,
+            pageHeightPx,
+            android.graphics.Bitmap.Config.ARGB_8888,
+        )
+        try {
+            imageSpans.forEach { span ->
+                span.drawable.initWithKnownDimensions(columnWidthPx, 32f)
+                span.drawable.setResult(BitmapDrawable(null, bitmap))
+            }
+
+            assertEquals(2, imageSpans.size)
+            assertTrue(
+                "the occurrence attached to the heading must reserve space for that heading; " +
+                    "actual=${imageSpans[0].drawable.bounds}",
+                imageSpans[0].drawable.bounds.height() < pageHeightPx,
+            )
+            assertEquals(
+                "a standalone occurrence must retain full-page bounds even when its href was used after a heading",
+                Rect(0, 0, columnWidthPx, pageHeightPx),
+                imageSpans[1].drawable.bounds,
+            )
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    @Test
+    fun `large multiline h1 separator and attached image fit one page using measured layout height`() {
+        val pageHeightPx = 720
+        val columnWidthPx = 280
+        val fontSizeSp = 32f
+        val lineSpacingMultiplier = 1.3f
+        val imageHref = "heading-plate.png"
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                heading(0, "A large\nchapter\nheading\non five\nlines"),
+                image(1, imageHref),
+            ),
+        )
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = columnWidthPx,
+            pageHeightProvider = { pageHeightPx },
+            inlineMaxHeightPx = pageHeightPx,
+            fullPageHrefs = setOf(imageHref),
+        )
+        val context = RuntimeEnvironment.getApplication()
+        val spannable = epubBuildFlowSpannable(
+            context = context,
+            flow = flow,
+            style = style().copy(
+                fontSizeSp = fontSizeSp,
+                lineSpacingMultiplier = lineSpacingMultiplier,
+                columnWidthPx = columnWidthPx,
+                imageMaxHeightPx = pageHeightPx,
+                density = 1f,
+            ),
+            markwonTheme = io.noties.markwon.core.MarkwonTheme.create(context),
+            imageLoader = AsyncDrawableLoader.noOp(),
+            imageSizeResolver = resolver,
+            onLinkClick = {},
+            fullPageHrefs = setOf(imageHref),
+        )
+        val imageSpan = spannable.getSpans(0, spannable.length, AsyncDrawableSpan::class.java).single()
+        val bitmap = android.graphics.Bitmap.createBitmap(800, 2400, android.graphics.Bitmap.Config.ARGB_8888)
+        try {
+            imageSpan.drawable.initWithKnownDimensions(columnWidthPx, fontSizeSp)
+            imageSpan.drawable.setResult(BitmapDrawable(null, bitmap))
+            val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = fontSizeSp
+                typeface = android.graphics.Typeface.SERIF
+            }
+            val baseFontHeightPx = (paint.fontMetricsInt.descent - paint.fontMetricsInt.ascent).coerceAtLeast(1)
+            val spacingAddPx = ((lineSpacingMultiplier - 1f) * baseFontHeightPx).coerceAtLeast(0f)
+            val layout = android.text.StaticLayout.Builder.obtain(
+                spannable,
+                0,
+                spannable.length,
+                paint,
+                columnWidthPx,
+            )
+                .setIncludePad(false)
+                .setLineSpacing(spacingAddPx, 1f)
+                .build()
+            val headingSegment = flow.segments[0]
+            val imageSegment = flow.segments[1]
+            val firstHeadingLine = layout.getLineForOffset(headingSegment.layoutStart)
+            val lastHeadingLine = layout.getLineForOffset(headingSegment.layoutEnd - 1)
+            val imageLine = layout.getLineForOffset(imageSegment.layoutStart)
+            val headingAndSeparatorHeightPx = layout.getLineTop(imageLine) - layout.getLineTop(firstHeadingLine)
+            val completeGroupHeightPx = layout.getLineBottom(imageLine) - layout.getLineTop(firstHeadingLine)
+
+            assertTrue("the H1 precondition must exercise at least five measured lines", lastHeadingLine - firstHeadingLine + 1 >= 5)
+            assertTrue("the heading and separator leave positive room for an attached image", headingAndSeparatorHeightPx in 1 until pageHeightPx)
+            assertTrue(
+                "measured H1 + separator + image is ${completeGroupHeightPx}px, exceeding the ${pageHeightPx}px page",
+                completeGroupHeightPx <= pageHeightPx,
+            )
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    @Test
     fun `full page illustrations fit the usable viewport while inline images keep intrinsic size`() {
         val viewportStyle = style().copy(
             columnWidthPx = 760,
@@ -1084,13 +1310,12 @@ class EpubFlowSpannableTest {
         ) { null } as android.text.Spanned
         val drawable = spannable.getSpans(0, spannable.length, AsyncDrawableSpan::class.java).single().drawable
         val target = epubFlowImageTargetSize(
-            href = href,
             intrinsicWidth = intrinsicWidth,
             intrinsicHeight = intrinsicHeight,
             columnWidthPx = flowStyle.columnWidthPx,
             pageHeightPx = pageHeightPx,
             inlineMaxHeightPx = 720,
-            fullPageHrefs = fullPageHrefs,
+            isFullPage = href in fullPageHrefs,
         )
         drawable.initWithKnownDimensions(flowStyle.columnWidthPx, flowStyle.fontSizeSp * flowStyle.density)
         drawable.setResult(ColorDrawable(Color.GRAY).apply { bounds = target })

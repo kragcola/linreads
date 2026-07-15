@@ -9,6 +9,8 @@ import android.text.Layout
 import android.text.Spannable
 import android.text.SpannableStringBuilder
 import android.text.Spanned
+import android.text.StaticLayout
+import android.text.TextPaint
 import android.text.style.AlignmentSpan
 import android.text.style.BackgroundColorSpan
 import android.text.style.ForegroundColorSpan
@@ -22,6 +24,7 @@ import android.text.style.SubscriptSpan
 import android.text.style.SuperscriptSpan
 import android.text.style.TypefaceSpan
 import android.text.style.UnderlineSpan
+import android.util.TypedValue
 import dev.readflow.render.api.ReaderTextHighlightRange
 import io.noties.markwon.core.MarkwonTheme
 import io.noties.markwon.image.AsyncDrawable
@@ -29,6 +32,7 @@ import io.noties.markwon.image.AsyncDrawableLoader
 import io.noties.markwon.image.AsyncDrawableSpan
 import io.noties.markwon.image.ImageSizeResolver
 import io.noties.markwon.image.ImageSize
+import kotlin.math.ceil
 
 /**
  * Styling inputs for the continuous-flow Spannable. Pulled from engine state so font/spacing/theme
@@ -66,8 +70,20 @@ internal fun epubBuildFlowSpannable(
     onLinkClick: (EpubTextLink) -> Unit,
     highlightRanges: List<ReaderTextHighlightRange> = emptyList(),
     fullPageHrefs: Set<String> = emptySet(),
+    fullPageImageOffsets: Set<Int>? = null,
+    pageHeightProvider: () -> Int = { style.imageMaxHeightPx },
+    columnWidthProvider: () -> Int = { style.columnWidthPx },
 ): SpannableStringBuilder {
     val sb = SpannableStringBuilder(flow.text)
+    val attachedHeadingByImageOffset = buildMap {
+        flow.segments.forEachIndexed { index, segment ->
+            val heading = segment.block as? EpubDisplayBlock.Text ?: return@forEachIndexed
+            if (heading.headingLevel == null) return@forEachIndexed
+            val imageSegment = flow.nextContentSegmentAfter(index) ?: return@forEachIndexed
+            val image = imageSegment.block as? EpubDisplayBlock.Image ?: return@forEachIndexed
+            if (!image.isInlineContent) put(imageSegment.layoutStart, heading)
+        }
+    }
     flow.segments.forEach { seg ->
         when (val block = seg.block) {
             is EpubDisplayBlock.Text -> applyTextSpans(sb, seg, block, style, onLinkClick)
@@ -79,7 +95,22 @@ internal fun epubBuildFlowSpannable(
                 markwonTheme = markwonTheme,
                 imageLoader = imageLoader,
                 imageSizeResolver = imageSizeResolver,
-                isFullPage = block.href in fullPageHrefs,
+                isFullPage = fullPageImageOffsets?.contains(seg.layoutStart)
+                    ?: (block.href in fullPageHrefs),
+                maxHeightProvider = attachedHeadingByImageOffset[seg.layoutStart]
+                    ?.takeIf {
+                        fullPageImageOffsets?.contains(seg.layoutStart)
+                            ?: (block.href in fullPageHrefs)
+                    }
+                    ?.let { heading ->
+                        headingAttachedImageMaxHeightProvider(
+                            context = context,
+                            heading = heading,
+                            style = style,
+                            pageHeightProvider = pageHeightProvider,
+                            columnWidthProvider = columnWidthProvider,
+                        )
+                    },
             )
             is EpubDisplayBlock.Break -> Unit
         }
@@ -91,6 +122,82 @@ internal fun epubBuildFlowSpannable(
         if (e > s) sb.setSpan(BackgroundColorSpan(range.color), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
     }
     return sb
+}
+
+private fun headingAttachedImageMaxHeightProvider(
+    context: Context,
+    heading: EpubDisplayBlock.Text,
+    style: EpubFlowStyle,
+    pageHeightProvider: () -> Int,
+    columnWidthProvider: () -> Int,
+): () -> Int {
+    var measuredWidthPx = -1
+    var measuredPrefixHeightPx = 0
+    val imageLineSpacingPx = epubFlowLineSpacingAddPx(context, style)
+    return {
+        val columnWidthPx = columnWidthProvider().coerceAtLeast(1)
+        if (columnWidthPx != measuredWidthPx) {
+            measuredWidthPx = columnWidthPx
+            measuredPrefixHeightPx = epubMeasureHeadingPrefixHeightPx(
+                context = context,
+                heading = heading,
+                style = style.copy(columnWidthPx = columnWidthPx),
+                columnWidthPx = columnWidthPx,
+            )
+        }
+        (pageHeightProvider().coerceAtLeast(1) - measuredPrefixHeightPx - imageLineSpacingPx)
+            .coerceAtLeast(1)
+    }
+}
+
+internal fun epubMeasureHeadingPrefixHeightPx(
+    context: Context,
+    heading: EpubDisplayBlock.Text,
+    style: EpubFlowStyle,
+    columnWidthPx: Int,
+): Int {
+    val probe = epubBuildChapterFlow(
+        spineIndex = 0,
+        blocks = listOf(
+            heading.copy(paragraphIndex = 0),
+            EpubDisplayBlock.Break(paragraphIndex = 1),
+        ),
+    )
+    val text = SpannableStringBuilder(probe.text)
+    applyTextSpans(text, probe.segments.first(), heading.copy(paragraphIndex = 0), style, onLinkClick = {})
+    val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_SP,
+            style.fontSizeSp,
+            context.resources.displayMetrics,
+        )
+        typeface = style.typeface
+        color = style.inkColor
+    }
+    val layout = StaticLayout.Builder.obtain(text, 0, text.length, paint, columnWidthPx.coerceAtLeast(1))
+        .setIncludePad(false)
+        .setLineSpacing(epubFlowLineSpacingAddPx(paint, style.lineSpacingMultiplier), 1f)
+        .build()
+    val imageStartLine = layout.getLineForOffset(probe.segments.last().layoutStart)
+    return layout.getLineTop(imageStartLine).coerceAtLeast(0)
+}
+
+private fun epubFlowLineSpacingAddPx(context: Context, style: EpubFlowStyle): Int {
+    val paint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_SP,
+            style.fontSizeSp,
+            context.resources.displayMetrics,
+        )
+        typeface = style.typeface
+    }
+    return ceil(epubFlowLineSpacingAddPx(paint, style.lineSpacingMultiplier)).toInt()
+}
+
+private fun epubFlowLineSpacingAddPx(paint: TextPaint, multiplier: Float): Float {
+    val metrics = paint.fontMetricsInt
+    val fontHeightPx = (metrics.descent - metrics.ascent).coerceAtLeast(1)
+    return ((multiplier - 1f) * fontHeightPx).coerceAtLeast(0f)
 }
 
 private fun applyTextSpans(
@@ -216,17 +323,22 @@ private fun applyImageSpan(
     imageLoader: AsyncDrawableLoader,
     imageSizeResolver: ImageSizeResolver,
     isFullPage: Boolean,
+    maxHeightProvider: (() -> Int)?,
 ) {
     val start = seg.layoutStart
     val end = seg.layoutEnd
     if (end <= start) return
     // Markwon AsyncDrawable: decodes async into the attached TextView, sized by the resolver. No
     // eager bitmap retention (审计 M7). Anchored on the single U+FFFC char — never changes length.
-    val styledResolver = if (isFullPage) {
-        imageSizeResolver
+    val occurrenceResolver = EpubOccurrenceImageSizeResolver(imageSizeResolver, isFullPage)
+    val baseResolver = if (isFullPage) {
+        occurrenceResolver
     } else {
-        EpubCssImageSizeResolver(imageSizeResolver, block.style, style)
+        EpubCssImageSizeResolver(occurrenceResolver, block.style, style)
     }
+    val constrainedResolver = maxHeightProvider?.let { EpubMaxHeightImageSizeResolver(baseResolver, it) }
+        ?: baseResolver
+    val styledResolver = EpubOccurrenceImageSizeResolver(constrainedResolver, isFullPage)
     val imageSize = if (isFullPage) null else block.style.toImageSize(style)
     val asyncDrawable = AsyncDrawable(block.href, imageLoader, styledResolver, imageSize)
     val span = AsyncDrawableSpan(markwonTheme, asyncDrawable, AsyncDrawableSpan.ALIGN_CENTER, false)

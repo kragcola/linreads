@@ -41,6 +41,23 @@ class EpubFlowPaginatorTest {
         override fun getLineForOffset(offset: Int) = offset.coerceIn(0, heights.lastIndex.coerceAtLeast(0))
     }
 
+    private class OffsetGeometry(
+        private val starts: IntArray,
+        private val ends: IntArray,
+        private val lineHeight: Int = 10,
+    ) : LineGeometry {
+        override val lineCount: Int = starts.size
+        override fun getLineTop(line: Int) = line.coerceIn(0, lineCount) * lineHeight
+        override fun getLineBottom(line: Int) = (line + 1).coerceIn(0, lineCount) * lineHeight
+        override fun getLineStart(line: Int) = starts[line.coerceIn(starts.indices)]
+        override fun getLineEnd(line: Int) = ends[line.coerceIn(ends.indices)]
+        override fun getLineForVertical(y: Int) = (y / lineHeight).coerceIn(0, lineCount - 1)
+        override fun getLineForOffset(offset: Int): Int =
+            ends.indexOfFirst { end -> offset < end }
+                .takeIf { it >= 0 }
+                ?: ends.lastIndex
+    }
+
     @Test
     fun `fills each page to the viewport then breaks`() {
         // 10 lines @ 10px, page 30px → 3 lines per page → pages [0,3) [3,6) [6,9) [9,10).
@@ -146,6 +163,61 @@ class EpubFlowPaginatorTest {
         )
         assertEquals(2, pages[0].endLineExclusive) // heading (line2) NOT on page0
         assertEquals(2, pages[1].startLine) // heading starts page1
+    }
+
+    @Test
+    fun `heading and following image move together when a separator reaches the page bottom`() {
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Text("AB", headingLevel = null, paragraphIndex = 0),
+                EpubDisplayBlock.Text("Illustration", headingLevel = 2, paragraphIndex = 1),
+                EpubDisplayBlock.Image("images/plate.png", altText = "Plate", paragraphIndex = 2),
+            ),
+        )
+        val body = flow.segments[0]
+        val heading = flow.segments[1]
+        val image = flow.segments[2]
+        val geometry = OffsetGeometry(
+            starts = intArrayOf(
+                body.layoutStart,
+                body.layoutStart + 1,
+                heading.layoutStart,
+                heading.layoutEnd,
+                image.layoutStart,
+            ),
+            ends = intArrayOf(
+                body.layoutStart + 1,
+                heading.layoutStart,
+                heading.layoutEnd,
+                image.layoutStart,
+                image.layoutEnd,
+            ),
+        )
+
+        val pages = epubPaginateFlow(
+            geometry = geometry,
+            pageHeightPx = 40,
+            isHeadingLine = { line ->
+                geometry.getLineStart(line) < heading.layoutEnd &&
+                    geometry.getLineEnd(line) > heading.layoutStart
+            },
+            keepTogetherLineRange = { line ->
+                if (line in 2..4) 2..5 else null
+            },
+        )
+
+        assertEquals(
+            "the separator must not strand the heading on the previous page",
+            2,
+            pages[0].endLineExclusive,
+        )
+        assertEquals(2, pages[1].startLine)
+        assertEquals(5, pages[1].endLineExclusive)
+        assertTrue("the complete heading-image group must fit without clipping", pages[1].bottomPx - pages[1].topPx <= 40)
+        assertTrue(heading.layoutStart >= pages[1].startOffset && heading.layoutEnd <= pages[1].endOffset)
+        assertTrue(image.layoutStart >= pages[1].startOffset && image.layoutEnd <= pages[1].endOffset)
+        assertEquals("the image locator must remain mapped to its source block", 2 to 0, flow.paragraphAtOffset(image.layoutStart))
     }
 
     @Test

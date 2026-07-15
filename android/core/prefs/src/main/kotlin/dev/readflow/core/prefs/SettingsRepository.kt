@@ -31,6 +31,9 @@ interface SettingsRepository {
     /** 分页模式翻页动画风格（滑动/仿真/无）。 */
     val pageFlipStyle: Flow<PageFlipStyle>
 
+    /** Installs this release's typography baseline once; later user changes remain untouched. */
+    suspend fun ensureCurrentTypographyBaseline(): Boolean = false
+
     suspend fun setCalibreBaseUrl(url: String)
     suspend fun setFontSize(size: Int)
     suspend fun setLineSpacing(multiplier: Float)

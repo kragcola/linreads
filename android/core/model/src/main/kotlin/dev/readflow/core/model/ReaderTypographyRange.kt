@@ -12,5 +12,5 @@ object ReaderTypographyRange {
 
     const val MIN_LINE_SPACING = 1.0f
     const val MAX_LINE_SPACING = 2.2f
-    const val DEFAULT_LINE_SPACING = 1.0f
+    const val DEFAULT_LINE_SPACING = 1.3f
 }

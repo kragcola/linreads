@@ -7,10 +7,8 @@
 | Web | Dev server | `cd web && npm run dev` |
 | Web | Build | `cd web && npm run build` |
 | Web | Type check | `cd web && npx tsc --noEmit` |
-| Android | Build debug APK (phase 2) | `cd android && ./gradlew -Preadflow.phase=2 assembleDebug` |
-| Android | Build phase 1 (foundation) | `cd android && ./gradlew -Preadflow.phase=1 assembleDebug` |
-| Android | Run tests | `cd android && ./gradlew test` |
-| Android | Lint | `cd android && ./gradlew lint` |
+| Android | Local targeted test only | `cd android && ./gradlew <module>:test... --tests '<test>'` |
+| Android | Full regression / R8 / OTA build | GitHub Actions only |
 | Android | Push OTA update to tablet | `git push` → Actions builds → tablet notified automatically |
 | HarmonyOS | Build | DevEco Studio → Build → Build Hap |
 
@@ -73,15 +71,24 @@ compact 后任务判定：system-reminder 注入的 `### Skill:` 段尾若带 `A
 
 ## Dev Testing — OTA 推送更新
 
-改完代码后，**一条命令**把新版推到远端平板：
+### Build resource policy
+
+- Full Android regression suites, R8/minification, and `:app:assembleOta` run in GitHub Actions only.
+- Local Android verification is limited to the smallest targeted test tasks needed for the current change.
+- After pushing, monitor `.github/workflows/android-release.yml` through completion and verify the published `dev-latest` APK; do not duplicate that release build locally.
+
+改完代码后，先检查工作树并只暂存本次文件，再推送到远端平板：
 
 ```bash
-git add -A && git commit -m "feat: ..." && git push
+git status --short
+git add <files changed for this release>
+git commit -m "feat: ..."
+git push
 ```
 
 自动流程：
 1. `git push` → GitHub Actions 触发（见 [`.github/workflows/android-release.yml`](.github/workflows/android-release.yml)）
-2. Actions 构建 `phase=2` debug APK，~3-4 分钟
+2. Actions 运行 `phase=2` 全量回归并构建经过 R8/minification 的 OTA APK
 3. 上传到 [`dev-latest` Release](https://github.com/kragcola/linreads/releases/tag/dev-latest)
 4. 平板切到前台后约 8 秒：弹出系统通知「LinReads 新版本可用」
 5. 点通知 → 下载 → 系统安装器 → 完成

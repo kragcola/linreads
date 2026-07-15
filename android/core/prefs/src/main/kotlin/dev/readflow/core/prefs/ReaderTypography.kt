@@ -7,6 +7,9 @@ import dev.readflow.core.model.ReaderTypographyRange
  * Persisted theme profile validation uses the same core model bounds.
  */
 object ReaderTypography {
+    /** Bump only when a release intentionally installs a new baseline for every user. */
+    const val BASELINE_VERSION = 1
+
     const val MIN_FONT_SP = ReaderTypographyRange.MIN_FONT_SP
     const val MAX_FONT_SP = ReaderTypographyRange.MAX_FONT_SP
     /** 12..32sp，1sp 步进 → Slider steps（不含两端）。 */

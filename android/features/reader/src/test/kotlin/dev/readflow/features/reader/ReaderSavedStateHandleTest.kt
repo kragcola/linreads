@@ -35,6 +35,7 @@ import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.TransitionType
+import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.model.Bookmark
 import dev.readflow.core.sync.NoOpSyncBackend
@@ -286,6 +287,7 @@ class ReaderSavedStateHandleTest {
         val error = ReadflowError.io("之前打开失败")
         val handle = SavedStateHandle(
             mapOf(
+                READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY to ReaderTypography.BASELINE_VERSION,
                 READER_STATE_SAVED_STATE_KEY to Json.encodeToString(
                     ReaderState(
                         bookId = "book-1",
@@ -325,6 +327,7 @@ class ReaderSavedStateHandleTest {
         val restoredLocator = Locator(LocatorStrategy.Page(index = 4, total = 10), totalProgression = 0.4f)
         val handle = SavedStateHandle(
             mapOf(
+                READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY to ReaderTypography.BASELINE_VERSION,
                 READER_STATE_SAVED_STATE_KEY to readerStateJsonWithLineSpacing(
                     ReaderState(
                         bookId = "book-1",
@@ -369,6 +372,40 @@ class ReaderSavedStateHandleTest {
             "initial global settings replay must not override the restored book geometry, events=$events",
             events.indexOf("setLineSpacing:1.1") !in 0..events.lastIndex,
         )
+    }
+
+    @Test
+    fun `legacy saved reader typography is reset without losing reading state`() = runTest(dispatcher) {
+        val locator = Locator(LocatorStrategy.Page(index = 4, total = 10), totalProgression = 0.4f)
+        val handle = SavedStateHandle(
+            mapOf(
+                READER_STATE_SAVED_STATE_KEY to readerStateJsonWithLineSpacing(
+                    ReaderState(
+                        bookId = "book-1",
+                        currentLocator = locator,
+                        fontSize = 24,
+                        readingMode = ReaderReadingMode.PAGED,
+                        theme = ThemeMode.SEPIA,
+                    ),
+                    lineSpacing = 2.0f,
+                ),
+            ),
+        )
+
+        val viewModel = readerViewModel(
+            handle = handle,
+            engine = FakeReaderEngine(locator),
+        )
+
+        assertEquals(18f, viewModel.uiState.value.fontSizeSp, 0.001f)
+        assertEquals(1.3f, viewModel.uiState.value.lineSpacing, 0.001f)
+        assertEquals(ReadingMode.PAGED, viewModel.uiState.value.readingMode)
+        assertEquals(ThemeMode.SEPIA, viewModel.uiState.value.themeMode)
+        assertEquals(ReaderTypography.BASELINE_VERSION, handle[READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY])
+        val migrated = Json.decodeFromString<ReaderState>(checkNotNull(handle[READER_STATE_SAVED_STATE_KEY]))
+        assertEquals(locator, migrated.currentLocator)
+        assertEquals(18, migrated.fontSize)
+        assertEquals(1.3f, migrated.lineSpacing, 0.001f)
     }
 
     @Test
