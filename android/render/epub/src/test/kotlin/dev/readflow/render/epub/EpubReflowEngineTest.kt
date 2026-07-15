@@ -2399,6 +2399,171 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `released boundary swipe commits after a slow adjacent image renderer becomes stable`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("boundary-swipe-slow-image-renderer.epub")
+        writeBoundaryImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 600))
+        host.measure(exactly(360), exactly(600))
+        host.layout(0, 0, 360, 600)
+
+        val previewView = awaitBoundaryPreviewSession(engine, forward = true)
+        previewView.pendingDecodesProvider = { true }
+        val emissions = mutableListOf<LocatorStrategy.Section>()
+        val locatorJob = launch {
+            engine.currentLocator.collect { locator ->
+                (locator.strategy as? LocatorStrategy.Section)?.let(emissions::add)
+            }
+        }
+        runCurrent()
+        emissions.clear()
+        val x = flowView.width * 0.85f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            flowView.dispatchTouchEvent(
+                MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, flowView.height * 0.85f, 0),
+            )
+            flowView.dispatchTouchEvent(
+                MotionEvent.obtain(
+                    downTime,
+                    downTime + 100L,
+                    MotionEvent.ACTION_MOVE,
+                    x,
+                    flowView.height * 0.65f,
+                    0,
+                ),
+            )
+            flowView.dispatchTouchEvent(
+                MotionEvent.obtain(
+                    downTime,
+                    downTime + 200L,
+                    MotionEvent.ACTION_UP,
+                    x,
+                    flowView.height * 0.50f,
+                    0,
+                ),
+            )
+            assertEquals("BOUNDARY_DISCRETE_WAITING", flowView.privateField("interactiveTurnState").toString())
+
+            shadowOf(Looper.getMainLooper()).idleFor(3_500L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "a released turn must remain required throughout the adjacent renderer window",
+                "BOUNDARY_DISCRETE_WAITING",
+                flowView.privateField("interactiveTurnState").toString(),
+            )
+            @Suppress("UNCHECKED_CAST")
+            val sessions = engine.privateField("boundaryPreviewSessions") as Map<Boolean, Any>
+            assertTrue("the required hidden renderer must not be cancelled early", sessions.containsKey(true))
+
+            previewView.pendingDecodesProvider = { false }
+            previewView.onAsyncImageDecodeFinished()
+            previewView.viewTreeObserver.dispatchOnPreDraw()
+            awaitCondition("the accepted swipe must settle in the adjacent chapter") {
+                (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1
+            }
+            runCurrent()
+
+            assertEquals("the boundary transaction must publish one stable locator", 1, emissions.size)
+            assertEquals(1, emissions.single().spineIndex)
+        } finally {
+            locatorJob.cancel()
+            previewView.pendingDecodesProvider = { false }
+            engine.close()
+        }
+    }
+
+    @Test
+    fun `timed out required boundary renderer rejects its wait and a retry can commit`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("boundary-required-timeout-retry.epub")
+        writeBoundaryImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.SLIDE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 600))
+        host.measure(exactly(360), exactly(600))
+        host.layout(0, 0, 360, 600)
+
+        fun dispatchAcceptedSwipe() {
+            val x = flowView.width * 0.85f
+            val downTime = SystemClock.uptimeMillis()
+            flowView.dispatchTouchEvent(
+                MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, flowView.height * 0.85f, 0),
+            )
+            flowView.dispatchTouchEvent(
+                MotionEvent.obtain(
+                    downTime,
+                    downTime + 100L,
+                    MotionEvent.ACTION_MOVE,
+                    x,
+                    flowView.height * 0.65f,
+                    0,
+                ),
+            )
+            flowView.dispatchTouchEvent(
+                MotionEvent.obtain(
+                    downTime,
+                    downTime + 200L,
+                    MotionEvent.ACTION_UP,
+                    x,
+                    flowView.height * 0.50f,
+                    0,
+                ),
+            )
+        }
+
+        val timedOutPreviewView = awaitBoundaryPreviewSession(engine, forward = true)
+        timedOutPreviewView.pendingDecodesProvider = { true }
+        try {
+            dispatchAcceptedSwipe()
+            assertEquals("BOUNDARY_DISCRETE_WAITING", flowView.privateField("interactiveTurnState").toString())
+
+            shadowOf(Looper.getMainLooper()).idleFor(10_001L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "renderer timeout must explicitly reject the required gesture",
+                "NONE",
+                flowView.privateField("interactiveTurnState").toString(),
+            )
+            assertTrue(
+                "renderer timeout must remove the stale hidden session",
+                (engine.privateField("boundaryPreviewSessions") as Map<*, *>).isEmpty(),
+            )
+            assertEquals(0, (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex)
+
+            dispatchAcceptedSwipe()
+            assertEquals("BOUNDARY_DISCRETE_WAITING", flowView.privateField("interactiveTurnState").toString())
+            val retryPreviewView = awaitBoundaryPreviewSession(engine, forward = true)
+            assertTrue("retry must install a fresh hidden renderer", retryPreviewView !== timedOutPreviewView)
+            retryPreviewView.pendingDecodesProvider = { false }
+            retryPreviewView.onAsyncImageDecodeFinished()
+            retryPreviewView.viewTreeObserver.dispatchOnPreDraw()
+
+            awaitCondition("the retry must settle in the adjacent chapter") {
+                (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1
+            }
+        } finally {
+            timedOutPreviewView.pendingDecodesProvider = { false }
+            engine.close()
+        }
+    }
+
+    @Test
     fun `required boundary wait promotes an existing speculative renderer before shot admission`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("boundary-preview-required-promotion.epub")

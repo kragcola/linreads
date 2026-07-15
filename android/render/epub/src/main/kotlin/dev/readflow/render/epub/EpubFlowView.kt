@@ -289,14 +289,6 @@ internal class EpubFlowView(
     private var waitingBoundaryX = 0f
     private var waitingBoundaryY = 0f
     private var waitingDiscreteBoundaryForward = true
-    private val boundaryDiscreteWaitTimeoutRunnable = Runnable {
-        if (boundaryDiscreteWaiting) {
-            val forward = waitingDiscreteBoundaryForward
-            interactiveTurnState = InteractiveTurnState.NONE
-            onBoundaryPreviewRequestCancelled?.invoke(forward)
-            releasePageShotBudgetForBoundaryPreview(forward)
-        }
-    }
 
     /** Requests an adjacent chapter preview without turning the request into semantic navigation. */
     var onBoundaryPreviewNeeded: ((forward: Boolean, sourceChapterGeneration: Long) -> Unit)? = null
@@ -1609,7 +1601,6 @@ internal class EpubFlowView(
                 flipped = true
             }
             boundaryDiscreteWaiting && waitingDiscreteBoundaryForward == forward -> {
-                removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
                 interactiveTurnState = InteractiveTurnState.NONE
                 releasePageShotBudgetForBoundaryPreview(forward)
             }
@@ -1691,7 +1682,6 @@ internal class EpubFlowView(
         pageShotSpeculationPaused = true
         cancelWaitingBoundaryTurn(invalidateRequest = false)
         if (boundaryDiscreteWaiting) interactiveTurnState = InteractiveTurnState.NONE
-        removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
         recycleCachedTextures()
         listOfNotNull(forwardBoundaryPreview, backwardBoundaryPreview).forEach { preview ->
             onBoundaryTurnDiscarded?.invoke(preview)
@@ -1746,7 +1736,6 @@ internal class EpubFlowView(
         if (boundaryOwnsAnimator) flipAnimator?.cancel()
         cancelWaitingBoundaryTurn(invalidateRequest = false)
         if (boundaryDiscreteWaiting) interactiveTurnState = InteractiveTurnState.NONE
-        removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
         activeBoundaryPreview?.let { preview ->
             activeBoundaryPreview = null
             clearFlipOverlay()
@@ -1765,7 +1754,6 @@ internal class EpubFlowView(
         removeCallbacks(revealSafetyRunnable)
         removeCallbacks(reflowRunnable)
         removeCallbacks(conversionSnapshotClearRunnable)
-        removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
         flipAnimator?.cancel()
         flipAnimator = null
         activeBoundaryPreview?.let { onBoundaryTurnDiscarded?.invoke(it) }
@@ -2096,17 +2084,18 @@ internal class EpubFlowView(
     }
 
     fun startDiscreteBoundaryTurn(delta: Int): Boolean {
-        if (delta == 0 || mode != Mode.PAGED || paged.isEmpty() || width <= 0 || height <= 0) return false
+        if (disposed || delta == 0 || mode != Mode.PAGED || paged.isEmpty() || width <= 0 || height <= 0) {
+            return false
+        }
         if (boundaryContinuityCover && awaitingStableChapter) return true
         if (turnInFlight) return true
         val forward = delta > 0
         val preview = takeBoundaryPreview(forward)
         if (preview == null) {
+            val requestPreview = onBoundaryPreviewNeeded ?: return false
             waitingDiscreteBoundaryForward = forward
             interactiveTurnState = InteractiveTurnState.BOUNDARY_DISCRETE_WAITING
-            removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
-            postDelayed(boundaryDiscreteWaitTimeoutRunnable, BOUNDARY_DISCRETE_WAIT_TIMEOUT_MS)
-            onBoundaryPreviewNeeded?.invoke(forward, boundaryPreviewGeneration)
+            requestPreview(forward, boundaryPreviewGeneration)
             return true
         }
         startBoundaryDiscreteTurn(preview)
@@ -2115,7 +2104,6 @@ internal class EpubFlowView(
 
     private fun startWaitingDiscreteBoundaryTurnIfReady() {
         if (!boundaryDiscreteWaiting) return
-        removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
         val preview = takeBoundaryPreview(waitingDiscreteBoundaryForward) ?: return
         startBoundaryDiscreteTurn(preview)
     }
@@ -3061,7 +3049,7 @@ internal class EpubFlowView(
         latestX: Float?,
         latestY: Float?,
     ): InteractiveTurnStartResult {
-        if (!pageTurnAnimated || mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) {
+        if (disposed || !pageTurnAnimated || mode != Mode.PAGED || paged.isEmpty() || width == 0 || height == 0) {
             return InteractiveTurnStartResult.REJECTED
         }
         if (boundaryContinuityCover && awaitingStableChapter) return InteractiveTurnStartResult.REJECTED
@@ -3071,11 +3059,12 @@ internal class EpubFlowView(
         if (targetWindow == null) {
             val preview = takeBoundaryPreview(forward)
             if (preview == null) {
+                val requestPreview = onBoundaryPreviewNeeded ?: return InteractiveTurnStartResult.REJECTED
                 interactiveTurnState = InteractiveTurnState.BOUNDARY_WAITING
                 waitingBoundaryForward = forward
                 waitingBoundaryAxis = axis
                 waitingBoundaryAnchor = anchor
-                onBoundaryPreviewNeeded?.invoke(forward, boundaryPreviewGeneration)
+                requestPreview(forward, boundaryPreviewGeneration)
                 return InteractiveTurnStartResult.WAITING
             }
             return startBoundaryInteractiveCurl(
@@ -3485,8 +3474,8 @@ internal class EpubFlowView(
 
     /**
      * Settles the interactive turn on release: commit (animate to fully turned, keep the incoming page)
-     * when the drag passed half the width OR flung hard enough in the turn direction; otherwise spring
-     * back (animate to flat, restore the outgoing page). Only a committed turn reports the new offset.
+     * once the classified drag still exceeds the directional threshold, or when it flung hard enough
+     * in the turn direction. Returning inside that threshold springs back; ACTION_CANCEL always aborts.
      */
     private fun endInteractiveCurl(velocity: Float) {
         settleInteractiveCurl(velocity = velocity, cancelled = false)
@@ -3505,9 +3494,11 @@ internal class EpubFlowView(
             curlTargetWindow = null
             return
         }
+        val extentPx = if (curlAxis == InteractiveTurnAxis.HORIZONTAL) width else height
         val commit = shouldCommitInteractiveTurn(
             forward = curlForward,
             progress = progressNow,
+            extentPx = extentPx,
             velocity = velocity,
             cancelled = cancelled,
         )
@@ -3529,7 +3520,6 @@ internal class EpubFlowView(
         }
         val forward = curlForward
         val distance = kotlin.math.abs(end - start)
-        val extentPx = if (curlAxis == InteractiveTurnAxis.HORIZONTAL) width else height
         val progressVelocity = if (curlForward) -velocity else velocity
         val velocityTowardTarget = if (commit) progressVelocity else -progressVelocity
         val towardProgressPerSecond = if (extentPx > 0) {
@@ -3983,7 +3973,13 @@ internal class EpubFlowView(
         val progress = if (extent > 0) (travel / extent.toFloat()).coerceIn(0f, 1f) else 0f
         if (
             pageTurnAnimated &&
-            !shouldCommitInteractiveTurn(waitingBoundaryForward, progress, velocity, cancelled = false)
+            !shouldCommitInteractiveTurn(
+                forward = waitingBoundaryForward,
+                progress = progress,
+                extentPx = extent,
+                velocity = velocity,
+                cancelled = false,
+            )
         ) {
             cancelWaitingBoundaryTurn()
             return
@@ -3992,13 +3988,12 @@ internal class EpubFlowView(
         interactiveTurnState = InteractiveTurnState.BOUNDARY_DISCRETE_WAITING
         waitingBoundaryX = 0f
         waitingBoundaryY = 0f
-        removeCallbacks(boundaryDiscreteWaitTimeoutRunnable)
-        postDelayed(boundaryDiscreteWaitTimeoutRunnable, BOUNDARY_DISCRETE_WAIT_TIMEOUT_MS)
     }
 
     private fun shouldCommitInteractiveTurn(
         forward: Boolean,
         progress: Float,
+        extentPx: Int,
         velocity: Float,
         cancelled: Boolean,
     ): Boolean {
@@ -4008,7 +4003,7 @@ internal class EpubFlowView(
         } else {
             velocity > flipFlingThresholdPxPerSec
         }
-        return progress >= 0.5f || flung
+        return progress * extentPx >= flipDominanceThresholdPx || flung
     }
 
     private fun applyClassifiedMove(ev: MotionEvent) {
@@ -4104,11 +4099,15 @@ internal class EpubFlowView(
             startBoundaryDiscreteTurn(preview)
             return
         }
+        val requestPreview = onBoundaryPreviewNeeded ?: run {
+            flipped = true
+            return
+        }
         interactiveTurnState = InteractiveTurnState.BOUNDARY_WAITING
         waitingBoundaryForward = forward
         waitingBoundaryAxis = axis
         waitingBoundaryAnchor = anchor
-        onBoundaryPreviewNeeded?.invoke(forward, boundaryPreviewGeneration)
+        requestPreview(forward, boundaryPreviewGeneration)
     }
 
     private fun trackVelocity(ev: MotionEvent) {
@@ -4158,7 +4157,6 @@ internal class EpubFlowView(
         const val REVEAL_FADE_MS = 120L
         /** Maximum wait for layout stability before forcing reveal (MoonReader 800ms safety net). */
         const val REVEAL_SAFETY_MS = 800L
-        const val BOUNDARY_DISCRETE_WAIT_TIMEOUT_MS = 3_000L
         const val FREE_FLING_MIN_SETTLE_MS = 64L
         const val FREE_FLING_STABLE_FRAMES = 2
     }

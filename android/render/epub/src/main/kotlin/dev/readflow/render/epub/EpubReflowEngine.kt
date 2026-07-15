@@ -1097,26 +1097,27 @@ class EpubReflowEngine private constructor(
         boundaryPreviewJobTokens[forward] = requestId
         boundaryPreviewJobs[forward] = flowExecutor.submit {
             var startupSpine: EpubStartupSpine? = null
-            fun blocksFrom(indexedBook: EpubLazyBook): List<EpubDisplayBlock> =
-                indexedBook.layoutBlocks().filter { block ->
-                    indexedBook.paras.getOrNull(block.paragraphIndex)?.spineIndex == targetSpine
+            val targetFlow = runCatching {
+                fun blocksFrom(indexedBook: EpubLazyBook): List<EpubDisplayBlock> =
+                    indexedBook.layoutBlocks().filter { block ->
+                        indexedBook.paras.getOrNull(block.paragraphIndex)?.spineIndex == targetSpine
+                    }
+                var blocks = when {
+                    book != null -> blocksFrom(book)
+                    session != null -> session.ensureAdjacent(sourceSpine, targetSpine)
+                        ?.also { startupSpine = it }
+                        ?.globalBlocks
+                        .orEmpty()
+                    else -> emptyList()
                 }
-            var blocks = when {
-                book != null -> blocksFrom(book)
-                session != null -> session.ensureAdjacent(sourceSpine, targetSpine)
-                    ?.also { startupSpine = it }
-                    ?.globalBlocks
-                    .orEmpty()
-                else -> emptyList()
-            }
-            if (session != null && startupSession !== session) {
-                lazyBook?.let { promotedBook ->
-                    startupSpine = null
-                    blocks = blocksFrom(promotedBook)
+                if (session != null && startupSession !== session) {
+                    lazyBook?.let { promotedBook ->
+                        startupSpine = null
+                        blocks = blocksFrom(promotedBook)
+                    }
                 }
-            }
-            val targetFlow = runCatching { epubBuildChapterFlow(targetSpine, blocks) }.getOrNull()
-                ?.takeIf { blocks.isNotEmpty() }
+                epubBuildChapterFlow(targetSpine, blocks).takeIf { blocks.isNotEmpty() }
+            }.getOrNull()
             flowMainHandler.post {
                 if (boundaryPreviewJobTokens[forward] != requestId) return@post
                 boundaryPreviewJobs.remove(forward)

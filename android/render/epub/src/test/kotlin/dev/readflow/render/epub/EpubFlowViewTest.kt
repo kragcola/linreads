@@ -103,7 +103,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `cancelled interactive turn restores the exact free rest viewport`() {
+    fun `release inside the directional threshold restores the exact free rest viewport`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         val pageOneTop = requireNotNull(view.pageTopPxAt(1))
@@ -113,11 +113,50 @@ class EpubFlowViewTest {
         view.scrollTo(0, freeRest)
 
         assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
-        view.updateInteractiveCurl(x = view.width * 0.75f)
+        view.updateInteractiveCurl(x = view.width * 0.50f)
+        view.updateInteractiveCurl(x = view.width * 0.97f)
         view.endInteractiveCurl(velocityX = 0f)
         shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
 
         assertEquals("a cancelled turn must restore the viewport that was under the finger", freeRest, view.scrollY)
+    }
+
+    @Test
+    fun `boundary drag that returns inside the directional threshold cancels its cold request`() {
+        val requests = mutableListOf<Pair<Boolean, Long>>()
+        val cancellations = mutableListOf<Boolean>()
+        val commits = mutableListOf<Any>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE).apply {
+            onBoundaryPreviewNeeded = { forward, generation -> requests += forward to generation }
+            onBoundaryPreviewRequestCancelled = cancellations::add
+            installBoundaryCommitRecorderForTest(commits)
+        }
+        view.goToLastPage()
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, view.width * 0.85f, y),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 100L, MotionEvent.ACTION_MOVE, view.width * 0.50f, y),
+            )
+            assertEquals("BOUNDARY_WAITING", view.privateField("interactiveTurnState").toString())
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 300L, MotionEvent.ACTION_MOVE, view.width * 0.82f, y),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 450L, MotionEvent.ACTION_UP, view.width * 0.82f, y),
+            )
+
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertEquals(listOf(true to view.boundaryPreviewGenerationToken()), requests)
+            assertEquals(listOf(true), cancellations)
+            assertTrue(commits.isEmpty())
+        } finally {
+            view.dispose()
+        }
     }
 
     @Test
@@ -526,11 +565,13 @@ class EpubFlowViewTest {
     fun `committed boundary drag keeps its intent until a late preview arrives`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val commits = mutableListOf<Any>()
+        val previewRequests = mutableListOf<Boolean>()
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SIMULATION,
             onTapZone = tapZones::add,
         )
         view.installBoundaryCommitRecorderForTest(commits)
+        view.onBoundaryPreviewNeeded = { forward, _ -> previewRequests += forward }
         view.goToLastPage()
         val downX = view.width * 0.75f
         val moveX = view.width * 0.10f
@@ -543,6 +584,7 @@ class EpubFlowViewTest {
             view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
 
             assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
+            assertEquals(listOf(true), previewRequests)
             view.offerReadyBoundaryPreviewForTest(forward = true, token = 3L)
             shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
 
@@ -557,6 +599,7 @@ class EpubFlowViewTest {
     fun `NONE boundary swipe keeps the same late preview intent as an in chapter hard turn`() {
         lateinit var view: EpubFlowView
         val commits = mutableListOf<Any>()
+        val previewRequests = mutableListOf<Boolean>()
         view = pagedFlowView(
             flipStyle = PageFlipStyle.NONE,
             onTapZone = { zone ->
@@ -564,6 +607,7 @@ class EpubFlowViewTest {
             },
         )
         view.installBoundaryCommitRecorderForTest(commits)
+        view.onBoundaryPreviewNeeded = { forward, _ -> previewRequests += forward }
         view.goToLastPage()
         val downX = view.width * 0.85f
         val moveX = view.width * 0.05f
@@ -574,6 +618,7 @@ class EpubFlowViewTest {
             view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
             view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
             assertEquals("BOUNDARY_WAITING", view.privateField("interactiveTurnState").toString())
+            assertEquals(listOf(true), previewRequests)
 
             view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, y))
             assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
@@ -868,7 +913,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `discrete boundary cache miss timeout releases state for another turn`() {
+    fun `engine rejection releases a discrete boundary wait for another turn`() {
         val previewRequests = mutableListOf<Pair<Boolean, Long>>()
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE).apply {
             onBoundaryPreviewNeeded = { forward, generation ->
@@ -885,11 +930,16 @@ class EpubFlowViewTest {
             shadowOf(Looper.getMainLooper()).idleFor(3_001L, TimeUnit.MILLISECONDS)
 
             assertEquals(
-                "a cold preview timeout must release turnInFlight",
-                "NONE",
+                "the view must retain accepted navigation until the preview producer resolves it",
+                "BOUNDARY_DISCRETE_WAITING",
                 view.privateField("interactiveTurnState").toString(),
             )
-            assertTrue("the reader must accept another turn after timeout", view.startDiscreteBoundaryTurn(1))
+            assertEquals("waiting must not restart or duplicate the producer request", 1, previewRequests.size)
+
+            view.rejectBoundaryPreview(forward = true, sourceChapterGeneration = previewRequests.single().second)
+
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertTrue("the reader must accept another turn after engine rejection", view.startDiscreteBoundaryTurn(1))
             assertEquals("the retry must request a fresh preview", 2, previewRequests.size)
             assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
 
@@ -904,6 +954,40 @@ class EpubFlowViewTest {
             assertEquals(3, previewRequests.size)
         } finally {
             view.dispose()
+        }
+    }
+
+    @Test
+    fun `missing boundary preview producer never leaves a turn waiting`() {
+        val discrete = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        discrete.goToLastPage()
+        try {
+            assertFalse(discrete.startDiscreteBoundaryTurn(1))
+            assertEquals("NONE", discrete.privateField("interactiveTurnState").toString())
+        } finally {
+            discrete.dispose()
+        }
+
+        listOf(PageFlipStyle.SLIDE, PageFlipStyle.NONE).forEach { style ->
+            val view = pagedFlowView(flipStyle = style)
+            view.goToLastPage()
+            val y = view.height * 0.10f
+            val downTime = SystemClock.uptimeMillis()
+            try {
+                view.dispatchTouchEvent(
+                    motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, view.width * 0.85f, y),
+                )
+                view.dispatchTouchEvent(
+                    motionEvent(downTime, downTime + 100L, MotionEvent.ACTION_MOVE, view.width * 0.50f, y),
+                )
+                view.dispatchTouchEvent(
+                    motionEvent(downTime, downTime + 200L, MotionEvent.ACTION_UP, view.width * 0.50f, y),
+                )
+
+                assertEquals("style=$style", "NONE", view.privateField("interactiveTurnState").toString())
+            } finally {
+                view.dispose()
+            }
         }
     }
 
@@ -2596,7 +2680,7 @@ class EpubFlowViewTest {
                     val targetPage = view.currentPageIndex()
                     val targetTop = view.scrollY
                     val targetOffset = view.topLayoutOffset()
-                    view.updateInteractiveCurl(x = view.width * if (commit) 0.25f else 0.75f)
+                    view.updateInteractiveCurl(x = view.width * if (commit) 0.25f else 0.97f)
                     view.endInteractiveCurl(velocityX = 0f)
                     val oldAnimator = checkNotNull(
                         view.privateField("flipAnimator") as android.animation.ValueAnimator?,
@@ -3030,6 +3114,51 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `accepted boundary swipe survives the adjacent renderer completion window`() {
+        val commits = mutableListOf<Any>()
+        val cancellations = mutableListOf<Boolean>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportHeight = 600,
+        ).apply {
+            installBoundaryCommitRecorderForTest(commits)
+            onBoundaryPreviewRequestCancelled = cancellations::add
+        }
+        view.goToLastPage()
+        view.onBoundaryPreviewNeeded = { forward, sourceGeneration ->
+            val preview = BoundaryPagePreview(
+                token = 57L,
+                forward = forward,
+                sourceChapterGeneration = sourceGeneration,
+                bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888),
+            )
+            view.postDelayed({ view.offerBoundaryPreview(preview) }, 3_500L)
+        }
+        val x = view.width * 0.85f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, view.height * 0.85f),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 100L, MotionEvent.ACTION_MOVE, x, view.height * 0.65f),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 200L, MotionEvent.ACTION_UP, x, view.height * 0.50f),
+            )
+
+            assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
+            shadowOf(Looper.getMainLooper()).idleFor(4_500L, TimeUnit.MILLISECONDS)
+
+            assertEquals("an accepted swipe must commit when the valid adjacent preview arrives", 1, commits.size)
+            assertTrue("the view must not cancel work before the renderer deadline", cancellations.isEmpty())
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     @Config(qualifiers = "xxhdpi")
     fun `gentle short swipe commits equally within and across chapters on a dense screen`() {
         fun dispatchGentleForwardSwipe(view: EpubFlowView) {
@@ -3038,10 +3167,10 @@ class EpubFlowViewTest {
             val startY = view.height * 0.85f
             view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, startY))
             view.dispatchTouchEvent(
-                motionEvent(downTime, downTime + 100L, MotionEvent.ACTION_MOVE, x, view.height * 0.65f),
+                motionEvent(downTime, downTime + 150L, MotionEvent.ACTION_MOVE, x, view.height * 0.73f),
             )
             view.dispatchTouchEvent(
-                motionEvent(downTime, downTime + 200L, MotionEvent.ACTION_UP, x, view.height * 0.50f),
+                motionEvent(downTime, downTime + 300L, MotionEvent.ACTION_UP, x, view.height * 0.73f),
             )
         }
 
@@ -3058,7 +3187,7 @@ class EpubFlowViewTest {
             val localAnimatorAfterRelease = local.privateField("flipAnimator") as android.animation.ValueAnimator?
             shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
             assertTrue(
-                "a short light swipe must turn an ordinary page without density-scaled effort; " +
+                "a directional 24dp swipe below the fling gate must turn an ordinary page; " +
                     "state=$localStateAfterRelease commit=$localCommitAfterRelease " +
                     "animatorRunning=${localAnimatorAfterRelease?.isRunning} scrollY=${local.scrollY}",
                 local.scrollY > 0,
@@ -3076,12 +3205,13 @@ class EpubFlowViewTest {
         ).apply {
             installBoundaryCommitRecorderForTest(commits)
             onBoundaryPreviewRequestCancelled = cancellations::add
+            onBoundaryPreviewNeeded = { _, _ -> Unit }
         }
         boundary.goToLastPage()
         try {
             dispatchGentleForwardSwipe(boundary)
             assertEquals(
-                "the same light swipe must retain its cross-chapter intent while the preview is cold",
+                "the same directional 24dp swipe must retain its cross-chapter intent while the preview is cold",
                 "BOUNDARY_DISCRETE_WAITING",
                 boundary.privateField("interactiveTurnState").toString(),
             )
