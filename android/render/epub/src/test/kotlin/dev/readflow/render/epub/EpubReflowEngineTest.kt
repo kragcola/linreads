@@ -1158,6 +1158,7 @@ class EpubReflowEngineTest {
         )
         val buildStarted = CountDownLatch(1)
         val releaseOldBuild = CountDownLatch(1)
+        val fullIndexScheduler = TestCoroutineScheduler()
         val engine = EpubReflowEngine(
             context = RuntimeEnvironment.getApplication() as Application,
             pageLineMeasurer = EpubPageLineMeasurer.StaticLayout { text, _, _ ->
@@ -1168,9 +1169,15 @@ class EpubReflowEngineTest {
                 listOf(0 to text.length)
             },
             flowEngineEnabled = true,
+            fullIndexDispatcher = StandardTestDispatcher(fullIndexScheduler),
         )
         engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, 0)))
         engine.openBook(Uri.fromFile(oldBook))
+        fullIndexScheduler.advanceUntilIdle()
+        awaitCondition("old full index must promote before the page-table race starts") {
+            runCurrent()
+            engine.privateField("startupSession") == null
+        }
 
         val oldNavigation = async {
             engine.goTo(

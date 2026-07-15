@@ -198,12 +198,13 @@ class EpubReflowEngine private constructor(
         context: Context,
         pageLineMeasurer: EpubPageLineMeasurer,
         flowEngineEnabled: Boolean = false,
+        fullIndexDispatcher: CoroutineDispatcher = Dispatchers.IO,
     ) : this(
         context = context,
         pageLineMeasurer = pageLineMeasurer,
         flowEngineEnabled = flowEngineEnabled,
         epubParserFactory = { EpubParser() },
-        fullIndexDispatcher = Dispatchers.IO,
+        fullIndexDispatcher = fullIndexDispatcher,
         constructorMarker = null,
     )
 
