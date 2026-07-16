@@ -90,15 +90,45 @@ internal data class LibraryGridLayout(
     val coverWidthDp: Float,
 )
 
+/**
+ * Minimum cover width used for column packing.
+ *
+ * Moon [ActivityMain.initColumnCount] / [PrefGroupBooks.initColumnCount] divide
+ * width by `d(shelfCoverSize) * (largeTablet?138 : tablet?136 : 110) / 100`, which
+ * enlarges the column pitch on tablets so covers do not shrink. We keep fixed 8dp
+ * gaps (MyCardViewGrid) and raise the packing floor past Compact so Medium/Expanded
+ * stay near phone cover scale instead of packing to 116dp cells.
+ */
+internal fun libraryCoverMinWidthDp(widthDp: Float): Float =
+    if (widthDp < 600f) Dimens.coverMinWidth.value else Dimens.coverMinWidthTablet.value
+
+/** Phone hero cell width at 360dp; tablet/expanded covers must not exceed this. */
+internal const val LibraryCoverMaxWidthDp = 156f
+
 internal fun libraryGridLayout(widthDp: Float): LibraryGridLayout {
     val effectiveWidth = widthDp.coerceAtMost(Dimens.maxContentWidth.value)
     val horizontalGap = Dimens.gridGapHorizontal.value
     val verticalGap = Dimens.gridGapVertical.value
     val usableWidth = (effectiveWidth - Dimens.screenEdge.value * 2f).coerceAtLeast(0f)
-    val columns = floor((usableWidth + horizontalGap) / (Dimens.coverMinWidth.value + horizontalGap))
+    val coverMin = libraryCoverMinWidthDp(effectiveWidth)
+    var columns = floor((usableWidth + horizontalGap) / (coverMin + horizontalGap))
         .toInt()
         .coerceAtLeast(1)
-    val coverWidth = (usableWidth - horizontalGap * (columns - 1)) / columns
+    var coverWidth = if (columns > 0) {
+        (usableWidth - horizontalGap * (columns - 1)) / columns
+    } else {
+        0f
+    }
+    // When leftover width would grow cells past the phone hero, add columns (Moon densifies
+    // rather than ballooning tablet covers). Cap iterations to usable width.
+    while (
+        coverWidth > LibraryCoverMaxWidthDp + 0.001f &&
+        usableWidth > 0f &&
+        columns < 64
+    ) {
+        columns += 1
+        coverWidth = (usableWidth - horizontalGap * (columns - 1)) / columns
+    }
     return LibraryGridLayout(
         effectiveWidthDp = effectiveWidth,
         horizontalGapDp = horizontalGap,

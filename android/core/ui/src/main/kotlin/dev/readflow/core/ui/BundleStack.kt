@@ -29,13 +29,21 @@ internal fun bundleLayerDepth(topBookIndex: Int, layerCount: Int): Int {
     return topBookIndex.coerceIn(0, n - 1)
 }
 
-/** Full-rect black scrim alpha for a stack layer; coefficient 0.18 per back layer. */
-internal fun bundleLayerScrimAlpha(layerDepth: Int): Float = layerDepth * 0.18f
+/**
+ * Full-rect black scrim alpha for a stack layer; coefficient 0.18 per back layer.
+ * Depth 0 (front / topBooks[0]) is always 0 — Moon [ShelfImageView.drawGridCovers]
+ * paints the front cover without a dark fill filter (only thin stroke on back tiles).
+ */
+internal fun bundleLayerScrimAlpha(layerDepth: Int): Float =
+    if (layerDepth <= 0) 0f else layerDepth * 0.18f
 
 /**
  * 合订文件夹：顶层封面正面朝外，底层渐暗并向右下错开。
  * 1本=填满；2本=94%+6%露边；3本=90%+5%；4本=86%+4.7%。
  * 尺寸基于容器百分比，平板/手机效果一致。
+ *
+ * Front cover never receives a full-rect black scrim or BookCover material wash
+ * (only rear layers darken via intentional layer scrim).
  */
 @Composable
 fun BundleStack(
@@ -62,22 +70,30 @@ fun BundleStack(
             val layerDepth = bundleLayerDepth(topBookIndex = i, layerCount = layerCount)
             val xOff = stepW * layerDepth
             val yOff = stepH * layerDepth
-            // 越底层越暗
+            // Rear layers only: front depth must stay undarkened.
             val shadowAlpha = bundleLayerScrimAlpha(layerDepth)
 
-            Box(
-                modifier = Modifier
-                    .offset(x = xOff, y = yOff)
-                    .size(coverW, coverH)
-                    .drawWithContent {
-                        drawContent()
-                        if (shadowAlpha > 0f) drawRect(Color.Black.copy(alpha = shadowAlpha))
+            val layerModifier = Modifier
+                .offset(x = xOff, y = yOff)
+                .size(coverW, coverH)
+                .then(
+                    if (layerDepth > 0 && shadowAlpha > 0f) {
+                        Modifier.drawWithContent {
+                            drawContent()
+                            drawRect(Color.Black.copy(alpha = shadowAlpha))
+                        }
+                    } else {
+                        Modifier
                     },
-            ) {
+                )
+
+            Box(modifier = layerModifier) {
                 BookCover(
                     book = book,
                     showProgress = false,
-                    showMaterialDepth = i == 0,
+                    // Grouped front must match Moon (no dark fill/spine wash). Rear depth is the
+                    // intentional layer scrim only — never BookCover material overlays.
+                    showMaterialDepth = false,
                     modifier = Modifier.fillMaxSize(),
                 )
             }

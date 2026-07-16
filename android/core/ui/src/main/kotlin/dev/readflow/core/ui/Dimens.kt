@@ -26,8 +26,19 @@ object Dimens {
     /** 触摸目标下限。 */
     val touchTarget = 48.dp
 
-    /** 书架自适应网格允许的最小封面宽。 */
+    /**
+     * Compact (phone) minimum cover width for column packing.
+     * Moon phone pitch uses ~110dp shelfCoverSize × 1.10 unit; we keep a slightly
+     * larger min so two-up phone covers stay near the accepted ~156dp cell.
+     */
     val coverMinWidth = 116.dp
+
+    /**
+     * Medium / Expanded minimum cover width so tablet columns do not over-pack
+     * and shrink covers below phone scale (Moon tablet unit uses 136/138%).
+     * See [libraryCoverMinWidthDp].
+     */
+    val coverMinWidthTablet = 132.dp
 
     /** 封面宽高比固定 70:100（Moon+），即 0.7f。 */
     const val coverAspectRatio = 0.7f
@@ -35,6 +46,7 @@ object Dimens {
     /**
      * Moon+ shelf grid: MyCardViewGrid L/R 4dp each → 8dp inter-cover;
      * top 8dp + bottom 2dp → 10dp row gap. Fixed at all breakpoints.
+     * Source: moonreader-unpacked/res/values/styles.xml `MyCardViewGrid`.
      */
     val gridGapHorizontal = 8.dp
     val gridGapVertical = 10.dp

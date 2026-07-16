@@ -9,18 +9,19 @@ class LibraryGridLayoutTest {
 
     @Test
     fun `library grid restores phone tablet and expanded proportions`() {
-        // Moon+ fixed 8dp horizontal gap yields denser columns than 20/24/28.
+        // Phone keeps dense Moon-like packing; tablet uses a higher cover floor so
+        // columns do not over-pack after the 8dp inter-cover gap (MyCardViewGrid).
         assertEquals(2, libraryGridColumns(360f))
-        assertEquals(6, libraryGridColumns(800f))
-        assertEquals(8, libraryGridColumns(1_280f))
+        assertEquals(5, libraryGridColumns(800f))
+        assertEquals(7, libraryGridColumns(1_280f))
     }
 
     @Test
     fun `grid keeps covers near the accepted multi-device scale`() {
         // usable = min(width, 1120) - 2*20; cover = (usable - 8*(cols-1)) / cols
         assertEquals(156f, libraryGridLayout(360f).coverWidthDp, 0.001f)
-        assertEquals(120f, libraryGridLayout(800f).coverWidthDp, 0.001f)
-        assertEquals(128f, libraryGridLayout(1_280f).coverWidthDp, 0.001f)
+        assertEquals(145.6f, libraryGridLayout(800f).coverWidthDp, 0.001f)
+        assertEquals(147.42857f, libraryGridLayout(1_280f).coverWidthDp, 0.01f)
 
         // Moon+ MyCardViewGrid L/R 4dp each → 8dp inter-cover; top 8 + bottom 2 → 10dp row gap.
         assertEquals(8f, libraryGridLayout(360f).horizontalGapDp, 0.001f)
@@ -29,6 +30,37 @@ class LibraryGridLayoutTest {
         assertEquals(10f, libraryGridLayout(360f).verticalGapDp, 0.001f)
         assertEquals(10f, libraryGridLayout(800f).verticalGapDp, 0.001f)
         assertEquals(10f, libraryGridLayout(1_280f).verticalGapDp, 0.001f)
+    }
+
+    @Test
+    fun `tablet packing floor keeps covers near phone scale`() {
+        // Medium/Expanded must pack against the tablet floor, not the phone 116dp min.
+        assertEquals(116f, libraryCoverMinWidthDp(360f), 0.001f)
+        assertEquals(132f, libraryCoverMinWidthDp(600f), 0.001f)
+        assertEquals(132f, libraryCoverMinWidthDp(1_280f), 0.001f)
+        assertEquals(116f, Dimens.coverMinWidth.value, 0.001f)
+        assertEquals(132f, Dimens.coverMinWidthTablet.value, 0.001f)
+
+        // Phone cover stays the denser accepted cell; tablet covers must not drop below it.
+        val phoneCover = libraryGridLayout(360f).coverWidthDp
+        val tabletCover = libraryGridLayout(800f).coverWidthDp
+        val expandedCover = libraryGridLayout(1_280f).coverWidthDp
+        assertTrue(
+            tabletCover >= 132f,
+            "tablet covers shrank below Moon-like tablet floor: $tabletCover",
+        )
+        assertTrue(
+            expandedCover >= 132f,
+            "expanded covers shrank below Moon-like tablet floor: $expandedCover",
+        )
+        assertTrue(
+            tabletCover <= phoneCover + 0.001f,
+            "tablet covers must not grow larger than the phone hero cell: phone=$phoneCover tablet=$tabletCover",
+        )
+        assertTrue(
+            expandedCover <= phoneCover + 0.001f,
+            "expanded covers must not grow larger than the phone hero cell: phone=$phoneCover expanded=$expandedCover",
+        )
     }
 
     @Test

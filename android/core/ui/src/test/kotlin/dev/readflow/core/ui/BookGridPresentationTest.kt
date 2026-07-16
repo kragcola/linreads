@@ -6,6 +6,7 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.LibraryItem
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -39,6 +40,9 @@ class BookGridPresentationTest {
             assertEquals(0, depth, "topBooks[0] must be depth 0 for layerCount=$layerCount")
             assertEquals(0f, bundleLayerScrimAlpha(depth), 0.0001f)
         }
+        // Negative / zero depths must never invent a black wash on the front cover.
+        assertEquals(0f, bundleLayerScrimAlpha(0), 0.0001f)
+        assertEquals(0f, bundleLayerScrimAlpha(-1), 0.0001f)
     }
 
     @Test
@@ -60,6 +64,49 @@ class BookGridPresentationTest {
         assertEquals(0.18f, bundleLayerScrimAlpha(1), 0.0001f)
         assertEquals(0.36f, bundleLayerScrimAlpha(2), 0.0001f)
         assertEquals(0.54f, bundleLayerScrimAlpha(3), 0.0001f)
+    }
+
+    @Test
+    fun `bundle stack source never paints a full rect scrim on the front layer`() {
+        // Source-level visual contract: front layers omit drawWithContent scrim attachment
+        // and never enable BookCover material depth (full-rect gradient / spine wash).
+        val source = bundleStackSource()
+        assertTrue(
+            source.contains("if (layerDepth > 0 && shadowAlpha > 0f)"),
+            "BundleStack must gate the black scrim so depth 0 never draws a full-rect overlay",
+        )
+        assertTrue(
+            source.contains("showMaterialDepth = false"),
+            "grouped covers must disable BookCover material depth so the front has no dark wash",
+        )
+        assertFalse(
+            source.contains("showMaterialDepth = layerDepth == 0"),
+            "front must not re-enable material depth (full-rect paper wash)",
+        )
+        assertTrue(
+            source.contains("bundleLayerScrimAlpha(layerDepth)"),
+            "scrim alpha must come from the pure depth helper",
+        )
+        assertFalse(
+            Regex("""drawRect\(Color\.Black\.copy\(alpha = shadowAlpha\)\)""")
+                .containsMatchIn(source) &&
+                !source.contains("if (layerDepth > 0 && shadowAlpha > 0f)"),
+            "unguarded black scrim draw must not exist on the front path",
+        )
+    }
+
+    private fun bundleStackSource(): String {
+        val relativePath = java.nio.file.Path.of(
+            "src/main/kotlin/dev/readflow/core/ui/BundleStack.kt",
+        )
+        val candidates = sequenceOf(
+            relativePath,
+            java.nio.file.Path.of("core/ui").resolve(relativePath),
+            java.nio.file.Path.of("android/core/ui").resolve(relativePath),
+        )
+        val sourcePath = candidates.firstOrNull(java.nio.file.Files::exists)
+            ?: error("Cannot locate BundleStack.kt from ${java.nio.file.Path.of("").toAbsolutePath()}")
+        return sourcePath.toFile().readText()
     }
 
     @Test
