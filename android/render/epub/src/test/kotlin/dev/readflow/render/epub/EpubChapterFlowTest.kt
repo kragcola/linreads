@@ -120,4 +120,56 @@ class EpubChapterFlowTest {
         assertTrue(flow.segments[1].layoutEnd > flow.segments[1].layoutStart)
         assertEquals("下文", (flow.segments.last().block as EpubDisplayBlock.Text).text)
     }
+
+    @Test
+    fun `japanese light novel corpus compresses accidental blanks while preserving structure`() {
+        // Mixed JP paragraphs, intentional multi-blank scene beat (still collapses to one
+        // separator between retained content), heading, HR, image, and inline-styled body.
+        val raw = listOf(
+            heading(0, "第一章　朝焼け"),
+            text(1, "「……おはよう」彼は呟いた。"),
+            EpubDisplayBlock.Break(paragraphIndex = 2, kind = EpubBreakKind.LineBreak),
+            EpubDisplayBlock.Break(paragraphIndex = 3, kind = EpubBreakKind.LineBreak),
+            EpubDisplayBlock.Text(text = "\n\n", headingLevel = null, paragraphIndex = 4),
+            text(5, "窓の外では、鳥が鳴いていた。"),
+            EpubDisplayBlock.Break(paragraphIndex = 6, kind = EpubBreakKind.HorizontalRule),
+            EpubDisplayBlock.Break(paragraphIndex = 7, kind = EpubBreakKind.LineBreak),
+            text(8, "　　——場面が変わる——"),
+            EpubDisplayBlock.Text(text = "   ", headingLevel = null, paragraphIndex = 9),
+            image(10, "scene-break.png"),
+            text(11, "彼女は微笑んだ。<i>静かに</i>。"),
+        )
+
+        val compressed = epubCompressEmptyDisplayBlocks(raw)
+        // Line breaks + blank text drop; heading, body, HR, image, and styled body remain.
+        assertEquals(
+            listOf(0, 1, 5, 6, 8, 10, 11),
+            compressed.map { it.paragraphIndex },
+        )
+        assertTrue(compressed.any { it is EpubDisplayBlock.Text && it.headingLevel != null })
+        assertTrue(
+            compressed.any {
+                it is EpubDisplayBlock.Break && it.kind == EpubBreakKind.HorizontalRule
+            },
+        )
+        assertTrue(compressed.any { it is EpubDisplayBlock.Image })
+        assertTrue(compressed.none { it.isEmptyVisualBlock() })
+
+        val flow = epubBuildChapterFlow(0, raw)
+        // Bounded single separator between retained blocks — no stacked empty pages.
+        assertEquals(
+            "第一章　朝焼け${EPUB_FLOW_PARAGRAPH_SEPARATOR}" +
+                "「……おはよう」彼は呟いた。${EPUB_FLOW_PARAGRAPH_SEPARATOR}" +
+                "窓の外では、鳥が鳴いていた。${EPUB_FLOW_PARAGRAPH_SEPARATOR}" +
+                "$EPUB_FLOW_HORIZONTAL_RULE_CHAR${EPUB_FLOW_PARAGRAPH_SEPARATOR}" +
+                "　　——場面が変わる——${EPUB_FLOW_PARAGRAPH_SEPARATOR}" +
+                "$EPUB_FLOW_IMAGE_CHAR${EPUB_FLOW_PARAGRAPH_SEPARATOR}" +
+                "彼女は微笑んだ。<i>静かに</i>。",
+            flow.text,
+        )
+        // Locator anchors still use original paragraph indices on retained segments.
+        assertEquals(0 to 0, flow.paragraphAtOffset(flow.offsetForParagraph(0, 0)))
+        assertEquals(10 to 0, flow.paragraphAtOffset(flow.offsetForParagraph(10, 0)))
+        assertEquals(11 to 0, flow.paragraphAtOffset(flow.offsetForParagraph(11, 0)))
+    }
 }

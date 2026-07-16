@@ -8409,6 +8409,348 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `image starting at page top never paints a synthetic crop preview`() {
+        val viewportWidth = 360
+        val viewportHeight = 240
+        val imageColor = 0xFF0EA5E9.toInt()
+        val imageHeight = viewportHeight + 80
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Image(
+                    href = "top-plate.png",
+                    altText = "full page plate",
+                    paragraphIndex = 0,
+                    isInlineContent = false,
+                ),
+                EpubDisplayBlock.Text("后文段落", headingLevel = null, paragraphIndex = 1),
+            ),
+        )
+        val imageSegment = flow.segments.single { it.isImage }
+        val imageDrawable = ColorDrawable(imageColor).apply {
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val spannable = SpannableString(flow.text).apply {
+            setSpan(
+                ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
+                imageSegment.layoutStart,
+                imageSegment.layoutEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val view = pagedFlowView(
+            flow = flow,
+            spannable = spannable,
+            viewportWidth = viewportWidth,
+            viewportHeight = viewportHeight,
+        )
+        try {
+            val layout = requireNotNull(view.textView.layout)
+            val imageLine = layout.getLineForOffset(imageSegment.layoutStart)
+            assertEquals("fixture requires the image on the first layout line", 0, imageLine)
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+            val imagePage = pages.first { page ->
+                imageSegment.layoutStart >= page.startOffset &&
+                    imageSegment.layoutStart < page.endOffset
+            }
+            assertEquals(
+                "image-at-top page must begin at the image line",
+                imageLine,
+                imagePage.startLine,
+            )
+            view.goToPage(0)
+            val shot = view.drawToBitmapForTest()
+            try {
+                // Full image owns the page: top band is solid image pixels, not a leftover crop band.
+                assertEquals(imageColor, shot.getPixel(viewportWidth / 2, 4))
+                val fullHits = sampleImagePatternHits(
+                    bitmap = shot,
+                    left = viewportWidth / 4,
+                    top = 0,
+                    right = (viewportWidth * 3) / 4,
+                    bottom = viewportHeight,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue("image-only top page must paint the complete image; hits=$fullHits", fullHits > 0)
+            } finally {
+                shot.recycle()
+            }
+            assertEquals(1, flow.segments.count { it.isImage })
+            assertEquals(1, flow.text.count { it == EPUB_FLOW_IMAGE_CHAR })
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `heading with small leftover band still crops a visible first page preview`() {
+        val viewportWidth = 360
+        val viewportHeight = 240
+        val imageColor = 0xFF7C3AED.toInt()
+        val sampleBandHeight = 24
+        val imageHeight = viewportHeight + 160
+        // Keep the ImageSpan near the first viewport for reliable Robolectric paint, but use
+        // slightly more body than the main crop fixture so the leftover band under the heading
+        // is a tight strip rather than half a page.
+        val bodyText = (1..3).joinToString("\n") { "填充行 $it 把标题挤到页底附近。" }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Text(bodyText, headingLevel = null, paragraphIndex = 0),
+                EpubDisplayBlock.Text("小余量标题", headingLevel = 2, paragraphIndex = 1),
+                EpubDisplayBlock.Image(
+                    href = "small-band.png",
+                    altText = "small band plate",
+                    paragraphIndex = 2,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+        val imageSegment = flow.segments.single { it.isImage }
+        val headingSegment = flow.segments.single {
+            val block = it.block
+            block is EpubDisplayBlock.Text && block.headingLevel != null
+        }
+        val imageDrawable = ColorDrawable(imageColor).apply {
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val spannable = SpannableString(flow.text).apply {
+            setSpan(
+                ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
+                imageSegment.layoutStart,
+                imageSegment.layoutEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val view = pagedFlowView(
+            flow = flow,
+            spannable = spannable,
+            viewportWidth = viewportWidth,
+            viewportHeight = viewportHeight,
+        )
+        try {
+            val layout = requireNotNull(view.textView.layout)
+            val headingLine = layout.getLineForOffset(headingSegment.layoutStart)
+            val imageLine = layout.getLineForOffset(imageSegment.layoutStart)
+            val imageLineTop = layout.getLineTop(imageLine)
+
+            val headingPageIndex = (0 until view.pageCount()).firstOrNull { pageIndex ->
+                val top = requireNotNull(view.pageTopPxAt(pageIndex))
+                val nextTop = view.pageTopPxAt(pageIndex + 1) ?: (layout.height + 1)
+                layout.getLineTop(headingLine) in top until nextTop
+            } ?: error("heading must land on some paged window")
+            val headingPageTop = requireNotNull(view.pageTopPxAt(headingPageIndex))
+            val headingPageEndTop = view.pageTopPxAt(headingPageIndex + 1) ?: (layout.height + 1)
+            assertTrue(
+                "image must start after the heading page (crop path)",
+                imageLineTop >= headingPageEndTop,
+            )
+
+            val imagePageIndex = (0 until view.pageCount()).firstOrNull { pageIndex ->
+                val top = requireNotNull(view.pageTopPxAt(pageIndex))
+                val nextTop = view.pageTopPxAt(pageIndex + 1) ?: (layout.height + 1)
+                imageLineTop in top until nextTop
+            } ?: error("image must land on some paged window")
+            assertTrue(
+                "complete image must own a later page than the heading",
+                imagePageIndex > headingPageIndex,
+            )
+            val imagePageTop = requireNotNull(view.pageTopPxAt(imagePageIndex))
+            assertEquals(
+                "complete image page must start at the source image line top",
+                imageLineTop,
+                imagePageTop,
+            )
+
+            val headingBottomOnPage = layout.getLineBottom(headingLine) - headingPageTop
+            assertTrue(
+                "heading itself must fit inside the viewport on its page",
+                headingBottomOnPage in 1 until viewportHeight,
+            )
+            val leftoverBand = viewportHeight - headingBottomOnPage
+            // "Small" means the remainder is a minority of the viewport (not half-empty blank).
+            assertTrue(
+                "fixture needs a small leftover band under the heading; leftoverBand=$leftoverBand",
+                leftoverBand in 8..(viewportHeight / 2),
+            )
+
+            view.goToPage(headingPageIndex)
+            val headingPageShot = view.drawToBitmapForTest()
+            try {
+                val remainderHits = sampleImagePatternHits(
+                    bitmap = headingPageShot,
+                    left = viewportWidth / 4,
+                    top = (headingBottomOnPage + 2).coerceAtMost(viewportHeight - 2),
+                    right = (viewportWidth * 3) / 4,
+                    bottom = viewportHeight - 1,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue(
+                    "small leftover band must still paint a visible crop preview; " +
+                        "hits=$remainderHits leftoverBand=$leftoverBand " +
+                        "headingBottomOnPage=$headingBottomOnPage headingPage=$headingPageIndex",
+                    remainderHits > 0,
+                )
+            } finally {
+                headingPageShot.recycle()
+            }
+
+            view.goToPage(imagePageIndex)
+            val complete = view.drawToBitmapForTest()
+            try {
+                val topBandHits = sampleImagePatternHits(
+                    bitmap = complete,
+                    left = viewportWidth / 4,
+                    top = 2,
+                    right = (viewportWidth * 3) / 4,
+                    bottom = sampleBandHeight,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue(
+                    "next page must still render the complete image from its top; " +
+                        "topBandHits=$topBandHits imagePage=$imagePageIndex " +
+                        "imagePageTop=$imagePageTop scrollY=${view.scrollY}",
+                    topBandHits > 0,
+                )
+                assertEquals(
+                    "complete image page must start at the image's top pixels",
+                    imageColor,
+                    complete.getPixel(viewportWidth / 2, 4),
+                )
+            } finally {
+                complete.recycle()
+            }
+            assertEquals(1, flow.segments.count { it.isImage })
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `boundary image preview remains stable while async pixels arrive mid page turn`() {
+        val viewportWidth = 360
+        val viewportHeight = 240
+        val imageColor = 0xFF059669.toInt()
+        val imageHeight = viewportHeight + 120
+        val bodyText = (1..2).joinToString("\n") { "前置 $it" }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Text(bodyText, headingLevel = null, paragraphIndex = 0),
+                EpubDisplayBlock.Text("翻页中标题", headingLevel = 2, paragraphIndex = 1),
+                EpubDisplayBlock.Image(
+                    href = "mid-turn.png",
+                    altText = "mid turn plate",
+                    paragraphIndex = 2,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+        val imageSegment = flow.segments.single { it.isImage }
+        val headingSegment = flow.segments.single {
+            val block = it.block
+            block is EpubDisplayBlock.Text && block.headingLevel != null
+        }
+        val imageDrawable = ColorDrawable(imageColor).apply {
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val spannable = SpannableString(flow.text).apply {
+            setSpan(
+                ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
+                imageSegment.layoutStart,
+                imageSegment.layoutEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            flow = flow,
+            spannable = spannable,
+            viewportWidth = viewportWidth,
+            viewportHeight = viewportHeight,
+        )
+        try {
+            val layout = requireNotNull(view.textView.layout)
+            val headingLine = layout.getLineForOffset(headingSegment.layoutStart)
+            val headingPageIndex = (0 until view.pageCount()).first { pageIndex ->
+                val top = requireNotNull(view.pageTopPxAt(pageIndex))
+                val nextTop = view.pageTopPxAt(pageIndex + 1) ?: (layout.height + 1)
+                layout.getLineTop(headingLine) in top until nextTop
+            }
+            view.goToPage(headingPageIndex)
+            val headingPageTop = requireNotNull(view.pageTopPxAt(headingPageIndex))
+            val lastLine = (view.privateField("paged") as List<EpubFlowPage>)[headingPageIndex]
+                .endLineExclusive - 1
+            val leftoverTop = layout.getLineBottom(lastLine) - headingPageTop
+            assertTrue(leftoverTop in 1 until viewportHeight)
+
+            val warmFront = requireNotNull(view.snapshotPageAt(headingPageTop))
+            view.setPrivateField("cachedFrontBitmap", warmFront)
+            view.setPrivateField("cachedFromPage", headingPageIndex)
+
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            view.updateInteractiveCurl(x = view.width * 0.45f)
+            assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+            val slideBefore = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val genBefore = view.privateField("pageLayoutGeneration") as Long
+
+            // Async pixels during turn must not tear the boundary crop owner or repaginate.
+            view.onAsyncImagePixelsChanged(imageSegment.layoutStart)
+            view.refreshAfterAsyncImageResult()
+            shadowOf(Looper.getMainLooper()).idleFor(120L, TimeUnit.MILLISECONDS)
+
+            assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+            assertTrue(
+                "mid-turn async must keep the same slide owner",
+                view.privateField("slideDrawable") === slideBefore,
+            )
+            assertEquals(
+                "mid-turn async must not repaginate while turnInFlight",
+                genBefore,
+                view.privateField("pageLayoutGeneration") as Long,
+            )
+            assertTrue(
+                "geometry refresh must stay deferred for the whole turn",
+                view.privateBool("asyncImageRefreshPending") ||
+                    (view.privateField("asyncImagePixelRefreshOffsets") as Set<*>).isNotEmpty(),
+            )
+
+            view.endInteractiveCurl(velocityX = 0f)
+            val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+            if (animator != null && animator.isRunning) animator.end()
+            shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+            // After settle, heading page still shows a crop and image page still owns the full plate.
+            view.goToPage(headingPageIndex)
+            val afterShot = view.drawToBitmapForTest()
+            try {
+                val hits = sampleImagePatternHits(
+                    bitmap = afterShot,
+                    left = viewportWidth / 4,
+                    top = (leftoverTop + 2).coerceAtMost(viewportHeight - 2),
+                    right = (viewportWidth * 3) / 4,
+                    bottom = viewportHeight - 1,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue("post-turn heading page must still show crop preview; hits=$hits", hits > 0)
+            } finally {
+                afterShot.recycle()
+            }
+            assertEquals(1, flow.segments.count { it.isImage })
+        } finally {
+            if (view.privateField("interactiveTurnState").toString() != "NONE") {
+                view.endInteractiveCurl(velocityX = 0f)
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            }
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `async image result with unchanged geometry preserves active software slide turn`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
