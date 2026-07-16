@@ -21,6 +21,7 @@ import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.FontChoice
+import dev.readflow.core.model.ReaderMenuConfig
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.sync.SyncManager
@@ -82,6 +83,8 @@ data class ReaderUiState(
     val canBookmark: Boolean = false,
     val textSelection: ReaderTextSelection? = null,
     val showGuide: Boolean = false,
+    /** Resolved bottom-menu order/visibility from [SettingsRepository]; defaults match legacy row. */
+    val menuConfig: ReaderMenuConfig = ReaderMenuConfig.v1Defaults(),
 )
 
 class ReaderViewModel(
@@ -117,6 +120,12 @@ class ReaderViewModel(
             savedStateHandle[READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY] = ReaderTypography.BASELINE_VERSION
             restoredReaderState?.let { migrated ->
                 savedStateHandle[READER_STATE_SAVED_STATE_KEY] = Json.encodeToString(migrated)
+            }
+        }
+        // Menu config is owned by ViewModel, not Compose — collect resolved prefs Flow.
+        viewModelScope.launch {
+            settings.readerMenuConfig.collect { config ->
+                _uiState.update { it.copy(menuConfig = config) }
             }
         }
     }
@@ -936,7 +945,9 @@ class ReaderViewModel(
                     attempt { engine?.close() }
                 }
             } finally {
-                _uiState.value = ReaderUiState()
+                _uiState.update { current ->
+                    ReaderUiState(menuConfig = current.menuConfig)
+                }
                 currentBookId = null
                 activeEngine = null
             }

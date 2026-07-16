@@ -509,34 +509,18 @@ fun ReaderScreen(
                                         .padding(horizontal = 4.dp, vertical = 2.dp),
                                     horizontalArrangement = Arrangement.SpaceEvenly,
                                 ) {
-                                    if (ReaderFeature.TOC in features) {
-                                        ReaderMenuButton("目录", Icons.Default.Menu, state.activePanel == ReaderPanel.TOC) {
-                                            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.TOC))
-                                        }
-                                    }
-                                    if (ReaderFeature.SEARCH in features) {
-                                        ReaderMenuButton("搜索", Icons.Default.Search, state.activePanel == ReaderPanel.SEARCH) {
-                                            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.SEARCH))
-                                        }
-                                    }
-                                    if (ReaderFeature.BOOKMARKS in features) {
-                                        ReaderMenuButton("书签", Icons.Default.Edit, state.activePanel == ReaderPanel.BOOKMARKS) {
-                                            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.BOOKMARKS))
-                                        }
-                                    }
-                                    if (ReaderFeature.ANNOTATIONS in features) {
-                                        ReaderMenuButton("标注", Icons.Default.Edit, state.activePanel == ReaderPanel.ANNOTATIONS) {
-                                            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.ANNOTATIONS))
-                                        }
-                                    }
-                                    if (ReaderFeature.FONT in features) {
-                                        ReaderMenuButton("排版", Icons.Default.Edit, state.activePanel == ReaderPanel.FONT) {
-                                            viewModel.onIntent(ReaderIntent.FontPanel)
-                                        }
-                                    }
-                                    if (ReaderFeature.THEME in features) {
-                                        ReaderMenuButton("主题", Icons.Default.MoreVert, state.activePanel == ReaderPanel.THEME) {
-                                            viewModel.onIntent(ReaderIntent.ThemePanel)
+                                    // Order/visibility from ViewModel-owned menuConfig ∩ features filter.
+                                    val menuCommands = ReaderCommandRegistry.visibleCommands(
+                                        config = state.menuConfig,
+                                        features = features,
+                                    )
+                                    menuCommands.forEach { command ->
+                                        ReaderMenuButton(
+                                            label = command.label,
+                                            icon = command.icon,
+                                            selected = readerCommandSelected(command.id, state.activePanel),
+                                        ) {
+                                            viewModel.onIntent(readerCommandIntent(command.id))
                                         }
                                     }
                                 }

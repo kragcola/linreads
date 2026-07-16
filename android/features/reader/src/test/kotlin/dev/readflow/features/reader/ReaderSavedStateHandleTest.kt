@@ -32,6 +32,9 @@ import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
+import dev.readflow.core.model.ReaderCommandId
+import dev.readflow.core.model.ReaderMenuConfig
+import dev.readflow.core.model.ReaderMenuEntry
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.TransitionType
@@ -539,6 +542,40 @@ class ReaderSavedStateHandleTest {
         advanceUntilIdle()
 
         assertNull(store.savedStates["book-1"])
+    }
+
+    @Test
+    fun `opening and closing a book preserves the collected reader menu config`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val menuConfig = ReaderMenuConfig.resolve(
+            ReaderMenuConfig(
+                entries = listOf(
+                    ReaderMenuEntry(ReaderCommandId.THEME, visible = true),
+                    ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false),
+                    ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                ),
+            ),
+        )
+        val settings = FakeSettingsRepository().apply {
+            readerMenuConfig.value = menuConfig
+        }
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        advanceUntilIdle()
+        assertEquals(menuConfig, viewModel.uiState.value.menuConfig)
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        assertEquals(menuConfig, viewModel.uiState.value.menuConfig)
+
+        viewModel.onIntent(ReaderIntent.CloseBook)
+        advanceUntilIdle()
+        assertEquals(menuConfig, viewModel.uiState.value.menuConfig)
     }
 
     @Test
@@ -1770,6 +1807,7 @@ class ReaderSavedStateHandleTest {
         override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.System)
         override val readerGuideShown = MutableStateFlow(true)
         override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
+        override val readerMenuConfig = MutableStateFlow(ReaderMenuConfig.v1Defaults())
 
         override suspend fun setCalibreBaseUrl(url: String) {
             calibreBaseUrl.value = url

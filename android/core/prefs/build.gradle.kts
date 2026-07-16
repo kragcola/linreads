@@ -18,4 +18,6 @@ dependencies {
     implementation(libs.coroutines.core)
 
     testImplementation(libs.junit5)
+    testImplementation(libs.coroutines.test)
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }

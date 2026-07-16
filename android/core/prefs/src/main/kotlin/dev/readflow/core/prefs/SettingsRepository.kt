@@ -2,11 +2,13 @@ package dev.readflow.core.prefs
 
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.PageFlipStyle
+import dev.readflow.core.model.ReaderMenuConfig
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 
 /**
  * User settings contract (Layer 1). Phase 1 scaffold: field surface declared —
@@ -30,6 +32,12 @@ interface SettingsRepository {
     val readerGuideShown: Flow<Boolean>
     /** 分页模式翻页动画风格（滑动/仿真/无）。 */
     val pageFlipStyle: Flow<PageFlipStyle>
+    /**
+     * Resolved reader bottom-menu order/visibility.
+     * Default implementation emits v1 catalog defaults so legacy fakes stay source-compatible.
+     */
+    val readerMenuConfig: Flow<ReaderMenuConfig>
+        get() = flowOf(ReaderMenuConfig.v1Defaults())
 
     /** Installs this release's typography baseline once; later user changes remain untouched. */
     suspend fun ensureCurrentTypographyBaseline(): Boolean = false
@@ -45,4 +53,6 @@ interface SettingsRepository {
     suspend fun setFontChoice(choice: FontChoice)
     suspend fun setReaderGuideShown(shown: Boolean)
     suspend fun setPageFlipStyle(style: PageFlipStyle)
+    /** Persist resolved menu config; default no-op for legacy fakes. */
+    suspend fun setReaderMenuConfig(config: ReaderMenuConfig) = Unit
 }
