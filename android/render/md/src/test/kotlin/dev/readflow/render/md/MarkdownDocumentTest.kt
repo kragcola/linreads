@@ -3,7 +3,13 @@ package dev.readflow.render.md
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.render.api.ReaderTextAnnotation
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
@@ -53,12 +59,34 @@ class MarkdownDocumentTest {
         val markdown = "# Title\nIntro line\n\n## Deep\nAnother intro"
         val document = MarkdownDocument.parse(markdown)
 
-        val results = document.search("intro")
+        val results = runBlocking { document.search("intro") }
 
         assertEquals(2, results.size)
         assertEquals(LocatorStrategy.Section(0, 1, markdown.indexOf("Intro")), results[0].strategy)
         assertEquals(LocatorStrategy.Section(0, 4, markdown.lastIndexOf("intro")), results[1].strategy)
         assertTrue(results[0].totalProgression!! < results[1].totalProgression!!)
+    }
+
+    @Test
+    fun `search does not complete when invoked from a cancelled undispatched coroutine`() = runTest {
+        val markdown = buildString {
+            repeat(200) { index ->
+                append("line $index token-$index more text ")
+                append("shared-needle ")
+                appendLine("tail")
+            }
+        }
+        val document = MarkdownDocument.parse(markdown)
+
+        var completed = false
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            cancel()
+            document.search("shared-needle")
+            completed = true
+        }
+
+        assertFalse(completed, "cancelled search must not finish a full synchronous scan")
+        assertTrue(job.isCancelled)
     }
 
     @Test

@@ -4,6 +4,8 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.ReaderTextSelection
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 internal class MarkdownDocument private constructor(
     val markdown: String,
@@ -46,12 +48,13 @@ internal class MarkdownDocument private constructor(
     fun lineStart(lineIndex: Int): Int =
         lineStarts[lineIndex.coerceIn(0, lineStarts.lastIndex)]
 
-    fun search(query: String, limit: Int = DEFAULT_SEARCH_LIMIT): List<Locator> {
+    suspend fun search(query: String, limit: Int = DEFAULT_SEARCH_LIMIT): List<Locator> {
         val needle = query.trim()
         if (needle.isEmpty() || limit <= 0 || markdown.isEmpty()) return emptyList()
         val results = mutableListOf<Locator>()
         var fromIndex = 0
         while (results.size < limit) {
+            currentCoroutineContext().ensureActive()
             val matchIndex = markdown.indexOf(needle, startIndex = fromIndex, ignoreCase = true)
             if (matchIndex < 0) break
             results += locatorForOffset(matchIndex)

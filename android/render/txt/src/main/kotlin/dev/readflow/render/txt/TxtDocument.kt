@@ -15,6 +15,8 @@ import java.nio.file.StandardOpenOption
 import java.util.zip.CRC32
 import java.util.LinkedHashMap
 import java.util.Locale
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 internal data class TxtDocumentFingerprint(
     val byteLength: Long,
@@ -99,15 +101,17 @@ internal class TxtDocument private constructor(
 
     fun fingerprint(): TxtDocumentFingerprint = TxtDocumentFingerprint.fromFile(file)
 
-    fun search(query: String, limit: Int = DEFAULT_SEARCH_LIMIT): List<Locator> {
+    suspend fun search(query: String, limit: Int = DEFAULT_SEARCH_LIMIT): List<Locator> {
         val needle = query.trim()
         if (needle.isEmpty() || limit <= 0 || ranges.isEmpty()) return emptyList()
         val totalBytes = byteLength.coerceAtLeast(1L).toFloat()
         val results = mutableListOf<Locator>()
         for (index in ranges.indices) {
+            currentCoroutineContext().ensureActive()
             val paragraph = readParagraph(index)
             var fromIndex = 0
             while (results.size < limit) {
+                currentCoroutineContext().ensureActive()
                 val matchIndex = paragraph.indexOf(needle, startIndex = fromIndex, ignoreCase = true)
                 if (matchIndex < 0) break
                 val range = ranges[index]

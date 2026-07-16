@@ -3,7 +3,13 @@ package dev.readflow.render.txt
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.Locator
 import dev.readflow.render.api.ReaderTextAnnotation
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -56,7 +62,7 @@ class TxtDocumentTest {
             fingerprint = fingerprint,
             cachedEngineState = document.engineState(fingerprint),
         )
-        val searchResult = document.search("marker-37").single()
+        val searchResult = runBlocking { document.search("marker-37") }.single()
         val resultStrategy = searchResult.strategy as LocatorStrategy.ByteOffset
 
         assertTrue(file.toFile().length() > TxtDocument.BLOCK_BYTES * 3)
@@ -230,7 +236,7 @@ class TxtDocumentTest {
             val file = createTempFile(prefix = "readflow-mixed-encoding-", suffix = ".txt")
             file.writeBytes(corpus.paragraph.toByteArray(corpus.charset))
             val document = TxtDocument.index(file.toFile(), charsetDetection = detectionFor(corpus.charset))
-            val result = document.search(corpus.needle).single().strategy as LocatorStrategy.ByteOffset
+            val result = runBlocking { document.search(corpus.needle) }.single().strategy as LocatorStrategy.ByteOffset
             val start = corpus.paragraph.indexOf(corpus.selected)
             val end = start + corpus.selected.length
             val selection = document.selectionForParagraphRange(0, start, end)!!
@@ -257,7 +263,7 @@ class TxtDocumentTest {
         file.writeText("$first\n\n$second\n\n$third", charset = StandardCharsets.UTF_8)
         val document = TxtDocument.index(file.toFile())
 
-        val results = document.search("猫")
+        val results = runBlocking { document.search("猫") }
 
         assertEquals(2, results.size)
         assertEquals(
@@ -270,6 +276,26 @@ class TxtDocumentTest {
         )
         assertEquals(document.ranges[2].startByte + third.substring(0, third.indexOf("猫")).toByteArray(StandardCharsets.UTF_8).size, (results[1].strategy as LocatorStrategy.ByteOffset).offset)
         assertTrue(results[0].totalProgression!! < results[1].totalProgression!!)
+    }
+
+    @Test
+    fun `search does not complete when invoked from a cancelled undispatched coroutine`() = runTest {
+        val paragraphs = (0 until 64).map { index ->
+            "段落 $index search-token-${index % 7} 内容 ".repeat(32)
+        }
+        val file = createTempFile(prefix = "readflow-txt-cancel-search-", suffix = ".txt")
+        file.writeText(paragraphs.joinToString("\n\n"), charset = StandardCharsets.UTF_8)
+        val document = TxtDocument.index(file.toFile())
+
+        var completed = false
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            cancel()
+            document.search("search-token")
+            completed = true
+        }
+
+        assertFalse(completed, "cancelled search must not finish a full synchronous scan")
+        assertTrue(job.isCancelled)
     }
 
     @Test

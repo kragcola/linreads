@@ -2,8 +2,10 @@ package dev.readflow.render.epub
 
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
-internal fun epubSearchLocators(
+internal suspend fun epubSearchLocators(
     indexedParas: List<EpubPara>,
     query: String,
     limit: Int = 100,
@@ -14,9 +16,11 @@ internal fun epubSearchLocators(
     val totalChars = epubTotalChars(indexedParas).coerceAtLeast(1).toFloat()
     val results = mutableListOf<Locator>()
     for (index in indexedParas.indices) {
+        currentCoroutineContext().ensureActive()
         val paragraph = paragraphProvider(index) ?: indexedParas[index]
         var fromIndex = 0
         while (results.size < limit) {
+            currentCoroutineContext().ensureActive()
             val matchIndex = paragraph.text.indexOf(needle, startIndex = fromIndex, ignoreCase = true)
             if (matchIndex < 0) break
             val documentOffset = paragraph.documentCharStart + matchIndex
