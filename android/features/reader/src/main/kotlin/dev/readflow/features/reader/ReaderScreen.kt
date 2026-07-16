@@ -148,9 +148,35 @@ private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean
             val controller = WindowCompat.getInsetsController(window, view)
             val previousStatusBarAppearance = controller.isAppearanceLightStatusBars
             val previousNavigationBarAppearance = controller.isAppearanceLightNavigationBars
+            @Suppress("DEPRECATION")
+            val previousStatusBarColor = window.statusBarColor
+            @Suppress("DEPRECATION")
+            val previousNavigationBarColor = window.navigationBarColor
+            val previousNavigationBarContrastEnforced =
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    window.isNavigationBarContrastEnforced
+                } else {
+                    false
+                }
+            // Reader-scoped only: paper continues under system icons. Icons stay visible via
+            // palette-driven light/dark appearance; solid bar scrims are cleared for this screen.
+            @Suppress("DEPRECATION")
+            window.statusBarColor = android.graphics.Color.TRANSPARENT
+            @Suppress("DEPRECATION")
+            window.navigationBarColor = android.graphics.Color.TRANSPARENT
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                window.isNavigationBarContrastEnforced = false
+            }
             controller.isAppearanceLightStatusBars = lightBars
             controller.isAppearanceLightNavigationBars = lightBars
             onDispose {
+                @Suppress("DEPRECATION")
+                window.statusBarColor = previousStatusBarColor
+                @Suppress("DEPRECATION")
+                window.navigationBarColor = previousNavigationBarColor
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    window.isNavigationBarContrastEnforced = previousNavigationBarContrastEnforced
+                }
                 controller.isAppearanceLightStatusBars = previousStatusBarAppearance
                 controller.isAppearanceLightNavigationBars = previousNavigationBarAppearance
             }

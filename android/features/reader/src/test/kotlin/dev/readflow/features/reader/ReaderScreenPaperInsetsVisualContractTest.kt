@@ -90,6 +90,46 @@ class ReaderScreenPaperInsetsVisualContractTest {
                 source.contains("previousNavigationBarAppearance") &&
                 source.contains("onDispose"),
         )
+        assertTrue(
+            "reader-scoped status/navigation bar backgrounds must go transparent while icons stay visible",
+            source.contains("statusBarColor") &&
+                source.contains("navigationBarColor") &&
+                source.contains("Color.TRANSPARENT") &&
+                source.contains("previousStatusBarColor") &&
+                source.contains("previousNavigationBarColor"),
+        )
+        assertTrue(
+            "navigation-bar contrast enforcement must be disabled while reading and restored on leave",
+            source.contains("isNavigationBarContrastEnforced") &&
+                source.contains("previousNavigationBarContrastEnforced"),
+        )
+        // Restore path must re-apply prior colors/contrast/icons together on dispose.
+        val appearanceBlock = readerSystemBarAppearanceBlock(source)
+        assertTrue(
+            "onDispose must restore prior statusBarColor",
+            appearanceBlock.contains("statusBarColor = previousStatusBarColor") ||
+                appearanceBlock.contains("window.statusBarColor = previousStatusBarColor"),
+        )
+        assertTrue(
+            "onDispose must restore prior navigationBarColor",
+            appearanceBlock.contains("navigationBarColor = previousNavigationBarColor") ||
+                appearanceBlock.contains("window.navigationBarColor = previousNavigationBarColor"),
+        )
+        assertTrue(
+            "onDispose must restore prior navigation-bar contrast enforcement",
+            appearanceBlock.contains("isNavigationBarContrastEnforced = previousNavigationBarContrastEnforced"),
+        )
+    }
+
+    private fun readerSystemBarAppearanceBlock(source: String): String {
+        val marker = source.indexOf("private fun ReaderSystemBarAppearance")
+        require(marker >= 0) { "ReaderSystemBarAppearance not found in ReaderScreen.kt" }
+        // Body through the following private helper / ReaderScreen entry.
+        val end = source.indexOf("@OptIn(ExperimentalMaterial3Api::class)", marker)
+            .takeIf { it > marker }
+            ?: source.indexOf("fun ReaderScreen(", marker).takeIf { it > marker }
+            ?: (marker + 2500).coerceAtMost(source.length)
+        return source.substring(marker, end)
     }
 
     private fun androidViewModifierChain(source: String): String {

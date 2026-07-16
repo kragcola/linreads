@@ -164,6 +164,9 @@ internal class EpubFlowView(
             if (asyncImageRefreshPending) {
                 asyncImageRefreshPending = false
                 asyncImagePixelRefreshOffsets.clear()
+                // Geometry-level async result may also supersede any staged in-place pixel redraws.
+                cancelInPlacePageShotRefreshCallbacks()
+                pendingInPlacePageShotRefreshSlots.clear()
                 applyAsyncImageResultRefresh()
             } else {
                 val offsets = asyncImagePixelRefreshOffsets.toList()
@@ -172,6 +175,14 @@ internal class EpubFlowView(
             }
         }
     }
+    /**
+     * Stable warm slots that need an in-place pixel redraw after PIXELS_ONLY. Owners stay leased;
+     * only pixels are refreshed, one slot per animation frame while idle/aligned.
+     */
+    private enum class CachedPageShotSlot { FRONT, REVEALED, BACKWARD }
+    private val pendingInPlacePageShotRefreshSlots = LinkedHashSet<CachedPageShotSlot>()
+    private var inPlacePageShotRefreshPosted = false
+    private val inPlacePageShotRefreshRunnable = Runnable { drainOneInPlacePageShotRefresh() }
 
     /** True between [setChapter] and the first positioned frame: content is alpha-hidden until then. */
     private var awaitingReveal = false
@@ -214,10 +225,16 @@ internal class EpubFlowView(
         val firstLine: Int,
         val endLineExclusive: Int,
     )
-    private data class HeadingImageContinuation(
-        val headingLayoutStart: Int,
-        val headingFirstLine: Int,
-        val headingEndLineExclusive: Int,
+    /**
+     * Synthetic crop of a large indivisible image that starts on a later page, painted into the
+     * leftover band under preceding visible content on the current page. One image occurrence only
+     * (same AsyncDrawable / U+FFFC); the full image still owns its own page window.
+     */
+    private data class PageBoundaryImagePreview(
+        /** Layout start of the last visible content block that ends on this page (heading or body). */
+        val precedingLayoutStart: Int,
+        val precedingEndLineExclusive: Int,
+        val precedingIsHeading: Boolean,
         val imageLayoutStart: Int,
         val imageLine: Int,
     )
@@ -230,7 +247,7 @@ internal class EpubFlowView(
         val usablePageHeightPx: Int,
         val headingLines: Set<Int>,
         val paragraphIntervals: List<ParagraphLineInterval>,
-        val headingImageContinuations: List<HeadingImageContinuation>,
+        val pageBoundaryImagePreviews: List<PageBoundaryImagePreview>,
     )
     private var pageLayoutMetadata: PageLayoutMetadata? = null
 
@@ -286,6 +303,9 @@ internal class EpubFlowView(
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
+    /** Dirty warm-shot identities follow the active turn, then remap to their settled cache slots. */
+    private var activeFlipFrontPixelRefreshPending = false
+    private var activeFlipRevealedPixelRefreshPending = false
     private var localSoftwareSettleCommit: Boolean? = null
     private var conversionSnapshotDrawable: ViewportSnapshotDrawable? = null
     private var conversionSnapshotFlattener: (ViewportSnapshotDrawable, Bitmap) -> Boolean =
@@ -473,6 +493,13 @@ internal class EpubFlowView(
         if (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) return
         if (mode != Mode.PAGED || paged.isEmpty() || width == 0) return
         if (turnInFlight) return
+        // After a turn settles (or any idle re-entry), finish deferred in-place pixel redraws first
+        // so warm owners carry latest async image pixels before the next gesture.
+        if (pendingInPlacePageShotRefreshSlots.isNotEmpty()) {
+            resumeDeferredInPlacePageShotRefresh()
+            // Let the one-slot-per-frame drain own the frames; avoid racing a full allocate path.
+            return
+        }
         if (!pageClipActive || pagedMotionState == PagedMotionState.DRAGGING_FREE ||
             pagedMotionState == PagedMotionState.FLING_FREE || pagedMotionState == PagedMotionState.ALIGN_AND_TURN
         ) return
@@ -747,6 +774,9 @@ internal class EpubFlowView(
         pageTexturePrecacheGeneration += 1L
         pageTexturePrecachePending = false
         clearPendingPageTexturePrecacheCallbacks()
+        // Owners are gone; any staged in-place redraws are meaningless.
+        cancelInPlacePageShotRefreshCallbacks()
+        pendingInPlacePageShotRefreshSlots.clear()
         val request = pendingPageTexturePrecache
         listOfNotNull(
             request?.frontBitmap,
@@ -916,6 +946,10 @@ internal class EpubFlowView(
         targetTop: Int,
         targetWindow: EpubFlowPage,
     ): Pair<Bitmap, Bitmap>? {
+        val pendingPixelRefreshOwners = pendingInPlacePageShotRefreshSlots
+            .mapNotNull(::cachedBitmapForSlot)
+        // Defer remaining in-place redraw frames; keep warm owners for transfer.
+        cancelInPlacePageShotRefreshCallbacks()
         takePendingPageTexturesForTurn(
             fromPage,
             fromTop,
@@ -923,7 +957,12 @@ internal class EpubFlowView(
             targetPage,
             targetTop,
             targetWindow,
-        )?.let { return it }
+        )?.let { pair ->
+            rememberActiveFlipPixelRefreshes(pair.first, pair.second, pendingPixelRefreshOwners)
+            // Pending owners moved into the active turn — drop any slot redraws targeting them.
+            pendingInPlacePageShotRefreshSlots.clear()
+            return pair
+        }
         recycleCachedTexturesIfStaleForTurn(
             fromPage,
             fromTop,
@@ -956,9 +995,21 @@ internal class EpubFlowView(
         cachedFromTextureKey = null
         cachedTargetTextureKey = null
         cachedBackwardTextureKey = null
+        rememberActiveFlipPixelRefreshes(front, revealed, pendingPixelRefreshOwners)
+        // Owners left the cache for the active turn; drop slot redraws for missing slots.
+        pendingInPlacePageShotRefreshSlots.clear()
         relabelPageShot(front, PageShotLeaseKind.PINNED, "active.front")
         relabelPageShot(revealed, PageShotLeaseKind.PINNED, "active.target")
         return front to revealed
+    }
+
+    private fun rememberActiveFlipPixelRefreshes(
+        front: Bitmap,
+        revealed: Bitmap,
+        dirtyOwners: List<Bitmap>,
+    ) {
+        activeFlipFrontPixelRefreshPending = dirtyOwners.any { it === front }
+        activeFlipRevealedPixelRefreshPending = dirtyOwners.any { it === revealed }
     }
 
     /** Transfers only the warmed current page for a cross-chapter turn; target comes from its preview. */
@@ -967,6 +1018,8 @@ internal class EpubFlowView(
         fromTop: Int,
         fromWindow: EpubFlowPage?,
     ): Bitmap? {
+        // Boundary transfer may steal the front owner; never let a queued in-place redraw target it.
+        cancelInPlacePageShotRefreshCallbacks()
         val front = cachedFrontBitmap?.takeUnless(Bitmap::isRecycled)
         val fromKey = pageTextureKey(fromTop, fromWindow)
         if (
@@ -990,6 +1043,10 @@ internal class EpubFlowView(
         cachedFromTextureKey = null
         cachedTargetTextureKey = null
         cachedBackwardTextureKey = null
+        // A boundary outgoing shot is terminal for the old chapter: commit recycles it, while
+        // cancel reveals the already-updated live viewport. Redrawing it synchronously here would
+        // put a full-page capture back on the gesture path, so dirty cache-slot state ends here.
+        pendingInPlacePageShotRefreshSlots.clear()
         relabelPageShot(front, PageShotLeaseKind.PINNED, "active.front")
         return front
     }
@@ -1091,7 +1148,7 @@ internal class EpubFlowView(
         drawLiveViewportBackground(canvas)
         super.draw(canvas)
         settledWindowAtTop(scrollY)?.takeIf { mode == Mode.PAGED && pageClipActive }
-            ?.let { drawHeadingImageContinuationPreview(canvas, scrollY, it, canvasViewportTopPx = 0) }
+            ?.let { drawPageBoundaryImagePreview(canvas, scrollY, it, canvasViewportTopPx = 0) }
     }
 
     override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
@@ -1428,7 +1485,7 @@ internal class EpubFlowView(
     private fun applyAsyncImagePixelRefresh(layoutOffsets: Collection<Int>) {
         if (layoutOffsets.isEmpty()) return
         // Far-page PIXELS_ONLY must not touch the live viewport's warm shots or restart nearby
-        // precache. Continuation-dependent pages (heading that synthetically previews a next-page
+        // precache. Boundary-preview pages (preceding text that synthetically crops a next-page
         // image) count as nearby even when the image layout offset sits past the page endOffset.
         val nearbyOffsets = layoutOffsets.filter { pageShotDependsOnImageOffset(it) }
         if (nearbyOffsets.isEmpty()) {
@@ -1443,37 +1500,184 @@ internal class EpubFlowView(
                     pageWindowDependsOnImageOffset(pendingPrecache.targetWindow, offset)
             }
         ) {
+            // Drop only mid-flight speculative captures. Retained warm owners stay on cached* slots.
             discardPendingPageTexturePrecache(pendingPrecache)
         }
-        val bitmapsToRecycle = LinkedHashSet<Bitmap>()
+        // Preserve leased warm bitmap identities. Recycle/realloc creates a cold gap where a finger
+        // turn falls into beginPendingLocalPageShotHandoff and allocates two full-screen ARGB shots.
+        // Refresh dependent slots in place, one slot per animation frame, coalescing offsets.
+        var scheduledAny = false
         nearbyOffsets.forEach { offset ->
             if (pageShotSlotDependsOnImageOffset(cachedFromPage, offset)) {
-                cachedFrontBitmap?.let(bitmapsToRecycle::add)
+                if (cachedFrontBitmap?.isRecycled == false) {
+                    pendingInPlacePageShotRefreshSlots += CachedPageShotSlot.FRONT
+                    scheduledAny = true
+                }
             }
             if (pageShotSlotDependsOnImageOffset(cachedTargetPage, offset)) {
-                cachedRevealedBitmap?.let(bitmapsToRecycle::add)
+                if (cachedRevealedBitmap?.isRecycled == false) {
+                    pendingInPlacePageShotRefreshSlots += CachedPageShotSlot.REVEALED
+                    scheduledAny = true
+                }
             }
             if (pageShotSlotDependsOnImageOffset(cachedBackwardPage, offset)) {
-                cachedBackwardBitmap?.let(bitmapsToRecycle::add)
+                if (cachedBackwardBitmap?.isRecycled == false) {
+                    pendingInPlacePageShotRefreshSlots += CachedPageShotSlot.BACKWARD
+                    scheduledAny = true
+                }
             }
-        }
-        bitmapsToRecycle.forEach { bitmap ->
-            detachCachedTextureOwner(bitmap)
-            if (!bitmap.isRecycled) recyclePageShot(bitmap)
         }
         textView.invalidate()
         container.invalidate()
         invalidate()
-        // Nearby pixel completion: wake reveal/precache after the next pre-draw. Far-page results
-        // never reach here. Successful installs notify via onImageResultChanged only (loader
-        // suppresses the dual onDecodeFinished wake) so far-page PIXELS_ONLY stays silent.
-        onAsyncImageDecodeFinished()
+        if (scheduledAny) {
+            scheduleInPlacePageShotRefresh()
+        } else {
+            // No warm owners to repaint in place (cold cache, or only a discarded mid-flight
+            // precache). Wake normal nearby precache / chapter reveal after the next pre-draw so
+            // the next gesture is not permanently cold.
+            onAsyncImageDecodeFinished()
+        }
+        // Do not call onAsyncImageDecodeFinished for the warm in-place path: preCache key-match
+        // would early-return without redrawing pixels, and a recycle rebuild is the jank gap.
+    }
+
+    private fun scheduleInPlacePageShotRefresh() {
+        if (disposed || inPlacePageShotRefreshPosted || pendingInPlacePageShotRefreshSlots.isEmpty()) return
+        if (turnInFlight) return
+        inPlacePageShotRefreshPosted = true
+        postOnAnimation(inPlacePageShotRefreshRunnable)
+    }
+
+    private fun cancelInPlacePageShotRefreshCallbacks() {
+        removeCallbacks(inPlacePageShotRefreshRunnable)
+        inPlacePageShotRefreshPosted = false
+    }
+
+    private fun resumeDeferredInPlacePageShotRefresh() {
+        if (disposed || turnInFlight || pendingInPlacePageShotRefreshSlots.isEmpty()) return
+        scheduleInPlacePageShotRefresh()
+    }
+
+    private enum class InPlaceRefreshOutcome {
+        /** Slot pixels redrawn into the existing warm owner. */
+        REDRAWN,
+        /** Slot identity/key/window no longer valid; drop and let normal precache rebuild. */
+        DROPPED_STALE,
+        /** Transient layout/size gate; keep queued and try again next frame. */
+        DEFERRED_TRANSIENT,
+    }
+
+    /** Drains at most one dependent warm slot per animation frame while idle/aligned. */
+    private fun drainOneInPlacePageShotRefresh() {
+        inPlacePageShotRefreshPosted = false
+        if (disposed) {
+            pendingInPlacePageShotRefreshSlots.clear()
+            return
+        }
+        if (turnInFlight) {
+            // Finger owns the turn: keep warm owners, defer remaining slot redraws until settle.
+            return
+        }
+        val slot = pendingInPlacePageShotRefreshSlots.firstOrNull() ?: return
+        when (refreshCachedPageShotInPlace(slot)) {
+            InPlaceRefreshOutcome.REDRAWN,
+            InPlaceRefreshOutcome.DROPPED_STALE,
+            -> pendingInPlacePageShotRefreshSlots.remove(slot)
+            InPlaceRefreshOutcome.DEFERRED_TRANSIENT -> {
+                // Keep the slot at the head of the set; retry next animation frame.
+                scheduleInPlacePageShotRefresh()
+                return
+            }
+        }
+        if (pendingInPlacePageShotRefreshSlots.isNotEmpty()) {
+            scheduleInPlacePageShotRefresh()
+        } else {
+            // Queue drained: refill any current/adjacent slots missing after a discarded partial
+            // pending precache (retained warm owners were refreshed in place; incomplete cache must
+            // not stay permanent).
+            preCachePageTextures()
+        }
+    }
+
+    /**
+     * Attempts one in-place redraw of an existing warm page-shot. Returns whether the slot was
+     * painted, dropped as stale, or deferred for a transient layout/size reason. Never removes the
+     * warm bitmap on a transient skip — the queue holds the slot until a later frame succeeds.
+     */
+    private fun refreshCachedPageShotInPlace(slot: CachedPageShotSlot): InPlaceRefreshOutcome {
+        val bitmap = cachedBitmapForSlot(slot)?.takeUnless(Bitmap::isRecycled)
+            ?: return InPlaceRefreshOutcome.DROPPED_STALE
+        val pageIndex = cachedPageForSlot(slot)
+        val topPx = cachedTopForSlot(slot)
+        val textureKey = cachedTextureKeyForSlot(slot)
+        if (pageIndex < 0 || topPx < 0) return InPlaceRefreshOutcome.DROPPED_STALE
+        // Identity must still be the same leased owner in the same slot.
+        if (cachedBitmapForSlot(slot) !== bitmap) return InPlaceRefreshOutcome.DROPPED_STALE
+        if (cachedPageForSlot(slot) != pageIndex) return InPlaceRefreshOutcome.DROPPED_STALE
+        if (cachedTopForSlot(slot) != topPx) return InPlaceRefreshOutcome.DROPPED_STALE
+        if (cachedTextureKeyForSlot(slot) != textureKey) return InPlaceRefreshOutcome.DROPPED_STALE
+        if (mode != Mode.PAGED) return InPlaceRefreshOutcome.DROPPED_STALE
+        // Transient gates: keep the slot queued so pixels are not silently left stale forever.
+        if (width == 0 || height == 0) return InPlaceRefreshOutcome.DEFERRED_TRANSIENT
+        if (textView.isLayoutRequested) return InPlaceRefreshOutcome.DEFERRED_TRANSIENT
+        if (textView.layout?.height != paginatedLayoutHeight) return InPlaceRefreshOutcome.DEFERRED_TRANSIENT
+        // Stale geometry vs the live window / texture key: drop and allow normal precache.
+        if (bitmap.width != width || bitmap.height != height) return InPlaceRefreshOutcome.DROPPED_STALE
+        val window = paged.getOrNull(pageIndex)
+        if (window != null && window.topPx != topPx) return InPlaceRefreshOutcome.DROPPED_STALE
+        val expectedKey = pageTextureKey(topPx, window)
+        if (textureKey != null && textureKey != expectedKey) return InPlaceRefreshOutcome.DROPPED_STALE
+        redrawPageShotInto(bitmap, topPx, window)
+        return InPlaceRefreshOutcome.REDRAWN
+    }
+
+    private fun cachedBitmapForSlot(slot: CachedPageShotSlot): Bitmap? = when (slot) {
+        CachedPageShotSlot.FRONT -> cachedFrontBitmap
+        CachedPageShotSlot.REVEALED -> cachedRevealedBitmap
+        CachedPageShotSlot.BACKWARD -> cachedBackwardBitmap
+    }
+
+    private fun cachedPageForSlot(slot: CachedPageShotSlot): Int = when (slot) {
+        CachedPageShotSlot.FRONT -> cachedFromPage
+        CachedPageShotSlot.REVEALED -> cachedTargetPage
+        CachedPageShotSlot.BACKWARD -> cachedBackwardPage
+    }
+
+    private fun cachedTopForSlot(slot: CachedPageShotSlot): Int = when (slot) {
+        CachedPageShotSlot.FRONT -> cachedFromTopPx
+        CachedPageShotSlot.REVEALED -> cachedTargetTopPx
+        CachedPageShotSlot.BACKWARD -> cachedBackwardTopPx
+    }
+
+    private fun cachedTextureKeyForSlot(slot: CachedPageShotSlot): Any? = when (slot) {
+        CachedPageShotSlot.FRONT -> cachedFromTextureKey
+        CachedPageShotSlot.REVEALED -> cachedTargetTextureKey
+        CachedPageShotSlot.BACKWARD -> cachedBackwardTextureKey
+    }
+
+    /**
+     * Clears the existing bitmap then paints the same snapshot path used by [snapshotPageAt], so no
+     * stale regions remain after a PIXELS_ONLY update.
+     */
+    private fun redrawPageShotInto(bitmap: Bitmap, topPx: Int, window: EpubFlowPage?) {
+        bitmap.eraseColor(android.graphics.Color.TRANSPARENT)
+        val canvas = Canvas(bitmap)
+        drawSnapshotBackground(canvas)
+        val contentSave = canvas.save()
+        canvas.translate(0f, -topPx.toFloat())
+        val clipTop = snapshotClipTopFor(topPx, window)
+        val clipBottom = snapshotClipBottomFor(topPx, window)
+        canvas.clipRect(0, clipTop, width, clipBottom)
+        container.draw(canvas)
+        canvas.restoreToCount(contentSave)
+        window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx = 0) }
     }
 
     /**
      * True when a PIXELS_ONLY completion at [layoutOffset] can affect a currently held warm page
      * shot, a pending nearby precache window, or the current/adjacent page neighborhood (including
-     * a heading-page synthetic continuation preview of an image that starts on a later page).
+     * a synthetic page-boundary crop of an image that starts on a later page).
      */
     private fun pageShotDependsOnImageOffset(layoutOffset: Int): Boolean {
         if (pageShotSlotDependsOnImageOffset(cachedFromPage, layoutOffset)) return true
@@ -1499,18 +1703,20 @@ internal class EpubFlowView(
     private fun pageWindowDependsOnImageOffset(page: EpubFlowPage?, layoutOffset: Int): Boolean {
         if (page == null) return false
         if (page.containsLayoutOffset(layoutOffset)) return true
-        return pageHasHeadingContinuationForImage(page, layoutOffset)
+        return pageHasBoundaryPreviewForImage(page, layoutOffset)
     }
 
-    private fun pageHasHeadingContinuationForImage(page: EpubFlowPage, imageLayoutStart: Int): Boolean {
+    private fun pageHasBoundaryPreviewForImage(page: EpubFlowPage, imageLayoutStart: Int): Boolean {
         val layout = textView.layout ?: return false
         val chapter = flow ?: return false
-        val continuations = pageLayoutMetadataFor(layout)?.headingImageContinuations
-            ?: headingImageContinuations(layout, chapter)
-        return continuations.any { item ->
+        val previews = pageLayoutMetadataFor(layout)?.pageBoundaryImagePreviews
+            ?: pageBoundaryImagePreviews(layout, chapter)
+        return previews.any { item ->
             item.imageLayoutStart == imageLayoutStart &&
-                item.headingFirstLine >= page.startLine &&
-                item.headingEndLineExclusive <= page.endLineExclusive &&
+                // Preceding text may span earlier pages; only require it ends on this page and
+                // the full image starts after this page's last line.
+                item.precedingEndLineExclusive > page.startLine &&
+                item.precedingEndLineExclusive <= page.endLineExclusive &&
                 item.imageLine >= page.endLineExclusive
         }
     }
@@ -1615,6 +1821,8 @@ internal class EpubFlowView(
         removeCallbacks(asyncImageRefreshRunnable)
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
+        cancelInPlacePageShotRefreshCallbacks()
+        pendingInPlacePageShotRefreshSlots.clear()
         invalidateBoundaryPreviews()
         chapterGeneration++
         boundaryPreviewGeneration++
@@ -1967,6 +2175,8 @@ internal class EpubFlowView(
         removeCallbacks(asyncImageRefreshRunnable)
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
+        cancelInPlacePageShotRefreshCallbacks()
+        pendingInPlacePageShotRefreshSlots.clear()
         removeCallbacks(conversionSnapshotClearRunnable)
         flipAnimator?.cancel()
         flipAnimator = null
@@ -2133,9 +2343,11 @@ internal class EpubFlowView(
         generation: Long,
         usablePageHeightPx: Int,
     ): PageLayoutMetadata {
-        val headingImageContinuations = headingImageContinuations(layout, f)
-        val continuationHeadingStarts = headingImageContinuations
-            .mapTo(HashSet()) { it.headingLayoutStart }
+        val pageBoundaryImagePreviews = pageBoundaryImagePreviews(layout, f)
+        // Keep-with-next still applies only to heading→image groups (paginator keepTogether).
+        val keepTogetherHeadingStarts = pageBoundaryImagePreviews
+            .filter(PageBoundaryImagePreview::precedingIsHeading)
+            .mapTo(HashSet()) { it.precedingLayoutStart }
         val headingLines = HashSet<Int>()
         val paragraphIntervals = ArrayList<ParagraphLineInterval>(f.segments.size)
         f.segments.forEach { segment ->
@@ -2152,7 +2364,7 @@ internal class EpubFlowView(
             if (
                 block is EpubDisplayBlock.Text &&
                 block.headingLevel != null &&
-                segment.layoutStart !in continuationHeadingStarts
+                segment.layoutStart !in keepTogetherHeadingStarts
             ) {
                 for (line in firstLine..lastLine) headingLines += line
             }
@@ -2166,25 +2378,32 @@ internal class EpubFlowView(
             usablePageHeightPx = usablePageHeightPx,
             headingLines = headingLines,
             paragraphIntervals = paragraphIntervals,
-            headingImageContinuations = headingImageContinuations,
+            pageBoundaryImagePreviews = pageBoundaryImagePreviews,
         )
     }
 
-    private fun headingImageContinuations(
+    /**
+     * Any non-inline block image immediately after preceding text content can paint a cropped top
+     * preview in leftover page space when the full image moves to the next page. One occurrence
+     * only — the image still owns a single layout offset / U+FFFC.
+     */
+    private fun pageBoundaryImagePreviews(
         layout: Layout,
         f: EpubChapterFlow,
-    ): List<HeadingImageContinuation> = buildList {
-        f.segments.forEachIndexed { index, heading ->
-            val headingBlock = heading.block as? EpubDisplayBlock.Text ?: return@forEachIndexed
-            if (headingBlock.headingLevel == null || heading.layoutEnd <= heading.layoutStart) return@forEachIndexed
+    ): List<PageBoundaryImagePreview> = buildList {
+        f.segments.forEachIndexed { index, preceding ->
+            val textBlock = preceding.block as? EpubDisplayBlock.Text ?: return@forEachIndexed
+            if (preceding.layoutEnd <= preceding.layoutStart) return@forEachIndexed
+            // Headings and body paragraphs both qualify; skip empty / pure-separator text.
+            if (textBlock.text.isBlank()) return@forEachIndexed
             val nextContent = f.nextContentSegmentAfter(index) ?: return@forEachIndexed
             val image = nextContent.block as? EpubDisplayBlock.Image ?: return@forEachIndexed
             if (image.isInlineContent) return@forEachIndexed
             add(
-                HeadingImageContinuation(
-                    headingLayoutStart = heading.layoutStart,
-                    headingFirstLine = layout.getLineForOffset(heading.layoutStart),
-                    headingEndLineExclusive = layout.getLineForOffset(heading.layoutEnd - 1) + 1,
+                PageBoundaryImagePreview(
+                    precedingLayoutStart = preceding.layoutStart,
+                    precedingEndLineExclusive = layout.getLineForOffset(preceding.layoutEnd - 1) + 1,
+                    precedingIsHeading = textBlock.headingLevel != null,
                     imageLayoutStart = nextContent.layoutStart,
                     imageLine = layout.getLineForOffset(nextContent.layoutStart),
                 ),
@@ -2219,8 +2438,10 @@ internal class EpubFlowView(
         }
 
     private fun headingLineSet(layout: Layout, f: EpubChapterFlow): Set<Int> {
-        val continuationHeadingStarts = headingImageContinuations(layout, f)
-            .mapTo(HashSet()) { it.headingLayoutStart }
+        // Headings that keep-with-next an attached image are excluded so the group rides together.
+        val keepTogetherHeadingStarts = pageBoundaryImagePreviews(layout, f)
+            .filter(PageBoundaryImagePreview::precedingIsHeading)
+            .mapTo(HashSet()) { it.precedingLayoutStart }
         val lines = HashSet<Int>()
         f.segments.forEach { seg ->
             val block = seg.block
@@ -2228,7 +2449,7 @@ internal class EpubFlowView(
                 block is EpubDisplayBlock.Text &&
                 block.headingLevel != null &&
                 seg.layoutEnd > seg.layoutStart &&
-                seg.layoutStart !in continuationHeadingStarts
+                seg.layoutStart !in keepTogetherHeadingStarts
             ) {
                 val first = layout.getLineForOffset(seg.layoutStart)
                 val last = layout.getLineForOffset((seg.layoutEnd - 1).coerceAtLeast(seg.layoutStart))
@@ -2830,7 +3051,7 @@ internal class EpubFlowView(
         bitmap?.takeUnless(Bitmap::isRecycled)?.let { pageShotBudget.relabel(it, kind, label) }
     }
 
-    private fun drawHeadingImageContinuationPreview(
+    private fun drawPageBoundaryImagePreview(
         canvas: Canvas,
         pageTopPx: Int,
         window: EpubFlowPage,
@@ -2838,25 +3059,30 @@ internal class EpubFlowView(
     ) {
         val layout = textView.layout ?: return
         val chapter = flow ?: return
-        val continuations = pageLayoutMetadataFor(layout)?.headingImageContinuations
-            ?: headingImageContinuations(layout, chapter)
-        val continuation = continuations.firstOrNull { item ->
-            item.headingFirstLine >= window.startLine &&
-                item.headingEndLineExclusive <= window.endLineExclusive &&
+        val previews = pageLayoutMetadataFor(layout)?.pageBoundaryImagePreviews
+            ?: pageBoundaryImagePreviews(layout, chapter)
+        val preview = previews.firstOrNull { item ->
+            // Body/heading may begin on an earlier page; match when this page holds the end of
+            // preceding visible text and the indivisible image owns a later page.
+            item.precedingEndLineExclusive > window.startLine &&
+                item.precedingEndLineExclusive <= window.endLineExclusive &&
                 item.imageLine >= window.endLineExclusive
         } ?: return
 
-        val headingLastLine = continuation.headingEndLineExclusive - 1
-        val headingBottom = layout.getLineBottom(headingLastLine) + textView.paddingTop - pageTopPx
-        val imageTop = layout.getLineTop(continuation.imageLine) + textView.paddingTop - pageTopPx
-        val previewTopInViewport = maxOf(headingBottom, imageTop).coerceIn(0, height)
+        // Prefer the bottom of the page's last visible content line (body or heading), so leftover
+        // space under any preceding text can host the cropped next-page image top.
+        val lastWindowLine = (window.endLineExclusive - 1).coerceAtLeast(window.startLine)
+        val precedingBottom =
+            layout.getLineBottom(lastWindowLine) + textView.paddingTop - pageTopPx
+        val imageTop = layout.getLineTop(preview.imageLine) + textView.paddingTop - pageTopPx
+        val previewTopInViewport = maxOf(precedingBottom, imageTop).coerceIn(0, height)
         val previewBottomInViewport = (height - textView.paddingBottom).coerceAtLeast(previewTopInViewport)
         if (previewBottomInViewport <= previewTopInViewport) return
 
-        val imageLineHeight = layout.getLineBottom(continuation.imageLine) -
-            layout.getLineTop(continuation.imageLine)
+        val imageLineHeight = layout.getLineBottom(preview.imageLine) -
+            layout.getLineTop(preview.imageLine)
         if (imageLineHeight <= previewBottomInViewport - previewTopInViewport) return
-        val drawable = imageDrawableAt(continuation.imageLayoutStart) ?: return
+        val drawable = imageDrawableAt(preview.imageLayoutStart) ?: return
         val oldBounds = Rect(drawable.bounds)
         val sourceWidth = oldBounds.width().takeIf { it > 0 }
             ?: drawable.intrinsicWidth.takeIf { it > 0 }
@@ -2912,7 +3138,7 @@ internal class EpubFlowView(
             dispatchDraw(canvas)
             canvas.restoreToCount(save)
             activePageWindow?.takeIf { it.topPx == scrollY }
-                ?.let { drawHeadingImageContinuationPreview(canvas, scrollY, it, canvasViewportTopPx = 0) }
+                ?.let { drawPageBoundaryImagePreview(canvas, scrollY, it, canvasViewportTopPx = 0) }
         }
 
     /**
@@ -2946,7 +3172,7 @@ internal class EpubFlowView(
             canvas.clipRect(0, clipTop, width, clipBottom)
             container.draw(canvas)
             canvas.restoreToCount(contentSave)
-            window?.let { drawHeadingImageContinuationPreview(canvas, topPx, it, canvasViewportTopPx = 0) }
+            window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx = 0) }
         }
     }
 
@@ -3125,6 +3351,24 @@ internal class EpubFlowView(
         relabelPageShot(cachedRevealedBitmap, PageShotLeaseKind.EVICTABLE, "cache.forward")
         relabelPageShot(cachedBackwardBitmap, PageShotLeaseKind.EVICTABLE, "cache.backward")
         trimStablePageShotsToBudget()
+        restoreActiveFlipPixelRefreshes(front, revealed)
+    }
+
+    private fun restoreActiveFlipPixelRefreshes(front: Bitmap, revealed: Bitmap) {
+        val refreshFront = activeFlipFrontPixelRefreshPending
+        val refreshRevealed = activeFlipRevealedPixelRefreshPending
+        activeFlipFrontPixelRefreshPending = false
+        activeFlipRevealedPixelRefreshPending = false
+        if (refreshFront) queueCachedBitmapForPixelRefresh(front)
+        if (refreshRevealed) queueCachedBitmapForPixelRefresh(revealed)
+    }
+
+    private fun queueCachedBitmapForPixelRefresh(bitmap: Bitmap) {
+        when {
+            cachedFrontBitmap === bitmap -> pendingInPlacePageShotRefreshSlots += CachedPageShotSlot.FRONT
+            cachedRevealedBitmap === bitmap -> pendingInPlacePageShotRefreshSlots += CachedPageShotSlot.REVEALED
+            cachedBackwardBitmap === bitmap -> pendingInPlacePageShotRefreshSlots += CachedPageShotSlot.BACKWARD
+        }
     }
 
     private fun trimStablePageShotsToBudget() {
@@ -3149,7 +3393,7 @@ internal class EpubFlowView(
         onCancelled: () -> Unit = {},
     ) {
         flipAnimator?.cancel()
-        clearFlipOverlay()
+        clearFlipOverlay(preserveActivePixelRefreshes = true)
         // The overlay draws in content coords (canvas translated by scrollY). After [goToPage] the
         // content is parked on the incoming page, so scrollY is the new viewport top — place the overlay
         // there so it covers exactly what's on screen (each drawable translates to its bounds internally).
@@ -3230,7 +3474,7 @@ internal class EpubFlowView(
         flipped = true
     }
 
-    private fun clearFlipOverlay() {
+    private fun clearFlipOverlay(preserveActivePixelRefreshes: Boolean = false) {
         cancelPendingLocalPageShotHandoff(consumeGesture = true)
         slideDrawable?.let {
             overlay.remove(it)
@@ -3242,6 +3486,10 @@ internal class EpubFlowView(
             it.recycle()
         }
         curlDrawable = null
+        if (!preserveActivePixelRefreshes) {
+            activeFlipFrontPixelRefreshPending = false
+            activeFlipRevealedPixelRefreshPending = false
+        }
         if (
             interactiveTurnState == InteractiveTurnState.SOFTWARE ||
             interactiveTurnState == InteractiveTurnState.SOFTWARE_SETTLING ||
@@ -3626,7 +3874,7 @@ internal class EpubFlowView(
         // Park content on the incoming page beneath the overlay; stays silent until the turn commits.
         parkOnPageWindow(targetWindow, report = false)
         flipAnimator?.cancel()
-        clearFlipOverlay()
+        clearFlipOverlay(preserveActivePixelRefreshes = true)
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
             val drawable = PageCurlDrawable(
                 outgoing, revealed, width, height, forward, density, ::recyclePageShot,

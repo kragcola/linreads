@@ -27,6 +27,7 @@ import io.noties.markwon.image.AsyncDrawableLoader
 import io.noties.markwon.image.AsyncDrawableSpan
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -5258,9 +5259,16 @@ class EpubFlowViewTest {
 
         method!!.invoke(view, pages[0].startOffset)
 
-        assertTrue("the containing page texture must be retired when image pixels arrive", cachedFront.isRecycled)
+        // Slice A: dependent warm owners stay leased; no recycle/replace cold gap.
+        assertFalse(
+            "PIXELS_ONLY must keep the containing warm front owner (in-place refresh, not recycle)",
+            cachedFront.isRecycled,
+        )
         assertFalse("an unrelated adjacent page texture must stay warm", cachedRevealed.isRecycled)
-        assertNull(view.privateField("cachedFrontBitmap"))
+        assertTrue(
+            "dependent front slot must retain the same bitmap identity",
+            view.privateField("cachedFrontBitmap") === cachedFront,
+        )
         assertTrue(view.privateField("cachedRevealedBitmap") === cachedRevealed)
         assertTrue("same geometry must preserve the existing StaticLayout", view.textView.layout === layoutBefore)
         assertFalse("same geometry must not request a TextView re-layout", view.textView.isLayoutRequested)
@@ -5327,25 +5335,32 @@ class EpubFlowViewTest {
             assertFalse(headingShot.isRecycled)
             assertFalse(imageShot.isRecycled)
             assertFalse(unrelatedShot.isRecycled)
+            val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+            val leasedBytesBefore = budget.leasedBytes
 
             view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
-            // Drain pre-draw wake + the full split-frame precache lifecycle that rebuilds retired slots.
-            shadowOf(Looper.getMainLooper()).idle()
-            view.invalidate()
-            shadowOf(Looper.getMainLooper()).idle()
-            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+            // Drain one-slot-per-frame in-place redraws (no recycle/realloc rebuild).
+            view.drainInPlacePageShotRefreshForTest()
 
-            assertTrue(
-                "image-page shot must retire when its async pixels arrive",
+            assertFalse(
+                "image-page warm owner must stay leased after PIXELS_ONLY (in-place, not recycle)",
                 imageShot.isRecycled,
             )
-            assertTrue(
-                "heading-page shot that synthetically previews the next-page image must also retire",
+            assertFalse(
+                "heading continuation warm owner must stay leased after PIXELS_ONLY",
                 headingShot.isRecycled,
             )
             assertFalse(
                 "unrelated warm page shot must stay alive after the full lifecycle",
                 unrelatedShot.isRecycled,
+            )
+            assertTrue(
+                "heading slot must keep the same bitmap identity after in-place refresh",
+                view.privateField("cachedFrontBitmap") === headingShot,
+            )
+            assertTrue(
+                "image slot must keep the same bitmap identity after in-place refresh",
+                view.privateField("cachedRevealedBitmap") === imageShot,
             )
             assertTrue(
                 "unrelated owner must remain the same cached instance",
@@ -5360,19 +5375,10 @@ class EpubFlowViewTest {
                 requireNotNull(view.pageTopPxAt(fixture.headingPageIndex - 1)),
                 view.privateInt("cachedBackwardTopPx"),
             )
-
-            // Affected slots are retired then rebuilt by the production precache wake.
-            val newHeading = view.privateField("cachedFrontBitmap") as Bitmap?
-            val newImage = view.privateField("cachedRevealedBitmap") as Bitmap?
-            assertTrue(
-                "heading slot must be replaced with a fresh warm shot after lifecycle drain; " +
-                    "new=$newHeading recycled=${newHeading?.isRecycled}",
-                newHeading != null && !newHeading.isRecycled && newHeading !== headingShot,
-            )
-            assertTrue(
-                "image slot must be replaced with a fresh warm shot after lifecycle drain; " +
-                    "new=$newImage recycled=${newImage?.isRecycled}",
-                newImage != null && !newImage.isRecycled && newImage !== imageShot,
+            assertEquals(
+                "page-shot budget leased bytes must stay stable (no release/realloc)",
+                leasedBytesBefore,
+                budget.leasedBytes,
             )
             assertEquals(fixture.headingPageIndex, view.privateInt("cachedFromPage"))
             assertEquals(fixture.imagePageIndex, view.privateInt("cachedTargetPage"))
@@ -5384,17 +5390,15 @@ class EpubFlowViewTest {
                 requireNotNull(view.pageTopPxAt(fixture.imagePageIndex)),
                 view.privateInt("cachedTargetTopPx"),
             )
-            val newHeadingKey = checkNotNull(view.privateField("cachedFromTextureKey")) {
-                "rebuilt heading warm shot must carry a PageTextureKey"
-            }
-            val newImageKey = checkNotNull(view.privateField("cachedTargetTextureKey")) {
-                "rebuilt image warm shot must carry a PageTextureKey"
-            }
-            // Same geometry: rebuilt keys match the pre-invalidation page identity values.
-            assertEquals(headingKey, newHeadingKey)
-            assertEquals(imageKey, newImageKey)
+            // Same geometry: keys remain the pre-refresh page identity values.
+            assertEquals(headingKey, view.privateField("cachedFromTextureKey"))
+            assertEquals(imageKey, view.privateField("cachedTargetTextureKey"))
+            assertTrue(
+                "in-place refresh queue must drain after animation frames",
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
             assertFalse(
-                "split-frame precache must not remain pending after lifecycle drain",
+                "split-frame precache must not arm a recycle rebuild after PIXELS_ONLY",
                 view.privateBool("pageTexturePrecachePending"),
             )
         } finally {
@@ -5520,32 +5524,29 @@ class EpubFlowViewTest {
             asyncDrawable.setResult(decoded)
             asyncDrawable.setBounds(0, 0, viewportWidth, imageHeight)
             view.onAsyncImagePixelsChanged(imageSegment.layoutStart)
-            // Drain pre-draw wake + split-frame precache so the warm heading slot is rebuilt with pixels.
-            shadowOf(Looper.getMainLooper()).idle()
-            view.invalidate()
-            shadowOf(Looper.getMainLooper()).idle()
-            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+            // Drain one-slot-per-frame in-place redraw so the warm heading owner gets latest pixels.
+            view.drainInPlacePageShotRefreshForTest()
 
-            assertTrue(
-                "stale heading continuation warm shot must retire after PIXELS_ONLY",
+            assertFalse(
+                "heading continuation warm owner must stay leased after PIXELS_ONLY",
                 staleHeadingShot.isRecycled,
             )
-            val rebuiltHeading = view.privateField("cachedFrontBitmap") as Bitmap?
+            val refreshedHeading = view.privateField("cachedFrontBitmap") as Bitmap?
+            assertTrue(
+                "heading slot must keep the transparent-era owner identity (in-place refresh)",
+                refreshedHeading === staleHeadingShot,
+            )
             val livePixels = view.drawToBitmapForTest()
             try {
-                val warmHits = rebuiltHeading
-                    ?.takeUnless { it.isRecycled }
-                    ?.let {
-                        sampleImagePatternHits(
-                            bitmap = it,
-                            left = sampleLeft,
-                            top = sampleTop,
-                            right = sampleRight,
-                            bottom = sampleBottom,
-                            stripeA = imageColor,
-                            stripeB = imageColor,
-                        )
-                    } ?: 0
+                val warmHits = sampleImagePatternHits(
+                    bitmap = staleHeadingShot,
+                    left = sampleLeft,
+                    top = sampleTop,
+                    right = sampleRight,
+                    bottom = sampleBottom,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
                 val liveHits = sampleImagePatternHits(
                     bitmap = livePixels,
                     left = sampleLeft,
@@ -5556,24 +5557,16 @@ class EpubFlowViewTest {
                     stripeB = imageColor,
                 )
                 assertTrue(
-                    "heading continuation crop must show decoded pixels on warm shot and/or live render; " +
-                        "warmHits=$warmHits liveHits=$liveHits " +
-                        "rebuilt=${rebuiltHeading != null && rebuiltHeading !== staleHeadingShot} " +
-                        "headingBottomOnPage=$headingBottomOnPage",
+                    "heading continuation crop must show decoded pixels on the same warm owner and/or live render; " +
+                        "warmHits=$warmHits liveHits=$liveHits headingBottomOnPage=$headingBottomOnPage",
                     warmHits > 0 || liveHits > 0,
                 )
-                if (rebuiltHeading != null && !rebuiltHeading.isRecycled) {
-                    assertTrue(
-                        "rebuilt warm heading must be a new owner, not the transparent-era shot",
-                        rebuiltHeading !== staleHeadingShot,
-                    )
-                    assertNotNull(
-                        "rebuilt warm heading must keep a valid PageTextureKey",
-                        view.privateField("cachedFromTextureKey"),
-                    )
-                    // Same geometry: key identity values remain consistent with the pre-decode page.
-                    assertEquals(staleHeadingKey, view.privateField("cachedFromTextureKey"))
-                }
+                assertNotNull(
+                    "refreshed warm heading must keep a valid PageTextureKey",
+                    view.privateField("cachedFromTextureKey"),
+                )
+                // Same geometry: key identity values remain consistent with the pre-decode page.
+                assertEquals(staleHeadingKey, view.privateField("cachedFromTextureKey"))
             } finally {
                 livePixels.recycle()
             }
@@ -5636,6 +5629,729 @@ class EpubFlowViewTest {
                 view.privateField("asyncImageWakeListener") === wakeBefore,
         )
         view.dispose()
+    }
+
+    @Test
+    fun `PIXELS_ONLY during held finger turn defers shot recycle and precache until settle`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        try {
+            assertTrue(
+                "production-faithful warm shots require precache enabled",
+                view.pageTexturePrecacheEnabled,
+            )
+            // Park on the page before the heading so a forward turn targets the heading page,
+            // whose warm continuation depends on the next-page image pixels.
+            val parkPage = (fixture.headingPageIndex - 1).coerceAtLeast(0)
+            view.goToPage(parkPage)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            assertNotNull(
+                "precache must warm front at park=$parkPage",
+                view.privateField("cachedFrontBitmap"),
+            )
+            assertNotNull(
+                "precache must warm revealed at park=$parkPage",
+                view.privateField("cachedRevealedBitmap"),
+            )
+
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            view.updateInteractiveCurl(x = view.width * 0.45f)
+            assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+
+            // Snapshot owners after the turn has claimed finger-owned shots. Turn start may
+            // re-home front/revealed into the curl overlay and drop the opposite speculative
+            // slot — that is not PIXELS_ONLY behavior. Measure only what remains under turn.
+            val frontDuringTurn = view.privateField("cachedFrontBitmap") as Bitmap?
+            val revealedDuringTurn = view.privateField("cachedRevealedBitmap") as Bitmap?
+            val backwardDuringTurn = view.privateField("cachedBackwardBitmap") as Bitmap?
+            val genAtTurnStart = view.privateField("pageTexturePrecacheGeneration") as Long
+            val wakeBefore = view.privateField("asyncImageWakeListener")
+            val pendingPrecacheBefore = view.privateBool("pageTexturePrecachePending")
+
+            // Interleaved PIXELS_ONLY completions while the finger still owns the turn.
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+            @Suppress("UNCHECKED_CAST")
+            val queued = view.privateField("asyncImagePixelRefreshOffsets") as Set<Int>
+            assertTrue(
+                "PIXELS_ONLY offsets must queue while the finger owns the turn; queued=$queued",
+                fixture.imageLayoutStart in queued,
+            )
+            frontDuringTurn?.let {
+                assertFalse(
+                    "held-finger PIXELS_ONLY must not recycle a warm front still held mid-turn",
+                    it.isRecycled,
+                )
+            }
+            revealedDuringTurn?.let {
+                assertFalse(
+                    "held-finger PIXELS_ONLY must not recycle a warm revealed still held mid-turn",
+                    it.isRecycled,
+                )
+            }
+            backwardDuringTurn?.let {
+                assertFalse(
+                    "held-finger PIXELS_ONLY must not recycle an unrelated warm previous mid-turn",
+                    it.isRecycled,
+                )
+                assertTrue(
+                    "unrelated previous owner must remain the same instance mid-turn",
+                    view.privateField("cachedBackwardBitmap") === it,
+                )
+            }
+            assertEquals(
+                "held-finger PIXELS_ONLY must not bump the speculative precache generation",
+                genAtTurnStart,
+                view.privateField("pageTexturePrecacheGeneration") as Long,
+            )
+            assertTrue(
+                "held-finger PIXELS_ONLY must not install a new async-image precache wake; " +
+                    "before=$wakeBefore after=${view.privateField("asyncImageWakeListener")}",
+                view.privateField("asyncImageWakeListener") == null ||
+                    view.privateField("asyncImageWakeListener") === wakeBefore,
+            )
+            assertEquals(
+                "speculative precache arming must not change while the finger owns the turn",
+                pendingPrecacheBefore,
+                view.privateBool("pageTexturePrecachePending"),
+            )
+            assertFalse(
+                "speculative precache must not newly arm while the finger owns the turn",
+                !pendingPrecacheBefore && view.privateBool("pageTexturePrecachePending"),
+            )
+
+            // Settle the turn; deferred pixel refresh applies only after turnInFlight clears.
+            view.endInteractiveCurl(velocityX = 0f)
+            val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+            if (animator != null && animator.isRunning) {
+                animator.end()
+            }
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+
+            // Drain REFLOW_DEBOUNCE_MS + post-settle in-place redraw (owners may have moved after commit).
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+            view.drainInPlacePageShotRefreshForTest()
+            view.invalidate()
+            shadowOf(Looper.getMainLooper()).idle()
+            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "queued PIXELS_ONLY offsets must drain after the turn settles",
+                (view.privateField("asyncImagePixelRefreshOffsets") as Set<*>).isEmpty(),
+            )
+            // Queued pixels drained; no hang on recycle-based precache rebuild.
+            assertFalse(
+                "split-frame precache must not remain pending after post-settle drain",
+                view.privateBool("pageTexturePrecachePending"),
+            )
+            assertTrue(
+                "post-settle in-place refresh queue must empty after drain",
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
+        } finally {
+            if (view.privateField("interactiveTurnState").toString() != "NONE") {
+                view.endInteractiveCurl(velocityX = 0f)
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            }
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `PIXELS_ONLY in-place refresh keeps warm identities and coalesces one slot per frame`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            val headingShot = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            val imageShot = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+            val unrelatedShot = checkNotNull(view.privateField("cachedBackwardBitmap") as Bitmap?)
+            val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+            val leasedBefore = budget.leasedBytes
+            val marker = 0xFF00FF00.toInt()
+            headingShot.eraseColor(marker)
+            imageShot.eraseColor(marker)
+            assertEquals(marker, headingShot.getPixel(0, 0))
+            assertEquals(marker, imageShot.getPixel(0, 0))
+
+            // Multiple completions for the same offset coalesce into one refresh set.
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+            @Suppress("UNCHECKED_CAST")
+            val pendingSlots = view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>
+            // Snapshot size: pendingSlots is the live mutable set, mutated by runOneTask.
+            val pendingCountBeforeFrame = pendingSlots.size
+            assertTrue(
+                "dependent front+revealed must be scheduled; pending=$pendingSlots",
+                pendingCountBeforeFrame >= 2,
+            )
+            assertTrue(view.privateBool("inPlacePageShotRefreshPosted"))
+
+            // Frame 1: exactly one slot leaves the queue.
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            @Suppress("UNCHECKED_CAST")
+            val afterOne = view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>
+            assertEquals(
+                "exactly one dependent slot must repaint per animation frame",
+                pendingCountBeforeFrame - 1,
+                afterOne.size,
+            )
+            assertTrue(
+                "warm identities must stay leased after the first frame",
+                !headingShot.isRecycled &&
+                    !imageShot.isRecycled &&
+                    view.privateField("cachedFrontBitmap") === headingShot &&
+                    view.privateField("cachedRevealedBitmap") === imageShot &&
+                    view.privateField("cachedBackwardBitmap") === unrelatedShot,
+            )
+
+            // Drain remaining frames.
+            view.drainInPlacePageShotRefreshForTest()
+            assertTrue(
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
+            assertFalse(headingShot.isRecycled)
+            assertFalse(imageShot.isRecycled)
+            assertFalse(unrelatedShot.isRecycled)
+            assertTrue(view.privateField("cachedFrontBitmap") === headingShot)
+            assertTrue(view.privateField("cachedRevealedBitmap") === imageShot)
+            assertTrue(view.privateField("cachedBackwardBitmap") === unrelatedShot)
+            assertEquals(leasedBefore, budget.leasedBytes)
+            // In-place erase+redraw must replace the solid marker pixels.
+            assertTrue(
+                "refreshed heading owner must no longer be solid marker fill",
+                headingShot.getPixel(0, 0) != marker ||
+                    headingShot.getPixel(headingShot.width / 2, headingShot.height / 2) != marker,
+            )
+            assertTrue(
+                "refreshed image owner must no longer be solid marker fill",
+                imageShot.getPixel(0, 0) != marker ||
+                    imageShot.getPixel(imageShot.width / 2, imageShot.height / 2) != marker,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `PIXELS_ONLY scheduled refresh still warms immediate finger turn without LOCAL_SHOTS_WAITING`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            val front = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            val revealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+            val marker = 0xFF00FF00.toInt()
+            front.eraseColor(marker)
+            revealed.eraseColor(marker)
+            assertFalse(front.isRecycled)
+            assertFalse(revealed.isRecycled)
+
+            // Schedule in-place refresh but do not drain frames — finger arrives in the gap.
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+            assertTrue(
+                "refresh must be scheduled before the gesture",
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isNotEmpty(),
+            )
+            assertTrue(
+                "refresh callback must be posted before the gesture",
+                view.privateBool("inPlacePageShotRefreshPosted"),
+            )
+            assertFalse("scheduled refresh must not recycle warm front", front.isRecycled)
+            assertFalse("scheduled refresh must not recycle warm revealed", revealed.isRecycled)
+            assertTrue(view.privateField("cachedFrontBitmap") === front)
+            assertTrue(view.privateField("cachedRevealedBitmap") === revealed)
+
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            view.updateInteractiveCurl(x = view.width * 0.45f)
+            val state = view.privateField("interactiveTurnState").toString()
+            assertTrue(
+                "finger turn after scheduled PIXELS_ONLY must use warm shots, not cold handoff; state=$state " +
+                    "slide=${view.privateField("slideDrawable")} curl=${view.privateField("curlDrawable")}",
+                state == "SOFTWARE" || state == "SOFTWARE_SETTLING",
+            )
+            assertNotEquals(
+                "must not enter LOCAL_SHOTS_WAITING cold path",
+                "LOCAL_SHOTS_WAITING",
+                state,
+            )
+            assertTrue(
+                "active turn must install a local paper renderer from warm shots",
+                view.privateField("slideDrawable") != null || view.privateField("curlDrawable") != null,
+            )
+            assertFalse(front.isRecycled)
+            assertFalse(revealed.isRecycled)
+            assertTrue(
+                "gesture transfer must clear in-place refresh slots that targeted owners now in the turn",
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
+            assertFalse(
+                "gesture transfer must cancel the in-place refresh callback so it cannot target moved owners",
+                view.privateBool("inPlacePageShotRefreshPosted"),
+            )
+            assertTrue(view.privateBool("activeFlipFrontPixelRefreshPending"))
+            assertTrue(view.privateBool("activeFlipRevealedPixelRefreshPending"))
+
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+            assertFalse(view.privateBool("activeFlipFrontPixelRefreshPending"))
+            assertFalse(view.privateBool("activeFlipRevealedPixelRefreshPending"))
+            assertTrue(
+                "settle must remap and drain dirty active owners into their new cache slots",
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
+            assertTrue(
+                "committed forward turn must retain revealed as current",
+                view.privateField("cachedFrontBitmap") === revealed,
+            )
+            assertTrue(
+                "committed forward turn must retain outgoing as backward",
+                view.privateField("cachedBackwardBitmap") === front,
+            )
+            assertNotEquals(marker, front.getPixel(0, 0))
+            assertNotEquals(marker, front.getPixel(front.width / 2, front.height / 2))
+            assertNotEquals(marker, revealed.getPixel(0, 0))
+            assertNotEquals(marker, revealed.getPixel(revealed.width / 2, revealed.height / 2))
+        } finally {
+            if (view.privateField("interactiveTurnState").toString() != "NONE") {
+                view.endInteractiveCurl(velocityX = 0f)
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            }
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `PIXELS_ONLY with no warm owner wakes normal nearby precache`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            assertNull(view.privateField("cachedFrontBitmap"))
+            assertNull(view.privateField("cachedRevealedBitmap"))
+            assertNull(view.privateField("cachedBackwardBitmap"))
+            assertNull(view.privateField("pendingPageTexturePrecache"))
+            assertFalse(view.privateBool("pageTexturePrecachePending"))
+            assertNull(
+                "cold cache must start without an async-image wake listener",
+                view.privateField("asyncImageWakeListener"),
+            )
+
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+
+            assertTrue(
+                "no-warm-owner PIXELS_ONLY must not schedule in-place slot redraws",
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
+            assertNotNull(
+                "no-warm-owner PIXELS_ONLY must install a pre-draw wake for normal nearby precache",
+                view.privateField("asyncImageWakeListener"),
+            )
+            // Drive the wake path to pre-draw and confirm cold slots become warm.
+            view.invalidate()
+            shadowOf(Looper.getMainLooper()).idle()
+            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+            view.preCachePageTexturesForTest()
+            assertNotNull(
+                "after wake, normal precache must warm the front for the next gesture",
+                view.privateField("cachedFrontBitmap"),
+            )
+            assertNotNull(
+                "after wake, normal precache must warm the adjacent revealed page",
+                view.privateField("cachedRevealedBitmap"),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `PIXELS_ONLY discarded partial precache refills missing slots after in-place drain`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            // Fully warm, then drop adjacent slots so a new split-frame precache retains front only.
+            view.preCachePageTexturesForTest()
+            val retainedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            val oldRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+            val oldBackward = checkNotNull(view.privateField("cachedBackwardBitmap") as Bitmap?)
+            val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+            view.detachCachedTextureOwnerForTest(oldRevealed)
+            view.detachCachedTextureOwnerForTest(oldBackward)
+            assertTrue(budget.release(oldRevealed))
+            assertTrue(budget.release(oldBackward))
+            if (!oldRevealed.isRecycled) oldRevealed.recycle()
+            if (!oldBackward.isRecycled) oldBackward.recycle()
+            view.setPrivateField("cachedRevealedBitmap", null)
+            view.setPrivateField("cachedBackwardBitmap", null)
+            view.setPrivateField("cachedTargetPage", -1)
+            view.setPrivateField("cachedBackwardPage", -1)
+            view.setPrivateField("cachedTargetTopPx", -1)
+            view.setPrivateField("cachedBackwardTopPx", -1)
+            view.setPrivateField("cachedTargetTextureKey", null)
+            view.setPrivateField("cachedBackwardTextureKey", null)
+            assertTrue(view.privateField("cachedFrontBitmap") === retainedFront)
+
+            // Partial pending: retained front + mid-flight target/previous captures.
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            val pending = checkNotNull(view.privateField("pendingPageTexturePrecache")) {
+                "incomplete cache must arm a split-frame precache"
+            }
+            assertTrue(view.privateBool("pageTexturePrecachePending"))
+            assertTrue(
+                "production path must retain the existing front owner on the pending request",
+                pending.reflectedField("frontBitmap") === retainedFront &&
+                    pending.reflectedField("frontBitmapRetained") == true,
+            )
+            assertNull(view.privateField("cachedRevealedBitmap"))
+            assertNull(view.privateField("cachedBackwardBitmap"))
+
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+
+            assertNull(
+                "PIXELS_ONLY must discard the mid-flight partial pending precache",
+                view.privateField("pendingPageTexturePrecache"),
+            )
+            assertFalse(view.privateBool("pageTexturePrecachePending"))
+            assertTrue(
+                "retained warm front identity must stay for in-place refresh",
+                view.privateField("cachedFrontBitmap") === retainedFront && !retainedFront.isRecycled,
+            )
+            assertTrue(
+                "dependent front must be queued for in-place redraw",
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isNotEmpty(),
+            )
+
+            view.drainInPlacePageShotRefreshForTest()
+            // Drain ends by invoking normal preCache; advance postOnAnimation frames to commit
+            // adjacent slots (split-frame refill, same pattern as preCachePageTexturesForTest).
+            view.drainPendingPageTexturePrecacheForTest()
+
+            assertTrue(
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
+            assertTrue(
+                "in-place path must keep the retained front owner after drain",
+                view.privateField("cachedFrontBitmap") === retainedFront && !retainedFront.isRecycled,
+            )
+            assertNotNull(
+                "missing revealed slot must be refilled after in-place queue drain",
+                view.privateField("cachedRevealedBitmap"),
+            )
+            assertNotNull(
+                "missing backward slot must be refilled after in-place queue drain",
+                view.privateField("cachedBackwardBitmap"),
+            )
+            assertFalse(
+                checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?).isRecycled,
+            )
+            assertFalse(
+                checkNotNull(view.privateField("cachedBackwardBitmap") as Bitmap?).isRecycled,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `PIXELS_ONLY transient redraw skip requeues and later paints - stale identity drops safely`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            val front = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            val revealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+            val marker = 0xFF00AAFF.toInt()
+            front.eraseColor(marker)
+            revealed.eraseColor(marker)
+
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+            @Suppress("UNCHECKED_CAST")
+            val pendingBefore = (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).toSet()
+            assertTrue(pendingBefore.isNotEmpty())
+            assertTrue(view.privateBool("inPlacePageShotRefreshPosted"))
+
+            // Transient gate: paginated height not settled — slot stays queued, pixels stay marker-filled.
+            val settledHeight = view.privateInt("paginatedLayoutHeight")
+            view.setPrivateField("paginatedLayoutHeight", settledHeight - 1)
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            @Suppress("UNCHECKED_CAST")
+            val pendingAfterTransient =
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).toSet()
+            assertEquals(
+                "transient layout skip must requeue the same slots, not silently drop them",
+                pendingBefore,
+                pendingAfterTransient,
+            )
+            assertEquals(
+                "transient skip must not paint over warm pixels yet",
+                marker,
+                front.getPixel(0, 0),
+            )
+            assertTrue(
+                "transient skip must re-post the one-slot-per-frame callback",
+                view.privateBool("inPlacePageShotRefreshPosted") || pendingAfterTransient.isNotEmpty(),
+            )
+
+            // Clear the transient gate and finish the queue: slots must paint in place.
+            view.setPrivateField("paginatedLayoutHeight", settledHeight)
+            view.drainInPlacePageShotRefreshForTest()
+            assertTrue(
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
+            assertTrue(
+                "after transient clears, in-place refresh must replace marker fill on front",
+                front.getPixel(0, 0) != marker ||
+                    front.getPixel(front.width / 2, front.height / 2) != marker,
+            )
+            assertTrue(view.privateField("cachedFrontBitmap") === front)
+            assertTrue(view.privateField("cachedRevealedBitmap") === revealed)
+
+            // Stale identity: re-queue, corrupt page/top, drain — drop without hanging.
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+            assertTrue(
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isNotEmpty(),
+            )
+            view.setPrivateField("cachedFromPage", -1)
+            view.setPrivateField("cachedFromTopPx", -1)
+            view.drainInPlacePageShotRefreshForTest()
+            assertTrue(
+                "stale identity must drop from the queue without hanging",
+                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            )
+            assertFalse(
+                "stale-drop path must not recycle an unrelated still-leased revealed owner",
+                revealed.isRecycled,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `body paragraph page shows cropped top of following large image while next page shows complete image`() {
+        val viewportWidth = 360
+        val viewportHeight = 240
+        val imageColor = 0xFF2563EB.toInt()
+        val sampleBandHeight = 24
+        val imageHeight = viewportHeight + 120
+        // Body only — no heading. Product: any preceding visible text + oversized next-page image.
+        // Prefer geometries where the image is the immediate next page; tolerate a separator-
+        // only intermediate window when the paginator inserts one (same as heading fixture).
+        var selectedView: EpubFlowView? = null
+        var selectedFlow: EpubChapterFlow? = null
+        var selectedImageSegment: EpubFlowSegment? = null
+        var selectedBodyPageIndex = -1
+        var selectedImagePageIndex = -1
+        var lastDiagnostics: String? = null
+        for (bodyLines in 3..24) {
+            val bodyText = (1..bodyLines).joinToString("\n") {
+                "正文段落 $it 铺满本页，后面是不可拆分的大图。"
+            }
+            val flow = epubBuildChapterFlow(
+                spineIndex = 0,
+                blocks = listOf(
+                    EpubDisplayBlock.Text(bodyText, headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Image(
+                        href = "body-plate.png",
+                        altText = "body plate",
+                        paragraphIndex = 1,
+                        isInlineContent = false,
+                    ),
+                ),
+            )
+            val imageSegment = flow.segments.single { it.isImage }
+            val bodySegment = flow.segments.single {
+                val block = it.block
+                block is EpubDisplayBlock.Text && block.headingLevel == null
+            }
+            val imageDrawable = ColorDrawable(imageColor).apply {
+                setBounds(0, 0, viewportWidth, imageHeight)
+            }
+            val spannable = SpannableString(flow.text).apply {
+                setSpan(
+                    ImageSpan(imageDrawable, ImageSpan.ALIGN_BOTTOM),
+                    imageSegment.layoutStart,
+                    imageSegment.layoutEnd,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+            }
+            val view = pagedFlowView(
+                flow = flow,
+                spannable = spannable,
+                viewportWidth = viewportWidth,
+                viewportHeight = viewportHeight,
+            )
+            val layout = requireNotNull(view.textView.layout)
+            val imageLine = layout.getLineForOffset(imageSegment.layoutStart)
+            val imageLineBottom = layout.getLineBottom(imageLine)
+            val imageLineTop = layout.getLineTop(imageLine)
+            if (imageLineBottom - imageLineTop <= viewportHeight) {
+                view.dispose()
+                continue
+            }
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+            val bodyPageIndex = pages.indexOfLast { page ->
+                // Last page that ends at/after some body text and before the image offset.
+                page.endOffset > bodySegment.layoutStart &&
+                    page.endOffset <= imageSegment.layoutStart
+            }
+            val imagePageIndex = pages.indexOfFirst { page ->
+                imageSegment.layoutStart >= page.startOffset &&
+                    imageSegment.layoutStart < page.endOffset
+            }
+            lastDiagnostics =
+                "lines=$bodyLines bodyPage=$bodyPageIndex imagePage=$imagePageIndex pages=${pages.size} " +
+                    pages.mapIndexed { i, p ->
+                        "#$i[${p.startOffset},${p.endOffset}) lines=${p.startLine}..${p.endLineExclusive}"
+                    }.joinToString(" ")
+            if (bodyPageIndex >= 0 && imagePageIndex == bodyPageIndex + 1) {
+                selectedView = view
+                selectedFlow = flow
+                selectedImageSegment = imageSegment
+                selectedBodyPageIndex = bodyPageIndex
+                selectedImagePageIndex = imagePageIndex
+                break
+            }
+            view.dispose()
+        }
+        val view = selectedView ?: error(
+            "unable to place body text + immediate oversized image page; last=$lastDiagnostics",
+        )
+        val flow = requireNotNull(selectedFlow)
+        val imageSegment = requireNotNull(selectedImageSegment)
+        val bodyPageIndex = selectedBodyPageIndex
+        val imagePageIndex = selectedImagePageIndex
+        try {
+            val layout = requireNotNull(view.textView.layout)
+            val imageLine = layout.getLineForOffset(imageSegment.layoutStart)
+            val imageLineTop = layout.getLineTop(imageLine)
+            val imageLineBottom = layout.getLineBottom(imageLine)
+            assertTrue(
+                "fixture needs a non-inline image taller than the viewport",
+                imageLineBottom - imageLineTop > viewportHeight,
+            )
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+            assertTrue(
+                "body page must precede the complete-image page",
+                bodyPageIndex < imagePageIndex,
+            )
+            assertEquals(
+                "complete image should be the immediate next page after the body remainder page",
+                bodyPageIndex + 1,
+                imagePageIndex,
+            )
+
+            val bodyPageTop = requireNotNull(view.pageTopPxAt(bodyPageIndex))
+            val bodyPage = pages[bodyPageIndex]
+            val lastBodyLine = bodyPage.endLineExclusive - 1
+            val bodyBottomOnPage = layout.getLineBottom(lastBodyLine) - bodyPageTop
+            assertTrue(
+                "body content must leave leftover space under the last line",
+                bodyBottomOnPage in 1 until viewportHeight,
+            )
+            assertTrue(
+                "complete image must not fit under the body on the same page",
+                imageLineBottom - bodyPageTop > viewportHeight,
+            )
+
+            // Single occurrence identity stays stable (one U+FFFC / one image segment).
+            assertEquals(1, flow.segments.count { it.isImage })
+            assertEquals(1, flow.text.count { it == EPUB_FLOW_IMAGE_CHAR })
+            assertEquals(1 to 0, flow.paragraphAtOffset(imageSegment.layoutStart))
+
+            view.goToPage(bodyPageIndex)
+            val bodySnapshot = requireNotNull(view.snapshotPageAt(bodyPageTop))
+            val snapshotRemainderSamples = sampleImagePatternHits(
+                bitmap = bodySnapshot,
+                left = viewportWidth / 4,
+                top = (bodyBottomOnPage + 4).coerceAtMost(viewportHeight - 2),
+                right = (viewportWidth * 3) / 4,
+                bottom = viewportHeight - 2,
+                stripeA = imageColor,
+                stripeB = imageColor,
+            )
+            val bodyPageShot = view.drawToBitmapForTest()
+            try {
+                assertTrue(
+                    "page-turn snapshot must include the cropped next-page image preview; " +
+                        "hits=$snapshotRemainderSamples bodyBottomOnPage=$bodyBottomOnPage",
+                    snapshotRemainderSamples > 0,
+                )
+                val remainderSamples = sampleImagePatternHits(
+                    bitmap = bodyPageShot,
+                    left = viewportWidth / 4,
+                    top = (bodyBottomOnPage + 4).coerceAtMost(viewportHeight - 2),
+                    right = (viewportWidth * 3) / 4,
+                    bottom = viewportHeight - 2,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue(
+                    "body page must paint a cropped top preview of the following large image " +
+                        "in the leftover remainder; hits=$remainderSamples " +
+                        "snapshotHits=$snapshotRemainderSamples bodyBottomOnPage=$bodyBottomOnPage " +
+                        "bodyPage=$bodyPageIndex imagePage=$imagePageIndex pageCount=${view.pageCount()}",
+                    remainderSamples > 0,
+                )
+            } finally {
+                bodyPageShot.recycle()
+                bodySnapshot.recycle()
+            }
+
+            view.goToPage(imagePageIndex)
+            val completeImageShot = view.drawToBitmapForTest()
+            try {
+                val topBandHits = sampleImagePatternHits(
+                    bitmap = completeImageShot,
+                    left = viewportWidth / 4,
+                    top = 2,
+                    right = (viewportWidth * 3) / 4,
+                    bottom = sampleBandHeight,
+                    stripeA = imageColor,
+                    stripeB = imageColor,
+                )
+                assertTrue(
+                    "next page must still render the complete image from its top; topBandHits=$topBandHits",
+                    topBandHits > 0,
+                )
+                assertEquals(
+                    "complete image page must start at the source image line top",
+                    imageLineTop,
+                    requireNotNull(view.pageTopPxAt(imagePageIndex)),
+                )
+            } finally {
+                completeImageShot.recycle()
+            }
+
+            // Page count / locator identity must remain single-occurrence stable.
+            assertEquals(1, (view.privateField("flow") as EpubChapterFlow).segments.count { it.isImage })
+            assertEquals(1, (view.privateField("flow") as EpubChapterFlow).text.count { it == EPUB_FLOW_IMAGE_CHAR })
+        } finally {
+            view.dispose()
+        }
     }
 
     @Test
@@ -8002,6 +8718,39 @@ class EpubFlowViewTest {
             .apply { isAccessible = true }
             .invoke(this)
         if (idlePostedWork) shadowOf(Looper.getMainLooper()).idle()
+    }
+
+    /**
+     * Advances one postOnAnimation frame at a time until a split-frame page-texture precache
+     * commits (or is discarded). Mirrors production's front/target/previous frame chain; idle()
+     * alone is not reliable once work is already posted as chained animation callbacks.
+     */
+    private fun EpubFlowView.drainPendingPageTexturePrecacheForTest(maxFrames: Int = 8) {
+        repeat(maxFrames) {
+            if (
+                !privateBool("pageTexturePrecachePending") &&
+                privateField("pendingPageTexturePrecache") == null
+            ) {
+                return
+            }
+            shadowOf(Looper.getMainLooper()).runOneTask()
+        }
+        shadowOf(Looper.getMainLooper()).idle()
+    }
+
+    /**
+     * Drains the one-slot-per-frame in-place PIXELS_ONLY redraw queue without requiring a full
+     * idle that might also arm unrelated work. Caps frames so a stuck queue fails loudly.
+     */
+    private fun EpubFlowView.drainInPlacePageShotRefreshForTest(maxFrames: Int = 8) {
+        repeat(maxFrames) {
+            @Suppress("UNCHECKED_CAST")
+            val pending = privateField("pendingInPlacePageShotRefreshSlots") as Set<*>
+            val posted = privateBool("inPlacePageShotRefreshPosted")
+            if (pending.isEmpty() && !posted) return
+            shadowOf(Looper.getMainLooper()).runOneTask()
+        }
+        shadowOf(Looper.getMainLooper()).idle()
     }
 
     private fun EpubFlowView.recycleCachedTexturesForTest() {
