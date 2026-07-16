@@ -165,6 +165,27 @@ class EpubLazyBookTest {
     }
 
     @Test
+    fun `font map lookup reuses the io index without loading a cold spine`() {
+        val epub = tempDir.resolve("indexed-fonts.epub").toFile()
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>plain</p></body></html>",
+            "OEBPS/ch2.xhtml" to """
+                <html><head><style>
+                  @font-face { font-family: Story; src: url("fonts/story.ttf"); }
+                  p { font-family: Story, serif; }
+                </style></head><body><p>styled</p></body></html>
+            """.trimIndent(),
+        )
+        val book = EpubParser().parseLazyBook(epub, maxCachedSpines = 1)
+
+        assertEquals("OEBPS/fonts/story.ttf", book.bookFontMapForSpine(1).faceForFamily("Story")?.srcPath)
+        assertEquals(0, book.loadCount(0))
+        assertEquals(0, book.loadCount(1))
+        assertEquals(emptySet<Int>(), book.cachedSpineIndexes())
+    }
+
+    @Test
     fun `close clears lazy cache and load counters`() {
         val epub = tempDir.resolve("close.epub").toFile()
         writeEpub(

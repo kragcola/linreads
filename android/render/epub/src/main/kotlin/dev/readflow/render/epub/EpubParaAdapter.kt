@@ -23,7 +23,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageView
-import android.widget.Space
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.render.api.SelectionAwareTextView
@@ -45,7 +44,7 @@ internal class EpubParaAdapter(
 
     inner class TextVH(frame: FrameLayout, val tv: SelectionAwareTextView) : RecyclerView.ViewHolder(frame)
     inner class ImageVH(frame: FrameLayout, val image: ImageView) : RecyclerView.ViewHolder(frame)
-    inner class BreakVH(space: Space) : RecyclerView.ViewHolder(space)
+    inner class BreakVH(val divider: View) : RecyclerView.ViewHolder(divider)
 
     override fun getItemViewType(position: Int): Int = when (blockAt(position)) {
         is EpubDisplayBlock.Text -> VIEW_TYPE_TEXT
@@ -113,7 +112,7 @@ internal class EpubParaAdapter(
     private fun createBreakViewHolder(parent: ViewGroup): BreakVH {
         val d = parent.resources.displayMetrics.density
         return BreakVH(
-            Space(parent.context).apply {
+            View(parent.context).apply {
                 layoutParams = RecyclerView.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     (16 * d).toInt(),
@@ -126,8 +125,28 @@ internal class EpubParaAdapter(
         when (val block = blockAt(position)) {
             is EpubDisplayBlock.Text -> bindText(holder as TextVH, block)
             is EpubDisplayBlock.Image -> bindImage(holder as ImageVH, block)
-            is EpubDisplayBlock.Break -> Unit
+            is EpubDisplayBlock.Break -> bindBreak(holder as BreakVH, block)
         }
+    }
+
+    private fun bindBreak(holder: BreakVH, block: EpubDisplayBlock.Break) {
+        val density = holder.divider.resources.displayMetrics.density
+        val params = holder.divider.layoutParams as RecyclerView.LayoutParams
+        if (block.kind == EpubBreakKind.HorizontalRule) {
+            params.height = density.toInt().coerceAtLeast(1)
+            params.setMargins(
+                (24 * density).toInt(),
+                (12 * density).toInt(),
+                (24 * density).toInt(),
+                (12 * density).toInt(),
+            )
+            holder.divider.setBackgroundColor(Color.argb(0x4D, Color.red(inkColor), Color.green(inkColor), Color.blue(inkColor)))
+        } else {
+            params.height = (16 * density).toInt()
+            params.setMargins(0, 0, 0, 0)
+            holder.divider.setBackgroundColor(Color.TRANSPARENT)
+        }
+        holder.divider.layoutParams = params
     }
 
     private fun bindText(holder: TextVH, block: EpubDisplayBlock.Text) {
@@ -373,6 +392,7 @@ internal class EpubParaAdapter(
             EpubTextStyle.ForegroundColor -> safeForeground?.let { listOf(ForegroundColorSpan(it)) }.orEmpty()
             EpubTextStyle.BackgroundColor -> safeBackground?.let { listOf(BackgroundColorSpan(it)) }.orEmpty()
             EpubTextStyle.RelativeSize -> scale?.let { listOf(RelativeSizeSpan(it)) }.orEmpty()
+            EpubTextStyle.FontFamily -> emptyList()
         }
 
     private fun EpubTextAlign?.toGravity(fallback: Int = Gravity.START): Int =

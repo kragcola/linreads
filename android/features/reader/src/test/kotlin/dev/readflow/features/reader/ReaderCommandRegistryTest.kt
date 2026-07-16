@@ -1,10 +1,12 @@
 package dev.readflow.features.reader
 
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.TextFields
 import dev.readflow.core.model.ReaderCommandId
 import dev.readflow.core.model.ReaderMenuConfig
 import dev.readflow.core.model.ReaderMenuEntry
@@ -44,14 +46,14 @@ class ReaderCommandRegistryTest {
     }
 
     @Test
-    fun `default icons match previous hard-coded row`() {
+    fun `default icons give each reader command a distinct semantic glyph`() {
         val byId = ReaderCommandRegistry.catalog.associateBy { it.id }
         assertEquals(Icons.Default.Menu, byId[ReaderCommandId.TOC]!!.icon)
         assertEquals(Icons.Default.Search, byId[ReaderCommandId.SEARCH]!!.icon)
-        assertEquals(Icons.Default.Edit, byId[ReaderCommandId.BOOKMARKS]!!.icon)
+        assertEquals(Icons.Default.Bookmark, byId[ReaderCommandId.BOOKMARKS]!!.icon)
         assertEquals(Icons.Default.Edit, byId[ReaderCommandId.ANNOTATIONS]!!.icon)
-        assertEquals(Icons.Default.Edit, byId[ReaderCommandId.FONT]!!.icon)
-        assertEquals(Icons.Default.MoreVert, byId[ReaderCommandId.THEME]!!.icon)
+        assertEquals(Icons.Outlined.TextFields, byId[ReaderCommandId.FONT]!!.icon)
+        assertEquals(Icons.Outlined.Palette, byId[ReaderCommandId.THEME]!!.icon)
     }
 
     @Test
@@ -148,5 +150,52 @@ class ReaderCommandRegistryTest {
         assertFalse(readerCommandSelected(ReaderCommandId.TOC, ReaderPanel.SEARCH))
         assertTrue(readerCommandSelected(ReaderCommandId.FONT, ReaderPanel.FONT))
         assertTrue(readerCommandSelected(ReaderCommandId.THEME, ReaderPanel.THEME))
+    }
+
+    @Test
+    fun `all hidden menu entries yield empty command list without fallback`() {
+        val config = ReaderMenuConfig(
+            version = 1,
+            entries = ReaderCommandId.entries.map { ReaderMenuEntry(it, visible = false) },
+        )
+        val visible = ReaderCommandCatalog.visibleSpecs(
+            config = config,
+            features = ReaderFeature.entries.toSet(),
+        )
+        assertTrue(visible.isEmpty())
+        assertTrue(
+            ReaderCommandRegistry.visibleCommands(config, ReaderFeature.entries.toSet()).isEmpty(),
+        )
+    }
+
+    @Test
+    fun `unsupported features stay hidden without mutating saved order or visibility`() {
+        val config = ReaderMenuConfig(
+            version = 1,
+            entries = listOf(
+                ReaderMenuEntry(ReaderCommandId.SEARCH, visible = true),
+                ReaderMenuEntry(ReaderCommandId.TOC, visible = false),
+                ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.FONT, visible = true),
+                ReaderMenuEntry(ReaderCommandId.THEME, visible = true),
+            ),
+        )
+        // PDF-like feature set: no SEARCH / ANNOTATIONS support at runtime.
+        val features = setOf(
+            ReaderFeature.TOC,
+            ReaderFeature.BOOKMARKS,
+            ReaderFeature.FONT,
+            ReaderFeature.THEME,
+        )
+        val visible = ReaderCommandCatalog.visibleSpecs(config, features)
+        assertEquals(
+            listOf(ReaderCommandId.BOOKMARKS, ReaderCommandId.FONT, ReaderCommandId.THEME),
+            visible.map { it.id },
+        )
+        // Global config is not mutated by the feature filter path.
+        assertEquals(config.entries, ReaderMenuConfig.resolve(config).entries)
+        assertTrue(ReaderMenuConfig.resolve(config).entries.first { it.id == ReaderCommandId.SEARCH }.visible)
+        assertFalse(ReaderMenuConfig.resolve(config).entries.first { it.id == ReaderCommandId.TOC }.visible)
     }
 }

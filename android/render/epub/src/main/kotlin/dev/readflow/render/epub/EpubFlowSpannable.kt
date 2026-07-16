@@ -2,6 +2,7 @@ package dev.readflow.render.epub
 
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.Typeface
@@ -16,6 +17,7 @@ import android.text.style.LeadingMarginSpan
 import android.text.style.LineBackgroundSpan
 import android.text.style.LineHeightSpan
 import android.text.style.RelativeSizeSpan
+import android.text.style.ReplacementSpan
 import android.text.style.StrikethroughSpan
 import android.text.style.StyleSpan
 import android.text.style.SubscriptSpan
@@ -44,6 +46,11 @@ internal data class EpubFlowStyle(
     val density: Float,
     /** First-line indent for body paragraphs (Moon+ 首行缩进, ~2 CJK char widths). 0 disables. */
     val firstLineIndentPx: Int = 0,
+    /**
+     * Optional book-scoped CSS font-family resolver. Returns an embedded Typeface when the
+     * family maps to a valid in-zip @font-face; null falls back to the user/system [typeface].
+     */
+    val bookFontResolver: ((String) -> Typeface?)? = null,
 )
 
 /**
@@ -85,7 +92,22 @@ internal fun epubBuildFlowSpannable(
                 isFullPage = fullPageImageOffsets?.contains(seg.layoutStart)
                     ?: (block.href in fullPageHrefs),
             )
-            is EpubDisplayBlock.Break -> Unit
+            is EpubDisplayBlock.Break -> if (
+                block.kind == EpubBreakKind.HorizontalRule && seg.layoutEnd > seg.layoutStart
+            ) {
+                sb.setSpan(
+                    EpubHorizontalRuleSpan(
+                        widthPx = style.columnWidthPx,
+                        color = style.inkColor,
+                        density = style.density,
+                    ),
+                    seg.layoutStart,
+                    seg.layoutEnd,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+            } else {
+                Unit
+            }
         }
     }
 
@@ -95,6 +117,59 @@ internal fun epubBuildFlowSpannable(
         if (e > s) sb.setSpan(BackgroundColorSpan(range.color), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
     }
     return sb
+}
+
+internal class EpubHorizontalRuleSpan(
+    private val widthPx: Int,
+    color: Int,
+    density: Float,
+) : ReplacementSpan() {
+    private val lineColor = Color.argb(0x4D, Color.red(color), Color.green(color), Color.blue(color))
+    private val verticalInsetPx = (12f * density).toInt().coerceAtLeast(1)
+    private val horizontalInsetPx = (8f * density).coerceAtLeast(1f)
+    private val strokeWidthPx = density.coerceAtLeast(1f)
+
+    override fun getSize(
+        paint: Paint,
+        text: CharSequence,
+        start: Int,
+        end: Int,
+        fm: Paint.FontMetricsInt?,
+    ): Int {
+        fm?.let {
+            val halfHeight = verticalInsetPx
+            it.ascent = -halfHeight
+            it.top = it.ascent
+            it.descent = halfHeight
+            it.bottom = it.descent
+        }
+        return widthPx.coerceAtLeast(1)
+    }
+
+    override fun draw(
+        canvas: Canvas,
+        text: CharSequence,
+        start: Int,
+        end: Int,
+        x: Float,
+        top: Int,
+        y: Int,
+        bottom: Int,
+        paint: Paint,
+    ) {
+        val oldColor = paint.color
+        val oldStyle = paint.style
+        val oldStrokeWidth = paint.strokeWidth
+        paint.color = lineColor
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = strokeWidthPx
+        val centerY = (top + bottom) / 2f
+        val right = (x + widthPx - horizontalInsetPx).coerceAtLeast(x + horizontalInsetPx)
+        canvas.drawLine(x + horizontalInsetPx, centerY, right, centerY, paint)
+        paint.color = oldColor
+        paint.style = oldStyle
+        paint.strokeWidth = oldStrokeWidth
+    }
 }
 
 private fun applyTextSpans(
@@ -187,7 +262,7 @@ private fun applyTextSpans(
         } else {
             null
         }
-        styleToAndroid(span, safeForeground, safeBackground).forEach {
+        styleToAndroid(span, safeForeground, safeBackground, style.bookFontResolver).forEach {
             sb.setSpan(it, s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
         }
     }
@@ -247,6 +322,7 @@ private fun styleToAndroid(
     span: EpubTextStyleSpan,
     safeForeground: Int?,
     safeBackground: Int?,
+    bookFontResolver: ((String) -> Typeface?)?,
 ): List<Any> = when (span.style) {
     EpubTextStyle.Bold -> listOf(StyleSpan(Typeface.BOLD))
     EpubTextStyle.Italic -> listOf(StyleSpan(Typeface.ITALIC))
@@ -258,6 +334,51 @@ private fun styleToAndroid(
     EpubTextStyle.ForegroundColor -> safeForeground?.let { listOf(ForegroundColorSpan(it)) }.orEmpty()
     EpubTextStyle.BackgroundColor -> safeBackground?.let { listOf(BackgroundColorSpan(it)) }.orEmpty()
     EpubTextStyle.RelativeSize -> span.scale?.let { listOf(RelativeSizeSpan(it)) }.orEmpty()
+    EpubTextStyle.FontFamily -> {
+        val family = span.fontFamily ?: return emptyList()
+        val face = bookFontResolver?.invoke(family) ?: return emptyList()
+        listOf(EpubTypefaceSpan(face))
+    }
+}
+
+/** MetricAffectingSpan that paints an embedded book Typeface without requiring a family name. */
+internal class EpubTypefaceSpan(
+    private val typeface: Typeface,
+) : android.text.style.MetricAffectingSpan() {
+    /**
+     * Per-requested-style Typeface.create results keyed by Android's four style bits
+     * (NORMAL/BOLD/ITALIC/BOLD_ITALIC). Measure/draw hits this instead of recreating.
+     */
+    private val styleCache = android.util.SparseArray<Typeface>(4)
+
+    override fun updateDrawState(tp: android.text.TextPaint) {
+        applyTypeface(tp)
+    }
+    override fun updateMeasureState(tp: android.text.TextPaint) {
+        applyTypeface(tp)
+    }
+
+    private fun applyTypeface(paint: android.text.TextPaint) {
+        // Only the four Typeface style combinations are valid cache keys.
+        val requestedStyle = (paint.typeface?.style ?: Typeface.NORMAL) and STYLE_MASK
+        var styled = styleCache.get(requestedStyle)
+        if (styled == null) {
+            styled = Typeface.create(typeface, requestedStyle)
+            styleCache.put(requestedStyle, styled)
+        }
+        val missingStyle = requestedStyle and styled.style.inv()
+        // Always write both flags so a prior bold/italic paint cannot leak into a later style.
+        paint.isFakeBoldText = missingStyle and Typeface.BOLD != 0
+        paint.textSkewX = if (missingStyle and Typeface.ITALIC != 0) -0.25f else 0f
+        paint.typeface = styled
+    }
+
+    /** Test-only: number of distinct requested styles cached by [applyTypeface]. */
+    internal fun styleCacheSizeForTest(): Int = styleCache.size()
+
+    private companion object {
+        private const val STYLE_MASK = Typeface.BOLD or Typeface.ITALIC
+    }
 }
 
 internal class EpubBlockBoxSpan private constructor(

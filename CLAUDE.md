@@ -127,3 +127,11 @@ Android 端 `CalibreClient` 初始化时传 `baseUrl`，来源待接 Settings Sh
 ## Language
 
 Chinese: user-facing strings, UI labels. English: code, comments, commit messages, logs.
+
+## Grok Delegated Execution
+
+- Codex may dispatch bounded implementation, debugging, audit, and verification tasks to Grok from the repository root.
+- Grok has workspace write permission and may run normal local builds/tests, but must follow `AGENTS.md` for parallel ownership and handoff rules.
+- Grok must invoke the same mandatory LinReads skills listed above before touching their trigger scopes.
+- Grok must preserve the existing dirty worktree and must not commit, push, publish OTA builds, deploy, or contact external systems unless the delegated task explicitly authorizes it.
+- Headless Grok tasks must return a final result with changed files and verification evidence; a tool-only or partial response is not completion.

@@ -32,6 +32,8 @@ internal enum class EpubTextStyle {
     ForegroundColor,
     BackgroundColor,
     RelativeSize,
+    /** CSS font-family token (non-generic); resolved via book @font-face map at paint time. */
+    FontFamily,
 }
 
 internal data class EpubTextStyleSpan(
@@ -40,7 +42,14 @@ internal data class EpubTextStyleSpan(
     val style: EpubTextStyle,
     val color: Int? = null,
     val scale: Float? = null,
+    /** CSS font-family list or single family for [EpubTextStyle.FontFamily]. */
+    val fontFamily: String? = null,
 )
+
+internal enum class EpubBreakKind {
+    LineBreak,
+    HorizontalRule,
+}
 
 internal sealed interface EpubReaderItem {
     val locator: EpubItemLocator
@@ -79,5 +88,6 @@ internal sealed interface EpubReaderItem {
 
     data class Break(
         override val locator: EpubItemLocator,
+        val kind: EpubBreakKind = EpubBreakKind.LineBreak,
     ) : EpubReaderItem
 }

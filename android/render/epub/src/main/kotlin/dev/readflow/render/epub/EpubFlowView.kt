@@ -300,10 +300,20 @@ internal class EpubFlowView(
                 pagedMotionState == PagedMotionState.DRAGGING_FREE ||
                 pagedMotionState == PagedMotionState.FLING_FREE
 
+    /**
+     * Public idle gate for external chapter rebuilds (e.g. font prewarm completion).
+     * Same predicate as internal reflow deferral: animation, interactive turn, temporary free drag,
+     * or free fling.
+     */
+    fun isPageMutationInFlight(): Boolean = turnInFlight
+
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
     private var curlDrawable: PageCurlDrawable? = null
-    /** Dirty warm-shot identities follow the active turn, then remap to their settled cache slots. */
+    /**
+     * Dirty warm-shot identities follow the active turn. Frames only blit cached bitmaps + shadow;
+     * PIXELS_ONLY redraw is deferred until settle (briefly stale preferred over mid-turn software draw).
+     */
     private var activeFlipFrontPixelRefreshPending = false
     private var activeFlipRevealedPixelRefreshPending = false
     private var localSoftwareSettleCommit: Boolean? = null
@@ -960,6 +970,7 @@ internal class EpubFlowView(
         )?.let { pair ->
             rememberActiveFlipPixelRefreshes(pair.first, pair.second, pendingPixelRefreshOwners)
             // Pending owners moved into the active turn — drop any slot redraws targeting them.
+            // Mid-turn frames only blit; PIXELS_ONLY repaint waits until settle.
             pendingInPlacePageShotRefreshSlots.clear()
             return pair
         }
@@ -997,12 +1008,17 @@ internal class EpubFlowView(
         cachedBackwardTextureKey = null
         rememberActiveFlipPixelRefreshes(front, revealed, pendingPixelRefreshOwners)
         // Owners left the cache for the active turn; drop slot redraws for missing slots.
+        // Dirty identities ride activeFlip*Pending until settle remaps them into cache slots.
         pendingInPlacePageShotRefreshSlots.clear()
         relabelPageShot(front, PageShotLeaseKind.PINNED, "active.front")
         relabelPageShot(revealed, PageShotLeaseKind.PINNED, "active.target")
         return front to revealed
     }
 
+    /**
+     * Records that transferred warm owners need a post-settle in-place pixel refresh. Must not
+     * schedule [redrawPageShotInto] or [container.draw] while the finger/overlay still owns the turn.
+     */
     private fun rememberActiveFlipPixelRefreshes(
         front: Bitmap,
         revealed: Bitmap,
@@ -1010,6 +1026,11 @@ internal class EpubFlowView(
     ) {
         activeFlipFrontPixelRefreshPending = dirtyOwners.any { it === front }
         activeFlipRevealedPixelRefreshPending = dirtyOwners.any { it === revealed }
+    }
+
+    private fun clearActiveFlipPixelRefreshes() {
+        activeFlipFrontPixelRefreshPending = false
+        activeFlipRevealedPixelRefreshPending = false
     }
 
     /** Transfers only the warmed current page for a cross-chapter turn; target comes from its preview. */
@@ -3071,16 +3092,20 @@ internal class EpubFlowView(
 
         // Prefer the bottom of the page's last visible content line (body or heading), so leftover
         // space under any preceding text can host the cropped next-page image top.
+        //
+        // Do NOT raise the crop to layout.getLineTop(imageLine): that coordinate is on a later page
+        // (often >> viewport height). maxOf(precedingBottom, imageTop) collapsed the crop band to
+        // empty and left a title-only blank remainder.
         val lastWindowLine = (window.endLineExclusive - 1).coerceAtLeast(window.startLine)
         val precedingBottom =
             layout.getLineBottom(lastWindowLine) + textView.paddingTop - pageTopPx
-        val imageTop = layout.getLineTop(preview.imageLine) + textView.paddingTop - pageTopPx
-        val previewTopInViewport = maxOf(precedingBottom, imageTop).coerceIn(0, height)
+        val previewTopInViewport = precedingBottom.coerceIn(0, height)
         val previewBottomInViewport = (height - textView.paddingBottom).coerceAtLeast(previewTopInViewport)
         if (previewBottomInViewport <= previewTopInViewport) return
 
         val imageLineHeight = layout.getLineBottom(preview.imageLine) -
             layout.getLineTop(preview.imageLine)
+        // Crop only when the full image line is taller than the leftover band (indivisible image).
         if (imageLineHeight <= previewBottomInViewport - previewTopInViewport) return
         val drawable = imageDrawableAt(preview.imageLayoutStart) ?: return
         val oldBounds = Rect(drawable.bounds)
@@ -3486,10 +3511,7 @@ internal class EpubFlowView(
             it.recycle()
         }
         curlDrawable = null
-        if (!preserveActivePixelRefreshes) {
-            activeFlipFrontPixelRefreshPending = false
-            activeFlipRevealedPixelRefreshPending = false
-        }
+        if (!preserveActivePixelRefreshes) clearActiveFlipPixelRefreshes()
         if (
             interactiveTurnState == InteractiveTurnState.SOFTWARE ||
             interactiveTurnState == InteractiveTurnState.SOFTWARE_SETTLING ||
@@ -3756,6 +3778,7 @@ internal class EpubFlowView(
         )
         pendingLocalPageShotHandoff = request
         interactiveTurnState = InteractiveTurnState.LOCAL_SHOTS_WAITING
+        updatePendingLocalPageShotFeedback(request, latestX, latestY)
         postPendingLocalTargetShot(request)
         return InteractiveTurnStartResult.WAITING
     }
@@ -3822,6 +3845,9 @@ internal class EpubFlowView(
             cancelPendingLocalPageShotHandoff(request, consumeGesture = true)
             return
         }
+        // Waiting feedback translates the live container for finger responsiveness. Clear it before
+        // any front pin capture so snapshotViewport/dispatchDraw never bakes that offset in.
+        clearPendingLocalPageShotFeedback()
         val conversionCapture = conversionSnapshotCopy()
         val outgoing = when (conversionCapture) {
             ConversionSnapshotCapture.Failed -> null
@@ -3914,7 +3940,39 @@ internal class EpubFlowView(
         }
         request.latestX = x
         request.latestY = y
+        updatePendingLocalPageShotFeedback(request, x, y)
         return true
+    }
+
+    /**
+     * Keeps a cold finger turn visually responsive while its two pinned shots are captured on later
+     * frames. This is a render-node translation only: it does not allocate, copy, or redraw a bitmap
+     * on the input MOVE path. The translation is cleared before the overlay takes ownership.
+     */
+    private fun updatePendingLocalPageShotFeedback(
+        request: PendingLocalPageShotHandoff,
+        x: Float,
+        y: Float,
+    ) {
+        val coordinate = if (request.axis == InteractiveTurnAxis.HORIZONTAL) x else y
+        val extent = if (request.axis == InteractiveTurnAxis.HORIZONTAL) width else height
+        if (extent <= 0) return
+        val travel = if (request.forward) request.anchor - coordinate else coordinate - request.anchor
+        val offset = travel.coerceAtLeast(0f)
+            .coerceAtMost(extent * LOCAL_SHOTS_WAIT_FEEDBACK_MAX_FRACTION)
+        val translation = if (request.forward) -offset else offset
+        if (request.axis == InteractiveTurnAxis.HORIZONTAL) {
+            container.translationX = translation
+            container.translationY = 0f
+        } else {
+            container.translationX = 0f
+            container.translationY = translation
+        }
+    }
+
+    private fun clearPendingLocalPageShotFeedback() {
+        container.translationX = 0f
+        container.translationY = 0f
     }
 
     private fun releasePendingLocalPageShotHandoff(ev: MotionEvent, velocity: Float) {
@@ -3941,7 +3999,10 @@ internal class EpubFlowView(
         consumeGesture: Boolean,
     ) {
         if (request == null) {
-            if (localShotsWaiting) interactiveTurnState = InteractiveTurnState.NONE
+            if (localShotsWaiting) {
+                clearPendingLocalPageShotFeedback()
+                interactiveTurnState = InteractiveTurnState.NONE
+            }
             return
         }
         val ownsCurrent =
@@ -3950,6 +4011,7 @@ internal class EpubFlowView(
             localPageShotHandoffGeneration += 1L
             clearPendingLocalPageShotCallbacks()
             pendingLocalPageShotHandoff = null
+            clearPendingLocalPageShotFeedback()
         }
         request.targetBitmap?.let(::recyclePageShot)
         request.targetBitmap = null
@@ -4251,6 +4313,8 @@ internal class EpubFlowView(
         invalidate()
         reportTopOffset()
         preCachePageTextures()
+        // Free-scroll rest is a genuine idle settle — drain deferred external rebuilds (font prewarm).
+        onPageSettled?.invoke()
     }
 
     private fun stopFreeFlingForTouch(): Boolean {
@@ -4897,6 +4961,7 @@ internal class EpubFlowView(
         const val MICRO_TURN_PROJECTION_SECONDS = 0.04f
         const val MICRO_TURN_MAX_CROSS_AXIS_RATIO = 0.5f
         const val BOUNDARY_WAIT_FEEDBACK_MAX_FRACTION = 0.12f
+        const val LOCAL_SHOTS_WAIT_FEEDBACK_MAX_FRACTION = 0.12f
         const val FREE_FLING_MIN_SETTLE_MS = 64L
         const val FREE_FLING_STABLE_FRAMES = 2
     }

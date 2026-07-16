@@ -84,6 +84,7 @@ internal class EpubParser(
                     blockCount = index.blockCount,
                     paragraphBlockIndexes = index.paragraphBlockIndexes,
                     layoutBlocks = index.layoutBlocks,
+                    bookFontMapsBySpine = index.bookFontMapsBySpine,
                     maxCachedSpines = maxCachedSpines,
                 )
             }
@@ -106,6 +107,7 @@ internal class EpubParser(
         val blockCount: Int,
         val paragraphBlockIndexes: List<Int>,
         val layoutBlocks: List<EpubDisplayBlock>,
+        val bookFontMapsBySpine: Map<Int, EpubBookFontMap>,
         val fragmentTargetIndexes: Map<String, EpubTargetPosition>,
     )
 
@@ -114,11 +116,19 @@ internal class EpubParser(
             parseSpineItems(zip, spineIndex, item.manifestItem)
         }
 
-    private fun parseSpineItems(zip: ZipFile, spineIndex: Int, item: EpubManifestItem): List<EpubReaderItem> {
-        val html = readEpubZipText(zip, item.path, EPUB_MAX_SPINE_ENTRY_BYTES) ?: return emptyList()
+    private fun parseSpineItems(zip: ZipFile, spineIndex: Int, item: EpubManifestItem): List<EpubReaderItem> =
+        parseSpineContent(zip, spineIndex, item).items
+
+    private fun parseSpineContent(
+        zip: ZipFile,
+        spineIndex: Int,
+        item: EpubManifestItem,
+    ): EpubParsedHtmlContent {
+        val html = readEpubZipText(zip, item.path, EPUB_MAX_SPINE_ENTRY_BYTES)
+            ?: return EpubParsedHtmlContent(emptyList())
         epubParserGuard(Unit) { onSpineRead(spineIndex) }
-        return epubParserGuard(emptyList()) {
-            parseReaderItemsFromHtml(
+        return epubParserGuard(EpubParsedHtmlContent(emptyList())) {
+            parseReaderItemsContent(
                 spineIndex = spineIndex,
                 html = html,
                 resourceBaseDir = epubParentDir(item.path),
@@ -136,8 +146,11 @@ internal class EpubParser(
         spineIndex: Int,
         item: EpubManifestItem,
     ): EpubParsedSpine {
-        val items = parseSpineItems(zip, spineIndex, item)
-        if (items.isEmpty()) return EpubParsedSpine.empty(spineIndex, item.path)
+        val content = parseSpineContent(zip, spineIndex, item)
+        val items = content.items
+        if (items.isEmpty()) {
+            return EpubParsedSpine.empty(spineIndex, item.path).copy(bookFontMap = content.bookFontMap)
+        }
         val paras = epubParasFromReaderItems(items)
         return EpubParsedSpine(
             spineIndex = spineIndex,
@@ -147,6 +160,7 @@ internal class EpubParser(
             blocks = epubDisplayBlocks(items),
             fragmentTargetIndexes = epubFragmentTargetIndexes(packageIndex.spinePaths, items),
             charCount = paras.maxOfOrNull(EpubPara::spineCharEnd) ?: 0,
+            bookFontMap = content.bookFontMap,
         )
     }
 
@@ -155,6 +169,7 @@ internal class EpubParser(
         val paras = mutableListOf<EpubPara>()
         val paragraphBlockIndexes = mutableListOf<Int>()
         val layoutBlocks = mutableListOf<EpubDisplayBlock>()
+        val bookFontMapsBySpine = mutableMapOf<Int, EpubBookFontMap>()
         var firstParagraphIndex = 0
         var firstBlockIndex = 0
         var documentOffset = 0
@@ -162,7 +177,9 @@ internal class EpubParser(
 
         pkg.spineItems.forEachIndexed { spineIndex, spineItem ->
             val item = spineItem.manifestItem
-            val items = parseSpineItems(zip, spineIndex, item)
+            val content = parseSpineContent(zip, spineIndex, item)
+            val items = content.items
+            bookFontMapsBySpine[spineIndex] = content.bookFontMap
             val localParas = epubParasFromReaderItems(items)
             val blocks = epubDisplayBlocks(items)
             val localParagraphBlockIndexes = firstBlockIndexesByParagraph(blocks, localParas.size)
@@ -202,6 +219,7 @@ internal class EpubParser(
             blockCount = firstBlockIndex,
             paragraphBlockIndexes = paragraphBlockIndexes,
             layoutBlocks = layoutBlocks,
+            bookFontMapsBySpine = bookFontMapsBySpine,
             fragmentTargetIndexes = fragmentTargetIndexes,
         )
     }

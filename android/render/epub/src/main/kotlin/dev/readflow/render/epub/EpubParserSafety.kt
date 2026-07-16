@@ -45,12 +45,21 @@ internal fun readEpubZipText(
     maxBytes: Int,
     sanitizeXml: Boolean = true,
 ): String? {
+    val bytes = readEpubZipBytes(zip, path, maxBytes) ?: return null
+    val text = bytes.toString(Charsets.UTF_8)
+    return if (sanitizeXml) sanitizeEpubXml(text) else text
+}
+
+/** Bounded zip entry bytes for offline assets (styles, fonts). Path is sanitized. */
+internal fun readEpubZipBytes(
+    zip: ZipFile,
+    path: String,
+    maxBytes: Int,
+): ByteArray? {
     val safePath = epubSafeZipPath(path) ?: return null
     val entry = zip.getEntry(safePath) ?: return null
     if (entry.isDirectory || entry.size > maxBytes) return null
-    val bytes = zip.getInputStream(entry).use { input -> input.readBoundedBytes(maxBytes) } ?: return null
-    val text = bytes.toString(Charsets.UTF_8)
-    return if (sanitizeXml) sanitizeEpubXml(text) else text
+    return zip.getInputStream(entry).use { input -> input.readBoundedBytes(maxBytes) }
 }
 
 internal fun sanitizeEpubXml(text: String): String? {

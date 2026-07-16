@@ -3,6 +3,7 @@ package dev.readflow.render.epub
 import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Color
+import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
@@ -64,6 +65,54 @@ class EpubFlowSpannableTest {
     private fun image(p: Int, href: String, alt: String? = null) =
         EpubDisplayBlock.Image(href = href, altText = alt, paragraphIndex = p)
 
+    @Test
+    fun `embedded typeface span preserves an existing bold style`() {
+        val paint = android.text.TextPaint().apply { typeface = Typeface.DEFAULT_BOLD }
+
+        EpubTypefaceSpan(Typeface.DEFAULT).updateMeasureState(paint)
+
+        assertTrue(
+            paint.typeface.style and Typeface.BOLD != 0 || paint.isFakeBoldText,
+        )
+    }
+
+    @Test
+    fun `embedded typeface span caches four styles and clears stale fake bold skew`() {
+        val span = EpubTypefaceSpan(Typeface.DEFAULT)
+        val paint = android.text.TextPaint()
+
+        // Warm the four Android style combinations; cache must stay at most size 4.
+        listOf(
+            Typeface.NORMAL,
+            Typeface.BOLD,
+            Typeface.ITALIC,
+            Typeface.BOLD_ITALIC,
+        ).forEach { style ->
+            paint.typeface = Typeface.defaultFromStyle(style)
+            paint.isFakeBoldText = false
+            paint.textSkewX = 0f
+            span.updateMeasureState(paint)
+            span.updateDrawState(paint)
+        }
+        assertEquals(4, span.styleCacheSizeForTest())
+
+        // Re-applying the same styles must not grow the cache.
+        paint.typeface = Typeface.DEFAULT_BOLD
+        span.updateMeasureState(paint)
+        assertEquals(4, span.styleCacheSizeForTest())
+
+        // After a bold pass that may set fake-bold, a normal pass must clear both paint flags.
+        paint.typeface = Typeface.DEFAULT_BOLD
+        paint.isFakeBoldText = true
+        paint.textSkewX = -0.25f
+        span.updateMeasureState(paint)
+        paint.typeface = Typeface.DEFAULT
+        span.updateMeasureState(paint)
+        assertFalse(paint.isFakeBoldText)
+        assertEquals(0f, paint.textSkewX, 0.0001f)
+        assertEquals(4, span.styleCacheSizeForTest())
+    }
+
     private fun build(
         flow: EpubChapterFlow,
         style: EpubFlowStyle = style(),
@@ -123,6 +172,28 @@ class EpubFlowSpannableTest {
         val flow = epubBuildChapterFlow(0, listOf(text(0, "前文"), image(1, "missing.png", alt = null)))
         val sb = build(flow) { null }
         assertEquals(flow.text, sb.toString())
+    }
+
+    @Test
+    fun `horizontal rule has a visible drawing span`() {
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = epubDisplayBlocks(
+                parseReaderItemsFromHtml(
+                    spineIndex = 0,
+                    html = "<html><body><p>上文</p><hr/><p>下文</p></body></html>",
+                ),
+            ),
+        )
+
+        val spannable = build(flow) { null } as android.text.Spanned
+        val ruleSpans = spannable.getSpans(0, spannable.length, Any::class.java)
+            .filter { it.javaClass.simpleName == "EpubHorizontalRuleSpan" }
+
+        assertEquals(1, ruleSpans.size)
+        val ruleSegment = flow.segments.single { it.block is EpubDisplayBlock.Break }
+        assertEquals(ruleSegment.layoutStart, spannable.getSpanStart(ruleSpans.single()))
+        assertEquals(ruleSegment.layoutEnd, spannable.getSpanEnd(ruleSpans.single()))
     }
 
     @Test

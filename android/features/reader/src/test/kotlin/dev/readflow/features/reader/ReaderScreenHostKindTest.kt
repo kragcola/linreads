@@ -6,6 +6,8 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.PageFlipStyle
+import dev.readflow.core.model.TransitionType
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ReaderEngine
@@ -36,6 +38,39 @@ class ReaderScreenHostKindTest {
         val hostKind = readerHostKindFor(engine, engine.pagingKind.value)
 
         assertEquals(ReaderHostKind.CONTINUOUS, hostKind)
+    }
+
+    @Test
+    fun `page flip SLIDE maps to host transition SLIDE`() {
+        assertEquals(TransitionType.SLIDE, pageFlipStyleToTransitionType(PageFlipStyle.SLIDE))
+    }
+
+    @Test
+    fun `page flip NONE maps to host transition NONE`() {
+        assertEquals(TransitionType.NONE, pageFlipStyleToTransitionType(PageFlipStyle.NONE))
+    }
+
+    @Test
+    fun `page flip SIMULATION maps to host transition CURL as nearest ViewPager analogue`() {
+        // EPUB mesh SIMULATION is not available on regular PAGED hosts; CURL is the only
+        // TransitionType vocabulary that approximates a curl/simulation page turn.
+        assertEquals(TransitionType.CURL, pageFlipStyleToTransitionType(PageFlipStyle.SIMULATION))
+    }
+
+    @Test
+    fun `every PageFlipStyle has an explicit TransitionType mapping`() {
+        val mapped = PageFlipStyle.entries.map { style ->
+            style to pageFlipStyleToTransitionType(style)
+        }.toMap()
+
+        assertEquals(
+            mapOf(
+                PageFlipStyle.SLIDE to TransitionType.SLIDE,
+                PageFlipStyle.SIMULATION to TransitionType.CURL,
+                PageFlipStyle.NONE to TransitionType.NONE,
+            ),
+            mapped,
+        )
     }
 
     private open class FakeReaderEngine(

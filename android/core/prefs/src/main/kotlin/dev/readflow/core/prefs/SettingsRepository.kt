@@ -28,6 +28,9 @@ interface SettingsRepository {
     val useSourceHanFont: Flow<Boolean>
     val txtEncoding: Flow<TxtEncoding>
     val fontChoice: Flow<FontChoice>
+    /** Global EPUB CSS family -> reader font id replacement table. */
+    val epubFontReplacements: Flow<Map<String, String>>
+        get() = flowOf(emptyMap())
     /** 阅读器首次手势引导是否已展示过（一次性）。 */
     val readerGuideShown: Flow<Boolean>
     /** 分页模式翻页动画风格（滑动/仿真/无）。 */
@@ -51,6 +54,7 @@ interface SettingsRepository {
     suspend fun setUseSourceHanFont(enabled: Boolean)
     suspend fun setTxtEncoding(encoding: TxtEncoding)
     suspend fun setFontChoice(choice: FontChoice)
+    suspend fun setEpubFontReplacements(replacements: Map<String, String>) = Unit
     suspend fun setReaderGuideShown(shown: Boolean)
     suspend fun setPageFlipStyle(style: PageFlipStyle)
     /** Persist resolved menu config; default no-op for legacy fakes. */

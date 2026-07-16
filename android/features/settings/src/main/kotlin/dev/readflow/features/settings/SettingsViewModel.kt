@@ -15,6 +15,8 @@ import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
+import dev.readflow.core.model.ReaderCommandId
+import dev.readflow.core.model.ReaderMenuConfig
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.sync.SyncBackend
@@ -34,6 +36,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 sealed interface CalibreConnectionUiState {
@@ -97,6 +101,16 @@ class SettingsViewModel(
 
     val fontChoice = settings.fontChoice
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), FontChoice.System)
+
+    val epubFontReplacements = settings.epubFontReplacements
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyMap())
+
+    val readerMenuConfig = settings.readerMenuConfig
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ReaderMenuConfig.v1Defaults())
+
+    /** Serializes read-modify-write of [readerMenuConfig] so rapid toggles cannot drop updates. */
+    private val readerMenuConfigMutex = Mutex()
+    private val epubFontReplacementMutex = Mutex()
 
     private val _calibreUrlError = MutableStateFlow<String?>(null)
     val calibreUrlError: StateFlow<String?> = _calibreUrlError.asStateFlow()
@@ -318,6 +332,87 @@ class SettingsViewModel(
     fun setTxtEncoding(encoding: TxtEncoding) { viewModelScope.launch { settings.setTxtEncoding(encoding) } }
     fun setFontChoice(choice: FontChoice) { viewModelScope.launch { settings.setFontChoice(choice) } }
 
+    fun setEpubFontReplacement(family: String, choice: FontChoice) {
+        val normalizedFamily = normalizedEpubFontFamily(family) ?: return
+        viewModelScope.launch {
+            epubFontReplacementMutex.withLock {
+                val current = settings.epubFontReplacements.first()
+                settings.setEpubFontReplacements(current + (normalizedFamily to choice.serialize()))
+            }
+        }
+    }
+
+    fun removeEpubFontReplacement(family: String) {
+        val normalizedFamily = normalizedEpubFontFamily(family) ?: return
+        viewModelScope.launch {
+            epubFontReplacementMutex.withLock {
+                val current = settings.epubFontReplacements.first()
+                settings.setEpubFontReplacements(current - normalizedFamily)
+            }
+        }
+    }
+
+    /**
+     * Toggle one reader bottom-bar command visibility and persist a resolved catalog.
+     * Order is preserved; unknown IDs cannot be introduced from this surface.
+     * Updates are serialized and always re-read the latest repository value so concurrent
+     * rapid toggles cannot lose each other's writes.
+     */
+    fun setReaderMenuCommandVisible(id: ReaderCommandId, visible: Boolean) {
+        viewModelScope.launch {
+            readerMenuConfigMutex.withLock {
+                val current = settings.readerMenuConfig.first()
+                val updated = ReaderMenuConfig.setCommandVisible(current, id, visible)
+                settings.setReaderMenuConfig(updated)
+            }
+        }
+    }
+
+    /**
+     * Move [id] one slot toward the start of the ordered catalog.
+     * First entry is a no-op. Re-reads under [readerMenuConfigMutex].
+     */
+    fun moveReaderMenuCommandUp(id: ReaderCommandId) {
+        viewModelScope.launch {
+            readerMenuConfigMutex.withLock {
+                val current = settings.readerMenuConfig.first()
+                settings.setReaderMenuConfig(ReaderMenuConfig.moveCommandUp(current, id))
+            }
+        }
+    }
+
+    /**
+     * Move [id] one slot toward the end of the ordered catalog.
+     * Last entry is a no-op. Re-reads under [readerMenuConfigMutex].
+     */
+    fun moveReaderMenuCommandDown(id: ReaderCommandId) {
+        viewModelScope.launch {
+            readerMenuConfigMutex.withLock {
+                val current = settings.readerMenuConfig.first()
+                settings.setReaderMenuConfig(ReaderMenuConfig.moveCommandDown(current, id))
+            }
+        }
+    }
+
+    /** Restore versioned default order and all-visible catalog. */
+    fun resetReaderMenuConfig() {
+        viewModelScope.launch {
+            readerMenuConfigMutex.withLock {
+                settings.setReaderMenuConfig(ReaderMenuConfig.restoreDefaults())
+            }
+        }
+    }
+
+    fun setReaderMenuConfig(config: ReaderMenuConfig) {
+        viewModelScope.launch {
+            // Share the same mutex as per-command toggles so a bulk replace cannot race
+            // mid read-modify-write and drop concurrent visibility updates.
+            readerMenuConfigMutex.withLock {
+                settings.setReaderMenuConfig(ReaderMenuConfig.resolve(config))
+            }
+        }
+    }
+
     /**
      * 导入自定义字体：把 [input] 拷贝到 [dest]（已由调用方清洗为 fonts 目录内的安全文件名），
      * 成功后选用该字体。IO 在 [backupDispatcher] 上跑，避免阻塞主线程。
@@ -354,6 +449,12 @@ class SettingsViewModel(
         }
     }
 }
+
+internal fun normalizedEpubFontFamily(raw: String): String? =
+    raw.trim().trim('"', '\'')
+        .replace(Regex("\\s+"), " ")
+        .lowercase()
+        .takeIf { it.isNotEmpty() && it.length <= 96 && it.none { char -> char.isISOControl() } }
 
 private fun String.removeProtocol(): String =
     removePrefix("http://").removePrefix("https://")

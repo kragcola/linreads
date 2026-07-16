@@ -16,6 +16,9 @@ import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flowOf
@@ -65,6 +68,11 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     override val fontChoice: Flow<FontChoice> =
         context.dataStore.data.map {
             FontChoice.parse(it[KEY_FONT_CHOICE])
+        }
+
+    override val epubFontReplacements: Flow<Map<String, String>> =
+        context.dataStore.data.map { preferences ->
+            resolvedEpubFontReplacements(preferences[KEY_EPUB_FONT_REPLACEMENTS])
         }
 
     override val readerGuideShown: Flow<Boolean> =
@@ -136,6 +144,12 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         context.dataStore.edit { it[KEY_FONT_CHOICE] = choice.serialize() }
     }
 
+    override suspend fun setEpubFontReplacements(replacements: Map<String, String>) {
+        context.dataStore.edit {
+            it[KEY_EPUB_FONT_REPLACEMENTS] = encodeEpubFontReplacements(replacements)
+        }
+    }
+
     override suspend fun setReaderGuideShown(shown: Boolean) {
         context.dataStore.edit { it[KEY_READER_GUIDE_SHOWN] = shown }
     }
@@ -178,6 +192,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_USE_SOURCE_HAN = booleanPreferencesKey("use_source_han_font")
         val KEY_TXT_ENCODING = stringPreferencesKey("txt_encoding")
         val KEY_FONT_CHOICE = stringPreferencesKey("font_choice")
+        val KEY_EPUB_FONT_REPLACEMENTS = stringPreferencesKey("epub_font_replacements")
         val KEY_READER_GUIDE_SHOWN = booleanPreferencesKey("reader_guide_shown")
         val KEY_PAGE_FLIP_STYLE = stringPreferencesKey("page_flip_style")
         val KEY_TYPOGRAPHY_BASELINE_VERSION = intPreferencesKey("typography_baseline_version")
@@ -191,6 +206,43 @@ internal fun resolvedReaderMenuConfig(stored: String?): ReaderMenuConfig =
 
 internal fun resolvedLineSpacingPreference(stored: Float?): Float =
     stored ?: ReaderTypography.DEFAULT_LINE_SPACING
+
+internal fun encodeEpubFontReplacements(replacements: Map<String, String>): String =
+    Json.encodeToString(canonicalEpubFontReplacements(replacements))
+
+internal fun resolvedEpubFontReplacements(stored: String?): Map<String, String> {
+    if (stored.isNullOrBlank()) return emptyMap()
+    val decoded = runCatching { Json.decodeFromString<Map<String, String>>(stored) }.getOrNull()
+        ?: return emptyMap()
+    return canonicalEpubFontReplacements(decoded)
+}
+
+private fun canonicalEpubFontReplacements(replacements: Map<String, String>): Map<String, String> =
+    buildMap {
+        replacements.forEach { (rawFamily, rawFontId) ->
+            val family = rawFamily.trim().trim('"', '\'')
+                .replace(Regex("\\s+"), " ")
+                .lowercase()
+                .takeIf { it.isNotEmpty() && it.length <= 96 && it.none(Char::isISOControl) }
+                ?: return@forEach
+            val fontId = canonicalReplacementFontId(rawFontId) ?: return@forEach
+            put(family, fontId)
+        }
+    }.toSortedMap()
+
+private fun canonicalReplacementFontId(raw: String): String? {
+    val value = raw.trim()
+    if (value in setOf("system_serif", "system_sans", "system_monospace")) return value
+    if (!value.startsWith("custom:")) return null
+    val fileName = value.removePrefix("custom:")
+    if (
+        fileName.isBlank() || fileName.length > 128 ||
+        fileName == "." || fileName == ".." ||
+        '/' in fileName || '\\' in fileName || '\u0000' in fileName
+    ) return null
+    if (fileName.substringAfterLast('.', "").lowercase() !in setOf("ttf", "otf")) return null
+    return "custom:$fileName"
+}
 
 internal data class TypographyBaseline(
     val fontSize: Int,

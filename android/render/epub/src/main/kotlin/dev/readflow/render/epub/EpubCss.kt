@@ -114,6 +114,8 @@ internal class EpubCssCascade private constructor(
     private val rulesByClass: Map<String, List<EpubCssRule>>,
     private val rulesByTag: Map<String, List<EpubCssRule>>,
     private val universalRules: List<EpubCssRule>,
+    /** Book-scoped @font-face map collected while loading stylesheets (first face per family). */
+    val bookFontMap: EpubBookFontMap = EpubBookFontMap.EMPTY,
 ) {
     private val computedCache = IdentityHashMap<Element, EpubComputedCssStyle>()
 
@@ -191,6 +193,24 @@ internal class EpubCssCascade private constructor(
             if (style.fontSizeScale != 1f) {
                 add(EpubTextStyleSpan(start, end, EpubTextStyle.RelativeSize, scale = style.fontSizeScale))
             }
+            // Non-generic CSS families only; paint layer resolves against book @font-face or falls back.
+            style.values["font-family"]
+                ?.takeIf { raw ->
+                    splitCssFontFamilyList(raw).any { token ->
+                        val key = normalizeFontFamilyKey(token)
+                        key != null && key !in GENERIC_FONT_FAMILIES
+                    }
+                }
+                ?.let { familyList ->
+                    add(
+                        EpubTextStyleSpan(
+                            start = start,
+                            end = end,
+                            style = EpubTextStyle.FontFamily,
+                            fontFamily = familyList,
+                        ),
+                    )
+                }
         }
     }
 
@@ -287,6 +307,7 @@ internal class EpubCssCascade private constructor(
         ): EpubCssCascade {
             val rules = mutableListOf<EpubCssRule>()
             val loadedPaths = mutableSetOf<String>()
+            val fontFaces = mutableListOf<EpubFontFace>()
             var order = 0
 
             fun addCss(css: String, baseDir: String, importDepth: Int) {
@@ -302,6 +323,13 @@ internal class EpubCssCascade private constructor(
                             }
                         }
                     }
+                }
+                if (fontFaces.size < MAX_FONT_FACES_TOTAL) {
+                    fontFaces += parseEpubFontFaces(
+                        css = css,
+                        resourceBaseDir = baseDir,
+                        maxFaces = MAX_FONT_FACES_TOTAL - fontFaces.size,
+                    )
                 }
                 if (rules.size >= MAX_CSS_RULES) return
                 parseCssRules(
@@ -344,7 +372,13 @@ internal class EpubCssCascade private constructor(
                     EpubCssIndexKey.Universal -> universal += rule
                 }
             }
-            return EpubCssCascade(byId, byClass, byTag, universal)
+            return EpubCssCascade(
+                byId,
+                byClass,
+                byTag,
+                universal,
+                bookFontMap = epubBookFontMapFromFaces(fontFaces),
+            )
         }
     }
 }
@@ -829,6 +863,7 @@ private const val INLINE_SPECIFICITY = 1_000
 private const val INLINE_ORDER = 1_000_000_000
 private const val DECLARATION_ORDER_STRIDE = 128
 private const val MAX_CSS_RULES = 4_096
+private const val MAX_FONT_FACES_TOTAL = 32
 private const val MAX_SELECTORS_PER_RULE = 32
 private const val MAX_IMPORT_DEPTH = 4
 private const val MAX_CSS_CHARS = 1024 * 1024

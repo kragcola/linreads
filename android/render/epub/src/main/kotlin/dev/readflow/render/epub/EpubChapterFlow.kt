@@ -10,10 +10,11 @@ package dev.readflow.render.epub
  * Spannable from [EpubChapterFlow.text] verbatim and apply spans over [EpubChapterFlow.segments],
  * otherwise the offset map and the laid-out text disagree.
  *
- * Images become a single U+FFFC object-replacement char (the standard ImageSpan anchor). Break blocks
- * are zero-length segments; the uniform paragraph separator below already provides the blank-line gap.
+ * Images and horizontal rules become a single U+FFFC object-replacement char. Plain line-break blocks
+ * are zero-length and compressed; the uniform paragraph separator provides the bounded blank-line gap.
  */
 internal const val EPUB_FLOW_IMAGE_CHAR = '￼'
+internal const val EPUB_FLOW_HORIZONTAL_RULE_CHAR = '￼'
 
 /** Blank-line gap inserted between adjacent blocks (paragraph spacing). */
 internal const val EPUB_FLOW_PARAGRAPH_SEPARATOR = "\n\n"
@@ -42,20 +43,49 @@ internal fun EpubChapterFlow.nextContentSegmentAfter(index: Int): EpubFlowSegmen
     return null
 }
 
+/** True when a display block contributes no readable content (break or blank text). */
+internal fun EpubDisplayBlock.isEmptyVisualBlock(): Boolean = when (this) {
+    is EpubDisplayBlock.Break -> kind == EpubBreakKind.LineBreak
+    is EpubDisplayBlock.Text -> text.isBlank()
+    is EpubDisplayBlock.Image -> false
+}
+
+/**
+ * Removes empty visual blocks (Break / blank Text) so Japanese light-novel exports with long
+ * runs of empty `<p>`/`<br>` do not stack into nearly empty pages.
+ *
+ * Meaningful body/image blocks stay in order with their original [EpubDisplayBlock.paragraphIndex]
+ * (locator anchors). Adjacent retained content still gets exactly one
+ * [EPUB_FLOW_PARAGRAPH_SEPARATOR] — that single short gap is the bounded beat, not a run of
+ * stacked empty blocks.
+ */
+internal fun epubCompressEmptyDisplayBlocks(
+    blocks: List<EpubDisplayBlock>,
+): List<EpubDisplayBlock> =
+    if (blocks.none { it.isEmptyVisualBlock() }) {
+        blocks
+    } else {
+        blocks.filterNot { it.isEmptyVisualBlock() }
+    }
+
 /** Builds the canonical flow text + offset map for one chapter's [blocks] (already in source order). */
 internal fun epubBuildChapterFlow(
     spineIndex: Int,
     blocks: List<EpubDisplayBlock>,
 ): EpubChapterFlow {
+    val compressed = epubCompressEmptyDisplayBlocks(blocks)
     val sb = StringBuilder()
-    val segments = ArrayList<EpubFlowSegment>(blocks.size)
-    blocks.forEachIndexed { i, block ->
+    val segments = ArrayList<EpubFlowSegment>(compressed.size)
+    compressed.forEachIndexed { i, block ->
         if (i > 0) sb.append(EPUB_FLOW_PARAGRAPH_SEPARATOR)
         val start = sb.length
         when (block) {
             is EpubDisplayBlock.Text -> sb.append(block.text)
             is EpubDisplayBlock.Image -> sb.append(EPUB_FLOW_IMAGE_CHAR)
-            is EpubDisplayBlock.Break -> Unit // zero-length; separator gap above/below renders the break
+            is EpubDisplayBlock.Break -> when (block.kind) {
+                EpubBreakKind.LineBreak -> Unit
+                EpubBreakKind.HorizontalRule -> sb.append(EPUB_FLOW_HORIZONTAL_RULE_CHAR)
+            }
         }
         segments += EpubFlowSegment(start, sb.length, block.paragraphIndex, block)
     }

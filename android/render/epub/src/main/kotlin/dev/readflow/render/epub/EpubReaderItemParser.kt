@@ -6,6 +6,12 @@ import org.jsoup.nodes.Node
 import org.jsoup.nodes.TextNode
 import org.jsoup.parser.Parser
 
+/** Spine HTML parse result: display items plus book-scoped @font-face map from linked CSS. */
+internal data class EpubParsedHtmlContent(
+    val items: List<EpubReaderItem>,
+    val bookFontMap: EpubBookFontMap = EpubBookFontMap.EMPTY,
+)
+
 internal fun parseReaderItemsFromHtml(
     spineIndex: Int,
     html: String,
@@ -13,14 +19,33 @@ internal fun parseReaderItemsFromHtml(
     documentPath: String? = null,
     maxDomDepth: Int = EPUB_MAX_DOM_DEPTH,
     resourceTextLoader: ((String) -> String?)? = null,
-): List<EpubReaderItem> = epubParserGuard(emptyList()) {
-    val safeHtml = sanitizeEpubXml(html) ?: return@epubParserGuard emptyList()
+): List<EpubReaderItem> =
+    parseReaderItemsContent(
+        spineIndex = spineIndex,
+        html = html,
+        resourceBaseDir = resourceBaseDir,
+        documentPath = documentPath,
+        maxDomDepth = maxDomDepth,
+        resourceTextLoader = resourceTextLoader,
+    ).items
+
+internal fun parseReaderItemsContent(
+    spineIndex: Int,
+    html: String,
+    resourceBaseDir: String = "",
+    documentPath: String? = null,
+    maxDomDepth: Int = EPUB_MAX_DOM_DEPTH,
+    resourceTextLoader: ((String) -> String?)? = null,
+): EpubParsedHtmlContent = epubParserGuard(EpubParsedHtmlContent(emptyList())) {
+    val safeHtml = sanitizeEpubXml(html) ?: return@epubParserGuard EpubParsedHtmlContent(emptyList())
     val items = mutableListOf<EpubReaderItem>()
     val rawPreTexts = rawPreTexts(safeHtml).toMutableList()
     val doc = Jsoup.parse(safeHtml, "", Parser.xmlParser())
     val css = EpubCssCascade.create(doc, resourceBaseDir, resourceTextLoader)
     val body = doc.selectFirst("body") ?: doc
-    if (css.computedStyle(body).displayNone) return@epubParserGuard emptyList()
+    if (css.computedStyle(body).displayNone) {
+        return@epubParserGuard EpubParsedHtmlContent(emptyList(), css.bookFontMap)
+    }
     body.children().forEach { element ->
         collectReaderItems(
             element = element,
@@ -35,7 +60,7 @@ internal fun parseReaderItemsFromHtml(
             css = css,
         )
     }
-    items
+    EpubParsedHtmlContent(items = items, bookFontMap = css.bookFontMap)
 }
 
 private data class TextWithLinks(
@@ -92,7 +117,11 @@ private fun collectReaderItems(
         "p" -> addParagraphWithImages(spineIndex, items, element, resourceBaseDir, documentPath, maxDomDepth, css)
         "img" -> addImageItem(spineIndex, items, element, resourceBaseDir, css)
         "svg" -> addSvgImageItems(spineIndex, items, element, resourceBaseDir, css)
-        "br", "hr" -> items += EpubReaderItem.Break(EpubItemLocator(spineIndex, items.size))
+        "br" -> items += EpubReaderItem.Break(EpubItemLocator(spineIndex, items.size))
+        "hr" -> items += EpubReaderItem.Break(
+            locator = EpubItemLocator(spineIndex, items.size),
+            kind = EpubBreakKind.HorizontalRule,
+        )
         "table" -> addPlainTextItem(
             spineIndex = spineIndex,
             items = items,

@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dev.readflow.core.database.BookDao
 import dev.readflow.core.database.BookmarkDao
+import dev.readflow.core.database.BookmarkEntity
 import dev.readflow.core.database.ReadingProgressDao
 import dev.readflow.core.database.ReadingProgressEntity
 import dev.readflow.core.database.ReadingSessionDao
@@ -52,6 +53,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -63,6 +65,17 @@ import java.util.UUID
 
 internal const val READER_STATE_SAVED_STATE_KEY = "reader_state_json"
 internal const val READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY = "reader_typography_baseline_version"
+
+/** Optimistic Room lag overlay; Main-confined via [ReaderViewModel] pending flow. */
+private sealed class PendingBookmarkMutation {
+    abstract val id: String
+
+    data class Insert(val entity: BookmarkEntity) : PendingBookmarkMutation() {
+        override val id: String get() = entity.id
+    }
+
+    data class Remove(override val id: String) : PendingBookmarkMutation()
+}
 
 data class ReaderUiState(
     val loadingState: LoadingState = LoadingState.Idle,
@@ -133,14 +146,29 @@ class ReaderViewModel(
     private var progressJob: Job? = null
     private var fontPreviewPersistJob: Job? = null
     private var searchJob: Job? = null
+    /** Monotonic owner for in-flight search; only the latest generation may publish. */
+    private var searchGeneration: Long = 0L
     private var bookmarkJob: Job? = null
     private var textSelectionJob: Job? = null
     private var annotationJob: Job? = null
     private var settingsFontJob: Job? = null
     private var settingsLineSpacingJob: Job? = null
+    private var settingsEpubFontReplacementJob: Job? = null
     private var openJob: Job? = null
     private var activeEngine: ReaderEngine? = _uiState.value.engine
     private val sessionMutex = Mutex()
+    /** Serializes bookmark add/remove so rapid taps cannot create duplicate actives. */
+    private val bookmarkMutex = Mutex()
+    /**
+     * Main-confined optimistic overlay while Room observe lags.
+     * Scoped by [pendingBookmarkBookId]; merged into Room entities before projection.
+     */
+    private var pendingBookmarkBookId: String? = null
+    private val pendingBookmarkMutations =
+        MutableStateFlow<Map<String, PendingBookmarkMutation>>(emptyMap())
+    /** Last Room emission for the open book; used to re-project under [bookmarkMutex]. */
+    private var latestRoomBookmarkEntities: List<BookmarkEntity> = emptyList()
+    private var latestBookmarkLocator: Locator? = null
     private val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var sessionStartedAt: Long? = null
     // 记录最近一次打开请求，供错误页「重试」复用。
@@ -206,6 +234,7 @@ class ReaderViewModel(
         val theme: ThemeMode,
         val useSourceHanFont: Boolean,
         val fontChoice: FontChoice,
+        val epubFontReplacements: Map<String, String>,
         val flipStyle: PageFlipStyle,
         val txtEncodingCharsetName: String?,
         val readingMode: ReadingMode?,
@@ -404,6 +433,7 @@ class ReaderViewModel(
             theme = restoredForBook?.theme ?: settings.themeMode.first(),
             useSourceHanFont = settings.useSourceHanFont.first(),
             fontChoice = FontChoice.parse(settings.fontChoice.first().serialize()),
+            epubFontReplacements = settings.epubFontReplacements.first(),
             flipStyle = settings.pageFlipStyle.first(),
             txtEncodingCharsetName = settings.txtEncoding.first().charsetName,
             readingMode = requestedMode,
@@ -419,6 +449,7 @@ class ReaderViewModel(
         engine.setTheme(openSettings.theme)
         engine.setSerifFont(openSettings.useSourceHanFont)
         engine.setFont(openSettings.fontChoice.serialize())
+        engine.setEpubFontReplacements(openSettings.epubFontReplacements)
         engine.setPageFlipStyle(openSettings.flipStyle)
         if (openSettings.txtEncodingCharsetName != null) {
             engine.setTxtEncodingOverride(openSettings.txtEncodingCharsetName)
@@ -499,16 +530,116 @@ class ReaderViewModel(
 
     private fun watchBookmarks(engine: ReaderEngine, bookId: String?) {
         bookmarkJob?.cancel()
+        clearPendingBookmarkMutations()
         if (bookId == null) {
             _uiState.update { it.copy(bookmarks = ReaderBookmarkState(), canBookmark = false) }
             return
         }
+        pendingBookmarkBookId = bookId
         bookmarkJob = viewModelScope.launch {
-            combine(bookmarkDao.observeForBook(bookId), engine.currentLocator) { entities, locator ->
-                readerBookmarkStateFor(entities, locator)
-            }.collect { bookmarks ->
-                _uiState.update { it.copy(bookmarks = bookmarks, canBookmark = true) }
+            // Ack only on upstream DAO emissions (onEach), never on locator/pending combine ticks.
+            val roomBookmarks = bookmarkDao.observeForBook(bookId).onEach { entities ->
+                latestRoomBookmarkEntities = entities
+                acknowledgePendingBookmarkMutations(entities)
             }
+            combine(
+                roomBookmarks,
+                engine.currentLocator,
+                pendingBookmarkMutations,
+            ) { entities, locator, pending ->
+                Triple(entities, locator, pending)
+            }.collect { (entities, locator, pending) ->
+                latestBookmarkLocator = locator
+                projectBookmarks(entities, locator, pending)
+            }
+        }
+    }
+
+    private fun mergePendingBookmarks(
+        roomEntities: List<BookmarkEntity>,
+        pending: Map<String, PendingBookmarkMutation>,
+    ): List<BookmarkEntity> {
+        if (pending.isEmpty()) {
+            return roomEntities.filterNot { it.isDeleted }
+        }
+        val byId = roomEntities
+            .asSequence()
+            .filterNot { it.isDeleted }
+            .associateByTo(linkedMapOf()) { it.id }
+        for (mutation in pending.values) {
+            when (mutation) {
+                is PendingBookmarkMutation.Insert -> byId[mutation.entity.id] = mutation.entity
+                is PendingBookmarkMutation.Remove -> byId.remove(mutation.id)
+            }
+        }
+        return byId.values.toList()
+    }
+
+    private fun projectBookmarks(
+        roomEntities: List<BookmarkEntity>,
+        locator: Locator?,
+        pending: Map<String, PendingBookmarkMutation>,
+    ) {
+        val bookmarks = readerBookmarkStateFor(mergePendingBookmarks(roomEntities, pending), locator)
+        _uiState.update { it.copy(bookmarks = bookmarks, canBookmark = true) }
+    }
+
+    /**
+     * Re-project under [bookmarkMutex] so the next serialized toggle sees optimistic state
+     * without waiting for the combine collector.
+     */
+    private fun projectBookmarksFromOverlay(locator: Locator?) {
+        projectBookmarks(latestRoomBookmarkEntities, locator, pendingBookmarkMutations.value)
+    }
+
+    private fun acknowledgePendingBookmarkMutations(roomEntities: List<BookmarkEntity>) {
+        val pending = pendingBookmarkMutations.value
+        if (pending.isEmpty()) return
+        val activeIds = roomEntities
+            .asSequence()
+            .filterNot { it.isDeleted }
+            .map { it.id }
+            .toSet()
+        pendingBookmarkMutations.update { current ->
+            current.filterValues { mutation ->
+                when (mutation) {
+                    // Keep Insert until Room lists the id.
+                    is PendingBookmarkMutation.Insert -> mutation.entity.id !in activeIds
+                    // Keep Remove until Room no longer lists the id.
+                    is PendingBookmarkMutation.Remove -> mutation.id in activeIds
+                }
+            }
+        }
+    }
+
+    private fun setPendingBookmarkInsert(entity: BookmarkEntity) {
+        if (pendingBookmarkBookId != entity.bookId) return
+        pendingBookmarkMutations.update { current ->
+            current + (entity.id to PendingBookmarkMutation.Insert(entity))
+        }
+    }
+
+    private fun setPendingBookmarkRemove(bookmarkId: String, bookId: String) {
+        if (pendingBookmarkBookId != bookId) return
+        // Always Replace with Remove (including over Insert). Room may emit the upserted
+        // active row before delete invalidation; dropping overlay would resurrect it.
+        pendingBookmarkMutations.update { current ->
+            current + (bookmarkId to PendingBookmarkMutation.Remove(bookmarkId))
+        }
+    }
+
+    private fun clearPendingBookmarkMutation(bookmarkId: String) {
+        pendingBookmarkMutations.update { current ->
+            if (bookmarkId !in current) current else current - bookmarkId
+        }
+    }
+
+    private fun clearPendingBookmarkMutations() {
+        pendingBookmarkBookId = null
+        latestRoomBookmarkEntities = emptyList()
+        latestBookmarkLocator = null
+        if (pendingBookmarkMutations.value.isNotEmpty()) {
+            pendingBookmarkMutations.value = emptyMap()
         }
     }
 
@@ -573,6 +704,17 @@ class ReaderViewModel(
                 _uiState.update { it.copy(lineSpacing = clamped) }
             }
         }
+        settingsEpubFontReplacementJob?.cancel()
+        settingsEpubFontReplacementJob = viewModelScope.launch {
+            var firstEmission = true
+            settings.epubFontReplacements.collect { replacements ->
+                if (firstEmission) {
+                    firstEmission = false
+                    return@collect
+                }
+                engine.setEpubFontReplacements(replacements)
+            }
+        }
     }
 
     private fun goTo(locator: Locator) {
@@ -604,24 +746,50 @@ class ReaderViewModel(
     private fun toggleBookmark() {
         val bookId = currentBookId ?: return
         val engine = _uiState.value.engine ?: return
-        val currentBookmarkId = _uiState.value.bookmarks.currentBookmarkId
-        val currentBookmark = _uiState.value.bookmarks.items.firstOrNull { it.id == currentBookmarkId }
         viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val deviceId = settings.deviceId.first()
-            if (currentBookmark != null) {
-                bookmarkDao.markDeleted(currentBookmark.id, now, deviceId)
-                syncManager.syncBookmark(currentBookmark.toDeletedBookmarkModel(bookId, deviceId, now))
-            } else {
-                val entity = readerBookmarkEntityFor(
-                    bookId = bookId,
-                    locator = engine.currentLocator.value,
-                    deviceId = deviceId,
-                    now = now,
-                    id = UUID.randomUUID().toString(),
-                )
-                bookmarkDao.upsert(entity)
-                entity.toBookmarkModel()?.let { syncManager.syncBookmark(it) }
+            bookmarkMutex.withLock {
+                // Re-read under the lock so concurrent taps share one decision.
+                val bookmarks = _uiState.value.bookmarks
+                val currentBookmark = bookmarks.currentBookmarkId?.let { id ->
+                    bookmarks.items.firstOrNull { it.id == id }
+                }
+                val now = System.currentTimeMillis()
+                val deviceId = settings.deviceId.first()
+                if (currentBookmark != null) {
+                    setPendingBookmarkRemove(currentBookmark.id, bookId)
+                    // Publish under lock so the next rapid toggle sees the optimistic state.
+                    projectBookmarksFromOverlay(engine.currentLocator.value)
+                    try {
+                        bookmarkDao.markDeleted(currentBookmark.id, now, deviceId)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Throwable) {
+                        clearPendingBookmarkMutation(currentBookmark.id)
+                        projectBookmarksFromOverlay(engine.currentLocator.value)
+                        return@withLock
+                    }
+                    syncManager.syncBookmark(currentBookmark.toDeletedBookmarkModel(bookId, deviceId, now))
+                } else {
+                    val entity = readerBookmarkEntityFor(
+                        bookId = bookId,
+                        locator = engine.currentLocator.value,
+                        deviceId = deviceId,
+                        now = now,
+                        id = UUID.randomUUID().toString(),
+                    )
+                    setPendingBookmarkInsert(entity)
+                    projectBookmarksFromOverlay(engine.currentLocator.value)
+                    try {
+                        bookmarkDao.upsert(entity)
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Throwable) {
+                        clearPendingBookmarkMutation(entity.id)
+                        projectBookmarksFromOverlay(engine.currentLocator.value)
+                        return@withLock
+                    }
+                    entity.toBookmarkModel()?.let { syncManager.syncBookmark(it) }
+                }
             }
         }
     }
@@ -638,10 +806,26 @@ class ReaderViewModel(
     private fun removeBookmark(bookmark: ReaderBookmarkItem) {
         val bookId = currentBookId ?: return
         viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            val deviceId = settings.deviceId.first()
-            bookmarkDao.markDeleted(bookmark.id, now, deviceId)
-            syncManager.syncBookmark(bookmark.toDeletedBookmarkModel(bookId, deviceId, now))
+            bookmarkMutex.withLock {
+                setPendingBookmarkRemove(bookmark.id, bookId)
+                projectBookmarksFromOverlay(
+                    latestBookmarkLocator ?: _uiState.value.engine?.currentLocator?.value,
+                )
+                val now = System.currentTimeMillis()
+                val deviceId = settings.deviceId.first()
+                try {
+                    bookmarkDao.markDeleted(bookmark.id, now, deviceId)
+                } catch (error: CancellationException) {
+                    throw error
+                } catch (_: Throwable) {
+                    clearPendingBookmarkMutation(bookmark.id)
+                    projectBookmarksFromOverlay(
+                        latestBookmarkLocator ?: _uiState.value.engine?.currentLocator?.value,
+                    )
+                    return@withLock
+                }
+                syncManager.syncBookmark(bookmark.toDeletedBookmarkModel(bookId, deviceId, now))
+            }
         }
     }
 
@@ -677,6 +861,7 @@ class ReaderViewModel(
 
     private fun setSearchQuery(query: String) {
         searchJob?.cancel()
+        searchGeneration += 1L
         _uiState.update { it.copy(search = it.search.withQuery(query)) }
     }
 
@@ -688,6 +873,7 @@ class ReaderViewModel(
             return
         }
         searchJob?.cancel()
+        val generation = ++searchGeneration
         _uiState.update {
             it.copy(
                 search = it.search.copy(
@@ -699,6 +885,26 @@ class ReaderViewModel(
                 ),
             )
         }
+        // Capability short-circuit: no engine work when format cannot search.
+        if (!engine.supportsSearch) {
+            if (generation == searchGeneration) {
+                _uiState.update { state ->
+                    if (state.search.query != query) {
+                        state
+                    } else {
+                        state.copy(
+                            search = state.search.copy(
+                                results = emptyList(),
+                                selectedIndex = null,
+                                isSearching = false,
+                                message = "当前格式暂不支持搜索",
+                            ),
+                        )
+                    }
+                }
+            }
+            return
+        }
         searchJob = viewModelScope.launch {
             val searchResult = try {
                 Result.success(engine.search(query))
@@ -707,8 +913,9 @@ class ReaderViewModel(
             } catch (error: Throwable) {
                 Result.failure(error)
             }
+            if (generation != searchGeneration) return@launch
             _uiState.update { state ->
-                if (state.search.query != query) {
+                if (state.search.query != query || generation != searchGeneration) {
                     state
                 } else {
                     searchResult.fold(
@@ -721,7 +928,6 @@ class ReaderViewModel(
                                     isSearching = false,
                                     message = when {
                                         results.isNotEmpty() -> null
-                                        !engine.supportsSearch -> "当前格式暂不支持搜索"
                                         else -> "未找到结果"
                                     },
                                 ),
@@ -767,6 +973,7 @@ class ReaderViewModel(
 
     private fun clearSearch() {
         searchJob?.cancel()
+        searchGeneration += 1L
         _uiState.update { it.copy(search = it.search.cleared()) }
     }
 
@@ -896,10 +1103,12 @@ class ReaderViewModel(
         fontPreviewPersistJob?.cancel()
         searchJob?.cancel()
         bookmarkJob?.cancel()
+        clearPendingBookmarkMutations()
         textSelectionJob?.cancel()
         annotationJob?.cancel()
         settingsFontJob?.cancel()
         settingsLineSpacingJob?.cancel()
+        settingsEpubFontReplacementJob?.cancel()
         var closeCancellation: CancellationException? = null
 
         suspend fun attempt(block: suspend () -> Unit) {

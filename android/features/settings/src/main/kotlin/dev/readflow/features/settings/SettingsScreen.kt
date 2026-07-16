@@ -15,14 +15,19 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Notes
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.FileDownload
 import androidx.compose.material.icons.outlined.FileUpload
@@ -54,6 +59,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.readerThemeLabel
+import dev.readflow.core.model.ReaderCommandId
+import dev.readflow.core.model.ReaderMenuConfig
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
@@ -83,6 +90,8 @@ fun SettingsScreen(
     val readingMode by vm.readingMode.collectAsStateWithLifecycle()
     val txtEncoding by vm.txtEncoding.collectAsStateWithLifecycle()
     val fontChoice by vm.fontChoice.collectAsStateWithLifecycle()
+    val epubFontReplacements by vm.epubFontReplacements.collectAsStateWithLifecycle()
+    val readerMenuConfig by vm.readerMenuConfig.collectAsStateWithLifecycle()
     val syncStatus by vm.syncStatus.collectAsStateWithLifecycle()
     val backupExportState by vm.backupExportState.collectAsStateWithLifecycle()
     val backupRestoreState by vm.backupRestoreState.collectAsStateWithLifecycle()
@@ -381,6 +390,78 @@ fun SettingsScreen(
                 }
             }
 
+            var showReaderMenuEditor by rememberSaveable { mutableStateOf(false) }
+            val resolvedMenu = remember(readerMenuConfig) {
+                ReaderMenuConfig.resolve(readerMenuConfig)
+            }
+            val visibleMenuEntries = remember(resolvedMenu) {
+                resolvedMenu.entries.filter { it.visible }
+            }
+            val menuVisibleSummary = remember(visibleMenuEntries) {
+                if (visibleMenuEntries.isEmpty()) {
+                    "0 项显示"
+                } else {
+                    val orderSummary = visibleMenuEntries
+                        .joinToString(" · ") { readerMenuCommandLabel(it.id) }
+                    "${visibleMenuEntries.size} 项 · $orderSummary"
+                }
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .clickable(
+                        role = Role.Button,
+                        onClick = { showReaderMenuEditor = true },
+                    )
+                    .semantics(mergeDescendants = true) {
+                        stateDescription = menuVisibleSummary
+                    }
+                    .padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Box(
+                    modifier = Modifier.size(width = 28.dp, height = 48.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.ViewCarousel,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "阅读菜单命令",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = menuVisibleSummary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            if (showReaderMenuEditor) {
+                ReaderMenuConfigEditorDialog(
+                    config = resolvedMenu,
+                    onDismiss = { showReaderMenuEditor = false },
+                    onToggleVisible = { id, visible ->
+                        vm.setReaderMenuCommandVisible(id, visible)
+                    },
+                    onMoveUp = { id -> vm.moveReaderMenuCommandUp(id) },
+                    onMoveDown = { id -> vm.moveReaderMenuCommandDown(id) },
+                    onReset = { vm.resetReaderMenuConfig() },
+                )
+            }
+
             var customFonts by remember { mutableStateOf(emptyList<String>()) }
             // key 于 fontChoice：导入成功会更新 fontChoice，从而刷新列表显示新字体
             LaunchedEffect(fontChoice) {
@@ -426,6 +507,116 @@ fun SettingsScreen(
                     Spacer(Modifier.width(8.dp))
                     Text("导入字体")
                 }
+            }
+
+            var showFontReplacementDialog by rememberSaveable { mutableStateOf(false) }
+            var fontReplacementFamily by rememberSaveable { mutableStateOf("") }
+            var fontReplacementTarget by rememberSaveable { mutableStateOf(FontChoice.System.serialize()) }
+            SettingItemHeader(
+                icon = Icons.Outlined.FontDownload,
+                title = "EPUB 字体替换",
+                currentValue = "${epubFontReplacements.size} 条",
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                epubFontReplacements.forEach { (family, targetId) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = family,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = FontProvider.label(FontChoice.parse(targetId)),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        IconButton(
+                            onClick = { vm.removeEpubFontReplacement(family) },
+                            modifier = Modifier.size(48.dp),
+                        ) {
+                            Icon(Icons.Outlined.Delete, contentDescription = "删除 $family 字体替换")
+                        }
+                    }
+                }
+                OutlinedButton(
+                    onClick = {
+                        fontReplacementFamily = ""
+                        fontReplacementTarget = fontChoice.serialize()
+                        showFontReplacementDialog = true
+                    },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("添加替换")
+                }
+            }
+
+            if (showFontReplacementDialog) {
+                AlertDialog(
+                    onDismissRequest = { showFontReplacementDialog = false },
+                    title = { Text("EPUB 字体替换") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            OutlinedTextField(
+                                value = fontReplacementFamily,
+                                onValueChange = { fontReplacementFamily = it },
+                                label = { Text("书中 CSS 字体名") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                FontProvider.availableChoices(customFonts).forEach { choice ->
+                                    FilterChip(
+                                        selected = fontReplacementTarget == choice.serialize(),
+                                        onClick = { fontReplacementTarget = choice.serialize() },
+                                        label = {
+                                            Text(
+                                                FontProvider.label(choice),
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        },
+                                        modifier = Modifier.heightIn(min = 48.dp),
+                                    )
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(
+                            onClick = {
+                                vm.setEpubFontReplacement(
+                                    fontReplacementFamily,
+                                    FontChoice.parse(fontReplacementTarget),
+                                )
+                                showFontReplacementDialog = false
+                            },
+                            enabled = normalizedEpubFontFamily(fontReplacementFamily) != null,
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text("保存") }
+                    },
+                    dismissButton = {
+                        TextButton(
+                            onClick = { showFontReplacementDialog = false },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        ) { Text("取消") }
+                    },
+                )
             }
 
             SettingItemHeader(
@@ -974,6 +1165,115 @@ private fun SettingsCategory.icon(): ImageVector = when (this) {
     SettingsCategory.SOURCE -> Icons.Outlined.Link
     SettingsCategory.DATA -> Icons.Outlined.ImportExport
     SettingsCategory.ABOUT -> Icons.Outlined.Info
+}
+
+/** Chinese labels for reader bottom-bar command toggles (must match ReaderCommandCatalog). */
+internal fun readerMenuCommandLabel(id: ReaderCommandId): String = when (id) {
+    ReaderCommandId.TOC -> "目录"
+    ReaderCommandId.SEARCH -> "搜索"
+    ReaderCommandId.BOOKMARKS -> "书签"
+    ReaderCommandId.ANNOTATIONS -> "标注"
+    ReaderCommandId.FONT -> "排版"
+    ReaderCommandId.THEME -> "主题"
+}
+
+@Composable
+private fun ReaderMenuConfigEditorDialog(
+    config: ReaderMenuConfig,
+    onDismiss: () -> Unit,
+    onToggleVisible: (ReaderCommandId, Boolean) -> Unit,
+    onMoveUp: (ReaderCommandId) -> Unit,
+    onMoveDown: (ReaderCommandId) -> Unit,
+    onReset: () -> Unit,
+) {
+    val entries = config.entries
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("阅读菜单命令") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                entries.forEachIndexed { index, entry ->
+                    val label = readerMenuCommandLabel(entry.id)
+                    val canMoveUp = index > 0
+                    val canMoveDown = index < entries.lastIndex
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .padding(horizontal = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                                .toggleable(
+                                    value = entry.visible,
+                                    role = Role.Switch,
+                                    onValueChange = { visible ->
+                                        onToggleVisible(entry.id, visible)
+                                    },
+                                )
+                                .semantics {
+                                    stateDescription = if (entry.visible) "已显示" else "已隐藏"
+                                },
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = label,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Switch(
+                                checked = entry.visible,
+                                onCheckedChange = null,
+                            )
+                        }
+                        IconButton(
+                            onClick = { onMoveUp(entry.id) },
+                            enabled = canMoveUp,
+                            modifier = Modifier.size(48.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.KeyboardArrowUp,
+                                contentDescription = "上移$label",
+                            )
+                        }
+                        IconButton(
+                            onClick = { onMoveDown(entry.id) },
+                            enabled = canMoveDown,
+                            modifier = Modifier.size(48.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.KeyboardArrowDown,
+                                contentDescription = "下移$label",
+                            )
+                        }
+                    }
+                }
+                TextButton(
+                    onClick = onReset,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp),
+                ) {
+                    Text("恢复默认")
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text("完成")
+            }
+        },
+    )
 }
 
 @Composable

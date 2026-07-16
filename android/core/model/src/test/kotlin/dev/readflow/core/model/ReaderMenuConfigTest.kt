@@ -149,4 +149,126 @@ class ReaderMenuConfigTest {
             resolved.entries,
         )
     }
+
+    @Test
+    fun `moveCommandUp swaps with previous entry and preserves visibility version and catalog`() {
+        val start = ReaderMenuConfig(
+            version = ReaderMenuConfig.VERSION_V1,
+            entries = listOf(
+                ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false),
+                ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = false),
+                ReaderMenuEntry(ReaderCommandId.FONT, visible = true),
+                ReaderMenuEntry(ReaderCommandId.THEME, visible = true),
+            ),
+        )
+        val moved = ReaderMenuConfig.moveCommandUp(start, ReaderCommandId.BOOKMARKS)
+        assertEquals(ReaderMenuConfig.VERSION_V1, moved.version)
+        assertEquals(
+            listOf(
+                ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false),
+                ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = false),
+                ReaderMenuEntry(ReaderCommandId.FONT, visible = true),
+                ReaderMenuEntry(ReaderCommandId.THEME, visible = true),
+            ),
+            moved.entries,
+        )
+        assertEquals(ReaderCommandId.entries.toSet(), moved.entries.map { it.id }.toSet())
+    }
+
+    @Test
+    fun `moveCommandDown swaps with next entry and preserves visibility`() {
+        val start = ReaderMenuConfig.v1Defaults().let {
+            ReaderMenuConfig.setCommandVisible(it, ReaderCommandId.FONT, visible = false)
+        }
+        val moved = ReaderMenuConfig.moveCommandDown(start, ReaderCommandId.FONT)
+        assertEquals(
+            listOf(
+                ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                ReaderMenuEntry(ReaderCommandId.SEARCH, visible = true),
+                ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.THEME, visible = true),
+                ReaderMenuEntry(ReaderCommandId.FONT, visible = false),
+            ),
+            moved.entries,
+        )
+    }
+
+    @Test
+    fun `moveCommandUp on first entry is a no-op and moveCommandDown on last is a no-op`() {
+        val defaults = ReaderMenuConfig.v1Defaults()
+        assertEquals(defaults, ReaderMenuConfig.moveCommandUp(defaults, ReaderCommandId.TOC))
+        assertEquals(defaults, ReaderMenuConfig.moveCommandDown(defaults, ReaderCommandId.THEME))
+    }
+
+    @Test
+    fun `move preserves each entry visibility across encode decode`() {
+        val reordered = ReaderMenuConfig.moveCommandUp(
+            ReaderMenuConfig.setCommandVisible(
+                ReaderMenuConfig.v1Defaults(),
+                ReaderCommandId.SEARCH,
+                visible = false,
+            ),
+            ReaderCommandId.SEARCH,
+        )
+        val roundTripped = ReaderMenuConfig.decodeOrDefaults(ReaderMenuConfig.encode(reordered))
+        assertEquals(reordered.entries, roundTripped.entries)
+        assertFalse(roundTripped.entries.first { it.id == ReaderCommandId.SEARCH }.visible)
+        assertEquals(ReaderCommandId.SEARCH, roundTripped.entries.first().id)
+    }
+
+    @Test
+    fun `restoreDefaults returns full v1 catalog all visible`() {
+        val customized = ReaderMenuConfig(
+            version = ReaderMenuConfig.VERSION_V1,
+            entries = listOf(
+                ReaderMenuEntry(ReaderCommandId.THEME, visible = false),
+                ReaderMenuEntry(ReaderCommandId.FONT, visible = false),
+                ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false),
+                ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = false),
+            ),
+        )
+        assertEquals(ReaderMenuConfig.v1Defaults(), ReaderMenuConfig.restoreDefaults())
+        assertEquals(ReaderMenuConfig.v1Defaults(), ReaderMenuConfig.restoreDefaults().let {
+            // restore ignores prior state — pure factory
+            ReaderMenuConfig.restoreDefaults()
+        })
+        assertTrue(customized.entries.any { !it.visible })
+        assertTrue(ReaderMenuConfig.restoreDefaults().entries.all { it.visible })
+    }
+
+    @Test
+    fun `serialized rapid move and visibility reducers never lose prior updates`() {
+        // Simulates ViewModel mutex serialization: each step reads prior result.
+        var config = ReaderMenuConfig.v1Defaults()
+        config = ReaderMenuConfig.setCommandVisible(config, ReaderCommandId.ANNOTATIONS, false)
+        config = ReaderMenuConfig.moveCommandUp(config, ReaderCommandId.THEME)
+        config = ReaderMenuConfig.moveCommandUp(config, ReaderCommandId.THEME)
+        config = ReaderMenuConfig.setCommandVisible(config, ReaderCommandId.SEARCH, false)
+        config = ReaderMenuConfig.moveCommandDown(config, ReaderCommandId.TOC)
+        config = ReaderMenuConfig.setCommandVisible(config, ReaderCommandId.ANNOTATIONS, true)
+
+        // TOC↓ SEARCH(hide) THEME↑↑ ANNOTATIONS(show after hide):
+        // SEARCH(f), TOC, BOOKMARKS, THEME, ANNOTATIONS(t), FONT
+        assertEquals(
+            listOf(
+                ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false),
+                ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.THEME, visible = true),
+                ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.FONT, visible = true),
+            ),
+            config.entries,
+        )
+        assertEquals(ReaderMenuConfig.VERSION_V1, config.version)
+        assertEquals(6, config.entries.size)
+        assertEquals(ReaderCommandId.entries.toSet(), config.entries.map { it.id }.toSet())
+    }
 }

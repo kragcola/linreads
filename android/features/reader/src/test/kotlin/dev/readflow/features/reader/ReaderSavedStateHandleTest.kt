@@ -462,6 +462,124 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `applies persisted epub font replacements before engine is exposed as loaded`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val replacements = mapOf("book serif" to "system_sans")
+        val settings = FakeSettingsRepository().apply {
+            epubFontReplacements.value = replacements
+        }
+        val events = mutableListOf<String>()
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = events,
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        val openIndex = events.indexOf("open:0.0")
+        val replacementIndex = events.indexOf("setEpubFontReplacements:{book serif=system_sans}")
+        assertTrue(
+            "persisted replacements must be applied before openBook, events=$events",
+            replacementIndex in 0 until openIndex,
+        )
+        assertEquals(LoadingState.Loaded, viewModel.uiState.value.loadingState)
+        assertEquals(
+            "collector must skip the initial map emission already applied at open",
+            1,
+            events.count { it.startsWith("setEpubFontReplacements:") },
+        )
+        assertEquals(listOf(replacements), engine.epubFontReplacementMaps)
+    }
+
+    @Test
+    fun `live epub font replacement updates only the active engine`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val firstEvents = mutableListOf<String>()
+        val secondEvents = mutableListOf<String>()
+        val firstEngine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = firstEvents,
+        )
+        val secondEngine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = secondEvents,
+        )
+        var resolveCount = 0
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = firstEngine,
+            engineProvider = {
+                resolveCount += 1
+                if (resolveCount == 1) firstEngine else secondEngine
+            },
+            settings = settings,
+            bookDao = FakeBookDao(
+                BookEntity(
+                    id = "book-1",
+                    title = "Saved Book",
+                    author = "Author",
+                    format = BookFormat.TXT.name,
+                    downloadStatus = "DOWNLOADED",
+                    localUri = "file:///tmp/saved-book.txt",
+                ),
+                BookEntity(
+                    id = "book-2",
+                    title = "Second Book",
+                    author = "Author",
+                    format = BookFormat.TXT.name,
+                    downloadStatus = "DOWNLOADED",
+                    localUri = "file:///tmp/second-book.txt",
+                ),
+            ),
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        assertEquals(1, firstEngine.epubFontReplacementMaps.size)
+
+        settings.setEpubFontReplacements(mapOf("primary" to "system_sans"))
+        advanceUntilIdle()
+        assertEquals(
+            listOf(emptyMap(), mapOf("primary" to "system_sans")),
+            firstEngine.epubFontReplacementMaps,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-2"))
+        advanceUntilIdle()
+        assertEquals(LoadingState.Loaded, viewModel.uiState.value.loadingState)
+        assertEquals(1, secondEngine.epubFontReplacementMaps.size)
+        assertEquals(mapOf("primary" to "system_sans"), secondEngine.epubFontReplacementMaps.single())
+
+        val firstMapsAfterReopen = firstEngine.epubFontReplacementMaps.toList()
+        settings.setEpubFontReplacements(mapOf("secondary" to "system_monospace"))
+        advanceUntilIdle()
+
+        assertEquals(
+            "stale engine must not receive replacement updates after reopen",
+            firstMapsAfterReopen,
+            firstEngine.epubFontReplacementMaps,
+        )
+        assertEquals(
+            listOf(
+                mapOf("primary" to "system_sans"),
+                mapOf("secondary" to "system_monospace"),
+            ),
+            secondEngine.epubFontReplacementMaps,
+        )
+        assertTrue(
+            "closed first engine should not keep receiving live settings",
+            firstEngine.closeCalls >= 1,
+        )
+    }
+
+    @Test
     fun `font choice intent updates reader settings and live engine together`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val settings = FakeSettingsRepository().apply {
@@ -1513,6 +1631,7 @@ class ReaderSavedStateHandleTest {
         val themes = mutableListOf<ThemeMode>()
         val modeChanges = mutableListOf<ReadingMode>()
         val restoredStates = mutableListOf<ByteArray>()
+        val epubFontReplacementMaps = mutableListOf<Map<String, String>>()
         var clearTextSelectionCalls = 0
         var closeCalls = 0
         var closeFailure: Throwable? = null
@@ -1553,6 +1672,10 @@ class ReaderSavedStateHandleTest {
         }
         override suspend fun setFont(fontId: String) {
             events += "setFont:$fontId"
+        }
+        override suspend fun setEpubFontReplacements(replacements: Map<String, String>) {
+            epubFontReplacementMaps += replacements
+            events += "setEpubFontReplacements:$replacements"
         }
         override suspend fun setPageFlipStyle(style: PageFlipStyle) {
             events += "setPageFlipStyle:$style"
@@ -1645,15 +1768,15 @@ class ReaderSavedStateHandleTest {
         override fun unbind() = Unit
     }
 
-    private class FakeBookDao(book: BookEntity) : BookDao {
-        private val books = mutableMapOf(book.id to book)
+    private class FakeBookDao(vararg books: BookEntity) : BookDao {
+        private val books = books.associateBy { it.id }.toMutableMap()
         var getByIdCalls = 0
             private set
-        override fun observeAll(): Flow<List<BookEntity>> = MutableStateFlow(books.values.toList())
+        override fun observeAll(): Flow<List<BookEntity>> = MutableStateFlow(this.books.values.toList())
         override fun observeShelf(): Flow<List<BookWithProgress>> = MutableStateFlow(emptyList())
-        override suspend fun count(): Int = books.size
-        override suspend fun maxSortOrder(): Int? = books.values.maxOfOrNull { it.sortOrder }
-        override suspend fun shelfRowsForOrderNormalization(): List<BookEntity> = books.values.toList()
+        override suspend fun count(): Int = this.books.size
+        override suspend fun maxSortOrder(): Int? = this.books.values.maxOfOrNull { it.sortOrder }
+        override suspend fun shelfRowsForOrderNormalization(): List<BookEntity> = this.books.values.toList()
         override suspend fun upsert(book: BookEntity) {
             books[book.id] = book
         }
@@ -1805,6 +1928,7 @@ class ReaderSavedStateHandleTest {
         override val useSourceHanFont = MutableStateFlow(true)
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.System)
+        override val epubFontReplacements = MutableStateFlow<Map<String, String>>(emptyMap())
         override val readerGuideShown = MutableStateFlow(true)
         override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
         override val readerMenuConfig = MutableStateFlow(ReaderMenuConfig.v1Defaults())
@@ -1842,6 +1966,10 @@ class ReaderSavedStateHandleTest {
 
         override suspend fun setFontChoice(choice: FontChoice) {
             fontChoice.value = choice
+        }
+
+        override suspend fun setEpubFontReplacements(replacements: Map<String, String>) {
+            epubFontReplacements.value = replacements
         }
 
         override suspend fun setReaderGuideShown(shown: Boolean) {

@@ -16,9 +16,12 @@ class MainActivity : ComponentActivity() {
     private var incomingBookMimeType: String? by mutableStateOf(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Edge-to-edge before super so decor fits system windows is cleared before content attaches.
+        // Default styles: transparent status bar (API 29+); navigation keeps platform contrast scrim
+        // on 3-button devices. ReaderScreen further scopes paper continuity + icon appearance.
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         updateIncomingBook(intent)
-        enableEdgeToEdge()
         setContent {
             ReadflowApp(
                 incomingBookUri = incomingBookUri,

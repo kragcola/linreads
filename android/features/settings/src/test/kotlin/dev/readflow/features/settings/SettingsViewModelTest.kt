@@ -14,6 +14,9 @@ import dev.readflow.core.database.LinReadsBackupRestoreResult
 import dev.readflow.core.database.LinReadsBackupRestoreStore
 import dev.readflow.core.database.NotesMarkdownExportStore
 import dev.readflow.core.model.Bookmark
+import dev.readflow.core.model.ReaderCommandId
+import dev.readflow.core.model.ReaderMenuConfig
+import dev.readflow.core.model.ReaderMenuEntry
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
@@ -380,6 +383,199 @@ class SettingsViewModelTest {
         assertTrue(viewModel.themeImportState.value is BackupRestoreUiState.Failure)
     }
 
+    @Test
+    fun setEpubFontReplacementNormalizesFamilyAndPersistsMapping() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val viewModel = createViewModel(settings)
+
+        viewModel.setEpubFontReplacement("  Book   Serif  ", FontChoice.SystemSans)
+        advanceUntilIdle()
+
+        assertEquals(
+            mapOf("book serif" to FontChoice.SystemSans.serialize()),
+            settings.epubFontReplacements.value,
+        )
+    }
+
+    @Test
+    fun rapidEpubFontReplacementAddsDoNotLosePriorMappings() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val viewModel = createViewModel(settings)
+
+        // Fire several read-modify-write adds without intermediate idle drains.
+        // Without a shared mutex these would race and keep only the last write.
+        viewModel.setEpubFontReplacement("serif", FontChoice.System)
+        viewModel.setEpubFontReplacement("sans", FontChoice.SystemSans)
+        viewModel.setEpubFontReplacement("mono", FontChoice.SystemMonospace)
+        advanceUntilIdle()
+
+        assertEquals(
+            mapOf(
+                "serif" to FontChoice.System.serialize(),
+                "sans" to FontChoice.SystemSans.serialize(),
+                "mono" to FontChoice.SystemMonospace.serialize(),
+            ),
+            settings.epubFontReplacements.value,
+        )
+        assertEquals(3, settings.setEpubFontReplacementsCalls)
+    }
+
+    @Test
+    fun rapidEpubFontReplacementRemoveIsSerializedAndKeepsSiblings() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            epubFontReplacements.value = mapOf(
+                "serif" to FontChoice.System.serialize(),
+                "sans" to FontChoice.SystemSans.serialize(),
+                "mono" to FontChoice.SystemMonospace.serialize(),
+            )
+        }
+        val viewModel = createViewModel(settings)
+
+        viewModel.removeEpubFontReplacement("serif")
+        viewModel.removeEpubFontReplacement("MONO") // normalization + concurrent remove
+        advanceUntilIdle()
+
+        assertEquals(
+            mapOf("sans" to FontChoice.SystemSans.serialize()),
+            settings.epubFontReplacements.value,
+        )
+        assertEquals(2, settings.setEpubFontReplacementsCalls)
+    }
+
+    @Test
+    fun interleavedAddAndRemoveEpubFontReplacementsStayConsistent() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            epubFontReplacements.value = mapOf(
+                "keep" to FontChoice.System.serialize(),
+            )
+        }
+        val viewModel = createViewModel(settings)
+
+        viewModel.setEpubFontReplacement("new-a", FontChoice.SystemSans)
+        viewModel.removeEpubFontReplacement("keep")
+        viewModel.setEpubFontReplacement("new-b", FontChoice.SystemMonospace)
+        advanceUntilIdle()
+
+        assertEquals(
+            mapOf(
+                "new-a" to FontChoice.SystemSans.serialize(),
+                "new-b" to FontChoice.SystemMonospace.serialize(),
+            ),
+            settings.epubFontReplacements.value,
+        )
+    }
+
+    @Test
+    fun blankEpubFontFamilyIsRejectedWithoutPersisting() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val viewModel = createViewModel(settings)
+
+        viewModel.setEpubFontReplacement("   ", FontChoice.SystemSans)
+        viewModel.removeEpubFontReplacement("")
+        advanceUntilIdle()
+
+        assertTrue(settings.epubFontReplacements.value.isEmpty())
+        assertEquals(0, settings.setEpubFontReplacementsCalls)
+    }
+
+    @Test
+    fun moveReaderMenuCommandUpPersistsOrderWhileKeepingVisibility() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            readerMenuConfig.value = ReaderMenuConfig.resolve(
+                ReaderMenuConfig(
+                    entries = listOf(
+                        ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                        ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false),
+                        ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                    ),
+                ),
+            )
+        }
+        val viewModel = createViewModel(settings)
+
+        viewModel.moveReaderMenuCommandUp(ReaderCommandId.SEARCH)
+        advanceUntilIdle()
+
+        val loaded = settings.readerMenuConfig.value
+        assertEquals(ReaderCommandId.SEARCH, loaded.entries[0].id)
+        assertFalse(loaded.entries[0].visible)
+        assertEquals(ReaderCommandId.TOC, loaded.entries[1].id)
+        assertEquals(6, loaded.entries.size)
+        assertEquals(1, settings.setReaderMenuConfigCalls)
+    }
+
+    @Test
+    fun moveReaderMenuCommandDownAtLastEntryIsNoOp() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val viewModel = createViewModel(settings)
+
+        viewModel.moveReaderMenuCommandDown(ReaderCommandId.THEME)
+        advanceUntilIdle()
+
+        assertEquals(ReaderMenuConfig.v1Defaults(), settings.readerMenuConfig.value)
+        assertEquals(1, settings.setReaderMenuConfigCalls)
+    }
+
+    @Test
+    fun resetReaderMenuConfigRestoresDefaults() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            readerMenuConfig.value = ReaderMenuConfig(
+                version = ReaderMenuConfig.VERSION_V1,
+                entries = listOf(
+                    ReaderMenuEntry(ReaderCommandId.THEME, visible = false),
+                    ReaderMenuEntry(ReaderCommandId.FONT, visible = true),
+                    ReaderMenuEntry(ReaderCommandId.TOC, visible = false),
+                    ReaderMenuEntry(ReaderCommandId.SEARCH, visible = true),
+                    ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = false),
+                    ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = true),
+                ),
+            )
+        }
+        val viewModel = createViewModel(settings)
+
+        viewModel.resetReaderMenuConfig()
+        advanceUntilIdle()
+
+        assertEquals(ReaderMenuConfig.v1Defaults(), settings.readerMenuConfig.value)
+    }
+
+    @Test
+    fun rapidReaderMenuMoveAndVisibilityDoNotLoseUpdates() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val viewModel = createViewModel(settings)
+
+        // Fire without intermediate idle drains; mutex must serialize read-modify-write.
+        viewModel.setReaderMenuCommandVisible(ReaderCommandId.ANNOTATIONS, false)
+        viewModel.moveReaderMenuCommandUp(ReaderCommandId.THEME)
+        viewModel.moveReaderMenuCommandUp(ReaderCommandId.THEME)
+        viewModel.setReaderMenuCommandVisible(ReaderCommandId.SEARCH, false)
+        viewModel.moveReaderMenuCommandDown(ReaderCommandId.TOC)
+        viewModel.setReaderMenuCommandVisible(ReaderCommandId.ANNOTATIONS, true)
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(
+                ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false),
+                ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.THEME, visible = true),
+                ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.FONT, visible = true),
+            ),
+            settings.readerMenuConfig.value.entries,
+        )
+        assertEquals(6, settings.setReaderMenuConfigCalls)
+    }
+
     private fun createViewModel(
         settings: SettingsRepository,
         connectionTester: CalibreConnectionTester = FakeCalibreConnectionTester(),
@@ -411,9 +607,13 @@ class SettingsViewModelTest {
         override val useSourceHanFont = MutableStateFlow(true)
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.System)
+        override val epubFontReplacements = MutableStateFlow<Map<String, String>>(emptyMap())
         override val readerGuideShown = MutableStateFlow(false)
         override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
+        override val readerMenuConfig = MutableStateFlow(ReaderMenuConfig.v1Defaults())
         var savedCalibreUrl: String? = null
+        var setEpubFontReplacementsCalls = 0
+        var setReaderMenuConfigCalls = 0
 
         override suspend fun setCalibreBaseUrl(url: String) {
             savedCalibreUrl = url
@@ -456,12 +656,22 @@ class SettingsViewModelTest {
             fontChoice.value = choice
         }
 
+        override suspend fun setEpubFontReplacements(replacements: Map<String, String>) {
+            setEpubFontReplacementsCalls += 1
+            epubFontReplacements.value = replacements
+        }
+
         override suspend fun setReaderGuideShown(shown: Boolean) {
             readerGuideShown.value = shown
         }
 
         override suspend fun setPageFlipStyle(style: dev.readflow.core.model.PageFlipStyle) {
             pageFlipStyle.value = style
+        }
+
+        override suspend fun setReaderMenuConfig(config: ReaderMenuConfig) {
+            setReaderMenuConfigCalls += 1
+            readerMenuConfig.value = ReaderMenuConfig.resolve(config)
         }
     }
 

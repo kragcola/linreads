@@ -1,10 +1,12 @@
 package dev.readflow.features.reader
 
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.TextFields
 import androidx.compose.ui.graphics.vector.ImageVector
 import dev.readflow.core.model.ReaderCommandId
 import dev.readflow.core.model.ReaderMenuConfig
@@ -29,10 +31,10 @@ object ReaderCommandRegistry {
     private val icons: Map<ReaderCommandId, ImageVector> = mapOf(
         ReaderCommandId.TOC to Icons.Default.Menu,
         ReaderCommandId.SEARCH to Icons.Default.Search,
-        ReaderCommandId.BOOKMARKS to Icons.Default.Edit,
+        ReaderCommandId.BOOKMARKS to Icons.Default.Bookmark,
         ReaderCommandId.ANNOTATIONS to Icons.Default.Edit,
-        ReaderCommandId.FONT to Icons.Default.Edit,
-        ReaderCommandId.THEME to Icons.Default.MoreVert,
+        ReaderCommandId.FONT to Icons.Outlined.TextFields,
+        ReaderCommandId.THEME to Icons.Outlined.Palette,
     )
 
     val catalog: List<ReaderCommandDescriptor> =

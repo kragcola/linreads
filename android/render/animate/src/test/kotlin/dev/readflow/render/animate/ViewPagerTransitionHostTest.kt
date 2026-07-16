@@ -28,6 +28,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -147,6 +148,52 @@ class ViewPagerTransitionHostTest {
         host.unbind()
     }
 
+    @Test
+    fun `paged host reports actual ViewPager viewport size to engine after layout`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = FakePagedEngine(context, initialPageCount = 2)
+        val host = ViewPagerTransitionHost(context, TransitionType.NONE)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(engine)
+        // Layout the pager to a known non-displayMetrics size.
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(640, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(960, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 640, 960)
+        runCurrent()
+
+        assertEquals(
+            "host must report laid-out width, not ignore layout",
+            640,
+            engine.lastViewportWidth,
+        )
+        assertEquals(960, engine.lastViewportHeight)
+
+        // Resize (rotation / container change).
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(400, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(700, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 400, 700)
+        runCurrent()
+
+        assertEquals(400, engine.lastViewportWidth)
+        assertEquals(700, engine.lastViewportHeight)
+        assertTrue(
+            "viewport reports must include both sizes",
+            engine.viewportReports.any { it.first == 640 && it.second == 960 } &&
+                engine.viewportReports.any { it.first == 400 && it.second == 700 },
+        )
+        host.unbind()
+        // After unbind, further layout must not call into unbound engine.
+        val reportsAfterUnbind = engine.viewportReports.size
+        pager.layout(0, 0, 300, 500)
+        assertEquals(reportsAfterUnbind, engine.viewportReports.size)
+    }
+
     private class FakePagedEngine(
         private val context: Context,
         initialPageCount: Int,
@@ -156,6 +203,9 @@ class ViewPagerTransitionHostTest {
         )
 
         val pageCountState = MutableStateFlow(initialPageCount)
+        val viewportReports = mutableListOf<Pair<Int, Int>>()
+        val lastViewportWidth: Int get() = viewportReports.lastOrNull()?.first ?: 0
+        val lastViewportHeight: Int get() = viewportReports.lastOrNull()?.second ?: 0
 
         override val id: String = "fake-paged"
         override val format: BookFormat = BookFormat.EPUB
@@ -177,6 +227,10 @@ class ViewPagerTransitionHostTest {
 
         override fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?) {
             pageRequestCallback = callback
+        }
+
+        override fun setViewportSize(widthPx: Int, heightPx: Int) {
+            viewportReports += widthPx to heightPx
         }
 
         fun requestPage(pageIndex: Int) {

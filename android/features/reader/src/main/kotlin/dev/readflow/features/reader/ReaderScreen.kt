@@ -34,12 +34,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
@@ -80,6 +83,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.shape.CircleShape
 import androidx.core.view.ViewCompat
@@ -102,6 +106,7 @@ import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.SelfPagingReaderEngine
+import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.ZoomableReaderEngine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
@@ -121,6 +126,16 @@ enum class ReaderFeature(val label: String) {
     THEME("主题"),
 }
 
+internal fun readerFeaturesFor(engine: ReaderEngine): Set<ReaderFeature> = buildSet {
+    add(ReaderFeature.TOC)
+    if (engine.supportsSearch) add(ReaderFeature.SEARCH)
+    add(ReaderFeature.BOOKMARKS)
+    if (engine is TextAnnotatableReaderEngine) add(ReaderFeature.ANNOTATIONS)
+    add(ReaderFeature.PROGRESS)
+    if (ReadingMode.SCROLL in engine.supportedModes) add(ReaderFeature.FONT)
+    add(ReaderFeature.THEME)
+}
+
 private val ReaderBottomChromeOuterPadding = 8.dp
 private val ReaderPanelBaseOverlap = 12.dp
 
@@ -136,11 +151,42 @@ internal fun readerHostKindFor(engine: ReaderEngine, pagingKind: PagingKind): Re
         }
     }
 
+/**
+ * Maps user-facing [PageFlipStyle] to the render-host [TransitionType] for regular PAGED hosts
+ * (TXT/PDF ViewPager path). EPUB [SelfPagingReaderEngine] owns its own flip style and must not
+ * go through this mapping for host remount.
+ *
+ * Exhaustive `when` fails compilation when a new [PageFlipStyle] value is added.
+ *
+ * Semantic gap: [PageFlipStyle.SIMULATION] is EPUB mesh curl; the nearest host vocabulary is
+ * [TransitionType.CURL] (ViewPager page transformer), not a full mesh simulation.
+ */
+internal fun pageFlipStyleToTransitionType(style: dev.readflow.core.model.PageFlipStyle): TransitionType =
+    when (style) {
+        dev.readflow.core.model.PageFlipStyle.SLIDE -> TransitionType.SLIDE
+        // SIMULATION has no ViewPager mesh equivalent; CURL is the only host-level curl analogue.
+        dev.readflow.core.model.PageFlipStyle.SIMULATION -> TransitionType.CURL
+        dev.readflow.core.model.PageFlipStyle.NONE -> TransitionType.NONE
+    }
+
+/**
+ * Reader-scoped edge-to-edge system bars.
+ *
+ * Root cause of the foreign top band: after [androidx.activity.enableEdgeToEdge], OEMs / API 29+
+ * may still paint a solid status-bar contrast scrim, and residual [Window.statusBarColor] can sit
+ * above the paper. Content is already edge-to-edge (paper full-bleed); this only clears scrims and
+ * drives icon light/dark from the reader paper palette. Status bar is never hidden.
+ *
+ * Scoped to the reader: prior colors / contrast / icon appearance are restored on leave so library
+ * and settings keep their own bar treatment.
+ */
 @Composable
 private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean) {
     val view = LocalView.current
     val lightBars = !readerPaletteFor(themeMode, systemNight).isNight
-    DisposableEffect(view, lightBars) {
+    // Capture prior window state once; restore on leave. Continuous re-apply lives in SideEffect
+    // so a later system/OEM write cannot leave a solid foreign band over paper.
+    DisposableEffect(view) {
         val window = view.context.findActivity()?.window
         if (window == null) {
             onDispose { }
@@ -158,17 +204,12 @@ private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean
                 } else {
                     false
                 }
-            // Reader-scoped only: paper continues under system icons. Icons stay visible via
-            // palette-driven light/dark appearance; solid bar scrims are cleared for this screen.
-            @Suppress("DEPRECATION")
-            window.statusBarColor = android.graphics.Color.TRANSPARENT
-            @Suppress("DEPRECATION")
-            window.navigationBarColor = android.graphics.Color.TRANSPARENT
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                window.isNavigationBarContrastEnforced = false
-            }
-            controller.isAppearanceLightStatusBars = lightBars
-            controller.isAppearanceLightNavigationBars = lightBars
+            val previousStatusBarContrastEnforced =
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    window.isStatusBarContrastEnforced
+                } else {
+                    false
+                }
             onDispose {
                 @Suppress("DEPRECATION")
                 window.statusBarColor = previousStatusBarColor
@@ -176,11 +217,28 @@ private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean
                 window.navigationBarColor = previousNavigationBarColor
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                     window.isNavigationBarContrastEnforced = previousNavigationBarContrastEnforced
+                    window.setStatusBarContrastEnforced(previousStatusBarContrastEnforced)
                 }
                 controller.isAppearanceLightStatusBars = previousStatusBarAppearance
                 controller.isAppearanceLightNavigationBars = previousNavigationBarAppearance
             }
         }
+    }
+    SideEffect {
+        val window = view.context.findActivity()?.window ?: return@SideEffect
+        val controller = WindowCompat.getInsetsController(window, view)
+        // Paper must show through; keep icons visible via lightBars, never hide the status bar.
+        @Suppress("DEPRECATION")
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
+        @Suppress("DEPRECATION")
+        window.navigationBarColor = android.graphics.Color.TRANSPARENT
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+            // Direct API (compileSdk 36): disable the flat status scrim that creates a foreign band.
+            window.setStatusBarContrastEnforced(false)
+        }
+        controller.isAppearanceLightStatusBars = lightBars
+        controller.isAppearanceLightNavigationBars = lightBars
     }
 }
 
@@ -223,16 +281,38 @@ fun ReaderScreen(
                 if (engine == null) {
                     Text("无内容", color = MaterialTheme.colorScheme.onBackground)
                 } else {
+                    val availableFeatures = remember(engine, features) {
+                        features.intersect(readerFeaturesFor(engine))
+                    }
                     val pagingKind by engine.pagingKind.collectAsState()
                     val hostKind = readerHostKindFor(engine, pagingKind)
+                    // Self-paging engines (EPUB) keep one stable host; their internal flip style
+                    // is applied via engine.setPageFlipStyle, not via host TransitionType.
+                    val isSelfPaging =
+                        (engine as? SelfPagingReaderEngine)?.selfPagingActive == true
                     val host = remember(engine, hostKind) {
                         when (hostKind) {
                             ReaderHostKind.CONTINUOUS -> viewModel.hostFactory.continuous()
-                            ReaderHostKind.PAGED -> viewModel.hostFactory.paged(TransitionType.CURL)
+                            ReaderHostKind.PAGED -> {
+                                val initialTransition = if (isSelfPaging) {
+                                    // Placeholder only — self-paging owns flip inside its surface.
+                                    TransitionType.SLIDE
+                                } else {
+                                    pageFlipStyleToTransitionType(state.pageFlipStyle)
+                                }
+                                viewModel.hostFactory.paged(initialTransition)
+                            }
                         }.also { it.bind(engine) }
                     }
                     DisposableEffect(host) {
                         onDispose { host.unbind() }
+                    }
+                    // Regular PAGED hosts (TXT/PDF): honor PageFlipStyle without remounting.
+                    // Never push transition onto self-paging hosts (avoids double-transform).
+                    LaunchedEffect(host, hostKind, isSelfPaging, state.pageFlipStyle) {
+                        if (!isSelfPaging && hostKind == ReaderHostKind.PAGED) {
+                            host.setTransition(pageFlipStyleToTransitionType(state.pageFlipStyle))
+                        }
                     }
                     var bottomChromeHeightPx by remember { mutableIntStateOf(0) }
                     val bottomChromeHeightDp = with(LocalDensity.current) {
@@ -373,9 +453,14 @@ fun ReaderScreen(
                                 IconButton(
                                     onClick = { viewModel.onIntent(ReaderIntent.ToggleBookmark) },
                                     enabled = state.canBookmark,
+                                    modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
                                 ) {
                                     Icon(
-                                        Icons.Default.Edit,
+                                        imageVector = if (state.bookmarks.isCurrentBookmarked) {
+                                            Icons.Default.Bookmark
+                                        } else {
+                                            Icons.Default.BookmarkBorder
+                                        },
                                         contentDescription = if (state.bookmarks.isCurrentBookmarked) {
                                             "移除书签"
                                         } else {
@@ -538,7 +623,7 @@ fun ReaderScreen(
                                     // Order/visibility from ViewModel-owned menuConfig ∩ features filter.
                                     val menuCommands = ReaderCommandRegistry.visibleCommands(
                                         config = state.menuConfig,
-                                        features = features,
+                                        features = availableFeatures,
                                     )
                                     menuCommands.forEach { command ->
                                         ReaderMenuButton(
@@ -767,9 +852,23 @@ private fun BookmarkPanel(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(min = 48.dp),
+                            .heightIn(min = 48.dp)
+                            .semantics {
+                                contentDescription = bookmark.accessibilityLabel()
+                            }
+                            .clickable { onBookmarkClick(bookmark) }
+                            .padding(horizontal = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
+                        Icon(
+                            imageVector = Icons.Default.Bookmark,
+                            contentDescription = null,
+                            tint = if (bookmark.id == bookmarkState.currentBookmarkId) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
                         Text(
                             text = bookmark.label,
                             style = MaterialTheme.typography.bodyMedium,
@@ -777,10 +876,6 @@ private fun BookmarkPanel(
                             maxLines = 1,
                             modifier = Modifier
                                 .weight(1f)
-                                .semantics {
-                                    contentDescription = bookmark.accessibilityLabel()
-                                }
-                                .clickable { onBookmarkClick(bookmark) }
                                 .padding(horizontal = 8.dp, vertical = 14.dp),
                         )
                         IconButton(onClick = { onBookmarkRemove(bookmark) }) {
@@ -874,6 +969,8 @@ private fun SearchPanel(
                 modifier = Modifier.weight(1f),
                 singleLine = true,
                 label = { Text("关键词") },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { onSubmit() }),
             )
             IconButton(
                 onClick = onSubmit,
@@ -902,16 +999,35 @@ private fun SearchPanel(
             )
         }
         if (searchState.results.isNotEmpty()) {
+            Text(
+                text = "${searchState.results.size} 个结果",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             LazyColumn {
                 items(searchState.results) { result ->
+                    val selected = result.index == searchState.selectedIndex
                     Text(
                         text = result.readerLabel(),
                         style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onBackground,
+                        color = if (selected) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onBackground
+                        },
                         maxLines = 1,
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
+                            .then(
+                                if (selected) {
+                                    Modifier.background(
+                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.10f),
+                                    )
+                                } else {
+                                    Modifier
+                                },
+                            )
                             .semantics {
                                 contentDescription = result.readerAccessibilityLabel()
                             }

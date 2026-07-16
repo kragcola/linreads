@@ -91,6 +91,10 @@ class ReaderScreenPaperInsetsVisualContractTest {
                 source.contains("onDispose"),
         )
         assertTrue(
+            "icon light/dark must follow reader paper palette (not only system dark theme)",
+            source.contains("lightBars = !readerPaletteFor(themeMode, systemNight).isNight"),
+        )
+        assertTrue(
             "reader-scoped status/navigation bar backgrounds must go transparent while icons stay visible",
             source.contains("statusBarColor") &&
                 source.contains("navigationBarColor") &&
@@ -103,8 +107,19 @@ class ReaderScreenPaperInsetsVisualContractTest {
             source.contains("isNavigationBarContrastEnforced") &&
                 source.contains("previousNavigationBarContrastEnforced"),
         )
+        assertTrue(
+            "status-bar contrast enforcement must be cleared via the direct Window API so OEMs " +
+                "cannot paint a flat scrim over the transparent paper edge",
+            source.contains("previousStatusBarContrastEnforced") &&
+                source.contains("isStatusBarContrastEnforced") &&
+                source.contains("setStatusBarContrastEnforced(false)"),
+        )
         // Restore path must re-apply prior colors/contrast/icons together on dispose.
         val appearanceBlock = readerSystemBarAppearanceBlock(source)
+        assertTrue(
+            "continuous SideEffect re-applies transparent bars + contrast clear while on reader",
+            appearanceBlock.contains("SideEffect"),
+        )
         assertTrue(
             "onDispose must restore prior statusBarColor",
             appearanceBlock.contains("statusBarColor = previousStatusBarColor") ||
@@ -119,6 +134,21 @@ class ReaderScreenPaperInsetsVisualContractTest {
             "onDispose must restore prior navigation-bar contrast enforcement",
             appearanceBlock.contains("isNavigationBarContrastEnforced = previousNavigationBarContrastEnforced"),
         )
+        assertTrue(
+            "onDispose must restore prior status-bar contrast enforcement",
+            appearanceBlock.contains("setStatusBarContrastEnforced(previousStatusBarContrastEnforced)") ||
+                appearanceBlock.contains("previousStatusBarContrastEnforced"),
+        )
+        // Status bar stays visible: icons remain via light/dark appearance; never hide system bars.
+        assertFalse(
+            "do not call InsetsController.hide for status bars on the reader",
+            Regex("""\.hide\s*\(\s*WindowInsetsCompat\.Type\.statusBars""").containsMatchIn(appearanceBlock),
+        )
+        assertFalse(
+            "do not use legacy fullscreen flags that hide the status bar",
+            appearanceBlock.contains("SYSTEM_UI_FLAG_FULLSCREEN") ||
+                appearanceBlock.contains("SYSTEM_UI_FLAG_HIDE_NAVIGATION"),
+        )
     }
 
     private fun readerSystemBarAppearanceBlock(source: String): String {
@@ -128,7 +158,7 @@ class ReaderScreenPaperInsetsVisualContractTest {
         val end = source.indexOf("@OptIn(ExperimentalMaterial3Api::class)", marker)
             .takeIf { it > marker }
             ?: source.indexOf("fun ReaderScreen(", marker).takeIf { it > marker }
-            ?: (marker + 2500).coerceAtMost(source.length)
+            ?: (marker + 3500).coerceAtMost(source.length)
         return source.substring(marker, end)
     }
 

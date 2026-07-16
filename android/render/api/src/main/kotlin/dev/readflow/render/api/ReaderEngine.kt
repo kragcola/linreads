@@ -85,6 +85,8 @@ interface ReaderEngine {
     suspend fun setSerifFont(useSourceHan: Boolean) {}
     /** 按 fontId 切换正文字体：system/source_han/custom:<fileName>。默认空实现。 */
     suspend fun setFont(fontId: String) {}
+    /** EPUB CSS family -> reader font id replacements. Other formats ignore this setting. */
+    suspend fun setEpubFontReplacements(replacements: Map<String, String>) {}
     /** TXT 用户编码覆盖：传 charset 名强制重解码，null=沿用自动检测。默认空实现，仅 TXT 引擎实现。 */
     suspend fun setTxtEncodingOverride(charsetName: String?) {}
     suspend fun setTheme(mode: ThemeMode) {}
@@ -116,6 +118,13 @@ interface InitialLocatorAwareReaderEngine : ReaderEngine {
 interface PagedReaderEngine : ReaderEngine {
     fun createPageView(pageIndex: Int): View
     fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?)
+
+    /**
+     * Report the host viewport size in pixels (typically the ViewPager content size after
+     * layout / rotation). Default is a no-op so TXT/PDF/EPUB engines keep existing behaviour.
+     * Markdown uses this for complete-line StaticLayout pagination instead of displayMetrics.
+     */
+    fun setViewportSize(widthPx: Int, heightPx: Int) {}
 
     fun pageIndexForLocator(locator: Locator): Int {
         val total = pageCount.value.coerceAtLeast(1)

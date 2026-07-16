@@ -8,6 +8,8 @@ internal data class EpubParsedSpine(
     val blocks: List<EpubDisplayBlock>,
     val fragmentTargetIndexes: Map<String, EpubTargetPosition>,
     val charCount: Int,
+    /** Book-scoped @font-face map collected from this spine's stylesheets (first face per family). */
+    val bookFontMap: EpubBookFontMap = EpubBookFontMap.EMPTY,
 ) {
     companion object {
         fun empty(spineIndex: Int, path: String = ""): EpubParsedSpine =
@@ -19,6 +21,7 @@ internal data class EpubParsedSpine(
                 blocks = emptyList(),
                 fragmentTargetIndexes = emptyMap(),
                 charCount = 0,
+                bookFontMap = EpubBookFontMap.EMPTY,
             )
     }
 }

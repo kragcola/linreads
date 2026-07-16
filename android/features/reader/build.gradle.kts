@@ -22,6 +22,7 @@ dependencies {
     implementation(libs.coroutines.core)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.bundles.koin)
+    implementation(libs.compose.material.icons.extended)
 
     testImplementation(libs.junit5)
     testImplementation(libs.junit4)

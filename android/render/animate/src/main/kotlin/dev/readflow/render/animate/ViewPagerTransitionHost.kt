@@ -46,6 +46,21 @@ class ViewPagerTransitionHost(
     private var pageCountJob: Job? = null
     private var onPageSettled: ((pageIndex: Int) -> Unit)? = null
     private var transitionType: TransitionType = transition
+    private var lastReportedViewportWidth: Int = 0
+    private var lastReportedViewportHeight: Int = 0
+
+    private val viewportLayoutListener =
+        View.OnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
+            val width = right - left
+            val height = bottom - top
+            val oldWidth = oldRight - oldLeft
+            val oldHeight = oldBottom - oldTop
+            if (width > 0 && height > 0 && (width != oldWidth || height != oldHeight ||
+                    width != lastReportedViewportWidth || height != lastReportedViewportHeight)
+            ) {
+                reportViewportSize(width, height)
+            }
+        }
 
     private val pageCallback = object : ViewPager2.OnPageChangeCallback() {
         override fun onPageSelected(position: Int) {
@@ -69,6 +84,7 @@ class ViewPagerTransitionHost(
 
     init {
         pager.registerOnPageChangeCallback(pageCallback)
+        pager.addOnLayoutChangeListener(viewportLayoutListener)
         setTransition(transition)
     }
 
@@ -117,6 +133,16 @@ class ViewPagerTransitionHost(
         if (total > 0) {
             val initial = fixedPageEngine.pageIndexForLocator(engine.currentLocator.value)
             pager.setCurrentItem(initial, false)
+        }
+        // Report actual pager viewport once layout has a size (and again on size changes).
+        if (pager.width > 0 && pager.height > 0) {
+            reportViewportSize(pager.width, pager.height)
+        } else {
+            pager.post {
+                if (pagedEngine === fixedPageEngine && pager.width > 0 && pager.height > 0) {
+                    reportViewportSize(pager.width, pager.height)
+                }
+            }
         }
         pageCountJob = scope.launch {
             fixedPageEngine.pageCount.collect { pageCount ->
@@ -172,6 +198,8 @@ class ViewPagerTransitionHost(
         pageCountJob?.cancel()
         pageCountJob = null
         pagedEngine?.setPageRequestCallback(null)
+        lastReportedViewportWidth = 0
+        lastReportedViewportHeight = 0
         pager.isUserInputEnabled = true
         pager.adapter = null
         selfPagingContainer.removeAllViews()
@@ -179,6 +207,14 @@ class ViewPagerTransitionHost(
         selfPagingEngine = null
         engine = null
         scope.cancel()
+    }
+
+    private fun reportViewportSize(widthPx: Int, heightPx: Int) {
+        if (widthPx <= 0 || heightPx <= 0) return
+        if (widthPx == lastReportedViewportWidth && heightPx == lastReportedViewportHeight) return
+        lastReportedViewportWidth = widthPx
+        lastReportedViewportHeight = heightPx
+        pagedEngine?.setViewportSize(widthPx, heightPx)
     }
 
     private fun clampCurrentItemTo(pageCount: Int) {

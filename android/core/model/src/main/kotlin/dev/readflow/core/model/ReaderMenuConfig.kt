@@ -106,6 +106,62 @@ data class ReaderMenuConfig(
             return ReaderMenuConfig(version = VERSION_V1, entries = kept)
         }
 
+        /**
+         * Pure reducer: move [id] one slot toward the start of the ordered catalog.
+         * First entry is a no-op. Visibility, version, and catalog completeness are preserved.
+         */
+        fun moveCommandUp(config: ReaderMenuConfig, id: ReaderCommandId): ReaderMenuConfig {
+            val resolved = resolve(config)
+            val index = resolved.entries.indexOfFirst { it.id == id }
+            if (index <= 0) return resolved
+            return swapEntries(resolved, index, index - 1)
+        }
+
+        /**
+         * Pure reducer: move [id] one slot toward the end of the ordered catalog.
+         * Last entry is a no-op. Visibility, version, and catalog completeness are preserved.
+         */
+        fun moveCommandDown(config: ReaderMenuConfig, id: ReaderCommandId): ReaderMenuConfig {
+            val resolved = resolve(config)
+            val index = resolved.entries.indexOfFirst { it.id == id }
+            if (index < 0 || index >= resolved.entries.lastIndex) return resolved
+            return swapEntries(resolved, index, index + 1)
+        }
+
+        /**
+         * Pure reducer: set visibility for one known command without reordering.
+         * Unknown IDs are ignored after [resolve].
+         */
+        fun setCommandVisible(
+            config: ReaderMenuConfig,
+            id: ReaderCommandId,
+            visible: Boolean,
+        ): ReaderMenuConfig {
+            val resolved = resolve(config)
+            return resolve(
+                resolved.copy(
+                    entries = resolved.entries.map { entry ->
+                        if (entry.id == id) ReaderMenuEntry(id = id, visible = visible) else entry
+                    },
+                ),
+            )
+        }
+
+        /** Pure reducer: restore the versioned default order and all-visible catalog. */
+        fun restoreDefaults(): ReaderMenuConfig = v1Defaults()
+
+        private fun swapEntries(
+            config: ReaderMenuConfig,
+            from: Int,
+            to: Int,
+        ): ReaderMenuConfig {
+            val entries = config.entries.toMutableList()
+            val tmp = entries[from]
+            entries[from] = entries[to]
+            entries[to] = tmp
+            return config.copy(entries = entries)
+        }
+
         private fun ReaderMenuConfig.toDto(): ReaderMenuConfigDto = ReaderMenuConfigDto(
             version = version,
             entries = entries.map { ReaderMenuEntryDto(id = it.id.wireId, visible = it.visible) },

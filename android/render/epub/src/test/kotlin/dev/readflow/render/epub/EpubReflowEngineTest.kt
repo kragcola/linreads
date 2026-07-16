@@ -23,6 +23,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.PageFlipStyle
+import dev.readflow.core.model.ReaderTypographyRange
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.ReadingMode
@@ -83,7 +84,11 @@ class EpubReflowEngineTest {
         )
 
         assertEquals(18f, engine.privateField("fontSizeSp") as Float, 0.001f)
-        assertEquals(1.0f, engine.privateField("lineSpacingMultiplier") as Float, 0.001f)
+        assertEquals(
+            ReaderTypographyRange.DEFAULT_LINE_SPACING,
+            engine.privateField("lineSpacingMultiplier") as Float,
+            0.001f,
+        )
         assertEquals("system_serif", engine.privateField("currentFontId"))
     }
 
@@ -4249,6 +4254,219 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `font prewarm rebuild is deferred during turnInFlight and drains once after settle`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("font-prewarm-idle-gate.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to
+                    "<html><body>" +
+                    "<p>Font prewarm idle gate paragraph one.</p>" +
+                    "<p>Font prewarm idle gate paragraph two.</p>" +
+                    "<p>Font prewarm idle gate paragraph three.</p>" +
+                    "</body></html>",
+            )
+            val context = RuntimeEnvironment.getApplication() as Application
+            val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+            engine.openBook(Uri.fromFile(epub))
+            engine.setMode(ReadingMode.PAGED)
+            val host = engine.createView() as FrameLayout
+            idleMainLooper()
+            runCurrent()
+            val flowView = host.getChildAt(0) as EpubFlowView
+            val flowBefore = engine.privateField("flowCurrentFlow")
+            // Simulate interactive page mutation in flight.
+            flowView.setPrivateField(
+                "interactiveTurnState",
+                interactiveTurnStateValue("SOFTWARE"),
+            )
+            assertTrue(flowView.isPageMutationInFlight())
+
+            engine.invokePrivate("noteFontPrewarmNeedsRebuild")
+            engine.invokePrivate("noteFontPrewarmNeedsRebuild") // coalesce
+            runCurrent()
+            idleMainLooper()
+
+            assertTrue(
+                "rebuild must stay pending while turn is in flight",
+                engine.privateField("pendingFontPrewarmRebuild") as Boolean,
+            )
+            assertTrue(
+                "must not rebuild while page mutation is in flight",
+                engine.privateField("flowCurrentFlow") === flowBefore,
+            )
+
+            // Settle: clear mutation and invoke the same idle drain path as onPageSettled.
+            flowView.setPrivateField(
+                "interactiveTurnState",
+                interactiveTurnStateValue("NONE"),
+            )
+            assertFalse(flowView.isPageMutationInFlight())
+            engine.invokePrivate("tryDrainPendingFontPrewarmRebuild")
+            runCurrent()
+            idleMainLooper()
+            runCurrent()
+
+            assertFalse(
+                "pending flag must clear after a single idle drain",
+                engine.privateField("pendingFontPrewarmRebuild") as Boolean,
+            )
+            engine.close()
+        }
+
+    @Test
+    fun `font prewarm rebuild is single-flight when idle notes coalesce and follow-up is one`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("font-prewarm-single-flight.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to
+                    "<html><body>" +
+                    "<p>Single flight paragraph one.</p>" +
+                    "<p>Single flight paragraph two.</p>" +
+                    "</body></html>",
+            )
+            val context = RuntimeEnvironment.getApplication() as Application
+            val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+            engine.openBook(Uri.fromFile(epub))
+            engine.setMode(ReadingMode.PAGED)
+            engine.createView()
+            idleMainLooper()
+            runCurrent()
+
+            // Idle: two notes before the scheduler runs must schedule exactly one job.
+            engine.invokePrivate("noteFontPrewarmNeedsRebuild")
+            engine.invokePrivate("noteFontPrewarmNeedsRebuild")
+            assertTrue(
+                "first drain must set single-flight scheduled gate",
+                engine.privateField("fontPrewarmRebuildScheduled") as Boolean,
+            )
+            assertTrue(
+                "second note while scheduled must leave pending for one follow-up",
+                engine.privateField("pendingFontPrewarmRebuild") as Boolean,
+            )
+            val firstJob = engine.privateField("fontPrewarmRebuildJob") as? kotlinx.coroutines.Job
+            assertNotNull("exactly one rebuild job must be queued", firstJob)
+
+            // Another completion while still scheduled/running: same job, pending bit only.
+            engine.invokePrivate("noteFontPrewarmNeedsRebuild")
+            assertTrue(engine.privateField("fontPrewarmRebuildScheduled") as Boolean)
+            assertTrue(engine.privateField("pendingFontPrewarmRebuild") as Boolean)
+            assertTrue(
+                "must not enqueue a second concurrent rebuild job",
+                engine.privateField("fontPrewarmRebuildJob") === firstJob,
+            )
+
+            // Drain the first flight; follow-up may schedule once after it finishes.
+            runCurrent()
+            idleMainLooper()
+            runCurrent()
+            idleMainLooper()
+            runCurrent()
+
+            assertFalse(
+                "pending must clear after at most one follow-up",
+                engine.privateField("pendingFontPrewarmRebuild") as Boolean,
+            )
+            assertFalse(
+                "scheduled gate must release after flights complete",
+                engine.privateField("fontPrewarmRebuildScheduled") as Boolean,
+            )
+            assertNull(
+                "no active rebuild job after idle drain",
+                engine.privateField("fontPrewarmRebuildJob"),
+            )
+            engine.close()
+            assertFalse(engine.privateField("fontPrewarmRebuildScheduled") as Boolean)
+            assertFalse(engine.privateField("pendingFontPrewarmRebuild") as Boolean)
+        }
+
+    @Test
+    fun `font prewarm completion discards stale generation and view identity`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("font-prewarm-stale.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Stale prewarm generation test.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val host = engine.createView() as FrameLayout
+        idleMainLooper()
+        runCurrent()
+        val flowView = host.getChildAt(0) as EpubFlowView
+        flowView.setPrivateField(
+            "interactiveTurnState",
+            interactiveTurnStateValue("SOFTWARE"),
+        )
+        engine.invokePrivate("noteFontPrewarmNeedsRebuild")
+        assertTrue(engine.privateField("pendingFontPrewarmRebuild") as Boolean)
+
+        // close() bumps generation, disposes view, clears pending.
+        engine.close()
+        assertFalse(
+            "close must discard pending font-prewarm rebuild",
+            engine.privateField("pendingFontPrewarmRebuild") as Boolean,
+        )
+        assertFalse(
+            "close must clear single-flight scheduled gate",
+            engine.privateField("fontPrewarmRebuildScheduled") as Boolean,
+        )
+        assertNull(engine.privateField("fontPrewarmRebuildJob"))
+        engine.invokePrivate("tryDrainPendingFontPrewarmRebuild")
+        runCurrent()
+        assertNull("closed engine must not retain a flow view", engine.privateField("flowView"))
+    }
+
+    @Test
+    fun `flow executor shuts down on close and recreates safely on reuse`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-executor-lifecycle.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Executor lifecycle paragraph.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        engine.createView()
+        idleMainLooper()
+        runCurrent()
+
+        val firstExecutor = engine.invokePrivate("flowExecutor") as java.util.concurrent.ExecutorService
+        assertFalse(firstExecutor.isShutdown)
+
+        engine.close()
+        assertTrue(
+            "close() must shutdownNow the flow executor",
+            firstExecutor.isShutdown,
+        )
+        assertNull(
+            "executor instance must be cleared so reopen creates a new pool",
+            engine.privateField("flowExecutorInstance"),
+        )
+
+        // Reuse same engine instance: acquisition must create a live pool, not submit to terminated.
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        engine.createView()
+        idleMainLooper()
+        runCurrent()
+        val secondExecutor = engine.invokePrivate("flowExecutor") as java.util.concurrent.ExecutorService
+        assertFalse("reopened engine must get a live executor", secondExecutor.isShutdown)
+        assertTrue(
+            "reopen must not reuse the terminated pool instance",
+            secondExecutor !== firstExecutor,
+        )
+        engine.close()
+    }
+
+    @Test
     fun `paged runtime clears compose selection when switching to scroll mode`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val text = "Compose selection must not survive when the EPUB reader switches modes."
@@ -4511,6 +4729,26 @@ class EpubReflowEngineTest {
         EpubReflowEngine::class.java.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this)
+
+    private fun EpubReflowEngine.invokePrivate(name: String, vararg args: Any?): Any? {
+        val method = EpubReflowEngine::class.java.declaredMethods.first { method ->
+            method.name == name && method.parameterTypes.size == args.size
+        }
+        method.isAccessible = true
+        return method.invoke(this, *args)
+    }
+
+    private fun interactiveTurnStateValue(name: String): Any {
+        val enumClass = Class.forName(
+            "dev.readflow.render.epub.EpubFlowView\$InteractiveTurnState",
+        )
+        @Suppress("UNCHECKED_CAST")
+        return java.lang.Enum.valueOf(enumClass as Class<out Enum<*>>, name)
+    }
+
+    private fun idleMainLooper() {
+        shadowOf(Looper.getMainLooper()).idle()
+    }
 
     private fun EpubFlowView.privateField(name: String): Any? =
         EpubFlowView::class.java.getDeclaredField(name)

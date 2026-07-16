@@ -64,6 +64,7 @@ import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.ReaderTypographyRange
 import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.ui.readerPaperBackground
@@ -86,21 +87,25 @@ import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.zip.ZipFile
 
 internal enum class EpubImagePlacement {
     FullPage,
@@ -267,6 +272,11 @@ class EpubReflowEngine private constructor(
     private var fullIndexDeferred: Deferred<EpubLazyBook>? = null
     private var displayBlockCount: Int = 0
     private var epubFile: File? = null
+    /** Book-scoped embedded fonts for the open EPUB; cleared on close/reset. */
+    private var bookFontTypefaceCache: EpubBookFontTypefaceCache? = null
+    private var flowBookFontMap: EpubBookFontMap = EpubBookFontMap.EMPTY
+    private var epubFontReplacementIds: Map<String, String> = emptyMap()
+    private var epubFontReplacementTypefaces: Map<String, Typeface> = emptyMap()
     private var internalLinkTargetIndexes: Map<String, EpubTargetPosition> = emptyMap()
     private var spineCharCounts: List<Int> = emptyList()
     private var pagedSlices: List<EpubPageSlice> = emptyList()
@@ -274,7 +284,7 @@ class EpubReflowEngine private constructor(
     private val bookGeneration = AtomicLong(0L)
     private var chapterBoundaries: List<ChapterBoundary> = emptyList()
     private var fontSizeSp: Float = 18f
-    private var lineSpacingMultiplier: Float = 1.0f
+    private var lineSpacingMultiplier: Float = ReaderTypographyRange.DEFAULT_LINE_SPACING
     private var flipStyle: dev.readflow.core.model.PageFlipStyle = dev.readflow.core.model.PageFlipStyle.SLIDE
     private var useSourceHan: Boolean = false
     private var currentFontId: String = "system_serif"
@@ -289,8 +299,38 @@ class EpubReflowEngine private constructor(
     private var flowHost: android.widget.FrameLayout? = null
     private var flowSpineIndex: Int = -1
     private var flowAppliedPalette: ReaderPalette? = null
-    private val flowExecutor: ExecutorService by lazy { Executors.newFixedThreadPool(2) }
+    /** Fixed pool for boundary preview + image decode. Recreated after [close] if engine is reused. */
+    private val flowExecutorLock = Any()
+    @Volatile private var flowExecutorInstance: ExecutorService? = null
+    /**
+     * Coalesced request to rebuild the flow chapter after book-font prewarm. Set while a page
+     * mutation is in flight or while a rebuild is already scheduled/running; drained once idle.
+     * Cleared on close / generation change.
+     */
+    @Volatile private var pendingFontPrewarmRebuild = false
+    /**
+     * Single-flight gate: true while one font-prewarm rebuild coroutine is queued or executing.
+     * Additional [noteFontPrewarmNeedsRebuild] calls only set [pendingFontPrewarmRebuild].
+     */
+    @Volatile private var fontPrewarmRebuildScheduled = false
+    /** Active single-flight job; identity used so cancelled/stale flights cannot clear a newer one. */
+    @Volatile private var fontPrewarmRebuildJob: Job? = null
     private val flowMainHandler = Handler(Looper.getMainLooper())
+
+    private fun flowExecutor(): ExecutorService {
+        synchronized(flowExecutorLock) {
+            val existing = flowExecutorInstance
+            if (existing != null && !existing.isShutdown) return existing
+            return Executors.newFixedThreadPool(2).also { flowExecutorInstance = it }
+        }
+    }
+
+    private fun shutdownFlowExecutor() {
+        synchronized(flowExecutorLock) {
+            flowExecutorInstance?.shutdownNow()
+            flowExecutorInstance = null
+        }
+    }
     private val pageShotApplicationContext = context.applicationContext
     private val pageShotBudget = run {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
@@ -514,10 +554,23 @@ class EpubReflowEngine private constructor(
 
     private fun installBookRuntime(file: File) {
         epubFile = file
-        imageBoundsCache.clear()
+        bookFontTypefaceCache?.clear()
         cacheJob?.cancel()
         cacheJob = SupervisorJob()
         cacheScope = CoroutineScope(cacheJob!! + Dispatchers.IO)
+        bookFontTypefaceCache = EpubBookFontTypefaceCache(
+            cacheRoot = File(context.cacheDir, EPUB_FONT_CACHE_DIR),
+            bookCacheKey = epubFontBookCacheKey(file),
+            bytesForPath = { path ->
+                runCatching {
+                    ZipFile(file).use { zip ->
+                        readEpubZipBytes(zip, path, MAX_BOOK_FONT_ENTRY_BYTES)
+                    }
+                }.getOrNull()
+            },
+        )
+        flowBookFontMap = EpubBookFontMap.EMPTY
+        imageBoundsCache.clear()
     }
 
     private data class StartupOpenState(
@@ -840,9 +893,13 @@ class EpubReflowEngine private constructor(
         view.onBoundaryPreviewEvicted = { preview -> boundaryPreviewTargets.remove(preview.token) }
         view.onBoundaryPreviewRequestCancelled = ::cancelBoundaryPreviewRequest
         view.onPageShotForeground = ::resumePageShotsAfterForeground
-        view.onPageSettled = ::prewarmBoundaryPreviews
+        view.onPageSettled = {
+            prewarmBoundaryPreviews()
+            tryDrainPendingFontPrewarmRebuild()
+        }
         view.onChapterStable = {
             if (flowView === view && flowSpineIndex >= 0) prewarmBoundaryPreviews()
+            tryDrainPendingFontPrewarmRebuild()
         }
         flowAppliedPalette = palette
         flowView = view
@@ -955,6 +1012,137 @@ class EpubReflowEngine private constructor(
                 paras.getOrNull(block.paragraphIndex)?.spineIndex == spineIndex
             }.orEmpty()
 
+    private fun refreshFlowBookFontMap(spineIndex: Int) {
+        val fromStartup = startupSession?.startupSpine(spineIndex)?.parsed?.bookFontMap
+        val fromLazy = lazyBook?.bookFontMapForSpine(spineIndex)
+        flowBookFontMap = when {
+            fromStartup != null && fromStartup.facesByFamily.isNotEmpty() -> fromStartup
+            fromLazy != null && fromLazy.facesByFamily.isNotEmpty() -> fromLazy
+            fromStartup != null -> fromStartup
+            fromLazy != null -> fromLazy
+            else -> EpubBookFontMap.EMPTY
+        }
+    }
+
+    private fun scheduleFlowBookFontPrewarm(spineIndex: Int, activeFonts: EpubBookFontMap) {
+        val scope = cacheScope ?: return
+        val cache = bookFontTypefaceCache ?: return
+        if (activeFonts.facesByFamily.isEmpty()) return
+        val generation = bookGeneration.get()
+        val expectedView = flowView
+        scope.launch {
+            val faces = LinkedHashMap<String, EpubFontFace>()
+            fun collect(fonts: EpubBookFontMap?) {
+                fonts?.facesByFamily?.values?.forEach { face -> faces.putIfAbsent(face.srcPath, face) }
+            }
+            collect(activeFonts)
+            listOf(spineIndex - 1, spineIndex + 1).forEach { adjacentSpine ->
+                if (adjacentSpine < 0) return@forEach
+                collect(startupSession?.startupSpine(adjacentSpine)?.parsed?.bookFontMap)
+                collect(lazyBook?.bookFontMapForSpine(adjacentSpine))
+            }
+            val changed = cache.prewarm(faces.values)
+            if (!changed) return@launch
+            withContext(Dispatchers.Main) {
+                if (
+                    generation != bookGeneration.get() ||
+                    bookFontTypefaceCache !== cache ||
+                    flowSpineIndex != spineIndex ||
+                    flowView !== expectedView
+                ) {
+                    return@withContext
+                }
+                // Never rebuild mid page-turn / free fling; coalesce into one idle drain.
+                noteFontPrewarmNeedsRebuild()
+            }
+        }
+    }
+
+    /**
+     * Marks that font prewarm changed typefaces and a single chapter rebuild is needed.
+     * Coalesces repeated completions into [pendingFontPrewarmRebuild]; at most one rebuild
+     * coroutine is scheduled via [fontPrewarmRebuildScheduled].
+     */
+    private fun noteFontPrewarmNeedsRebuild() {
+        pendingFontPrewarmRebuild = true
+        tryDrainPendingFontPrewarmRebuild()
+    }
+
+    private fun clearFontPrewarmRebuildState() {
+        pendingFontPrewarmRebuild = false
+        fontPrewarmRebuildScheduled = false
+        val job = fontPrewarmRebuildJob
+        fontPrewarmRebuildJob = null
+        job?.cancel()
+    }
+
+    /**
+     * Drains at most one pending font-prewarm rebuild when the flow view has no page mutation
+     * in flight and no rebuild is already scheduled/running. Completions during flight set the
+     * pending bit only; after the current rebuild finishes, one follow-up may be scheduled.
+     * Stale generation/view identity drops the flight without leaving the gate stuck.
+     */
+    private fun tryDrainPendingFontPrewarmRebuild() {
+        if (!pendingFontPrewarmRebuild) return
+        val view = flowView
+        if (view == null) {
+            // No live view: drop pending. Do not clear the scheduled gate here — an in-flight
+            // coroutine's finally still owns that bit (or close already cleared both).
+            pendingFontPrewarmRebuild = false
+            return
+        }
+        if (view.isPageMutationInFlight()) return
+        // Single-flight: additional notes only keep the pending bit for one follow-up.
+        if (fontPrewarmRebuildScheduled) return
+        val scope = cacheScope
+        if (scope == null) {
+            pendingFontPrewarmRebuild = false
+            return
+        }
+        val generation = bookGeneration.get()
+        val spineIndex = flowSpineIndex
+        val expectedView = view
+        pendingFontPrewarmRebuild = false
+        fontPrewarmRebuildScheduled = true
+        // Launch on Main (not cacheScope's IO default) so the rebuild + single-flight gate
+        // release are serialized with UI idle drains and test StandardTestDispatcher pumps.
+        // LAZY so we can publish job identity before the body/finally can run.
+        val job = scope.launch(Dispatchers.Main, start = CoroutineStart.LAZY) {
+            // Capture before withContext(NonCancellable): that replaces Job with NonCancellable,
+            // so coroutineContext.job in finally is never the launch Job.
+            val flightJob = coroutineContext.job
+            try {
+                if (
+                    generation != bookGeneration.get() ||
+                    flowSpineIndex != spineIndex ||
+                    flowView !== expectedView
+                ) {
+                    return@launch
+                }
+                if (flowView?.isPageMutationInFlight() == true) {
+                    pendingFontPrewarmRebuild = true
+                    return@launch
+                }
+                rebuildFlowChapter()
+            } finally {
+                // NonCancellable: cancelled/stale flights must still release their own gate.
+                // Job identity: a cancelled flight must not clear a newer schedule after reopen.
+                // Main.immediate: gate + follow-up drain stay on the UI thread even if cancel
+                // delivered the finally from another dispatcher.
+                withContext(NonCancellable + Dispatchers.Main.immediate) {
+                    if (fontPrewarmRebuildJob !== flightJob) return@withContext
+                    fontPrewarmRebuildScheduled = false
+                    fontPrewarmRebuildJob = null
+                    if (pendingFontPrewarmRebuild) {
+                        tryDrainPendingFontPrewarmRebuild()
+                    }
+                }
+            }
+        }
+        fontPrewarmRebuildJob = job
+        job.start()
+    }
+
     private fun installFlowChapter(
         view: EpubFlowView,
         flow: EpubChapterFlow,
@@ -970,6 +1158,10 @@ class EpubReflowEngine private constructor(
         val initialColumnWidthPx = (view.width - view.textView.paddingLeft - view.textView.paddingRight)
             .takeIf { it > 0 }
             ?: flowColumnWidthPx()
+        refreshFlowBookFontMap(flow.spineIndex)
+        val fontCache = bookFontTypefaceCache
+        val bookFonts = flowBookFontMap
+        scheduleFlowBookFontPrewarm(flow.spineIndex, bookFonts)
         val style = EpubFlowStyle(
             fontSizeSp = fontSizeSp,
             lineSpacingMultiplier = lineSpacingMultiplier,
@@ -979,6 +1171,22 @@ class EpubReflowEngine private constructor(
             imageMaxHeightPx = view.usablePageImageHeightPx().takeIf { it > 0 } ?: flowPageHeightPx(),
             density = density,
             firstLineIndentPx = flowFirstLineIndentPx(density),
+            bookFontResolver = if (
+                epubFontReplacementIds.isEmpty() &&
+                (fontCache == null || bookFonts.facesByFamily.isEmpty())
+            ) {
+                null
+            } else {
+                { cssFamily ->
+                    resolveEpubCssTypeface(
+                        cssFontFamily = cssFamily,
+                        replacements = epubFontReplacementIds,
+                        bookFonts = bookFonts,
+                        replacementResolver = epubFontReplacementTypefaces::get,
+                        embeddedResolver = { face -> fontCache?.typefaceFor(face) },
+                    )
+                }
+            },
         )
         val theme = MarkwonTheme.create(context)
         val fullPageImageOffsets = flowFullPageImageOffsets(flow)
@@ -1001,7 +1209,7 @@ class EpubReflowEngine private constructor(
         lateinit var loader: EpubFlowImageLoader
         loader = EpubFlowImageLoader(
             epubFileProvider = { epubFile },
-            executor = flowExecutor,
+            executor = flowExecutor(),
             columnWidthPx = initialColumnWidthPx,
             columnWidthProvider = columnWidthProvider,
             pageHeightProvider = pageHeightProvider,
@@ -1123,7 +1331,7 @@ class EpubReflowEngine private constructor(
         val generation = boundaryPreviewGeneration
         val requestId = ++nextBoundaryPreviewRequestId
         boundaryPreviewJobTokens[forward] = requestId
-        boundaryPreviewJobs[forward] = flowExecutor.submit {
+        boundaryPreviewJobs[forward] = flowExecutor().submit {
             var startupSpine: EpubStartupSpine? = null
             val targetFlow = runCatching {
                 fun blocksFrom(indexedBook: EpubLazyBook): List<EpubDisplayBlock> =
@@ -2330,6 +2538,7 @@ class EpubReflowEngine private constructor(
 
     private fun resetBookStateForOpen() {
         bookGeneration.incrementAndGet()
+        clearFontPrewarmRebuildState()
         invalidateBoundaryPreviewState(clearViewSlots = false)
         flowMainHandler.removeCallbacksAndMessages(null)
         liveFlowImageLoader?.releaseAll()
@@ -2363,6 +2572,9 @@ class EpubReflowEngine private constructor(
         paras = emptyList()
         displayBlockCount = 0
         epubFile = null
+        bookFontTypefaceCache?.clear()
+        bookFontTypefaceCache = null
+        flowBookFontMap = EpubBookFontMap.EMPTY
         internalLinkTargetIndexes = emptyMap()
         spineCharCounts = emptyList()
         pagedSlices = emptyList()
@@ -2380,6 +2592,7 @@ class EpubReflowEngine private constructor(
 
     override suspend fun close() {
         bookGeneration.incrementAndGet()
+        clearFontPrewarmRebuildState()
         unregisterPageShotMemoryCallbacks()
         invalidateBoundaryPreviewState(clearViewSlots = false)
         flowMainHandler.removeCallbacksAndMessages(null)
@@ -2398,6 +2611,8 @@ class EpubReflowEngine private constructor(
         cacheJob?.cancel()
         cacheJob = null
         cacheScope = null
+        // Cancel boundary jobs already done via invalidateBoundaryPreviewState; stop the pool.
+        shutdownFlowExecutor()
         activePagedTextPages.keys.toList().forEach { composeView ->
             composeView.clearEpubComposeTextPageForBookReset()
         }
@@ -2417,6 +2632,9 @@ class EpubReflowEngine private constructor(
         paras = emptyList()
         displayBlockCount = 0
         epubFile = null
+        bookFontTypefaceCache?.clear()
+        bookFontTypefaceCache = null
+        flowBookFontMap = EpubBookFontMap.EMPTY
         internalLinkTargetIndexes = emptyMap()
         spineCharCounts = emptyList()
         pagedSlices = emptyList()
@@ -2488,6 +2706,28 @@ class EpubReflowEngine private constructor(
             activePagedCompositePages.keys.toList().forEach(::rebindActiveCompositePage)
         }
         (recyclerView?.adapter as? EpubParaAdapter)?.notifyDataSetChanged()
+    }
+
+    override suspend fun setEpubFontReplacements(replacements: Map<String, String>) {
+        val canonicalIds = replacements.mapNotNull { (family, fontId) ->
+            val key = normalizeFontFamilyKey(family) ?: return@mapNotNull null
+            if (key in GENERIC_FONT_FAMILIES) return@mapNotNull null
+            key to fontId
+        }.toMap()
+        val loaded = withContext(Dispatchers.IO) {
+            canonicalIds.values.distinct().associateWith { fontId ->
+                dev.readflow.core.ui.FontProvider.typefaceFor(context, fontId)
+            }
+        }
+        withContext(Dispatchers.Main) {
+            if (
+                canonicalIds == epubFontReplacementIds &&
+                loaded.keys == epubFontReplacementTypefaces.keys
+            ) return@withContext
+            epubFontReplacementIds = canonicalIds
+            epubFontReplacementTypefaces = loaded
+            if (flowEngineEnabled && flowView != null) rebuildFlowChapter()
+        }
     }
 
     override suspend fun setTheme(mode: ThemeMode) {
@@ -3248,6 +3488,9 @@ class EpubReflowEngine private constructor(
         const val INLINE_IMAGE_VERTICAL_PADDING_DP = 24
         const val BOUNDARY_PREVIEW_TIMEOUT_MS = 10_000L
         const val DEFAULT_MEMORY_CLASS_MIB = 256
+        /** Cap for embedded @font-face bytes loaded from the open EPUB zip. */
+        const val MAX_BOOK_FONT_ENTRY_BYTES = 8 * 1024 * 1024
+        const val EPUB_FONT_CACHE_DIR = "epub-fonts"
         const val STARTUP_SPINE_START_TOLERANCE = 0.08f
         // Intrinsic-pixel gate for full-page placement. Light-novel illustrations/彩插/covers run
         // ~800px+ on the long side; inline avatars (~142px) and icons (~300-400px) sit well below.

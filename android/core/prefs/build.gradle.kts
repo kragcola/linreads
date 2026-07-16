@@ -16,6 +16,7 @@ dependencies {
     implementation(project(":core:model"))
     implementation(libs.datastore.preferences)
     implementation(libs.coroutines.core)
+    implementation(libs.kotlinx.serialization.json)
 
     testImplementation(libs.junit5)
     testImplementation(libs.coroutines.test)

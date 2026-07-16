@@ -26,6 +26,7 @@ internal class EpubLazyBook(
     val blockCount: Int,
     private val paragraphBlockIndexes: List<Int>,
     private val layoutBlocks: List<EpubDisplayBlock>,
+    private val bookFontMapsBySpine: Map<Int, EpubBookFontMap>,
     maxCachedSpines: Int,
 ) {
     private val cacheLimit = maxCachedSpines.coerceAtLeast(1)
@@ -101,10 +102,15 @@ internal class EpubLazyBook(
                 globalParagraphIndex < ref.firstParagraphIndex + ref.paragraphCount
         }
 
+    @Synchronized
+    fun bookFontMapForSpine(spineIndex: Int): EpubBookFontMap =
+        bookFontMapsBySpine[spineIndex] ?: EpubBookFontMap.EMPTY
+
     private fun loadSpine(ref: EpubSpineRef): EpubSpineContent {
         cache[ref.spineIndex]?.let { return it }
         loadCounts[ref.spineIndex] = loadCount(ref.spineIndex) + 1
-        val items = readSpineItems(ref)
+        val content = readSpineContent(ref)
+        val items = content.items
         val paras = epubParasFromReaderItems(items).map { para ->
             para.copy(
                 documentCharStart = ref.documentCharStart + para.documentCharStart,
@@ -112,15 +118,19 @@ internal class EpubLazyBook(
             )
         }
         val blocks = epubDisplayBlocks(items).map { it.withParagraphOffset(ref.firstParagraphIndex) }
-        return EpubSpineContent(paras = paras, blocks = blocks)
-            .also { cache[ref.spineIndex] = it }
+        return EpubSpineContent(
+            paras = paras,
+            blocks = blocks,
+            bookFontMap = content.bookFontMap,
+        ).also { cache[ref.spineIndex] = it }
     }
 
-    private fun readSpineItems(ref: EpubSpineRef): List<EpubReaderItem> =
+    private fun readSpineContent(ref: EpubSpineRef): EpubParsedHtmlContent =
         ZipFile(file).use { zip ->
-            val html = readEpubZipText(zip, ref.path, EPUB_MAX_SPINE_ENTRY_BYTES) ?: return emptyList()
-            epubParserGuard(emptyList()) {
-                parseReaderItemsFromHtml(
+            val html = readEpubZipText(zip, ref.path, EPUB_MAX_SPINE_ENTRY_BYTES)
+                ?: return EpubParsedHtmlContent(emptyList())
+            epubParserGuard(EpubParsedHtmlContent(emptyList())) {
+                parseReaderItemsContent(
                     spineIndex = ref.spineIndex,
                     html = html,
                     resourceBaseDir = epubParentDir(ref.path),
@@ -142,6 +152,7 @@ internal class EpubLazyBook(
     private data class EpubSpineContent(
         val paras: List<EpubPara>,
         val blocks: List<EpubDisplayBlock>,
+        val bookFontMap: EpubBookFontMap = EpubBookFontMap.EMPTY,
     )
 
     companion object {
@@ -159,6 +170,7 @@ internal class EpubLazyBook(
                 blockCount = 0,
                 paragraphBlockIndexes = emptyList(),
                 layoutBlocks = emptyList(),
+                bookFontMapsBySpine = emptyMap(),
                 maxCachedSpines = maxCachedSpines,
             )
     }
