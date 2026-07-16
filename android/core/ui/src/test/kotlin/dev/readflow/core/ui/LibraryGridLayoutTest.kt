@@ -9,20 +9,35 @@ class LibraryGridLayoutTest {
 
     @Test
     fun `library grid restores phone tablet and expanded proportions`() {
+        // Moon+ fixed 8dp horizontal gap yields denser columns than 20/24/28.
         assertEquals(2, libraryGridColumns(360f))
-        assertEquals(5, libraryGridColumns(800f))
-        assertEquals(7, libraryGridColumns(1_280f))
+        assertEquals(6, libraryGridColumns(800f))
+        assertEquals(8, libraryGridColumns(1_280f))
     }
 
     @Test
     fun `grid keeps covers near the accepted multi-device scale`() {
-        assertEquals(150f, libraryGridLayout(360f).coverWidthDp, 0.001f)
-        assertEquals(132.8f, libraryGridLayout(800f).coverWidthDp, 0.001f)
-        assertEquals(130.2857f, libraryGridLayout(1_280f).coverWidthDp, 0.001f)
+        // usable = min(width, 1120) - 2*20; cover = (usable - 8*(cols-1)) / cols
+        assertEquals(156f, libraryGridLayout(360f).coverWidthDp, 0.001f)
+        assertEquals(120f, libraryGridLayout(800f).coverWidthDp, 0.001f)
+        assertEquals(128f, libraryGridLayout(1_280f).coverWidthDp, 0.001f)
 
-        assertEquals(20f, libraryGridLayout(360f).gapDp, 0.001f)
-        assertEquals(24f, libraryGridLayout(800f).gapDp, 0.001f)
-        assertEquals(28f, libraryGridLayout(1_280f).gapDp, 0.001f)
+        // Moon+ MyCardViewGrid L/R 4dp each → 8dp inter-cover; top 8 + bottom 2 → 10dp row gap.
+        assertEquals(8f, libraryGridLayout(360f).horizontalGapDp, 0.001f)
+        assertEquals(8f, libraryGridLayout(800f).horizontalGapDp, 0.001f)
+        assertEquals(8f, libraryGridLayout(1_280f).horizontalGapDp, 0.001f)
+        assertEquals(10f, libraryGridLayout(360f).verticalGapDp, 0.001f)
+        assertEquals(10f, libraryGridLayout(800f).verticalGapDp, 0.001f)
+        assertEquals(10f, libraryGridLayout(1_280f).verticalGapDp, 0.001f)
+    }
+
+    @Test
+    fun `shelf tokens pin Moon plus fixed gaps and retained cover aspect`() {
+        assertEquals(8f, Dimens.gridGapHorizontal.value, 0.001f)
+        assertEquals(10f, Dimens.gridGapVertical.value, 0.001f)
+        assertEquals(0.7f, Dimens.coverAspectRatio)
+        assertEquals(20f, Dimens.screenEdge.value, 0.001f)
+        assertEquals(48f, Dimens.touchTarget.value, 0.001f)
     }
 
     @Test

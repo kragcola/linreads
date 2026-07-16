@@ -32,10 +32,12 @@ object Dimens {
     /** 封面宽高比固定 70:100（Moon+），即 0.7f。 */
     const val coverAspectRatio = 0.7f
 
-    // 网格间距随断点放松，手机保持紧凑，平板避免封面过度放大。
-    val gridGapCompact = 20.dp
-    val gridGapMedium = 24.dp
-    val gridGapExpanded = 28.dp
+    /**
+     * Moon+ shelf grid: MyCardViewGrid L/R 4dp each → 8dp inter-cover;
+     * top 8dp + bottom 2dp → 10dp row gap. Fixed at all breakpoints.
+     */
+    val gridGapHorizontal = 8.dp
+    val gridGapVertical = 10.dp
 
     /** Expanded 下书架内容区限宽居中（§3.2）。 */
     val maxContentWidth = 1120.dp

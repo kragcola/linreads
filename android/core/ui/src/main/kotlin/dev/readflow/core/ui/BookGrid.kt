@@ -82,32 +82,27 @@ private val BookMeta.isOfflineReadable: Boolean
     get() = localUri != null &&
         (!id.startsWith("calibre-") || downloadStatus == DownloadStatus.DOWNLOADED)
 
-private const val LibraryExpandedGapMinWidthDp = 1_020f
-
-private fun libraryGridGapDp(widthDp: Float): Float = when {
-    widthDp < 600f -> Dimens.gridGapCompact.value
-    widthDp < LibraryExpandedGapMinWidthDp -> Dimens.gridGapMedium.value
-    else -> Dimens.gridGapExpanded.value
-}
-
 internal data class LibraryGridLayout(
     val effectiveWidthDp: Float,
-    val gapDp: Float,
+    val horizontalGapDp: Float,
+    val verticalGapDp: Float,
     val columns: Int,
     val coverWidthDp: Float,
 )
 
 internal fun libraryGridLayout(widthDp: Float): LibraryGridLayout {
     val effectiveWidth = widthDp.coerceAtMost(Dimens.maxContentWidth.value)
-    val gap = libraryGridGapDp(effectiveWidth)
+    val horizontalGap = Dimens.gridGapHorizontal.value
+    val verticalGap = Dimens.gridGapVertical.value
     val usableWidth = (effectiveWidth - Dimens.screenEdge.value * 2f).coerceAtLeast(0f)
-    val columns = floor((usableWidth + gap) / (Dimens.coverMinWidth.value + gap))
+    val columns = floor((usableWidth + horizontalGap) / (Dimens.coverMinWidth.value + horizontalGap))
         .toInt()
         .coerceAtLeast(1)
-    val coverWidth = (usableWidth - gap * (columns - 1)) / columns
+    val coverWidth = (usableWidth - horizontalGap * (columns - 1)) / columns
     return LibraryGridLayout(
         effectiveWidthDp = effectiveWidth,
-        gapDp = gap,
+        horizontalGapDp = horizontalGap,
+        verticalGapDp = verticalGap,
         columns = columns,
         coverWidthDp = coverWidth.coerceAtLeast(0f),
     )
@@ -385,8 +380,8 @@ fun BookGrid(
                 end = Dimens.screenEdge,
                 bottom = Dimens.spaceXl,
             ),
-            horizontalArrangement = Arrangement.spacedBy(gridLayout.gapDp.dp),
-            verticalArrangement = Arrangement.spacedBy(Dimens.spaceXl),
+            horizontalArrangement = Arrangement.spacedBy(gridLayout.horizontalGapDp.dp),
+            verticalArrangement = Arrangement.spacedBy(gridLayout.verticalGapDp.dp),
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .widthIn(max = Dimens.maxContentWidth)
