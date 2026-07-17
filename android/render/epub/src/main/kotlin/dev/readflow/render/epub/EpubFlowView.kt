@@ -11,6 +11,7 @@ import android.graphics.ColorFilter
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.text.Layout
 import android.text.Spanned
@@ -25,6 +26,7 @@ import android.widget.FrameLayout
 import android.widget.ScrollView
 import dev.readflow.render.api.SelectionAwareTextView
 import dev.readflow.render.api.R as RenderApiR
+import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableSpan
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -215,6 +217,8 @@ internal class EpubFlowView(
     /** First page turn requested before the initial layout exists; replayed once pagination is ready. */
     private var pendingInitialPageTurnDelta: Int? = null
     private val pageShotConfig = Bitmap.Config.ARGB_8888
+    private val pageBoundaryBitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val pageBoundaryDestination = Rect()
 
     /** Layout height we last paginated against; a change means the content reflowed (async image load). */
     private var paginatedLayoutHeight: Int = -1
@@ -262,6 +266,14 @@ internal class EpubFlowView(
     private var downX = 0f
     private var downY = 0f
     private var lastY = 0f
+    /**
+     * Crossing MOVE is applied in [onInterceptTouchEvent] because ViewGroup does not always replay
+     * that event to [onTouchEvent]. When the *same* coordinates are still delivered after intercept,
+     * skip that one re-apply so progress stays monotonic and page shots allocate once. A later MOVE
+     * with different coordinates must still advance the gesture (cold handoff resume).
+     */
+    private var suppressClassifiedMoveX = Float.NaN
+    private var suppressClassifiedMoveY = Float.NaN
     private var inSelectionMode = false
     private var classified = false
     private var freeScrolling = false
@@ -1169,7 +1181,9 @@ internal class EpubFlowView(
         drawLiveViewportBackground(canvas)
         super.draw(canvas)
         settledWindowAtTop(scrollY)?.takeIf { mode == Mode.PAGED && pageClipActive }
-            ?.let { drawPageBoundaryImagePreview(canvas, scrollY, it, canvasViewportTopPx = 0) }
+            // A parent draws this scrolled View with a -scrollY canvas transform. Keep the preview
+            // in content coordinates so it lands in the visible viewport after that transform.
+            ?.let { drawPageBoundaryImagePreview(canvas, scrollY, it, canvasViewportTopPx = scrollY) }
     }
 
     override fun onScrollChanged(l: Int, t: Int, oldl: Int, oldt: Int) {
@@ -1271,13 +1285,14 @@ internal class EpubFlowView(
             return
         }
         val save = canvas.save()
-        // Canvas is in the ScrollView's own coords here (already translated by scrollY for children),
-        // so the viewport spans [scrollY, scrollY + height]. Clip the top past the previous line's ink
-        // overflow (drop the half-line bleed) and the bottom to this page's last complete line.
+        // pageClip* helpers return content-space Y (layout coords: page top = line top, +padTop for
+        // painted ink). Android's parent draw path and snapshotViewport both pre-translate the canvas
+        // by -scrollY before dispatchDraw, so clipRect must stay in content coordinates. Subtracting
+        // scrollY here would apply the scroll twice and truncate/blank later pages.
         //
         // The paginator works in pure StaticLayout coords (line 0 at y=0), but the child TextView paints
         // its layout shifted DOWN by its own [TextView.paddingTop] — a line at layout-y L lands at
-        // canvas-y L + padTop. [pageClipBottomInViewport] returns the bottom in layout space, so without
+        // content-y L + padTop. [pageClipBottomInViewport] returns the bottom in layout space, so without
         // the offset the clip falls padTop px too high and slices ~padTop off the last line's painted
         // glyphs (审计: 底部半截文字). Add padTop so the clip meets the line's PAINTED bottom; cap at the
         // viewport bottom (a near-full page then relies on the viewport edge, off by ≤padTop, invisible).
@@ -3107,13 +3122,22 @@ internal class EpubFlowView(
             layout.getLineTop(preview.imageLine)
         // Crop only when the full image line is taller than the leftover band (indivisible image).
         if (imageLineHeight <= previewBottomInViewport - previewTopInViewport) return
-        val drawable = imageDrawableAt(preview.imageLayoutStart) ?: return
-        val oldBounds = Rect(drawable.bounds)
-        val sourceWidth = oldBounds.width().takeIf { it > 0 }
-            ?: drawable.intrinsicWidth.takeIf { it > 0 }
+        // Markwon AsyncDrawable.draw() only forwards to result.draw and never copies shell setBounds
+        // onto the nested result. Resolve host + nested result; paint decoded BitmapDrawable pixels
+        // via canvas.drawBitmap at the crop destination (bounds-only draw leaves leftover blank:
+        // shell setBounds does not move result, and LEGACY Robolectric paints BitmapDrawable at 0,0).
+        val host = imageDrawableHostAt(preview.imageLayoutStart) ?: return
+        val result = (host as? AsyncDrawable)?.result
+        val paintTarget = result ?: host
+        val sourceWidth = paintTarget.bounds.width().takeIf { it > 0 }
+            ?: paintTarget.intrinsicWidth.takeIf { it > 0 }
+            ?: host.bounds.width().takeIf { it > 0 }
+            ?: host.intrinsicWidth.takeIf { it > 0 }
             ?: return
-        val sourceHeight = oldBounds.height().takeIf { it > 0 }
-            ?: drawable.intrinsicHeight.takeIf { it > 0 }
+        val sourceHeight = paintTarget.bounds.height().takeIf { it > 0 }
+            ?: paintTarget.intrinsicHeight.takeIf { it > 0 }
+            ?: host.bounds.height().takeIf { it > 0 }
+            ?: host.intrinsicHeight.takeIf { it > 0 }
             ?: return
         val availableWidth = (width - textView.paddingLeft - textView.paddingRight).coerceAtLeast(1)
         val scale = minOf(1f, availableWidth.toFloat() / sourceWidth)
@@ -3122,25 +3146,64 @@ internal class EpubFlowView(
         val left = textView.paddingLeft + (availableWidth - targetWidth) / 2
         val previewTop = canvasViewportTopPx + previewTopInViewport
         val previewBottom = canvasViewportTopPx + previewBottomInViewport
+        pageBoundaryDestination.set(left, previewTop, left + targetWidth, previewTop + targetHeight)
 
         val save = canvas.save()
         try {
             canvas.clipRect(left, previewTop, left + targetWidth, previewBottom)
-            drawable.setBounds(left, previewTop, left + targetWidth, previewTop + targetHeight)
-            drawable.draw(canvas)
+            paintCropImageInto(canvas, paintTarget, host, result, pageBoundaryDestination)
         } finally {
-            drawable.bounds = oldBounds
             canvas.restoreToCount(save)
         }
     }
 
-    private fun imageDrawableAt(layoutOffset: Int): Drawable? {
+    /**
+     * Paints [paintTarget] into [dst] for the page-boundary crop. Bitmap pixels are blitted at
+     * [dst] explicitly; other drawables use temporary bounds + [Drawable.draw].
+     */
+    private fun paintCropImageInto(
+        canvas: Canvas,
+        paintTarget: Drawable,
+        host: Drawable,
+        result: Drawable?,
+        dst: Rect,
+    ) {
+        val bitmap = (paintTarget as? BitmapDrawable)
+            ?.bitmap
+            ?.takeUnless { it.isRecycled }
+        if (bitmap != null) {
+            // Scale directly on Canvas. Creating a resized bitmap here would add a full image
+            // allocation to page preview/snapshot rendering and reintroduce turn-time jank.
+            canvas.drawBitmap(bitmap, null, dst, pageBoundaryBitmapPaint)
+            return
+        }
+        val oldHostBounds = Rect(host.bounds)
+        val oldResultBounds = result?.let { Rect(it.bounds) }
+        try {
+            paintTarget.bounds = dst
+            if (result != null) host.bounds = dst
+            paintTarget.draw(canvas)
+        } finally {
+            if (result != null) {
+                result.bounds = oldResultBounds ?: oldHostBounds
+                host.bounds = oldHostBounds
+            } else {
+                host.bounds = oldHostBounds
+            }
+        }
+    }
+
+    /**
+     * Span host drawable at [layoutOffset]: AsyncDrawable shell (result may be nested) or ImageSpan.
+     * Crop painting must prefer [AsyncDrawable.result] when present.
+     */
+    private fun imageDrawableHostAt(layoutOffset: Int): Drawable? {
         val text = textView.text as? Spanned ?: return null
         val end = (layoutOffset + 1).coerceAtMost(text.length)
         text.getSpans(layoutOffset, end, AsyncDrawableSpan::class.java)
             .firstOrNull()
             ?.drawable
-            ?.let { return it.result ?: it }
+            ?.let { return it }
         return text.getSpans(layoutOffset, end, ImageSpan::class.java)
             .firstOrNull()
             ?.drawable
@@ -4527,6 +4590,7 @@ internal class EpubFlowView(
                 flipped = false
                 inSelectionMode = false
                 stealing = false
+                clearSuppressClassifiedMoveRedelivery()
             }
             MotionEvent.ACTION_MOVE -> {
                 if (inSelectionMode) return false
@@ -4555,7 +4619,10 @@ internal class EpubFlowView(
                     stealing = true // own the rest of this gesture
                     // ViewGroup cancels the former child on this crossing MOVE but does not replay the
                     // same event to our onTouchEvent, so apply its full DOWN-to-MOVE displacement here.
+                    // If the same MOVE is still delivered to onTouchEvent, suppress that redelivery only.
                     applyClassifiedMove(ev)
+                    suppressClassifiedMoveX = ev.x
+                    suppressClassifiedMoveY = ev.y
                     return true
                 }
             }
@@ -4578,6 +4645,7 @@ internal class EpubFlowView(
                 centerDeadGesture = false
                 flipped = false
                 inSelectionMode = false
+                clearSuppressClassifiedMoveRedelivery()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
@@ -4603,10 +4671,13 @@ internal class EpubFlowView(
                         invalidate()
                     }
                 }
-                if (classified) applyClassifiedMove(ev)
+                if (classified && !shouldSuppressClassifiedMoveRedelivery(ev)) {
+                    applyClassifiedMove(ev)
+                }
                 return true
             }
             MotionEvent.ACTION_UP -> {
+                clearSuppressClassifiedMoveRedelivery()
                 if (!classified && !inSelectionMode && tryStartReleasedMicroTurn(ev)) {
                     recycleTracker()
                     return true
@@ -4629,6 +4700,7 @@ internal class EpubFlowView(
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
+                clearSuppressClassifiedMoveRedelivery()
                 if (interactiveCurl) {
                     cancelInteractiveCurl()
                 } else if (localShotsWaiting) {
@@ -4648,6 +4720,23 @@ internal class EpubFlowView(
             }
         }
         return true
+    }
+
+    private fun clearSuppressClassifiedMoveRedelivery() {
+        suppressClassifiedMoveX = Float.NaN
+        suppressClassifiedMoveY = Float.NaN
+    }
+
+    /**
+     * Returns true when [ev] is a redelivery of the intercept-applied threshold MOVE (same x/y).
+     * Consumes the suppress token either way so a later distinct MOVE is never dropped.
+     */
+    private fun shouldSuppressClassifiedMoveRedelivery(ev: MotionEvent): Boolean {
+        if (suppressClassifiedMoveX.isNaN() || suppressClassifiedMoveY.isNaN()) return false
+        val sameRedelivery =
+            ev.x == suppressClassifiedMoveX && ev.y == suppressClassifiedMoveY
+        clearSuppressClassifiedMoveRedelivery()
+        return sameRedelivery
     }
 
     private fun cancelWaitingBoundaryTurn(invalidateRequest: Boolean = true) {

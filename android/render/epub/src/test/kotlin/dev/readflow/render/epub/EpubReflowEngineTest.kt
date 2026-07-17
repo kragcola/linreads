@@ -56,6 +56,7 @@ import org.junit.rules.TemporaryFolder
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import java.io.File
@@ -65,6 +66,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlin.math.abs
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -2531,6 +2533,228 @@ class EpubReflowEngineTest {
         if (!staleAfterClose.bitmap.isRecycled) staleAfterClose.bitmap.recycle()
     }
 
+    /**
+     * Production ZIP path: heading/body leftover band receives decoded AsyncDrawable plate pixels,
+     * the next page owns the full image from its top, and single-occurrence identity is stable.
+     * Both assertions draw through the parent (the real -scrollY canvas path) and snapshotPageAt.
+     */
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `heading plus full-page zip image paints residual crop after decode on production path`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val plateColor = 0xFFE11D48.toInt()
+        val viewportWidth = 360
+        val viewportHeight = 320
+        val epub = tempDir.newFile("heading-fullpage-crop.epub")
+        writeHeadingFullPageImageEpub(epub, plateColor)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        // Instant reveal so child TextView paint is not held at alpha=0 after decode settle.
+        flowView.animateChapterReveal = false
+        activity.addContentView(host, ViewGroup.LayoutParams(viewportWidth, viewportHeight))
+        host.measure(exactly(viewportWidth), exactly(viewportHeight))
+        host.layout(0, 0, viewportWidth, viewportHeight)
+        awaitCondition("layout ready") {
+            flowView.width == viewportWidth &&
+                flowView.height == viewportHeight &&
+                flowView.textView.layout != null
+        }
+
+        val text = flowView.textView.text as Spanned
+        val asyncSpans = text.getSpans(0, text.length, AsyncDrawableSpan::class.java)
+        assertEquals("exactly one plate image span on production path", 1, asyncSpans.size)
+
+        awaitCondition("plate decode must settle") {
+            val hostDrawable = asyncSpans[0].drawable
+            val result = hostDrawable.result
+            result != null &&
+                result.intrinsicWidth > 0 &&
+                result.intrinsicHeight > 0 &&
+                flowView.pendingDecodesProvider?.invoke() != true
+        }
+        // Force stable reveal so production child paint is visible to parent and snapshot paths.
+        flowView.tryRevealWhenStable()
+        shadowOf(Looper.getMainLooper()).idle()
+        awaitCondition("chapter must reveal after decode settle") {
+            val container = flowView.privateField("container") as android.view.View
+            container.alpha >= 0.99f && flowView.pendingDecodesProvider?.invoke() != true
+        }
+
+        val layout = requireNotNull(flowView.textView.layout)
+        val flow = flowView.privateField("flow") as EpubChapterFlow
+        val imageSeg = flow.segments.single { it.isImage }
+        val headingSeg = flow.segments.single {
+            val block = it.block
+            block is EpubDisplayBlock.Text && block.headingLevel != null
+        }
+        assertEquals("exactly one image segment", 1, flow.segments.count { it.isImage })
+        assertEquals(1, flow.text.count { it == EPUB_FLOW_IMAGE_CHAR })
+
+        val imageLine = layout.getLineForOffset(imageSeg.layoutStart)
+        val imageLineTop = layout.getLineTop(imageLine)
+        val imageLineHeight = layout.getLineBottom(imageLine) - imageLineTop
+        @Suppress("UNCHECKED_CAST")
+        val pages = flowView.privateField("paged") as List<EpubFlowPage>
+        val headingPageIndex = pages.indexOfLast { page ->
+            headingSeg.layoutStart >= page.startOffset && headingSeg.layoutStart < page.endOffset
+        }.takeIf { it >= 0 } ?: pages.indexOfLast { page ->
+            page.endOffset > headingSeg.layoutStart && page.endOffset <= imageSeg.layoutStart
+        }
+        assertTrue("heading page before image required", headingPageIndex >= 0)
+        val headingPage = pages[headingPageIndex]
+        assertTrue(
+            "fixture must exercise a scrolled heading page",
+            headingPage.topPx > 0,
+        )
+        val lastLine = (headingPage.endLineExclusive - 1).coerceAtLeast(headingPage.startLine)
+        val padTop = flowView.textView.paddingTop
+        val padBottom = flowView.textView.paddingBottom
+        val precedingBottomPainted = layout.getLineBottom(lastLine) + padTop - headingPage.topPx
+        val leftoverPainted = (viewportHeight - padBottom) - precedingBottomPainted.coerceIn(0, viewportHeight)
+        assertTrue(
+            "fixture needs a visible leftover band shorter than the image; " +
+                "leftover=$leftoverPainted imageH=$imageLineHeight",
+            leftoverPainted in 8 until viewportHeight && imageLineHeight > leftoverPainted,
+        )
+
+        val imagePageIndex = pages.indexOfFirst { page ->
+            imageSeg.layoutStart >= page.startOffset && imageSeg.layoutStart < page.endOffset
+        }
+        assertTrue("image must own a later page", imagePageIndex > headingPageIndex)
+        assertEquals(
+            "next image page must start at the image line top (full image ownership from top)",
+            imageLineTop,
+            pages[imagePageIndex].topPx,
+        )
+
+        flowView.goToPage(headingPageIndex)
+        shadowOf(Looper.getMainLooper()).idle()
+        val sampleTop = (precedingBottomPainted + 2).coerceIn(padTop + 2, viewportHeight - 2)
+        val sampleLeft = viewportWidth / 4
+        val sampleRight = (viewportWidth * 3) / 4
+        val sampleBottom = viewportHeight - 2
+        val headingShot = Bitmap.createBitmap(viewportWidth, viewportHeight, Bitmap.Config.ARGB_8888).also {
+            // Draw through the real parent path: View.draw(parent) applies the ScrollView's
+            // -scrollY transform before EpubFlowView.dispatchDraw.
+            host.draw(Canvas(it))
+        }
+        val headingSnap = requireNotNull(flowView.snapshotPageAt(headingPage.topPx))
+        try {
+            val liveHits = countColorHits(
+                headingShot,
+                left = sampleLeft,
+                top = sampleTop,
+                right = sampleRight,
+                bottom = sampleBottom,
+                color = plateColor,
+            )
+            val snapHits = countColorHits(
+                headingSnap,
+                left = sampleLeft,
+                top = sampleTop,
+                right = sampleRight,
+                bottom = sampleBottom,
+                color = plateColor,
+            )
+            assertTrue(
+                "live parent draw and page snapshot must paint the decoded residual crop; " +
+                    "liveHits=$liveHits snapHits=$snapHits scrollY=${flowView.scrollY}",
+                liveHits > 0 && snapHits > 0,
+            )
+        } finally {
+            headingShot.recycle()
+            headingSnap.recycle()
+        }
+
+        flowView.goToPage(imagePageIndex)
+        shadowOf(Looper.getMainLooper()).idle()
+        flowView.tryRevealWhenStable()
+        shadowOf(Looper.getMainLooper()).idle()
+        val imagePageShot = Bitmap.createBitmap(viewportWidth, viewportHeight, Bitmap.Config.ARGB_8888).also {
+            host.draw(Canvas(it))
+        }
+        val imagePageSnap = requireNotNull(flowView.snapshotPageAt(pages[imagePageIndex].topPx))
+        try {
+            // Image line top is layout-y = page.topPx; TextView paints at layout-y + padTop, and
+            // pageClipTop strips [0, padTop) as the previous-page bleed margin. Sample the content
+            // top (padTop..), not canvas y=0..padTop which is intentionally paper.
+            val contentTop = padTop.coerceAtLeast(0)
+            val topBandBottom = (contentTop + 24).coerceAtMost(viewportHeight)
+            val topBandHits = countColorHits(
+                imagePageShot,
+                left = sampleLeft,
+                top = contentTop + 2,
+                right = sampleRight,
+                bottom = topBandBottom,
+                color = plateColor,
+            )
+            val snapTopHits = countColorHits(
+                imagePageSnap,
+                left = sampleLeft,
+                top = contentTop + 2,
+                right = sampleRight,
+                bottom = topBandBottom,
+                color = plateColor,
+            )
+            val fullPageHits = countColorHits(
+                imagePageShot,
+                left = sampleLeft,
+                top = contentTop,
+                right = sampleRight,
+                bottom = viewportHeight,
+                color = plateColor,
+            )
+            val snapFullHits = countColorHits(
+                imagePageSnap,
+                left = sampleLeft,
+                top = contentTop,
+                right = sampleRight,
+                bottom = viewportHeight,
+                color = plateColor,
+            )
+            val bottomBandTop = (viewportHeight - padBottom - 24).coerceAtLeast(contentTop)
+            val bottomBandBottom = (viewportHeight - padBottom).coerceAtLeast(bottomBandTop + 1)
+            val bottomBandHits = countColorHits(
+                imagePageShot,
+                left = sampleLeft,
+                top = bottomBandTop,
+                right = sampleRight,
+                bottom = bottomBandBottom,
+                color = plateColor,
+            )
+            val snapBottomHits = countColorHits(
+                imagePageSnap,
+                left = sampleLeft,
+                top = bottomBandTop,
+                right = sampleRight,
+                bottom = bottomBandBottom,
+                color = plateColor,
+            )
+            assertTrue(
+                "live parent draw and page snapshot must own the full image from the page top; " +
+                    "top=$topBandHits/$snapTopHits bottom=$bottomBandHits/$snapBottomHits " +
+                    "full=$fullPageHits/$snapFullHits " +
+                    "scrollY=${flowView.scrollY}",
+                topBandHits > 0 && snapTopHits > 0 &&
+                    bottomBandHits > 0 && snapBottomHits > 0 &&
+                    fullPageHits > 0 && snapFullHits > 0,
+            )
+            // Single occurrence remains stable after decode + reveal + navigation.
+            assertEquals(1, (flowView.privateField("flow") as EpubChapterFlow).segments.count { it.isImage })
+            assertEquals(1, (flowView.privateField("flow") as EpubChapterFlow).text.count { it == EPUB_FLOW_IMAGE_CHAR })
+            assertEquals(1, text.getSpans(0, text.length, AsyncDrawableSpan::class.java).size)
+        } finally {
+            imagePageShot.recycle()
+            imagePageSnap.recycle()
+        }
+        engine.close()
+    }
+
     @Test
     fun `hidden boundary preview waits through safety timeout until image decode becomes stable`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
@@ -4967,6 +5191,118 @@ class EpubReflowEngineTest {
             add("OEBPS/shared.png", png(600, 300, 0xFF336699.toInt()))
             add("OEBPS/plate.png", png(1120, 1600, 0xFF663399.toInt()))
         }
+    }
+
+    /**
+     * Real ZIP EPUB: short body + H2 + tall plate so heading page leaves a leftover crop band and
+     * the next page starts at the image line top. [plateColor] is solid ARGB for pixel sampling.
+     */
+    private fun writeHeadingFullPageImageEpub(file: File, plateColor: Int) {
+        val bodyParas = (1..8).joinToString("") { i ->
+            "<p>填充段落 $i：把标题推到页中下，图版不可整页并入，余量可裁。</p>"
+        }
+        val imageBytes = ByteArrayOutputStream().use { output ->
+            // Taller than a 320px viewport after fit-to-width so the image is indivisible.
+            Bitmap.createBitmap(360, 520, Bitmap.Config.ARGB_8888).let { bitmap ->
+                try {
+                    bitmap.eraseColor(plateColor)
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                    output.toByteArray()
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+        }
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+
+            fun addText(path: String, content: String) = add(path, content.toByteArray(Charsets.UTF_8))
+
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="c0" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="plate" href="plate.png" media-type="image/png"/>
+                      </manifest>
+                      <spine><itemref idref="c0"/></spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        $bodyParas
+                        <h2>图版标题</h2>
+                        <p><img src="plate.png" alt="plate"/></p>
+                        <p>图版之后的正文。</p>
+                      </body>
+                    </html>
+                """.trimIndent(),
+            )
+            add("OEBPS/plate.png", imageBytes)
+        }
+    }
+
+    private fun countColorHits(
+        bitmap: Bitmap,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int,
+        color: Int,
+        tolerance: Int = 12,
+    ): Int {
+        val l = left.coerceIn(0, bitmap.width - 1)
+        val t = top.coerceIn(0, bitmap.height - 1)
+        val r = right.coerceIn(l + 1, bitmap.width)
+        val b = bottom.coerceIn(t + 1, bitmap.height)
+        val stepX = ((r - l) / 8).coerceAtLeast(1)
+        val stepY = ((b - t) / 8).coerceAtLeast(1)
+        val targetA = (color ushr 24) and 0xFF
+        val targetR = (color ushr 16) and 0xFF
+        val targetG = (color ushr 8) and 0xFF
+        val targetB = color and 0xFF
+        var hits = 0
+        var y = t
+        while (y < b) {
+            var x = l
+            while (x < r) {
+                val pixel = bitmap.getPixel(x, y)
+                val a = (pixel ushr 24) and 0xFF
+                val pr = (pixel ushr 16) and 0xFF
+                val pg = (pixel ushr 8) and 0xFF
+                val pb = pixel and 0xFF
+                if (a >= 0xC0 &&
+                    abs(pr - targetR) <= tolerance &&
+                    abs(pg - targetG) <= tolerance &&
+                    abs(pb - targetB) <= tolerance &&
+                    abs(a - targetA) <= tolerance
+                ) {
+                    hits++
+                }
+                x += stepX
+            }
+            y += stepY
+        }
+        return hits
     }
 
     private fun writeBoundaryImageEpub(file: File) {

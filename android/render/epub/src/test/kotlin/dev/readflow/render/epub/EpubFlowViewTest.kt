@@ -1476,6 +1476,88 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `intercepted threshold MOVE is not applied twice when the same event reaches onTouchEvent`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val downX = view.width * 0.90f
+        val firstMoveX = view.width * 0.70f
+        val secondMoveX = view.width * 0.45f
+        val y = view.height * 0.50f
+        val downTime = SystemClock.uptimeMillis()
+        val firstMove = motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, firstMoveX, y)
+        val secondMove = motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_MOVE, secondMoveX, y)
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        assertTrue(
+            "threshold-crossing MOVE must be stolen in onInterceptTouchEvent",
+            view.onInterceptTouchEvent(firstMove),
+        )
+        val slideAfterIntercept = checkNotNull(
+            view.privateField("slideDrawable") as PageSlideDrawable?,
+        ) { "intercept apply must start interactive slide once" }
+        val frontAfterIntercept = slideAfterIntercept.privateBitmap("frontBitmap")
+        val revealedAfterIntercept = slideAfterIntercept.privateBitmap("revealedBitmap")
+        val progressAfterIntercept = slideAfterIntercept.progress
+        val expectedFirst = (downX - firstMoveX) / view.width.toFloat()
+        assertEquals(
+            "first intercepted MOVE progress must use full DOWN displacement once",
+            expectedFirst,
+            progressAfterIntercept,
+            0.001f,
+        )
+
+        // Same MOVE may still be delivered to onTouchEvent after intercept returns true.
+        assertTrue(view.onTouchEvent(firstMove))
+        val slideAfterDuplicate = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+        assertEquals(
+            "duplicate onTouch MOVE must not re-apply the same threshold event",
+            progressAfterIntercept,
+            slideAfterDuplicate.progress,
+            0.0001f,
+        )
+        assertTrue(
+            "page shots must not reallocate when the intercepted MOVE is redelivered",
+            slideAfterDuplicate.privateBitmap("frontBitmap") === frontAfterIntercept,
+        )
+        assertTrue(
+            "revealed page shot must stay the same owner across the suppressed redelivery",
+            slideAfterDuplicate.privateBitmap("revealedBitmap") === revealedAfterIntercept,
+        )
+
+        assertTrue(view.onTouchEvent(secondMove))
+        val slideAfterSecond = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+        val expectedSecond = (downX - secondMoveX) / view.width.toFloat()
+        assertEquals(
+            "later MOVE must still advance progress monotonically after suppress is consumed",
+            expectedSecond,
+            slideAfterSecond.progress,
+            0.001f,
+        )
+        assertTrue(
+            "gesture progress must be monotonic after the first apply",
+            slideAfterSecond.progress > progressAfterIntercept + 0.01f,
+        )
+        assertTrue(
+            "subsequent MOVE must not reallocate page shots once the turn is live",
+            slideAfterSecond.privateBitmap("frontBitmap") === frontAfterIntercept &&
+                slideAfterSecond.privateBitmap("revealedBitmap") === revealedAfterIntercept,
+        )
+
+        view.onTouchEvent(motionEvent(downTime, downTime + 72L, MotionEvent.ACTION_CANCEL, secondMoveX, y))
+        // CANCEL starts a non-commit settle; drain the retreat animator so the overlay clears.
+        shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+        assertNull(
+            "CANCEL must still tear down the interactive turn after settle",
+            view.privateField("slideDrawable"),
+        )
+        assertEquals(
+            "CANCEL settle must leave interactive turn state NONE",
+            "NONE",
+            view.privateField("interactiveTurnState").toString(),
+        )
+    }
+
+    @Test
     fun `warmed interactive turn takes cached page shots without recapturing them on first move`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
