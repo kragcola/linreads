@@ -198,4 +198,51 @@ class ReaderCommandRegistryTest {
         assertTrue(ReaderMenuConfig.resolve(config).entries.first { it.id == ReaderCommandId.SEARCH }.visible)
         assertFalse(ReaderMenuConfig.resolve(config).entries.first { it.id == ReaderCommandId.TOC }.visible)
     }
+
+    @Test
+    fun `panel command visibility follows resolved menu config without feature filtering`() {
+        val config = ReaderMenuConfig(
+            version = 1,
+            entries = listOf(
+                ReaderMenuEntry(ReaderCommandId.TOC, visible = true),
+                ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false),
+                ReaderMenuEntry(ReaderCommandId.BOOKMARKS, visible = true),
+                ReaderMenuEntry(ReaderCommandId.ANNOTATIONS, visible = false),
+                ReaderMenuEntry(ReaderCommandId.FONT, visible = true),
+                ReaderMenuEntry(ReaderCommandId.THEME, visible = false),
+            ),
+        )
+        assertTrue(ReaderCommandCatalog.isPanelCommandVisible(config, ReaderPanel.TOC))
+        assertFalse(ReaderCommandCatalog.isPanelCommandVisible(config, ReaderPanel.SEARCH))
+        assertTrue(ReaderCommandCatalog.isPanelCommandVisible(config, ReaderPanel.BOOKMARKS))
+        assertFalse(ReaderCommandCatalog.isPanelCommandVisible(config, ReaderPanel.ANNOTATIONS))
+        assertTrue(ReaderCommandCatalog.isPanelCommandVisible(config, ReaderPanel.FONT))
+        assertFalse(ReaderCommandCatalog.isPanelCommandVisible(config, ReaderPanel.THEME))
+    }
+
+    @Test
+    fun `all-hidden menu config keeps every panel command not visible`() {
+        val config = ReaderMenuConfig(
+            version = 1,
+            entries = ReaderCommandId.entries.map { ReaderMenuEntry(it, visible = false) },
+        )
+        ReaderPanel.entries.forEach { panel ->
+            assertFalse(
+                ReaderCommandCatalog.isPanelCommandVisible(config, panel),
+                "all-hidden config must keep $panel not visible",
+            )
+        }
+    }
+
+    @Test
+    fun `panel command visibility resolves incomplete config before reading visibility`() {
+        // Missing catalog IDs are filled from defaults (visible=true) by resolve.
+        val partial = ReaderMenuConfig(
+            version = 1,
+            entries = listOf(ReaderMenuEntry(ReaderCommandId.SEARCH, visible = false)),
+        )
+        assertFalse(ReaderCommandCatalog.isPanelCommandVisible(partial, ReaderPanel.SEARCH))
+        assertTrue(ReaderCommandCatalog.isPanelCommandVisible(partial, ReaderPanel.TOC))
+        assertTrue(ReaderCommandCatalog.isPanelCommandVisible(partial, ReaderPanel.FONT))
+    }
 }

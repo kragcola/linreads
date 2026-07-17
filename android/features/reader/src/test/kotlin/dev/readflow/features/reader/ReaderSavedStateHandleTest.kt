@@ -697,6 +697,111 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `menu config emission clears activePanel only when that panel command is hidden`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.SEARCH))
+        advanceUntilIdle()
+        assertEquals(ReaderPanel.SEARCH, viewModel.uiState.value.activePanel)
+        assertTrue(viewModel.uiState.value.isUiVisible)
+        val chromeVisible = viewModel.uiState.value.isUiVisible
+
+        val hideSearch = ReaderMenuConfig.resolve(
+            ReaderMenuConfig.setCommandVisible(
+                ReaderMenuConfig.v1Defaults(),
+                ReaderCommandId.SEARCH,
+                visible = false,
+            ),
+        )
+        settings.readerMenuConfig.value = hideSearch
+        advanceUntilIdle()
+
+        assertEquals(hideSearch, viewModel.uiState.value.menuConfig)
+        assertNull(viewModel.uiState.value.activePanel)
+        assertEquals(
+            "hiding the active panel command must not toggle chrome visibility",
+            chromeVisible,
+            viewModel.uiState.value.isUiVisible,
+        )
+    }
+
+    @Test
+    fun `menu config emission preserves activePanel when a different command is hidden`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.TOC))
+        advanceUntilIdle()
+        assertEquals(ReaderPanel.TOC, viewModel.uiState.value.activePanel)
+        val chromeVisible = viewModel.uiState.value.isUiVisible
+
+        val hideSearch = ReaderMenuConfig.resolve(
+            ReaderMenuConfig.setCommandVisible(
+                ReaderMenuConfig.v1Defaults(),
+                ReaderCommandId.SEARCH,
+                visible = false,
+            ),
+        )
+        settings.readerMenuConfig.value = hideSearch
+        advanceUntilIdle()
+
+        assertEquals(hideSearch, viewModel.uiState.value.menuConfig)
+        assertEquals(ReaderPanel.TOC, viewModel.uiState.value.activePanel)
+        assertEquals(chromeVisible, viewModel.uiState.value.isUiVisible)
+    }
+
+    @Test
+    fun `all-hidden menu config remains valid and clears any active panel`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val engine = FakeReaderEngine(Locator(LocatorStrategy.Page(index = 0, total = 10)))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        viewModel.onIntent(ReaderIntent.FontPanel)
+        advanceUntilIdle()
+        assertEquals(ReaderPanel.FONT, viewModel.uiState.value.activePanel)
+        val chromeVisible = viewModel.uiState.value.isUiVisible
+
+        val allHidden = ReaderMenuConfig.resolve(
+            ReaderMenuConfig(
+                entries = ReaderCommandId.entries.map { ReaderMenuEntry(it, visible = false) },
+            ),
+        )
+        settings.readerMenuConfig.value = allHidden
+        advanceUntilIdle()
+
+        assertEquals(allHidden, viewModel.uiState.value.menuConfig)
+        assertNull(viewModel.uiState.value.activePanel)
+        assertEquals(chromeVisible, viewModel.uiState.value.isUiVisible)
+        assertTrue(
+            ReaderCommandCatalog.visibleSpecs(allHidden, ReaderFeature.entries.toSet()).isEmpty(),
+        )
+    }
+
+    @Test
     fun `ordinary close failures are contained and the engine is not closed twice`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
 

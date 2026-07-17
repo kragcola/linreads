@@ -35,6 +35,17 @@ object ReaderCommandCatalog {
     fun spec(id: ReaderCommandId): ReaderCommandSpec? = byId[id]
 
     /**
+     * Whether the catalog command that owns [panel] is visible in [config].
+     * Uses [ReaderMenuConfig.resolve] only — no capability/feature filtering.
+     * All-hidden configs are valid and return false for every panel.
+     */
+    fun isPanelCommandVisible(config: ReaderMenuConfig, panel: ReaderPanel): Boolean {
+        val spec = specs.firstOrNull { it.panel == panel } ?: return false
+        val resolved = ReaderMenuConfig.resolve(config)
+        return resolved.entries.any { it.id == spec.id && it.visible }
+    }
+
+    /**
      * Intersect persisted menu config with the caller/test [features] filter.
      * Hidden entries and entries whose feature is disabled are excluded;
      * remaining entries keep the resolved config order.

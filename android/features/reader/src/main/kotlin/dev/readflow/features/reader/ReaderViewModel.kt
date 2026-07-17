@@ -136,9 +136,19 @@ class ReaderViewModel(
             }
         }
         // Menu config is owned by ViewModel, not Compose — collect resolved prefs Flow.
+        // When the active panel's command becomes hidden, clear activePanel in the same
+        // atomic update; isUiVisible is left unchanged.
         viewModelScope.launch {
             settings.readerMenuConfig.collect { config ->
-                _uiState.update { it.copy(menuConfig = config) }
+                _uiState.update { state ->
+                    val active = state.activePanel
+                    val clearActive = active != null &&
+                        !ReaderCommandCatalog.isPanelCommandVisible(config, active)
+                    state.copy(
+                        menuConfig = config,
+                        activePanel = if (clearActive) null else active,
+                    )
+                }
             }
         }
     }
