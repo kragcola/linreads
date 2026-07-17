@@ -255,7 +255,7 @@ class EpubReflowEngine private constructor(
     private val _pageCount = MutableStateFlow(0)
     override val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
 
-    private val _chapterInfo = MutableStateFlow(ChapterInfo(0, 1, "", 0f))
+    private val _chapterInfo = MutableStateFlow(EMPTY_CHAPTER_INFO)
     override val chapterInfo: StateFlow<ChapterInfo> = _chapterInfo.asStateFlow()
 
     private val _tableOfContents = MutableStateFlow<List<TocEntry>>(emptyList())
@@ -2094,6 +2094,11 @@ class EpubReflowEngine private constructor(
     }
 
     private fun updateChapterInfo(paraIndex: Int) {
+        // Empty EPUB must not invent a fake CHAPTER 1/1 from an empty boundary.
+        if (paras.isEmpty()) {
+            _chapterInfo.value = EMPTY_CHAPTER_INFO
+            return
+        }
         startupSession?.let { session ->
             val para = paras.getOrNull(paraIndex) ?: return
             val base = session.globalBase(para.spineIndex) ?: return
@@ -2582,7 +2587,7 @@ class EpubReflowEngine private constructor(
         textAnnotations = emptyList()
         _currentTextSelection.value = null
         _currentLocator.value = Locator(LocatorStrategy.Unknown)
-        _chapterInfo.value = ChapterInfo(0, 1, "", 0f)
+        _chapterInfo.value = EMPTY_CHAPTER_INFO
         _tableOfContents.value = emptyList()
         _pageCount.value = 0
     }
@@ -2642,7 +2647,7 @@ class EpubReflowEngine private constructor(
         _currentTextSelection.value = null
         textAnnotations = emptyList()
         _currentLocator.value = Locator(LocatorStrategy.Unknown)
-        _chapterInfo.value = ChapterInfo(0, 1, "", 0f)
+        _chapterInfo.value = EMPTY_CHAPTER_INFO
         _tableOfContents.value = emptyList()
         _pageCount.value = 0
     }
@@ -3496,6 +3501,15 @@ class EpubReflowEngine private constructor(
         // ~800px+ on the long side; inline avatars (~142px) and icons (~300-400px) sit well below.
         const val FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX = 600
         const val AVERAGE_PAGE_CHARACTER_SAMPLE = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz一二三四五六七八九十"
+
+        /** Idle / empty EPUB chapter chrome: no fake 1/1 CHAPTER. */
+        val EMPTY_CHAPTER_INFO = ChapterInfo(
+            currentIndex = 0,
+            totalChapters = 0,
+            currentTitle = "正文",
+            progressInChapter = 0f,
+            kind = ChapterInfo.Kind.DOCUMENT,
+        )
 
         private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==

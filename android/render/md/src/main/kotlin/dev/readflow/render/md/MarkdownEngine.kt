@@ -16,10 +16,13 @@ import android.widget.FrameLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
+import dev.readflow.core.model.adjacentTocEntry
+import dev.readflow.core.model.chapterInfoFromOrderedToc
 import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.render.api.PagedReaderEngine
@@ -75,6 +78,15 @@ class MarkdownEngine(private val context: Context) :
         Locator(strategy = LocatorStrategy.ByteOffset(0L, 0), progression = 0f, totalProgression = 0f),
     )
     override val currentLocator: StateFlow<Locator> = _currentLocator.asStateFlow()
+
+    private val _chapterInfo = MutableStateFlow(
+        chapterInfoFromOrderedToc(
+            tocEntries = emptyList(),
+            totalProgression = 0f,
+            documentTitleFallback = DOCUMENT_TITLE_FALLBACK,
+        ),
+    )
+    override val chapterInfo: StateFlow<ChapterInfo> = _chapterInfo.asStateFlow()
 
     private val _pageCount = MutableStateFlow(1)
     override val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
@@ -149,7 +161,7 @@ class MarkdownEngine(private val context: Context) :
             document.clearMappingCache()
             recomputeCachedHighlightRanges()
             _tableOfContents.value = parsed.tableOfContents
-            _currentLocator.value = initial
+            publishLocator(initial)
             if (_pagingKind.value == PagingKind.PAGED) {
                 rebuildPageWindows(requestPageForAnchor = false)
             } else {
@@ -157,6 +169,16 @@ class MarkdownEngine(private val context: Context) :
             }
         }
         initial
+    }
+
+    /** Publish locator and keep chapter chrome in sync with TOC + progression. */
+    private fun publishLocator(locator: Locator) {
+        _currentLocator.value = locator
+        _chapterInfo.value = chapterInfoFromOrderedToc(
+            tocEntries = _tableOfContents.value,
+            totalProgression = locator.totalProgression,
+            documentTitleFallback = DOCUMENT_TITLE_FALLBACK,
+        )
     }
 
     override fun createView(): View {
@@ -189,9 +211,11 @@ class MarkdownEngine(private val context: Context) :
             )
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
                 if (suppressLocatorUpdates) return@setOnScrollChangeListener
-                _currentLocator.value = document.locatorForRenderedOffset(
-                    renderedOffset = tv.characterOffsetForScrollY(scrollY),
-                    renderedText = tv.text,
+                publishLocator(
+                    document.locatorForRenderedOffset(
+                        renderedOffset = tv.characterOffsetForScrollY(scrollY),
+                        renderedText = tv.text,
+                    ),
                 )
             }
         }
@@ -267,7 +291,7 @@ class MarkdownEngine(private val context: Context) :
         if (_pagingKind.value != PagingKind.PAGED) return
         // Preserve source Section anchor across rotation / real size change.
         val anchor = normalizeToSourceSection(_currentLocator.value)
-        _currentLocator.value = anchor
+        publishLocator(anchor)
         rebuildPageWindows(requestPageForAnchor = true)
         refreshActivePageContents()
     }
@@ -298,7 +322,7 @@ class MarkdownEngine(private val context: Context) :
     private suspend fun goToScroll(locator: Locator) {
         val offset = document.offsetFor(locator)
         val target = document.locatorForOffset(offset)
-        _currentLocator.value = target
+        publishLocator(target)
         if (scrollView == null || textView == null) return
         scheduleScrollRestore(target)
     }
@@ -314,9 +338,22 @@ class MarkdownEngine(private val context: Context) :
             }
             else -> document.locatorForOffset(document.offsetFor(locator))
         }
-        _currentLocator.value = sourceLocator
+        publishLocator(sourceLocator)
         val pageIndex = pageIndexForLocator(sourceLocator)
         pageRequestCallback?.invoke(pageIndex)
+    }
+
+    override suspend fun goToAdjacentChapter(delta: Int) {
+        val toc = _tableOfContents.value
+        if (toc.isEmpty()) return
+        val current = chapterInfoFromOrderedToc(
+            tocEntries = toc,
+            totalProgression = _currentLocator.value.totalProgression,
+            documentTitleFallback = DOCUMENT_TITLE_FALLBACK,
+        )
+        if (current.kind != ChapterInfo.Kind.CHAPTER) return
+        val target = adjacentTocEntry(toc, current.currentIndex, delta) ?: return
+        goTo(target.locator)
     }
 
     /**
@@ -452,7 +489,7 @@ class MarkdownEngine(private val context: Context) :
         } finally {
             suppressLocatorUpdates = false
         }
-        _currentLocator.value = document.locatorForOffset(document.offsetFor(locator))
+        publishLocator(document.locatorForOffset(document.offsetFor(locator)))
         // Success when we needed no scroll, or scroll moved (or content fits).
         return y == 0 || sv.scrollY > 0 || maxScroll == 0
     }
@@ -493,9 +530,11 @@ class MarkdownEngine(private val context: Context) :
         } finally {
             suppressLocatorUpdates = false
         }
-        _currentLocator.value = document.locatorForRenderedOffset(
-            renderedOffset = selectionAwareTextView.characterOffsetForScrollY(sv.scrollY),
-            renderedText = selectionAwareTextView.text,
+        publishLocator(
+            document.locatorForRenderedOffset(
+                renderedOffset = selectionAwareTextView.characterOffsetForScrollY(sv.scrollY),
+                renderedText = selectionAwareTextView.text,
+            ),
         )
     }
 
@@ -570,9 +609,11 @@ class MarkdownEngine(private val context: Context) :
             } finally {
                 suppressLocatorUpdates = false
             }
-            _currentLocator.value = document.locatorForRenderedOffset(
-                renderedOffset = activeTextView.characterOffsetForScrollY(restoreScrollY),
-                renderedText = activeTextView.text,
+            publishLocator(
+                document.locatorForRenderedOffset(
+                    renderedOffset = activeTextView.characterOffsetForScrollY(restoreScrollY),
+                    renderedText = activeTextView.text,
+                ),
             )
         }
     }
@@ -608,6 +649,9 @@ class MarkdownEngine(private val context: Context) :
         _tableOfContents.value = emptyList()
         _pageCount.value = 1
         _pagingKind.value = PagingKind.CONTINUOUS
+        publishLocator(
+            Locator(strategy = LocatorStrategy.ByteOffset(0L, 0), progression = 0f, totalProgression = 0f),
+        )
     }
 
     override suspend fun setFontSize(sp: Float) {
@@ -669,7 +713,7 @@ class MarkdownEngine(private val context: Context) :
                 }
                 PagingKind.PAGED -> normalizeToSourceSection(_currentLocator.value)
             }
-            _currentLocator.value = anchor
+            publishLocator(anchor)
             _pagingKind.value = targetKind
             if (targetKind == PagingKind.PAGED) {
                 rebuildPageWindows(requestPageForAnchor = true)
@@ -809,6 +853,7 @@ class MarkdownEngine(private val context: Context) :
     private companion object {
         /** Density-aware padding shared by measured StaticLayout and displayed TextViews. */
         const val TEXT_PADDING_DP: Float = 16f
+        private const val DOCUMENT_TITLE_FALLBACK = "正文"
 
         private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {
             val systemNight = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==

@@ -20,6 +20,7 @@ import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.style.TextDecoration
+import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.PageFlipStyle
@@ -4471,9 +4472,10 @@ class EpubReflowEngineTest {
         assertEquals(0, engine.pageCount.value)
         assertEquals(LocatorStrategy.Unknown, engine.currentLocator.value.strategy)
         assertEquals(0, engine.chapterInfo.value.currentIndex)
-        assertEquals(1, engine.chapterInfo.value.totalChapters)
-        assertEquals("", engine.chapterInfo.value.currentTitle)
+        assertEquals(0, engine.chapterInfo.value.totalChapters)
+        assertEquals("正文", engine.chapterInfo.value.currentTitle)
         assertEquals(0f, engine.chapterInfo.value.progressInChapter)
+        assertEquals(ChapterInfo.Kind.DOCUMENT, engine.chapterInfo.value.kind)
         assertTrue(engine.tableOfContents.value.isEmpty())
     }
 

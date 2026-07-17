@@ -31,6 +31,21 @@ class MarkdownDocumentTest {
     }
 
     @Test
+    fun `nonblank markdown without headings yields empty toc`() {
+        val markdown = "Plain paragraph without any ATX heading.\n\nSecond block still body."
+        val document = MarkdownDocument.parse(markdown)
+
+        assertTrue(document.tableOfContents.isEmpty())
+        assertTrue(document.lineCount >= 1)
+    }
+
+    @Test
+    fun `blank markdown yields empty toc`() {
+        assertTrue(MarkdownDocument.parse("").tableOfContents.isEmpty())
+        assertTrue(MarkdownDocument.parse("   \n\n  ").tableOfContents.isEmpty())
+    }
+
+    @Test
     fun `maps visible character offset to section locator`() {
         val markdown = "# Title\nIntro line\n\n## Deep\nBody"
         val document = MarkdownDocument.parse(markdown)

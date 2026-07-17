@@ -7,6 +7,7 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.render.api.PagingKind
@@ -303,5 +304,233 @@ class TxtVirtualPagerEngineTest {
                 "start=${textView.selectionStart} end=${textView.selectionEnd}",
             textView.selectionStart == textView.selectionEnd,
         )
+    }
+
+    @Test
+    fun `headingless open publishes empty toc and document chapterInfo`() = runTest {
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-headingless-", suffix = ".txt").toFile()
+        file.writeText(
+            """
+            Plain paragraph one with no chapter markers.
+            Plain paragraph two continues the body.
+            Plain paragraph three is still body text.
+            """.trimIndent(),
+            charset = StandardCharsets.UTF_8,
+        )
+        val engine = TxtVirtualPagerEngine(context)
+
+        engine.openBook(Uri.fromFile(file))
+
+        assertTrue(engine.tableOfContents.value.isEmpty())
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.DOCUMENT, info.kind)
+        assertEquals(0, info.currentIndex)
+        assertEquals(0, info.totalChapters)
+        assertEquals("正文", info.currentTitle)
+        assertEquals(0f, info.progressInChapter)
+    }
+
+    @Test
+    fun `real headings publish chapter kind with truthful count and title`() = runTest {
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-headings-", suffix = ".txt").toFile()
+        file.writeText(
+            """
+            第1章 开篇
+
+            Body of chapter one.
+
+            第2章 中途
+
+            Body of chapter two.
+
+            第3章 收束
+
+            Body of chapter three.
+            """.trimIndent(),
+            charset = StandardCharsets.UTF_8,
+        )
+        val engine = TxtVirtualPagerEngine(context)
+
+        engine.openBook(Uri.fromFile(file))
+
+        val toc = engine.tableOfContents.value
+        assertEquals(3, toc.size)
+        assertEquals("第1章 开篇", toc[0].title)
+        assertEquals("第2章 中途", toc[1].title)
+        assertEquals("第3章 收束", toc[2].title)
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.CHAPTER, info.kind)
+        assertEquals(0, info.currentIndex)
+        assertEquals(3, info.totalChapters)
+        assertEquals("第1章 开篇", info.currentTitle)
+    }
+
+    @Test
+    fun `goTo updates chapterInfo for real heading toc`() = runTest {
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-goto-chapter-", suffix = ".txt").toFile()
+        file.writeText(
+            """
+            第1章 开篇
+
+            Body of chapter one with enough lines to keep progression distinct.
+
+            第2章 中途
+
+            Body of chapter two sits after the second heading.
+
+            第3章 收束
+
+            Body of chapter three is last.
+            """.trimIndent(),
+            charset = StandardCharsets.UTF_8,
+        )
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val toc = engine.tableOfContents.value
+        assertEquals(3, toc.size)
+
+        engine.goTo(toc[1].locator)
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.CHAPTER, info.kind)
+        assertEquals(1, info.currentIndex)
+        assertEquals(3, info.totalChapters)
+        assertEquals("第2章 中途", info.currentTitle)
+    }
+
+    @Test
+    fun `adjacent chapter navigation uses real headings and respects boundaries`() = runTest {
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-adjacent-", suffix = ".txt").toFile()
+        file.writeText(
+            """
+            第1章 开篇
+
+            Body one.
+
+            第2章 中途
+
+            Body two.
+
+            第3章 收束
+
+            Body three.
+            """.trimIndent(),
+            charset = StandardCharsets.UTF_8,
+        )
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+
+        // At first chapter: previous is no-op.
+        engine.goToAdjacentChapter(-1)
+        assertEquals(0, engine.chapterInfo.value.currentIndex)
+        assertEquals("第1章 开篇", engine.chapterInfo.value.currentTitle)
+
+        engine.goToAdjacentChapter(+1)
+        assertEquals(1, engine.chapterInfo.value.currentIndex)
+        assertEquals("第2章 中途", engine.chapterInfo.value.currentTitle)
+
+        engine.goToAdjacentChapter(+1)
+        assertEquals(2, engine.chapterInfo.value.currentIndex)
+        assertEquals("第3章 收束", engine.chapterInfo.value.currentTitle)
+
+        // At last chapter: next is no-op.
+        engine.goToAdjacentChapter(+1)
+        assertEquals(2, engine.chapterInfo.value.currentIndex)
+        assertEquals("第3章 收束", engine.chapterInfo.value.currentTitle)
+    }
+
+    @Test
+    fun `headingless adjacent chapter navigation is a no-op document state`() = runTest {
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-adj-doc-", suffix = ".txt").toFile()
+        file.writeText("Only body text without chapter headings.\nSecond paragraph.", StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+
+        engine.goToAdjacentChapter(+1)
+        engine.goToAdjacentChapter(-1)
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.DOCUMENT, info.kind)
+        assertEquals(0, info.totalChapters)
+        assertEquals("正文", info.currentTitle)
+        assertTrue(engine.tableOfContents.value.isEmpty())
+    }
+
+    @Test
+    fun `setMode keeps chapterInfo in sync with updated locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-mode-chapter-", suffix = ".txt").toFile()
+        file.writeText(
+            """
+            第1章 开篇
+
+            Body of chapter one.
+
+            第2章 中途
+
+            Body of chapter two after the second heading marker.
+
+            第3章 收束
+
+            Body of chapter three.
+            """.trimIndent(),
+            charset = StandardCharsets.UTF_8,
+        )
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val chapter2 = engine.tableOfContents.value[1]
+        engine.goTo(chapter2.locator)
+        assertEquals("第2章 中途", engine.chapterInfo.value.currentTitle)
+
+        engine.setMode(ReadingMode.PAGED)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.CHAPTER, info.kind)
+        assertEquals(1, info.currentIndex)
+        assertEquals(3, info.totalChapters)
+        assertEquals("第2章 中途", info.currentTitle)
+        assertEquals(PagingKind.PAGED, engine.pagingKind.value)
+    }
+
+    @Test
+    fun `encoding reopen refreshes chapterInfo without inventing fake toc`() = runTest {
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-reopen-", suffix = ".txt").toFile()
+        file.writeText(
+            """
+            第1章 开篇
+
+            Body one.
+
+            第2章 中途
+
+            Body two.
+            """.trimIndent(),
+            charset = StandardCharsets.UTF_8,
+        )
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        engine.goTo(engine.tableOfContents.value[1].locator)
+        assertEquals(1, engine.chapterInfo.value.currentIndex)
+
+        engine.setTxtEncodingOverride("UTF-8")
+
+        val toc = engine.tableOfContents.value
+        assertEquals(2, toc.size)
+        assertTrue(toc.none { it.title == "正文" && toc.size == 1 })
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.CHAPTER, info.kind)
+        assertEquals(2, info.totalChapters)
+        // Restored progression should land back on chapter 2 when offsets remain stable.
+        assertEquals(1, info.currentIndex)
+        assertEquals("第2章 中途", info.currentTitle)
     }
 }

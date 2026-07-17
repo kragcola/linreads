@@ -22,6 +22,21 @@ fun PagingKind.toReadingMode(): ReadingMode = when (this) {
     PagingKind.CONTINUOUS -> ReadingMode.SCROLL
 }
 
+/** Stable default for engines that do not publish chapter chrome state. */
+private val DefaultReaderChapterInfo = ChapterInfo(
+    currentIndex = 0,
+    totalChapters = 0,
+    currentTitle = "正文",
+    progressInChapter = 0f,
+    kind = ChapterInfo.Kind.DOCUMENT,
+)
+
+private val DefaultReaderChapterInfoFlow: StateFlow<ChapterInfo> =
+    MutableStateFlow(DefaultReaderChapterInfo).asStateFlow()
+
+private val DefaultReaderTableOfContentsFlow: StateFlow<List<TocEntry>> =
+    MutableStateFlow(emptyList<TocEntry>()).asStateFlow()
+
 /**
  * THREADING CONTRACT (v4 §5.1, P0-C):
  *   - All methods are CALLED on Dispatchers.Main; engines assume the main thread on entry.
@@ -62,16 +77,14 @@ interface ReaderEngine {
 
     /** Chapter info for the bottom chrome progress bar. Emits on each position change. */
     val chapterInfo: StateFlow<ChapterInfo>
-        get() = kotlinx.coroutines.flow.MutableStateFlow(
-            ChapterInfo(0, 1, "", 0f)
-        ).asStateFlow()
+        get() = DefaultReaderChapterInfoFlow
 
     /** Jump to next (+1) or previous (-1) chapter. No-op if at boundary. */
     suspend fun goToAdjacentChapter(delta: Int) {}
 
     /** Navigable document outline for the reader TOC panel. */
     val tableOfContents: StateFlow<List<TocEntry>>
-        get() = MutableStateFlow(emptyList<TocEntry>()).asStateFlow()
+        get() = DefaultReaderTableOfContentsFlow
 
     /** Jump to a table-of-contents entry. Default delegates to [goTo]. */
     suspend fun goToTocEntry(entry: TocEntry) = goTo(entry.locator)

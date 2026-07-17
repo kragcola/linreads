@@ -519,9 +519,8 @@ internal class MarkdownDocument private constructor(
                     }
                 }
             }
-            return entries.ifEmpty {
-                listOf(TocEntry("正文", Locator(LocatorStrategy.Section(0, 0, 0), totalProgression = 0f)))
-            }
+            // Empty when no real ATX headings — never invent a fake "正文" TOC entry.
+            return entries
         }
     }
 }

@@ -16,8 +16,11 @@ import android.widget.TextView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.adjacentTocEntry
+import dev.readflow.core.model.chapterInfoFromOrderedToc
 import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.ThemeMode
@@ -65,6 +68,15 @@ class TxtVirtualPagerEngine(
         Locator(strategy = LocatorStrategy.ByteOffset(0L, 0), progression = 0f, totalProgression = 0f),
     )
     override val currentLocator: StateFlow<Locator> = _currentLocator.asStateFlow()
+
+    private val _chapterInfo = MutableStateFlow(
+        chapterInfoFromOrderedToc(
+            tocEntries = emptyList(),
+            totalProgression = 0f,
+            documentTitleFallback = DOCUMENT_TITLE_FALLBACK,
+        ),
+    )
+    override val chapterInfo: StateFlow<ChapterInfo> = _chapterInfo.asStateFlow()
 
     private val _pageCount = MutableStateFlow(0)
     override val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
@@ -127,7 +139,7 @@ class TxtVirtualPagerEngine(
         pagedParagraphStarts = emptyList()
         _pageCount.value = document.paragraphCount
         _tableOfContents.value = buildToc(document)
-        _currentLocator.value = locatorForIndex(0, document.paragraphCount)
+        publishLocator(locatorForIndex(0, document.paragraphCount))
         _currentLocator.value
     }
 
@@ -281,7 +293,7 @@ class TxtVirtualPagerEngine(
 
     private fun buildToc(document: TxtDocument): List<TocEntry> {
         if (document.paragraphCount == 0) return emptyList()
-        val entries = (0 until document.paragraphCount).mapNotNull { index ->
+        return (0 until document.paragraphCount).mapNotNull { index ->
             val paragraph = document.readParagraph(index)
             val heading = paragraph.lineSequence().firstOrNull()?.trim().orEmpty()
             if (!isTxtHeading(heading)) return@mapNotNull null
@@ -290,17 +302,20 @@ class TxtVirtualPagerEngine(
                 locator = locatorForIndex(index, document.paragraphCount),
             )
         }
-        return entries.ifEmpty {
-            listOf(
-                TocEntry(
-                    title = "正文",
-                    locator = Locator(
-                        strategy = LocatorStrategy.Section(0, 0, 0),
-                        totalProgression = 0f,
-                    ),
-                )
-            )
-        }
+    }
+
+    /** Publish locator and keep chapter chrome in sync with TOC + progression. */
+    private fun publishLocator(locator: Locator) {
+        _currentLocator.value = locator
+        publishChapterInfo(locator)
+    }
+
+    private fun publishChapterInfo(locator: Locator = _currentLocator.value) {
+        _chapterInfo.value = chapterInfoFromOrderedToc(
+            tocEntries = _tableOfContents.value,
+            totalProgression = locator.totalProgression,
+            documentTitleFallback = DOCUMENT_TITLE_FALLBACK,
+        )
     }
 
     private fun reportProgression(rv: RecyclerView) {
@@ -315,7 +330,7 @@ class TxtVirtualPagerEngine(
             }
             pendingProgrammaticScroll = null
         }
-        _currentLocator.value = locatorForIndex(first, total)
+        publishLocator(locatorForIndex(first, total))
     }
 
     override suspend fun goTo(locator: Locator) {
@@ -336,8 +351,21 @@ class TxtVirtualPagerEngine(
             )
             (rv.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(index, 0)
         }
-        _currentLocator.value = target
+        publishLocator(target)
         pageRequestCallback?.invoke(index)
+    }
+
+    override suspend fun goToAdjacentChapter(delta: Int) {
+        val toc = _tableOfContents.value
+        if (toc.isEmpty()) return
+        val current = chapterInfoFromOrderedToc(
+            tocEntries = toc,
+            totalProgression = _currentLocator.value.totalProgression,
+            documentTitleFallback = DOCUMENT_TITLE_FALLBACK,
+        )
+        if (current.kind != ChapterInfo.Kind.CHAPTER) return
+        val target = adjacentTocEntry(toc, current.currentIndex, delta) ?: return
+        goTo(target.locator)
     }
 
     override suspend fun search(query: String): List<Locator> = withContext(Dispatchers.IO) {
@@ -405,6 +433,9 @@ class TxtVirtualPagerEngine(
         txtFingerprint = null
         pendingEngineState = null
         _tableOfContents.value = emptyList()
+        publishLocator(
+            Locator(strategy = LocatorStrategy.ByteOffset(0L, 0), progression = 0f, totalProgression = 0f),
+        )
     }
 
     override suspend fun saveState(): ByteArray = withContext(Dispatchers.IO) {
@@ -495,7 +526,7 @@ class TxtVirtualPagerEngine(
             } else {
                 currentParagraphIndex()
             }
-            _currentLocator.value = locatorForIndex(paragraphIndex)
+            publishLocator(locatorForIndex(paragraphIndex))
             _pagingKind.value = targetKind
             if (targetKind == PagingKind.PAGED) {
                 pagedParagraphStarts = buildPagedParagraphStarts()
@@ -575,6 +606,7 @@ class TxtVirtualPagerEngine(
     }
 
     private companion object {
+        private const val DOCUMENT_TITLE_FALLBACK = "正文"
         private val TXT_HEADING = Regex("""^(第.{1,12}[章节回卷部篇集].*|Chapter\s+\d+.*|CHAPTER\s+\d+.*)$""")
 
         private fun isTxtHeading(value: String): Boolean =

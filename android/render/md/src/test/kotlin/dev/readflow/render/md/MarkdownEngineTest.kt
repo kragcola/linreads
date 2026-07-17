@@ -16,6 +16,7 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.render.api.PagingKind
@@ -68,6 +69,196 @@ class MarkdownEngineTest {
         engine.setFont("system_serif")
 
         assertEquals(Typeface.SERIF, textView.typeface)
+    }
+
+    @Test
+    fun `headingless open publishes empty toc and document chapterInfo`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val file = tempMarkdown(
+            """
+            Plain paragraph one with no ATX headings.
+            Plain paragraph two continues the body.
+            """.trimIndent(),
+        )
+        val engine = MarkdownEngine(context)
+
+        engine.openBook(Uri.fromFile(file))
+        idleMainLooper()
+
+        assertTrue(engine.tableOfContents.value.isEmpty())
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.DOCUMENT, info.kind)
+        assertEquals(0, info.currentIndex)
+        assertEquals(0, info.totalChapters)
+        assertEquals("正文", info.currentTitle)
+        assertEquals(0f, info.progressInChapter)
+        // Native paged MD must not invent PAGE chrome for headingless docs.
+        engine.setMode(ReadingMode.PAGED)
+        idleMainLooper()
+        assertEquals(ChapterInfo.Kind.DOCUMENT, engine.chapterInfo.value.kind)
+        assertEquals(0, engine.chapterInfo.value.totalChapters)
+    }
+
+    @Test
+    fun `real headings publish chapter kind with truthful count and title`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val file = tempMarkdown(
+            """
+            # 第1章 开篇
+
+            Body of chapter one.
+
+            ## 第2章 中途
+
+            Body of chapter two.
+
+            # 第3章 收束
+
+            Body of chapter three.
+            """.trimIndent(),
+        )
+        val engine = MarkdownEngine(context)
+
+        engine.openBook(Uri.fromFile(file))
+        idleMainLooper()
+
+        val toc = engine.tableOfContents.value
+        assertEquals(3, toc.size)
+        assertEquals("第1章 开篇", toc[0].title)
+        assertEquals("第2章 中途", toc[1].title)
+        assertEquals("第3章 收束", toc[2].title)
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.CHAPTER, info.kind)
+        assertEquals(0, info.currentIndex)
+        assertEquals(3, info.totalChapters)
+        assertEquals("第1章 开篇", info.currentTitle)
+    }
+
+    @Test
+    fun `goTo updates chapterInfo for real heading toc`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val file = tempMarkdown(headingMarkdown())
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        idleMainLooper()
+        val toc = engine.tableOfContents.value
+        assertEquals(3, toc.size)
+
+        engine.goTo(toc[1].locator)
+        idleMainLooper()
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.CHAPTER, info.kind)
+        assertEquals(1, info.currentIndex)
+        assertEquals(3, info.totalChapters)
+        assertEquals("第2章 中途", info.currentTitle)
+    }
+
+    @Test
+    fun `adjacent chapter navigation uses real headings and respects boundaries`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val file = tempMarkdown(headingMarkdown())
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        idleMainLooper()
+
+        engine.goToAdjacentChapter(-1)
+        assertEquals(0, engine.chapterInfo.value.currentIndex)
+        assertEquals("第1章 开篇", engine.chapterInfo.value.currentTitle)
+
+        engine.goToAdjacentChapter(+1)
+        assertEquals(1, engine.chapterInfo.value.currentIndex)
+        assertEquals("第2章 中途", engine.chapterInfo.value.currentTitle)
+
+        engine.goToAdjacentChapter(+1)
+        assertEquals(2, engine.chapterInfo.value.currentIndex)
+        assertEquals("第3章 收束", engine.chapterInfo.value.currentTitle)
+
+        engine.goToAdjacentChapter(+1)
+        assertEquals(2, engine.chapterInfo.value.currentIndex)
+        assertEquals("第3章 收束", engine.chapterInfo.value.currentTitle)
+    }
+
+    @Test
+    fun `headingless adjacent chapter navigation is a no-op document state`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val file = tempMarkdown("Only body text without ATX headings.\nSecond paragraph.")
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        idleMainLooper()
+
+        engine.goToAdjacentChapter(+1)
+        engine.goToAdjacentChapter(-1)
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.DOCUMENT, info.kind)
+        assertEquals(0, info.totalChapters)
+        assertEquals("正文", info.currentTitle)
+        assertTrue(engine.tableOfContents.value.isEmpty())
+    }
+
+    @Test
+    fun `setMode keeps chapterInfo in sync with updated locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val file = tempMarkdown(headingMarkdown())
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        idleMainLooper()
+        val chapter2 = engine.tableOfContents.value[1]
+        engine.goTo(chapter2.locator)
+        idleMainLooper()
+        assertEquals("第2章 中途", engine.chapterInfo.value.currentTitle)
+
+        engine.setMode(ReadingMode.PAGED)
+        idleMainLooper()
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.CHAPTER, info.kind)
+        assertEquals(1, info.currentIndex)
+        assertEquals(3, info.totalChapters)
+        assertEquals("第2章 中途", info.currentTitle)
+        assertEquals(PagingKind.PAGED, engine.pagingKind.value)
+    }
+
+    @Test
+    fun `scroll restore path refreshes chapterInfo with locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val markdown = headingMarkdown()
+        val file = tempMarkdown(markdown)
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        idleMainLooper()
+
+        // Jump to chapter 3 via goTo, then remount SCROLL so restoreScrollToLocator republishes.
+        val chapter3 = engine.tableOfContents.value[2]
+        engine.goTo(chapter3.locator)
+        idleMainLooper()
+        assertEquals("第3章 收束", engine.chapterInfo.value.currentTitle)
+
+        engine.setMode(ReadingMode.SCROLL)
+        idleMainLooper()
+        val scrollView = engine.createView() as ScrollView
+        val parent = attachMeasured(scrollView, context)
+        repeat(6) {
+            idleMainLooper()
+            relayout(parent)
+            idleMainLooper()
+        }
+
+        val info = engine.chapterInfo.value
+        assertEquals(ChapterInfo.Kind.CHAPTER, info.kind)
+        assertEquals(2, info.currentIndex)
+        assertEquals(3, info.totalChapters)
+        assertEquals("第3章 收束", info.currentTitle)
+        assertTrue((engine.currentLocator.value.totalProgression ?: 0f) > 0.3f)
     }
 
     @Test
@@ -1172,6 +1363,20 @@ class MarkdownEngineTest {
     }
 
     private fun buildLongMarkdown(): String = buildMarkdownDocument()
+
+    private fun headingMarkdown(): String = """
+        # 第1章 开篇
+
+        Body of chapter one with enough lines to keep progression distinct.
+
+        ## 第2章 中途
+
+        Body of chapter two sits after the second heading.
+
+        # 第3章 收束
+
+        Body of chapter three is last.
+    """.trimIndent()
 
     private data class ExpectedPageWindow(
         val startOffset: Int,

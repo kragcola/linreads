@@ -535,7 +535,10 @@ fun ReaderScreen(
                             currentIndex = chapter.currentIndex,
                             totalChapters = chapter.totalChapters,
                             progressInChapter = chapter.progressInChapter,
+                            kind = chapter.kind,
                         )
+                        val navigationCounterText = readerNavigationCounterText(chapter)
+                        val showsAdjacentNav = readerShowsAdjacentNavButtons(chapter.kind)
                         Surface(
                             modifier = Modifier
                                 .windowInsetsPadding(WindowInsets.navigationBars)
@@ -556,18 +559,26 @@ fun ReaderScreen(
                                         .padding(horizontal = 8.dp, vertical = 4.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                 ) {
-                                    val prevEnabled = chapter.currentIndex > 0
-                                    IconButton(
-                                        onClick = { scope.launch { engine.goToAdjacentChapter(-1) } },
-                                        enabled = prevEnabled,
-                                        modifier = Modifier.semantics { contentDescription = "上一章" },
-                                    ) {
-                                        Icon(
-                                            Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                                            contentDescription = null,
-                                            tint = if (prevEnabled)
-                                                MaterialTheme.colorScheme.onBackground
-                                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                    if (showsAdjacentNav) {
+                                        val prevEnabled = chapter.currentIndex > 0
+                                        val prevLabel = readerAdjacentNavLabel(chapter.kind, delta = -1)
+                                            ?: "上一章"
+                                        IconButton(
+                                            onClick = { scope.launch { engine.goToAdjacentChapter(-1) } },
+                                            enabled = prevEnabled,
+                                            modifier = Modifier.semantics { contentDescription = prevLabel },
+                                        ) {
+                                            Icon(
+                                                Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                                                contentDescription = null,
+                                                tint = if (prevEnabled)
+                                                    MaterialTheme.colorScheme.onBackground
+                                                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                            )
+                                        }
+                                    } else {
+                                        Spacer(
+                                            modifier = Modifier.size(readerDocumentNavSpacerDp.dp),
                                         )
                                     }
                                     Column(
@@ -584,29 +595,39 @@ fun ReaderScreen(
                                             color = MaterialTheme.colorScheme.onSurface,
                                             maxLines = 1,
                                         )
-                                        Text(
-                                            text = "${chapter.currentIndex + 1} / ${chapter.totalChapters} 章",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        )
+                                        if (navigationCounterText != null) {
+                                            Text(
+                                                text = navigationCounterText,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+                                        }
                                     }
-                                    val nextEnabled = chapter.currentIndex < chapter.totalChapters - 1
-                                    IconButton(
-                                        onClick = { scope.launch { engine.goToAdjacentChapter(+1) } },
-                                        enabled = nextEnabled,
-                                        modifier = Modifier.semantics { contentDescription = "下一章" },
-                                    ) {
-                                        Icon(
-                                            Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                                            contentDescription = null,
-                                            tint = if (nextEnabled)
-                                                MaterialTheme.colorScheme.onBackground
-                                            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                    if (showsAdjacentNav) {
+                                        val nextEnabled = chapter.currentIndex < chapter.totalChapters - 1
+                                        val nextLabel = readerAdjacentNavLabel(chapter.kind, delta = +1)
+                                            ?: "下一章"
+                                        IconButton(
+                                            onClick = { scope.launch { engine.goToAdjacentChapter(+1) } },
+                                            enabled = nextEnabled,
+                                            modifier = Modifier.semantics { contentDescription = nextLabel },
+                                        ) {
+                                            Icon(
+                                                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                                contentDescription = null,
+                                                tint = if (nextEnabled)
+                                                    MaterialTheme.colorScheme.onBackground
+                                                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f),
+                                            )
+                                        }
+                                    } else {
+                                        Spacer(
+                                            modifier = Modifier.size(readerDocumentNavSpacerDp.dp),
                                         )
                                     }
                                 }
                                 ReaderProgressSeekBar(
-                                    progress = (locator.totalProgression ?: 0f).coerceIn(0f, 1f),
+                                    progress = readerProgressValue(locator.totalProgression),
                                     progressDescription = overallProgressDescription,
                                     onSeek = { viewModel.onIntent(ReaderIntent.SeekToProgress(it)) },
                                 )

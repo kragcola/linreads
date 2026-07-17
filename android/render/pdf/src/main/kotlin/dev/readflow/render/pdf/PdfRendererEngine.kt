@@ -15,6 +15,7 @@ import android.widget.ImageView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.readerPaletteFor
@@ -41,6 +42,10 @@ import java.util.WeakHashMap
  * PDF engine using system [PdfRenderer] (v4 lite §5.5).
  * Paged reading; one bitmap per page, lazy-rendered and cached.
  * Locator = Page(index, total).
+ *
+ * Navigation chrome ([chapterInfo]) uses **real** PDF outline entries only.
+ * [buildPdfFallbackToc] page-list rows stay available for the TOC panel but are never
+ * treated as a chapter outline (PAGE chrome instead).
  */
 class PdfRendererEngine(private val context: Context) : PagedReaderEngine, ZoomableReaderEngine {
 
@@ -55,11 +60,17 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
     private val _currentLocator = MutableStateFlow(Locator(LocatorStrategy.Unknown))
     override val currentLocator: StateFlow<Locator> = _currentLocator.asStateFlow()
 
+    private val _chapterInfo = MutableStateFlow(pdfClosedOrEmptyDocumentChapterInfo())
+    override val chapterInfo: StateFlow<ChapterInfo> = _chapterInfo.asStateFlow()
+
     private val _pageCount = MutableStateFlow(0)
     override val pageCount: StateFlow<Int> = _pageCount.asStateFlow()
 
     private val _tableOfContents = MutableStateFlow<List<TocEntry>>(emptyList())
     override val tableOfContents: StateFlow<List<TocEntry>> = _tableOfContents.asStateFlow()
+
+    /** Real parsed outline only — never the fallback page list. */
+    private var realOutlineEntries: List<TocEntry> = emptyList()
 
     private val _zoomScale = MutableStateFlow(1f)
     override val zoomScale: StateFlow<Float> = _zoomScale.asStateFlow()
@@ -98,9 +109,15 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         val renderer = PdfRenderer(pfd)
         pdfRenderer = renderer
         val total = renderer.pageCount
-        val toc = PdfOutlineParser.parse(tmp, total).ifEmpty { buildPdfFallbackToc(total) }
+        // Parse real outline once; keep it separate from TOC-panel fallback page list.
+        val outline = PdfOutlineParser.parse(tmp, total)
+        val toc = outline.ifEmpty { buildPdfFallbackToc(total) }
         val initialBitmap = if (total > 0) renderFirstPage() else null
-        val initial = Locator(LocatorStrategy.Page(0, total), 0f, 0f)
+        val initial = if (total > 0) {
+            Locator(LocatorStrategy.Page(0, total), 0f, 0f)
+        } else {
+            Locator(LocatorStrategy.Unknown, 0f, 0f)
+        }
         withContext(Dispatchers.Main) {
             ensureRenderScope()
             pageCachePolicy = initialBitmap?.let { bitmap ->
@@ -111,9 +128,10 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
             )
             pageStore = createPageStore(renderScope, pageCachePolicy)
             initialBitmap?.let { pageStore.put(0, it) }
+            realOutlineEntries = outline
             _pageCount.value = total
             _tableOfContents.value = toc
-            _currentLocator.value = initial
+            publishLocator(initial)
             updateZoom(1f)
         }
         initial
@@ -166,15 +184,45 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         val lm = rv.layoutManager as? LinearLayoutManager ?: return
         val first = lm.findFirstVisibleItemPosition().coerceAtLeast(0)
         val ratio = first.toFloat() / total
-        _currentLocator.value = Locator(
-            strategy = LocatorStrategy.Page(first, total),
-            progression = ratio,
-            totalProgression = ratio,
+        publishLocator(
+            Locator(
+                strategy = LocatorStrategy.Page(first, total),
+                progression = ratio,
+                totalProgression = ratio,
+            ),
+        )
+    }
+
+    /** Publish locator and keep chapter chrome in sync (real outline vs PAGE vs DOCUMENT). */
+    private fun publishLocator(locator: Locator) {
+        _currentLocator.value = locator
+        publishChapterInfo(locator)
+    }
+
+    private fun publishChapterInfo(locator: Locator = _currentLocator.value) {
+        val pageIndex = (locator.strategy as? LocatorStrategy.Page)?.index
+            ?: locator.totalProgression
+                ?.takeIf { it.isFinite() }
+                ?.let { progression ->
+                    val total = _pageCount.value
+                    if (total > 0) (progression.coerceIn(0f, 1f) * total).toInt() else 0
+                }
+            ?: 0
+        _chapterInfo.value = pdfNavigationChapterInfo(
+            realOutlineEntries = realOutlineEntries,
+            currentPageIndex = pageIndex,
+            pageCount = _pageCount.value,
         )
     }
 
     override suspend fun goTo(locator: Locator) {
-        val total = _pageCount.value.coerceAtLeast(1)
+        val total = _pageCount.value
+        if (total <= 0) {
+            withContext(Dispatchers.Main) {
+                publishLocator(Locator(LocatorStrategy.Unknown, 0f, 0f))
+            }
+            return
+        }
         val idx = ((locator.strategy as? LocatorStrategy.Page)?.index ?: 0).coerceIn(0, total - 1)
         val target = Locator(
             strategy = LocatorStrategy.Page(idx, total),
@@ -187,7 +235,7 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
                 updateZoom(1f)
             }
             (recyclerView?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(idx, 0)
-            _currentLocator.value = target
+            publishLocator(target)
             pageStore.prefetchAround(idx, pageCachePolicy.radius, 0 until total)
             pageStore.retainAround(idx, pageCachePolicy.radius)
             pageRequestCallback?.invoke(idx)
@@ -195,9 +243,21 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
     }
 
     override suspend fun seekToProgress(fraction: Float) {
-        val total = _pageCount.value.coerceAtLeast(1)
+        val total = _pageCount.value
+        if (total <= 0) return
         val idx = (fraction.coerceIn(0f, 1f) * total).toInt().coerceIn(0, total - 1)
         goTo(Locator(strategy = LocatorStrategy.Page(idx, total)))
+    }
+
+    override suspend fun goToAdjacentChapter(delta: Int) {
+        val pageIndex = (_currentLocator.value.strategy as? LocatorStrategy.Page)?.index ?: 0
+        val target = pdfAdjacentNavigationLocator(
+            realOutlineEntries = realOutlineEntries,
+            currentPageIndex = pageIndex,
+            pageCount = _pageCount.value,
+            delta = delta,
+        ) ?: return
+        goTo(target)
     }
 
     override suspend fun close() {
@@ -208,7 +268,11 @@ class PdfRendererEngine(private val context: Context) : PagedReaderEngine, Zooma
         pageRequestCallback = null
         activePageViews.clear()
         _zoomScale.value = 1f
+        realOutlineEntries = emptyList()
         _tableOfContents.value = emptyList()
+        _pageCount.value = 0
+        // Locator reset + DOCUMENT chapterInfo — no stale page/chapter chrome after close.
+        publishLocator(Locator(LocatorStrategy.Unknown, 0f, 0f))
     }
 
     override suspend fun setFontSize(sp: Float) { /* not applicable for PDF */ }

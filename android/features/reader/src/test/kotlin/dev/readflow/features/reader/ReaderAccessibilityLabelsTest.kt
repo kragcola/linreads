@@ -28,6 +28,10 @@ class ReaderAccessibilityLabelsTest {
         assertEquals("0%", readerProgressPercentText(null))
         assertEquals("63%", readerProgressPercentText(0.625f))
         assertEquals("100%", readerProgressPercentText(2f))
+        assertEquals("0%", readerProgressPercentText(Float.NaN))
+        assertEquals(0f, readerProgressValue(Float.POSITIVE_INFINITY))
+        assertEquals(0f, readerProgressValue(Float.NEGATIVE_INFINITY))
+        assertEquals(1f, readerProgressValue(2f))
     }
 
     @Test
