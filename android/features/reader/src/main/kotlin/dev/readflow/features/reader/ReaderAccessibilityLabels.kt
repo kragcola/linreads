@@ -19,12 +19,26 @@ internal fun readerChapterProgressDescription(
     return "$safeTitle，第 $safeCurrent / $safeTotal 章，本章进度 $percent%"
 }
 
-internal fun ReaderSearchResult.readerAccessibilityLabel(): String =
-    locator.totalProgression?.coerceIn(0f, 1f)?.let {
-        "搜索结果 ${index + 1}，位置 ${(it * 100f).roundToInt()}%"
-    } ?: "搜索结果 ${index + 1}"
+internal fun ReaderSearchResult.readerAccessibilityLabel(
+    query: String = "",
+    selected: Boolean = false,
+): String {
+    val normalizedQuery = query.trim()
+    val head = if (normalizedQuery.isEmpty()) {
+        "搜索结果 ${index + 1}"
+    } else {
+        "搜索「$normalizedQuery」结果 ${index + 1}"
+    }
+    val withPosition = locator.totalProgression?.coerceIn(0f, 1f)?.let {
+        "$head，位置 ${(it * 100f).roundToInt()}%"
+    } ?: head
+    return if (selected) "$withPosition，已选中" else withPosition
+}
 
-internal fun ReaderBookmarkItem.accessibilityLabel(): String = "跳转到$label"
+internal fun ReaderBookmarkItem.accessibilityLabel(isCurrent: Boolean = false): String {
+    val base = "跳转到$label"
+    return if (isCurrent) "$base，当前" else base
+}
 
 internal fun ReaderAnnotationItem.accessibilityLabel(): String {
     val snippet = selectedText.singleLineSnippet()

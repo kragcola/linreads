@@ -849,12 +849,13 @@ private fun BookmarkPanel(
         } else {
             LazyColumn {
                 items(bookmarkState.items) { bookmark ->
+                    val isCurrent = bookmark.id == bookmarkState.currentBookmarkId
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
                             .semantics {
-                                contentDescription = bookmark.accessibilityLabel()
+                                contentDescription = bookmark.accessibilityLabel(isCurrent = isCurrent)
                             }
                             .clickable { onBookmarkClick(bookmark) }
                             .padding(horizontal = 8.dp),
@@ -863,7 +864,7 @@ private fun BookmarkPanel(
                         Icon(
                             imageVector = Icons.Default.Bookmark,
                             contentDescription = null,
-                            tint = if (bookmark.id == bookmarkState.currentBookmarkId) {
+                            tint = if (isCurrent) {
                                 MaterialTheme.colorScheme.primary
                             } else {
                                 MaterialTheme.colorScheme.onSurfaceVariant
@@ -878,7 +879,22 @@ private fun BookmarkPanel(
                                 .weight(1f)
                                 .padding(horizontal = 8.dp, vertical = 14.dp),
                         )
-                        IconButton(onClick = { onBookmarkRemove(bookmark) }) {
+                        if (isCurrent) {
+                            // Visible non-color cue; TalkBack uses row contentDescription (…，当前).
+                            Text(
+                                text = "当前",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                modifier = Modifier
+                                    .padding(end = 4.dp)
+                                    .clearAndSetSemantics { },
+                            )
+                        }
+                        IconButton(
+                            onClick = { onBookmarkRemove(bookmark) },
+                            modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
+                        ) {
                             Icon(Icons.Default.Clear, contentDescription = "删除${bookmark.label}")
                         }
                     }
@@ -988,7 +1004,13 @@ private fun SearchPanel(
             }
         }
         if (searchState.isSearching) {
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            LinearProgressIndicator(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics {
+                        contentDescription = "正在搜索"
+                    },
+            )
         }
         searchState.message?.let { message ->
             Text(
@@ -1029,7 +1051,10 @@ private fun SearchPanel(
                                 },
                             )
                             .semantics {
-                                contentDescription = result.readerAccessibilityLabel()
+                                contentDescription = result.readerAccessibilityLabel(
+                                    query = searchState.query,
+                                    selected = selected,
+                                )
                             }
                             .clickable { onResultClick(result) }
                             .padding(horizontal = 8.dp, vertical = 14.dp),

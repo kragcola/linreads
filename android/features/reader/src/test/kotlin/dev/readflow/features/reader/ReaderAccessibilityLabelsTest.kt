@@ -4,6 +4,8 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.TocEntry
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class ReaderAccessibilityLabelsTest {
@@ -50,6 +52,40 @@ class ReaderAccessibilityLabelsTest {
     }
 
     @Test
+    fun `search result accessibility label includes normalized query and selected state`() {
+        val result = ReaderSearchResult(
+            index = 1,
+            locator = Locator(
+                strategy = LocatorStrategy.Page(index = 12, total = 40),
+                totalProgression = 0.625f,
+            ),
+        )
+
+        assertEquals(
+            "搜索「关键词」结果 2，位置 63%",
+            result.readerAccessibilityLabel(query = "  关键词  ", selected = false),
+        )
+        assertEquals(
+            "搜索「关键词」结果 2，位置 63%，已选中",
+            result.readerAccessibilityLabel(query = "关键词", selected = true),
+        )
+        assertEquals(
+            "搜索结果 2，位置 63%，已选中",
+            result.readerAccessibilityLabel(query = "   ", selected = true),
+        )
+        assertEquals(
+            "搜索结果 1",
+            ReaderSearchResult(
+                index = 0,
+                locator = Locator(
+                    strategy = LocatorStrategy.Page(index = 0, total = 40),
+                    totalProgression = null,
+                ),
+            ).readerAccessibilityLabel(query = "", selected = false),
+        )
+    }
+
+    @Test
     fun `annotation accessibility label includes note and trims long text`() {
         val item = ReaderAnnotationItem(
             id = "annotation-1",
@@ -83,6 +119,10 @@ class ReaderAccessibilityLabelsTest {
         )
 
         assertEquals("跳转到书签 20%", bookmark.accessibilityLabel())
+        assertEquals("跳转到书签 20%", bookmark.accessibilityLabel(isCurrent = false))
+        assertEquals("跳转到书签 20%，当前", bookmark.accessibilityLabel(isCurrent = true))
+        assertFalse(bookmark.accessibilityLabel(isCurrent = false).contains("当前"))
+        assertTrue(bookmark.accessibilityLabel(isCurrent = true).endsWith("，当前"))
         assertEquals("2 级目录，Start", readerTocAccessibilityLabel(toc))
     }
 }

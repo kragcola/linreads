@@ -13,6 +13,22 @@ class ReaderBookmarkSearchPanelContractTest {
     @Test
     fun `bookmark and search chrome keep 48dp targets and Chinese accessibility labels`() {
         val source = readerScreenSource()
+        val bookmarkPanel = source
+            .substringAfter("private fun BookmarkPanel(", missingDelimiterValue = "")
+            .substringBefore("private fun AnnotationPanel(")
+        val bookmarkDelete = bookmarkPanel
+            .substringAfter("onClick = { onBookmarkRemove(bookmark) }", missingDelimiterValue = "")
+            .substringBefore("Icons.Default.Clear")
+        val searchPanel = source
+            .substringAfter("private fun SearchPanel(", missingDelimiterValue = "")
+            .substringBefore("private fun TocDrawer(")
+        val searchLoading = searchPanel
+            .substringAfter("searchState.isSearching", missingDelimiterValue = "")
+            .substringBefore("searchState.message")
+        val searchMessage = searchPanel
+            .substringAfter("searchState.message", missingDelimiterValue = "")
+            .substringBefore("if (searchState.results")
+
         assertTrue(
             "toolbar bookmark control must be >=48dp with Chinese add/remove labels",
             source.contains("onClick = { viewModel.onIntent(ReaderIntent.ToggleBookmark) }") &&
@@ -24,15 +40,22 @@ class ReaderBookmarkSearchPanelContractTest {
         )
         assertTrue(
             "BookmarkPanel rows must be whole-row navigable with min 48dp height",
-            source.contains("private fun BookmarkPanel(") &&
-                source.contains("heightIn(min = 48.dp)") &&
-                source.contains("contentDescription = bookmark.accessibilityLabel()") &&
-                source.contains(".clickable { onBookmarkClick(bookmark) }"),
+            bookmarkPanel.contains("heightIn(min = 48.dp)") &&
+                bookmarkPanel.contains("contentDescription = bookmark.accessibilityLabel(") &&
+                bookmarkPanel.contains(".clickable { onBookmarkClick(bookmark) }"),
         )
         assertTrue(
-            "bookmark delete control must have a Chinese contentDescription",
-            source.contains("contentDescription = \"删除\${bookmark.label}\"") ||
-                source.contains("contentDescription = \"删除"),
+            "current bookmark must expose non-color text marker and current TalkBack state",
+            bookmarkPanel.contains("bookmark.id == bookmarkState.currentBookmarkId") &&
+                bookmarkPanel.contains("text = \"当前\"") &&
+                bookmarkPanel.contains("accessibilityLabel(isCurrent = isCurrent)") &&
+                !bookmarkPanel.contains("FilterChip") &&
+                !bookmarkPanel.contains("AssistChip"),
+        )
+        assertTrue(
+            "bookmark delete control must use explicit 48dp sizeIn and Chinese contentDescription",
+            bookmarkDelete.contains("sizeIn(minWidth = 48.dp, minHeight = 48.dp)") &&
+                bookmarkPanel.contains("contentDescription = \"删除\${bookmark.label}\""),
         )
         assertTrue(
             "SearchPanel must gate IME search submit/clear with 48dp IconButtons",
@@ -44,11 +67,30 @@ class ReaderBookmarkSearchPanelContractTest {
                 source.contains("KeyboardActions(onSearch = { onSubmit() })"),
         )
         assertTrue(
-            "search results must expose count, selected styling, and 48dp rows",
-            source.contains("个结果") &&
-                source.contains("result.index == searchState.selectedIndex") &&
-                source.contains("contentDescription = result.readerAccessibilityLabel()") &&
-                source.contains("heightIn(min = 48.dp)"),
+            "search results must expose count, selected styling, query+selected a11y, and 48dp rows",
+            searchPanel.contains("个结果") &&
+                searchPanel.contains("result.index == searchState.selectedIndex") &&
+                searchPanel.contains("result.readerAccessibilityLabel(") &&
+                searchPanel.contains("query = searchState.query") &&
+                searchPanel.contains("selected = selected") &&
+                searchPanel.contains("heightIn(min = 48.dp)"),
+        )
+        assertTrue(
+            "search loading must keep progress semantics and add a Chinese description",
+            searchLoading.contains(".semantics {") &&
+                searchLoading.contains("contentDescription = \"正在搜索\"") &&
+                !searchLoading.contains("clearAndSetSemantics"),
+        )
+        assertTrue(
+            "search status remains visible text without a duplicate content description",
+            searchMessage.contains("Text(") &&
+                searchMessage.contains("text = message") &&
+                !searchMessage.contains("contentDescription"),
+        )
+        assertTrue(
+            "empty bookmark state stays compact Chinese copy",
+            bookmarkPanel.contains("\"暂无书签\"") &&
+                bookmarkPanel.contains("padding(vertical = 12.dp)"),
         )
         assertTrue(
             "panels must consume ReaderBookmarkState / ReaderSearchState",
