@@ -11,7 +11,12 @@ class LibraryGridLayoutTest {
     fun `library grid restores phone tablet and expanded proportions`() {
         // Phone keeps dense Moon-like packing; tablet uses a higher cover floor so
         // columns do not over-pack after the 8dp inter-cover gap (MyCardViewGrid).
+        // Full cell composition: usable = min(width, 1120) - 2*screenEdge(20);
+        // cover = (usable - 8*(cols-1)) / cols; gaps fixed 8h/10v (MyCardViewGrid).
         assertEquals(2, libraryGridColumns(360f))
+        // Medium foldable / small tablet (600dp): 4 columns near 134dp — not the
+        // oversized four-column tablet regression (that would be 800dp→4 large cells).
+        assertEquals(4, libraryGridColumns(600f))
         assertEquals(5, libraryGridColumns(800f))
         assertEquals(7, libraryGridColumns(1_280f))
     }
@@ -19,17 +24,30 @@ class LibraryGridLayoutTest {
     @Test
     fun `grid keeps covers near the accepted multi-device scale`() {
         // usable = min(width, 1120) - 2*20; cover = (usable - 8*(cols-1)) / cols
+        // 360: usable 320 → 2×156; 600: usable 560 → 4×134; 800: 760 → 5×145.6; 1280: 1080 → 7×~147.4
         assertEquals(156f, libraryGridLayout(360f).coverWidthDp, 0.001f)
+        assertEquals(134f, libraryGridLayout(600f).coverWidthDp, 0.001f)
         assertEquals(145.6f, libraryGridLayout(800f).coverWidthDp, 0.001f)
         assertEquals(147.42857f, libraryGridLayout(1_280f).coverWidthDp, 0.01f)
 
         // Moon+ MyCardViewGrid L/R 4dp each → 8dp inter-cover; top 8 + bottom 2 → 10dp row gap.
-        assertEquals(8f, libraryGridLayout(360f).horizontalGapDp, 0.001f)
-        assertEquals(8f, libraryGridLayout(800f).horizontalGapDp, 0.001f)
-        assertEquals(8f, libraryGridLayout(1_280f).horizontalGapDp, 0.001f)
-        assertEquals(10f, libraryGridLayout(360f).verticalGapDp, 0.001f)
-        assertEquals(10f, libraryGridLayout(800f).verticalGapDp, 0.001f)
-        assertEquals(10f, libraryGridLayout(1_280f).verticalGapDp, 0.001f)
+        for (width in listOf(360f, 600f, 800f, 1_280f)) {
+            val layout = libraryGridLayout(width)
+            assertEquals(8f, layout.horizontalGapDp, 0.001f, "h-gap at ${width}dp")
+            assertEquals(10f, layout.verticalGapDp, 0.001f, "v-gap at ${width}dp")
+            // Cell height from 70:100 aspect; whole cover cell stays ≥48dp touch floor.
+            val coverHeight = layout.coverWidthDp / Dimens.coverAspectRatio
+            assertTrue(
+                coverHeight >= Dimens.touchTarget.value,
+                "cover cell height at ${width}dp must stay ≥48dp: w=${layout.coverWidthDp} h=$coverHeight",
+            )
+        }
+        // 800dp must stay 5 columns (not regress to 4 oversized tablet columns).
+        assertEquals(5, libraryGridLayout(800f).columns)
+        assertTrue(
+            libraryGridLayout(800f).coverWidthDp <= LibraryCoverMaxWidthDp + 0.001f,
+            "800dp tablet must not balloon covers past the 156dp phone hero",
+        )
     }
 
     @Test

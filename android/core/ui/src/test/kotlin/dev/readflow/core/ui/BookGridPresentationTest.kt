@@ -68,9 +68,13 @@ class BookGridPresentationTest {
 
     @Test
     fun `bundle stack source never paints a full rect scrim on the front layer`() {
-        // Source-level visual contract: front layers omit drawWithContent scrim attachment
-        // and never enable BookCover material depth (full-rect gradient / spine wash).
+        // Composition contract for 1..4 layers: draw order is back→front (index n-1..0),
+        // front (topBooks[0] / depth 0) attaches neither black drawRect nor material wash.
         val source = bundleStackSource()
+        assertTrue(
+            source.contains("for (i in (layerCount - 1) downTo 0)"),
+            "draw loop must paint high depth first so index 0 composites last (front)",
+        )
         assertTrue(
             source.contains("if (layerDepth > 0 && shadowAlpha > 0f)"),
             "BundleStack must gate the black scrim so depth 0 never draws a full-rect overlay",
@@ -93,6 +97,18 @@ class BookGridPresentationTest {
                 !source.contains("if (layerDepth > 0 && shadowAlpha > 0f)"),
             "unguarded black scrim draw must not exist on the front path",
         )
+        // Effective front compositing for every layer count: depth0 alpha 0 and no scrim branch.
+        for (layerCount in 1..4) {
+            val frontDepth = bundleLayerDepth(topBookIndex = 0, layerCount = layerCount)
+            assertEquals(0, frontDepth)
+            assertEquals(0f, bundleLayerScrimAlpha(frontDepth), 0.0001f)
+            // Back layers (when present) may keep intentional depth scrim.
+            if (layerCount > 1) {
+                val backDepth = bundleLayerDepth(topBookIndex = layerCount - 1, layerCount = layerCount)
+                assertTrue(backDepth > 0)
+                assertTrue(bundleLayerScrimAlpha(backDepth) > 0f)
+            }
+        }
     }
 
     private fun bundleStackSource(): String {

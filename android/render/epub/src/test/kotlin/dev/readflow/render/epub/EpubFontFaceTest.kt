@@ -243,6 +243,81 @@ class EpubFontFaceTest {
         assertEquals(0, embeddedCalls)
     }
 
+    @Test
+    fun `generic-only family stack keeps the reader typeface without consulting resolvers`() {
+        var replacementCalls = 0
+        var embeddedCalls = 0
+
+        val resolved = resolveEpubCssTypeface(
+            cssFontFamily = "serif, system-ui, sans-serif, monospace",
+            replacements = mapOf("serif" to "system_sans"),
+            bookFonts = epubBookFontMapFromFaces(
+                listOf(EpubFontFace("serif", "fonts/ignored.ttf")),
+            ),
+            replacementResolver = {
+                replacementCalls += 1
+                android.graphics.Typeface.DEFAULT
+            },
+            embeddedResolver = {
+                embeddedCalls += 1
+                android.graphics.Typeface.DEFAULT
+            },
+        )
+
+        assertNull(resolved)
+        assertEquals(0, replacementCalls)
+        assertEquals(0, embeddedCalls)
+    }
+
+    @Test
+    fun `replacement miss falls through to a later embedded family in the css stack`() {
+        val bookFonts = epubBookFontMapFromFaces(
+            listOf(EpubFontFace("Mincho", "fonts/mincho.otf")),
+        )
+        var embeddedPath: String? = null
+
+        val resolved = resolveEpubCssTypeface(
+            cssFontFamily = "Unknown, Mincho, serif",
+            replacements = mapOf("other" to "system_serif"),
+            bookFonts = bookFonts,
+            replacementResolver = { android.graphics.Typeface.DEFAULT_BOLD },
+            embeddedResolver = { face ->
+                embeddedPath = face.srcPath
+                android.graphics.Typeface.MONOSPACE
+            },
+        )
+
+        assertSame(android.graphics.Typeface.MONOSPACE, resolved)
+        assertEquals("fonts/mincho.otf", embeddedPath)
+    }
+
+    @Test
+    fun `unavailable user replacement falls back to the embedded face for the same family`() {
+        val bookFonts = epubBookFontMapFromFaces(
+            listOf(EpubFontFace("Story", "fonts/story.ttf")),
+        )
+        var requestedReplacement: String? = null
+        var embeddedCalls = 0
+
+        val resolved = resolveEpubCssTypeface(
+            cssFontFamily = "Story, serif",
+            replacements = mapOf("story" to "custom:missing.ttf"),
+            bookFonts = bookFonts,
+            replacementResolver = { fontId ->
+                requestedReplacement = fontId
+                null
+            },
+            embeddedResolver = {
+                embeddedCalls += 1
+                android.graphics.Typeface.DEFAULT_BOLD
+            },
+        )
+
+        assertSame(android.graphics.Typeface.DEFAULT_BOLD, resolved)
+        assertEquals("custom:missing.ttf", requestedReplacement)
+        assertEquals(1, embeddedCalls)
+    }
+
     private fun diskBackedCache(
         root: File,
         bookKey: String,
