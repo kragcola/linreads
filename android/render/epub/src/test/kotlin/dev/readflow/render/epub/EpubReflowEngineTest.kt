@@ -1900,6 +1900,64 @@ class EpubReflowEngineTest {
         )
     }
 
+    /**
+     * Alice-style cover: first spine is a sole non-inline block image whose intrinsic longest side
+     * (413) is below [EpubReflowEngine.FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX] (600). Flow must still
+     * treat it as full-page so PIXELS_ONLY decode rebinds the TextView instead of staying blank.
+     */
+    @Test
+    fun `flow runtime treats small first-spine sole cover image as full page`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-small-first-spine-cover.epub")
+        writeSmallFirstSpineCoverEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        try {
+            engine.openBook(Uri.fromFile(epub))
+            val host = engine.createView() as FrameLayout
+            val flowView = host.getChildAt(0) as EpubFlowView
+            val text = flowView.textView.text as Spanned
+            val spans = text.getSpans(0, text.length, AsyncDrawableSpan::class.java)
+            assertEquals("cover spine must expose exactly one image span", 1, spans.size)
+            val drawable = spans.single().drawable
+            assertTrue(
+                "destination should resolve to the cover thumbnail path",
+                drawable.destination.endsWith("images/cover_th.jpg") ||
+                    drawable.destination.endsWith("images/cover_th.png") ||
+                    drawable.destination.contains("cover_th"),
+            )
+            val occurrenceResolver = drawable.imageSizeResolver as? EpubOccurrenceImageSizeResolver
+            assertNotNull(
+                "full-page occurrences must use EpubOccurrenceImageSizeResolver",
+                occurrenceResolver,
+            )
+            assertTrue(
+                "300x413 sole first-spine cover must use full-page policy despite <600 longest side",
+                occurrenceResolver!!.isFullPage,
+            )
+            assertNull(
+                "full-page cover must clear authored imageSize so decode fits the viewport",
+                drawable.imageSize,
+            )
+            val stableBounds = Rect(0, 0, 300, 413)
+            val pixelsOnly = EpubAsyncImageResult(
+                layoutStart = text.getSpanStart(spans.single()),
+                destination = drawable.destination,
+                generation = 1L,
+                beforeBounds = stableBounds,
+                afterBounds = Rect(stableBounds),
+                isFullPage = occurrenceResolver.isFullPage,
+            )
+            assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, pixelsOnly.kind)
+            assertTrue(
+                "same-size full-page PIXELS_ONLY must require TextView rebind (blank-cover regression)",
+                pixelsOnly.requiresTextRebind,
+            )
+        } finally {
+            engine.close()
+        }
+    }
+
     @Test
     fun `paged runtime exposes compose text surface state`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
@@ -5692,6 +5750,80 @@ class EpubReflowEngineTest {
                 """.trimIndent(),
             )
             add("OEBPS/plate.png", imageBytes)
+        }
+    }
+
+    /**
+     * Alice-shaped cover spine: sole non-inline block image at 300×413 (longest side below
+     * [EpubReflowEngine.FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX]). PNG bytes are used so Robolectric
+     * can decode bounds; path mirrors `OPS/images/cover_th.jpg` semantics.
+     */
+    private fun writeSmallFirstSpineCoverEpub(file: File) {
+        val coverBytes = ByteArrayOutputStream().use { output ->
+            Bitmap.createBitmap(300, 413, Bitmap.Config.ARGB_8888).let { bitmap ->
+                try {
+                    bitmap.eraseColor(0xFFCC6644.toInt())
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                    output.toByteArray()
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+        }
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+
+            fun addText(path: String, content: String) = add(path, content.toByteArray(Charsets.UTF_8))
+
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="cover_th" href="images/cover_th.png" media-type="image/png"/>
+                        <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                      </manifest>
+                      <spine>
+                        <itemref idref="cover"/>
+                        <itemref idref="ch1"/>
+                      </spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/cover.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        <img src="images/cover_th.png" alt="Cover"/>
+                      </body>
+                    </html>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body><p>Chapter body after the small cover spine.</p></body>
+                    </html>
+                """.trimIndent(),
+            )
+            add("OEBPS/images/cover_th.png", coverBytes)
         }
     }
 

@@ -152,6 +152,70 @@ class EpubFlowPaginatorTest {
     }
 
     @Test
+    fun `separator only window before an oversized image is not exposed as a blank page`() {
+        val rawPages = epubPaginateFlow(
+            geometry = VariableGeometry(intArrayOf(30, 10, 100)),
+            pageHeightPx = 30,
+        )
+
+        assertEquals(
+            "fixture must reproduce text page then separator ghost page then image page",
+            listOf(0, 1, 2),
+            rawPages.map(EpubFlowPage::startLine),
+        )
+
+        val flowText = "A\n$EPUB_FLOW_IMAGE_CHAR"
+        val visibleContentSegments = listOf(
+            EpubFlowSegment(
+                layoutStart = 0,
+                layoutEnd = 1,
+                paragraphIndex = 0,
+                block = EpubDisplayBlock.Text("A", headingLevel = null, paragraphIndex = 0),
+            ),
+            EpubFlowSegment(
+                layoutStart = 2,
+                layoutEnd = 3,
+                paragraphIndex = 1,
+                block = EpubDisplayBlock.Image("plate.png", altText = null, paragraphIndex = 1),
+            ),
+        )
+        val visiblePages = epubDropSeparatorOnlyPages(
+            pages = rawPages,
+            contentSegments = visibleContentSegments,
+        )
+
+        assertEquals(listOf(0, 2), visiblePages.map(EpubFlowPage::startLine))
+        assertEquals(
+            "the next exposed page must be the image owner, not the synthetic separator",
+            EPUB_FLOW_IMAGE_CHAR.toString(),
+            flowText.substring(
+                visiblePages[1].startOffset,
+                visiblePages[1].endOffset,
+            ),
+        )
+        assertEquals(
+            "interactive forward turns must skip the same separator-only window",
+            2,
+            epubNextAuthoredPageFromStartLine(
+                geometry = VariableGeometry(intArrayOf(30, 10, 100)),
+                startLine = 1,
+                pageHeightPx = 30,
+                contentSegments = visibleContentSegments,
+            )?.startLine,
+        )
+        assertEquals(
+            "interactive backward turns must skip the same separator-only window",
+            0,
+            epubPreviousAuthoredPageEndingAtLine(
+                geometry = VariableGeometry(intArrayOf(30, 10, 100)),
+                endLineExclusive = 2,
+                pageHeightPx = 30,
+                contentSegments = visibleContentSegments,
+            )?.startLine,
+        )
+    }
+
+    @Test
     fun `heading at page bottom is pushed to next page with its body`() {
         // 6 lines, page = 30px (3 lines). Line 2 is a heading, line 3 its body → keep-with-next
         // should pull the break up so the heading leaves the first page.

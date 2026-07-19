@@ -1673,17 +1673,35 @@ class EpubReflowEngine private constructor(
     }
 
     /**
-     * Flow offsets of full-page illustration occurrences (covers/彩插), by the same intrinsic-pixel
-     * gate the legacy paged path uses ([FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX]). Occurrence identity keeps
+     * Flow offsets of full-page illustration occurrences (covers/彩插). Occurrence identity keeps
      * an inline and a standalone use of the same resource from affecting each other's sizing policy.
+     *
+     * A non-inline image is full-page when its intrinsic longest side is
+     * >= [FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX], **or** it is the sole meaningful visual segment of
+     * spineIndex 0 (small cover thumbnails such as Alice's 300×413 `cover_th.jpg` that sit below the
+     * pixel gate). Mixed-content small images and sole small images on later spines stay inline.
      */
     private fun flowFullPageImageOffsets(flow: EpubChapterFlow): Set<Int> {
         val result = HashSet<Int>()
+        val meaningful = flow.segments.filter { !it.block.isEmptyVisualBlock() }
+        val soleFirstSpineCoverStart: Int? =
+            if (flow.spineIndex == 0 &&
+                meaningful.size == 1 &&
+                meaningful.single().block.let { block ->
+                    block is EpubDisplayBlock.Image && !block.isInlineContent
+                }
+            ) {
+                meaningful.single().layoutStart
+            } else {
+                null
+            }
         flow.segments.forEach { seg ->
             val block = seg.block
             if (block is EpubDisplayBlock.Image && !block.isInlineContent) {
-                val bounds = epubImageBoundsFor(block.href) ?: return@forEach
-                if (maxOf(bounds.width, bounds.height) >= FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX) {
+                val bounds = epubImageBoundsFor(block.href)
+                val largeEnough = bounds != null &&
+                    maxOf(bounds.width, bounds.height) >= FULL_PAGE_IMAGE_MIN_LONGEST_SIDE_PX
+                if (largeEnough || seg.layoutStart == soleFirstSpineCoverStart) {
                     result += seg.layoutStart
                 }
             }

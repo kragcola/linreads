@@ -2472,11 +2472,14 @@ internal class EpubFlowView(
             null
         }
         val nextPaged = if (nextMetadata != null) {
-            epubPaginateFlow(
-                geometry = geometry,
-                pageHeightPx = effectivePageH,
-                isHeadingLine = nextMetadata.headingLines::contains,
-                paragraphLineRange = { nextMetadata.paragraphLineRange(layout, it) },
+            epubDropSeparatorOnlyPages(
+                pages = epubPaginateFlow(
+                    geometry = geometry,
+                    pageHeightPx = effectivePageH,
+                    isHeadingLine = nextMetadata.headingLines::contains,
+                    paragraphLineRange = { nextMetadata.paragraphLineRange(layout, it) },
+                ),
+                contentSegments = f.segments,
             )
         } else {
             emptyList()
@@ -2971,10 +2974,11 @@ internal class EpubFlowView(
         return if (forward) {
             val startLine = aligned?.endLineExclusive ?: (lastFullyVisibleLine(layout, scrollY) + 1)
             val headingLines = metadata?.headingLines ?: headingLineSet(layout, f)
-            epubPageFromStartLine(
+            epubNextAuthoredPageFromStartLine(
                 geometry = geometry,
                 startLine = startLine,
                 pageHeightPx = usablePageHeightPx(),
+                contentSegments = f.segments,
                 isHeadingLine = { it in headingLines },
                 paragraphLineRange = { line ->
                     metadata?.paragraphLineRange(layout, line) ?: paragraphLineRange(layout, f, line)
@@ -2983,10 +2987,11 @@ internal class EpubFlowView(
         } else {
             val endLineExclusive = aligned?.startLine
                 ?: layout.getLineForVertical(viewportTopInLayout(scrollY))
-            epubPageEndingAtLine(
+            epubPreviousAuthoredPageEndingAtLine(
                 geometry = geometry,
                 endLineExclusive = endLineExclusive,
                 pageHeightPx = usablePageHeightPx(),
+                contentSegments = f.segments,
             )
         }
     }

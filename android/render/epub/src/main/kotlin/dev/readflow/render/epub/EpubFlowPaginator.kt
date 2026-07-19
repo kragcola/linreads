@@ -36,6 +36,65 @@ internal data class EpubFlowPage(
 internal const val EPUB_FLOW_WIDOWS = 2
 internal const val EPUB_FLOW_ORPHANS = 2
 
+/** Removes windows that overlap no authored flow segment (only synthetic inter-block separators). */
+internal fun epubDropSeparatorOnlyPages(
+    pages: List<EpubFlowPage>,
+    contentSegments: List<EpubFlowSegment>,
+): List<EpubFlowPage> = pages.filter { page -> epubPageHasAuthoredContent(page, contentSegments) }
+
+internal fun epubPageHasAuthoredContent(
+    page: EpubFlowPage,
+    contentSegments: List<EpubFlowSegment>,
+): Boolean = contentSegments.any { segment ->
+    segment.layoutEnd > page.startOffset && segment.layoutStart < page.endOffset
+}
+
+internal fun epubNextAuthoredPageFromStartLine(
+    geometry: LineGeometry,
+    startLine: Int,
+    pageHeightPx: Int,
+    contentSegments: List<EpubFlowSegment>,
+    isHeadingLine: (Int) -> Boolean = { false },
+    paragraphLineRange: (Int) -> IntRange = { it..it },
+    keepTogetherLineRange: (Int) -> IntRange? = { null },
+): EpubFlowPage? {
+    var nextStartLine = startLine
+    while (nextStartLine in 0 until geometry.lineCount) {
+        val page = epubPageFromStartLine(
+            geometry = geometry,
+            startLine = nextStartLine,
+            pageHeightPx = pageHeightPx,
+            isHeadingLine = isHeadingLine,
+            paragraphLineRange = paragraphLineRange,
+            keepTogetherLineRange = keepTogetherLineRange,
+        ) ?: return null
+        if (epubPageHasAuthoredContent(page, contentSegments)) return page
+        if (page.endLineExclusive <= nextStartLine) return null
+        nextStartLine = page.endLineExclusive
+    }
+    return null
+}
+
+internal fun epubPreviousAuthoredPageEndingAtLine(
+    geometry: LineGeometry,
+    endLineExclusive: Int,
+    pageHeightPx: Int,
+    contentSegments: List<EpubFlowSegment>,
+): EpubFlowPage? {
+    var nextEndLineExclusive = endLineExclusive
+    while (nextEndLineExclusive in 1..geometry.lineCount) {
+        val page = epubPageEndingAtLine(
+            geometry = geometry,
+            endLineExclusive = nextEndLineExclusive,
+            pageHeightPx = pageHeightPx,
+        ) ?: return null
+        if (epubPageHasAuthoredContent(page, contentSegments)) return page
+        if (page.startLine >= nextEndLineExclusive) return null
+        nextEndLineExclusive = page.startLine
+    }
+    return null
+}
+
 /**
  * Paginate [geometry] into [EpubFlowPage] windows of [pageHeightPx].
  *
