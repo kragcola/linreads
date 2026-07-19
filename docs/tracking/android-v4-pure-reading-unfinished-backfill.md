@@ -46,7 +46,7 @@ _最后更新：2026-07-19_
 
 | 发现日期 | 范围 | 现象 | 当前证据 | 下一步 |
 | --- | --- | --- | --- | --- |
-| 2026-07-19 | EPUB 跨章节翻页 | 当前 `dev-latest` OTA 在跨章节翻页时，页面先沿手势方向顿挫/位移一次，随后才提交翻页；左右手势与上下手势均触发。 | 根因已确认：boundary preview 等待态平移 live `container`，preview 到达后才清零并启动 overlay；源码回归已覆盖横/纵等待态静止与纵向 Drawable。尚无云端 full regression/OTA 与物理设备 Perfetto/vsync 证据。 | 推送后等待 GitHub Actions 全量回归及 `dev-latest` OTA；然后在真实手机/平板上验证横纵跨章节手势首帧、跟手、提交一次性与不同密度/方向。 |
+| 2026-07-19 | EPUB 跨章节翻页 | 旧 `dev-latest` OTA 在跨章节翻页时，页面先沿手势方向顿挫/位移一次，随后才提交翻页；左右手势与上下手势均触发。 | 根因已确认并由 `4f9f2ea` 修复：boundary preview 等待态不再平移 live `container`，横/纵 slide/PAPER overlay 沿手势轴绘制；run `29676190557` 已通过 full regression、R8 OTA 和 `dev-latest` 发布。release `BUILD_TAG`/`Commit` 指向 `4f9f2ea985132ddd55b7332f3e5116a4c775e045`；APK 10,012,965 bytes，SHA-256 `b48385887aa172382da0062cf4b53bcf01d5da9e6a81e14ee58c2e9d2024e30d`。尚缺物理设备 Perfetto/vsync 与真人手势证据。 | 在真实手机/平板上验证横纵跨章节手势首帧、跟手、单次提交，不同屏幕尺寸/密度/方向，以及真实出版和图片密集 EPUB；通过后分配验收 ID 并闭环。 |
 
 ## 验收队列
 
