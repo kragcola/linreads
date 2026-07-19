@@ -512,21 +512,32 @@ class EpubFlowViewTest {
                 )
                 val frontColor = 0xFFD12C4D.toInt()
                 val revealedColor = 0xFF1D78C1.toInt()
-                drawable.privateBitmap("frontBitmap").eraseColor(frontColor)
-                drawable.privateBitmap("revealedBitmap").eraseColor(revealedColor)
+                val frontBitmap = drawable.privateBitmap("frontBitmap")
+                val revealedBitmap = drawable.privateBitmap("revealedBitmap")
+                frontBitmap.eraseColor(frontColor)
+                revealedBitmap.eraseColor(revealedColor)
                 val composed = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
                 drawable.setBounds(0, 0, view.width, view.height)
                 drawable.draw(Canvas(composed))
                 try {
+                    val topLeft = composed.getPixel(view.width / 4, view.height / 4)
+                    val bottomLeft = composed.getPixel(view.width / 4, view.height * 3 / 4)
+                    val topRight = composed.getPixel(view.width * 3 / 4, view.height / 4)
+                    val bottomRight = composed.getPixel(view.width * 3 / 4, view.height * 3 / 4)
                     assertEquals(
-                        "style=$style horizontal reveal must expose the target at top-right",
-                        revealedColor,
-                        composed.getPixel(view.width * 3 / 4, view.height / 4),
+                        "style=$style horizontal renderer must keep the left column consistent across Y",
+                        topLeft,
+                        bottomLeft,
+                    )
+                    assertEquals(
+                        "style=$style horizontal renderer must keep the right column consistent across Y",
+                        topRight,
+                        bottomRight,
                     )
                     assertNotEquals(
-                        "style=$style horizontal outgoing page must still own bottom-left",
-                        revealedColor,
-                        composed.getPixel(view.width / 4, view.height * 3 / 4),
+                        "style=$style horizontal renderer must split the two page colours across X",
+                        topLeft,
+                        topRight,
                     )
                 } finally {
                     composed.recycle()
@@ -1580,14 +1591,37 @@ class EpubFlowViewTest {
 
     @Test
     fun `active page shot overlay covers live synthetic boundary image until settle`() {
-        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val fixture = headingImageContinuationFixture(
+            leadingBodyLines = 40,
+            requireVisibleHeadingCrop = true,
+        )
         val view = fixture.view
         view.flipStyle = PageFlipStyle.SLIDE
         val sourcePage = fixture.headingPageIndex - 1
+        val originalImageColor = fixture.imageDrawable.color
         val liveSyntheticColor = 0xFF16A34A.toInt()
 
         try {
             assertTrue("fixture requires a page before the heading preview", sourcePage >= 0)
+            view.goToPage(fixture.headingPageIndex)
+            fixture.imageDrawable.color = liveSyntheticColor
+            view.textView.invalidate()
+            view.invalidate()
+            val baselineFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val baselineHits = baselineFrame.countExactPixels(liveSyntheticColor)
+                assertTrue(
+                    "fixture must visibly paint the changed heading-page continuation before overlay; " +
+                        "hits=$baselineHits",
+                    baselineHits > 0,
+                )
+            } finally {
+                baselineFrame.recycle()
+            }
+
+            fixture.imageDrawable.color = originalImageColor
+            view.textView.invalidate()
+            view.invalidate()
             view.goToPage(sourcePage)
             shadowOf(Looper.getMainLooper()).idle()
             view.recycleCachedTexturesForTest()
@@ -1642,23 +1676,44 @@ class EpubFlowViewTest {
 
     @Test
     fun `conversion snapshot covers live synthetic boundary image across the full viewport`() {
-        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val fixture = headingImageContinuationFixture(
+            leadingBodyLines = 40,
+            requireVisibleHeadingCrop = true,
+        )
         val view = fixture.view
         val changedImageColor = 0xFF0891B2.toInt()
         try {
             view.goToPage(fixture.headingPageIndex)
             shadowOf(Looper.getMainLooper()).idle()
+            fixture.imageDrawable.color = changedImageColor
+            view.textView.invalidate()
+            view.invalidate()
+            val baselineFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val baselineHits = baselineFrame.countExactPixels(changedImageColor)
+                assertTrue(
+                    "fixture must visibly paint the changed heading-page continuation before cover; " +
+                        "hits=$baselineHits",
+                    baselineHits > 0,
+                )
+            } finally {
+                baselineFrame.recycle()
+            }
+
+            val coverColor = 0xFFF5E9D7.toInt()
             val solidCover = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).apply {
-                eraseColor(0xFFF5E9D7.toInt())
+                eraseColor(coverColor)
             }
             view.showConversionSnapshotForTest(solidCover)
             assertNotNull(view.privateField("conversionSnapshotDrawable"))
 
-            fixture.imageDrawable.color = changedImageColor
-            view.textView.invalidate()
-            view.invalidate()
             val coveredFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
+                assertEquals(
+                    "the conversion snapshot must own every pixel in the visible viewport",
+                    view.width * view.height,
+                    coveredFrame.countExactPixels(coverColor),
+                )
                 assertEquals(
                     "the opaque conversion snapshot must cover changed continuation pixels across the viewport",
                     0,
@@ -10460,14 +10515,22 @@ class EpubFlowViewTest {
      */
     private fun headingImageContinuationFixture(
         leadingBodyLines: Int = 2,
+        requireVisibleHeadingCrop: Boolean = false,
     ): HeadingImageContinuationFixture {
         // Prefer the requested leading count; if that yields a non-adjacent intermediate window
         // (separator-only page between a bottom-parked heading and the complete image page), search
         // nearby counts so the production next-page target owns the image offset.
-        val lineCandidates = linkedSetOf(leadingBodyLines).apply {
-            for (delta in 1..32) {
-                add(leadingBodyLines + delta)
-                if (leadingBodyLines - delta >= 1) add(leadingBodyLines - delta)
+        val lineCandidates = linkedSetOf<Int>().apply {
+            add(leadingBodyLines)
+            if (requireVisibleHeadingCrop) {
+                // Start near the proven low-content crop geometries, then add enough preceding
+                // lines to require a real page before the heading without guessing page capacity.
+                addAll(2..136)
+            } else {
+                for (delta in 1..32) {
+                    add(leadingBodyLines + delta)
+                    if (leadingBodyLines - delta >= 1) add(leadingBodyLines - delta)
+                }
             }
         }
         var lastDiagnostics: String? = null
@@ -10478,10 +10541,22 @@ class EpubFlowViewTest {
                 fixture.headingPageIndex > 0 &&
                     fixture.imagePageIndex == fixture.headingPageIndex + 1 &&
                     fixture.imagePageIndex < pages.size
-            if (productCase) return fixture
+            val visibleHeadingCropHits = if (productCase && requireVisibleHeadingCrop) {
+                fixture.view.goToPage(fixture.headingPageIndex)
+                shadowOf(Looper.getMainLooper()).idle()
+                val baseline = fixture.view.drawAsScrolledChildToBitmapForTest()
+                try {
+                    baseline.countExactPixels(fixture.imageDrawable.color)
+                } finally {
+                    baseline.recycle()
+                }
+            } else {
+                0
+            }
+            if (productCase && (!requireVisibleHeadingCrop || visibleHeadingCropHits > 0)) return fixture
             lastDiagnostics =
                 "lines=$lines heading=${fixture.headingPageIndex} image=${fixture.imagePageIndex} " +
-                    "pages=${pages.size} " +
+                    "pages=${pages.size} visibleHeadingCropHits=$visibleHeadingCropHits " +
                     pages.mapIndexed { index, page ->
                         "#$index[${page.startOffset},${page.endOffset}) lines=${page.startLine}..${page.endLineExclusive}"
                     }.joinToString(" ")
