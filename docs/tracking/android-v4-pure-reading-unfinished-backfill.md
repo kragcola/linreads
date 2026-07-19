@@ -1,6 +1,6 @@
 # Android v4 纯阅读未完成项验收回填总表
 
-_最后更新：2026-06-27_
+_最后更新：2026-07-19_
 
 本文档只收 Android v4 纯阅读范围内尚未完成或尚缺验收证据的条目，方便逐项实现、验收、回填。完整来源表见
 [`android-v4-pure-reading-gap-checklist.md`](android-v4-pure-reading-gap-checklist.md)。
@@ -41,6 +41,12 @@ _最后更新：2026-06-27_
 | VERIFY | A-01, UX-02, UX-03, UX-04, PAGE-01, PAGE-02, PAGE-03, PAGE-04, EPUB-04, EPUB-05, EPUB-06, EPUB-07, EPUB-08, TXT-01, TXT-02, TXT-03, TXT-04, PDF-01, PDF-02, MD-01, READ-01, READ-02, READ-03, READ-04, READ-05, STATE-01, STATE-02, STATE-03, STATE-04, STATE-06, SRC-01, SRC-02, SRC-03, SRC-04, SRC-05, SRC-06, SRC-07, SRC-08, SRC-09 |
 | PARTIAL | A-02, A-03, UX-01, UX-05, PAGE-05 |
 | TODO | 无 |
+
+## 新近缺陷（待分配验收 ID）
+
+| 发现日期 | 范围 | 现象 | 当前证据 | 下一步 |
+| --- | --- | --- | --- | --- |
+| 2026-07-19 | EPUB 跨章节翻页 | 当前 `dev-latest` OTA 在跨章节翻页时，页面先沿手势方向顿挫/位移一次，随后才提交翻页；左右手势与上下手势均触发。 | 根因已确认：boundary preview 等待态平移 live `container`，preview 到达后才清零并启动 overlay；源码回归已覆盖横/纵等待态静止与纵向 Drawable。尚无云端 full regression/OTA 与物理设备 Perfetto/vsync 证据。 | 推送后等待 GitHub Actions 全量回归及 `dev-latest` OTA；然后在真实手机/平板上验证横纵跨章节手势首帧、跟手、提交一次性与不同密度/方向。 |
 
 ## 验收队列
 

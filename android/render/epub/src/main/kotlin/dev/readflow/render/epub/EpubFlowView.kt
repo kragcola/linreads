@@ -2727,7 +2727,10 @@ internal class EpubFlowView(
         startBoundaryDiscreteTurn(preview)
     }
 
-    private fun startBoundaryDiscreteTurn(preview: BoundaryPagePreview) {
+    private fun startBoundaryDiscreteTurn(
+        preview: BoundaryPagePreview,
+        axis: InteractiveTurnAxis = InteractiveTurnAxis.HORIZONTAL,
+    ) {
         if (canCommitBoundaryTurn?.invoke(preview) == false) {
             recyclePageShot(preview.bitmap)
             onBoundaryTurnDiscarded?.invoke(preview)
@@ -2761,14 +2764,28 @@ internal class EpubFlowView(
         interactiveTurnState = InteractiveTurnState.BOUNDARY_DISCRETE_ACTIVE
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
             val drawable = PageCurlDrawable(
-                outgoing, preview.bitmap, width, height, preview.forward, density, ::recyclePageShot,
+                outgoing,
+                preview.bitmap,
+                width,
+                height,
+                preview.forward,
+                density,
+                ::recyclePageShot,
+                vertical = axis == InteractiveTurnAxis.VERTICAL,
             )
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
             val drawable = PageSlideDrawable(
-                outgoing, preview.bitmap, width, height, preview.forward, density, ::recyclePageShot,
+                outgoing,
+                preview.bitmap,
+                width,
+                height,
+                preview.forward,
+                density,
+                ::recyclePageShot,
+                vertical = axis == InteractiveTurnAxis.VERTICAL,
             )
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
@@ -3500,9 +3517,10 @@ internal class EpubFlowView(
     private fun applyFlipProgress(progress: Float, forward: Boolean) {
         slideDrawable?.let {
             it.progress = progress
-            container.translationX = 0f
         }
         curlDrawable?.progress = progress
+        container.translationX = 0f
+        container.translationY = 0f
     }
 
     private fun takeActiveFlipBitmaps(): Pair<Bitmap, Bitmap>? {
@@ -4118,14 +4136,28 @@ internal class EpubFlowView(
         clearFlipOverlay(preserveActivePixelRefreshes = true)
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
             val drawable = PageCurlDrawable(
-                outgoing, revealed, width, height, forward, density, ::recyclePageShot,
+                outgoing,
+                revealed,
+                width,
+                height,
+                forward,
+                density,
+                ::recyclePageShot,
+                vertical = axis == InteractiveTurnAxis.VERTICAL,
             )
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
             val drawable = PageSlideDrawable(
-                outgoing, revealed, width, height, forward, density, ::recyclePageShot,
+                outgoing,
+                revealed,
+                width,
+                height,
+                forward,
+                density,
+                ::recyclePageShot,
+                vertical = axis == InteractiveTurnAxis.VERTICAL,
             )
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
@@ -4277,14 +4309,28 @@ internal class EpubFlowView(
         clearFlipOverlay()
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
             val drawable = PageCurlDrawable(
-                outgoing, preview.bitmap, width, height, preview.forward, density, ::recyclePageShot,
+                outgoing,
+                preview.bitmap,
+                width,
+                height,
+                preview.forward,
+                density,
+                ::recyclePageShot,
+                vertical = axis == InteractiveTurnAxis.VERTICAL,
             )
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
             val drawable = PageSlideDrawable(
-                outgoing, preview.bitmap, width, height, preview.forward, density, ::recyclePageShot,
+                outgoing,
+                preview.bitmap,
+                width,
+                height,
+                preview.forward,
+                density,
+                ::recyclePageShot,
+                vertical = axis == InteractiveTurnAxis.VERTICAL,
             )
             drawable.setBounds(0, scrollY, width, scrollY + height)
             overlay.add(drawable)
@@ -4307,7 +4353,7 @@ internal class EpubFlowView(
         clearBoundaryWaitFeedback()
         if (!pageTurnAnimated) {
             flipped = true
-            startBoundaryDiscreteTurn(preview)
+            startBoundaryDiscreteTurn(preview, waitingBoundaryAxis)
             return
         }
         val origin = capturePageTurnOrigin()
@@ -4904,27 +4950,6 @@ internal class EpubFlowView(
         releasePageShotBudgetForBoundaryPreview(forward)
     }
 
-    private fun updateBoundaryWaitFeedback(x: Float, y: Float) {
-        if (!boundaryWaiting) return
-        val coordinate = if (waitingBoundaryAxis == InteractiveTurnAxis.HORIZONTAL) x else y
-        val extent = if (waitingBoundaryAxis == InteractiveTurnAxis.HORIZONTAL) width else height
-        if (extent <= 0) return
-        val travel = if (waitingBoundaryForward) {
-            waitingBoundaryAnchor - coordinate
-        } else {
-            coordinate - waitingBoundaryAnchor
-        }.coerceAtLeast(0f)
-        val offset = travel.coerceAtMost(extent * BOUNDARY_WAIT_FEEDBACK_MAX_FRACTION)
-        val translation = if (waitingBoundaryForward) -offset else offset
-        if (waitingBoundaryAxis == InteractiveTurnAxis.HORIZONTAL) {
-            container.translationX = translation
-            container.translationY = 0f
-        } else {
-            container.translationX = 0f
-            container.translationY = translation
-        }
-    }
-
     private fun clearBoundaryWaitFeedback() {
         container.translationX = 0f
         container.translationY = 0f
@@ -4952,6 +4977,9 @@ internal class EpubFlowView(
             cancelWaitingBoundaryTurn()
             return
         }
+        // Boundary preview work can outlive the finger. Keep the live page anchored until the
+        // real two-shot overlay is ready; this also clears any translation left by older callers.
+        clearBoundaryWaitFeedback()
         waitingDiscreteBoundaryForward = waitingBoundaryForward
         interactiveTurnState = InteractiveTurnState.BOUNDARY_DISCRETE_WAITING
         waitingBoundaryX = 0f
@@ -5068,7 +5096,6 @@ internal class EpubFlowView(
         if (boundaryWaiting) {
             waitingBoundaryX = ev.x
             waitingBoundaryY = ev.y
-            updateBoundaryWaitFeedback(ev.x, ev.y)
             return
         }
         if (flipped) return
@@ -5089,7 +5116,6 @@ internal class EpubFlowView(
             if (boundaryWaiting) {
                 waitingBoundaryX = ev.x
                 waitingBoundaryY = ev.y
-                updateBoundaryWaitFeedback(ev.x, ev.y)
                 return InteractiveTurnStartResult.WAITING
             }
             return InteractiveTurnStartResult.STARTED
@@ -5103,7 +5129,6 @@ internal class EpubFlowView(
                 } else {
                     waitingBoundaryX = ev.x
                     waitingBoundaryY = ev.y
-                    updateBoundaryWaitFeedback(ev.x, ev.y)
                 }
             }
             InteractiveTurnStartResult.REJECTED -> flipped = true
@@ -5124,7 +5149,7 @@ internal class EpubFlowView(
         val preview = takeBoundaryPreview(forward)
         if (preview != null) {
             flipped = true
-            startBoundaryDiscreteTurn(preview)
+            startBoundaryDiscreteTurn(preview, axis)
             return
         }
         val requestPreview = onBoundaryPreviewNeeded ?: run {
@@ -5203,7 +5228,6 @@ internal class EpubFlowView(
         const val MICRO_TURN_MIN_VELOCITY_DP_PER_SEC = 90f
         const val MICRO_TURN_PROJECTION_SECONDS = 0.04f
         const val MICRO_TURN_MAX_CROSS_AXIS_RATIO = 0.5f
-        const val BOUNDARY_WAIT_FEEDBACK_MAX_FRACTION = 0.12f
         const val LOCAL_SHOTS_WAIT_FEEDBACK_MAX_FRACTION = 0.12f
         const val FREE_FLING_MIN_SETTLE_MS = 64L
         const val FREE_FLING_STABLE_FRAMES = 2

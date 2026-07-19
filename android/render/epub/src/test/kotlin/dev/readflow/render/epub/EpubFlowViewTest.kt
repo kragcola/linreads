@@ -3280,7 +3280,7 @@ class EpubFlowViewTest {
 
     @Test
     @Config(qualifiers = "xxhdpi")
-    fun `fast five dp cold boundary swipe gives bounded feedback then commits once`() {
+    fun `fast five dp cold vertical boundary swipe keeps the live page still until preview then commits once`() {
         val commits = mutableListOf<Any>()
         val previewRequests = mutableListOf<Pair<Boolean, Long>>()
         val view = pagedFlowView(
@@ -3294,7 +3294,27 @@ class EpubFlowViewTest {
         view.goToLastPage()
 
         try {
-            dispatchFiveDpForwardGesture(view, durationMs = 48L)
+            val downTime = SystemClock.uptimeMillis()
+            val x = view.width * 0.85f
+            val startY = view.height * 0.85f
+            val travelPx = 5f * view.resources.displayMetrics.density
+            val halfwayY = startY - travelPx / 2f
+            val releaseY = startY - travelPx
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, startY))
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, x, halfwayY),
+            )
+            val currentPage = view.getChildAt(0)
+            assertEquals(
+                "a cold boundary wait must keep the live page still while the finger is down",
+                0f,
+                currentPage.translationY,
+                0.01f,
+            )
+            assertEquals(0f, currentPage.translationX, 0.01f)
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, x, releaseY),
+            )
 
             assertEquals(
                 "an accepted cold boundary swipe must wait for its requested target",
@@ -3302,13 +3322,14 @@ class EpubFlowViewTest {
                 view.privateField("interactiveTurnState").toString(),
             )
             assertEquals(listOf(true to view.boundaryPreviewGenerationToken()), previewRequests)
-            val currentPage = view.getChildAt(0)
             val immediateTranslationY = currentPage.translationY
-            assertTrue(
-                "the outgoing page must immediately follow the forward swipe upward without exceeding " +
-                    "the 15px finger travel; pageY=$immediateTranslationY",
-                immediateTranslationY < 0f && immediateTranslationY >= -15f,
+            assertEquals(
+                "a cold boundary wait must not move the live page before the target preview exists",
+                0f,
+                immediateTranslationY,
+                0.01f,
             )
+            assertEquals(0f, currentPage.translationX, 0.01f)
 
             val preview = view.newBoundaryPreviewForTest(forward = true, token = 58L)
             assertTrue(view.offerBoundaryPreviewForTest(preview))
@@ -3318,6 +3339,60 @@ class EpubFlowViewTest {
             assertEquals("settled feedback must restore the outgoing page translation", 0f, currentPage.translationY, 0.01f)
             shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
             assertEquals("late settle work must not publish the same swipe twice", 1, commits.size)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    @Config(qualifiers = "xxhdpi")
+    fun `fast five dp cold horizontal boundary swipe keeps the live page still until preview then commits once`() {
+        val commits = mutableListOf<Any>()
+        val previewRequests = mutableListOf<Pair<Boolean, Long>>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+        ).apply {
+            installBoundaryCommitRecorderForTest(commits)
+            onBoundaryPreviewNeeded = { forward, generation -> previewRequests += forward to generation }
+        }
+        view.goToLastPage()
+
+        val downTime = SystemClock.uptimeMillis()
+        val startX = view.width * 0.85f
+        val endX = startX - 5f * view.resources.displayMetrics.density
+        val y = view.height * 0.50f
+        val currentPage = view.getChildAt(0)
+
+        try {
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, startX, y))
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, (startX + endX) / 2f, y),
+            )
+            assertEquals(
+                "a cold boundary wait must keep the live page still while the finger is down",
+                0f,
+                currentPage.translationX,
+                0.01f,
+            )
+            assertEquals(0f, currentPage.translationY, 0.01f)
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, endX, y),
+            )
+
+            assertEquals("BOUNDARY_DISCRETE_WAITING", view.privateField("interactiveTurnState").toString())
+            assertEquals(listOf(true to view.boundaryPreviewGenerationToken()), previewRequests)
+            assertEquals(0f, currentPage.translationX, 0.01f)
+            assertEquals(0f, currentPage.translationY, 0.01f)
+
+            val preview = view.newBoundaryPreviewForTest(forward = true, token = 58L)
+            assertTrue(view.offerBoundaryPreviewForTest(preview))
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals("the accepted cold horizontal boundary swipe must commit once", 1, commits.size)
+            assertEquals(0f, currentPage.translationX, 0.01f)
+            assertEquals(0f, currentPage.translationY, 0.01f)
         } finally {
             view.dispose()
         }
