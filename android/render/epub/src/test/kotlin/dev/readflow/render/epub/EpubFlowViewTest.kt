@@ -1651,6 +1651,9 @@ class EpubFlowViewTest {
         try {
             view.goToPage(fixture.headingPageIndex)
             shadowOf(Looper.getMainLooper()).idle()
+            // Isolate the synthetic preview drawn after super.draw(): the live TextView uses the
+            // same ImageSpan color and must not satisfy either side of this gate regression.
+            view.getChildAt(0).visibility = View.INVISIBLE
             fixture.imageDrawable.color = changedImageColor
             view.textView.invalidate()
             view.invalidate()
@@ -1658,7 +1661,7 @@ class EpubFlowViewTest {
             try {
                 val baselineHits = baselineFrame.countExactPixels(changedImageColor)
                 assertTrue(
-                    "fixture must visibly paint the changed heading-page continuation before cover; " +
+                    "fixture must visibly paint the changed synthetic heading-page continuation before cover; " +
                         "hits=$baselineHits",
                     baselineHits > 0,
                 )
@@ -1682,7 +1685,7 @@ class EpubFlowViewTest {
             val coveredFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
                 assertEquals(
-                    "the installed conversion snapshot must suppress live continuation pixels drawn after ViewOverlay",
+                    "the installed conversion snapshot must suppress synthetic continuation pixels appended after ViewOverlay",
                     0,
                     coveredFrame.countExactPixels(changedImageColor),
                 )
@@ -1697,7 +1700,7 @@ class EpubFlowViewTest {
             try {
                 val changedHits = uncoveredFrame.countExactPixels(changedImageColor)
                 assertTrue(
-                    "clearing the conversion snapshot must reveal the live continuation pixels; hits=$changedHits",
+                    "clearing the conversion snapshot must restore synthetic continuation pixels; hits=$changedHits",
                     changedHits > 0,
                 )
             } finally {
