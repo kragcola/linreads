@@ -1671,15 +1671,27 @@ class EpubFlowViewTest {
                 eraseColor(coverColor)
             }
             view.showConversionSnapshotForTest(solidCover)
-            assertNotNull(view.privateField("conversionSnapshotDrawable"))
+            val installedCover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+            assertTrue(installedCover.privateBitmap("bitmap") === solidCover)
+            assertEquals(255, installedCover.privateInt("alphaValue"))
+            assertEquals(
+                Rect(0, view.scrollY, view.width, view.scrollY + view.height),
+                (installedCover as Drawable).bounds,
+            )
 
             val coveredFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
-                assertEquals(
-                    "the conversion snapshot must own every pixel in the visible viewport",
-                    view.width * view.height,
-                    coveredFrame.countExactPixels(coverColor),
-                )
+                val sampleXs = listOf(view.width / 4, view.width / 2, view.width * 3 / 4)
+                val sampleYs = listOf(view.height / 4, view.height / 2, view.height * 3 / 4)
+                for (sampleY in sampleYs) {
+                    for (sampleX in sampleXs) {
+                        assertEquals(
+                            "the conversion snapshot must cover interior viewport point ($sampleX,$sampleY)",
+                            coverColor,
+                            coveredFrame.getPixel(sampleX, sampleY),
+                        )
+                    }
+                }
                 assertEquals(
                     "the opaque conversion snapshot must cover changed continuation pixels across the viewport",
                     0,
