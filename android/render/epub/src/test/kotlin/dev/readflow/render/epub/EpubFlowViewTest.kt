@@ -1468,10 +1468,13 @@ class EpubFlowViewTest {
 
         try {
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            // A cold direct start may capture the live outgoing/target pages before installing the
+            // overlay. Start the overdraw window after that setup work has completed.
+            val drawsAfterOverlayStart = childDraws.boundsTops.size
             view.drawToBitmapForTest().recycle()
             assertEquals(
                 "cached page-shot overlay must not repaint image/text spans beneath it",
-                drawsBeforeTurn,
+                drawsAfterOverlayStart,
                 childDraws.boundsTops.size,
             )
         } finally {
