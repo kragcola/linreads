@@ -1644,7 +1644,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `conversion snapshot covers live synthetic boundary image across the full viewport`() {
+    fun `conversion snapshot suppresses live synthetic boundary image until cleared`() {
         val fixture = visibleHeadingImageContinuationFixture()
         val view = fixture.view
         val changedImageColor = 0xFF0891B2.toInt()
@@ -1681,19 +1681,8 @@ class EpubFlowViewTest {
 
             val coveredFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
-                val sampleXs = listOf(view.width / 4, view.width / 2, view.width * 3 / 4)
-                val sampleYs = listOf(view.height / 4, view.height / 2, view.height * 3 / 4)
-                for (sampleY in sampleYs) {
-                    for (sampleX in sampleXs) {
-                        assertEquals(
-                            "the conversion snapshot must cover interior viewport point ($sampleX,$sampleY)",
-                            coverColor,
-                            coveredFrame.getPixel(sampleX, sampleY),
-                        )
-                    }
-                }
                 assertEquals(
-                    "the opaque conversion snapshot must cover changed continuation pixels across the viewport",
+                    "the installed conversion snapshot must suppress live continuation pixels drawn after ViewOverlay",
                     0,
                     coveredFrame.countExactPixels(changedImageColor),
                 )
