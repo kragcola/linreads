@@ -1747,6 +1747,65 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `held outgoing page shot keeps its viewport band while slide and simulation reveal the target`() {
+        val frontColor = 0xFF16A34A.toInt()
+        val targetColor = 0xFF2563EB.toInt()
+
+        listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION).forEach { style ->
+            val view = pagedFlowView(flipStyle = style)
+            try {
+                assertTrue("$style fixture needs adjacent pages", view.pageCount() > 2)
+                view.goToPage(1)
+                shadowOf(Looper.getMainLooper()).idle()
+
+                assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+                val drawable = when (style) {
+                    PageFlipStyle.SLIDE -> checkNotNull(view.privateField("slideDrawable"))
+                    PageFlipStyle.SIMULATION -> checkNotNull(view.privateField("curlDrawable"))
+                    else -> error("unsupported test style $style")
+                }
+                drawable.privateBitmap("frontBitmap").eraseColor(frontColor)
+                drawable.privateBitmap("revealedBitmap").eraseColor(targetColor)
+
+                view.updateInteractiveCurl(x = view.width / 2f)
+                val progress = when (drawable) {
+                    is PageSlideDrawable -> drawable.progress
+                    is PageCurlDrawable -> drawable.progress
+                    else -> error("unexpected turn drawable ${drawable.javaClass.name}")
+                }
+                assertEquals("$style must remain held at half progress", 0.5f, progress, 0.001f)
+                assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+
+                val heldFrame = view.drawAsScrolledChildToBitmapForTest()
+                try {
+                    assertEquals(
+                        "$style must keep the outgoing page shot visible before release",
+                        frontColor,
+                        heldFrame.getPixel(view.width / 10, view.height / 2),
+                    )
+                    assertEquals(
+                        "$style must reveal only the target half before release",
+                        targetColor,
+                        heldFrame.getPixel(view.width * 3 / 4, view.height / 2),
+                    )
+                } finally {
+                    heldFrame.recycle()
+                }
+            } finally {
+                if (view.privateField("interactiveTurnState").toString() != "NONE") {
+                    view.endInteractiveCurl(velocityX = 0f)
+                    (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.let { animator ->
+                        if (animator.isRunning) animator.end()
+                    }
+                    shadowOf(Looper.getMainLooper()).idle()
+                }
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
     fun `first threshold crossing move uses the full down displacement for interactive slide progress`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
