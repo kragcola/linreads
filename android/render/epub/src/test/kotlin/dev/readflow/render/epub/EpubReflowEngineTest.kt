@@ -4865,6 +4865,16 @@ class EpubReflowEngineTest {
             val context = RuntimeEnvironment.getApplication() as Application
             val engine = EpubReflowEngine(context, flowEngineEnabled = true)
             engine.openBook(Uri.fromFile(epub))
+            val embeddedTypeface = Typeface.create(Typeface.SERIF, Typeface.NORMAL)
+            engine.setPrivateField(
+                "bookFontTypefaceCache",
+                EpubBookFontTypefaceCache(
+                    cacheRoot = tempDir.newFolder("flow-css-font-cache"),
+                    bookCacheKey = "flow-css-font-production",
+                    bytesForPath = { byteArrayOf(1, 2, 3, 4) },
+                    typefaceFromFile = { embeddedTypeface },
+                ),
+            )
             engine.setMode(ReadingMode.PAGED)
             val host = engine.createView() as FrameLayout
             idleMainLooper()
@@ -5304,6 +5314,12 @@ class EpubReflowEngineTest {
             .apply { isAccessible = true }
             .get(this)
 
+    private fun EpubReflowEngine.setPrivateField(name: String, value: Any?) {
+        EpubReflowEngine::class.java.getDeclaredField(name)
+            .apply { isAccessible = true }
+            .set(this, value)
+    }
+
     private fun EpubReflowEngine.invokePrivate(name: String, vararg args: Any?): Any? {
         val method = EpubReflowEngine::class.java.declaredMethods.first { method ->
             method.name == name && method.parameterTypes.size == args.size
@@ -5402,12 +5418,8 @@ class EpubReflowEngineTest {
         return field.get(span) as Typeface
     }
 
-    /**
-     * Minimal real-zip EPUB with CSS @font-face + a non-generic family span, using a real TTF so
-     * [EpubBookFontTypefaceCache] can prewarm through Typeface.createFromFile.
-     */
+    /** Minimal real-zip EPUB with CSS @font-face + a non-generic family span. */
     private fun writeFontEmbeddedEpub(file: File) {
-        val fontBytes = sampleEmbeddedFontBytes()
         ZipOutputStream(file.outputStream()).use { zip ->
             fun add(path: String, bytes: ByteArray) {
                 zip.putNextEntry(ZipEntry(path))
@@ -5458,20 +5470,10 @@ class EpubReflowEngineTest {
                     </html>
                 """.trimIndent(),
             )
-            add("OEBPS/fonts/story.ttf", fontBytes)
+            // The production-path test injects the cache's typeface loader seam after openBook(),
+            // so the zip only needs deterministic non-empty bytes at the declared font path.
+            add("OEBPS/fonts/story.ttf", byteArrayOf(1, 2, 3, 4))
         }
-    }
-
-    private fun sampleEmbeddedFontBytes(): ByteArray {
-        val candidates = listOf(
-            File("references/episteme/app/src/main/assets/fonts/lato.ttf"),
-            File("../references/episteme/app/src/main/assets/fonts/lato.ttf"),
-            File("../../references/episteme/app/src/main/assets/fonts/lato.ttf"),
-            File("/Volumes/OmubotDisk/readflow/references/episteme/app/src/main/assets/fonts/lato.ttf"),
-        )
-        val file = candidates.firstOrNull { it.isFile }
-            ?: error("sample TTF missing; expected references/episteme/.../lato.ttf")
-        return file.readBytes()
     }
 
     private fun writeEpub(file: File, vararg spineEntries: Pair<String, String>) {

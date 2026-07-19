@@ -28,6 +28,9 @@ internal class PageShotBudget(
     val chargedBytes: Long
         get() = activeReservedBytes + activeLeasedBytes
 
+    val hasAvailableShotSlot: Boolean
+        get() = activeReservations.size + activeLeases.size < maxActiveShots
+
     var isSpeculativeAdmissionPaused: Boolean = false
         private set
 

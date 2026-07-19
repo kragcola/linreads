@@ -2123,15 +2123,28 @@ internal class EpubFlowView(
     /** Gives a boundary target the directional slot when a third full-screen shot is too expensive. */
     fun preparePageShotBudgetForBoundaryPreview(forward: Boolean, required: Boolean): Boolean {
         if (width <= 0 || height <= 0) return false
-        if (threePageShotsFitOppositeBudget()) return true
         val existingDirection = boundaryPreviewBudgetDirection
-        if (existingDirection != null && existingDirection != forward && !required) return false
-        if (existingDirection != null && existingDirection != forward) {
-            onBoundaryPreviewRequestCancelled?.invoke(existingDirection)
+        val switchingDirection = existingDirection != null && existingDirection != forward
+        if (
+            switchingDirection &&
+            !required &&
+            shouldPrewarmBoundaryPreview(checkNotNull(existingDirection))
+        ) return false
+        if (switchingDirection) {
+            onBoundaryPreviewRequestCancelled?.invoke(checkNotNull(existingDirection))
+            val obsoletePreview = if (forward) backwardBoundaryPreview else forwardBoundaryPreview
+            if (obsoletePreview != null) {
+                if (forward) backwardBoundaryPreview = null else forwardBoundaryPreview = null
+                onBoundaryPreviewEvicted?.invoke(obsoletePreview)
+                recyclePageShot(obsoletePreview.bitmap)
+            }
         }
         boundaryPreviewBudgetDirection = forward
-
         pendingPageTexturePrecache?.let(::discardPendingPageTexturePrecache)
+        // Reserve this direction before the background renderer is ready. A programmatic goToPage
+        // can otherwise fill the third local slot after the request starts and starve the preview.
+        if (threePageShotsFitOppositeBudget() && pageShotBudget.hasAvailableShotSlot) return true
+
         if (required) {
             val oppositePreview = if (forward) backwardBoundaryPreview else forwardBoundaryPreview
             if (oppositePreview != null) {
