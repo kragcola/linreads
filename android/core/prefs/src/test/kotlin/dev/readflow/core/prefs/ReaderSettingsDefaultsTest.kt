@@ -6,13 +6,14 @@ import org.junit.jupiter.api.Test
 class ReaderSettingsDefaultsTest {
 
     @Test
-    fun `missing line spacing uses Moon fresh install default`() {
-        assertEquals(1.3f, resolvedLineSpacingPreference(null), 0.001f)
+    fun `missing line spacing uses accessible fresh install default`() {
+        assertEquals(1.6f, resolvedLineSpacingPreference(null), 0.001f)
     }
 
     @Test
     fun `persisted line spacing is never replaced by the new default`() {
         assertEquals(1.7f, resolvedLineSpacingPreference(1.7f), 0.001f)
+        assertEquals(1.3f, resolvedLineSpacingPreference(1.3f), 0.001f)
     }
 
     @Test
@@ -20,7 +21,7 @@ class ReaderSettingsDefaultsTest {
         assertEquals(
             TypographyBaseline(
                 fontSize = 18,
-                lineSpacing = 1.3f,
+                lineSpacing = 1.6f,
                 version = ReaderTypography.BASELINE_VERSION,
             ),
             resolvedTypographyBaseline(
@@ -42,6 +43,22 @@ class ReaderSettingsDefaultsTest {
             resolvedTypographyBaseline(
                 storedFontSize = 21,
                 storedLineSpacing = 1.6f,
+                storedVersion = ReaderTypography.BASELINE_VERSION,
+            ),
+        )
+    }
+
+    @Test
+    fun `baseline version preserves explicit version-1 line spacing of 1_3 with non-default font`() {
+        assertEquals(
+            TypographyBaseline(
+                fontSize = 24,
+                lineSpacing = 1.3f,
+                version = ReaderTypography.BASELINE_VERSION,
+            ),
+            resolvedTypographyBaseline(
+                storedFontSize = 24,
+                storedLineSpacing = 1.3f,
                 storedVersion = ReaderTypography.BASELINE_VERSION,
             ),
         )

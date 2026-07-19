@@ -401,14 +401,14 @@ class ReaderSavedStateHandleTest {
         )
 
         assertEquals(18f, viewModel.uiState.value.fontSizeSp, 0.001f)
-        assertEquals(1.3f, viewModel.uiState.value.lineSpacing, 0.001f)
+        assertEquals(1.6f, viewModel.uiState.value.lineSpacing, 0.001f)
         assertEquals(ReadingMode.PAGED, viewModel.uiState.value.readingMode)
         assertEquals(ThemeMode.SEPIA, viewModel.uiState.value.themeMode)
         assertEquals(ReaderTypography.BASELINE_VERSION, handle[READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY])
         val migrated = Json.decodeFromString<ReaderState>(checkNotNull(handle[READER_STATE_SAVED_STATE_KEY]))
         assertEquals(locator, migrated.currentLocator)
         assertEquals(18, migrated.fontSize)
-        assertEquals(1.3f, migrated.lineSpacing, 0.001f)
+        assertEquals(1.6f, migrated.lineSpacing, 0.001f)
     }
 
     @Test
@@ -1560,6 +1560,179 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `remove annotation tombs current book row and clears paint list without closing panel`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val start = Locator(
+                LocatorStrategy.Section(spineIndex = 0, elementIndex = 3, charOffset = 12),
+                totalProgression = 0.24f,
+            )
+            val end = Locator(
+                LocatorStrategy.Section(spineIndex = 0, elementIndex = 3, charOffset = 18),
+                totalProgression = 0.26f,
+            )
+            val entity = TextAnnotationEntity(
+                id = "annotation-remove-1",
+                bookId = "book-1",
+                totalProgression = 0.24f,
+                anchorType = TEXT_ANNOTATION_ANCHOR_TYPE,
+                anchorJson = Json.encodeToString(ReaderTextAnnotationAnchor(start, end)),
+                selectedText = "重点内容",
+                note = "这里要回看",
+                color = 0x66FFE082,
+                createdAt = 1_000L,
+                updatedAt = 1_000L,
+                deviceId = "old-device",
+                isDeleted = false,
+            )
+            val engine = FakeReaderEngine(
+                initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10)),
+            )
+            val textAnnotationDao = FakeTextAnnotationDao(listOf(entity))
+            val settings = FakeSettingsRepository()
+            settings.deviceId.value = "device-after-delete"
+            val viewModel = readerViewModel(
+                handle = SavedStateHandle(),
+                engine = engine,
+                textAnnotationDao = textAnnotationDao,
+                settings = settings,
+            )
+
+            viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+            advanceUntilIdle()
+            viewModel.onIntent(ReaderIntent.OpenPanel(ReaderPanel.ANNOTATIONS))
+            advanceUntilIdle()
+            assertEquals(1, viewModel.uiState.value.annotations.items.size)
+            assertEquals(1, engine.latestAnnotations.size)
+
+            viewModel.onIntent(
+                ReaderIntent.RemoveAnnotation(
+                    ReaderAnnotationItem(
+                        id = entity.id,
+                        start = start,
+                        end = end,
+                        selectedText = entity.selectedText,
+                        note = entity.note,
+                        color = entity.color,
+                        totalProgression = entity.totalProgression,
+                    ),
+                ),
+            )
+            advanceUntilIdle()
+
+            val tombstone = textAnnotationDao.savedAnnotations("book-1").single { it.id == entity.id }
+            assertEquals(true, tombstone.isDeleted)
+            assertTrue(tombstone.updatedAt > entity.updatedAt)
+            assertEquals("device-after-delete", tombstone.deviceId)
+            assertEquals(entity.id, tombstone.id)
+            assertEquals(entity.bookId, tombstone.bookId)
+            assertEquals(entity.anchorType, tombstone.anchorType)
+            assertEquals(entity.anchorJson, tombstone.anchorJson)
+            assertEquals(entity.selectedText, tombstone.selectedText)
+            assertEquals(entity.note, tombstone.note)
+            assertEquals(entity.color, tombstone.color)
+            assertEquals(entity.createdAt, tombstone.createdAt)
+            assertEquals(entity.totalProgression, tombstone.totalProgression)
+            assertEquals(emptyList<ReaderAnnotationItem>(), viewModel.uiState.value.annotations.items)
+            assertEquals(emptyList<ReaderTextAnnotation>(), engine.latestAnnotations)
+            assertEquals(ReaderPanel.ANNOTATIONS, viewModel.uiState.value.activePanel)
+            assertEquals(true, viewModel.uiState.value.isUiVisible)
+        }
+
+    @Test
+    fun `remove annotation is no-op for missing or wrong book rows`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val start = Locator(
+            LocatorStrategy.Section(spineIndex = 0, elementIndex = 1, charOffset = 0),
+            totalProgression = 0.1f,
+        )
+        val end = Locator(
+            LocatorStrategy.Section(spineIndex = 0, elementIndex = 1, charOffset = 4),
+            totalProgression = 0.11f,
+        )
+        val otherBookEntity = TextAnnotationEntity(
+            id = "annotation-other-book",
+            bookId = "book-other",
+            totalProgression = 0.1f,
+            anchorType = TEXT_ANNOTATION_ANCHOR_TYPE,
+            anchorJson = Json.encodeToString(ReaderTextAnnotationAnchor(start, end)),
+            selectedText = "别的书",
+            note = null,
+            color = 0x66FFE082,
+            createdAt = 500L,
+            updatedAt = 500L,
+            deviceId = "device-other",
+            isDeleted = false,
+        )
+        val currentBookEntity = TextAnnotationEntity(
+            id = "annotation-current",
+            bookId = "book-1",
+            totalProgression = 0.2f,
+            anchorType = TEXT_ANNOTATION_ANCHOR_TYPE,
+            anchorJson = Json.encodeToString(ReaderTextAnnotationAnchor(start, end)),
+            selectedText = "当前书",
+            note = null,
+            color = 0x66FFE082,
+            createdAt = 600L,
+            updatedAt = 600L,
+            deviceId = "device-current",
+            isDeleted = false,
+        )
+        val engine = FakeReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10)),
+        )
+        val textAnnotationDao = FakeTextAnnotationDao(listOf(otherBookEntity, currentBookEntity))
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            textAnnotationDao = textAnnotationDao,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        assertEquals(1, viewModel.uiState.value.annotations.items.size)
+
+        viewModel.onIntent(
+            ReaderIntent.RemoveAnnotation(
+                ReaderAnnotationItem(
+                    id = "missing-annotation",
+                    start = start,
+                    end = end,
+                    selectedText = "不存在",
+                    note = null,
+                    color = 0x66FFE082,
+                    totalProgression = 0.05f,
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.onIntent(
+            ReaderIntent.RemoveAnnotation(
+                ReaderAnnotationItem(
+                    id = otherBookEntity.id,
+                    start = start,
+                    end = end,
+                    selectedText = otherBookEntity.selectedText,
+                    note = null,
+                    color = otherBookEntity.color,
+                    totalProgression = otherBookEntity.totalProgression,
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        val other = textAnnotationDao.savedAnnotations("book-other").single { it.id == otherBookEntity.id }
+        assertEquals(false, other.isDeleted)
+        assertEquals(500L, other.updatedAt)
+        assertEquals("device-other", other.deviceId)
+        val current = textAnnotationDao.savedAnnotations("book-1").single { it.id == currentBookEntity.id }
+        assertEquals(false, current.isDeleted)
+        assertEquals(1, viewModel.uiState.value.annotations.items.size)
+        assertEquals(listOf("当前书"), viewModel.uiState.value.annotations.items.map { it.selectedText })
+    }
+
+    @Test
     fun `go to bookmark persists Room progress without waiting for debounce`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val target = Locator(
@@ -1625,7 +1798,7 @@ class ReaderSavedStateHandleTest {
 
         viewModel.onIntent(
             ReaderIntent.GoToSearchResult(
-                ReaderSearchResult(index = 0, locator = target),
+                ReaderSearchResult(index = 0, locator = target, matchLength = 1),
             ),
         )
         runCurrent()

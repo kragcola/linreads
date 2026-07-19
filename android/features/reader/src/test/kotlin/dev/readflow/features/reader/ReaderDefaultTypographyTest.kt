@@ -14,8 +14,8 @@ class ReaderDefaultTypographyTest {
     }
 
     @Test
-    fun `reader ui state uses the shared Moon fresh install line spacing default`() {
-        assertEquals(1.3f, ReaderTypography.DEFAULT_LINE_SPACING, 0.001f)
+    fun `reader ui state uses the shared accessible fresh install line spacing default`() {
+        assertEquals(1.6f, ReaderTypography.DEFAULT_LINE_SPACING, 0.001f)
         assertEquals(ReaderTypography.DEFAULT_LINE_SPACING, ReaderUiState().lineSpacing, 0.001f)
         assertEquals(ReaderTypography.DEFAULT_LINE_SPACING, ReaderState(bookId = "book").lineSpacing, 0.001f)
         assertEquals(ReaderTypography.DEFAULT_LINE_SPACING, ThemeProfile().lineSpacing, 0.001f)

@@ -2,6 +2,8 @@ package dev.readflow.render.md
 
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.render.api.READER_SEARCH_HIGHLIGHT_COLOR
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextAnnotation
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.cancel
@@ -67,6 +69,18 @@ class MarkdownDocumentTest {
         assertEquals(deepOffset, document.offsetFor(Locator(LocatorStrategy.Section(0, 3, 0))))
         assertEquals(bodyOffset, document.offsetFor(Locator(LocatorStrategy.ByteOffset(bodyOffset.toLong(), 0))))
         assertEquals(deepOffset, document.offsetFor(Locator(LocatorStrategy.Unknown, totalProgression = deepOffset.toFloat() / markdown.length)))
+        // PageText is foreign PDF identity — never treat index/charOffset as MD source offsets.
+        val pageTextOffset = document.offsetFor(
+            Locator(
+                strategy = LocatorStrategy.PageText(index = 99, total = 10, charOffset = 5000),
+                totalProgression = deepOffset.toFloat() / markdown.length,
+            ),
+        )
+        assertEquals(deepOffset, pageTextOffset)
+        assertEquals(
+            0,
+            document.offsetFor(Locator(LocatorStrategy.PageText(index = 99, total = 10, charOffset = 5000))),
+        )
     }
 
     @Test
@@ -77,9 +91,14 @@ class MarkdownDocumentTest {
         val results = runBlocking { document.search("intro") }
 
         assertEquals(2, results.size)
-        assertEquals(LocatorStrategy.Section(0, 1, markdown.indexOf("Intro")), results[0].strategy)
-        assertEquals(LocatorStrategy.Section(0, 4, markdown.lastIndexOf("intro")), results[1].strategy)
-        assertTrue(results[0].totalProgression!! < results[1].totalProgression!!)
+        assertEquals(LocatorStrategy.Section(0, 1, markdown.indexOf("Intro")), results[0].locator.strategy)
+        assertEquals(LocatorStrategy.Section(0, 4, markdown.lastIndexOf("intro")), results[1].locator.strategy)
+        assertTrue(results[0].locator.totalProgression!! < results[1].locator.totalProgression!!)
+        assertTrue(results[0].snippet.contains("Intro", ignoreCase = true), results[0].snippet)
+        assertTrue(results[1].snippet.contains("intro", ignoreCase = true), results[1].snippet)
+        assertFalse(results[0].snippet.contains('\n'), results[0].snippet)
+        assertEquals("intro".length, results[0].matchLength)
+        assertEquals("intro".length, results[1].matchLength)
     }
 
     @Test
@@ -185,6 +204,72 @@ class MarkdownDocumentTest {
         assertEquals(rendered.indexOf("bold"), ranges.single().start)
         assertEquals(rendered.indexOf("link") + "link".length, ranges.single().end)
         assertEquals(0x66FFE082, ranges.single().color)
+    }
+
+    @Test
+    fun `search highlight maps source start plus matchLength through rendered offsets for markup`() {
+        val markdown = "# Title\nIntro **bold** and [link](https://example.com)\n"
+        val document = MarkdownDocument.parse(markdown)
+        val rendered = "Title\nIntro bold and link\n"
+        // Match "bold" in source (inside **bold**); matchLength is source characters of the needle.
+        val sourceStart = markdown.indexOf("bold")
+        val matchLength = "bold".length
+        assertTrue(sourceStart + matchLength < markdown.indexOf("](https://example.com)"))
+
+        val range = document.searchHighlightRange(
+            hit = ReaderSearchHit(
+                locator = Locator(LocatorStrategy.Section(0, 1, sourceStart)),
+                snippet = "bold",
+                matchLength = matchLength,
+            ),
+            renderedText = rendered,
+        )!!
+
+        assertEquals(rendered.indexOf("bold"), range.start)
+        assertEquals(rendered.indexOf("bold") + "bold".length, range.end)
+        assertEquals(READER_SEARCH_HIGHLIGHT_COLOR, range.color)
+        // Source span of markdown syntax around bold is longer than rendered paint width.
+        val sourceSpanWithMarkup = markdown.indexOf("**bold**")
+        assertTrue(sourceSpanWithMarkup >= 0)
+        assertTrue(range.end - range.start == matchLength)
+    }
+
+    @Test
+    fun `search and annotation ranges stay separate when both target markup-rendered text`() {
+        val markdown = "# Title\nIntro **bold** and [link](https://example.com)\n"
+        val document = MarkdownDocument.parse(markdown)
+        val rendered = "Title\nIntro bold and link\n"
+        val annStart = markdown.indexOf("Intro")
+        val annEnd = markdown.indexOf("bold") + "bold".length
+        val searchStart = markdown.indexOf("link")
+
+        val annotations = document.highlightRanges(
+            annotations = listOf(
+                ReaderTextAnnotation(
+                    id = "a1",
+                    start = Locator(LocatorStrategy.Section(0, 1, annStart)),
+                    end = Locator(LocatorStrategy.Section(0, 1, annEnd)),
+                    selectedText = "Intro bold",
+                    note = null,
+                    color = 0x66FFE082,
+                ),
+            ),
+            renderedText = rendered,
+        )
+        val search = document.searchHighlightRange(
+            hit = ReaderSearchHit(
+                locator = Locator(LocatorStrategy.Section(0, 1, searchStart)),
+                snippet = "link",
+                matchLength = 4,
+            ),
+            renderedText = rendered,
+        )!!
+
+        assertEquals(1, annotations.size)
+        assertEquals(0x66FFE082, annotations.single().color)
+        assertEquals(READER_SEARCH_HIGHLIGHT_COLOR, search.color)
+        assertEquals(rendered.indexOf("link"), search.start)
+        assertEquals(rendered.indexOf("link") + 4, search.end)
     }
 
     @Test

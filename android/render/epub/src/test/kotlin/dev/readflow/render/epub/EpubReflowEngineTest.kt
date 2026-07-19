@@ -6,12 +6,14 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.ColorFilter
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Looper
 import android.os.SystemClock
 import android.text.Spanned
+import android.text.TextPaint
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -28,6 +30,8 @@ import dev.readflow.core.model.ReaderTypographyRange
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.ReaderSearchHighlightSpan
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightRange
 import kotlinx.coroutines.launch
@@ -41,13 +45,16 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableSpan
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Rule
@@ -86,7 +93,11 @@ class EpubReflowEngineTest {
             flowEngineEnabled = true,
         )
 
-        assertEquals(18f, engine.privateField("fontSizeSp") as Float, 0.001f)
+        assertEquals(
+            ReaderTypographyRange.DEFAULT_FONT_SIZE.toFloat(),
+            engine.privateField("fontSizeSp") as Float,
+            0.001f,
+        )
         assertEquals(
             ReaderTypographyRange.DEFAULT_LINE_SPACING,
             engine.privateField("lineSpacingMultiplier") as Float,
@@ -186,6 +197,101 @@ class EpubReflowEngineTest {
         assertEquals("theme change must keep the host transparent so press/turn layers reveal the same paper", null, host.background)
         assertNotNull("theme change must keep flow paper background", flowView.background)
         assertTrue("flow background should refresh with theme", flowView.background !== initialFlowBackground)
+    }
+
+    @Test
+    fun `production default createView is Flow with selfPaging and not legacy page factory`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            // Default constructor follows EPUB_FLOW_ENGINE_ENABLED=true. Hosts that honor
+            // SelfPagingReaderEngine never bind createPageView (sync BitmapFactory path) in production.
+            val context = RuntimeEnvironment.getApplication() as Application
+            val engine = EpubReflowEngine(context)
+
+            assertTrue(
+                "default engine must keep the continuous-flow flag on",
+                engine.privateField("flowEngineEnabled") as Boolean,
+            )
+            assertTrue(
+                "selfPagingActive must match the Flow host contract so ReaderScreen skips ViewPager pages",
+                engine.selfPagingActive,
+            )
+
+            engine.setMode(ReadingMode.PAGED)
+            val host = engine.createView() as FrameLayout
+            assertTrue(
+                "createView() production path must install EpubFlowView, not legacy RecyclerView/page slices",
+                host.getChildAt(0) is EpubFlowView,
+            )
+            assertFalse(
+                "default host surface must not be the legacy SCROLL recycler",
+                host.getChildAt(0) is androidx.recyclerview.widget.RecyclerView,
+            )
+        }
+
+    @Test
+    fun `flow image loader full-pixel decode stays off main thread`() {
+        // Prove the production async loader (not legacy createPageView) owns full-pixel decode.
+        EpubImageDecodeProbe.reset()
+        val epub = tempDir.newFile("flow-async-decode-off-main.epub")
+        writeImageEpub(epub)
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 360,
+                pageHeightProvider = { 640 },
+                inlineMaxHeightPx = 360,
+                fullPageHrefs = emptySet(),
+            )
+            val drawable = AsyncDrawable(
+                "image.png",
+                loader,
+                EpubFlowImageSizeResolver(
+                    columnWidthPx = 360,
+                    pageHeightProvider = { 640 },
+                    inlineMaxHeightPx = 360,
+                    fullPageHrefs = emptySet(),
+                ),
+                null,
+            )
+            // Attach so postDecodeResult may install the BitmapDrawable; full decode still runs on executor.
+            drawable.setCallback2(object : android.graphics.drawable.Drawable.Callback {
+                override fun invalidateDrawable(who: android.graphics.drawable.Drawable) = Unit
+                override fun scheduleDrawable(
+                    who: android.graphics.drawable.Drawable,
+                    what: Runnable,
+                    `when`: Long,
+                ) = Unit
+                override fun unscheduleDrawable(
+                    who: android.graphics.drawable.Drawable,
+                    what: Runnable,
+                ) = Unit
+            })
+            drawable.setBounds(0, 0, 120, 80)
+            val mainBefore = EpubImageDecodeProbe.fullDecodeMainThread()
+            loader.load(drawable)
+            executor.shutdown()
+            assertTrue(
+                "worker decode should finish in the unit-test window",
+                executor.awaitTermination(5, TimeUnit.SECONDS),
+            )
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(
+                "async loader must eventually full-decode the zip image",
+                EpubImageDecodeProbe.fullDecodeTotal() >= 1,
+            )
+            assertEquals(
+                "full-pixel decode must run on the loader executor, not the main/UI thread",
+                mainBefore,
+                EpubImageDecodeProbe.fullDecodeMainThread(),
+            )
+            loader.releaseAll()
+        } finally {
+            if (!executor.isShutdown) executor.shutdownNow()
+            EpubImageDecodeProbe.stop()
+        }
     }
 
     @Test
@@ -931,7 +1037,11 @@ class EpubReflowEngineTest {
             }
             val results = pendingSearch.await()
             assertEquals(1, results.size)
-            assertEquals(1, (results.single().strategy as LocatorStrategy.Section).spineIndex)
+            assertEquals(1, (results.single().locator.strategy as LocatorStrategy.Section).spineIndex)
+            assertTrue(
+                "search hit must include the matched paragraph snippet",
+                results.single().snippet.contains("Unique cold search needle"),
+            )
             engine.close()
         }
 
@@ -1592,6 +1702,104 @@ class EpubReflowEngineTest {
             "12x12 marker must stay inline via placement tag or composite inline constraints",
             placement == EpubImagePlacement.Inline || imageView?.adjustViewBounds == true,
         )
+    }
+
+    @Test
+    fun `paged composite text views paint search highlight spans for segment hits`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("composite-search-highlight.epub")
+        writeImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val hits = engine.search("Before")
+        assertTrue("search must find Before image text", hits.isNotEmpty())
+        val hit = hits.first()
+
+        val compositePage = (0 until engine.pageCount.value)
+            .map { engine.createPageView(it) }
+            .firstOrNull { page ->
+                val slice = page.tag as? EpubPageSlice
+                slice != null && slice.elements.isNotEmpty()
+            }
+        assertNotNull("expected a composite page for short text + small image", compositePage)
+        val textViews = collectViews(compositePage!!, android.widget.TextView::class.java)
+        assertTrue("composite page must expose TextViews", textViews.isNotEmpty())
+
+        engine.setSearchHighlight(hit)
+        idleMainLooper()
+
+        fun searchSpansOn(page: android.view.View) =
+            collectViews(page, android.widget.TextView::class.java).flatMap { tv ->
+                val spanned = tv.text as? Spanned ?: return@flatMap emptyList()
+                spanned.getSpans(0, spanned.length, ReaderSearchHighlightSpan::class.java).toList()
+            }
+        assertTrue(
+            "composite text must carry ReaderSearchHighlightSpan after setSearchHighlight",
+            searchSpansOn(compositePage).isNotEmpty(),
+        )
+
+        // Rebind path (refreshBoundHighlightSurfaces → rebindActiveCompositePage) must repaint.
+        engine.setSearchHighlight(hit)
+        idleMainLooper()
+        assertTrue(
+            "rebinding composite must keep search highlight spans",
+            searchSpansOn(compositePage).isNotEmpty(),
+        )
+
+        engine.setSearchHighlight(null)
+        idleMainLooper()
+        assertTrue(
+            "clearing search highlight must drop composite spans",
+            searchSpansOn(compositePage).isEmpty(),
+        )
+    }
+
+    @Test
+    fun `paged image caption paints search highlight and rebind refreshes it`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("caption-search-highlight.epub")
+        writeHeadingCaptionImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context)
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val hits = engine.search("图版标题")
+        assertTrue(hits.isNotEmpty())
+        val hit = hits.first()
+
+        val captionPage = (0 until engine.pageCount.value)
+            .map { engine.createPageView(it) }
+            .firstOrNull { page ->
+                collectViews(page, android.widget.TextView::class.java).any {
+                    it.text?.toString()?.contains("图版标题") == true
+                }
+            }
+        assertNotNull(captionPage)
+        fun captionSearchSpans(page: android.view.View) =
+            collectViews(page, android.widget.TextView::class.java)
+                .filter { it.text?.toString()?.contains("图版标题") == true }
+                .flatMap { tv ->
+                    val spanned = tv.text as? Spanned ?: return@flatMap emptyList()
+                    spanned.getSpans(0, spanned.length, ReaderSearchHighlightSpan::class.java).toList()
+                }
+        assertTrue(
+            "caption page must expose the heading TextView before highlight",
+            collectViews(captionPage!!, android.widget.TextView::class.java).any {
+                it.text?.toString()?.contains("图版标题") == true
+            },
+        )
+
+        engine.setSearchHighlight(hit)
+        idleMainLooper()
+        assertTrue("image caption TextView must paint search highlight", captionSearchSpans(captionPage).isNotEmpty())
+
+        engine.setSearchHighlight(hit)
+        idleMainLooper()
+        assertTrue("caption rebind must keep search highlight", captionSearchSpans(captionPage).isNotEmpty())
     }
 
     @Test
@@ -4649,6 +4857,136 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `flow production path applies CSS font replacement then embedded after prewarm`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("flow-css-font-production.epub")
+            writeFontEmbeddedEpub(epub)
+            val context = RuntimeEnvironment.getApplication() as Application
+            val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+            engine.openBook(Uri.fromFile(epub))
+            engine.setMode(ReadingMode.PAGED)
+            val host = engine.createView() as FrameLayout
+            idleMainLooper()
+            runCurrent()
+            val flowView = host.getChildAt(0) as EpubFlowView
+
+            // (a) Production flow install exposes the CSS @font-face family from the real zip.
+            val bookFonts = engine.privateField("flowBookFontMap") as EpubBookFontMap
+            val face = bookFonts.faceForFamily("Story")
+            assertNotNull(
+                "parser must surface @font-face Story into the installed flow book map",
+                face,
+            )
+            val cache = engine.privateField("bookFontTypefaceCache") as EpubBookFontTypefaceCache
+            assertNotNull(cache)
+
+            // (b) Async prewarm fills the cache; idle drain rebuilds with EpubTypefaceSpan.
+            // Do not null cacheScope or assert a cold TextView state — createView/loadFlowChapter
+            // may race with prewarm; existing EpubFlowSpannableTest covers resolver-null omission.
+            awaitCondition("embedded face must be prewarmed into the book cache") {
+                cache.typefaceFor(face!!) != null
+            }
+            val embedded = cache.typefaceFor(face!!)
+            assertNotNull(embedded)
+            // If prewarm finished while a page mutation was in flight, drain once at idle.
+            if (flowTypefaceSpans(flowView).isEmpty()) {
+                engine.invokePrivate("tryDrainPendingFontPrewarmRebuild")
+                idleMainLooper()
+                runCurrent()
+            }
+            awaitCondition("prewarm rebuild must install an EpubTypefaceSpan on the CSS family span") {
+                flowTypefaceSpans(flowView).any { epubTypefaceSpanBase(it) === embedded }
+            }
+            val hotSpan = flowTypefaceSpans(flowView).single {
+                epubTypefaceSpanBase(it) === embedded
+            }
+            val measurePaint = TextPaint()
+            val drawPaint = TextPaint()
+            hotSpan.updateMeasureState(measurePaint)
+            hotSpan.updateDrawState(drawPaint)
+            assertSame(
+                "measure and draw must share the same resolved typeface instance",
+                measurePaint.typeface,
+                drawPaint.typeface,
+            )
+            assertNotNull(measurePaint.typeface)
+
+            // (c) Replacement-first: configured family map wins over the warm embedded face.
+            engine.setEpubFontReplacements(mapOf("Story" to "system_sans"))
+            idleMainLooper()
+            runCurrent()
+            assertEquals(
+                mapOf("story" to "system_sans"),
+                engine.privateField("epubFontReplacementIds"),
+            )
+            @Suppress("UNCHECKED_CAST")
+            val loadedReplacements =
+                engine.privateField("epubFontReplacementTypefaces") as Map<String, Typeface>
+            val configuredSans = loadedReplacements["system_sans"]
+            assertNotNull(
+                "setEpubFontReplacements must load system_sans into the replacement typeface map",
+                configuredSans,
+            )
+            assertEquals(
+                "replacement id system_sans must map to FontProvider SANS_SERIF base",
+                Typeface.SANS_SERIF,
+                configuredSans,
+            )
+            val replacementSpan = flowTypefaceSpans(flowView).single()
+            assertSame(
+                "replacement-first must win over a warm embedded face",
+                configuredSans,
+                epubTypefaceSpanBase(replacementSpan),
+            )
+            assertNotSame(
+                "with a valid replacement loaded, the span must not keep the prewarmed embedded face",
+                embedded,
+                epubTypefaceSpanBase(replacementSpan),
+            )
+            val replacementMeasure = TextPaint()
+            val replacementDraw = TextPaint()
+            replacementSpan.updateMeasureState(replacementMeasure)
+            replacementSpan.updateDrawState(replacementDraw)
+            assertSame(
+                "replacement must apply the same typeface to measure and draw",
+                replacementMeasure.typeface,
+                replacementDraw.typeface,
+            )
+            val replacementMeasureAgain = TextPaint()
+            replacementSpan.updateMeasureState(replacementMeasureAgain)
+            assertSame(
+                "replacement span style cache must reuse the same typeface across measure passes",
+                replacementMeasure.typeface,
+                replacementMeasureAgain.typeface,
+            )
+
+            // (d) Clearing replacement restores the warm embedded face (no system-only fallback).
+            engine.setEpubFontReplacements(emptyMap())
+            idleMainLooper()
+            runCurrent()
+            assertTrue(
+                "clearing replacements must keep the warm embedded face available",
+                cache.typefaceFor(face) != null,
+            )
+            val restoredSpan = flowTypefaceSpans(flowView).single()
+            assertSame(
+                "clearing replacements must re-apply the prewarmed embedded face (not system fallback)",
+                embedded,
+                epubTypefaceSpanBase(restoredSpan),
+            )
+            // (e) measure and draw apply equivalent styled typefaces after restore.
+            val restoredMeasure = TextPaint()
+            val restoredDraw = TextPaint()
+            restoredSpan.updateMeasureState(restoredMeasure)
+            restoredSpan.updateDrawState(restoredDraw)
+            assertSame(restoredMeasure.typeface, restoredDraw.typeface)
+            assertNotNull(restoredMeasure.typeface)
+
+            engine.close()
+        }
+
+    @Test
     fun `flow executor shuts down on close and recreates safely on reuse`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("flow-executor-lifecycle.epub")
@@ -4918,6 +5256,16 @@ class EpubReflowEngineTest {
         return null
     }
 
+    private fun <T : android.view.View> collectViews(view: android.view.View, type: Class<T>): List<T> {
+        val found = mutableListOf<T>()
+        if (type.isInstance(view)) type.cast(view)?.let { found += it }
+        val group = view as? ViewGroup ?: return found
+        for (index in 0 until group.childCount) {
+            found += collectViews(group.getChildAt(index), type)
+        }
+        return found
+    }
+
     private fun oneCharacterPerLineMeasurer() =
         EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
             text.indices.map { index -> EpubTextLayoutLineRange(index, index + 1) }
@@ -5042,6 +5390,90 @@ class EpubReflowEngineTest {
         assertTrue(message, condition())
     }
 
+    private fun flowTypefaceSpans(flowView: EpubFlowView): List<EpubTypefaceSpan> {
+        val text = flowView.textView.text as? Spanned ?: return emptyList()
+        return text.getSpans(0, text.length, EpubTypefaceSpan::class.java).toList()
+    }
+
+    /** Base Typeface stored on [EpubTypefaceSpan] (before per-style Typeface.create). */
+    private fun epubTypefaceSpanBase(span: EpubTypefaceSpan): Typeface {
+        val field = EpubTypefaceSpan::class.java.getDeclaredField("typeface")
+        field.isAccessible = true
+        return field.get(span) as Typeface
+    }
+
+    /**
+     * Minimal real-zip EPUB with CSS @font-face + a non-generic family span, using a real TTF so
+     * [EpubBookFontTypefaceCache] can prewarm through Typeface.createFromFile.
+     */
+    private fun writeFontEmbeddedEpub(file: File) {
+        val fontBytes = sampleEmbeddedFontBytes()
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+
+            fun addText(path: String, content: String) = add(path, content.toByteArray(Charsets.UTF_8))
+
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="c0" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="font" href="fonts/story.ttf" media-type="font/ttf"/>
+                      </manifest>
+                      <spine><itemref idref="c0"/></spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <head>
+                        <style>
+                          @font-face {
+                            font-family: "Story";
+                            src: url("fonts/story.ttf") format("truetype");
+                          }
+                          .story { font-family: "Story", serif; }
+                        </style>
+                      </head>
+                      <body>
+                        <p class="story">Embedded CSS font production path.</p>
+                      </body>
+                    </html>
+                """.trimIndent(),
+            )
+            add("OEBPS/fonts/story.ttf", fontBytes)
+        }
+    }
+
+    private fun sampleEmbeddedFontBytes(): ByteArray {
+        val candidates = listOf(
+            File("references/episteme/app/src/main/assets/fonts/lato.ttf"),
+            File("../references/episteme/app/src/main/assets/fonts/lato.ttf"),
+            File("../../references/episteme/app/src/main/assets/fonts/lato.ttf"),
+            File("/Volumes/OmubotDisk/readflow/references/episteme/app/src/main/assets/fonts/lato.ttf"),
+        )
+        val file = candidates.firstOrNull { it.isFile }
+            ?: error("sample TTF missing; expected references/episteme/.../lato.ttf")
+        return file.readBytes()
+    }
+
     private fun writeEpub(file: File, vararg spineEntries: Pair<String, String>) {
         ZipOutputStream(file.outputStream()).use { zip ->
             fun add(path: String, content: String) {
@@ -5133,6 +5565,65 @@ class EpubReflowEngineTest {
                 """.trimIndent(),
             )
             add("OEBPS/image.png", imageBytes)
+        }
+    }
+
+    /** Heading immediately before a large plate so pagination stacks the title as an image caption. */
+    private fun writeHeadingCaptionImageEpub(file: File) {
+        val imageBytes = ByteArrayOutputStream().use { output ->
+            Bitmap.createBitmap(800, 1200, Bitmap.Config.ARGB_8888).let { bitmap ->
+                try {
+                    bitmap.eraseColor(0xFF336699.toInt())
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                    output.toByteArray()
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+        }
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+
+            fun addText(path: String, content: String) = add(path, content.toByteArray(Charsets.UTF_8))
+
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="c0" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="plate" href="plate.png" media-type="image/png"/>
+                      </manifest>
+                      <spine><itemref idref="c0"/></spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                """
+                    <html xmlns="http://www.w3.org/1999/xhtml">
+                      <body>
+                        <h2>图版标题</h2>
+                        <p><img src="plate.png" alt="plate"/></p>
+                      </body>
+                    </html>
+                """.trimIndent(),
+            )
+            add("OEBPS/plate.png", imageBytes)
         }
     }
 

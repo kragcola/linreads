@@ -121,6 +121,20 @@ class ReaderScreenPaperInsetsVisualContractTest {
             appearanceBlock.contains("SideEffect"),
         )
         assertTrue(
+            "focus/attach re-apply must be installed so OEM focus-return scrim is cleared " +
+                "without waiting for a Compose recomposition",
+            appearanceBlock.contains("installReaderSystemBarReapply") &&
+                source.contains("fun installReaderSystemBarReapply") &&
+                source.contains("class ReaderSystemBarReapplySession") &&
+                source.contains("OnWindowFocusChangeListener") &&
+                source.contains("OnAttachStateChangeListener"),
+        )
+        assertTrue(
+            "window apply must be a testable internal function used by SideEffect and re-apply",
+            source.contains("fun applyReaderSystemBars") &&
+                appearanceBlock.contains("applyReaderSystemBars"),
+        )
+        assertTrue(
             "onDispose must restore prior statusBarColor",
             appearanceBlock.contains("statusBarColor = previousStatusBarColor") ||
                 appearanceBlock.contains("window.statusBarColor = previousStatusBarColor"),

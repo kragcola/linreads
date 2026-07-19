@@ -10,6 +10,8 @@ import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
+import android.view.Window
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
@@ -58,6 +60,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -126,11 +129,19 @@ enum class ReaderFeature(val label: String) {
     THEME("主题"),
 }
 
-internal fun readerFeaturesFor(engine: ReaderEngine): Set<ReaderFeature> = buildSet {
+internal fun readerFeaturesFor(
+    engine: ReaderEngine,
+    hasSavedAnnotations: Boolean = false,
+): Set<ReaderFeature> = buildSet {
     add(ReaderFeature.TOC)
     if (engine.supportsSearch) add(ReaderFeature.SEARCH)
     add(ReaderFeature.BOOKMARKS)
-    if (engine is TextAnnotatableReaderEngine) add(ReaderFeature.ANNOTATIONS)
+    // Creation needs selection; list/jump/delete of saved rows does not.
+    if (engine is TextAnnotatableReaderEngine &&
+        (engine.supportsTextAnnotationCreation || hasSavedAnnotations)
+    ) {
+        add(ReaderFeature.ANNOTATIONS)
+    }
     add(ReaderFeature.PROGRESS)
     if (ReadingMode.SCROLL in engine.supportedModes) add(ReaderFeature.FONT)
     add(ReaderFeature.THEME)
@@ -169,23 +180,118 @@ internal fun pageFlipStyleToTransitionType(style: dev.readflow.core.model.PageFl
         dev.readflow.core.model.PageFlipStyle.NONE -> TransitionType.NONE
     }
 
+/** Transparent status/nav, contrast-off, palette-driven icons. No hide/immersive/padding. */
+internal fun applyReaderSystemBars(window: Window, view: View, lightBars: Boolean) {
+    val controller = WindowCompat.getInsetsController(window, view)
+    @Suppress("DEPRECATION")
+    window.statusBarColor = android.graphics.Color.TRANSPARENT
+    @Suppress("DEPRECATION")
+    window.navigationBarColor = android.graphics.Color.TRANSPARENT
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+        window.isNavigationBarContrastEnforced = false
+        window.setStatusBarContrastEnforced(false)
+    }
+    controller.isAppearanceLightStatusBars = lightBars
+    controller.isAppearanceLightNavigationBars = lightBars
+}
+
 /**
- * Reader-scoped edge-to-edge system bars.
+ * Re-applies reader bar chrome on focus gain / attach.
  *
- * Root cause of the foreign top band: after [androidx.activity.enableEdgeToEdge], OEMs / API 29+
- * may still paint a solid status-bar contrast scrim, and residual [Window.statusBarColor] can sit
- * above the paper. Content is already edge-to-edge (paper full-bleed); this only clears scrims and
- * drives icon light/dark from the reader paper palette. Status bar is never hidden.
+ * Focus listeners must be unbound from the **exact** [ViewTreeObserver] they were added to.
+ * Detach can replace the view's observer; removing via the current [View.viewTreeObserver] is a
+ * no-op leak, and the new observer never receives focus until re-registered.
  *
- * Scoped to the reader: prior colors / contrast / icon appearance are restored on leave so library
- * and settings keep their own bar treatment.
+ * [onWindowFocusChanged] / [onViewAttachedToWindow] remain callable for Window-level tests.
+ */
+internal class ReaderSystemBarReapplySession(
+    private val window: Window,
+    private val view: View,
+    private val lightBars: () -> Boolean,
+) {
+    /** Observer that currently owns [focusListener]; never remove from a different instance. */
+    private var registeredFocusObserver: ViewTreeObserver? = null
+
+    private val focusListener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+        onWindowFocusChanged(hasFocus)
+    }
+
+    private val attachListener = object : View.OnAttachStateChangeListener {
+        override fun onViewAttachedToWindow(v: View) {
+            registerFocusListener()
+            onViewAttachedToWindow()
+        }
+
+        override fun onViewDetachedFromWindow(v: View) {
+            unregisterFocusListener()
+        }
+    }
+
+    fun reapply() {
+        applyReaderSystemBars(window, view, lightBars())
+    }
+
+    fun onWindowFocusChanged(hasFocus: Boolean) {
+        if (hasFocus) reapply()
+    }
+
+    fun onViewAttachedToWindow() {
+        reapply()
+    }
+
+    private var attachRegistered = false
+
+    /** @return disposer for [DisposableEffect] onDispose (before window restore). */
+    fun install(): () -> Unit {
+        if (!attachRegistered) {
+            if (view.isAttachedToWindow) {
+                registerFocusListener()
+            }
+            view.addOnAttachStateChangeListener(attachListener)
+            attachRegistered = true
+        }
+        return {
+            if (attachRegistered) {
+                unregisterFocusListener()
+                view.removeOnAttachStateChangeListener(attachListener)
+                attachRegistered = false
+            }
+        }
+    }
+
+    private fun registerFocusListener() {
+        val observer = view.viewTreeObserver
+        if (!observer.isAlive) return
+        if (registeredFocusObserver === observer) return
+        unregisterFocusListener()
+        observer.addOnWindowFocusChangeListener(focusListener)
+        registeredFocusObserver = observer
+    }
+
+    private fun unregisterFocusListener() {
+        val observer = registeredFocusObserver ?: return
+        if (observer.isAlive) {
+            observer.removeOnWindowFocusChangeListener(focusListener)
+        }
+        registeredFocusObserver = null
+    }
+}
+
+internal fun installReaderSystemBarReapply(
+    window: Window,
+    view: View,
+    lightBars: () -> Boolean,
+): () -> Unit = ReaderSystemBarReapplySession(window, view, lightBars).install()
+
+/**
+ * Reader-scoped edge-to-edge system bars: clear OEM scrims, palette icons, never hide bars.
+ * Focus/attach re-apply covers OEM rewrites without Compose recomposition. Restores on leave.
  */
 @Composable
 private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean) {
     val view = LocalView.current
     val lightBars = !readerPaletteFor(themeMode, systemNight).isNight
-    // Capture prior window state once; restore on leave. Continuous re-apply lives in SideEffect
-    // so a later system/OEM write cannot leave a solid foreign band over paper.
+    val lightBarsState = rememberUpdatedState(lightBars)
     DisposableEffect(view) {
         val window = view.context.findActivity()?.window
         if (window == null) {
@@ -210,7 +316,10 @@ private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean
                 } else {
                     false
                 }
+            val uninstallReapply = installReaderSystemBarReapply(window, view) { lightBarsState.value }
+            applyReaderSystemBars(window, view, lightBarsState.value)
             onDispose {
+                uninstallReapply()
                 @Suppress("DEPRECATION")
                 window.statusBarColor = previousStatusBarColor
                 @Suppress("DEPRECATION")
@@ -226,19 +335,7 @@ private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean
     }
     SideEffect {
         val window = view.context.findActivity()?.window ?: return@SideEffect
-        val controller = WindowCompat.getInsetsController(window, view)
-        // Paper must show through; keep icons visible via lightBars, never hide the status bar.
-        @Suppress("DEPRECATION")
-        window.statusBarColor = android.graphics.Color.TRANSPARENT
-        @Suppress("DEPRECATION")
-        window.navigationBarColor = android.graphics.Color.TRANSPARENT
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-            window.isNavigationBarContrastEnforced = false
-            // Direct API (compileSdk 36): disable the flat status scrim that creates a foreign band.
-            window.setStatusBarContrastEnforced(false)
-        }
-        controller.isAppearanceLightStatusBars = lightBars
-        controller.isAppearanceLightNavigationBars = lightBars
+        applyReaderSystemBars(window, view, lightBars)
     }
 }
 
@@ -281,8 +378,14 @@ fun ReaderScreen(
                 if (engine == null) {
                     Text("无内容", color = MaterialTheme.colorScheme.onBackground)
                 } else {
-                    val availableFeatures = remember(engine, features) {
-                        features.intersect(readerFeaturesFor(engine))
+                    // Keep ANNOTATIONS while panel is open even after last row is deleted;
+                    // after close, empty list can hide the command again.
+                    val hasSavedAnnotations = state.annotations.items.isNotEmpty() ||
+                        state.activePanel == ReaderPanel.ANNOTATIONS
+                    val availableFeatures = remember(engine, features, hasSavedAnnotations) {
+                        features.intersect(
+                            readerFeaturesFor(engine, hasSavedAnnotations = hasSavedAnnotations),
+                        )
                     }
                     val pagingKind by engine.pagingKind.collectAsState()
                     val hostKind = readerHostKindFor(engine, pagingKind)
@@ -413,6 +516,21 @@ fun ReaderScreen(
                         )
                     }
 
+                    // Host-level bookmark rail (SCROLL + PAGED): trailing markers only when items exist.
+                    if (state.bookmarks.items.isNotEmpty()) {
+                        ReaderBookmarkRail(
+                            bookmarkState = state.bookmarks,
+                            onBookmarkClick = { viewModel.onIntent(ReaderIntent.GoToBookmark(it)) },
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .windowInsetsPadding(WindowInsets.systemBars)
+                                .padding(end = 4.dp)
+                                // Keep clear of bottom control panel / chrome.
+                                .padding(bottom = (bottomChromeHeightDp + 72.dp).coerceAtLeast(96.dp))
+                                .padding(top = 56.dp),
+                        )
+                    }
+
                     // ── Compact floating top chrome ──
                     AnimatedVisibility(
                         visible = state.isUiVisible,
@@ -493,9 +611,12 @@ fun ReaderScreen(
                         onBookmarkClick = { viewModel.onIntent(ReaderIntent.GoToBookmark(it)) },
                         onBookmarkRemove = { viewModel.onIntent(ReaderIntent.RemoveBookmark(it)) },
                         onAnnotationClick = { viewModel.onIntent(ReaderIntent.GoToAnnotation(it)) },
+                        onAnnotationRemove = { viewModel.onIntent(ReaderIntent.RemoveAnnotation(it)) },
                         onSearchQueryChange = { viewModel.onIntent(ReaderIntent.SetSearchQuery(it)) },
                         onSearchSubmit = { viewModel.onIntent(ReaderIntent.SubmitSearch) },
                         onSearchResultClick = { viewModel.onIntent(ReaderIntent.GoToSearchResult(it)) },
+                        onSearchPrevious = { viewModel.onIntent(ReaderIntent.GoToPreviousSearchResult) },
+                        onSearchNext = { viewModel.onIntent(ReaderIntent.GoToNextSearchResult) },
                         onSearchClear = { viewModel.onIntent(ReaderIntent.ClearSearch) },
                         onFontSizeChange = { viewModel.onIntent(ReaderIntent.SetFontSize(it)) },
                         onLineSpacingChange = { viewModel.onIntent(ReaderIntent.SetLineSpacing(it)) },
@@ -683,6 +804,52 @@ fun ReaderScreen(
     }
 }
 
+/**
+ * Compact trailing bookmark rail. Host-level (SCROLL + PAGED), narrow, non-blocking.
+ * Click jumps via [onBookmarkClick] only — does not mutate bookmark state.
+ */
+@Composable
+private fun ReaderBookmarkRail(
+    bookmarkState: ReaderBookmarkState,
+    onBookmarkClick: (ReaderBookmarkItem) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .width(48.dp)
+            .heightIn(max = 280.dp)
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(0.dp),
+    ) {
+        bookmarkState.items.forEach { bookmark ->
+            val isCurrent = bookmark.id == bookmarkState.currentBookmarkId
+            IconButton(
+                onClick = { onBookmarkClick(bookmark) },
+                modifier = Modifier
+                    .size(48.dp)
+                    .semantics {
+                        contentDescription = bookmark.accessibilityLabel(isCurrent = isCurrent)
+                    },
+            ) {
+                Icon(
+                    imageVector = if (isCurrent) {
+                        Icons.Default.Bookmark
+                    } else {
+                        Icons.Default.BookmarkBorder
+                    },
+                    contentDescription = null,
+                    tint = if (isCurrent) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f)
+                    },
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun ReaderControlPanel(
     panel: ReaderPanel?,
@@ -699,9 +866,12 @@ private fun ReaderControlPanel(
     onBookmarkClick: (ReaderBookmarkItem) -> Unit,
     onBookmarkRemove: (ReaderBookmarkItem) -> Unit,
     onAnnotationClick: (ReaderAnnotationItem) -> Unit,
+    onAnnotationRemove: (ReaderAnnotationItem) -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSearchSubmit: () -> Unit,
     onSearchResultClick: (ReaderSearchResult) -> Unit,
+    onSearchPrevious: () -> Unit,
+    onSearchNext: () -> Unit,
     onSearchClear: () -> Unit,
     onFontSizeChange: (Float) -> Unit,
     onLineSpacingChange: (Float) -> Unit,
@@ -764,12 +934,15 @@ private fun ReaderControlPanel(
                     ReaderPanel.ANNOTATIONS -> AnnotationPanel(
                         annotationState = annotationState,
                         onAnnotationClick = onAnnotationClick,
+                        onAnnotationRemove = onAnnotationRemove,
                     )
                     ReaderPanel.SEARCH -> SearchPanel(
                         searchState = searchState,
                         onQueryChange = onSearchQueryChange,
                         onSubmit = onSearchSubmit,
                         onResultClick = onSearchResultClick,
+                        onPreviousResult = onSearchPrevious,
+                        onNextResult = onSearchNext,
                         onClear = onSearchClear,
                     )
                     ReaderPanel.FONT -> ReaderTypographyPanel(
@@ -859,7 +1032,10 @@ private fun BookmarkPanel(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text("书签", style = MaterialTheme.typography.titleSmall)
+        Text(
+            text = "书签（${bookmarkState.items.size}）",
+            style = MaterialTheme.typography.titleSmall,
+        )
         if (bookmarkState.items.isEmpty()) {
             Text(
                 "暂无书签",
@@ -869,8 +1045,12 @@ private fun BookmarkPanel(
             )
         } else {
             LazyColumn {
-                items(bookmarkState.items) { bookmark ->
+                items(
+                    items = bookmarkState.items,
+                    key = { it.id },
+                ) { bookmark ->
                     val isCurrent = bookmark.id == bookmarkState.currentBookmarkId
+                    val detail = readerBookmarkDetailLabel(bookmark)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -883,7 +1063,11 @@ private fun BookmarkPanel(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Bookmark,
+                            imageVector = if (isCurrent) {
+                                Icons.Default.Bookmark
+                            } else {
+                                Icons.Default.BookmarkBorder
+                            },
                             contentDescription = null,
                             tint = if (isCurrent) {
                                 MaterialTheme.colorScheme.primary
@@ -891,15 +1075,28 @@ private fun BookmarkPanel(
                                 MaterialTheme.colorScheme.onSurfaceVariant
                             },
                         )
-                        Text(
-                            text = bookmark.label,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            maxLines = 1,
+                        Column(
                             modifier = Modifier
                                 .weight(1f)
-                                .padding(horizontal = 8.dp, vertical = 14.dp),
-                        )
+                                .padding(horizontal = 8.dp, vertical = 10.dp),
+                        ) {
+                            Text(
+                                text = bookmark.label,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (detail != null) {
+                                Text(
+                                    text = detail,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
                         if (isCurrent) {
                             // Visible non-color cue; TalkBack uses row contentDescription (…，当前).
                             Text(
@@ -929,6 +1126,7 @@ private fun BookmarkPanel(
 private fun AnnotationPanel(
     annotationState: ReaderAnnotationState,
     onAnnotationClick: (ReaderAnnotationItem) -> Unit,
+    onAnnotationRemove: (ReaderAnnotationItem) -> Unit,
 ) {
     Column(
         modifier = Modifier
@@ -937,7 +1135,10 @@ private fun AnnotationPanel(
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text("标注", style = MaterialTheme.typography.titleSmall)
+        Text(
+            text = "标注（${annotationState.items.size}）",
+            style = MaterialTheme.typography.titleSmall,
+        )
         if (annotationState.items.isEmpty()) {
             Text(
                 "暂无标注",
@@ -947,8 +1148,11 @@ private fun AnnotationPanel(
             )
         } else {
             LazyColumn {
-                items(annotationState.items) { annotation ->
-                    Column(
+                items(
+                    items = annotationState.items,
+                    key = { it.id },
+                ) { annotation ->
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
@@ -956,20 +1160,38 @@ private fun AnnotationPanel(
                                 contentDescription = annotation.accessibilityLabel()
                             }
                             .clickable { onAnnotationClick(annotation) }
-                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(
-                            text = annotation.selectedText.trim().replace('\n', ' '),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            maxLines = 2,
-                        )
-                        annotation.note?.let { note ->
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(horizontal = 0.dp, vertical = 10.dp),
+                        ) {
                             Text(
-                                text = note,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
+                                text = annotation.selectedText.trim().replace('\n', ' '),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            annotation.note?.let { note ->
+                                Text(
+                                    text = note,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                        IconButton(
+                            onClick = { onAnnotationRemove(annotation) },
+                            modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
+                        ) {
+                            Icon(
+                                Icons.Default.Clear,
+                                contentDescription = annotation.deleteAccessibilityLabel(),
                             )
                         }
                     }
@@ -985,6 +1207,8 @@ private fun SearchPanel(
     onQueryChange: (String) -> Unit,
     onSubmit: () -> Unit,
     onResultClick: (ReaderSearchResult) -> Unit,
+    onPreviousResult: () -> Unit,
+    onNextResult: () -> Unit,
     onClear: () -> Unit,
 ) {
     Column(
@@ -1042,23 +1266,53 @@ private fun SearchPanel(
             )
         }
         if (searchState.results.isNotEmpty()) {
-            Text(
-                text = "${searchState.results.size} 个结果",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            val current = searchState.selectedIndex?.plus(1) ?: 0
+            val total = searchState.results.size
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "$total 个结果",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                )
+                Text(
+                    text = "$current / $total",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                )
+                IconButton(
+                    onClick = onPreviousResult,
+                    enabled = searchState.canNavigateToPreviousSearchResult(),
+                    modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                        contentDescription = "上一个搜索结果",
+                    )
+                }
+                IconButton(
+                    onClick = onNextResult,
+                    enabled = searchState.canNavigateToNextSearchResult(),
+                    modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                        contentDescription = "下一个搜索结果",
+                    )
+                }
+            }
             LazyColumn {
                 items(searchState.results) { result ->
                     val selected = result.index == searchState.selectedIndex
-                    Text(
-                        text = result.readerLabel(),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = if (selected) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onBackground
-                        },
-                        maxLines = 1,
+                    val label = result.readerLabel()
+                    val snippetText = result.snippet.trim()
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
@@ -1078,8 +1332,28 @@ private fun SearchPanel(
                                 )
                             }
                             .clickable { onResultClick(result) }
-                            .padding(horizontal = 8.dp, vertical = 14.dp),
-                    )
+                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = if (selected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onBackground
+                            },
+                            maxLines = 1,
+                        )
+                        if (snippetText.isNotEmpty()) {
+                            Text(
+                                text = snippetText,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                            )
+                        }
+                    }
                 }
             }
         }

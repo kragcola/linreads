@@ -122,14 +122,50 @@ internal fun resolveEpubCssTypeface(
     for (token in splitCssFontFamilyList(cssFontFamily.orEmpty())) {
         val key = normalizeFontFamilyKey(token) ?: continue
         if (key in GENERIC_FONT_FAMILIES) continue
+        // Exact replacement first; if mapped but resolver returns null, still try Moon base key.
         replacements[key]?.let { replacementId ->
             replacementResolver(replacementId)?.let { return it }
+        }
+        // MoonReader-compatible base key for replacement lookup only (never for embedded faces).
+        val baseKey = moonStyleBaseFontReplacementKey(key)
+        if (baseKey != null && baseKey != key && baseKey.isNotEmpty()) {
+            replacements[baseKey]?.let { replacementId ->
+                replacementResolver(replacementId)?.let { return it }
+            }
         }
         bookFonts.facesByFamily[key]?.let { face ->
             embeddedResolver(face)?.let { return it }
         }
     }
     return null
+}
+
+/**
+ * MoonReader-style base family key for replacement map lookup only.
+ * Matches A.getFontNameWithoutStyle after T.getOnlyFilename: strip trailing extension-like
+ * segment, then strip at first -regular / -bold / -italic (else-if order).
+ * Returns a non-null key when extension stripping and/or style-suffix stripping changes the
+ * input (including extension-only cases such as `story.ttf` → `story`). Returns null only when
+ * the key is unchanged after both steps (caller should skip duplicate lookup).
+ */
+internal fun moonStyleBaseFontReplacementKey(normalizedKey: String): String? {
+    if (normalizedKey.isEmpty()) return null
+    // T.getOnlyFilename: drop final ".ext" segment when present (filename semantics on the token).
+    var base = normalizedKey
+    val dot = base.lastIndexOf('.')
+    if (dot > 0) {
+        base = base.substring(0, dot)
+    }
+    // A.getFontNameWithoutStyle else-if order: -regular, else -bold, else -italic.
+    val styleMarkers = listOf("-regular", "-bold", "-italic")
+    for (marker in styleMarkers) {
+        val idx = base.indexOf(marker)
+        if (idx >= 0) {
+            base = base.substring(0, idx)
+            break
+        }
+    }
+    return base.takeIf { it.isNotEmpty() && it != normalizedKey }
 }
 
 /**
@@ -266,6 +302,9 @@ internal fun normalizeFontFamilyKey(raw: String): String? {
         s = s.substring(1, s.length - 1).trim()
     }
     if (s.isEmpty()) return null
+    // Collapse internal whitespace to a single space (Settings / DataStore parity).
+    s = WHITESPACE_RUN.replace(s, " ")
+    if (s.isEmpty()) return null
     return s.lowercase()
 }
 
@@ -321,6 +360,7 @@ private const val MAX_FONT_DISK_CACHE_BYTES = 96L * 1024L * 1024L
 // that is intentionally out of scope; advertise only formats the platform can load.
 private val FONT_EXTENSIONS = setOf("ttf", "otf", "ttc")
 private val FONT_FACE_COMMENTS = Regex("/\\*[\\s\\S]*?\\*/")
+private val WHITESPACE_RUN = Regex("\\s+")
 private val FONT_FACE_BLOCK = Regex(
     "@font-face\\s*\\{([^{}]*)\\}",
     setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),

@@ -219,6 +219,9 @@ internal class EpubFlowView(
     private val pageShotConfig = Bitmap.Config.ARGB_8888
     private val pageBoundaryBitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val pageBoundaryDestination = Rect()
+    /** Reused by non-BitmapDrawable crop paint (main-thread draw only; no concurrent access). */
+    private val pageBoundaryHostBoundsScratch = Rect()
+    private val pageBoundaryResultBoundsScratch = Rect()
 
     /** Layout height we last paginated against; a change means the content reflowed (async image load). */
     private var paginatedLayoutHeight: Int = -1
@@ -233,6 +236,10 @@ internal class EpubFlowView(
      * Synthetic crop of a large indivisible image that starts on a later page, painted into the
      * leftover band under preceding visible content on the current page. One image occurrence only
      * (same AsyncDrawable / U+FFFC); the full image still owns its own page window.
+     *
+     * [imageDrawableHost] is resolved once when page layout metadata is built for this generation
+     * so live/page-shot draws reuse the same AsyncDrawable shell (result may still swap in place)
+     * without re-running Spannable.getSpans every frame.
      */
     private data class PageBoundaryImagePreview(
         /** Layout start of the last visible content block that ends on this page (heading or body). */
@@ -241,6 +248,8 @@ internal class EpubFlowView(
         val precedingIsHeading: Boolean,
         val imageLayoutStart: Int,
         val imageLine: Int,
+        /** Generation-owned span host; null only when the span was missing at metadata build. */
+        val imageDrawableHost: Drawable? = null,
     )
     private data class PageLayoutMetadata(
         val pageGeneration: Long,
@@ -299,6 +308,10 @@ internal class EpubFlowView(
             abortLocalPageShotTurnForExternalMutation(restoreOrigin = true)
             recycleCachedTextures()
             field = value
+            // Live settings / instrumentation flip must re-arm warm front+revealed for the parked page.
+            if (mode == Mode.PAGED && isLayoutSettled()) {
+                preCachePageTextures()
+            }
         }
     private val pageTurnAnimated: Boolean get() = flipStyle != dev.readflow.core.model.PageFlipStyle.NONE
     /**
@@ -427,6 +440,8 @@ internal class EpubFlowView(
         val targetTextureKey: PageTextureKey,
         var latestX: Float,
         var latestY: Float,
+        /** Zero-copy staged front retained when directional target was still missing at MOVE. */
+        var frontBitmap: Bitmap? = null,
         var targetBitmap: Bitmap? = null,
         var releasedVelocity: Float? = null,
     )
@@ -958,6 +973,54 @@ internal class EpubFlowView(
         // Otherwise a quick turn can transiently retain four full-screen ARGB bitmaps.
         discardPendingPageTexturePrecache(request)
         return null
+    }
+
+    /**
+     * Deferred finger cold-shot path only: when the staged precache owns a live matching front but
+     * still lacks the requested directional revealed page, detach that front so
+     * [beginPendingLocalPageShotHandoff] can seed it without a second front recapture. A complete
+     * requested pair is left untouched for [takeCachedTexturesForTurn]'s zero-copy transfer.
+     */
+    private fun takePartialPendingFrontForDeferredLocalHandoff(
+        fromPage: Int,
+        fromTop: Int,
+        fromWindow: EpubFlowPage?,
+        targetPage: Int,
+        targetTop: Int,
+        targetWindow: EpubFlowPage,
+    ): Bitmap? {
+        val request = pendingPageTexturePrecache ?: return null
+        val fromKey = pageTextureKey(fromTop, fromWindow)
+        val targetKey = pageTextureKey(targetTop, targetWindow)
+        val matchesCurrent =
+            pendingPageTexturePrecacheIsValid(request) &&
+                fromPage == request.fromPage &&
+                fromTop == request.fromTop &&
+                fromWindow == request.fromWindow &&
+                fromKey == request.fromTextureKey
+        if (!matchesCurrent) return null
+        val front = request.frontBitmap?.takeUnless(Bitmap::isRecycled) ?: return null
+        val revealed = when {
+            targetPage == request.targetPage &&
+                targetTop == request.targetWindow?.topPx &&
+                targetWindow == request.targetWindow &&
+                targetKey == request.targetTextureKey ->
+                request.targetBitmap?.takeUnless(Bitmap::isRecycled)
+            targetPage == request.previousPage &&
+                targetTop == request.previousWindow?.topPx &&
+                targetWindow == request.previousWindow &&
+                targetKey == request.previousTextureKey ->
+                request.previousBitmap?.takeUnless(Bitmap::isRecycled)
+            else -> null
+        }
+        // Complete pair: leave request for takeCachedTexturesForTurn / takePendingPageTexturesForTurn.
+        if (revealed != null) return null
+        // Front-only extract: detach before discard so existing cleanup cannot recycle it.
+        detachCachedTextureOwner(front)
+        request.frontBitmap = null
+        discardPendingPageTexturePrecache(request)
+        relabelPageShot(front, PageShotLeaseKind.PINNED, "active.front")
+        return front
     }
 
     private fun takeCachedTexturesForTurn(
@@ -2290,28 +2353,50 @@ internal class EpubFlowView(
     }
 
     /**
-     * Re-applies annotation highlights in place without rebuilding the chapter. [BackgroundColorSpan]
-     * is used exclusively for highlights in the flow Spannable, so we can strip the old ones and paint
-     * the current [ranges] — span changes don't alter text length, so the StaticLayout just redraws
-     * (no repagination, no scroll disruption). Offsets are absolute layout offsets within the chapter.
+     * Re-applies annotation and transient search highlights in place without rebuilding the chapter.
+     *
+     * Only [ReaderTextHighlightSpan] / [ReaderSearchHighlightSpan] are stripped and replaced — plain
+     * [BackgroundColorSpan] (CSS background, selection) stays intact. Span changes don't alter text
+     * length, so the StaticLayout just redraws (no repagination, no scroll disruption). Offsets are
+     * absolute layout offsets within the chapter.
      */
-    fun refreshHighlights(ranges: List<dev.readflow.render.api.ReaderTextHighlightRange>) {
+    fun refreshHighlights(
+        annotationRanges: List<dev.readflow.render.api.ReaderTextHighlightRange>,
+        searchRanges: List<dev.readflow.render.api.ReaderTextHighlightRange> = emptyList(),
+    ) {
         abortLocalPageShotTurnForExternalMutation(restoreOrigin = true)
         recycleCachedTextures()
         val text = textView.text as? android.text.Spannable ?: return
-        text.getSpans(0, text.length, android.text.style.BackgroundColorSpan::class.java)
+        text.getSpans(0, text.length, dev.readflow.render.api.ReaderTextHighlightSpan::class.java)
             .forEach { text.removeSpan(it) }
-        ranges.forEach { range ->
+        text.getSpans(0, text.length, dev.readflow.render.api.ReaderSearchHighlightSpan::class.java)
+            .forEach { text.removeSpan(it) }
+        annotationRanges.forEach { range ->
             val s = range.start.coerceIn(0, text.length)
             val e = range.end.coerceIn(s, text.length)
             if (e > s) {
                 text.setSpan(
-                    android.text.style.BackgroundColorSpan(range.color),
+                    dev.readflow.render.api.ReaderTextHighlightSpan(range.color),
+                    s, e, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+            }
+        }
+        searchRanges.forEach { range ->
+            val s = range.start.coerceIn(0, text.length)
+            val e = range.end.coerceIn(s, text.length)
+            if (e > s) {
+                text.setSpan(
+                    dev.readflow.render.api.ReaderSearchHighlightSpan(range.color),
                     s, e, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
                 )
             }
         }
         textView.invalidate()
+    }
+
+    /** Back-compat single-list form used by older tests (annotation ranges only). */
+    fun refreshHighlights(ranges: List<dev.readflow.render.api.ReaderTextHighlightRange>) {
+        refreshHighlights(annotationRanges = ranges, searchRanges = emptyList())
     }
 
     /**
@@ -2435,13 +2520,17 @@ internal class EpubFlowView(
             val nextContent = f.nextContentSegmentAfter(index) ?: return@forEachIndexed
             val image = nextContent.block as? EpubDisplayBlock.Image ?: return@forEachIndexed
             if (image.isInlineContent) return@forEachIndexed
+            val imageLayoutStart = nextContent.layoutStart
             add(
                 PageBoundaryImagePreview(
                     precedingLayoutStart = preceding.layoutStart,
                     precedingEndLineExclusive = layout.getLineForOffset(preceding.layoutEnd - 1) + 1,
                     precedingIsHeading = textBlock.headingLevel != null,
-                    imageLayoutStart = nextContent.layoutStart,
-                    imageLine = layout.getLineForOffset(nextContent.layoutStart),
+                    imageLayoutStart = imageLayoutStart,
+                    imageLine = layout.getLineForOffset(imageLayoutStart),
+                    // Resolve once per page-layout generation; AsyncDrawable.result may still
+                    // replace in place without changing this shell host.
+                    imageDrawableHost = imageDrawableHostAt(imageLayoutStart),
                 ),
             )
         }
@@ -2766,6 +2855,11 @@ internal class EpubFlowView(
         abortLocalPageShotTurnForExternalMutation()
         scrollToPage(index, report = true)
         rebaseInterruptedFreeFlingAtCurrentViewport()
+        // Programmatic park (TOC/bookmark/search/F1 harness) must warm front+revealed without a
+        // prior interactive settle animation that would otherwise call preCachePageTextures.
+        if (mode == Mode.PAGED && isLayoutSettled()) {
+            preCachePageTextures()
+        }
     }
 
     private fun canonicalScrollTopForPage(index: Int): Int? {
@@ -3064,6 +3158,8 @@ internal class EpubFlowView(
                 bitmap.recycle()
                 return null
             }
+            // Full viewport/page recapture (not warm-cache transfer). Probe for interactive MOVE tests.
+            EpubPageShotCaptureProbe.noteCapture()
             draw(bitmap)
             bitmap
         } catch (_: OutOfMemoryError) {
@@ -3123,10 +3219,11 @@ internal class EpubFlowView(
         // Crop only when the full image line is taller than the leftover band (indivisible image).
         if (imageLineHeight <= previewBottomInViewport - previewTopInViewport) return
         // Markwon AsyncDrawable.draw() only forwards to result.draw and never copies shell setBounds
-        // onto the nested result. Resolve host + nested result; paint decoded BitmapDrawable pixels
-        // via canvas.drawBitmap at the crop destination (bounds-only draw leaves leftover blank:
-        // shell setBounds does not move result, and LEGACY Robolectric paints BitmapDrawable at 0,0).
-        val host = imageDrawableHostAt(preview.imageLayoutStart) ?: return
+        // onto the nested result. Prefer generation-owned host from metadata; paint decoded
+        // BitmapDrawable pixels via canvas.drawBitmap at the crop destination (bounds-only draw
+        // leaves leftover blank: shell setBounds does not move result, and LEGACY Robolectric
+        // paints BitmapDrawable at 0,0).
+        val host = preview.imageDrawableHost ?: return
         val result = (host as? AsyncDrawable)?.result
         val paintTarget = result ?: host
         val sourceWidth = paintTarget.bounds.width().takeIf { it > 0 }
@@ -3177,27 +3274,34 @@ internal class EpubFlowView(
             canvas.drawBitmap(bitmap, null, dst, pageBoundaryBitmapPaint)
             return
         }
-        val oldHostBounds = Rect(host.bounds)
-        val oldResultBounds = result?.let { Rect(it.bounds) }
+        // Allocation-free scratch (single main-thread draw path).
+        EpubBoundaryImageHostProbe.noteNonBitmapBoundsCopy()
+        pageBoundaryHostBoundsScratch.set(host.bounds)
+        val resultDrawable = result
+        if (resultDrawable != null) {
+            pageBoundaryResultBoundsScratch.set(resultDrawable.bounds)
+        }
         try {
             paintTarget.bounds = dst
-            if (result != null) host.bounds = dst
+            if (resultDrawable != null) host.bounds = dst
             paintTarget.draw(canvas)
         } finally {
-            if (result != null) {
-                result.bounds = oldResultBounds ?: oldHostBounds
-                host.bounds = oldHostBounds
+            if (resultDrawable != null) {
+                resultDrawable.bounds = pageBoundaryResultBoundsScratch
+                host.bounds = pageBoundaryHostBoundsScratch
             } else {
-                host.bounds = oldHostBounds
+                host.bounds = pageBoundaryHostBoundsScratch
             }
         }
     }
 
     /**
      * Span host drawable at [layoutOffset]: AsyncDrawable shell (result may be nested) or ImageSpan.
-     * Crop painting must prefer [AsyncDrawable.result] when present.
+     * Crop painting must prefer [AsyncDrawable.result] when present. Call only from page-layout
+     * metadata build (generation-owned cache), not from the live/page-shot draw hot path.
      */
     private fun imageDrawableHostAt(layoutOffset: Int): Drawable? {
+        EpubBoundaryImageHostProbe.noteSpanHostLookup()
         val text = textView.text as? Spanned ?: return null
         val end = (layoutOffset + 1).coerceAtMost(text.length)
         text.getSpans(layoutOffset, end, AsyncDrawableSpan::class.java)
@@ -3755,7 +3859,20 @@ internal class EpubFlowView(
             return InteractiveTurnStartResult.REJECTED
         }
         val frozenOutgoing = (conversionCapture as? ConversionSnapshotCapture.Captured)?.bitmap
+        var seededPartialFront: Bitmap? = null
         val cached = if (frozenOutgoing == null) {
+            // Real finger deferred path: retain a matching staged front before takeCachedTexturesForTurn
+            // would discard an incomplete precache owner.
+            if (deferColdShots) {
+                seededPartialFront = takePartialPendingFrontForDeferredLocalHandoff(
+                    origin.pageProjection,
+                    origin.topPx,
+                    origin.window,
+                    targetPage,
+                    targetTop,
+                    targetWindow,
+                )
+            }
             takeCachedTexturesForTurn(
                 origin.pageProjection,
                 origin.topPx,
@@ -3777,8 +3894,11 @@ internal class EpubFlowView(
                 anchor = anchor,
                 latestX = latestX,
                 latestY = latestY,
+                frontBitmap = seededPartialFront,
             )
         }
+        // Complete-pair / synchronous path must not keep a detached front (extract returns null then).
+        seededPartialFront?.let(::recyclePageShot)
         val outgoing = frozenOutgoing ?: cached?.first ?: snapshotViewport(
             PageShotLeaseKind.PINNED,
             "active.front",
@@ -3817,8 +3937,10 @@ internal class EpubFlowView(
         anchor: Float,
         latestX: Float,
         latestY: Float,
+        frontBitmap: Bitmap? = null,
     ): InteractiveTurnStartResult {
         // A queued background precache must not race the two finger-owned shots or increase peak memory.
+        // Seeded front was already detached from pending/cache before this call.
         recycleCachedTextures()
         val token = localPageShotHandoffGeneration + 1L
         localPageShotHandoffGeneration = token
@@ -3838,6 +3960,7 @@ internal class EpubFlowView(
             targetTextureKey = pageTextureKey(targetWindow.topPx, targetWindow),
             latestX = latestX,
             latestY = latestY,
+            frontBitmap = frontBitmap,
         )
         pendingLocalPageShotHandoff = request
         interactiveTurnState = InteractiveTurnState.LOCAL_SHOTS_WAITING
@@ -3911,14 +4034,22 @@ internal class EpubFlowView(
         // Waiting feedback translates the live container for finger responsiveness. Clear it before
         // any front pin capture so snapshotViewport/dispatchDraw never bakes that offset in.
         clearPendingLocalPageShotFeedback()
-        val conversionCapture = conversionSnapshotCopy()
-        val outgoing = when (conversionCapture) {
-            ConversionSnapshotCapture.Failed -> null
-            ConversionSnapshotCapture.NoCover -> snapshotViewport(
-                PageShotLeaseKind.PINNED,
-                "active.front",
-            )
-            is ConversionSnapshotCapture.Captured -> conversionCapture.bitmap
+        // Prefer a zero-copy staged front when the deferred MOVE extracted one; clear ownership
+        // before the overlay takes the pin so cancel cannot double-recycle.
+        val seededFront = request.frontBitmap?.takeUnless(Bitmap::isRecycled)
+        request.frontBitmap = null
+        val outgoing = if (seededFront != null) {
+            seededFront
+        } else {
+            val conversionCapture = conversionSnapshotCopy()
+            when (conversionCapture) {
+                ConversionSnapshotCapture.Failed -> null
+                ConversionSnapshotCapture.NoCover -> snapshotViewport(
+                    PageShotLeaseKind.PINNED,
+                    "active.front",
+                )
+                is ConversionSnapshotCapture.Captured -> conversionCapture.bitmap
+            }
         }
         if (outgoing == null) {
             cancelPendingLocalPageShotHandoff(request, consumeGesture = true)
@@ -4076,6 +4207,8 @@ internal class EpubFlowView(
             pendingLocalPageShotHandoff = null
             clearPendingLocalPageShotFeedback()
         }
+        request.frontBitmap?.let(::recyclePageShot)
+        request.frontBitmap = null
         request.targetBitmap?.let(::recyclePageShot)
         request.targetBitmap = null
         if (!ownsCurrent) return

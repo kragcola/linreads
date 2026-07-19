@@ -257,13 +257,12 @@ class EpubCorpusSmokeTest {
                     kind = block.kind,
                     indentLevel = block.indentLevel,
                 )
+                // Packed multi-paragraph pages keep per-paragraph style on textSegments; page-level
+                // textStyle is only authoritative for single-segment pages (textSegments empty).
                 assertTrue(
-                    pages.any { page ->
-                        page.kind == EpubPageSliceKind.Text &&
-                            page.paragraphIndex == block.paragraphIndex &&
-                            page.textStyle == expectedStyle
-                    },
-                    "${file.name} styled text block $blockIndex lost paged style metadata.",
+                    pages.any { page -> pagePreservesStyledParagraph(page, block.paragraphIndex, expectedStyle) },
+                    "${file.name} styled text block $blockIndex (paragraph ${block.paragraphIndex}) " +
+                        "lost paged style metadata at page or segment level.",
                 )
             }
 
@@ -278,7 +277,7 @@ class EpubCorpusSmokeTest {
                     "|pages=${pages.size}" +
                     "|imagePages=${pages.count { it.kind is EpubPageSliceKind.Image }}" +
                     "|linkPages=${pages.count { it.links.isNotEmpty() }}" +
-                    "|styledPages=${pages.count { page -> page.textStyle != EpubPageTextStyle() }}" +
+                    "|styledPages=${pages.count { page -> pageHasNonDefaultStyle(page) }}" +
                     "|targetedInternalLinkPages=$targetedInternalLinkPages",
             )
         }
@@ -609,6 +608,34 @@ class EpubCorpusSmokeTest {
         val preformatted: Int,
         val fixedLayoutFallback: Boolean,
     )
+
+    /**
+     * Authoritative style contract for paged layout:
+     * - Multi-segment / packed pages: [EpubPageTextSegment.textStyle] for the paragraph.
+     * - Single-segment pages ([EpubPageSlice.textSegments] empty): page-level [EpubPageSlice.textStyle].
+     * Page-level style alone is not enough when packing merges paragraphs (anchor paragraphIndex only).
+     */
+    private fun pagePreservesStyledParagraph(
+        page: EpubPageSlice,
+        paragraphIndex: Int,
+        expectedStyle: EpubPageTextStyle,
+    ): Boolean {
+        if (page.kind != EpubPageSliceKind.Text) return false
+        if (page.textSegments.isNotEmpty()) {
+            return page.textSegments.any { segment ->
+                segment.paragraphIndex == paragraphIndex && segment.textStyle == expectedStyle
+            }
+        }
+        return page.paragraphIndex == paragraphIndex && page.textStyle == expectedStyle
+    }
+
+    private fun pageHasNonDefaultStyle(page: EpubPageSlice): Boolean {
+        if (page.kind != EpubPageSliceKind.Text) return false
+        if (page.textSegments.isNotEmpty()) {
+            return page.textSegments.any { it.textStyle != EpubPageTextStyle() }
+        }
+        return page.textStyle != EpubPageTextStyle()
+    }
 
     private fun pagedCorpusMetrics(): EpubPageMetrics =
         EpubPageMetrics(

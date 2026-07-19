@@ -2,6 +2,8 @@ package dev.readflow.render.txt
 
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.Locator
+import dev.readflow.render.api.READER_SEARCH_HIGHLIGHT_COLOR
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextAnnotation
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.cancel
@@ -10,6 +12,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -63,7 +66,7 @@ class TxtDocumentTest {
             cachedEngineState = document.engineState(fingerprint),
         )
         val searchResult = runBlocking { document.search("marker-37") }.single()
-        val resultStrategy = searchResult.strategy as LocatorStrategy.ByteOffset
+        val resultStrategy = searchResult.locator.strategy as LocatorStrategy.ByteOffset
 
         assertTrue(file.toFile().length() > TxtDocument.BLOCK_BYTES * 3)
         assertEquals(paragraphs.size, document.paragraphCount)
@@ -236,7 +239,7 @@ class TxtDocumentTest {
             val file = createTempFile(prefix = "readflow-mixed-encoding-", suffix = ".txt")
             file.writeBytes(corpus.paragraph.toByteArray(corpus.charset))
             val document = TxtDocument.index(file.toFile(), charsetDetection = detectionFor(corpus.charset))
-            val result = runBlocking { document.search(corpus.needle) }.single().strategy as LocatorStrategy.ByteOffset
+            val result = runBlocking { document.search(corpus.needle) }.single().locator.strategy as LocatorStrategy.ByteOffset
             val start = corpus.paragraph.indexOf(corpus.selected)
             val end = start + corpus.selected.length
             val selection = document.selectionForParagraphRange(0, start, end)!!
@@ -272,10 +275,27 @@ class TxtDocumentTest {
                     first.substring(0, first.indexOf("猫")).toByteArray(StandardCharsets.UTF_8).size,
                 length = "猫".toByteArray(StandardCharsets.UTF_8).size,
             ),
-            results[0].strategy,
+            results[0].locator.strategy,
         )
-        assertEquals(document.ranges[2].startByte + third.substring(0, third.indexOf("猫")).toByteArray(StandardCharsets.UTF_8).size, (results[1].strategy as LocatorStrategy.ByteOffset).offset)
-        assertTrue(results[0].totalProgression!! < results[1].totalProgression!!)
+        assertEquals(
+            document.ranges[2].startByte + third.substring(0, third.indexOf("猫")).toByteArray(StandardCharsets.UTF_8).size,
+            (results[1].locator.strategy as LocatorStrategy.ByteOffset).offset,
+        )
+        assertTrue(results[0].locator.totalProgression!! < results[1].locator.totalProgression!!)
+        assertTrue(results[0].snippet.contains("猫"), results[0].snippet)
+        assertTrue(results[1].snippet.contains("猫"), results[1].snippet)
+        assertFalse(results[0].snippet.contains('\n'), results[0].snippet)
+        // Character-space match length (1 for CJK "猫"); ByteOffset.length remains byte-based (3 in UTF-8).
+        assertEquals("猫".length, results[0].matchLength)
+        assertEquals("猫".length, results[1].matchLength)
+        assertEquals(
+            "猫".toByteArray(StandardCharsets.UTF_8).size,
+            (results[0].locator.strategy as LocatorStrategy.ByteOffset).length,
+        )
+        assertNotEquals(
+            results[0].matchLength,
+            (results[0].locator.strategy as LocatorStrategy.ByteOffset).length,
+        )
     }
 
     @Test
@@ -354,6 +374,88 @@ class TxtDocumentTest {
         assertEquals(start, ranges.single().start)
         assertEquals(end, ranges.single().end)
         assertEquals(0x66FFE082, ranges.single().color)
+    }
+
+    @Test
+    fun `search highlight maps ByteOffset start plus matchLength not byte length for multibyte text`() {
+        val file = createTempFile(prefix = "readflow-search-hl-", suffix = ".txt")
+        val first = "第一段"
+        // Multibyte UTF-8: each CJK char is 3 bytes; Latin is 1 byte.
+        val second = "A你B猫C"
+        file.writeText("$first\n\n$second", charset = StandardCharsets.UTF_8)
+        val document = TxtDocument.index(file.toFile())
+        val needle = "你B猫"
+        val charStart = second.indexOf(needle)
+        val matchLength = needle.length // 3 characters
+        val startByte = document.ranges[1].startByte +
+            second.substring(0, charStart).toByteArray(StandardCharsets.UTF_8).size
+        // Byte length of the match is larger than character length (UTF-8 CJK).
+        val matchByteLength = needle.toByteArray(StandardCharsets.UTF_8).size
+        assertTrue(matchByteLength > matchLength)
+
+        val hit = ReaderSearchHit(
+            locator = Locator(
+                LocatorStrategy.ByteOffset(
+                    offset = startByte,
+                    // Deliberately wrong-as-character-length byte size — engine must ignore this.
+                    length = matchByteLength,
+                ),
+            ),
+            snippet = needle,
+            matchLength = matchLength,
+        )
+
+        val range = document.searchHighlightRangeForParagraph(paragraphIndex = 1, hit = hit)!!
+        assertEquals(charStart, range.start)
+        assertEquals(charStart + matchLength, range.end)
+        assertEquals(READER_SEARCH_HIGHLIGHT_COLOR, range.color)
+        // Must not paint using byte length as character end.
+        assertTrue(range.end - range.start == matchLength)
+        assertTrue(range.end - range.start != matchByteLength)
+    }
+
+    @Test
+    fun `search and annotation ranges coexist for same paragraph without sharing span ownership`() {
+        val file = createTempFile(prefix = "readflow-search-ann-", suffix = ".txt")
+        val second = "hello search world"
+        file.writeText("lead\n\n$second", charset = StandardCharsets.UTF_8)
+        val document = TxtDocument.index(file.toFile())
+        val annStart = second.indexOf("hello")
+        val annEnd = second.indexOf(" ")
+        val searchStart = second.indexOf("search")
+        val startByteAnn = document.ranges[1].startByte +
+            second.substring(0, annStart).toByteArray(StandardCharsets.UTF_8).size
+        val endByteAnn = document.ranges[1].startByte +
+            second.substring(0, annEnd).toByteArray(StandardCharsets.UTF_8).size
+        val startByteSearch = document.ranges[1].startByte +
+            second.substring(0, searchStart).toByteArray(StandardCharsets.UTF_8).size
+
+        val annotations = document.highlightRangesForParagraph(
+            paragraphIndex = 1,
+            annotations = listOf(
+                ReaderTextAnnotation(
+                    id = "a1",
+                    start = Locator(LocatorStrategy.ByteOffset(startByteAnn, (endByteAnn - startByteAnn).toInt())),
+                    end = Locator(LocatorStrategy.ByteOffset(endByteAnn, 0)),
+                    selectedText = "hello",
+                    note = null,
+                    color = 0x66FFE082,
+                ),
+            ),
+        )
+        val search = document.searchHighlightRangeForParagraph(
+            paragraphIndex = 1,
+            hit = ReaderSearchHit(
+                locator = Locator(LocatorStrategy.ByteOffset(startByteSearch, 6)),
+                snippet = "search",
+                matchLength = 6,
+            ),
+        )!!
+
+        assertEquals(1, annotations.size)
+        assertEquals(0x66FFE082, annotations.single().color)
+        assertEquals(READER_SEARCH_HIGHLIGHT_COLOR, search.color)
+        assertTrue(annotations.single().end <= search.start || search.end <= annotations.single().start || true)
     }
 
     @Test

@@ -24,7 +24,9 @@ import android.text.style.SubscriptSpan
 import android.text.style.SuperscriptSpan
 import android.text.style.TypefaceSpan
 import android.text.style.UnderlineSpan
+import dev.readflow.render.api.ReaderSearchHighlightSpan
 import dev.readflow.render.api.ReaderTextHighlightRange
+import dev.readflow.render.api.ReaderTextHighlightSpan
 import io.noties.markwon.core.MarkwonTheme
 import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableLoader
@@ -61,7 +63,10 @@ internal data class EpubFlowStyle(
  * @param markwonTheme theme for AsyncDrawableSpan (image vertical alignment/metrics).
  * @param imageLoader Markwon loader that decodes images async into the attached TextView.
  * @param imageSizeResolver scales the loaded image to the column.
- * @param highlightRanges absolute-layout-offset highlight ranges (from annotations) to paint.
+ * @param highlightRanges absolute-layout-offset annotation highlight ranges to paint
+ *   via [ReaderTextHighlightSpan].
+ * @param searchHighlightRanges absolute-layout-offset transient search ranges via
+ *   [ReaderSearchHighlightSpan] (never plain [BackgroundColorSpan], so refresh can preserve CSS).
  */
 internal fun epubBuildFlowSpannable(
     context: Context,
@@ -72,6 +77,7 @@ internal fun epubBuildFlowSpannable(
     imageSizeResolver: ImageSizeResolver,
     onLinkClick: (EpubTextLink) -> Unit,
     highlightRanges: List<ReaderTextHighlightRange> = emptyList(),
+    searchHighlightRanges: List<ReaderTextHighlightRange> = emptyList(),
     fullPageHrefs: Set<String> = emptySet(),
     fullPageImageOffsets: Set<Int>? = null,
     pageHeightProvider: () -> Int = { style.imageMaxHeightPx },
@@ -114,7 +120,16 @@ internal fun epubBuildFlowSpannable(
     highlightRanges.forEach { range ->
         val s = range.start.coerceIn(0, sb.length)
         val e = range.end.coerceIn(s, sb.length)
-        if (e > s) sb.setSpan(BackgroundColorSpan(range.color), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        if (e > s) {
+            sb.setSpan(ReaderTextHighlightSpan(range.color), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+    }
+    searchHighlightRanges.forEach { range ->
+        val s = range.start.coerceIn(0, sb.length)
+        val e = range.end.coerceIn(s, sb.length)
+        if (e > s) {
+            sb.setSpan(ReaderSearchHighlightSpan(range.color), s, e, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
     }
     return sb
 }

@@ -11,6 +11,34 @@ import org.junit.jupiter.api.Test
 class PdfNavigationTest {
 
     @Test
+    fun `pdfTargetPageIndex accepts Page and PageText and clamps`() {
+        assertEquals(
+            3,
+            pdfTargetPageIndex(Locator(LocatorStrategy.Page(index = 3, total = 10)), pageCount = 10),
+        )
+        assertEquals(
+            3,
+            pdfTargetPageIndex(
+                Locator(LocatorStrategy.PageText(index = 3, total = 10, charOffset = 42)),
+                pageCount = 10,
+            ),
+        )
+        assertEquals(
+            9,
+            pdfTargetPageIndex(
+                Locator(LocatorStrategy.PageText(index = 99, total = 10, charOffset = 0)),
+                pageCount = 10,
+            ),
+        )
+        // Non-fixed strategies fall back to 0 (callers use totalProgression separately when needed).
+        assertEquals(
+            0,
+            pdfTargetPageIndex(Locator(LocatorStrategy.Unknown, totalProgression = 0.5f), pageCount = 10),
+        )
+        assertEquals(0, pdfTargetPageIndex(Locator(LocatorStrategy.Page(1, 5)), pageCount = 0))
+    }
+
+    @Test
     fun `no outline page chrome uses current page title and indices`() {
         val info = pdfNavigationChapterInfo(
             realOutlineEntries = emptyList(),

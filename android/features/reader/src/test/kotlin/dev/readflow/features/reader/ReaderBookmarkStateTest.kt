@@ -163,6 +163,70 @@ class ReaderBookmarkStateTest {
         assertEquals(locator, Json.decodeFromString<Locator>(entity.locatorJson))
     }
 
+    @Test
+    fun `detail label is strategy-aware with page section and unknown fallback`() {
+        val page = ReaderBookmarkItem(
+            id = "p",
+            locator = Locator(
+                strategy = LocatorStrategy.Page(index = 2, total = 10),
+                totalProgression = 0.2f,
+            ),
+            label = "书签 20%",
+            totalProgression = 0.2f,
+            createdAt = 0L,
+        )
+        val section = ReaderBookmarkItem(
+            id = "s",
+            locator = Locator(
+                strategy = LocatorStrategy.Section(spineIndex = 3, elementIndex = 12, charOffset = 40),
+                totalProgression = 0.42f,
+            ),
+            label = "书签 42%",
+            totalProgression = 0.42f,
+            createdAt = 0L,
+        )
+        val byteOffset = ReaderBookmarkItem(
+            id = "b",
+            locator = Locator(
+                strategy = LocatorStrategy.ByteOffset(offset = 4096L, length = 512),
+                totalProgression = 0.33f,
+            ),
+            label = "书签 33%",
+            totalProgression = 0.33f,
+            createdAt = 0L,
+        )
+        val unknown = ReaderBookmarkItem(
+            id = "u",
+            locator = Locator(
+                strategy = LocatorStrategy.Unknown,
+                totalProgression = 0.5f,
+            ),
+            label = "书签 50%",
+            totalProgression = 0.5f,
+            createdAt = 0L,
+        )
+
+        assertEquals("第 3 / 10 页", readerBookmarkDetailLabel(page))
+        assertEquals("第 4 节", readerBookmarkDetailLabel(section))
+        // Never expose raw byte offsets as the only secondary label.
+        assertNull(readerBookmarkDetailLabel(byteOffset))
+        assertNull(readerBookmarkDetailLabel(unknown))
+        assertFalse(readerBookmarkDetailLabel(page).orEmpty().contains("offset", ignoreCase = true))
+
+        // Imported PageText may show page number; creation still uses bare Page.
+        val pageText = ReaderBookmarkItem(
+            id = "pt",
+            locator = Locator(
+                strategy = LocatorStrategy.PageText(index = 2, total = 10, charOffset = 99),
+                totalProgression = 0.2f,
+            ),
+            label = "书签 20%",
+            totalProgression = 0.2f,
+            createdAt = 0L,
+        )
+        assertEquals("第 3 / 10 页", readerBookmarkDetailLabel(pageText))
+    }
+
     private fun bookmarkEntity(
         id: String,
         locator: Locator,

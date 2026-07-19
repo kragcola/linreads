@@ -2,8 +2,10 @@ package dev.readflow.render.epub
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.os.Looper
 import android.util.Base64
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.ZipFile
 
 internal const val EPUB_MAX_IMAGE_SIDE = 1600
@@ -12,12 +14,56 @@ internal const val EPUB_MAX_ENCODED_IMAGE_BYTES = 20L * 1024L * 1024L
 
 internal data class EpubImageBounds(val width: Int, val height: Int)
 
+/**
+ * Test/diagnostic counters for full-pixel [decodeEpubImage] vs bounds-only probes.
+ * Bounds decode is allowed on the main thread (placeholder sizing); full-pixel decode must stay
+ * off the interactive gesture path (Flow async loader / background executor).
+ */
+internal object EpubImageDecodeProbe {
+    private val fullDecodeTotal = AtomicInteger(0)
+    private val fullDecodeMainThread = AtomicInteger(0)
+    private val boundsDecodeTotal = AtomicInteger(0)
+    @Volatile private var enabled = false
+
+    fun reset() {
+        fullDecodeTotal.set(0)
+        fullDecodeMainThread.set(0)
+        boundsDecodeTotal.set(0)
+        enabled = true
+    }
+
+    fun stop() {
+        enabled = false
+        fullDecodeTotal.set(0)
+        fullDecodeMainThread.set(0)
+        boundsDecodeTotal.set(0)
+    }
+
+    fun noteFullDecode() {
+        if (!enabled) return
+        fullDecodeTotal.incrementAndGet()
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            fullDecodeMainThread.incrementAndGet()
+        }
+    }
+
+    fun noteBoundsDecode() {
+        if (!enabled) return
+        boundsDecodeTotal.incrementAndGet()
+    }
+
+    fun fullDecodeTotal(): Int = fullDecodeTotal.get()
+    fun fullDecodeMainThread(): Int = fullDecodeMainThread.get()
+    fun boundsDecodeTotal(): Int = boundsDecodeTotal.get()
+}
+
 // Decode only the intrinsic pixel dimensions (no pixel data) so placement can classify an image
 // as a full-page illustration vs a small inline marker/avatar without loading the full bitmap.
 internal fun decodeEpubImageBounds(
     epubFile: File,
     entryPath: String,
 ): EpubImageBounds? = try {
+    EpubImageDecodeProbe.noteBoundsDecode()
     decodeEpubDataImageBytes(entryPath, EPUB_MAX_ENCODED_IMAGE_BYTES)?.let { bytes ->
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
@@ -52,6 +98,7 @@ internal fun decodeEpubImage(
     maxPixels: Int = EPUB_MAX_IMAGE_PIXELS,
     maxEncodedBytes: Long = EPUB_MAX_ENCODED_IMAGE_BYTES,
 ): Bitmap? = try {
+    EpubImageDecodeProbe.noteFullDecode()
     decodeEpubDataImageBytes(entryPath, maxEncodedBytes)?.let { bytes ->
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)

@@ -29,10 +29,12 @@ import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.EngineStateStore
 import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PageTransitionHostFactory
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReaderEngineRegistry
 import dev.readflow.render.api.ReaderTextSelection
+import dev.readflow.render.api.SearchHighlightableReaderEngine
 import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.TextSelectableReaderEngine
 import dev.readflow.render.api.ZoomableReaderEngine
@@ -158,6 +160,13 @@ class ReaderViewModel(
     private var searchJob: Job? = null
     /** Monotonic owner for in-flight search; only the latest generation may publish. */
     private var searchGeneration: Long = 0L
+    /**
+     * In-flight search-result navigation ([goTo] + highlight + progress). Cancelled/superseded by a
+     * newer next/previous/result request; invalidated by close/open via [searchNavigationGeneration].
+     */
+    private var searchNavigationJob: Job? = null
+    /** Monotonic owner for search navigation; close/open and superseding requests bump this. */
+    private var searchNavigationGeneration: Long = 0L
     private var bookmarkJob: Job? = null
     private var textSelectionJob: Job? = null
     private var annotationJob: Job? = null
@@ -166,6 +175,11 @@ class ReaderViewModel(
     private var settingsEpubFontReplacementJob: Job? = null
     private var openJob: Job? = null
     private var activeEngine: ReaderEngine? = _uiState.value.engine
+    /**
+     * Bumps on each successful book attach and on close so a stale navigation completion cannot
+     * persist progress or selectedIndex into a newly opened book.
+     */
+    private var bookSessionGeneration: Long = 0L
     private val sessionMutex = Mutex()
     /** Serializes bookmark add/remove so rapid taps cannot create duplicate actives. */
     private val bookmarkMutex = Mutex()
@@ -207,9 +221,12 @@ class ReaderViewModel(
         is ReaderIntent.RemoveBookmark -> removeBookmark(intent.bookmark)
         is ReaderIntent.SaveTextAnnotation -> saveTextAnnotation(intent.note)
         is ReaderIntent.GoToAnnotation -> goToAnnotation(intent.annotation)
+        is ReaderIntent.RemoveAnnotation -> removeAnnotation(intent.annotation)
         is ReaderIntent.SetSearchQuery -> setSearchQuery(intent.query)
         ReaderIntent.SubmitSearch -> submitSearch()
         is ReaderIntent.GoToSearchResult -> goToSearchResult(intent.result)
+        ReaderIntent.GoToPreviousSearchResult -> goToAdjacentSearchResult(previous = true)
+        ReaderIntent.GoToNextSearchResult -> goToAdjacentSearchResult(previous = false)
         ReaderIntent.ClearSearch -> clearSearch()
         ReaderIntent.ClearTextSelection -> clearTextSelection()
         ReaderIntent.ToggleChrome -> updateUiStateAndPersist { it.copy(isUiVisible = !it.isUiVisible, activePanel = null) }
@@ -384,6 +401,11 @@ class ReaderViewModel(
             currentBookId = bookId
             activeEngine = engine
             engineAttached = true
+            // New book session: drop any in-flight search navigation from a prior open.
+            searchNavigationJob?.cancel()
+            searchNavigationJob = null
+            searchNavigationGeneration += 1L
+            bookSessionGeneration += 1L
             _uiState.update {
                 it.copy(
                     loadingState = LoadingState.Loaded,
@@ -729,6 +751,7 @@ class ReaderViewModel(
 
     private fun goTo(locator: Locator) {
         val engine = _uiState.value.engine ?: return
+        clearTransientSearchHighlight(engine)
         viewModelScope.launch {
             engine.goTo(locator)
             persistExplicitNavigation(engine, locator)
@@ -738,6 +761,7 @@ class ReaderViewModel(
 
     private fun seekToProgress(fraction: Float) {
         val engine = _uiState.value.engine ?: return
+        clearTransientSearchHighlight(engine)
         viewModelScope.launch {
             engine.seekToProgress(fraction)
             persistExplicitNavigation(engine, engine.currentLocator.value)
@@ -746,6 +770,7 @@ class ReaderViewModel(
 
     private fun goToTocEntry(entry: TocEntry) {
         val engine = _uiState.value.engine ?: return
+        clearTransientSearchHighlight(engine)
         viewModelScope.launch {
             engine.goToTocEntry(entry)
             persistExplicitNavigation(engine, engine.currentLocator.value)
@@ -806,6 +831,7 @@ class ReaderViewModel(
 
     private fun goToBookmark(bookmark: ReaderBookmarkItem) {
         val engine = _uiState.value.engine ?: return
+        clearTransientSearchHighlight(engine)
         viewModelScope.launch {
             engine.goTo(bookmark.locator)
             persistExplicitNavigation(engine, bookmark.locator)
@@ -862,6 +888,7 @@ class ReaderViewModel(
 
     private fun goToAnnotation(annotation: ReaderAnnotationItem) {
         val engine = _uiState.value.engine ?: return
+        clearTransientSearchHighlight(engine)
         viewModelScope.launch {
             engine.goTo(annotation.start)
             persistExplicitNavigation(engine, annotation.start)
@@ -869,9 +896,39 @@ class ReaderViewModel(
         updateUiStateAndPersist { it.copy(activePanel = null, isUiVisible = false) }
     }
 
+    private fun removeAnnotation(annotation: ReaderAnnotationItem) {
+        val bookId = currentBookId ?: return
+        viewModelScope.launch {
+            val existing = try {
+                textAnnotationDao.getById(annotation.id)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                return@launch
+            } ?: return@launch
+            if (existing.bookId != bookId) return@launch
+            val now = System.currentTimeMillis()
+            val deviceId = settings.deviceId.first()
+            try {
+                textAnnotationDao.upsert(
+                    existing.copy(
+                        isDeleted = true,
+                        updatedAt = now,
+                        deviceId = deviceId,
+                    ),
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                return@launch
+            }
+        }
+    }
+
     private fun setSearchQuery(query: String) {
         searchJob?.cancel()
         searchGeneration += 1L
+        clearTransientSearchHighlight(_uiState.value.engine)
         _uiState.update { it.copy(search = it.search.withQuery(query)) }
     }
 
@@ -884,6 +941,8 @@ class ReaderViewModel(
         }
         searchJob?.cancel()
         val generation = ++searchGeneration
+        // New search session: drop any previous in-page selection highlight before results arrive.
+        clearTransientSearchHighlight(engine)
         _uiState.update {
             it.copy(
                 search = it.search.copy(
@@ -929,8 +988,8 @@ class ReaderViewModel(
                     state
                 } else {
                     searchResult.fold(
-                        onSuccess = { locators ->
-                            val results = readerSearchResultsFor(locators)
+                        onSuccess = { hits ->
+                            val results = readerSearchResultsFor(hits)
                             state.copy(
                                 search = state.search.copy(
                                     results = results,
@@ -961,17 +1020,51 @@ class ReaderViewModel(
 
     private fun goToSearchResult(result: ReaderSearchResult) {
         val engine = _uiState.value.engine ?: return
-        viewModelScope.launch {
-            engine.goTo(result.locator)
-            persistExplicitNavigation(engine, result.locator)
-        }
+        // Supersede any in-flight navigation: newer next/previous/click owns goTo + persist.
+        searchNavigationJob?.cancel()
+        val navigationGeneration = ++searchNavigationGeneration
+        val sessionGeneration = bookSessionGeneration
+        val targetBookId = currentBookId
+        applySearchHighlight(engine, result.toSearchHit())
+        // Keep SEARCH chrome so previous/next and result list stay usable for repeated stepping.
+        // selectedIndex updates immediately so rapid stepping reflects the latest request even while
+        // an older goTo is still in flight (it will no-op on completion via generation guards).
         updateUiStateAndPersist {
             it.copy(
                 search = it.search.copy(selectedIndex = result.index),
-                activePanel = null,
-                isUiVisible = false,
+                activePanel = ReaderPanel.SEARCH,
+                isUiVisible = true,
             )
         }
+        searchNavigationJob = viewModelScope.launch {
+            try {
+                engine.goTo(result.locator)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                // Engine navigation failed; do not persist a locator we never reached.
+                return@launch
+            }
+            // Stale completion must not persist progress into a newer navigation request
+            // or a different book session (close/open). Highlight + selectedIndex were applied
+            // eagerly for the owning request; a superseding request already overwrote them.
+            if (navigationGeneration != searchNavigationGeneration) return@launch
+            if (sessionGeneration != bookSessionGeneration) return@launch
+            if (currentBookId != targetBookId) return@launch
+            if (_uiState.value.engine !== engine) return@launch
+            persistExplicitNavigation(engine, result.locator)
+        }
+    }
+
+    private fun goToAdjacentSearchResult(previous: Boolean) {
+        val search = _uiState.value.search
+        val targetIndex = if (previous) {
+            search.previousSearchResultIndex()
+        } else {
+            search.nextSearchResultIndex()
+        } ?: return
+        val result = search.results.getOrNull(targetIndex) ?: return
+        goToSearchResult(result)
     }
 
     private suspend fun persistExplicitNavigation(engine: ReaderEngine, locator: Locator) {
@@ -984,8 +1077,37 @@ class ReaderViewModel(
     private fun clearSearch() {
         searchJob?.cancel()
         searchGeneration += 1L
+        clearTransientSearchHighlight(_uiState.value.engine)
         _uiState.update { it.copy(search = it.search.cleared()) }
     }
+
+    /**
+     * Paint the exact selected search hit (locator + matchLength). Engines that do not implement
+     * [SearchHighlightableReaderEngine] no-op. Never stores hits as [ReaderTextAnnotation].
+     */
+    private fun applySearchHighlight(engine: ReaderEngine, hit: ReaderSearchHit) {
+        (engine as? SearchHighlightableReaderEngine)?.setSearchHighlight(hit)
+    }
+
+    /**
+     * Clear engine paint and drop [ReaderSearchState.selectedIndex]. Used by query change, new
+     * search, clear, and explicit non-search navigation. Closing only the SEARCH panel does not call this.
+     */
+    private fun clearTransientSearchHighlight(engine: ReaderEngine?) {
+        (engine as? SearchHighlightableReaderEngine)?.setSearchHighlight(null)
+        _uiState.update { state ->
+            if (state.search.selectedIndex == null) state
+            else state.copy(search = state.search.copy(selectedIndex = null))
+        }
+    }
+
+    private fun ReaderSearchResult.toSearchHit(): ReaderSearchHit =
+        ReaderSearchHit(
+            locator = locator,
+            snippet = snippet,
+            matchLength = matchLength,
+            matchStart = matchStart,
+        )
 
     private fun clearTextSelection() {
         (_uiState.value.engine as? TextSelectableReaderEngine)?.clearTextSelection()
@@ -1112,6 +1234,12 @@ class ReaderViewModel(
         progressJob?.cancel()
         fontPreviewPersistJob?.cancel()
         searchJob?.cancel()
+        searchGeneration += 1L
+        // Invalidate in-flight search navigation so a slow goTo cannot persist after close.
+        searchNavigationJob?.cancel()
+        searchNavigationJob = null
+        searchNavigationGeneration += 1L
+        bookSessionGeneration += 1L
         bookmarkJob?.cancel()
         clearPendingBookmarkMutations()
         textSelectionJob?.cancel()

@@ -16,8 +16,9 @@ class PageShotBudgetTest {
             48L * MIB,
             pageShotBudgetCapacityBytes(memoryClassMiB = 512, isLowRamDevice = false),
         )
+        // Normal devices keep a floor large enough for a tablet forward pair (see below).
         assertEquals(
-            16L * MIB,
+            32L * MIB,
             pageShotBudgetCapacityBytes(memoryClassMiB = 128, isLowRamDevice = false),
         )
         assertEquals(
@@ -27,6 +28,24 @@ class PageShotBudgetTest {
         assertEquals(
             128L * MIB / 10L,
             pageShotBudgetCapacityBytes(memoryClassMiB = 128, isLowRamDevice = true),
+        )
+    }
+
+    @Test
+    fun `normal ram floor admits tablet-sized forward page-shot pair`() {
+        // Emulator tablet override 1600x2560 ARGB8888 ≈ 15.625 MiB/shot; front+revealed ≈ 31.25 MiB.
+        // memoryClass 192 with /8 alone yields 24 MiB and starves the warm forward slot.
+        val tabletPairBytes = 1600L * 2560L * 4L * 2L
+        val capacity = pageShotBudgetCapacityBytes(memoryClassMiB = 192, isLowRamDevice = false)
+        assertTrue(
+            capacity >= tabletPairBytes,
+            "normal budget must admit a tablet front+revealed pair; capacity=$capacity pair=$tabletPairBytes",
+        )
+        assertTrue(capacity <= 48L * MIB)
+        // Low-RAM policy must not inherit the normal floor.
+        assertEquals(
+            192L * MIB / 10L,
+            pageShotBudgetCapacityBytes(memoryClassMiB = 192, isLowRamDevice = true),
         )
     }
 

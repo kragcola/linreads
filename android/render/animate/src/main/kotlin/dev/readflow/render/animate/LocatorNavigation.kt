@@ -15,6 +15,8 @@ internal fun moveLocatorBy(locator: Locator, totalItems: Int, delta: Int): Locat
             val index = (strategy.elementIndex + delta).coerceIn(0, lastIndex)
             if (index == strategy.elementIndex) null else locator.withIndex(index, totalItems)
         }
+        // PageText is a text point, not page-turn progress identity — do not step it.
+        is LocatorStrategy.PageText,
         is LocatorStrategy.ByteOffset,
         LocatorStrategy.Unknown,
         -> null
@@ -27,6 +29,8 @@ internal fun pageIndexFromLocator(locator: Locator, totalItems: Int): Int {
     val index = when (val strategy = locator.strategy) {
         is LocatorStrategy.Page -> strategy.index
         is LocatorStrategy.Section -> strategy.elementIndex
+        // PageText is not progress identity; fall back like Unknown/ByteOffset.
+        is LocatorStrategy.PageText,
         is LocatorStrategy.ByteOffset,
         LocatorStrategy.Unknown,
         -> locator.totalProgression?.let { (it * total).toInt() } ?: 0

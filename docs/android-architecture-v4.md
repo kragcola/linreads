@@ -260,7 +260,7 @@ sealed interface ReaderIntent {
 }
 ```
 
-引擎侧支撑：TOC 来自解析（EPUB nav/ncx、PDF outline）；`Search`/`GoToSearchResult` 需 `ReaderEngine` 增 `suspend fun search(query): List<Locator>`（原生重排在已解析的 `ReaderItem` 文本上做，PDF 走 PdfRenderer 文本层或降级不支持）；文字选择由各引擎 View 上报 `InkAnchor.Text`（§6.3），与 Ink 锚点模型复用同一套坐标。搜索/TOC/选择按 Phase 推进（Phase 2 基础导航 + TOC，搜索/选择可后置），但 **Intent 契约在架构层先定义齐**，避免功能落地时回头改 MVI 形状。
+引擎侧支撑：TOC 来自解析（EPUB nav/ncx、PDF outline）；`Search`/`GoToSearchResult` 需 `ReaderEngine` 增 `suspend fun search(query): List<Locator>`（原生重排在已解析的 `ReaderItem` 文本上做；PDF 的 `supportsSearch` 由 open-session 的 framework 文本 API 动态投影——可用则检索/零命中，API 不可用才 unsupported）；文字选择由各引擎 View 上报 `InkAnchor.Text`（§6.3），与 Ink 锚点模型复用同一套坐标。搜索/TOC/选择按 Phase 推进（Phase 2 基础导航 + TOC，搜索/选择可后置），但 **Intent 契约在架构层先定义齐**，避免功能落地时回头改 MVI 形状。
 
 ## 五、渲染引擎契约
 
@@ -296,7 +296,7 @@ interface ReaderEngine {
     val format: BookFormat
     val priority: Int              // lower = preferred; 0-9 system, 10-19 first-party JNI, 20-29 third-party, 30+ fallback
     val pagingKind: StateFlow<PagingKind>  // PAGED → PageTransitionHost; CONTINUOUS → scroll. StateFlow: runtime SCROLL↔PAGED switch (R-6)
-    val supportsSearch: Boolean    // F8: false for fixed-layout/no-text-layer (PDF image-only) engines
+    val supportsSearch: Boolean    // F8: capability flag; PDF projects from current open-session PdfOpenTextSession (framework text API), not a permanent false
     suspend fun supports(uri: Uri): Boolean
 
     // ── Lifecycle ───────────────────────────────────────
@@ -310,8 +310,11 @@ interface ReaderEngine {
     val pageCount: StateFlow<Int>             // reactive; updates after parse / reflow
 
     // ── In-document search (F8, backs ReaderIntent.Search §4.5) ──
-    // Returns empty list when !supportsSearch. Reflow engines search parsed ReaderItem
-    // text; PdfRenderer goes through its text layer or returns empty (image-only PDF).
+    // Returns empty list when !supportsSearch. Reflow engines search parsed ReaderItem text.
+    // PDF: supportsSearch/supportsTextAnnotationCreation are session-dynamic from
+    // PdfOpenTextSession (API binding + flag; no early-page content probe). Capable API +
+    // image-only/zero-hit → empty results; unavailable API → unsupported UI. Saved PDF
+    // annotations remain manageable when creation capability is false.
     suspend fun search(query: String): List<Locator> = emptyList()
 
     // ── Layout control (reflow formats) ─────────────────
@@ -583,9 +586,23 @@ Room 以 `anchor_type: String` + `anchor_json: String` 存储，`:ink` 的 `InkA
 
 ### 7.1 Locator（`:core:model`，Layer 0）
 
-定位策略由下方 `LocatorStrategy` 显式建模（B2）：`Page(index, total)`、`Section(spineIndex, elementIndex, charOffset)`、`ByteOffset(offset, length)`（保证 offset 落在字符起始字节，见 §5.4）、`Unknown`。EPUB 原生重排用 `Section`（spine + 元素 index + 章节内字符偏移）定位，**不再使用 CFI**（CFI 是 WebView/DOM range 概念，去 WebView 后无意义；E1）。
+定位策略由下方 `LocatorStrategy` 显式建模（B2）：`Page(index, total)`、`PageText(index, total, charOffset)`、`Section(spineIndex, elementIndex, charOffset)`、`ByteOffset(offset, length)`（保证 offset 落在字符起始字节，见 §5.4）、`Unknown`。EPUB 原生重排用 `Section`（spine + 元素 index + 章节内字符偏移）定位，**不再使用 CFI**（CFI 是 WebView/DOM range 概念，去 WebView 后无意义；E1）。
 
-**跨端同步主键（v4 外部对标修订，E2/P2-EXT-3）**：`Locator` 额外携带与定位策略无关的两个进度标量，作为三端同步的**稳定主键**——`ByteOffset`/`Section` 等是引擎内精确恢复用的细节，对字号敏感、互操作性差，不适合做同步比对键。注意 Web 端仍用 epubjs CFI，但 CFI 不进同步主键，三端统一用 `totalProgression` 比对。
+**Page vs PageText identity rule**：
+
+| 策略 | 身份 | 用途 | 禁止 |
+|------|------|------|------|
+| **`Page`** | 固定版面 **进度身份** | PDF 进度发布、TOC、翻页、书签创建 | 不要把 `PageText` 当进度身份写入 `currentLocator` / 书签 |
+| **`PageText`** | 固定页 **文本点** | PDF 标注锚点（range = start+end 两个点）；未来标注跳转用 `index` 定位页 | 不要把 `index` 当 EPUB 段/ MD 切片 / TXT 段；不要在 locator 内再塞 `charStart/charEnd` 或 quads |
+
+- PDF `goTo` 可接受 `PageText` 的页号，但**发布的当前定位仍是 bare `Page`**。
+- Stage-1 PDF 搜索仍用 bare `Page` + 瞬态 `ReaderSearchHit.matchStart`。
+- **PDF 划选 / 持久标注（Packet B）**：`PdfRendererEngine` 实现 `TextSelectableReaderEngine` + `TextAnnotatableReaderEngine`。划选经反射 `PdfRenderer.Page.selectContent`（`PdfFrameworkTextApi`，生产签名不含 API-36 model 类型）映射为同页 `PageText` start/end；跨页手势 fail-closed，不伪造 locator。搜索高亮、划选、标注为独立 overlay 层；`setTextAnnotations` 仅 paint，Room/Sync 路径不变。
+- EPUB 仅保留 **legacy bare `Page`** 迁移；**不得**消费 `PageText` 为段索引（外源 `PageText` → `totalProgression` 回退）。
+- 共享辅助 `fixedPageIndex(Page|PageText)` 只用于「需要固定页号」的路径（如 PDF 跳转），**不鼓励**把 `PageText` 当进度身份。
+- Room/backup/sync 仍存 opaque JSON；**无需 schema migration**；LWW/Union 语义不变。
+
+**跨端同步主键（v4 外部对标修订，E2/P2-EXT-3）**：`Locator` 额外携带与定位策略无关的两个进度标量，作为三端同步的**稳定主键**——`ByteOffset`/`Section`/`PageText` 等是引擎内精确恢复用的细节，对字号敏感、互操作性差，不适合做同步比对键。注意 Web 端仍用 epubjs CFI，但 CFI 不进同步主键，三端统一用 `totalProgression` 比对。
 
 ```kotlin
 @Serializable
@@ -603,9 +620,18 @@ data class Locator(
  */
 @Serializable
 sealed interface LocatorStrategy {
-    /** Fixed-layout（PDF/CBZ/DOCX）：页号定位。 */
+    /** Fixed-layout 进度身份（PDF 进度 / TOC / 翻页 / 书签）。 */
     @Serializable
     data class Page(val index: Int, val total: Int) : LocatorStrategy
+
+    /** Fixed-page 文本点（PDF 标注锚点 / 跳转）；非进度身份。
+     *  range = 两个 PageText 点（ReaderTextSelection/Annotation 的 start+end）。 */
+    @Serializable
+    data class PageText(
+        val index: Int,
+        val total: Int,
+        val charOffset: Int,
+    ) : LocatorStrategy
 
     /** Reflow（EPUB 原生重排 / TXT / MD）：spine + 元素 index + 章节内字符偏移。
      *  与 §5.5 定位锚点、§6.3 InkAnchor.Text 同坐标系；charOffset 单位为 code point，
@@ -625,9 +651,12 @@ sealed interface LocatorStrategy {
     @Serializable
     data object Unknown : LocatorStrategy
 }
+
+/** Page 或 PageText 的固定页号；非固定策略返回 null。勿当进度身份使用。 */
+fun fixedPageIndex(strategy: LocatorStrategy): Int?
 ```
 
-> **建模说明（B2）**：早期版本把「Page/ByteOffset/Section」当作裸枚举名写在注释里，但 `goTo(locator)`、`search(): List<Locator>`、`InkAnchor.Text` 都依赖 spine index + 字符偏移这些 **payload**。裸枚举装不下，照抄即语义落空（违反原则 7）。故 `LocatorStrategy` 必须是带字段的 `@Serializable sealed interface`，`Section` 与 `InkAnchor.Text`（§6.3）共用同一坐标系。`ByteOffset`/`Section` 是「引擎内精确恢复」用，对字号敏感、互操作差，**不做同步比对键**；同步比对一律用下面的 `totalProgression`。
+> **建模说明（B2）**：早期版本把「Page/ByteOffset/Section」当作裸枚举名写在注释里，但 `goTo(locator)`、`search(): List<Locator>`、`InkAnchor.Text` 都依赖 spine index + 字符偏移这些 **payload**。裸枚举装不下，照抄即语义落空（违反原则 7）。故 `LocatorStrategy` 必须是带字段的 `@Serializable sealed interface`，`Section` 与 `InkAnchor.Text`（§6.3）共用同一坐标系。`ByteOffset`/`Section`/`PageText` 是「引擎内精确恢复」用，对字号敏感、互操作差，**不做同步比对键**；同步比对一律用下面的 `totalProgression`。`Page` 仍是固定版面进度身份；`PageText` 仅作文本点，range 由两个点表示。
 
 对标 Readium（progression + position + totalProgression 为主、`partialCfi` 为可选兼容字段）与 KOReader（`percentage = cur/total`）。三端同步比对用 `totalProgression`，本端精确跳转用 `strategy`。与 `linreads-sync` 的 LWW 正交互补：LWW 决谁赢，`totalProgression` 决进度值。
 

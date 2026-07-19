@@ -18,7 +18,9 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -111,6 +113,79 @@ class EpubFlowSpannableTest {
         assertFalse(paint.isFakeBoldText)
         assertEquals(0f, paint.textSkewX, 0.0001f)
         assertEquals(4, span.styleCacheSizeForTest())
+    }
+
+    @Test
+    fun `font family style span uses bookFontResolver for measure and draw typeface`() {
+        val resolved = Typeface.MONOSPACE
+        var resolveCalls = 0
+        val flow = epubBuildChapterFlow(
+            0,
+            listOf(
+                EpubDisplayBlock.Text(
+                    text = "Styled family",
+                    headingLevel = null,
+                    paragraphIndex = 0,
+                    styleSpans = listOf(
+                        EpubTextStyleSpan(
+                            start = 0,
+                            end = "Styled family".length,
+                            style = EpubTextStyle.FontFamily,
+                            fontFamily = "Story, serif",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val sb = build(
+            flow,
+            style = style().copy(
+                bookFontResolver = { family ->
+                    resolveCalls += 1
+                    assertTrue(family.contains("Story", ignoreCase = true))
+                    resolved
+                },
+            ),
+        ) { null } as android.text.Spanned
+
+        val spans = sb.getSpans(0, sb.length, EpubTypefaceSpan::class.java)
+        assertEquals(1, spans.size)
+        assertEquals(1, resolveCalls)
+
+        val measurePaint = android.text.TextPaint()
+        val drawPaint = android.text.TextPaint()
+        spans[0].updateMeasureState(measurePaint)
+        spans[0].updateDrawState(drawPaint)
+        assertSame(measurePaint.typeface, drawPaint.typeface)
+        assertNotNull(measurePaint.typeface)
+    }
+
+    @Test
+    fun `font family style span is omitted when bookFontResolver returns null`() {
+        val flow = epubBuildChapterFlow(
+            0,
+            listOf(
+                EpubDisplayBlock.Text(
+                    text = "No face yet",
+                    headingLevel = null,
+                    paragraphIndex = 0,
+                    styleSpans = listOf(
+                        EpubTextStyleSpan(
+                            start = 0,
+                            end = "No face yet".length,
+                            style = EpubTextStyle.FontFamily,
+                            fontFamily = "Story",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val sb = build(
+            flow,
+            style = style().copy(bookFontResolver = { null }),
+        ) { null } as android.text.Spanned
+
+        assertEquals(0, sb.getSpans(0, sb.length, EpubTypefaceSpan::class.java).size)
     }
 
     private fun build(

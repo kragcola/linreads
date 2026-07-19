@@ -14,6 +14,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.text.SpannableString
 import android.text.Spanned
+import android.text.style.BackgroundColorSpan
 import android.text.style.ClickableSpan
 import android.text.style.ImageSpan
 import android.view.MotionEvent
@@ -22,6 +23,10 @@ import android.view.ViewConfiguration
 import android.view.ViewGroup
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.ui.readerPaperBackground
+import dev.readflow.render.api.READER_SEARCH_HIGHLIGHT_COLOR
+import dev.readflow.render.api.ReaderSearchHighlightSpan
+import dev.readflow.render.api.ReaderTextHighlightRange
+import dev.readflow.render.api.ReaderTextHighlightSpan
 import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableLoader
 import io.noties.markwon.image.AsyncDrawableSpan
@@ -1051,6 +1056,48 @@ class EpubFlowViewTest {
             "highlight refresh must rebuild a new target bitmap before the next local turn",
             checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) !== resizedTarget,
         )
+    }
+
+    @Test
+    fun `refreshHighlights preserves plain BackgroundColorSpan while replacing annotation and search spans`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val base = SpannableString("css annotation search rest")
+        val cssSpan = BackgroundColorSpan(0x33FF0000)
+        base.setSpan(cssSpan, 0, 3, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        view.textView.setText(base, android.widget.TextView.BufferType.SPANNABLE)
+
+        view.refreshHighlights(
+            annotationRanges = listOf(ReaderTextHighlightRange(4, 14, 0x66FFE082)),
+            searchRanges = listOf(ReaderTextHighlightRange(15, 21, READER_SEARCH_HIGHLIGHT_COLOR)),
+        )
+
+        val text = view.textView.text as Spanned
+        val plain = text.getSpans(0, text.length, BackgroundColorSpan::class.java)
+            .filter { it !is ReaderTextHighlightSpan && it !is ReaderSearchHighlightSpan }
+        assertEquals(1, plain.size)
+        assertEquals(0x33FF0000, plain.single().backgroundColor)
+        assertEquals(0, text.getSpanStart(plain.single()))
+        assertEquals(3, text.getSpanEnd(plain.single()))
+
+        val annotations = text.getSpans(0, text.length, ReaderTextHighlightSpan::class.java)
+        val searches = text.getSpans(0, text.length, ReaderSearchHighlightSpan::class.java)
+        assertEquals(1, annotations.size)
+        assertEquals(1, searches.size)
+        assertEquals(0x66FFE082, annotations.single().backgroundColor)
+        assertEquals(READER_SEARCH_HIGHLIGHT_COLOR, searches.single().backgroundColor)
+
+        // Clear search only via empty searchRanges; annotation + CSS must remain.
+        view.refreshHighlights(
+            annotationRanges = listOf(ReaderTextHighlightRange(4, 14, 0x66FFE082)),
+            searchRanges = emptyList(),
+        )
+        val cleared = view.textView.text as Spanned
+        assertEquals(0, cleared.getSpans(0, cleared.length, ReaderSearchHighlightSpan::class.java).size)
+        assertEquals(1, cleared.getSpans(0, cleared.length, ReaderTextHighlightSpan::class.java).size)
+        val plainAfter = cleared.getSpans(0, cleared.length, BackgroundColorSpan::class.java)
+            .filter { it !is ReaderTextHighlightSpan && it !is ReaderSearchHighlightSpan }
+        assertEquals(1, plainAfter.size)
+        assertEquals(0x33FF0000, plainAfter.single().backgroundColor)
     }
 
     @Test
@@ -5121,6 +5168,539 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `partial staged front survives real finger MOVE and seeds local handoff without front recapture`() {
+        // Product contract: real touch MOVE with a matching staged front but missing directional
+        // target must retain that front as pendingLocalPageShotHandoff.frontBitmap (LOCAL_SHOTS_WAITING)
+        // and later install the overlay with that exact identity after only one additional target draw.
+        val background = RecordingTargetBitmapDrawable()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.55f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            // Arm split-frame precache without idling all work.
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            // Exactly the first precache frame: matching current-page front, no directional target yet.
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val pending = checkNotNull(view.privateField("pendingPageTexturePrecache")) {
+                "first precache frame must leave a staged pending request"
+            }
+            val stagedFront = checkNotNull(pending.reflectedField("frontBitmap") as Bitmap?) {
+                "first precache frame must capture a live front bitmap"
+            }
+            assertFalse("staged front must be live after the first precache frame", stagedFront.isRecycled)
+            assertNull(
+                "directional target must be missing after only the front frame",
+                pending.reflectedField("targetBitmap"),
+            )
+            assertEquals(
+                "only the staged front draw may have occurred before the gesture",
+                1,
+                background.targetBitmaps.size,
+            )
+
+            // Real threshold-crossing finger MOVE (not the direct reflection overload).
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+
+            assertEquals(
+                "partial-front gesture must enter deferred local handoff",
+                "LOCAL_SHOTS_WAITING",
+                view.privateField("interactiveTurnState").toString(),
+            )
+            checkNotNull(view.privateField("pendingLocalPageShotHandoff")) {
+                "LOCAL_SHOTS_WAITING must own a pending local handoff"
+            }
+            assertFalse(
+                "real finger MOVE must retain the matching staged front instead of recycling it " +
+                    "before the deferred target capture; staged=$stagedFront",
+                stagedFront.isRecycled,
+            )
+            assertNull(
+                "front-only extract must clear the incomplete pending precache",
+                view.privateField("pendingPageTexturePrecache"),
+            )
+            assertEquals(
+                "threshold MOVE must not allocate the missing target yet",
+                1,
+                background.targetBitmaps.size,
+            )
+
+            // Queued frames: target capture, then resume with the seeded front (no front recapture).
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            assertNull(
+                "target-only preparation frame must not install the slide overlay yet",
+                view.privateField("slideDrawable"),
+            )
+            val handoffAfterTarget = checkNotNull(view.privateField("pendingLocalPageShotHandoff"))
+            assertFalse(
+                "staged front must stay live while the target shot is pending",
+                stagedFront.isRecycled,
+            )
+            assertNotNull(
+                "first handoff frame must capture the directional target",
+                handoffAfterTarget.reflectedField("targetBitmap"),
+            )
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?) {
+                "seeded handoff must install the local slide overlay after target + front resolution"
+            }
+            assertTrue(
+                "local slide overlay must use the exact staged front identity; " +
+                    "paperFront=${slide.privateBitmap("frontBitmap")} staged=$stagedFront " +
+                    "recycled=${stagedFront.isRecycled}",
+                slide.privateBitmap("frontBitmap") === stagedFront && !stagedFront.isRecycled,
+            )
+            assertEquals(
+                "only one additional full page-shot draw (target) may occur after the staged front; " +
+                    "draws=${background.targetBitmaps.size}",
+                2,
+                background.targetBitmaps.size,
+            )
+            assertTrue(
+                "overlay revealed must be the newly captured target identity",
+                slide.privateBitmap("revealedBitmap") === background.targetBitmaps[1],
+            )
+        } finally {
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `seeded front ACTION_CANCEL recycles staged front and blocks stale target capture`() {
+        val background = RecordingTargetBitmapDrawable()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+        val chargedBefore = budget.chargedBytes
+        val leasedBefore = budget.leasedBytes
+
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.55f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val pending = checkNotNull(view.privateField("pendingPageTexturePrecache"))
+            val stagedFront = checkNotNull(pending.reflectedField("frontBitmap") as Bitmap?)
+            assertFalse(stagedFront.isRecycled)
+            assertNull(pending.reflectedField("targetBitmap"))
+            assertEquals(1, background.targetBitmaps.size)
+            val chargedAfterStage = budget.chargedBytes
+
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+
+            assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
+            val handoff = checkNotNull(view.privateField("pendingLocalPageShotHandoff"))
+            assertTrue(
+                "handoff must own the exact staged front identity",
+                handoff.reflectedField("frontBitmap") === stagedFront && !stagedFront.isRecycled,
+            )
+            assertNull(handoff.reflectedField("targetBitmap"))
+            assertNull(view.privateField("pendingPageTexturePrecache"))
+            assertEquals(1, background.targetBitmaps.size)
+            val dequeuedTarget = checkNotNull(
+                view.privateField("capturePendingLocalTargetRunnable") as Runnable?,
+            ) {
+                "seeded handoff must queue the deferred target capture"
+            }
+
+            view.onTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y),
+            )
+
+            assertTrue(
+                "ACTION_CANCEL must recycle the seeded front and clear handoff/overlay/callbacks; " +
+                    "frontRecycled=${stagedFront.isRecycled} " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "handoff=${view.privateField("pendingLocalPageShotHandoff")} " +
+                    "slide=${view.privateField("slideDrawable")} curl=${view.privateField("curlDrawable")} " +
+                    "targetCb=${view.privateField("capturePendingLocalTargetRunnable")} " +
+                    "frontCb=${view.privateField("capturePendingLocalFrontRunnable")} " +
+                    "charged=${budget.chargedBytes} leased=${budget.leasedBytes} " +
+                    "beforeStage charged=$chargedBefore leased=$leasedBefore stagedCharged=$chargedAfterStage",
+                stagedFront.isRecycled &&
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                    view.privateField("pendingLocalPageShotHandoff") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    view.privateField("curlDrawable") == null &&
+                    view.privateField("capturePendingLocalTargetRunnable") == null &&
+                    view.privateField("capturePendingLocalFrontRunnable") == null &&
+                    budget.leasedBytes <= leasedBefore &&
+                    budget.chargedBytes <= chargedBefore &&
+                    budget.leasedBytes < chargedAfterStage,
+            )
+
+            val drawsBeforeStale = background.targetBitmaps.toList()
+            dequeuedTarget.run()
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "a captured stale target runnable must not allocate or revive overlay/state; " +
+                    "drawsBefore=$drawsBeforeStale drawsAfter=${background.targetBitmaps} " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "handoff=${view.privateField("pendingLocalPageShotHandoff")} " +
+                    "slide=${view.privateField("slideDrawable")} curl=${view.privateField("curlDrawable")}",
+                background.targetBitmaps == drawsBeforeStale &&
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                    view.privateField("pendingLocalPageShotHandoff") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    view.privateField("curlDrawable") == null &&
+                    stagedFront.isRecycled,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `seeded front invalidation recycles seed and target and ignores stale resume`() {
+        val background = RecordingTargetBitmapDrawable()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.55f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val stagedFront = checkNotNull(
+                (view.privateField("pendingPageTexturePrecache") as Any)
+                    .reflectedField("frontBitmap") as Bitmap?,
+            )
+
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+            val handoff = checkNotNull(view.privateField("pendingLocalPageShotHandoff"))
+            assertTrue(handoff.reflectedField("frontBitmap") === stagedFront)
+
+            // Capture directional target so the request owns both seed and target.
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val handoffAfterTarget = checkNotNull(view.privateField("pendingLocalPageShotHandoff"))
+            val target = checkNotNull(handoffAfterTarget.reflectedField("targetBitmap") as Bitmap?) {
+                "first handoff frame must capture the directional target"
+            }
+            assertTrue(
+                handoffAfterTarget.reflectedField("frontBitmap") === stagedFront &&
+                    !stagedFront.isRecycled &&
+                    !target.isRecycled,
+            )
+            assertNull("target frame must not install overlay yet", view.privateField("slideDrawable"))
+            val dequeuedFrontResume = checkNotNull(
+                view.privateField("capturePendingLocalFrontRunnable") as Runnable?,
+            ) {
+                "after target capture the resume-with-seeded-front frame must be queued"
+            }
+            val leasedWithBoth = budget.leasedBytes
+
+            // Representative visual invalidator (same family as target-only retirement suite).
+            view.background = ColorDrawable(0xFFF1E8D8.toInt())
+
+            assertTrue(
+                "visual invalidation must recycle both seeded front and captured target; " +
+                    "frontRecycled=${stagedFront.isRecycled} targetRecycled=${target.isRecycled} " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "handoff=${view.privateField("pendingLocalPageShotHandoff")} " +
+                    "slide=${view.privateField("slideDrawable")} curl=${view.privateField("curlDrawable")} " +
+                    "leasedBefore=$leasedWithBoth leasedAfter=${budget.leasedBytes}",
+                stagedFront.isRecycled &&
+                    target.isRecycled &&
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                    view.privateField("pendingLocalPageShotHandoff") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    view.privateField("curlDrawable") == null &&
+                    budget.leasedBytes < leasedWithBoth,
+            )
+
+            val drawsBeforeStale = background.targetBitmaps.toList()
+            dequeuedFrontResume.run()
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "queued stale front/resume runnable must be harmless after invalidation; " +
+                    "drawsBefore=$drawsBeforeStale drawsAfter=${background.targetBitmaps} " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "handoff=${view.privateField("pendingLocalPageShotHandoff")} " +
+                    "slide=${view.privateField("slideDrawable")} curl=${view.privateField("curlDrawable")}",
+                background.targetBitmaps == drawsBeforeStale &&
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                    view.privateField("pendingLocalPageShotHandoff") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    view.privateField("curlDrawable") == null &&
+                    stagedFront.isRecycled &&
+                    target.isRecycled,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `seeded front new down supersedes A and only replacement B survives`() {
+        val reportedOffsets = mutableListOf<Int>()
+        val background = RecordingTargetBitmapDrawable()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTopOffsetChanged = reportedOffsets::add,
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        reportedOffsets.clear()
+        val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+
+        val y = view.height * 0.10f
+        val aDownX = view.width * 0.85f
+        val aMoveX = view.width * 0.55f
+        val aDownTime = SystemClock.uptimeMillis()
+        val bDownX = view.width * 0.15f
+        val bMoveX = view.width * 0.75f
+        val bDownTime = aDownTime + 100L
+
+        try {
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val stagedFront = checkNotNull(
+                (view.privateField("pendingPageTexturePrecache") as Any)
+                    .reflectedField("frontBitmap") as Bitmap?,
+            )
+
+            view.dispatchTouchEvent(motionEvent(aDownTime, aDownTime, MotionEvent.ACTION_DOWN, aDownX, y))
+            assertTrue(
+                "gesture A must enter seeded forward handoff",
+                view.onInterceptTouchEvent(
+                    motionEvent(aDownTime, aDownTime + 24L, MotionEvent.ACTION_MOVE, aMoveX, y),
+                ),
+            )
+            val aHandoff = checkNotNull(view.privateField("pendingLocalPageShotHandoff"))
+            assertTrue(
+                aHandoff.reflectedField("frontBitmap") === stagedFront && !stagedFront.isRecycled,
+            )
+            val dequeuedATarget = checkNotNull(
+                view.privateField("capturePendingLocalTargetRunnable") as Runnable?,
+            )
+
+            // New DOWN synchronously retires A before B classification.
+            view.dispatchTouchEvent(motionEvent(bDownTime, bDownTime, MotionEvent.ACTION_DOWN, bDownX, y))
+            val bOriginPage = view.currentPageIndex()
+            val bOriginTop = view.scrollY
+
+            assertTrue(
+                "new DOWN must recycle A's seeded front and clear handoff before B classifies; " +
+                    "frontRecycled=${stagedFront.isRecycled} " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "handoff=${view.privateField("pendingLocalPageShotHandoff")} " +
+                    "slide=${view.privateField("slideDrawable")} curl=${view.privateField("curlDrawable")} " +
+                    "reports=$reportedOffsets",
+                stagedFront.isRecycled &&
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                    view.privateField("pendingLocalPageShotHandoff") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    view.privateField("curlDrawable") == null &&
+                    reportedOffsets.isEmpty(),
+            )
+
+            assertTrue(
+                "gesture B must classify its own turn from the new anchor",
+                view.onInterceptTouchEvent(
+                    motionEvent(bDownTime, bDownTime + 24L, MotionEvent.ACTION_MOVE, bMoveX, y),
+                ),
+            )
+            val bHandoff = checkNotNull(view.privateField("pendingLocalPageShotHandoff")) {
+                "gesture B must own the current handoff after classification"
+            }
+            assertTrue(
+                "only B may own the current handoff; A's front must stay recycled",
+                view.privateField("pendingLocalPageShotHandoff") === bHandoff &&
+                    stagedFront.isRecycled &&
+                    view.privateField("interactiveTurnState").toString() == "LOCAL_SHOTS_WAITING",
+            )
+            val bFrontBeforeStale = bHandoff.reflectedField("frontBitmap")
+            val bTargetBeforeStale = bHandoff.reflectedField("targetBitmap")
+            val drawsBeforeStaleA = background.targetBitmaps.toList()
+            val leasedBeforeStaleA = budget.leasedBytes
+
+            dequeuedATarget.run()
+
+            assertTrue(
+                "stale A target callback must not mutate or revive B; " +
+                    "sameOwner=${view.privateField("pendingLocalPageShotHandoff") === bHandoff} " +
+                    "front=${bHandoff.reflectedField("frontBitmap")} " +
+                    "target=${bHandoff.reflectedField("targetBitmap")} " +
+                    "drawsBefore=$drawsBeforeStaleA drawsAfter=${background.targetBitmaps} " +
+                    "state=${view.privateField("interactiveTurnState")} " +
+                    "slide=${view.privateField("slideDrawable")} curl=${view.privateField("curlDrawable")} " +
+                    "aFrontRecycled=${stagedFront.isRecycled} reports=$reportedOffsets",
+                view.privateField("pendingLocalPageShotHandoff") === bHandoff &&
+                    bHandoff.reflectedField("frontBitmap") === bFrontBeforeStale &&
+                    bHandoff.reflectedField("targetBitmap") === bTargetBeforeStale &&
+                    background.targetBitmaps == drawsBeforeStaleA &&
+                    budget.leasedBytes == leasedBeforeStaleA &&
+                    view.privateField("interactiveTurnState").toString() == "LOCAL_SHOTS_WAITING" &&
+                    view.privateField("slideDrawable") == null &&
+                    view.privateField("curlDrawable") == null &&
+                    stagedFront.isRecycled &&
+                    reportedOffsets.isEmpty(),
+            )
+
+            view.onTouchEvent(
+                motionEvent(bDownTime, bDownTime + 48L, MotionEvent.ACTION_CANCEL, bMoveX, y),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "CANCEL of B must restore origin without reviving A; " +
+                    "origin=[$bOriginPage,$bOriginTop] final=[${view.currentPageIndex()},${view.scrollY}] " +
+                    "state=${view.privateField("interactiveTurnState")} reports=$reportedOffsets",
+                view.currentPageIndex() == bOriginPage &&
+                    view.scrollY == bOriginTop &&
+                    view.privateField("interactiveTurnState").toString() == "NONE" &&
+                    view.privateField("pendingLocalPageShotHandoff") == null &&
+                    view.privateField("slideDrawable") == null &&
+                    view.privateField("curlDrawable") == null &&
+                    stagedFront.isRecycled &&
+                    reportedOffsets.isEmpty(),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `partial front with opposite neighbor seeds handoff and recycles opposite on missing direction MOVE`() {
+        // Stage front + forward (opposite of a backward request) while backward previous is missing.
+        // Real backward MOVE must retain front for local handoff and recycle the staged forward neighbor.
+        val background = RecordingTargetBitmapDrawable()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        view.background = background
+        shadowOf(Looper.getMainLooper()).idle()
+        view.recycleCachedTexturesForTest()
+        background.targetBitmaps.clear()
+        val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+
+        val downX = view.width * 0.15f
+        val moveX = view.width * 0.45f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+
+        try {
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+            // Frame 1: current front.
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val pendingAfterFront = checkNotNull(view.privateField("pendingPageTexturePrecache"))
+            val stagedFront = checkNotNull(pendingAfterFront.reflectedField("frontBitmap") as Bitmap?)
+            assertNull(pendingAfterFront.reflectedField("targetBitmap"))
+            assertNull(pendingAfterFront.reflectedField("previousBitmap"))
+
+            // Frame 2: forward neighbor (opposite of the upcoming backward request).
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            val pendingAfterOpposite = checkNotNull(view.privateField("pendingPageTexturePrecache")) {
+                "after front+forward frames the precache must still be incomplete (previous missing)"
+            }
+            val stagedOpposite = checkNotNull(
+                pendingAfterOpposite.reflectedField("targetBitmap") as Bitmap?,
+            ) {
+                "second precache frame must stage the forward neighbor"
+            }
+            assertTrue(
+                pendingAfterOpposite.reflectedField("frontBitmap") === stagedFront &&
+                    !stagedFront.isRecycled &&
+                    !stagedOpposite.isRecycled,
+            )
+            assertNull(
+                "previous/backward neighbor must still be missing",
+                pendingAfterOpposite.reflectedField("previousBitmap"),
+            )
+            assertEquals(2, background.targetBitmaps.size)
+            val leasedWithOpposite = budget.leasedBytes
+
+            // Real threshold MOVE in the missing (backward) direction.
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+
+            assertEquals(
+                "missing-direction MOVE must enter deferred local handoff",
+                "LOCAL_SHOTS_WAITING",
+                view.privateField("interactiveTurnState").toString(),
+            )
+            val handoff = checkNotNull(view.privateField("pendingLocalPageShotHandoff"))
+            assertTrue(
+                "front must seed local handoff while opposite neighbor is released; " +
+                    "frontLive=${!stagedFront.isRecycled} oppositeRecycled=${stagedOpposite.isRecycled} " +
+                    "handoffFront=${handoff.reflectedField("frontBitmap")} " +
+                    "pending=${view.privateField("pendingPageTexturePrecache")} " +
+                    "draws=${background.targetBitmaps.size} " +
+                    "leasedBefore=$leasedWithOpposite leasedAfter=${budget.leasedBytes}",
+                handoff.reflectedField("frontBitmap") === stagedFront &&
+                    !stagedFront.isRecycled &&
+                    stagedOpposite.isRecycled &&
+                    view.privateField("pendingPageTexturePrecache") == null &&
+                    background.targetBitmaps.size == 2 &&
+                    budget.leasedBytes < leasedWithOpposite,
+            )
+            assertNull(handoff.reflectedField("targetBitmap"))
+            assertNull(view.privateField("slideDrawable"))
+            assertNull(view.privateField("curlDrawable"))
+        } finally {
+            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `large viewport precache keeps current and forward target without opposite owner`() {
         val view = pagedFlowView(
             text = (1..800).joinToString("\n") { "Line $it marker text." },
@@ -9133,6 +9713,495 @@ class EpubFlowViewTest {
         )
         assertEquals(0f, view.getChildAt(0).alpha)
         view.dispose()
+    }
+
+    @Test
+    fun `boundary image preview reuses generation host without per frame span lookup`() {
+        // Hot path: live draw + page-shot capture must not re-run Spannable.getSpans for the same
+        // page-boundary image occurrence every frame. Host is generation-owned in page layout metadata.
+        EpubBoundaryImageHostProbe.reset()
+        val viewportWidth = 360
+        val viewportHeight = 240
+        val placeholderColor = 0x00000000
+        val decodedColor = 0xFFDC2626.toInt()
+        val imageHeight = viewportHeight + 120
+        val bodyText = (1..2).joinToString("\n") { "前置 $it 把标题推到页底附近。" }
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Text(bodyText, headingLevel = null, paragraphIndex = 0),
+                EpubDisplayBlock.Text("缓存宿主标题", headingLevel = 2, paragraphIndex = 1),
+                EpubDisplayBlock.Image(
+                    href = "host-cache-plate.png",
+                    altText = "host cache plate",
+                    paragraphIndex = 2,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+        val imageSegment = flow.segments.single { it.isImage }
+        val headingSegment = flow.segments.single {
+            val block = it.block
+            block is EpubDisplayBlock.Text && block.headingLevel != null
+        }
+        val placeholder = ColorDrawable(placeholderColor).apply {
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val asyncDrawable = AsyncDrawable(
+            "host-cache-plate.png",
+            AsyncDrawableLoader.noOp(),
+            EpubFlowImageSizeResolver(
+                columnWidthPx = viewportWidth,
+                pageHeightProvider = { viewportHeight },
+                inlineMaxHeightPx = viewportHeight,
+                fullPageHrefs = emptySet(),
+            ),
+            null,
+        ).apply {
+            setResult(placeholder)
+            setBounds(0, 0, viewportWidth, imageHeight)
+        }
+        val spannable = SpannableString(flow.text).apply {
+            setSpan(
+                AsyncDrawableSpan(
+                    io.noties.markwon.core.MarkwonTheme.create(RuntimeEnvironment.getApplication()),
+                    asyncDrawable,
+                    AsyncDrawableSpan.ALIGN_CENTER,
+                    false,
+                ),
+                imageSegment.layoutStart,
+                imageSegment.layoutEnd,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val view = pagedFlowView(
+            flow = flow,
+            spannable = spannable,
+            viewportWidth = viewportWidth,
+            viewportHeight = viewportHeight,
+        )
+        try {
+            val layout = requireNotNull(view.textView.layout)
+            val headingLine = layout.getLineForOffset(headingSegment.layoutStart)
+            val headingPageIndex = (0 until view.pageCount()).firstOrNull { pageIndex ->
+                val top = requireNotNull(view.pageTopPxAt(pageIndex))
+                val nextTop = view.pageTopPxAt(pageIndex + 1) ?: (layout.height + 1)
+                layout.getLineTop(headingLine) in top until nextTop
+            } ?: error("heading must land on a paged window")
+            view.goToPage(headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            // Baseline after layout/pagination (host resolved into pageBoundaryImagePreviews metadata).
+            val lookupsAfterLayout = EpubBoundaryImageHostProbe.spanHostLookups()
+            assertTrue(
+                "metadata build must resolve the boundary image host at least once; lookups=$lookupsAfterLayout",
+                lookupsAfterLayout >= 1,
+            )
+
+            // Live draw path (draw → drawPageBoundaryImagePreview) must not re-resolve.
+            val liveA = view.drawToBitmapForTest()
+            val liveB = view.drawToBitmapForTest()
+            val liveC = view.drawToBitmapForTest()
+            liveA.recycle()
+            liveB.recycle()
+            liveC.recycle()
+            assertEquals(
+                "repeated live boundary-preview draws must not call Spannable.getSpans host lookup; " +
+                    "afterLayout=$lookupsAfterLayout afterLive=${EpubBoundaryImageHostProbe.spanHostLookups()}",
+                lookupsAfterLayout,
+                EpubBoundaryImageHostProbe.spanHostLookups(),
+            )
+
+            // Page-shot / snapshot path also paints the crop; still no span scan.
+            // Release budget leases after each capture: Bitmap.recycle does not free PageShotBudget
+            // slots (DEFAULT_MAX_ACTIVE_SHOTS = 3), and goToPage may already hold warm owners.
+            val headingTop = requireNotNull(view.pageTopPxAt(headingPageIndex))
+            val pageShotBudget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+            view.recycleCachedTexturesForTest()
+            shadowOf(Looper.getMainLooper()).idle()
+            val shotA = requireNotNull(view.snapshotPageAt(headingTop))
+            pageShotBudget.release(shotA)
+            if (!shotA.isRecycled) shotA.recycle()
+            val shotB = requireNotNull(view.snapshotPageAt(headingTop))
+            pageShotBudget.release(shotB)
+            if (!shotB.isRecycled) shotB.recycle()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(
+                "page-shot boundary-preview draws must reuse generation-owned host; " +
+                    "afterLayout=$lookupsAfterLayout afterShots=${EpubBoundaryImageHostProbe.spanHostLookups()}",
+                lookupsAfterLayout,
+                EpubBoundaryImageHostProbe.spanHostLookups(),
+            )
+
+            // Placeholder → decoded result on the same AsyncDrawable shell: host identity stays,
+            // crop still paints, and draws still do not re-scan spans.
+            val headingBottomOnPage =
+                layout.getLineBottom(headingLine) - headingTop
+            val sampleTop = (headingBottomOnPage + 2).coerceAtMost(viewportHeight - 2)
+            val decoded = ColorDrawable(decodedColor).apply {
+                setBounds(0, 0, viewportWidth, imageHeight)
+            }
+            asyncDrawable.setResult(decoded)
+            asyncDrawable.setBounds(0, 0, viewportWidth, imageHeight)
+            val afterPixels = view.drawToBitmapForTest()
+            try {
+                val hits = sampleImagePatternHits(
+                    bitmap = afterPixels,
+                    left = viewportWidth / 4,
+                    top = sampleTop,
+                    right = (viewportWidth * 3) / 4,
+                    bottom = viewportHeight - 1,
+                    stripeA = decodedColor,
+                    stripeB = decodedColor,
+                )
+                assertTrue(
+                    "same AsyncDrawable shell must paint decoded pixels into the leftover crop; " +
+                        "hits=$hits sampleTop=$sampleTop",
+                    hits > 0,
+                )
+            } finally {
+                afterPixels.recycle()
+            }
+            assertEquals(
+                "PIXELS_ONLY result swap must not force another span host lookup on draw",
+                lookupsAfterLayout,
+                EpubBoundaryImageHostProbe.spanHostLookups(),
+            )
+
+            // Chapter replacement invalidates generation-owned metadata; a new host resolution is required.
+            val chapter2 = epubBuildChapterFlow(
+                spineIndex = 1,
+                blocks = listOf(
+                    EpubDisplayBlock.Text("新章前置", headingLevel = null, paragraphIndex = 0),
+                    EpubDisplayBlock.Text("新章标题", headingLevel = 2, paragraphIndex = 1),
+                    EpubDisplayBlock.Image(
+                        href = "host-cache-plate-2.png",
+                        altText = "replacement plate",
+                        paragraphIndex = 2,
+                        isInlineContent = false,
+                    ),
+                ),
+            )
+            val image2 = chapter2.segments.single { it.isImage }
+            val drawable2 = ColorDrawable(0xFF2563EB.toInt()).apply {
+                setBounds(0, 0, viewportWidth, imageHeight)
+            }
+            val spannable2 = SpannableString(chapter2.text).apply {
+                setSpan(
+                    ImageSpan(drawable2, ImageSpan.ALIGN_BOTTOM),
+                    image2.layoutStart,
+                    image2.layoutEnd,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+            }
+            view.setChapter(chapter2, spannable2, pageHeightPx = viewportHeight)
+            view.measure(
+                android.view.View.MeasureSpec.makeMeasureSpec(viewportWidth, android.view.View.MeasureSpec.EXACTLY),
+                android.view.View.MeasureSpec.makeMeasureSpec(viewportHeight, android.view.View.MeasureSpec.EXACTLY),
+            )
+            view.layout(0, 0, viewportWidth, viewportHeight)
+            shadowOf(Looper.getMainLooper()).idle()
+            shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+            val lookupsAfterChapter = EpubBoundaryImageHostProbe.spanHostLookups()
+            assertTrue(
+                "chapter replacement must rebuild metadata and resolve a new host; " +
+                    "before=$lookupsAfterLayout after=$lookupsAfterChapter",
+                lookupsAfterChapter > lookupsAfterLayout,
+            )
+            // Draws under the new generation still must not re-scan.
+            val gen2Baseline = lookupsAfterChapter
+            view.drawToBitmapForTest().recycle()
+            view.drawToBitmapForTest().recycle()
+            assertEquals(
+                "post-replacement draws must not re-resolve the host every frame",
+                gen2Baseline,
+                EpubBoundaryImageHostProbe.spanHostLookups(),
+            )
+        } finally {
+            view.dispose()
+            EpubBoundaryImageHostProbe.stop()
+        }
+    }
+
+    @Test
+    fun `goToPage and setFlipStyle arm warm page-shot precache without test-only helpers`() {
+        // Production reader navigation parks via goToPage / live setFlipStyle; F1 warm gate and
+        // interactive turns must not require preCachePageTexturesForTest to arm front+revealed.
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        try {
+            assertTrue(
+                "fixture needs heading then immediate image page; heading=${fixture.headingPageIndex} " +
+                    "image=${fixture.imagePageIndex}",
+                fixture.headingPageIndex > 0 &&
+                    fixture.imagePageIndex == fixture.headingPageIndex + 1,
+            )
+            view.flipStyle = PageFlipStyle.SLIDE
+            view.goToPage(fixture.headingPageIndex)
+            // Production posts split-frame captures; drain the main looper like the real frame loop.
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+
+            val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) {
+                "goToPage must arm heading front page-shot without test precache helper"
+            }
+            val cachedRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) {
+                "goToPage must arm image revealed page-shot without test precache helper"
+            }
+            assertEquals(fixture.headingPageIndex, view.privateInt("cachedFromPage"))
+            assertEquals(fixture.imagePageIndex, view.privateInt("cachedTargetPage"))
+            assertEquals(
+                requireNotNull(view.pageTopPxAt(fixture.headingPageIndex)),
+                view.privateInt("cachedFromTopPx"),
+            )
+            assertEquals(
+                requireNotNull(view.pageTopPxAt(fixture.imagePageIndex)),
+                view.privateInt("cachedTargetTopPx"),
+            )
+            assertFalse(cachedFront.isRecycled)
+            assertFalse(cachedRevealed.isRecycled)
+            assertFalse(view.privateBool("pageTexturePrecachePending"))
+
+            // Live flip-style change recycles owners; production must re-arm warm pair for the parked page.
+            view.flipStyle = PageFlipStyle.SIMULATION
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+            assertNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            assertNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+            assertEquals(fixture.headingPageIndex, view.privateInt("cachedFromPage"))
+            assertEquals(fixture.imagePageIndex, view.privateInt("cachedTargetPage"))
+            assertEquals(PageFlipStyle.SIMULATION, view.flipStyle)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `mixed heading image warm interactive turn transfers cache without recapture or main-thread full decode`() {
+        // Production hot path: warm front+target must be zero-copy transfer; page-shot allocate and
+        // full-pixel image decode must not run on the threshold MOVE / beginInteractiveCurl.
+        EpubImageDecodeProbe.reset()
+        EpubPageShotCaptureProbe.reset()
+        val reportedOffsets = mutableListOf<Int>()
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        // Rebind top-offset callback after fixture construction (pagedFlowView already ran).
+        view.javaClass.getDeclaredField("onTopOffsetChanged").apply { isAccessible = true }
+            .set(view, { offset: Int -> reportedOffsets.add(offset) })
+        try {
+            assertTrue(
+                "fixture needs heading then immediate image page; heading=${fixture.headingPageIndex} " +
+                    "image=${fixture.imagePageIndex}",
+                fixture.headingPageIndex > 0 &&
+                    fixture.imagePageIndex == fixture.headingPageIndex + 1,
+            )
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) {
+                "warm mixed path requires a heading-page front shot"
+            }
+            val cachedRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) {
+                "warm mixed path requires an image-page revealed shot"
+            }
+            assertEquals(fixture.headingPageIndex, view.privateInt("cachedFromPage"))
+            assertEquals(fixture.imagePageIndex, view.privateInt("cachedTargetPage"))
+            assertFalse(cachedFront.isRecycled)
+            assertFalse(cachedRevealed.isRecycled)
+
+            // Baseline after warm setup: MOVE must not grow these counters.
+            val capturesAfterWarm = EpubPageShotCaptureProbe.total()
+            val fullMainAfterWarm = EpubImageDecodeProbe.fullDecodeMainThread()
+            reportedOffsets.clear()
+
+            assertTrue(
+                view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()),
+            )
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            assertTrue(
+                "warm mixed MOVE must transfer heading front by identity",
+                slide.privateBitmap("frontBitmap") === cachedFront && !cachedFront.isRecycled,
+            )
+            assertTrue(
+                "warm mixed MOVE must transfer image-page target by identity",
+                slide.privateBitmap("revealedBitmap") === cachedRevealed && !cachedRevealed.isRecycled,
+            )
+            assertEquals(
+                "warm path must not recapture full page shots after the pair exists",
+                capturesAfterWarm,
+                EpubPageShotCaptureProbe.total(),
+            )
+            assertEquals(
+                "interactive turn must not full-decode images on the main thread",
+                fullMainAfterWarm,
+                EpubImageDecodeProbe.fullDecodeMainThread(),
+            )
+            assertTrue(
+                "turn setup must stay locator-silent until settle",
+                reportedOffsets.isEmpty(),
+            )
+
+            // Progress must cross the directional threshold (or fling left). beginInteractiveCurl
+            // alone leaves progress at 0; a positive velocity is a reverse fling for forward turns.
+            view.updateInteractiveCurl(x = view.width * 0.25f)
+            assertEquals(
+                "progress updates must not recapture after warm transfer",
+                capturesAfterWarm,
+                EpubPageShotCaptureProbe.total(),
+            )
+            assertEquals(
+                "progress updates must not full-decode on the main thread",
+                fullMainAfterWarm,
+                EpubImageDecodeProbe.fullDecodeMainThread(),
+            )
+            assertTrue(reportedOffsets.isEmpty())
+
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "committed mixed turn must land on the image page once",
+                fixture.imagePageIndex,
+                view.currentPageIndex(),
+            )
+            assertEquals(
+                "locator must publish exactly once for the committed page",
+                1,
+                reportedOffsets.size,
+            )
+            assertFalse("committed front identity must not be recycled early", cachedFront.isRecycled)
+            // After settle, the revealed image page is typically rekeyed as the new front.
+            val settledFront = view.privateField("cachedFrontBitmap") as Bitmap?
+            assertTrue(
+                "settle should retain a live image-page owner (rekeyed target or new front)",
+                settledFront != null && !settledFront.isRecycled,
+            )
+            assertEquals(
+                "settle must not perform main-thread full image decode",
+                fullMainAfterWarm,
+                EpubImageDecodeProbe.fullDecodeMainThread(),
+            )
+        } finally {
+            view.dispose()
+            EpubImageDecodeProbe.stop()
+            EpubPageShotCaptureProbe.stop()
+        }
+    }
+
+    @Test
+    fun `mixed heading image cold interactive MOVE defers shots and commits once without main-thread full decode`() {
+        EpubImageDecodeProbe.reset()
+        EpubPageShotCaptureProbe.reset()
+        val reportedOffsets = mutableListOf<Int>()
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        view.javaClass.getDeclaredField("onTopOffsetChanged").apply { isAccessible = true }
+            .set(view, { offset: Int -> reportedOffsets.add(offset) })
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            // No precache: first finger MOVE must enter LOCAL_SHOTS_WAITING (deferred cold handoff).
+            assertNull(view.privateField("cachedFrontBitmap"))
+            assertNull(view.privateField("cachedRevealedBitmap"))
+
+            val capturesBeforeMove = EpubPageShotCaptureProbe.total()
+            val fullMainBeforeMove = EpubImageDecodeProbe.fullDecodeMainThread()
+            reportedOffsets.clear()
+
+            val downX = view.width * 0.85f
+            val moveX = view.width * 0.45f
+            val y = view.height * 0.12f
+            val downTime = SystemClock.uptimeMillis()
+
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            assertTrue(
+                view.onInterceptTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+
+            assertEquals(
+                "cold mixed MOVE must defer local page shots",
+                "LOCAL_SHOTS_WAITING",
+                view.privateField("interactiveTurnState").toString(),
+            )
+            assertNull("threshold MOVE must not install slide yet", view.privateField("slideDrawable"))
+            assertEquals(
+                "threshold MOVE must not allocate full page shots synchronously",
+                capturesBeforeMove,
+                EpubPageShotCaptureProbe.total(),
+            )
+            assertEquals(
+                "threshold MOVE must not full-decode images on the main thread",
+                fullMainBeforeMove,
+                EpubImageDecodeProbe.fullDecodeMainThread(),
+            )
+            assertTrue(reportedOffsets.isEmpty())
+
+            // Deferred frames: target, then front, then overlay install under the held finger.
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            assertNull(
+                "first deferred frame must not install the overlay yet",
+                view.privateField("slideDrawable"),
+            )
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?) {
+                "deferred cold handoff must install the local slide after shot frames"
+            }
+            val front = slide.privateBitmap("frontBitmap")
+            val revealed = slide.privateBitmap("revealedBitmap")
+            assertFalse(front.isRecycled)
+            assertFalse(revealed.isRecycled)
+            assertTrue(front !== revealed)
+            assertTrue(
+                "cold handoff captures after MOVE, not during the threshold event",
+                EpubPageShotCaptureProbe.total() >= capturesBeforeMove + 2,
+            )
+            assertEquals(
+                "deferred capture path must not main-thread full-decode EPUB zip images",
+                fullMainBeforeMove,
+                EpubImageDecodeProbe.fullDecodeMainThread(),
+            )
+            assertTrue("ready handoff under finger must stay locator-silent", reportedOffsets.isEmpty())
+
+            view.onTouchEvent(
+                motionEvent(downTime, downTime + 600L, MotionEvent.ACTION_UP, moveX, y),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(500L, TimeUnit.MILLISECONDS)
+
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertEquals(
+                "cold mixed commit must land on the image page",
+                fixture.imagePageIndex,
+                view.currentPageIndex(),
+            )
+            assertEquals(
+                "committed locator must publish exactly once",
+                1,
+                reportedOffsets.size,
+            )
+            assertEquals(
+                "no late main-thread full decode after settle",
+                fullMainBeforeMove,
+                EpubImageDecodeProbe.fullDecodeMainThread(),
+            )
+            // Working frames may be rekeyed into cache; neither identity may be double-freed early
+            // while still owned — settle leaves at least one live neighbour owner.
+            val settledFront = view.privateField("cachedFrontBitmap") as Bitmap?
+            assertTrue(
+                settledFront == null || !settledFront.isRecycled,
+            )
+        } finally {
+            view.dispose()
+            EpubImageDecodeProbe.stop()
+            EpubPageShotCaptureProbe.stop()
+        }
     }
 
     private data class HeadingImageContinuationFixture(

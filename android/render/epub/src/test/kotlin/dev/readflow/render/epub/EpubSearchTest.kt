@@ -22,16 +22,24 @@ class EpubSearchTest {
             ),
         )
 
-        val results = runBlocking { epubSearchLocators(paras, "needle") { paras[it] } }
+        val results = runBlocking { epubSearchHits(paras, "needle") { paras[it] } }
 
         assertEquals(3, results.size)
-        assertEquals(LocatorStrategy.Section(0, 0, "Alpha ".length), results[0].strategy)
+        assertEquals(LocatorStrategy.Section(0, 0, "Alpha ".length), results[0].locator.strategy)
         assertEquals(
             LocatorStrategy.Section(0, 1, "Alpha needle".length + "Second ".length),
-            results[1].strategy,
+            results[1].locator.strategy,
         )
-        assertEquals(LocatorStrategy.Section(1, 2, 0), results[2].strategy)
-        assertTrue(results[0].totalProgression!! < results[2].totalProgression!!)
+        assertEquals(LocatorStrategy.Section(1, 2, 0), results[2].locator.strategy)
+        assertTrue(results[0].locator.totalProgression!! < results[2].locator.totalProgression!!)
+        assertTrue(results[0].snippet.contains("needle", ignoreCase = true), results[0].snippet)
+        assertTrue(results[1].snippet.contains("Needle", ignoreCase = true), results[1].snippet)
+        assertTrue(results[2].snippet.contains("needle", ignoreCase = true), results[2].snippet)
+        assertFalse(results[0].snippet.contains('\n'), results[0].snippet)
+        // Character-space match length equals needle length (not byte length).
+        assertEquals("needle".length, results[0].matchLength)
+        assertEquals("needle".length, results[1].matchLength)
+        assertEquals("needle".length, results[2].matchLength)
     }
 
     @Test
@@ -46,7 +54,7 @@ class EpubSearchTest {
         var completed = false
         val job = launch(start = CoroutineStart.UNDISPATCHED) {
             cancel()
-            epubSearchLocators(paras, "shared-needle") { paras[it] }
+            epubSearchHits(paras, "shared-needle") { paras[it] }
             completed = true
         }
 

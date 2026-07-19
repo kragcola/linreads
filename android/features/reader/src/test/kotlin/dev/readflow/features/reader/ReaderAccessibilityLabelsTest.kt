@@ -42,6 +42,7 @@ class ReaderAccessibilityLabelsTest {
                 strategy = LocatorStrategy.Page(index = 12, total = 40),
                 totalProgression = 0.625f,
             ),
+            matchLength = 0,
         )
         val withoutProgress = ReaderSearchResult(
             index = 0,
@@ -49,10 +50,46 @@ class ReaderAccessibilityLabelsTest {
                 strategy = LocatorStrategy.Page(index = 0, total = 40),
                 totalProgression = null,
             ),
+            matchLength = 0,
         )
 
         assertEquals("搜索结果 2，位置 63%", withProgress.readerAccessibilityLabel())
         assertEquals("搜索结果 1", withoutProgress.readerAccessibilityLabel())
+    }
+
+    @Test
+    fun `search result accessibility label includes normalized snippet after position`() {
+        val result = ReaderSearchResult(
+            index = 1,
+            locator = Locator(
+                strategy = LocatorStrategy.Page(index = 12, total = 40),
+                totalProgression = 0.625f,
+            ),
+            snippet = "  前文  \n  关键词  后文  ",
+            matchLength = 3,
+        )
+        val blankSnippet = ReaderSearchResult(
+            index = 0,
+            locator = Locator(
+                strategy = LocatorStrategy.Page(index = 0, total = 40),
+                totalProgression = 0.1f,
+            ),
+            snippet = "   ",
+            matchLength = 0,
+        )
+
+        assertEquals(
+            "搜索「关键词」结果 2，位置 63%，前文 关键词 后文",
+            result.readerAccessibilityLabel(query = "关键词", selected = false),
+        )
+        assertEquals(
+            "搜索「关键词」结果 2，位置 63%，前文 关键词 后文，已选中",
+            result.readerAccessibilityLabel(query = "关键词", selected = true),
+        )
+        assertEquals(
+            "搜索结果 1，位置 10%",
+            blankSnippet.readerAccessibilityLabel(query = "", selected = false),
+        )
     }
 
     @Test
@@ -63,6 +100,7 @@ class ReaderAccessibilityLabelsTest {
                 strategy = LocatorStrategy.Page(index = 12, total = 40),
                 totalProgression = 0.625f,
             ),
+            matchLength = 0,
         )
 
         assertEquals(
@@ -85,6 +123,7 @@ class ReaderAccessibilityLabelsTest {
                     strategy = LocatorStrategy.Page(index = 0, total = 40),
                     totalProgression = null,
                 ),
+                matchLength = 0,
             ).readerAccessibilityLabel(query = "", selected = false),
         )
     }
@@ -105,6 +144,29 @@ class ReaderAccessibilityLabelsTest {
             "跳转到标注：第一行 第二行 第三行，笔记：这里要回看这段内容",
             item.accessibilityLabel(),
         )
+    }
+
+    @Test
+    fun `annotation delete accessibility label is concise Chinese snippet`() {
+        val item = ReaderAnnotationItem(
+            id = "annotation-delete-1",
+            start = Locator(LocatorStrategy.ByteOffset(offset = 10L, length = 5), totalProgression = 0.2f),
+            end = Locator(LocatorStrategy.ByteOffset(offset = 15L, length = 0), totalProgression = 0.21f),
+            selectedText = "  第一行\n第二行  第三行  ",
+            note = "  这里要回看这段内容  ",
+            color = 0,
+            totalProgression = 0.2f,
+        )
+        val longText = "甲".repeat(50)
+        val longItem = item.copy(selectedText = longText)
+
+        assertEquals("删除标注：第一行 第二行 第三行", item.deleteAccessibilityLabel())
+        assertEquals(
+            "删除标注：${"甲".repeat(39)}…",
+            longItem.deleteAccessibilityLabel(),
+        )
+        assertFalse(item.deleteAccessibilityLabel().contains("笔记"))
+        assertFalse(item.deleteAccessibilityLabel().contains("button", ignoreCase = true))
     }
 
     @Test

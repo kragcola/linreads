@@ -1,6 +1,6 @@
 # LinReads Architecture
 
-> **→ Android 端架构设计见 [Android Architecture v3](android-architecture-v3.md)**（权威规范，v1/v2 已废弃）
+> **Android 端当前权威规范**：[Android Architecture v4](android-architecture-v4.md)（22 模块，8 层）。v1/v2/v3 文档仅作历史参考，不再描述当前实现。
 
 ## System Overview
 
@@ -22,7 +22,7 @@
    └──────────┘    └────────────┘   └──────────────┘
 ```
 
-`*` Web current implementation still uses `epubjs`; Android v3 and future EPUB work standardize on `@likecoin/epub-ts`.
+`*` Web 当前实现仍用 `epubjs`（浏览器 JS / iframe 宿主，非 Android WebView）。**Android v4 不走此路线**：EPUB 为自研原生重排（jsoup → Compose/AnnotatedString，无 WebView、无 epub-ts、无 CFI）。三端仅在 `shared/api` 类型契约层对齐，不要求引擎层一致。
 
 ## 共享契约
 
@@ -32,12 +32,12 @@
 
 **路由：**
 - `/library` → `Library.tsx`：书库列表，搜索/封面/点击进入阅读
-- `/read/:id` → `Reader.tsx`：EPUB（当前 epubjs，目标 epub-ts）或 PDF（iframe）
+- `/read/:id` → `Reader.tsx`：EPUB（epubjs）或 PDF（iframe）
 
 **Calibre 代理（绕 CORS）：**
 Vite dev 服务将 `/calibre/*` 代理到 `VITE_CALIBRE_URL`（默认 `http://localhost:8080`）。生产部署需在 nginx / CDN 层做同等配置。
 
-**EPUB 渲染注意事项：** 当前 Web 代码仍使用 epubjs 0.3.x；架构目标为 `@likecoin/epub-ts`。涉及 EPUB/CFI/书签/渲染前先读 `.claude/skills/linreads-epub/SKILL.md`。
+**EPUB 渲染注意事项：** 当前 Web 代码使用 epubjs 0.3.x。涉及 EPUB/CFI/书签/渲染前先读 `.claude/skills/linreads-epub/SKILL.md`。**不要**把 Web 的 epubjs/CFI 路径当作 Android 当前或目标方案。
 
 **依赖关键版本：**
 
@@ -50,19 +50,29 @@ Vite dev 服务将 `/calibre/*` 代理到 `VITE_CALIBRE_URL`（默认 `http://lo
 
 ## Android 端
 
-**技术栈：** Kotlin + Jetpack Compose + Ktor HTTP client
+**权威文档：** [android-architecture-v4.md](android-architecture-v4.md)（22 模块 / 8 层）
 
-**包结构：**
-```
-dev.readflow
-├── calibre/CalibreClient.kt   # HTTP 客户端，搜索/元数据/下载URL
-├── ui/ReadflowApp.kt          # 顶层 Scaffold + 底部导航（书库/阅读/设置）
-└── MainActivity.kt            # 入口
-```
+**技术栈：** Kotlin + Jetpack Compose + Ktor HTTP client；阅读引擎在独立 `:render:*` 模块，经 `ReaderEngine` 可插拔注册。
 
-当前状态：UI 骨架完整，`LibraryScreen` 尚未接入 `CalibreClient`。Android v3 目标架构见 `docs/android-architecture-v3.md`，采用 21 模块、Hybrid View、`WebView + epub-ts` EPUB 引擎、PdfRenderer PDF 引擎、TxtVirtualPager TXT 引擎；旧 epublib/MuPDF-for-EPUB 路线已废弃。
+**当前能力（v4lite 已落地，持续体验打磨）：**
 
-注：`dev.readflow` 包名和 `ReadflowApp` 类名仍是当前技术标识，尚未做代码级改名。
+| 能力 | 状态 | 实现要点 |
+|------|------|----------|
+| 书库 | ✅ | 本地导入 + Calibre LAN |
+| EPUB | ✅ 原生重排 | jsoup 解析 → 流式/分页宿主；**无 WebView / epub-ts / CFI**；定位用 spine + 章节内字符偏移 + progression |
+| PDF | ✅ PdfRenderer | 系统 `PdfRenderer`；搜索/划选能力随 open-session 的 framework 文本 API 动态投影（见 v4 §5.1 / PDF 引擎） |
+| TXT / MD | ✅ | TxtVirtualPager + Markwon 路径 |
+| 进度 | ⚠️ LWW 骨架 | 本地 Room/DataStore 优先；远程后端仍为 no-op 候选 |
+| OTA | ✅ | phase2 updater + GitHub Actions `dev-latest` |
+
+**模块与引擎（摘要，细节以 v4 为准）：**
+- `:features:library` / `:features:reader` / `:features:settings`
+- `:render:api`（`ReaderEngine` 契约）+ `:render:epub` / `:render:pdf` / `:render:txt` / `:render:md` / `:render:animate`
+- `:core:model` / `:core:database` / `:core:prefs` / `:core:calibre` / `:core:sync` 等
+
+历史说明：v3 曾规划 21 模块与 `WebView + epub-ts` EPUB 路线；该方案**已被 v4 取代**，不得再当作当前实现或目标。旧 epublib/MuPDF-for-EPUB 路线同样已废弃。
+
+注：`dev.readflow` 包名和部分类名仍是技术标识，产品对外名称为 LinReads。
 
 ## HarmonyOS 端
 
@@ -76,7 +86,7 @@ entry/src/main/ets
 └── services/CalibreService.ets # HTTP 客户端
 ```
 
-当前状态：`Index.ets` 调用 `CalibreService.search()`，`BookList.ets` 已能渲染基础书单。`BASE_URL` 仍为默认内网地址 `192.168.1.1:8080`，需接 Settings 页持久化配置。
+当前状态：`Index.ets` 调用 `CalibreService.search()`，`BookList.ets` 已能渲染基础书单。`BASE_URL` 仍为默认内网地址 `192.168.1.1:8080`，需接 Settings 页持久化配置。**EPUB / PDF 阅读与进度同步仍待实现。**
 
 ## 进度同步（待实现）
 
@@ -86,7 +96,7 @@ entry/src/main/ets
 - **冲突策略**：阅读位置用 LWW（Last-Write-Wins，以时间戳为准）；书签/高亮用 Union（合并不删除）
 - **存储**：Android → Room；HarmonyOS → relationalStore；Web → IndexedDB
 
-同步服务端方案待定（Calibre 不提供同步 API，需自建轻量后端或 P2P）。
+同步服务端方案待定（Calibre 不提供同步 API，需自建轻量后端或 P2P）。Android 端已有 LWW 骨架与 `NoOpSyncBackend`，跨设备真实后端仍属后续里程碑。
 
 ## 关键约束
 

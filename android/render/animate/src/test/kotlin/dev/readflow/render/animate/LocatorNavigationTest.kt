@@ -42,6 +42,16 @@ class LocatorNavigationTest {
     }
 
     @Test
+    fun `page text is not stepped as page turn identity`() {
+        val pageText = Locator(
+            strategy = LocatorStrategy.PageText(index = 2, total = 10, charOffset = 40),
+            totalProgression = 0.2f,
+        )
+        assertNull(moveLocatorBy(pageText, totalItems = 10, delta = 1))
+        assertNull(moveLocatorBy(pageText, totalItems = 10, delta = -1))
+    }
+
+    @Test
     fun `page index can be restored from page or section locator`() {
         assertEquals(3, pageIndexFromLocator(Locator(LocatorStrategy.Page(index = 3, total = 10)), totalItems = 10))
         assertEquals(4, pageIndexFromLocator(Locator(LocatorStrategy.Section(0, 4, 20)), totalItems = 10))
@@ -51,5 +61,27 @@ class LocatorNavigationTest {
     fun `page index falls back to total progression and clamps`() {
         assertEquals(5, pageIndexFromLocator(Locator(LocatorStrategy.Unknown, totalProgression = 0.5f), totalItems = 10))
         assertEquals(9, pageIndexFromLocator(Locator(LocatorStrategy.Page(index = 20, total = 10)), totalItems = 10))
+    }
+
+    @Test
+    fun `page text index is not used as page slot falls back to total progression`() {
+        // PageText.index=9 must not become page 9; progression 0.2 → index 2 of 10.
+        assertEquals(
+            2,
+            pageIndexFromLocator(
+                Locator(
+                    strategy = LocatorStrategy.PageText(index = 9, total = 10, charOffset = 0),
+                    totalProgression = 0.2f,
+                ),
+                totalItems = 10,
+            ),
+        )
+        assertEquals(
+            0,
+            pageIndexFromLocator(
+                Locator(LocatorStrategy.PageText(index = 9, total = 10, charOffset = 0)),
+                totalItems = 10,
+            ),
+        )
     }
 }

@@ -56,6 +56,45 @@ class ReaderEngineFeatureProjectionTest {
         assertTrue(features.contains(ReaderFeature.BOOKMARKS))
     }
 
+    @Test
+    fun `annotatable engine with runtime annotation capability false omits ANNOTATIONS only`() {
+        // PDF-like: implements TextAnnotatableReaderEngine but session lacks selection API.
+        // hasSavedAnnotations defaults false — management panel stays hidden without persisted rows.
+        val engine = FakeAnnotatableReaderEngine(
+            format = BookFormat.PDF,
+            supportsSearch = true,
+            supportedModes = setOf(ReadingMode.PAGED),
+            supportsTextAnnotationCreation = false,
+        )
+        val features = readerFeaturesFor(engine, hasSavedAnnotations = false)
+        assertFalse(features.contains(ReaderFeature.ANNOTATIONS))
+        assertTrue(features.contains(ReaderFeature.SEARCH))
+        assertTrue(features.contains(ReaderFeature.BOOKMARKS))
+        assertTrue(features.contains(ReaderFeature.TOC))
+        assertTrue(features.contains(ReaderFeature.PROGRESS))
+        assertTrue(features.contains(ReaderFeature.THEME))
+        assertFalse(features.contains(ReaderFeature.FONT))
+    }
+
+    @Test
+    fun `annotatable engine with creation false still exposes ANNOTATIONS when hasSavedAnnotations`() {
+        // Saved/restored rows must surface management even when selectContent is unavailable.
+        val engine = FakeAnnotatableReaderEngine(
+            format = BookFormat.PDF,
+            supportsSearch = true,
+            supportedModes = setOf(ReadingMode.PAGED),
+            supportsTextAnnotationCreation = false,
+        )
+        val features = readerFeaturesFor(engine, hasSavedAnnotations = true)
+        assertTrue(features.contains(ReaderFeature.ANNOTATIONS))
+        assertTrue(features.contains(ReaderFeature.SEARCH))
+        assertTrue(features.contains(ReaderFeature.BOOKMARKS))
+        assertTrue(features.contains(ReaderFeature.TOC))
+        assertTrue(features.contains(ReaderFeature.PROGRESS))
+        assertTrue(features.contains(ReaderFeature.THEME))
+        assertFalse(features.contains(ReaderFeature.FONT))
+    }
+
     private open class FakeReaderEngine(
         override val format: BookFormat,
         override val supportsSearch: Boolean,
@@ -80,10 +119,15 @@ class ReaderEngineFeatureProjectionTest {
         override suspend fun setMode(mode: ReadingMode) = Unit
     }
 
-    private class FakeAnnotatableReaderEngine : FakeReaderEngine(
-        format = BookFormat.EPUB,
-        supportsSearch = true,
-        supportedModes = setOf(ReadingMode.SCROLL, ReadingMode.PAGED),
+    private class FakeAnnotatableReaderEngine(
+        format: BookFormat = BookFormat.EPUB,
+        supportsSearch: Boolean = true,
+        supportedModes: Set<ReadingMode> = setOf(ReadingMode.SCROLL, ReadingMode.PAGED),
+        override val supportsTextAnnotationCreation: Boolean = true,
+    ) : FakeReaderEngine(
+        format = format,
+        supportsSearch = supportsSearch,
+        supportedModes = supportedModes,
     ), TextAnnotatableReaderEngine {
         override fun setTextAnnotations(annotations: List<ReaderTextAnnotation>) = Unit
     }

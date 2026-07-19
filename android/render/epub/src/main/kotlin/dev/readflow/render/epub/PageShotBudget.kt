@@ -152,11 +152,17 @@ internal fun pageShotBudgetCapacityBytes(
     val memoryClassBytes = memoryClassMiB.coerceAtLeast(0).toLong() * MIB
     val divisor = if (isLowRamDevice) LOW_RAM_DIVISOR else NORMAL_RAM_DIVISOR
     val ceilingBytes = if (isLowRamDevice) LOW_RAM_CEILING_BYTES else NORMAL_RAM_CEILING_BYTES
-    return minOf(ceilingBytes, memoryClassBytes / divisor)
+    val proportional = memoryClassBytes / divisor
+    // Normal devices need a floor that admits a tablet-sized forward pair (front + revealed).
+    // 1600x2560 ARGB8888 × 2 ≈ 31.25 MiB; proportional /8 on memoryClass 192 is only 24 MiB.
+    val floorBytes = if (isLowRamDevice) 0L else NORMAL_RAM_FLOOR_BYTES
+    return minOf(ceilingBytes, maxOf(proportional, floorBytes))
 }
 
 private const val MIB = 1024L * 1024L
 private const val NORMAL_RAM_CEILING_BYTES = 48L * MIB
+/** Floor for non-low-RAM: enough for two full tablet page-shots under the 32 MiB opposite budget. */
+private const val NORMAL_RAM_FLOOR_BYTES = 32L * MIB
 private const val LOW_RAM_CEILING_BYTES = 24L * MIB
 private const val NORMAL_RAM_DIVISOR = 8L
 private const val LOW_RAM_DIVISOR = 10L

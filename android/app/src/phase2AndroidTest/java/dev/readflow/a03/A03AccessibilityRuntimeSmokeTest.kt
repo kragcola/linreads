@@ -52,8 +52,10 @@ class A03AccessibilityRuntimeSmokeTest {
     fun setUp() = runBlocking {
         resetTargetAppState()
         settings.setReaderGuideShown(false)
-        settings.setFontSize(16)
-        settings.setLineSpacing(1.75f)
+        // Match product typography baseline (18sp / 1.6x). Setting non-default values before
+        // KEY_TYPOGRAPHY_BASELINE_VERSION is written is overwritten by DataStore baseline install.
+        settings.setFontSize(18)
+        settings.setLineSpacing(1.6f)
         settings.setThemeMode(ThemeMode.LIGHT)
         evidenceDir().deleteRecursively()
         evidenceDir().mkdirs()
@@ -170,8 +172,12 @@ class A03AccessibilityRuntimeSmokeTest {
             assertAdjustableTouchTarget("行距", lineSpacingSlider)
             val fontSliderDescription = fontSlider.contentDescription.orEmpty()
             val lineSpacingSliderDescription = lineSpacingSlider.contentDescription.orEmpty()
-            val fontSizeLabel = waitForObject(By.text("16sp")).text.orEmpty()
-            val lineSpacingLabel = waitForObject(By.text("1.75x")).text.orEmpty()
+            // Typography steppers clear raw text for TalkBack and expose Chinese
+            // contentDescription / stateDescription (see TypographyStepper.clearAndSetSemantics).
+            val fontSizeNode = waitForObject(By.desc("字号，当前 18sp"))
+            val lineSpacingNode = waitForObject(By.desc("行距，当前 1.6倍"))
+            val fontSizeLabel = fontSizeNode.contentDescription.orEmpty()
+            val lineSpacingLabel = lineSpacingNode.contentDescription.orEmpty()
             waitForObject(By.text("滚动"))
             waitForObject(By.text("分页"))
             takeScreenshot("panel-font.png")

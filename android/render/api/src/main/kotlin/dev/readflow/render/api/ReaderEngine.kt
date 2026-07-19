@@ -89,7 +89,7 @@ interface ReaderEngine {
     /** Jump to a table-of-contents entry. Default delegates to [goTo]. */
     suspend fun goToTocEntry(entry: TocEntry) = goTo(entry.locator)
 
-    suspend fun search(query: String): List<Locator> = emptyList()
+    suspend fun search(query: String): List<ReaderSearchHit> = emptyList()
 
     // Layout control (reflow formats)
     suspend fun setFontSize(sp: Float)
@@ -141,9 +141,12 @@ interface PagedReaderEngine : ReaderEngine {
 
     fun pageIndexForLocator(locator: Locator): Int {
         val total = pageCount.value.coerceAtLeast(1)
+        // Bare Page only: progress / host settle identity. PageText is a text point and must
+        // not be treated as page/paragraph index here — PDF goTo uses fixedPageIndex instead.
         val index = when (val strategy = locator.strategy) {
             is LocatorStrategy.Page -> strategy.index
             is LocatorStrategy.Section -> strategy.elementIndex
+            is LocatorStrategy.PageText,
             is LocatorStrategy.ByteOffset,
             LocatorStrategy.Unknown,
             -> locator.totalProgression?.let { (it * total).toInt() } ?: 0
@@ -179,3 +182,29 @@ interface SelfPagingReaderEngine : ReaderEngine {
     /** Turn [delta] pages within the current self-managed view (+1 next, -1 previous). */
     suspend fun goToAdjacentPage(delta: Int)
 }
+
+/**
+ * Optional capability for engines that can paint a **transient** in-page search selection highlight.
+ *
+ * Search hits must never be stored as persistent [ReaderTextAnnotation] records. The engine keeps the
+ * selected [ReaderSearchHit] independently of view instances so [createView] / mode remount can
+ * re-apply paint. [setSearchHighlight] is called on Main and should stay cheap at the call site
+ * (null clears).
+ *
+ * Shared paint color: [READER_SEARCH_HIGHLIGHT_COLOR] — semi-transparent blue, distinct from saved
+ * annotation yellow.
+ */
+interface SearchHighlightableReaderEngine : ReaderEngine {
+    /**
+     * Apply or clear the selected search hit highlight. Pass null to clear.
+     * Uses [ReaderSearchHit.locator] + [ReaderSearchHit.matchLength] as authoritative; do not
+     * re-search snippets or infer length from collapsed snippet text.
+     */
+    fun setSearchHighlight(hit: ReaderSearchHit?)
+}
+
+/**
+ * Shared semi-transparent blue for the selected in-page search result.
+ * Distinct from ordinary saved annotation yellow (~0x66FFE082).
+ */
+const val READER_SEARCH_HIGHLIGHT_COLOR: Int = 0x664A90E2

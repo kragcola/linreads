@@ -23,7 +23,8 @@ class TxtParagraphAdapter(
     private var fontSizeSp: Float,
     private var lineSpacingMultiplier: Float,
     private var inkColor: Int = INK_DAY,
-    private var highlightRangesProvider: (paragraphIndex: Int) -> List<ReaderTextHighlightRange> = { emptyList() },
+    private var highlightRangesProvider: (paragraphIndex: Int) -> Pair<List<ReaderTextHighlightRange>, List<ReaderTextHighlightRange>> =
+        { emptyList<ReaderTextHighlightRange>() to emptyList() },
     private var onSelectionChanged: (paragraphIndex: Int, start: Int, end: Int) -> Unit = { _, _, _ -> },
     private var typeface: Typeface = Typeface.SERIF,
 ) : RecyclerView.Adapter<TxtParagraphAdapter.ParagraphHolder>() {
@@ -65,8 +66,9 @@ class TxtParagraphAdapter(
         holder.textView.setLineSpacing(0f, lineSpacingMultiplier)
         holder.textView.setTextColor(inkColor)
         holder.textView.typeface = typeface
+        val (annotationRanges, searchRanges) = highlightRangesProvider(position)
         holder.textView.text = paragraphProvider(position)
-            .withTextHighlightSpans(highlightRangesProvider(position))
+            .withTextHighlightSpans(ranges = annotationRanges, searchRanges = searchRanges)
         holder.textView.onSelectionRangeChanged = { start, end ->
             onSelectionChanged(position, start, end)
         }

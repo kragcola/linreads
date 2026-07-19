@@ -122,7 +122,7 @@ Android 端 `CalibreClient` 初始化时传 `baseUrl`，来源待接 Settings Sh
 - **[Android Architecture v4](docs/android-architecture-v4.md)** — 当前权威规范（22 模块，8 层）；取代 v2/v3
 - [全部审计报告](docs/audit/) — v1/v2/v3 终审 + 两轮 v3 框架审计
 - [参考项目](references/) — readbooks-v2-android / episteme / epub-ts
-- [待办清单](docs/tracking/BACKLOG.md) — 41 项未处理
+- [历史审计台账](docs/tracking/BACKLOG.md) — 已消解的 v1/v2/v3 审计项（非实时 backlog；现网恢复见 [ACTIVE.md](docs/tracking/ACTIVE.md)）
 
 ## Language
 

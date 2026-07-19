@@ -562,4 +562,158 @@ class EpubReaderItemParserTest {
         assertEquals(1, paras[2].spineIndex)
         assertEquals(9, paras[2].documentCharStart)
     }
+
+    @Test
+    fun `repeated internal br in normal body heading list and quote collapses to one break`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <h2>Title<br/><br/><br/>Still</h2>
+                  <p>Line A<br/><br/><br/>Line B<br/>Line C</p>
+                  <ul><li>Item<br/><br/>Next</li></ul>
+                  <blockquote>Quote<br/><br/>Cont</blockquote>
+                </body></html>
+            """.trimIndent(),
+        )
+
+        val heading = assertInstanceOf(EpubReaderItem.Heading::class.java, items[0])
+        assertEquals("Title\nStill", heading.text)
+
+        val body = assertInstanceOf(EpubReaderItem.Text::class.java, items[1])
+        assertEquals(EpubTextKind.Body, body.kind)
+        // Accidental multi-br runs collapse; a single meaningful br remains.
+        assertEquals("Line A\nLine B\nLine C", body.text)
+
+        val list = assertInstanceOf(EpubReaderItem.Text::class.java, items[2])
+        assertEquals(EpubTextKind.ListItem, list.kind)
+        assertEquals("• Item\nNext", list.text)
+
+        val quote = assertInstanceOf(EpubReaderItem.Text::class.java, items[3])
+        assertEquals(EpubTextKind.Blockquote, quote.kind)
+        assertEquals("Quote\nCont", quote.text)
+    }
+
+    @Test
+    fun `japanese light novel like multi br dialogue collapses internal blank runs`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <p>「……おはよう」<br/><br/><br/>彼は呟いた。<br/>窓の外では、鳥が鳴いていた。</p>
+                  <p>場面が変わる<br/><br/>——そして——</p>
+                </body></html>
+            """.trimIndent(),
+        )
+
+        assertEquals(2, items.size)
+        val first = assertInstanceOf(EpubReaderItem.Text::class.java, items[0])
+        assertEquals("「……おはよう」\n彼は呟いた。\n窓の外では、鳥が鳴いていた。", first.text)
+        val second = assertInstanceOf(EpubReaderItem.Text::class.java, items[1])
+        assertEquals("場面が変わる\n——そして——", second.text)
+    }
+
+    @Test
+    fun `pre pre-wrap break-spaces and table preserve repeated blank lines`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html>
+                  <head>
+                    <style>
+                      .prewrap { white-space: pre-wrap; }
+                      .breakspaces { white-space: break-spaces; }
+                    </style>
+                  </head>
+                  <body>
+                    <pre>code
+<br/><br/>
+kept</pre>
+                    <p class="prewrap">wrap<br/><br/>still</p>
+                    <p class="breakspaces">break<br/><br/>spaces</p>
+                    <table>
+                      <tr><td>A</td><td>B</td></tr>
+                      <tr><td>C</td><td>D</td></tr>
+                    </table>
+                  </body>
+                </html>
+            """.trimIndent(),
+        )
+
+        val pre = assertInstanceOf(EpubReaderItem.Text::class.java, items[0])
+        assertEquals(EpubTextKind.Preformatted, pre.kind)
+        assertTrue(pre.text.contains("\n\n"), "pre must keep multi blank lines: ${pre.text}")
+
+        val preWrap = assertInstanceOf(EpubReaderItem.Text::class.java, items[1])
+        assertEquals(EpubTextKind.Body, preWrap.kind)
+        assertEquals("wrap\n\nstill", preWrap.text)
+
+        val breakSpaces = assertInstanceOf(EpubReaderItem.Text::class.java, items[2])
+        assertEquals("break\n\nspaces", breakSpaces.text)
+
+        val table = assertInstanceOf(EpubReaderItem.Text::class.java, items[3])
+        assertEquals(EpubTextKind.Table, table.kind)
+        assertEquals("A, B\nC, D", table.text)
+    }
+
+    @Test
+    fun `style and link ranges track visible characters after blank line collapse`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html><body>
+                  <p>Before <a href="#n">link</a><br/><br/><br/><strong>After</strong></p>
+                </body></html>
+            """.trimIndent(),
+            resourceBaseDir = "OEBPS/text",
+            documentPath = "OEBPS/text/ch1.xhtml",
+        )
+
+        val text = assertInstanceOf(EpubReaderItem.Text::class.java, items.single())
+        // "Before link\nAfter" — multi-br collapsed to one newline.
+        assertEquals("Before link\nAfter", text.text)
+        assertEquals(
+            listOf(EpubTextLink(start = 7, end = 11, href = "OEBPS/text/ch1.xhtml#n", isExternal = false)),
+            text.links,
+        )
+        assertEquals("link", text.text.substring(text.links.single().start, text.links.single().end))
+        val bold = text.styleSpans.single { it.style == EpubTextStyle.Bold }
+        assertEquals(12, bold.start)
+        assertEquals(17, bold.end)
+        assertEquals("After", text.text.substring(bold.start, bold.end))
+    }
+
+    @Test
+    fun `nested inline pre-wrap span preserves blank lines while outer text collapses`() {
+        val items = parseReaderItemsFromHtml(
+            spineIndex = 0,
+            html = """
+                <html>
+                  <head>
+                    <style>
+                      .prewrap { white-space: pre-wrap; }
+                      .breakspaces { white-space: break-spaces; }
+                    </style>
+                  </head>
+                  <body>
+                    <p>Outer A<br/><br/><br/><span class="prewrap">kept<br/><br/><strong>span</strong></span><br/><br/>Outer B</p>
+                    <p>Lead<br/><br/><span class="breakspaces">break<br/><br/>spaces</span><br/><br/>Trail</p>
+                  </body>
+                </html>
+            """.trimIndent(),
+        )
+
+        assertEquals(2, items.size)
+
+        val preWrapPara = assertInstanceOf(EpubReaderItem.Text::class.java, items[0])
+        // Outer multi-br collapses; nested pre-wrap multi-br stays.
+        assertEquals("Outer A\nkept\n\nspan\nOuter B", preWrapPara.text)
+        val bold = preWrapPara.styleSpans.single { it.style == EpubTextStyle.Bold }
+        assertEquals("span", preWrapPara.text.substring(bold.start, bold.end))
+        assertEquals(preWrapPara.text.indexOf("span"), bold.start)
+        assertEquals(preWrapPara.text.indexOf("span") + "span".length, bold.end)
+
+        val breakSpacesPara = assertInstanceOf(EpubReaderItem.Text::class.java, items[1])
+        assertEquals("Lead\nbreak\n\nspaces\nTrail", breakSpacesPara.text)
+    }
 }

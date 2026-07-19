@@ -35,7 +35,12 @@ internal class EpubParaAdapter(
     private val imageLoader: (String) -> Bitmap?,
     private val onLinkClick: (EpubTextLink) -> Unit,
     private val onTextSelectionChanged: (paragraphIndex: Int, start: Int, end: Int) -> Unit,
-    private val highlightRangesProvider: (paragraphIndex: Int) -> List<ReaderTextHighlightRange> = { emptyList() },
+    /**
+     * Returns (annotationRanges, searchRanges) for the paragraph. Search is transient and must not
+     * be merged into [ReaderTextAnnotation] storage.
+     */
+    private val highlightRangesProvider: (paragraphIndex: Int) -> Pair<List<ReaderTextHighlightRange>, List<ReaderTextHighlightRange>> =
+        { emptyList<ReaderTextHighlightRange>() to emptyList() },
     private var fontSizeSp: Float,
     private var lineSpacingMultiplier: Float,
     private var inkColor: Int = INK_DAY,
@@ -207,8 +212,10 @@ internal class EpubParaAdapter(
             holder.tv.setBackgroundColor(
                 epubSafeCssBackground(block.blockStyle.backgroundColor, inkColor) ?: android.graphics.Color.TRANSPARENT,
             )
+            val (annotationRanges, searchRanges) = highlightRangesProvider(block.paragraphIndex)
             holder.tv.text = block.toSpannableText(density).withTextHighlightSpans(
-                highlightRangesProvider(block.paragraphIndex),
+                ranges = annotationRanges,
+                searchRanges = searchRanges,
             )
         }
         holder.tv.onSelectionRangeChanged = { start, end ->

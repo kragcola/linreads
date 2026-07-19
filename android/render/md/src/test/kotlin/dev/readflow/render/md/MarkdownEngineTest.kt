@@ -19,11 +19,15 @@ import android.widget.TextView
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.ReaderTypographyRange
 import dev.readflow.render.api.PagingKind
+import dev.readflow.render.api.ReaderSearchHighlightSpan
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightSpan
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.SelectionAwareTextView
+import android.text.Spanned
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
 import io.noties.markwon.ext.tables.TablePlugin
@@ -38,6 +42,8 @@ import org.junit.After
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotSame
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -56,6 +62,24 @@ class MarkdownEngineTest {
     @After
     fun tearDown() {
         Dispatchers.resetMain()
+    }
+
+    @Test
+    fun `engine fallback typography matches the new install defaults`() {
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = MarkdownEngine(context)
+
+        assertEquals(
+            ReaderTypographyRange.DEFAULT_FONT_SIZE.toFloat(),
+            engine.privateField("fontSizeSp") as Float,
+            0.001f,
+        )
+        assertEquals(
+            ReaderTypographyRange.DEFAULT_LINE_SPACING,
+            engine.privateField("lineSpacingMultiplier") as Float,
+            0.001f,
+        )
+        assertEquals("system_serif", engine.privateField("currentFontId"))
     }
 
     @Test
@@ -1424,6 +1448,11 @@ class MarkdownEngineTest {
         shadowOf(Looper.getMainLooper()).idle()
     }
 
+    private fun MarkdownEngine.privateField(name: String): Any? =
+        MarkdownEngine::class.java.getDeclaredField(name)
+            .apply { isAccessible = true }
+            .get(this)
+
     @Suppress("UNCHECKED_CAST")
     private fun currentLocatorFlow(engine: MarkdownEngine): MutableStateFlow<Locator> =
         MarkdownEngine::class.java.getDeclaredField("_currentLocator").apply {
@@ -1436,6 +1465,141 @@ class MarkdownEngineTest {
             set(target, value)
         }
     }
+
+    @Test
+    fun `stale post highlight refresh after remount does not mutate new view or locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val file = tempMarkdown("Stale callback must not repaint an old markdown surface.")
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val firstScroll = engine.createView() as ScrollView
+        val firstText = firstScroll.getChildAt(0) as TextView
+        attachMeasured(firstScroll, context)
+        idleMainLooper()
+
+        val hit = engine.search("Stale").first()
+
+        // Arm a deferred post{} from the first surface, then remount before it runs.
+        engine.setSearchHighlight(hit)
+        // Do not idle yet — createView/open must invalidate generation first.
+        val secondScroll = engine.createView() as ScrollView
+        val secondText = secondScroll.getChildAt(0) as TextView
+        attachMeasured(secondScroll, context)
+        assertNotSame(firstScroll, secondScroll)
+        assertNotSame(firstText, secondText)
+
+        // Force the first surface to a distinct text/locator-sensitive state so a stale
+        // post{} write would be observable.
+        firstText.text = "POISONED_OLD_SURFACE"
+        firstScroll.scrollTo(0, 0)
+
+        // Now drain queued posts: stale generation must no-op.
+        idleMainLooper()
+        assertEquals("POISONED_OLD_SURFACE", firstText.text.toString())
+        assertTrue(
+            "active remounted surface may paint, but must not be the poisoned old view",
+            secondText.text?.toString()?.contains("POISONED") != true,
+        )
+        // Locator must still belong to the live session (not a ghost scroll restore from old view).
+        assertNotNull(engine.currentLocator.value)
+        // Open a second book: leftover post from book A must not write book B.
+        val fileB = tempMarkdown("Second book content for isolation.")
+        engine.openBook(Uri.fromFile(fileB))
+        val thirdScroll = engine.createView() as ScrollView
+        attachMeasured(thirdScroll, context)
+        idleMainLooper()
+        assertNull(
+            "openBook must clear transient searchHighlightHit when reusing the engine",
+            engine.privateField("searchHighlightHit"),
+        )
+        assertEquals(
+            emptyList<Any>(),
+            engine.privateField("cachedSearchHighlightRanges") as List<*>,
+        )
+        // Poison first surface again and idle — still no write from any stale callback.
+        firstText.text = "STILL_POISON"
+        idleMainLooper()
+        assertEquals("STILL_POISON", firstText.text.toString())
+    }
+
+    @Test
+    fun `openBook clears search highlight state when engine is reused for another book`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val first = tempMarkdown("Needle appears in the first markdown book body.")
+        val second = tempMarkdown("Completely different second document without the prior match.")
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(first))
+        val scroll = engine.createView() as ScrollView
+        attachMeasured(scroll, context)
+        idleMainLooper()
+        val hit = engine.search("Needle").first()
+        engine.setSearchHighlight(hit)
+        idleMainLooper()
+        assertNotNull(engine.privateField("searchHighlightHit"))
+        assertTrue((engine.privateField("cachedSearchHighlightRanges") as List<*>).isNotEmpty())
+
+        engine.openBook(Uri.fromFile(second))
+        idleMainLooper()
+        assertNull(engine.privateField("searchHighlightHit"))
+        assertEquals(emptyList<Any>(), engine.privateField("cachedSearchHighlightRanges") as List<*>)
+    }
+
+    @Test
+    fun `stale scheduleScrollRestore after openBook without remount does not reapply old locator`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication() as Application
+            // Enough vertical content that a mid/tail restore is distinguishable from top.
+            val bookA = tempMarkdown(
+                buildString {
+                    appendLine("# Chapter A")
+                    repeat(80) { appendLine("Book A body line $it with enough text to force scroll height.") }
+                    appendLine("TAIL_TOKEN_A")
+                },
+            )
+            val bookB = tempMarkdown(
+                buildString {
+                    appendLine("# Chapter B")
+                    repeat(40) { appendLine("Book B replacement line $it — no shared tail token.") }
+                },
+            )
+            val engine = MarkdownEngine(context)
+            engine.openBook(Uri.fromFile(bookA))
+            val scroll = engine.createView() as ScrollView
+            attachMeasured(scroll, context)
+            idleMainLooper()
+
+            val hits = engine.search("TAIL_TOKEN_A")
+            assertTrue(hits.isNotEmpty())
+            // Arm SCROLL restore posts for book A; do not idle so they stay deferred.
+            // Reopen without createView remount so scrollView identity is unchanged —
+            // generation must still drop those posts.
+            engine.goTo(hits.first().locator)
+            val bookAProgression = hits.first().locator.totalProgression ?: 0f
+            assertTrue("fixture must land past the head of book A", bookAProgression > 0.2f)
+
+            engine.openBook(Uri.fromFile(bookB))
+            val afterOpenProgression = engine.currentLocator.value.totalProgression ?: 0f
+            assertEquals(0f, afterOpenProgression, 0.001f)
+
+            idleMainLooper()
+
+            val settledProgression = engine.currentLocator.value.totalProgression ?: 0f
+            assertEquals(
+                "openBook initial locator must remain after stale restore posts drain",
+                afterOpenProgression,
+                settledProgression,
+                0.001f,
+            )
+            assertTrue(
+                "stale restore must not republish book A progression onto book B",
+                settledProgression < 0.05f,
+            )
+            // Surface still the same instance (no remount); only generation ownership protects it.
+            assertTrue(engine.privateField("scrollView") === scroll)
+        }
 
     private class ResettingTextView(context: Context) : TextView(context) {
         override fun setText(text: CharSequence?, type: BufferType?) {

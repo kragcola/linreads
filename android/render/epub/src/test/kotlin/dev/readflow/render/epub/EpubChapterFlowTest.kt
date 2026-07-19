@@ -1,6 +1,7 @@
 package dev.readflow.render.epub
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -171,5 +172,28 @@ class EpubChapterFlowTest {
         assertEquals(0 to 0, flow.paragraphAtOffset(flow.offsetForParagraph(0, 0)))
         assertEquals(10 to 0, flow.paragraphAtOffset(flow.offsetForParagraph(10, 0)))
         assertEquals(11 to 0, flow.paragraphAtOffset(flow.offsetForParagraph(11, 0)))
+    }
+
+    @Test
+    fun `parsed japanese multi br body collapses inside flow text while pre stays multi blank`() {
+        val blocks = epubDisplayBlocks(
+            parseReaderItemsFromHtml(
+                spineIndex = 0,
+                html = """
+                    <html><body>
+                      <p>「……おはよう」<br/><br/><br/>彼は呟いた。</p>
+                      <pre>a<br/><br/>b</pre>
+                    </body></html>
+                """.trimIndent(),
+            ),
+        )
+        val flow = epubBuildChapterFlow(spineIndex = 0, blocks = blocks)
+        assertTrue(flow.text.startsWith("「……おはよう」\n彼は呟いた。"))
+        assertFalse(flow.text.contains("おはよう」\n\n彼は"))
+        // Preformatted block keeps its internal blank run after the paragraph separator.
+        assertTrue(
+            "flow should retain pre multi-blank: ${flow.text}",
+            flow.text.contains("a\n\nb"),
+        )
     }
 }

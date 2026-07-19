@@ -79,10 +79,28 @@ private fun extractTextWithLinks(
     val builder = StringBuilder()
     val links = mutableListOf<EpubTextLink>()
     val styleSpans = mutableListOf<EpubTextStyleSpan>()
+    val protectedBlankRanges = mutableListOf<IntRange>()
     element.childNodes().forEach { node ->
-        appendInlineNode(node, builder, links, styleSpans, resourceBaseDir, documentPath, depth = 0, maxDomDepth = maxDomDepth, css = css)
+        appendInlineNode(
+            node,
+            builder,
+            links,
+            styleSpans,
+            protectedBlankRanges,
+            resourceBaseDir,
+            documentPath,
+            depth = 0,
+            maxDomDepth = maxDomDepth,
+            css = css,
+        )
     }
-    return trimTextWithRanges(builder.toString(), links, styleSpans)
+    return finalizeTextWithRanges(
+        rawText = builder.toString(),
+        links = links,
+        styleSpans = styleSpans,
+        preserveInternalBlankLines = css.computedStyle(element).whiteSpace.preservesInternalBlankLines(),
+        protectedBlankRanges = protectedBlankRanges,
+    )
 }
 
 private fun collectReaderItems(
@@ -231,8 +249,14 @@ private fun collectListItems(
         val itemNodes = item.childNodes().filterNot { node ->
             node is Element && node.tagName().lowercase() in setOf("ol", "ul")
         }
-        val text = extractTextWithLinksFromNodes(itemNodes, resourceBaseDir, documentPath, maxDomDepth, css)
-            .withPrefix(if (ordered) "${index + 1}. " else "• ")
+        val text = extractTextWithLinksFromNodes(
+            nodes = itemNodes,
+            resourceBaseDir = resourceBaseDir,
+            documentPath = documentPath,
+            maxDomDepth = maxDomDepth,
+            css = css,
+            preserveInternalBlankLines = css.computedStyle(item).whiteSpace.preservesInternalBlankLines(),
+        ).withPrefix(if (ordered) "${index + 1}. " else "• ")
         addTextItem(
             spineIndex = spineIndex,
             items = items,
@@ -290,14 +314,33 @@ private fun extractTextWithLinksFromNodes(
     documentPath: String?,
     maxDomDepth: Int,
     css: EpubCssCascade,
+    preserveInternalBlankLines: Boolean = false,
 ): TextWithLinks {
     val builder = StringBuilder()
     val links = mutableListOf<EpubTextLink>()
     val styleSpans = mutableListOf<EpubTextStyleSpan>()
+    val protectedBlankRanges = mutableListOf<IntRange>()
     nodes.forEach { node ->
-        appendInlineNode(node, builder, links, styleSpans, resourceBaseDir, documentPath, depth = 0, maxDomDepth = maxDomDepth, css = css)
+        appendInlineNode(
+            node,
+            builder,
+            links,
+            styleSpans,
+            protectedBlankRanges,
+            resourceBaseDir,
+            documentPath,
+            depth = 0,
+            maxDomDepth = maxDomDepth,
+            css = css,
+        )
     }
-    return trimTextWithRanges(builder.toString(), links, styleSpans)
+    return finalizeTextWithRanges(
+        rawText = builder.toString(),
+        links = links,
+        styleSpans = styleSpans,
+        preserveInternalBlankLines = preserveInternalBlankLines,
+        protectedBlankRanges = protectedBlankRanges,
+    )
 }
 
 // A <p> can wrap a block image, e.g. <p><img .../><br/></p> (common in scanned light novels).
@@ -330,12 +373,14 @@ private fun addParagraphWithImages(
         )
         return
     }
+    val preserveBlankLines = css.computedStyle(element).whiteSpace.preservesInternalBlankLines()
     val hasVisibleText = extractTextWithLinksFromNodes(
         nodes = element.childNodes().filterNot(::isVisibleDirectImage),
         resourceBaseDir = resourceBaseDir,
         documentPath = documentPath,
         maxDomDepth = maxDomDepth,
         css = css,
+        preserveInternalBlankLines = preserveBlankLines,
     ).text.isNotEmpty()
     val pendingNodes = mutableListOf<Node>()
     fun flushPendingText() {
@@ -343,7 +388,14 @@ private fun addParagraphWithImages(
         addTextItem(
             spineIndex,
             items,
-            extractTextWithLinksFromNodes(pendingNodes, resourceBaseDir, documentPath, maxDomDepth, css),
+            extractTextWithLinksFromNodes(
+                nodes = pendingNodes,
+                resourceBaseDir = resourceBaseDir,
+                documentPath = documentPath,
+                maxDomDepth = maxDomDepth,
+                css = css,
+                preserveInternalBlankLines = preserveBlankLines,
+            ),
             blockStyle = css.blockStyle(element),
         )
         pendingNodes.clear()
@@ -514,6 +566,7 @@ private fun appendInlineNode(
     builder: StringBuilder,
     links: MutableList<EpubTextLink>,
     styleSpans: MutableList<EpubTextStyleSpan>,
+    protectedBlankRanges: MutableList<IntRange>,
     resourceBaseDir: String,
     documentPath: String?,
     depth: Int,
@@ -535,7 +588,18 @@ private fun appendInlineNode(
                 )
             }
         }
-        is Element -> appendInlineElement(node, builder, links, styleSpans, resourceBaseDir, documentPath, depth = depth + 1, maxDomDepth = maxDomDepth, css = css)
+        is Element -> appendInlineElement(
+            element = node,
+            builder = builder,
+            links = links,
+            styleSpans = styleSpans,
+            protectedBlankRanges = protectedBlankRanges,
+            resourceBaseDir = resourceBaseDir,
+            documentPath = documentPath,
+            depth = depth + 1,
+            maxDomDepth = maxDomDepth,
+            css = css,
+        )
     }
 }
 
@@ -544,6 +608,7 @@ private fun appendInlineElement(
     builder: StringBuilder,
     links: MutableList<EpubTextLink>,
     styleSpans: MutableList<EpubTextStyleSpan>,
+    protectedBlankRanges: MutableList<IntRange>,
     resourceBaseDir: String,
     documentPath: String?,
     depth: Int,
@@ -566,10 +631,26 @@ private fun appendInlineElement(
         else -> {
             val start = builder.length
             element.childNodes().forEach { child ->
-                appendInlineNode(child, builder, links, styleSpans, resourceBaseDir, documentPath, depth = depth + 1, maxDomDepth = maxDomDepth, css = css)
+                appendInlineNode(
+                    child,
+                    builder,
+                    links,
+                    styleSpans,
+                    protectedBlankRanges,
+                    resourceBaseDir,
+                    documentPath,
+                    depth = depth + 1,
+                    maxDomDepth = maxDomDepth,
+                    css = css,
+                )
             }
             val end = builder.length
             if (start >= end) return
+            // Nested pre / pre-wrap / break-spaces must keep multi-newline runs even when the
+            // enclosing block still collapses ordinary repeated <br>.
+            if (computedStyle.whiteSpace.preservesInternalBlankLines()) {
+                protectedBlankRanges += start until end
+            }
             if (tag == "a") {
                 val href = element.attr("href").trim()
                 if (href.isNotEmpty()) {
@@ -606,6 +687,71 @@ private fun rubyText(element: Element, depth: Int, maxDomDepth: Int): String {
     }
 }
 
+/**
+ * Finalize extracted inline text: optionally collapse accidental multi-newline runs from repeated
+ * `<br>` (and similar), then edge-trim spacers while remapping link/style ranges.
+ * Block-level pre / pre-wrap / break-spaces pass [preserveInternalBlankLines]=true; nested inline
+ * descendants with the same white-space contribute [protectedBlankRanges] so only their internal
+ * blank runs survive parent collapse. Tables and `<pre>`/`code` blocks never enter this path
+ * (they use [addPlainTextItem]).
+ */
+private fun finalizeTextWithRanges(
+    rawText: String,
+    links: List<EpubTextLink>,
+    styleSpans: List<EpubTextStyleSpan>,
+    preserveInternalBlankLines: Boolean,
+    protectedBlankRanges: List<IntRange> = emptyList(),
+): TextWithLinks {
+    val collapsed = if (preserveInternalBlankLines) {
+        TextWithLinks(rawText, links, styleSpans)
+    } else {
+        collapseRepeatedBlankLines(rawText, links, styleSpans, protectedBlankRanges)
+    }
+    return trimTextWithRanges(collapsed.text, collapsed.links, collapsed.styleSpans)
+}
+
+/** CSS white-space values that must keep all internal newlines and spaces as authored. */
+private fun EpubWhiteSpace.preservesInternalBlankLines(): Boolean =
+    this == EpubWhiteSpace.Pre || this == EpubWhiteSpace.PreWrap
+
+/**
+ * Collapse runs of 2+ consecutive `\n` to a single `\n` (accidental blank-line stacks from
+ * repeated `<br>`), remapping link/style offsets so they still address the same visible characters.
+ * Single newlines are preserved. Newlines inside [protectedBlankRanges] (nested pre-wrap /
+ * break-spaces) are never dropped.
+ */
+private fun collapseRepeatedBlankLines(
+    rawText: String,
+    links: List<EpubTextLink>,
+    styleSpans: List<EpubTextStyleSpan>,
+    protectedBlankRanges: List<IntRange> = emptyList(),
+): TextWithLinks {
+    if (rawText.length < 2 || !rawText.contains("\n\n")) {
+        return TextWithLinks(rawText, links, styleSpans)
+    }
+    val out = StringBuilder(rawText.length)
+    val oldToNew = IntArray(rawText.length + 1)
+    var newIndex = 0
+    for (oldIndex in rawText.indices) {
+        oldToNew[oldIndex] = newIndex
+        val c = rawText[oldIndex]
+        val inProtected = protectedBlankRanges.any { oldIndex in it }
+        if (c == '\n' && out.lastOrNull() == '\n' && !inProtected) {
+            // Drop extra newline in a blank-line run outside protected pre-wrap spans.
+            continue
+        }
+        out.append(c)
+        newIndex++
+    }
+    oldToNew[rawText.length] = newIndex
+    val text = out.toString()
+    return TextWithLinks(
+        text = text,
+        links = links.mapNotNull { it.remapped(oldToNew) },
+        styleSpans = styleSpans.mapNotNull { it.remapped(oldToNew) },
+    )
+}
+
 private fun trimTextWithRanges(
     rawText: String,
     links: List<EpubTextLink>,
@@ -620,6 +766,20 @@ private fun trimTextWithRanges(
         links = links.mapNotNull { it.trimmed(first, endExclusive) },
         styleSpans = styleSpans.mapNotNull { it.trimmed(first, endExclusive) },
     )
+}
+
+private fun EpubTextLink.remapped(oldToNew: IntArray): EpubTextLink? {
+    val mappedStart = oldToNew[start.coerceIn(0, oldToNew.lastIndex)]
+    val mappedEnd = oldToNew[end.coerceIn(0, oldToNew.lastIndex)]
+    if (mappedStart >= mappedEnd) return null
+    return copy(start = mappedStart, end = mappedEnd)
+}
+
+private fun EpubTextStyleSpan.remapped(oldToNew: IntArray): EpubTextStyleSpan? {
+    val mappedStart = oldToNew[start.coerceIn(0, oldToNew.lastIndex)]
+    val mappedEnd = oldToNew[end.coerceIn(0, oldToNew.lastIndex)]
+    if (mappedStart >= mappedEnd) return null
+    return copy(start = mappedStart, end = mappedEnd)
 }
 
 private fun TextWithLinks.withPrefix(prefix: String): TextWithLinks {

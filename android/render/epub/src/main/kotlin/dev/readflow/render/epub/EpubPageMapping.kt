@@ -81,7 +81,9 @@ internal fun epubIndexFromLocator(locator: Locator, totalItems: Int): Int {
     val total = totalItems.coerceAtLeast(1)
     val index = when (val strategy = locator.strategy) {
         is LocatorStrategy.Section -> strategy.elementIndex
+        // Legacy bare Page only (EPUB migration). PageText is not a paragraph index.
         is LocatorStrategy.Page -> strategy.index
+        is LocatorStrategy.PageText,
         is LocatorStrategy.ByteOffset,
         LocatorStrategy.Unknown,
         -> locator.totalProgression?.let { (it * total).toInt() } ?: 0

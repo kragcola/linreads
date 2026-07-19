@@ -23,12 +23,16 @@ import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.UiObject2
 import androidx.test.uiautomator.Until
 import dev.readflow.MainActivity
+import dev.readflow.core.prefs.DataStoreSettingsRepository
+import dev.readflow.render.pdf.PdfRendererEngine
 import java.io.File
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.runBlocking
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -41,10 +45,14 @@ class A02PerformanceRuntimeSmokeTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val appContext = ApplicationProvider.getApplicationContext<Context>()
     private val device = UiDevice.getInstance(instrumentation)
+    private val settings = DataStoreSettingsRepository(appContext)
 
     @Before
-    fun setUp() {
+    fun setUp() = runBlocking {
         resetTargetAppState()
+        // resetTargetAppState deletes DataStore; keep the first-run gesture guide from covering
+        // the reader surface that this runtime performance smoke measures.
+        settings.setReaderGuideShown(true)
         evidenceDir().deleteRecursively()
         evidenceDir().mkdirs()
         device.pressHome()
@@ -123,6 +131,17 @@ class A02PerformanceRuntimeSmokeTest {
 
         assertTrue(results.all { it.firstPaintMs > 0 })
         assertTrue(results.all { it.totalPssKb > 0 })
+    }
+
+    @Test
+    fun pdfEngineOpensGeneratedDocumentOnApi36Runtime() = runBlocking {
+        val engine = PdfRendererEngine(appContext)
+        try {
+            engine.openBook(createPdfUri(totalPages = 4))
+            assertEquals(4, engine.pageCount.value)
+        } finally {
+            engine.close()
+        }
     }
 
     private fun measureOpenAndGesture(

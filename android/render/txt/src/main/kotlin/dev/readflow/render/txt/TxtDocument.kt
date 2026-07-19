@@ -2,7 +2,9 @@ package dev.readflow.render.txt
 
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextSelection
+import dev.readflow.render.api.buildSearchSnippet
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
@@ -101,11 +103,11 @@ internal class TxtDocument private constructor(
 
     fun fingerprint(): TxtDocumentFingerprint = TxtDocumentFingerprint.fromFile(file)
 
-    suspend fun search(query: String, limit: Int = DEFAULT_SEARCH_LIMIT): List<Locator> {
+    suspend fun search(query: String, limit: Int = DEFAULT_SEARCH_LIMIT): List<ReaderSearchHit> {
         val needle = query.trim()
         if (needle.isEmpty() || limit <= 0 || ranges.isEmpty()) return emptyList()
         val totalBytes = byteLength.coerceAtLeast(1L).toFloat()
-        val results = mutableListOf<Locator>()
+        val results = mutableListOf<ReaderSearchHit>()
         for (index in ranges.indices) {
             currentCoroutineContext().ensureActive()
             val paragraph = readParagraph(index)
@@ -121,10 +123,20 @@ internal class TxtDocument private constructor(
                     .size
                 val byteOffset = range.startByte + prefixBytes
                 val totalProgression = (byteOffset.toFloat() / totalBytes).coerceIn(0f, 1f)
-                results += Locator(
+                val locator = Locator(
                     strategy = LocatorStrategy.ByteOffset(byteOffset, matchBytes),
                     progression = index.toFloat() / ranges.size.coerceAtLeast(1),
                     totalProgression = totalProgression,
+                )
+                results += ReaderSearchHit(
+                    locator = locator,
+                    snippet = buildSearchSnippet(
+                        source = paragraph,
+                        matchStart = matchIndex,
+                        matchLength = needle.length,
+                    ),
+                    // Character length of the needle; ByteOffset.length above is UTF-8 bytes.
+                    matchLength = needle.length,
                 )
                 fromIndex = matchIndex + needle.length
             }

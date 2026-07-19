@@ -3,6 +3,7 @@ package dev.readflow.features.reader
 import dev.readflow.core.database.BookmarkEntity
 import dev.readflow.core.model.Bookmark
 import dev.readflow.core.model.Locator
+import dev.readflow.core.model.LocatorStrategy
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlin.math.roundToInt
@@ -85,6 +86,32 @@ private fun bookmarkProgression(locator: Locator): Float =
 
 private fun readerBookmarkLabel(totalProgression: Float): String =
     "书签 ${(totalProgression.coerceIn(0f, 1f) * 100f).roundToInt()}%"
+
+/**
+ * Optional secondary line for BookmarkPanel: user-readable strategy detail only.
+ * Never returns raw byte offsets as the sole position label.
+ */
+internal fun readerBookmarkDetailLabel(item: ReaderBookmarkItem): String? =
+    when (val strategy = item.locator.strategy) {
+        is LocatorStrategy.Page -> pageDetailLabel(strategy.index, strategy.total)
+        // Imported/annotation PageText may show page number; creation stays bare Page.
+        is LocatorStrategy.PageText -> pageDetailLabel(strategy.index, strategy.total)
+        is LocatorStrategy.Section -> {
+            val section = (strategy.spineIndex + 1).coerceAtLeast(1)
+            "第 $section 节"
+        }
+        is LocatorStrategy.ByteOffset,
+        LocatorStrategy.Unknown,
+        -> null
+    }
+
+private fun pageDetailLabel(index: Int, totalRaw: Int): String {
+    val total = totalRaw.coerceAtLeast(0)
+    val page = (index + 1).let { n ->
+        if (total > 0) n.coerceIn(1, total) else n.coerceAtLeast(1)
+    }
+    return if (total > 0) "第 $page / $total 页" else "第 $page 页"
+}
 
 internal fun BookmarkEntity.toBookmarkModel(): Bookmark? {
     val locator = runCatching { Json.decodeFromString<Locator>(locatorJson) }.getOrNull() ?: return null

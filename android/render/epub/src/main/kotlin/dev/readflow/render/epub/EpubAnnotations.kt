@@ -1,6 +1,8 @@
 package dev.readflow.render.epub
 
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.render.api.READER_SEARCH_HIGHLIGHT_COLOR
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightRange
 
@@ -26,4 +28,29 @@ internal fun epubHighlightRanges(
             color = annotation.color,
         )
     }
+}
+
+/**
+ * Map a search hit's Section spine char start + [ReaderSearchHit.matchLength] to a paragraph-local
+ * character range. Reuse with existing paragraph→flow/page mapping at paint time.
+ */
+internal fun epubSearchHighlightRange(
+    indexedParas: List<EpubPara>,
+    paragraphIndex: Int,
+    hit: ReaderSearchHit,
+): ReaderTextHighlightRange? {
+    if (hit.matchLength <= 0) return null
+    val start = hit.locator.strategy as? LocatorStrategy.Section ?: return null
+    val paragraph = indexedParas.getOrNull(paragraphIndex) ?: return null
+    if (start.spineIndex != paragraph.spineIndex) return null
+    val matchStart = start.charOffset
+    val matchEnd = matchStart + hit.matchLength
+    val overlapStart = maxOf(matchStart, paragraph.spineCharStart)
+    val overlapEnd = minOf(matchEnd, paragraph.spineCharEnd)
+    if (overlapStart >= overlapEnd) return null
+    return ReaderTextHighlightRange(
+        start = overlapStart - paragraph.spineCharStart,
+        end = overlapEnd - paragraph.spineCharStart,
+        color = READER_SEARCH_HIGHLIGHT_COLOR,
+    )
 }

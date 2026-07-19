@@ -5,15 +5,27 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.adjacentTocEntry
+import dev.readflow.core.model.fixedPageIndex
 import dev.readflow.core.model.pageChapterInfo
 
 /**
  * Destination page for a PDF outline [TocEntry], when the locator carries a finite page index.
  * Non-page strategies and negative indices are treated as missing.
+ * Outline destinations remain bare [LocatorStrategy.Page] (progress identity).
  */
 internal fun pdfOutlineDestinationPage(entry: TocEntry): Int? {
     val page = (entry.locator.strategy as? LocatorStrategy.Page)?.index ?: return null
     return page.takeIf { it >= 0 }
+}
+
+/**
+ * Target page for PDF goTo / pageIndexForLocator.
+ * Accepts bare [LocatorStrategy.Page] and annotation [LocatorStrategy.PageText] via
+ * [fixedPageIndex]; callers must still publish bare Page as progress identity.
+ */
+internal fun pdfTargetPageIndex(locator: Locator, pageCount: Int): Int {
+    if (pageCount <= 0) return 0
+    return (fixedPageIndex(locator) ?: 0).coerceIn(0, pageCount - 1)
 }
 
 /**

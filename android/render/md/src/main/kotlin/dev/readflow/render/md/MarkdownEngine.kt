@@ -19,6 +19,7 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.ReaderTypographyRange
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.core.model.adjacentTocEntry
@@ -28,10 +29,12 @@ import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderEngine
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightRange
 import dev.readflow.render.api.ReaderTextSelection
 import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.SearchHighlightableReaderEngine
 import dev.readflow.render.api.SelectionAwareTextView
 import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.TextSelectableReaderEngine
@@ -63,7 +66,8 @@ class MarkdownEngine(private val context: Context) :
     ReaderEngine,
     PagedReaderEngine,
     TextSelectableReaderEngine,
-    TextAnnotatableReaderEngine {
+    TextAnnotatableReaderEngine,
+    SearchHighlightableReaderEngine {
 
     override val id: String = "md-markwon"
     override val format: BookFormat = BookFormat.MD
@@ -98,14 +102,24 @@ class MarkdownEngine(private val context: Context) :
     override val currentTextSelection: StateFlow<ReaderTextSelection?> = _currentTextSelection.asStateFlow()
 
     private var document: MarkdownDocument = MarkdownDocument.parse("")
-    private var fontSizeSp: Float = 18f
-    private var lineSpacingMultiplier: Float = 1.3f
+    private var fontSizeSp: Float = ReaderTypographyRange.DEFAULT_FONT_SIZE.toFloat()
+    private var lineSpacingMultiplier: Float = ReaderTypographyRange.DEFAULT_LINE_SPACING
     private var currentFontId: String = "system_serif"
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
     private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
+    /** Transient selected search hit; independent of view instances for mode remount repaint. */
+    private var searchHighlightHit: ReaderSearchHit? = null
     private var scrollView: ScrollView? = null
     private var textView: TextView? = null
     private var suppressLocatorUpdates = false
+    /**
+     * Bumps on open/close/createView remount so deferred ScrollView.post {} highlight refresh
+     * callbacks cannot mutate a newer view tree or republish an old book's locator.
+     */
+    private var highlightRefreshGeneration: Long = 0L
+    /** ScrollView identity that owns the active SCROLL highlight surface (null when detached). */
+    private var highlightRefreshScrollView: ScrollView? = null
+    private var highlightRefreshTextView: TextView? = null
 
     /** Full Markwon-rendered Spanned for the open document (no highlights). Rebuilt on open. */
     private var cachedRendered: Spanned = SpannableStringBuilder("")
@@ -125,6 +139,8 @@ class MarkdownEngine(private val context: Context) :
      * Recomputed on open / setTextAnnotations; page bind only filters by window.
      */
     private var cachedHighlightRanges: List<ReaderTextHighlightRange> = emptyList()
+    /** Full-document transient search highlight (absolute rendered offsets), separate from annotations. */
+    private var cachedSearchHighlightRanges: List<ReaderTextHighlightRange> = emptyList()
 
     /** Weak tracking of active PAGED views for selection clear / annotation refresh / typography. */
     private val activePageContainers = Collections.newSetFromMap(WeakHashMap<FrameLayout, Boolean>())
@@ -156,9 +172,13 @@ class MarkdownEngine(private val context: Context) :
         val rendered = markwon.toMarkdown(markdown)
         document = parsed
         withContext(Dispatchers.Main) {
+            // Invalidate any post{} callbacks from a previous open on this engine instance.
+            invalidateHighlightRefreshCallbacks()
             cachedRendered = rendered
             pageWindows = emptyList()
             document.clearMappingCache()
+            searchHighlightHit = null
+            cachedSearchHighlightRanges = emptyList()
             recomputeCachedHighlightRanges()
             _tableOfContents.value = parsed.tableOfContents
             publishLocator(initial)
@@ -184,6 +204,8 @@ class MarkdownEngine(private val context: Context) :
     override fun createView(): View {
         val palette = paletteFor(themeMode, context.resources.configuration)
         val padding = textPaddingPx
+        // Remount: drop ownership of any prior ScrollView/TextView so stale post{} cannot write them.
+        invalidateHighlightRefreshCallbacks()
         val tv = SelectionAwareTextView(context).apply {
             textSize = fontSizeSp
             setLineSpacing(0f, lineSpacingMultiplier)
@@ -220,6 +242,8 @@ class MarkdownEngine(private val context: Context) :
             }
         }
         scrollView = sv
+        highlightRefreshScrollView = sv
+        highlightRefreshTextView = tv
         // Restore source anchor after mode remount (host calls createView for SCROLL).
         // Must wait for a real layout pass — posting while unattached burns retries at width=0.
         scheduleScrollRestore(_currentLocator.value)
@@ -237,7 +261,8 @@ class MarkdownEngine(private val context: Context) :
         val base = ensureCachedRendered()
         val slice = pageSlice(base, window)
         val highlighted = slice.withTextHighlightSpans(
-            filterHighlightRangesForWindow(window, slice.length),
+            ranges = filterHighlightRangesForWindow(window, slice.length),
+            searchRanges = filterSearchHighlightRangesForWindow(window, slice.length),
         )
         val palette = paletteFor(themeMode, context.resources.configuration)
         val padding = textPaddingPx
@@ -304,9 +329,14 @@ class MarkdownEngine(private val context: Context) :
         val windows = pageWindows
         if (windows.isEmpty()) return 0
         when (val strategy = locator.strategy) {
+            // Host ViewPager settles with bare Page only; PageText is not a MD page slot.
             is LocatorStrategy.Page ->
                 return strategy.index.coerceIn(0, windows.lastIndex)
-            else -> Unit
+            is LocatorStrategy.PageText,
+            is LocatorStrategy.Section,
+            is LocatorStrategy.ByteOffset,
+            LocatorStrategy.Unknown,
+            -> Unit
         }
         val renderedOffset = document.renderedOffsetFor(locator, ensureCachedRendered())
         return pageIndexForRenderedOffset(windows, renderedOffset)
@@ -336,7 +366,12 @@ class MarkdownEngine(private val context: Context) :
                 val pageIndex = pageIndexForLocator(locator)
                 stableSourceLocatorForPage(pageIndex)
             }
-            else -> document.locatorForOffset(document.offsetFor(locator))
+            // PageText is foreign PDF identity — resolve via totalProgression (offsetFor else).
+            is LocatorStrategy.PageText,
+            is LocatorStrategy.Section,
+            is LocatorStrategy.ByteOffset,
+            LocatorStrategy.Unknown,
+            -> document.locatorForOffset(document.offsetFor(locator))
         }
         publishLocator(sourceLocator)
         val pageIndex = pageIndexForLocator(sourceLocator)
@@ -410,6 +445,9 @@ class MarkdownEngine(private val context: Context) :
      */
     private fun scheduleScrollRestore(locator: Locator) {
         val sv = scrollView ?: return
+        // Capture generation so open/close/createView invalidation drops deferred restores even
+        // when the same ScrollView instance is reused (openBook without remount).
+        val generation = highlightRefreshGeneration
         val listener = object : View.OnLayoutChangeListener {
             override fun onLayoutChange(
                 v: View?,
@@ -422,12 +460,12 @@ class MarkdownEngine(private val context: Context) :
                 oldRight: Int,
                 oldBottom: Int,
             ) {
-                if (scrollView !== sv) {
+                if (generation != highlightRefreshGeneration || scrollView !== sv) {
                     sv.removeOnLayoutChangeListener(this)
                     return
                 }
                 if (sv.width <= 0 || sv.height <= 0) return
-                val applied = restoreScrollToLocator(locator)
+                val applied = restoreScrollToLocator(locator, generation)
                 if (applied) {
                     sv.removeOnLayoutChangeListener(this)
                 }
@@ -436,11 +474,11 @@ class MarkdownEngine(private val context: Context) :
         sv.addOnLayoutChangeListener(listener)
         // Immediate attempts for already-laid-out hosts and post-attach frames.
         sv.post {
-            if (scrollView !== sv) {
+            if (generation != highlightRefreshGeneration || scrollView !== sv) {
                 sv.removeOnLayoutChangeListener(listener)
                 return@post
             }
-            if (sv.width > 0 && sv.height > 0 && restoreScrollToLocator(locator)) {
+            if (sv.width > 0 && sv.height > 0 && restoreScrollToLocator(locator, generation)) {
                 sv.removeOnLayoutChangeListener(listener)
             }
         }
@@ -450,7 +488,11 @@ class MarkdownEngine(private val context: Context) :
      * @return true when scroll position was applied (or no scroll needed); false if still waiting
      * for measurable content/viewport.
      */
-    private fun restoreScrollToLocator(locator: Locator): Boolean {
+    private fun restoreScrollToLocator(
+        locator: Locator,
+        generation: Long = highlightRefreshGeneration,
+    ): Boolean {
+        if (generation != highlightRefreshGeneration) return true
         val sv = scrollView ?: return true
         val tv = textView ?: return true
         if (sv.width <= 0 || sv.height <= 0) return false
@@ -479,6 +521,7 @@ class MarkdownEngine(private val context: Context) :
             // Some measure passes clamp once; retry on next frame if target not reached.
             if (y > 0 && sv.scrollY == 0) {
                 sv.post {
+                    if (generation != highlightRefreshGeneration) return@post
                     if (scrollView === sv && textView === tv) {
                         ensureScrollTextViewMeasured(sv, tv)
                         sv.scrollTo(0, y)
@@ -489,6 +532,7 @@ class MarkdownEngine(private val context: Context) :
         } finally {
             suppressLocatorUpdates = false
         }
+        if (generation != highlightRefreshGeneration) return true
         publishLocator(document.locatorForOffset(document.offsetFor(locator)))
         // Success when we needed no scroll, or scroll moved (or content fits).
         return y == 0 || sv.scrollY > 0 || maxScroll == 0
@@ -510,7 +554,7 @@ class MarkdownEngine(private val context: Context) :
         tv.layout(0, 0, measuredW, measuredH)
     }
 
-    override suspend fun search(query: String): List<Locator> = withContext(Dispatchers.Default) {
+    override suspend fun search(query: String): List<ReaderSearchHit> = withContext(Dispatchers.Default) {
         document.search(query)
     }
 
@@ -541,6 +585,16 @@ class MarkdownEngine(private val context: Context) :
     override fun setTextAnnotations(annotations: List<ReaderTextAnnotation>) {
         textAnnotations = annotations
         recomputeCachedHighlightRanges()
+        refreshBoundHighlightSurfaces()
+    }
+
+    override fun setSearchHighlight(hit: ReaderSearchHit?) {
+        searchHighlightHit = hit
+        recomputeCachedSearchHighlightRanges()
+        refreshBoundHighlightSurfaces()
+    }
+
+    private fun refreshBoundHighlightSurfaces() {
         if (_pagingKind.value == PagingKind.PAGED) {
             refreshActivePageContents()
             return
@@ -553,11 +607,34 @@ class MarkdownEngine(private val context: Context) :
         cachedHighlightRanges = document.highlightRanges(textAnnotations, base)
     }
 
+    private fun recomputeCachedSearchHighlightRanges() {
+        val hit = searchHighlightHit
+        if (hit == null) {
+            cachedSearchHighlightRanges = emptyList()
+            return
+        }
+        val base = ensureCachedRendered()
+        cachedSearchHighlightRanges = listOfNotNull(document.searchHighlightRange(hit, base))
+    }
+
     private fun filterHighlightRangesForWindow(
         window: MarkdownPageWindow,
         sliceLength: Int,
     ): List<ReaderTextHighlightRange> =
-        cachedHighlightRanges.mapNotNull { range ->
+        filterAbsoluteRangesForWindow(cachedHighlightRanges, window, sliceLength)
+
+    private fun filterSearchHighlightRangesForWindow(
+        window: MarkdownPageWindow,
+        sliceLength: Int,
+    ): List<ReaderTextHighlightRange> =
+        filterAbsoluteRangesForWindow(cachedSearchHighlightRanges, window, sliceLength)
+
+    private fun filterAbsoluteRangesForWindow(
+        ranges: List<ReaderTextHighlightRange>,
+        window: MarkdownPageWindow,
+        sliceLength: Int,
+    ): List<ReaderTextHighlightRange> =
+        ranges.mapNotNull { range ->
             val localStart = (range.start - window.startOffset).coerceAtLeast(0)
             val localEnd = (range.end - window.startOffset).coerceAtMost(sliceLength)
             if (localStart >= localEnd) null
@@ -566,13 +643,16 @@ class MarkdownEngine(private val context: Context) :
 
     private fun applyTextAnnotations(view: TextView) {
         val base = ensureCachedRendered()
-        val ranges = if (cachedHighlightRanges.isEmpty() && textAnnotations.isNotEmpty()) {
+        if (cachedHighlightRanges.isEmpty() && textAnnotations.isNotEmpty()) {
             recomputeCachedHighlightRanges()
-            cachedHighlightRanges
-        } else {
-            cachedHighlightRanges
         }
-        val highlightedText = base.withTextHighlightSpans(ranges)
+        if (cachedSearchHighlightRanges.isEmpty() && searchHighlightHit != null) {
+            recomputeCachedSearchHighlightRanges()
+        }
+        val highlightedText = base.withTextHighlightSpans(
+            ranges = cachedHighlightRanges,
+            searchRanges = cachedSearchHighlightRanges,
+        )
         val sv = scrollView
         if (sv == null) {
             view.text = highlightedText
@@ -581,6 +661,11 @@ class MarkdownEngine(private val context: Context) :
 
         val previousScrollY = sv.scrollY
         val previousLocator = _currentLocator.value
+        val generation = highlightRefreshGeneration
+        val expectedScrollView = sv
+        val expectedTextView = view
+        highlightRefreshScrollView = sv
+        highlightRefreshTextView = view
         suppressLocatorUpdates = true
         try {
             view.text = highlightedText
@@ -593,8 +678,13 @@ class MarkdownEngine(private val context: Context) :
             suppressLocatorUpdates = false
         }
         sv.post {
-            val activeScrollView = scrollView ?: return@post
-            val activeTextView = textView ?: return@post
+            // Stale after remount/open/close: do not touch current surfaces or locator.
+            if (generation != highlightRefreshGeneration) return@post
+            if (highlightRefreshScrollView !== expectedScrollView) return@post
+            if (highlightRefreshTextView !== expectedTextView) return@post
+            if (scrollView !== expectedScrollView || textView !== expectedTextView) return@post
+            val activeScrollView = expectedScrollView
+            val activeTextView = expectedTextView
             val maxScroll = (activeTextView.height - activeScrollView.height).coerceAtLeast(0)
             val locatorScrollY = activeTextView.scrollYForCharacterOffset(
                 document.renderedOffsetFor(previousLocator, activeTextView.text),
@@ -618,6 +708,12 @@ class MarkdownEngine(private val context: Context) :
         }
     }
 
+    private fun invalidateHighlightRefreshCallbacks() {
+        highlightRefreshGeneration += 1L
+        highlightRefreshScrollView = null
+        highlightRefreshTextView = null
+    }
+
     private fun updateScrollTextSelection(start: Int, end: Int) {
         val displayedText = textView?.text ?: ensureCachedRendered()
         _currentTextSelection.value = document.selectionForRenderedOffsets(start, end, displayedText)
@@ -632,6 +728,7 @@ class MarkdownEngine(private val context: Context) :
     }
 
     override suspend fun close() {
+        invalidateHighlightRefreshCallbacks()
         scrollView = null
         textView = null
         pageRequestCallback = null
@@ -646,6 +743,8 @@ class MarkdownEngine(private val context: Context) :
         document = MarkdownDocument.parse("")
         _currentTextSelection.value = null
         textAnnotations = emptyList()
+        searchHighlightHit = null
+        cachedSearchHighlightRanges = emptyList()
         _tableOfContents.value = emptyList()
         _pageCount.value = 1
         _pagingKind.value = PagingKind.CONTINUOUS
@@ -819,7 +918,8 @@ class MarkdownEngine(private val context: Context) :
             tv.tag = binding
             val slice = pageSlice(base, window)
             tv.text = slice.withTextHighlightSpans(
-                filterHighlightRangesForWindow(window, slice.length),
+                ranges = filterHighlightRangesForWindow(window, slice.length),
+                searchRanges = filterSearchHighlightRangesForWindow(window, slice.length),
             )
             tv.textSize = fontSizeSp
             tv.setLineSpacing(0f, lineSpacingMultiplier)

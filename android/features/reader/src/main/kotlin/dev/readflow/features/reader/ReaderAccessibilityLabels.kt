@@ -77,7 +77,15 @@ internal fun ReaderSearchResult.readerAccessibilityLabel(
     val withPosition = finiteProgressionOrNull(locator.totalProgression)?.let {
         "$head，位置 ${(it * 100f).roundToInt()}%"
     } ?: head
-    return if (selected) "$withPosition，已选中" else withPosition
+    val normalizedSnippet = snippet.trim()
+        .replace('\n', ' ')
+        .replace(Regex("\\s+"), " ")
+    val withSnippet = if (normalizedSnippet.isEmpty()) {
+        withPosition
+    } else {
+        "$withPosition，$normalizedSnippet"
+    }
+    return if (selected) "$withSnippet，已选中" else withSnippet
 }
 
 internal fun ReaderBookmarkItem.accessibilityLabel(isCurrent: Boolean = false): String {
@@ -94,6 +102,9 @@ internal fun ReaderAnnotationItem.accessibilityLabel(): String {
         "跳转到标注：$snippet，笔记：$noteSnippet"
     }
 }
+
+internal fun ReaderAnnotationItem.deleteAccessibilityLabel(): String =
+    "删除标注：${selectedText.singleLineSnippet()}"
 
 internal fun readerTocAccessibilityLabel(entry: TocEntry): String =
     entry.title.trim().ifEmpty { "未命名目录" }.let { title ->

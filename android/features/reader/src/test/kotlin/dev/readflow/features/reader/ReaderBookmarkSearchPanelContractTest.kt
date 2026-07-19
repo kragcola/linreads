@@ -28,6 +28,14 @@ class ReaderBookmarkSearchPanelContractTest {
         val searchMessage = searchPanel
             .substringAfter("searchState.message", missingDelimiterValue = "")
             .substringBefore("if (searchState.results")
+        val bookmarkRail = source
+            .substringAfter("private fun ReaderBookmarkRail(", missingDelimiterValue = "")
+            .substringBefore("private fun ReaderControlPanel(")
+            .ifEmpty {
+                source
+                    .substringAfter("private fun ReaderBookmarkRail(", missingDelimiterValue = "")
+                    .substringBefore("private fun BookmarkPanel(")
+            }
 
         assertTrue(
             "toolbar bookmark control must be >=48dp with Chinese add/remove labels",
@@ -58,6 +66,30 @@ class ReaderBookmarkSearchPanelContractTest {
                 bookmarkPanel.contains("contentDescription = \"删除\${bookmark.label}\""),
         )
         assertTrue(
+            "BookmarkPanel header shows total count and LazyColumn uses stable item keys",
+            (
+                bookmarkPanel.contains("bookmarkState.items.size") ||
+                    bookmarkPanel.contains("items.size")
+                ) &&
+                (
+                    bookmarkPanel.contains("\"书签（") ||
+                        bookmarkPanel.contains("书签（") ||
+                        bookmarkPanel.contains("个书签")
+                    ) &&
+                (
+                    bookmarkPanel.contains("key = { it.id }") ||
+                        bookmarkPanel.contains("key = { bookmark -> bookmark.id }") ||
+                        bookmarkPanel.contains("key = { bookmark.id }")
+                    ),
+        )
+        assertTrue(
+            "BookmarkPanel primary label is single-line with optional strategy-aware detail line",
+            bookmarkPanel.contains("bookmark.label") &&
+                bookmarkPanel.contains("maxLines = 1") &&
+                bookmarkPanel.contains("readerBookmarkDetailLabel") &&
+                !bookmarkPanel.contains("ByteOffset"),
+        )
+        assertTrue(
             "SearchPanel must gate IME search submit/clear with 48dp IconButtons",
             source.contains("private fun SearchPanel(") &&
                 source.contains("contentDescription = \"执行搜索\"") &&
@@ -74,6 +106,36 @@ class ReaderBookmarkSearchPanelContractTest {
                 searchPanel.contains("query = searchState.query") &&
                 searchPanel.contains("selected = selected") &&
                 searchPanel.contains("heightIn(min = 48.dp)"),
+        )
+        assertTrue(
+            "search prev/next must be 48dp IconButtons with Chinese descriptions and current/total counter",
+            searchPanel.contains("contentDescription = \"上一个搜索结果\"") &&
+                searchPanel.contains("contentDescription = \"下一个搜索结果\"") &&
+                searchPanel.contains("sizeIn(minWidth = 48.dp, minHeight = 48.dp)") &&
+                searchPanel.contains("canNavigateToPreviousSearchResult()") &&
+                searchPanel.contains("canNavigateToNextSearchResult()") &&
+                searchPanel.contains("onPreviousResult") &&
+                searchPanel.contains("onNextResult") &&
+                // current is 0 when selectedIndex is null: (selectedIndex?.plus(1) ?: 0)
+                searchPanel.contains("selectedIndex?.plus(1) ?: 0") &&
+                searchPanel.contains("results.size") &&
+                (
+                    searchPanel.contains("KeyboardArrowLeft") ||
+                        searchPanel.contains("KeyboardArrowUp") ||
+                        searchPanel.contains("ExpandLess")
+                    ) &&
+                (
+                    searchPanel.contains("KeyboardArrowRight") ||
+                        searchPanel.contains("KeyboardArrowDown") ||
+                        searchPanel.contains("ExpandMore")
+                    ),
+        )
+        assertTrue(
+            "search rows show position label plus up to two lines of snippet with graceful blank fallback",
+            searchPanel.contains("result.readerLabel()") &&
+                searchPanel.contains("result.snippet") &&
+                searchPanel.contains("maxLines = 2") &&
+                searchPanel.contains("snippetText.isNotEmpty()"),
         )
         assertTrue(
             "search loading must keep progress semantics and add a Chinese description",
@@ -96,6 +158,58 @@ class ReaderBookmarkSearchPanelContractTest {
             "panels must consume ReaderBookmarkState / ReaderSearchState",
             source.contains("bookmarkState: ReaderBookmarkState") &&
                 source.contains("searchState: ReaderSearchState"),
+        )
+        assertTrue(
+            "host-level ReaderBookmarkRail is trailing, gated on non-empty items, with 48dp targets",
+            source.contains("private fun ReaderBookmarkRail(") &&
+                (
+                    source.contains("bookmarkState.items.isNotEmpty()") ||
+                        source.contains("state.bookmarks.items.isNotEmpty()")
+                    ) &&
+                (
+                    source.contains("Alignment.CenterEnd") ||
+                        source.contains("Alignment.TopEnd") ||
+                        source.contains("Alignment.BottomEnd")
+                    ) &&
+                (
+                    bookmarkRail.contains("size(48.dp)") ||
+                        bookmarkRail.contains("sizeIn(minWidth = 48.dp, minHeight = 48.dp)") ||
+                        bookmarkRail.contains("Modifier.size(48.dp)")
+                    ) &&
+                bookmarkRail.contains("contentDescription = bookmark.accessibilityLabel(") &&
+                bookmarkRail.contains("onBookmarkClick(bookmark)") &&
+                (
+                    bookmarkRail.contains("Icons.Default.Bookmark") ||
+                        bookmarkRail.contains("Icons.Filled.Bookmark")
+                    ),
+        )
+        assertTrue(
+            "rail current bookmark uses tint plus non-color icon/semantics cue",
+            bookmarkRail.contains("currentBookmarkId") &&
+                bookmarkRail.contains("accessibilityLabel(isCurrent = isCurrent)") &&
+                (
+                    bookmarkRail.contains("BookmarkBorder") ||
+                        bookmarkRail.contains("text = \"当前\"")
+                    ),
+        )
+        assertTrue(
+            "rail stays narrow and does not use a full-width card surface",
+            (
+                bookmarkRail.contains("width(48.dp)") ||
+                    bookmarkRail.contains("widthIn(max = 48.dp)") ||
+                    bookmarkRail.contains(".width(48.dp)")
+                ) &&
+                !bookmarkRail.contains("fillMaxWidth()") &&
+                !bookmarkRail.contains("Card("),
+        )
+        assertTrue(
+            "bookmark chrome must not introduce database migration or entity schema edits",
+            !source.contains("Migration(") &&
+                !source.contains("@Database") &&
+                !source.contains("autoMigrations") &&
+                !source.contains("BookmarkEntity(") &&
+                !bookmarkPanel.contains("Room") &&
+                !bookmarkRail.contains("Room"),
         )
     }
 

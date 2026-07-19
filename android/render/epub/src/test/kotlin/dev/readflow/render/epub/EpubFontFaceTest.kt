@@ -67,6 +67,9 @@ class EpubFontFaceTest {
     @Test
     fun `normalize and split css font family lists handle quotes and commas`() {
         assertEquals("noto serif", normalizeFontFamilyKey("\"Noto Serif\""))
+        // Parity with SettingsViewModel.normalizedEpubFontFamily / DataStore canonicalEpubFontReplacements:
+        // collapse internal whitespace to a single space after quote stripping.
+        assertEquals("book serif", normalizeFontFamilyKey("\"Book   Serif\""))
         assertEquals(
             listOf("\"Noto Serif\"", "serif"),
             splitCssFontFamilyList("\"Noto Serif\", serif"),
@@ -316,6 +319,125 @@ class EpubFontFaceTest {
         assertSame(android.graphics.Typeface.DEFAULT_BOLD, resolved)
         assertEquals("custom:missing.ttf", requestedReplacement)
         assertEquals(1, embeddedCalls)
+    }
+
+    @Test
+    fun `Moon-style base replacement key covers Story-Regular Bold Italic when exact map missing`() {
+        val bookFonts = epubBookFontMapFromFaces(
+            listOf(
+                EpubFontFace("Story-Regular", "fonts/story-regular.ttf"),
+                EpubFontFace("Story-Bold", "fonts/story-bold.ttf"),
+                EpubFontFace("Story-Italic", "fonts/story-italic.ttf"),
+            ),
+        )
+        val replacements = mapOf("story" to "system_sans")
+        val requestedReplacementIds = mutableListOf<String>()
+        var embeddedCalls = 0
+        val embeddedResolver: (EpubFontFace) -> android.graphics.Typeface? = {
+            embeddedCalls += 1
+            android.graphics.Typeface.MONOSPACE
+        }
+        val replacementResolver: (String) -> android.graphics.Typeface? = { fontId ->
+            requestedReplacementIds += fontId
+            android.graphics.Typeface.DEFAULT_BOLD
+        }
+
+        for (cssFamily in listOf("Story-Regular", "Story-Bold", "Story-Italic")) {
+            val resolved = resolveEpubCssTypeface(
+                cssFontFamily = cssFamily,
+                replacements = replacements,
+                bookFonts = bookFonts,
+                replacementResolver = replacementResolver,
+                embeddedResolver = embeddedResolver,
+            )
+            assertSame(
+                "CSS family $cssFamily should use story base replacement",
+                android.graphics.Typeface.DEFAULT_BOLD,
+                resolved,
+            )
+        }
+        assertEquals(listOf("system_sans", "system_sans", "system_sans"), requestedReplacementIds)
+        assertEquals(0, embeddedCalls)
+
+        // Exact style-specific replacement still wins when both exact and base mappings exist.
+        val exactWins = resolveEpubCssTypeface(
+            cssFontFamily = "Story-Bold",
+            replacements = mapOf(
+                "story-bold" to "system_serif",
+                "story" to "system_sans",
+            ),
+            bookFonts = bookFonts,
+            replacementResolver = { fontId ->
+                when (fontId) {
+                    "system_serif" -> android.graphics.Typeface.SERIF
+                    "system_sans" -> android.graphics.Typeface.SANS_SERIF
+                    else -> null
+                }
+            },
+            embeddedResolver = embeddedResolver,
+        )
+        assertSame(android.graphics.Typeface.SERIF, exactWins)
+    }
+
+    @Test
+    fun `exact replacement null falls through to base replacement before embedded`() {
+        val bookFonts = epubBookFontMapFromFaces(
+            listOf(EpubFontFace("Story-Bold", "fonts/story-bold.ttf")),
+        )
+        val replacementCalls = mutableListOf<String>()
+        var embeddedCalls = 0
+
+        val resolved = resolveEpubCssTypeface(
+            cssFontFamily = "Story-Bold",
+            replacements = mapOf(
+                "story-bold" to "exact_missing",
+                "story" to "base_ok",
+            ),
+            bookFonts = bookFonts,
+            replacementResolver = { fontId ->
+                replacementCalls += fontId
+                when (fontId) {
+                    "exact_missing" -> null
+                    "base_ok" -> android.graphics.Typeface.DEFAULT_BOLD
+                    else -> null
+                }
+            },
+            embeddedResolver = {
+                embeddedCalls += 1
+                android.graphics.Typeface.MONOSPACE
+            },
+        )
+
+        assertSame(android.graphics.Typeface.DEFAULT_BOLD, resolved)
+        assertEquals(listOf("exact_missing", "base_ok"), replacementCalls)
+        assertEquals(0, embeddedCalls)
+    }
+
+    @Test
+    fun `base replacement null falls through to exact embedded face`() {
+        val bookFonts = epubBookFontMapFromFaces(
+            listOf(EpubFontFace("Story-Bold", "fonts/story-bold.ttf")),
+        )
+        val replacementCalls = mutableListOf<String>()
+        val embeddedPaths = mutableListOf<String>()
+
+        val resolved = resolveEpubCssTypeface(
+            cssFontFamily = "Story-Bold",
+            replacements = mapOf("story" to "base_missing"),
+            bookFonts = bookFonts,
+            replacementResolver = { fontId ->
+                replacementCalls += fontId
+                null
+            },
+            embeddedResolver = { face ->
+                embeddedPaths += face.srcPath
+                android.graphics.Typeface.MONOSPACE
+            },
+        )
+
+        assertSame(android.graphics.Typeface.MONOSPACE, resolved)
+        assertEquals(listOf("base_missing"), replacementCalls)
+        assertEquals(listOf("fonts/story-bold.ttf"), embeddedPaths)
     }
 
     private fun diskBackedCache(

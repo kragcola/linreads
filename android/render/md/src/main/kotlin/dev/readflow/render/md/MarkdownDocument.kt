@@ -3,7 +3,9 @@ package dev.readflow.render.md
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.TocEntry
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextSelection
+import dev.readflow.render.api.buildSearchSnippet
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
@@ -49,7 +51,11 @@ internal class MarkdownDocument private constructor(
                 }
             }
             is LocatorStrategy.ByteOffset -> strategy.offset.toInt()
-            else -> locator.totalProgression?.let { (it.coerceIn(0f, 1f) * markdown.length).toInt() } ?: 0
+            // Page / PageText are not MD source offsets; PageText must not use charOffset as MD index.
+            is LocatorStrategy.Page,
+            is LocatorStrategy.PageText,
+            LocatorStrategy.Unknown,
+            -> locator.totalProgression?.let { (it.coerceIn(0f, 1f) * markdown.length).toInt() } ?: 0
         }.coerceIn(0, markdown.length)
 
     fun renderedOffsetFor(locator: Locator, renderedText: CharSequence): Int =
@@ -58,16 +64,24 @@ internal class MarkdownDocument private constructor(
     fun lineStart(lineIndex: Int): Int =
         lineStarts[lineIndex.coerceIn(0, lineStarts.lastIndex)]
 
-    suspend fun search(query: String, limit: Int = DEFAULT_SEARCH_LIMIT): List<Locator> {
+    suspend fun search(query: String, limit: Int = DEFAULT_SEARCH_LIMIT): List<ReaderSearchHit> {
         val needle = query.trim()
         if (needle.isEmpty() || limit <= 0 || markdown.isEmpty()) return emptyList()
-        val results = mutableListOf<Locator>()
+        val results = mutableListOf<ReaderSearchHit>()
         var fromIndex = 0
         while (results.size < limit) {
             currentCoroutineContext().ensureActive()
             val matchIndex = markdown.indexOf(needle, startIndex = fromIndex, ignoreCase = true)
             if (matchIndex < 0) break
-            results += locatorForOffset(matchIndex)
+            results += ReaderSearchHit(
+                locator = locatorForOffset(matchIndex),
+                snippet = buildSearchSnippet(
+                    source = markdown,
+                    matchStart = matchIndex,
+                    matchLength = needle.length,
+                ),
+                matchLength = needle.length,
+            )
             fromIndex = matchIndex + needle.length
         }
         return results

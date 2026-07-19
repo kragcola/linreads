@@ -73,12 +73,15 @@ import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
+import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextAnnotation
 import dev.readflow.render.api.ReaderTextHighlightRange
 import dev.readflow.render.api.ReaderTextSelection
+import dev.readflow.render.api.SearchHighlightableReaderEngine
 import dev.readflow.render.api.SelfPagingReaderEngine
 import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.TextSelectableReaderEngine
+import dev.readflow.render.api.withTextHighlightSpans
 import io.noties.markwon.core.MarkwonTheme
 import io.noties.markwon.image.AsyncDrawableScheduler
 import java.util.concurrent.ExecutorService
@@ -188,6 +191,7 @@ class EpubReflowEngine private constructor(
     SelfPagingReaderEngine,
     TextSelectableReaderEngine,
     TextAnnotatableReaderEngine,
+    SearchHighlightableReaderEngine,
     InitialLocatorAwareReaderEngine {
 
     constructor(context: Context) : this(
@@ -283,13 +287,15 @@ class EpubReflowEngine private constructor(
     private val legacyPagedSlicesLock = Any()
     private val bookGeneration = AtomicLong(0L)
     private var chapterBoundaries: List<ChapterBoundary> = emptyList()
-    private var fontSizeSp: Float = 18f
+    private var fontSizeSp: Float = ReaderTypographyRange.DEFAULT_FONT_SIZE.toFloat()
     private var lineSpacingMultiplier: Float = ReaderTypographyRange.DEFAULT_LINE_SPACING
     private var flipStyle: dev.readflow.core.model.PageFlipStyle = dev.readflow.core.model.PageFlipStyle.SLIDE
     private var useSourceHan: Boolean = false
     private var currentFontId: String = "system_serif"
     private var themeMode: ThemeMode = ThemeMode.SYSTEM
     private var textAnnotations: List<ReaderTextAnnotation> = emptyList()
+    /** Transient selected search hit; independent of view instances for mode remount repaint. */
+    private var searchHighlightHit: ReaderSearchHit? = null
     private var recyclerView: RecyclerView? = null
     private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
 
@@ -738,6 +744,7 @@ class EpubReflowEngine private constructor(
     ): Locator {
         if (indexedParas.isEmpty()) return Locator(LocatorStrategy.Unknown)
         return when (val strategy = locator?.strategy) {
+            // Legacy bare Page only — PageText must not enter EPUB page migration.
             is LocatorStrategy.Page -> resolveLegacyPageLocator(locator, indexedParas, indexedPages)
             is LocatorStrategy.Section -> {
                 val paragraphIndex = epubIndexFromLocator(locator, indexedParas.size)
@@ -747,7 +754,11 @@ class EpubReflowEngine private constructor(
                 epubLocatorForOffset(indexedParas, paragraphIndex, paragraphOffset)
             }
             null -> epubLocatorForIndex(indexedParas, 0)
-            else -> epubLocatorForIndex(indexedParas, epubIndexFromLocator(locator, indexedParas.size))
+            // PageText / ByteOffset / Unknown: totalProgression via epubIndexFromLocator (no Page index).
+            is LocatorStrategy.PageText,
+            is LocatorStrategy.ByteOffset,
+            LocatorStrategy.Unknown,
+            -> epubLocatorForIndex(indexedParas, epubIndexFromLocator(locator, indexedParas.size))
         }
     }
 
@@ -799,6 +810,8 @@ class EpubReflowEngine private constructor(
     }
 
     override fun createView(): View {
+        // Production default: continuous-flow surface (async image loader). Legacy SCROLL recycler
+        // with synchronous imageLoader is only built when flowEngineEnabled is forced off.
         if (flowEngineEnabled) return createFlowView()
         return RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
@@ -809,7 +822,9 @@ class EpubReflowEngine private constructor(
                 imageLoader = { href -> epubFile?.let { decodeEpubImage(it, href) } },
                 onLinkClick = ::handleLinkClick,
                 onTextSelectionChanged = ::updateTextSelection,
-                highlightRangesProvider = ::highlightRangesForParagraph,
+                highlightRangesProvider = { index ->
+                    highlightRangesForParagraph(index) to searchHighlightRangesForParagraph(index)
+                },
                 fontSizeSp = fontSizeSp,
                 lineSpacingMultiplier = lineSpacingMultiplier,
                 inkColor = palette.ink,
@@ -1250,6 +1265,7 @@ class EpubReflowEngine private constructor(
             imageSizeResolver = resolver,
             onLinkClick = onLinkClick,
             highlightRanges = flowHighlightRanges(flow),
+            searchHighlightRanges = flowSearchHighlightRanges(flow),
             fullPageHrefs = fullPageHrefs,
             fullPageImageOffsets = fullPageImageOffsets,
             pageHeightProvider = pageHeightProvider,
@@ -1703,6 +1719,34 @@ class EpubReflowEngine private constructor(
         return result
     }
 
+    private fun flowSearchHighlightRanges(flow: EpubChapterFlow): List<ReaderTextHighlightRange> {
+        val hit = searchHighlightHit ?: return emptyList()
+        val result = ArrayList<ReaderTextHighlightRange>(1)
+        flow.segments.forEach { seg ->
+            if (seg.block !is EpubDisplayBlock.Text) return@forEach
+            val r = epubSearchHighlightRange(paras, seg.paragraphIndex, hit) ?: return@forEach
+            result += ReaderTextHighlightRange(seg.layoutStart + r.start, seg.layoutStart + r.end, r.color)
+        }
+        return result
+    }
+
+    private fun refreshBoundHighlightSurfaces() {
+        flowView?.let { view ->
+            flowCurrentFlow?.let { flow ->
+                view.refreshHighlights(
+                    annotationRanges = flowHighlightRanges(flow),
+                    searchRanges = flowSearchHighlightRanges(flow),
+                )
+            }
+        }
+        (recyclerView?.adapter as? EpubParaAdapter)?.updateTextAnnotations()
+        activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
+        // Composite stacks + image captions paint via TextView spans; rebind so setSearchHighlight
+        // refreshes them the same way as pure Compose text pages.
+        activePagedCompositePages.keys.toList().forEach(::rebindActiveCompositePage)
+        activePagedImagePages.keys.toList().forEach(::rebindActiveImagePage)
+    }
+
     private fun handleFlowTapZone(zone: EpubFlowTapZone) {
         when (zone) {
             EpubFlowTapZone.PREV -> advanceFlowPage(-1)
@@ -1769,6 +1813,12 @@ class EpubReflowEngine private constructor(
         withContext(Dispatchers.Main) { advanceFlowPage(delta) }
     }
 
+    /**
+     * Legacy slice-pack page factory (ViewPager host path). Production default keeps
+     * [EPUB_FLOW_ENGINE_ENABLED] and [selfPagingActive] true, so [createView] returns the Flow
+     * surface and the reader host never binds this path. Image pages here still decode
+     * synchronously — only for the explicit flow-disabled fallback / unit tests that force it.
+     */
     override fun createPageView(pageIndex: Int): View {
         val pages = ensureLegacyPagedSlices()
         val total = pages.size.coerceAtLeast(1)
@@ -1781,7 +1831,7 @@ class EpubReflowEngine private constructor(
             return createImagePageView(slice, safePageIndex, total)
         }
         val pageText = pageTextFor(slice)
-        val highlightRanges = highlightRangesForPageSlice(slice)
+        val highlightRanges = composePaintRangesForPageSlice(slice)
         val palette = paletteFor(themeMode, context.resources.configuration)
         val pageProgressDescription = "第 ${safePageIndex + 1} 页，共 $total 页"
         val composeSelectionHighlightState = mutableStateOf<ReaderTextHighlightRange?>(null)
@@ -1882,9 +1932,16 @@ class EpubReflowEngine private constructor(
         // The caption text is captured at pagination time, when the heading's spine may not yet be
         // in the lazy cache (then textProvider returned ""). Resolve it live here so the heading
         // renders even when it was paginated before its spine loaded; fall back to the captured text.
-        val captionText = captionSegment.text.takeIf { it.isNotBlank() }
-            ?: lazyBook?.paragraphAt(captionSegment.paragraphIndex)?.text.orEmpty()
+        val fullText = lazyBook?.paragraphAt(captionSegment.paragraphIndex)?.text
+            ?: captionSegment.text
+        val start = captionSegment.startOffset.coerceIn(0, fullText.length)
+        val end = captionSegment.endOffset.coerceIn(0, fullText.length).coerceAtLeast(start)
+        val captionText = when {
+            end > start -> fullText.substring(start, end)
+            else -> captionSegment.text.takeIf { it.isNotBlank() } ?: fullText
+        }
         if (captionText.isBlank()) return imageView
+        val (annotationRanges, searchRanges) = highlightRangesForTextSegment(captionSegment)
         return LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -1899,7 +1956,10 @@ class EpubReflowEngine private constructor(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT,
                     ).apply { bottomMargin = (16 * density).toInt() }
-                    text = captionText
+                    text = captionText.withTextHighlightSpans(
+                        ranges = annotationRanges,
+                        searchRanges = searchRanges,
+                    )
                     setTextColor(palette.ink)
                     textSize = paint.textSize / density
                     typeface = paint.typeface
@@ -1956,6 +2016,8 @@ class EpubReflowEngine private constructor(
                     val fullText = lazyBook?.paragraphAt(segment.paragraphIndex)?.text ?: segment.text
                     val start = segment.startOffset.coerceIn(0, fullText.length)
                     val end = segment.endOffset.coerceIn(0, fullText.length).coerceAtLeast(start)
+                    val localText = fullText.substring(start, end)
+                    val (annotationRanges, searchRanges) = highlightRangesForTextSegment(segment)
                     val paint = currentPageTextPaint(segment.textStyle)
                     column.addView(
                         TextView(context).apply {
@@ -1963,7 +2025,10 @@ class EpubReflowEngine private constructor(
                                 LinearLayout.LayoutParams.MATCH_PARENT,
                                 LinearLayout.LayoutParams.WRAP_CONTENT,
                             ).apply { if (index > 0) topMargin = (8 * density).toInt() }
-                            text = fullText.substring(start, end)
+                            text = localText.withTextHighlightSpans(
+                                ranges = annotationRanges,
+                                searchRanges = searchRanges,
+                            )
                             setTextColor(palette.ink)
                             textSize = paint.textSize / density
                             typeface = paint.typeface
@@ -2340,12 +2405,12 @@ class EpubReflowEngine private constructor(
         }
     }
 
-    override suspend fun search(query: String): List<Locator> {
+    override suspend fun search(query: String): List<ReaderSearchHit> {
         if (query.isBlank()) return emptyList()
         return withContext(Dispatchers.IO) {
             val indexedBook = if (startupSession != null) awaitFullIndexBook() else lazyBook
             val indexedParas = indexedBook?.paras ?: paras
-            epubSearchLocators(indexedParas, query) { index -> indexedBook?.paragraphAt(index) }
+            epubSearchHits(indexedParas, query) { index -> indexedBook?.paragraphAt(index) }
         }
     }
 
@@ -2366,12 +2431,15 @@ class EpubReflowEngine private constructor(
                 }
             }
         }
-        // Flow mode owns its own single-Spannable surface; refresh its highlight spans in place
-        // (no reload, no repagination) so newly added annotations paint immediately.
-        flowView?.let { view -> flowCurrentFlow?.let { flow -> view.refreshHighlights(flowHighlightRanges(flow)) } }
+        // Flow mode owns its own single-Spannable surface; refresh highlight spans in place
+        // (no reload, no repagination) so newly added annotations / search paint immediately.
+        refreshBoundHighlightSurfaces()
         if (flowEngineEnabled && Looper.myLooper() == Looper.getMainLooper()) prewarmBoundaryPreviews()
-        (recyclerView?.adapter as? EpubParaAdapter)?.updateTextAnnotations()
-        activePagedTextPages.keys.toList().forEach(::rebindActiveComposeTextPage)
+    }
+
+    override fun setSearchHighlight(hit: ReaderSearchHit?) {
+        searchHighlightHit = hit
+        refreshBoundHighlightSurfaces()
     }
 
     private fun updateTextSelection(paragraphIndex: Int, start: Int, end: Int) {
@@ -2444,7 +2512,7 @@ class EpubReflowEngine private constructor(
             R.id.epub_compose_text_annotated_string,
             epubComposeAnnotatedText(
                 text = pageText,
-                highlightRanges = highlightRangesForPageSlice(slice),
+                highlightRanges = composePaintRangesForPageSlice(slice),
                 links = slice.links,
                 selectionHighlightRange = composeSelectionHighlight,
                 linkClickHandler = composeLinkClickHandler(composeView, slice),
@@ -2482,7 +2550,7 @@ class EpubReflowEngine private constructor(
             R.id.epub_compose_text_annotated_string,
             epubComposeAnnotatedText(
                 text = pageText,
-                highlightRanges = highlightRangesForPageSlice(slice),
+                highlightRanges = composePaintRangesForPageSlice(slice),
                 links = slice.links,
                 selectionHighlightRange = composeSelectionHighlight,
                 linkClickHandler = composeLinkClickHandler(composeView, slice),
@@ -2585,6 +2653,7 @@ class EpubReflowEngine private constructor(
         pagedSlices = emptyList()
         chapterBoundaries = emptyList()
         textAnnotations = emptyList()
+        searchHighlightHit = null
         _currentTextSelection.value = null
         _currentLocator.value = Locator(LocatorStrategy.Unknown)
         _chapterInfo.value = EMPTY_CHAPTER_INFO
@@ -2594,6 +2663,11 @@ class EpubReflowEngine private constructor(
 
     private fun highlightRangesForParagraph(paragraphIndex: Int) =
         epubHighlightRanges(paras, paragraphIndex, textAnnotations)
+
+    private fun searchHighlightRangesForParagraph(paragraphIndex: Int): List<ReaderTextHighlightRange> {
+        val hit = searchHighlightHit ?: return emptyList()
+        return listOfNotNull(epubSearchHighlightRange(paras, paragraphIndex, hit))
+    }
 
     override suspend fun close() {
         bookGeneration.incrementAndGet()
@@ -2646,6 +2720,7 @@ class EpubReflowEngine private constructor(
         chapterBoundaries = emptyList()
         _currentTextSelection.value = null
         textAnnotations = emptyList()
+        searchHighlightHit = null
         _currentLocator.value = Locator(LocatorStrategy.Unknown)
         _chapterInfo.value = EMPTY_CHAPTER_INFO
         _tableOfContents.value = emptyList()
@@ -3143,11 +3218,24 @@ class EpubReflowEngine private constructor(
         return PagedTextRenderContent(text = text.toString(), segments = segments)
     }
 
-    private fun highlightRangesForPageSlice(slice: EpubPageSlice) =
+    private fun highlightRangesForPageSlice(slice: EpubPageSlice): List<ReaderTextHighlightRange> =
+        mapParagraphRangesToPageSlice(slice, ::highlightRangesForParagraph)
+
+    private fun searchHighlightRangesForPageSlice(slice: EpubPageSlice): List<ReaderTextHighlightRange> =
+        mapParagraphRangesToPageSlice(slice, ::searchHighlightRangesForParagraph)
+
+    /** Annotation + transient search ranges for Compose paint (colors already distinct). */
+    private fun composePaintRangesForPageSlice(slice: EpubPageSlice): List<ReaderTextHighlightRange> =
+        highlightRangesForPageSlice(slice) + searchHighlightRangesForPageSlice(slice)
+
+    private fun mapParagraphRangesToPageSlice(
+        slice: EpubPageSlice,
+        rangesForParagraph: (Int) -> List<ReaderTextHighlightRange>,
+    ): List<ReaderTextHighlightRange> =
         if (slice.textSegments.isNotEmpty()) {
             val content = pageTextRenderContent(slice)
             content.segments.flatMap { segment ->
-                highlightRangesForParagraph(segment.source.paragraphIndex).mapNotNull { range ->
+                rangesForParagraph(segment.source.paragraphIndex).mapNotNull { range ->
                     val start = maxOf(range.start, segment.source.startOffset)
                     val end = minOf(range.end, segment.source.endOffset)
                     if (start >= end) return@mapNotNull null
@@ -3158,7 +3246,7 @@ class EpubReflowEngine private constructor(
                 }
             }
         } else {
-            highlightRangesForParagraph(slice.paragraphIndex).mapNotNull { range ->
+            rangesForParagraph(slice.paragraphIndex).mapNotNull { range ->
                 val start = maxOf(range.start, slice.startOffset)
                 val end = minOf(range.end, slice.endOffset)
                 if (start >= end) return@mapNotNull null
@@ -3219,7 +3307,7 @@ class EpubReflowEngine private constructor(
         }
         composeView.applyComposePageAccessibilityProgress("第 ${pageIndex + 1} 页，共 $total 页")
         val pageText = pageTextFor(slice)
-        val highlightRanges = highlightRangesForPageSlice(slice)
+        val highlightRanges = composePaintRangesForPageSlice(slice)
         composeView.bindEpubComposeTextPage(
             pageText = pageText,
             slice = slice,
@@ -3254,6 +3342,45 @@ class EpubReflowEngine private constructor(
         imageView.setTag(R.id.epub_image_placement, placement)
         imageView.contentDescription = imagePageContentDescription(slice.kind, pageIndex, total)
         imageView.setImageBitmap(epubFile?.let { decodeEpubImage(it, slice.kind.href) })
+        // Caption TextView (heading stacked above image) must repaint search/annotation spans.
+        val captionSegment = slice.textSegments.firstOrNull { it.textStyle.headingLevel != null }
+        val captionView = (container as? ViewGroup)?.findEpubCaptionTextView()
+        if (captionSegment != null && captionView != null) {
+            val fullText = lazyBook?.paragraphAt(captionSegment.paragraphIndex)?.text
+                ?: captionSegment.text
+            val start = captionSegment.startOffset.coerceIn(0, fullText.length)
+            val end = captionSegment.endOffset.coerceIn(0, fullText.length).coerceAtLeast(start)
+            val captionText = when {
+                end > start -> fullText.substring(start, end)
+                else -> captionSegment.text.takeIf { it.isNotBlank() } ?: fullText
+            }
+            val (annotationRanges, searchRanges) = highlightRangesForTextSegment(captionSegment)
+            captionView.text = captionText.withTextHighlightSpans(
+                ranges = annotationRanges,
+                searchRanges = searchRanges,
+            )
+            captionView.setTextColor(palette.ink)
+        }
+    }
+
+    /**
+     * Map paragraph-local annotation/search ranges onto a composite/caption text segment's
+     * local [0, endOffset-startOffset) coordinate space for [withTextHighlightSpans].
+     */
+    private fun highlightRangesForTextSegment(
+        segment: EpubPageTextSegment,
+    ): Pair<List<ReaderTextHighlightRange>, List<ReaderTextHighlightRange>> {
+        val segmentStart = segment.startOffset
+        val segmentEnd = segment.endOffset.coerceAtLeast(segmentStart)
+        fun mapLocal(ranges: List<ReaderTextHighlightRange>): List<ReaderTextHighlightRange> =
+            ranges.mapNotNull { range ->
+                val start = maxOf(range.start, segmentStart)
+                val end = minOf(range.end, segmentEnd)
+                if (start >= end) return@mapNotNull null
+                range.copy(start = start - segmentStart, end = end - segmentStart)
+            }
+        return mapLocal(highlightRangesForParagraph(segment.paragraphIndex)) to
+            mapLocal(searchHighlightRangesForParagraph(segment.paragraphIndex))
     }
 
     private fun clearActiveComposeSelectionRanges() {
@@ -3265,7 +3392,7 @@ class EpubReflowEngine private constructor(
                 R.id.epub_compose_text_annotated_string,
                 epubComposeAnnotatedText(
                     text = pageText,
-                    highlightRanges = highlightRangesForPageSlice(pageState.slice),
+                    highlightRanges = composePaintRangesForPageSlice(pageState.slice),
                     links = pageState.slice.links,
                     linkClickHandler = composeLinkClickHandler(composeView, pageState.slice),
                 ),
@@ -3360,6 +3487,16 @@ class EpubReflowEngine private constructor(
         val group = this as? ViewGroup ?: return null
         for (index in 0 until group.childCount) {
             group.getChildAt(index).findEpubImageView()?.let { return it }
+        }
+        return null
+    }
+
+    /** Caption heading TextView stacked above a full-page image (sibling of the ImageView). */
+    private fun View.findEpubCaptionTextView(): TextView? {
+        if (this is TextView) return this
+        val group = this as? ViewGroup ?: return null
+        for (index in 0 until group.childCount) {
+            group.getChildAt(index).findEpubCaptionTextView()?.let { return it }
         }
         return null
     }

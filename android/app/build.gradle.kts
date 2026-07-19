@@ -90,11 +90,14 @@ android {
         }
         getByName("test") {
             if (readflowPhase >= 2) {
+                // Shared pure contracts for phase2 JVM + instrumentation harnesses.
+                java.srcDir("src/phase2TestSupport/java")
                 java.srcDir("src/phase2Test/java")
             }
         }
         getByName("androidTest") {
             if (readflowPhase >= 2) {
+                java.srcDir("src/phase2TestSupport/java")
                 java.srcDir("src/phase2AndroidTest/java")
             }
         }

@@ -29,8 +29,11 @@ sealed interface ReaderIntent {
     data class RemoveBookmark(val bookmark: ReaderBookmarkItem) : ReaderIntent
     data class SaveTextAnnotation(val note: String?) : ReaderIntent
     data class GoToAnnotation(val annotation: ReaderAnnotationItem) : ReaderIntent
+    data class RemoveAnnotation(val annotation: ReaderAnnotationItem) : ReaderIntent
     data class SetSearchQuery(val query: String) : ReaderIntent
     data class GoToSearchResult(val result: ReaderSearchResult) : ReaderIntent
+    data object GoToPreviousSearchResult : ReaderIntent
+    data object GoToNextSearchResult : ReaderIntent
     data object SubmitSearch : ReaderIntent
     data object ClearSearch : ReaderIntent
     data object ClearTextSelection : ReaderIntent

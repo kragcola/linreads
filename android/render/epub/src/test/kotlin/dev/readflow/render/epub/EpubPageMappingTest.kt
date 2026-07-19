@@ -38,6 +38,33 @@ class EpubPageMappingTest {
     }
 
     @Test
+    fun `PageText is not treated as paragraph index falls back to total progression`() {
+        // Foreign PDF PageText.index=9 must not become EPUB paragraph 9.
+        assertEquals(
+            2,
+            epubIndexFromLocator(
+                Locator(
+                    strategy = LocatorStrategy.PageText(index = 9, total = 10, charOffset = 0),
+                    totalProgression = 0.2f,
+                ),
+                totalItems = 10,
+            ),
+        )
+        assertEquals(
+            0,
+            epubIndexFromLocator(
+                Locator(LocatorStrategy.PageText(index = 9, total = 10, charOffset = 50)),
+                totalItems = 10,
+            ),
+        )
+        // Legacy bare Page still maps by index (migration contract).
+        assertEquals(
+            9,
+            epubIndexFromLocator(Locator(LocatorStrategy.Page(index = 9, total = 10)), totalItems = 10),
+        )
+    }
+
+    @Test
     fun `index maps back to section locator with original spine index`() {
         val paras = epubParasWithCharacterOffsets(
             listOf(
@@ -851,6 +878,79 @@ class EpubPageMappingTest {
                 EpubPageTextStyle(kind = EpubTextKind.Blockquote),
             ),
             pages.single().textSegments.map { it.textStyle },
+        )
+    }
+
+    @Test
+    fun `packed list items keep non-anchor paragraph style on segments`() {
+        // Regression for corpus smoke: image-layout-test.epub packs adjacent ListItems so only the
+        // first paragraph is page.paragraphIndex; non-anchor styles must survive on textSegments.
+        val paras = epubParasWithCharacterOffsets(
+            listOf(
+                listOf(
+                    "• First checkpoint.",
+                    "• Second checkpoint.",
+                    "• Third checkpoint.",
+                ),
+            ),
+        )
+        val listStyle = EpubPageTextStyle(kind = EpubTextKind.ListItem)
+
+        val pages = epubPagedLayoutWithBlocks(
+            paras = paras,
+            textProvider = { index -> paras[index].text },
+            blockProvider = {
+                listOf(
+                    EpubDisplayBlock.Text(
+                        "• First checkpoint.",
+                        headingLevel = null,
+                        paragraphIndex = 0,
+                        kind = EpubTextKind.ListItem,
+                    ),
+                    EpubDisplayBlock.Text(
+                        "• Second checkpoint.",
+                        headingLevel = null,
+                        paragraphIndex = 1,
+                        kind = EpubTextKind.ListItem,
+                    ),
+                    EpubDisplayBlock.Text(
+                        "• Third checkpoint.",
+                        headingLevel = null,
+                        paragraphIndex = 2,
+                        kind = EpubTextKind.ListItem,
+                    ),
+                )
+            },
+            metrics = EpubPageMetrics(
+                viewportWidthPx = 420,
+                viewportHeightPx = 240,
+                horizontalPaddingPx = 20,
+                verticalPaddingPx = 0,
+                averageCharacterWidthPx = 10f,
+                lineHeightPx = 24f,
+            ),
+            lineBreaker = { text, _, _ -> listOf(0 to text.length) },
+        )
+
+        val packed = pages.single()
+        assertEquals(EpubPageSliceKind.Text, packed.kind)
+        assertEquals(0, packed.paragraphIndex)
+        assertEquals(2, packed.endParagraphIndex)
+        assertEquals(listStyle, packed.textStyle)
+        // Page-level paragraphIndex alone would miss non-anchor list rows.
+        assertTrue(packed.paragraphIndex != 1)
+        assertTrue(
+            packed.textSegments.any { segment ->
+                segment.paragraphIndex == 1 && segment.textStyle == listStyle
+            },
+        )
+        assertEquals(
+            listOf(0, 1, 2),
+            packed.textSegments.map { it.paragraphIndex },
+        )
+        assertEquals(
+            listOf(listStyle, listStyle, listStyle),
+            packed.textSegments.map { it.textStyle },
         )
     }
 
