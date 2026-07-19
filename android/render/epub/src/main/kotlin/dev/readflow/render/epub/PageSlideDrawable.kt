@@ -94,6 +94,22 @@ internal class PageSlideDrawable(
         val visibleLeft = max(0f, left)
         val visibleRight = min(w, left + w)
         if (visibleRight <= visibleLeft) return
+
+        // Page shots are always viewport-sized. Keep this path as a clipped, translated 1:1 blit:
+        // drawBitmap(src,dst) makes the GPU run a filtered scale on every MOVE even when both rects
+        // are the same size, which is especially costly for image-heavy EPUB pages.
+        if (bitmap.width == viewportW && bitmap.height == viewportH) {
+            val save = canvas.save()
+            try {
+                canvas.clipRect(visibleLeft, 0f, visibleRight, h)
+                canvas.translate(left, 0f)
+                canvas.drawBitmap(bitmap, 0f, 0f, paint)
+            } finally {
+                canvas.restoreToCount(save)
+            }
+            return
+        }
+
         val srcLeft = sourceXForViewportX(left, visibleLeft, w) ?: return
         val srcRight = sourceXForViewportX(left, visibleRight, w)
             ?.coerceIn(srcLeft, viewportW)

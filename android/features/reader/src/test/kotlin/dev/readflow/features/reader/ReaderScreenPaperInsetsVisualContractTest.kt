@@ -91,6 +91,11 @@ class ReaderScreenPaperInsetsVisualContractTest {
                 source.contains("onDispose"),
         )
         assertTrue(
+            "reader must explicitly keep decor edge-to-edge even when an Activity host reapplies " +
+                "fitsSystemWindows during navigation or focus changes",
+            source.contains("WindowCompat.setDecorFitsSystemWindows(window, false)"),
+        )
+        assertTrue(
             "icon light/dark must follow reader paper palette (not only system dark theme)",
             source.contains("lightBars = !readerPaletteFor(themeMode, systemNight).isNight"),
         )

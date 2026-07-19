@@ -1455,6 +1455,33 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `active page shot overlay skips parked text child draw`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val childDraws = RecordingBoundsTopDrawable()
+        view.textView.background = childDraws
+        view.goToPage(1)
+
+        view.drawToBitmapForTest().recycle()
+        val drawsBeforeTurn = childDraws.boundsTops.size
+        assertTrue("baseline draw must visit the parked TextView", drawsBeforeTurn > 0)
+
+        try {
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            view.drawToBitmapForTest().recycle()
+            assertEquals(
+                "cached page-shot overlay must not repaint image/text spans beneath it",
+                drawsBeforeTurn,
+                childDraws.boundsTops.size,
+            )
+        } finally {
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `interactive slide moves incoming paper as a page shot`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)

@@ -180,6 +180,11 @@ internal fun pageFlipStyleToTransitionType(style: dev.readflow.core.model.PageFl
         dev.readflow.core.model.PageFlipStyle.NONE -> TransitionType.NONE
     }
 
+/** Re-assert edge-to-edge at low-frequency reader lifecycle boundaries. */
+internal fun ensureReaderEdgeToEdge(window: Window) {
+    WindowCompat.setDecorFitsSystemWindows(window, false)
+}
+
 /** Transparent status/nav, contrast-off, palette-driven icons. No hide/immersive/padding. */
 internal fun applyReaderSystemBars(window: Window, view: View, lightBars: Boolean) {
     val controller = WindowCompat.getInsetsController(window, view)
@@ -228,6 +233,7 @@ internal class ReaderSystemBarReapplySession(
     }
 
     fun reapply() {
+        ensureReaderEdgeToEdge(window)
         applyReaderSystemBars(window, view, lightBars())
     }
 
@@ -297,6 +303,7 @@ private fun ReaderSystemBarAppearance(themeMode: ThemeMode, systemNight: Boolean
         if (window == null) {
             onDispose { }
         } else {
+            ensureReaderEdgeToEdge(window)
             val controller = WindowCompat.getInsetsController(window, view)
             val previousStatusBarAppearance = controller.isAppearanceLightStatusBars
             val previousNavigationBarAppearance = controller.isAppearanceLightNavigationBars

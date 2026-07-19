@@ -1343,30 +1343,38 @@ internal class EpubFlowView(
     override fun dispatchDraw(canvas: Canvas) {
         val clipBottom = pageClipBottomInViewport()
         val topClip = pageClipTopInViewport()
-        if (clipBottom == null && topClip <= scrollY) {
+        // The page-turn overlay owns the complete viewport and draws cached page shots. Avoid
+        // repainting the parked TextView (including all image spans) underneath it on every finger
+        // MOVE; EpubFlowContainer keeps the parent ViewGroup overlay in the draw pass.
+        container.skipContentDraw = slideDrawable != null || curlDrawable != null
+        try {
+            if (clipBottom == null && topClip <= scrollY) {
+                super.dispatchDraw(canvas)
+                return
+            }
+            val save = canvas.save()
+            // pageClip* helpers return content-space Y (layout coords: page top = line top, +padTop for
+            // painted ink). Android's parent draw path and snapshotViewport both pre-translate the canvas
+            // by -scrollY before dispatchDraw, so clipRect must stay in content coordinates. Subtracting
+            // scrollY here would apply the scroll twice and truncate/blank later pages.
+            //
+            // The paginator works in pure StaticLayout coords (line 0 at y=0), but the child TextView paints
+            // its layout shifted DOWN by its own [TextView.paddingTop] — a line at layout-y L lands at
+            // content-y L + padTop. [pageClipBottomInViewport] returns the bottom in layout space, so without
+            // the offset the clip falls padTop px too high and slices ~padTop off the last line's painted
+            // glyphs (审计: 底部半截文字). Add padTop so the clip meets the line's PAINTED bottom; cap at the
+            // viewport bottom (a near-full page then relies on the viewport edge, off by ≤padTop, invisible).
+            val bottom = if (clipBottom != null) {
+                minOf(scrollY + clipBottom + textView.paddingTop, scrollY + height)
+            } else {
+                scrollY + height
+            }
+            canvas.clipRect(0, topClip, width, bottom)
             super.dispatchDraw(canvas)
-            return
+            canvas.restoreToCount(save)
+        } finally {
+            container.skipContentDraw = false
         }
-        val save = canvas.save()
-        // pageClip* helpers return content-space Y (layout coords: page top = line top, +padTop for
-        // painted ink). Android's parent draw path and snapshotViewport both pre-translate the canvas
-        // by -scrollY before dispatchDraw, so clipRect must stay in content coordinates. Subtracting
-        // scrollY here would apply the scroll twice and truncate/blank later pages.
-        //
-        // The paginator works in pure StaticLayout coords (line 0 at y=0), but the child TextView paints
-        // its layout shifted DOWN by its own [TextView.paddingTop] — a line at layout-y L lands at
-        // content-y L + padTop. [pageClipBottomInViewport] returns the bottom in layout space, so without
-        // the offset the clip falls padTop px too high and slices ~padTop off the last line's painted
-        // glyphs (审计: 底部半截文字). Add padTop so the clip meets the line's PAINTED bottom; cap at the
-        // viewport bottom (a near-full page then relies on the viewport edge, off by ≤padTop, invisible).
-        val bottom = if (clipBottom != null) {
-            minOf(scrollY + clipBottom + textView.paddingTop, scrollY + height)
-        } else {
-            scrollY + height
-        }
-        canvas.clipRect(0, topClip, width, bottom)
-        super.dispatchDraw(canvas)
-        canvas.restoreToCount(save)
     }
 
     /**
@@ -5235,6 +5243,14 @@ internal class EpubFlowView(
     }
 
     private class EpubFlowContainer(context: Context) : FrameLayout(context) {
+        /** Set only around dispatchDraw while a page-shot overlay owns the complete viewport. */
+        var skipContentDraw: Boolean = false
+
+        override fun dispatchDraw(canvas: Canvas) {
+            if (skipContentDraw) return
+            super.dispatchDraw(canvas)
+        }
+
         var minimumScrollableHeightPx: Int = 0
             set(value) {
                 val next = value.coerceAtLeast(0)
