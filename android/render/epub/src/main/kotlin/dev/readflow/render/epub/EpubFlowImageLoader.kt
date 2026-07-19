@@ -132,6 +132,11 @@ internal data class EpubAsyncImageResult(
     } else {
         EpubAsyncImageResultKind.PIXELS_ONLY
     }
+
+    val requiresTextRebind: Boolean
+        get() = kind == EpubAsyncImageResultKind.GEOMETRY_CHANGED ||
+            isFullPage ||
+            layoutStart < 0
 }
 
 internal class EpubFlowImageLoader(

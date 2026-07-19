@@ -557,6 +557,39 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `full page PIXELS_ONLY result requires TextView rebind while inline pixels stay incremental`() {
+        val stableBounds = Rect(0, 0, 800, 1200)
+        val fullPagePixels = EpubAsyncImageResult(
+            layoutStart = 42,
+            destination = "plate.png",
+            generation = 1L,
+            beforeBounds = stableBounds,
+            afterBounds = Rect(stableBounds),
+            isFullPage = true,
+        )
+        val inlinePixels = fullPagePixels.copy(
+            destination = "inline.png",
+            isFullPage = false,
+        )
+        val changedGeometry = inlinePixels.copy(
+            afterBounds = Rect(0, 0, 640, 960),
+        )
+        val unknownOccurrence = inlinePixels.copy(layoutStart = -1)
+
+        assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, fullPagePixels.kind)
+        assertTrue(
+            "same-size full-page bitmap must replace the transparent TextView display-list owner",
+            fullPagePixels.requiresTextRebind,
+        )
+        assertFalse(
+            "known inline same-size pixels should keep the incremental page-shot refresh path",
+            inlinePixels.requiresTextRebind,
+        )
+        assertTrue(changedGeometry.requiresTextRebind)
+        assertTrue(unknownOccurrence.requiresTextRebind)
+    }
+
+    @Test
     fun `PIXELS_ONLY successful install notifies result once and never dual fires decode finished`() {
         // Locks the host-wake contract: result callback present → exactly one onImageResultChanged,
         // zero onDecodeFinished; result callback absent → exactly one onDecodeFinished fallback.

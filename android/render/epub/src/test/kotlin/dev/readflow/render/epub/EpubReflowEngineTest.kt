@@ -6,14 +6,17 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.ColorFilter
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.Looper
 import android.os.SystemClock
+import android.text.Editable
 import android.text.Spanned
 import android.text.TextPaint
+import android.text.TextWatcher
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -313,6 +316,69 @@ class EpubReflowEngineTest {
             flowView.pendingDecodesProvider?.invoke() == true,
         )
     }
+
+    @Test
+    fun `full page PIXELS_ONLY callback rebinds TextView while inline pixels stay incremental`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("flow-image-result-routing.epub")
+            writeEpub(
+                epub,
+                "OEBPS/ch1.xhtml" to "<html><body><p>Image result routing host.</p></body></html>",
+            )
+            val context = RuntimeEnvironment.getApplication() as Application
+            val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+            try {
+                engine.openBook(Uri.fromFile(epub))
+                engine.setMode(ReadingMode.PAGED)
+                val host = engine.createView() as FrameLayout
+                val flowView = host.getChildAt(0) as EpubFlowView
+                host.measure(exactly(360), exactly(240))
+                host.layout(0, 0, 360, 240)
+
+                val loader = checkNotNull(engine.privateField("liveFlowImageLoader") as EpubFlowImageLoader?)
+                @Suppress("UNCHECKED_CAST")
+                val callback = checkNotNull(
+                    EpubFlowImageLoader::class.java.getDeclaredField("onImageResultChanged")
+                        .apply { isAccessible = true }
+                        .get(loader) as? ((EpubAsyncImageResult) -> Unit),
+                )
+                val textRebinds = AtomicInteger(0)
+                flowView.textView.addTextChangedListener(object : TextWatcher {
+                    override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+                    override fun afterTextChanged(s: Editable?) {
+                        textRebinds.incrementAndGet()
+                    }
+                })
+                val stableBounds = Rect(0, 0, 800, 1200)
+                val fullPagePixels = EpubAsyncImageResult(
+                    layoutStart = 0,
+                    destination = "plate.png",
+                    generation = 1L,
+                    beforeBounds = stableBounds,
+                    afterBounds = Rect(stableBounds),
+                    isFullPage = true,
+                )
+
+                assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, fullPagePixels.kind)
+                callback(fullPagePixels)
+                assertTrue(
+                    "same-size full-page pixels must rebind the TextView display owner",
+                    textRebinds.get() > 0,
+                )
+
+                textRebinds.set(0)
+                callback(fullPagePixels.copy(destination = "inline.png", isFullPage = false))
+                assertEquals(
+                    "known inline PIXELS_ONLY must retain the incremental page-shot path",
+                    0,
+                    textRebinds.get(),
+                )
+            } finally {
+                engine.close()
+            }
+        }
 
     @Test
     fun `open book can publish restored locator as the first resolved epub position`() = runTest(dispatcher) {
