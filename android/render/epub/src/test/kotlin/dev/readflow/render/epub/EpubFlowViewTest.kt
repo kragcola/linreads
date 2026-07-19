@@ -475,30 +475,67 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `simulation vertical side swipe uses local paper renderer`() {
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
-        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        val x = view.width * 0.85f
-        val downY = view.height * 0.65f
-        val upY = view.height * 0.10f
-        val downTime = SystemClock.uptimeMillis()
+    fun `vertical side swipe drives progress while slide and paper visuals stay horizontal`() {
+        for (style in listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION)) {
+            val view = pagedFlowView(flipStyle = style)
+            assertTrue("style=$style pageCount=${view.pageCount()}", view.pageCount() > 2)
+            view.preCachePageTexturesForTest()
+            val x = view.width * 0.85f
+            val downY = view.height * 0.65f
+            val moveY = view.height * 0.10f
+            val downTime = SystemClock.uptimeMillis()
 
-        try {
-            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, downY))
-            view.dispatchTouchEvent(
-                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, x, upY),
-            )
-            view.dispatchTouchEvent(
-                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, x, upY),
-            )
+            try {
+                view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, x, downY))
+                view.dispatchTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, x, moveY),
+                )
 
-            assertNotNull(
-                "SIMULATION vertical side swipe must create the software PageCurlDrawable",
-                view.privateField("curlDrawable") as PageCurlDrawable?,
-            )
-            assertNull("vertical software curl must not fall back to a slide drawable", view.privateField("slideDrawable"))
-        } finally {
-            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+                val drawable: Drawable = when (style) {
+                    PageFlipStyle.SIMULATION -> checkNotNull(
+                        view.privateField("curlDrawable") as PageCurlDrawable?,
+                    ) { "vertical SIMULATION swipe must create PageCurlDrawable" }
+                    else -> checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?) {
+                        "vertical SLIDE swipe must create PageSlideDrawable"
+                    }
+                }
+                val progress = when (drawable) {
+                    is PageCurlDrawable -> drawable.progress
+                    is PageSlideDrawable -> drawable.progress
+                    else -> error("unexpected page-turn drawable ${drawable.javaClass.name}")
+                }
+                assertEquals(
+                    "style=$style progress must still follow vertical finger travel",
+                    (downY - moveY) / view.height.toFloat(),
+                    progress,
+                    0.001f,
+                )
+                val frontColor = 0xFFD12C4D.toInt()
+                val revealedColor = 0xFF1D78C1.toInt()
+                drawable.privateBitmap("frontBitmap").eraseColor(frontColor)
+                drawable.privateBitmap("revealedBitmap").eraseColor(revealedColor)
+                val composed = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+                drawable.setBounds(0, 0, view.width, view.height)
+                drawable.draw(Canvas(composed))
+                try {
+                    assertEquals(
+                        "style=$style horizontal reveal must expose the target at top-right",
+                        revealedColor,
+                        composed.getPixel(view.width * 3 / 4, view.height / 4),
+                    )
+                    assertNotEquals(
+                        "style=$style horizontal outgoing page must still own bottom-left",
+                        revealedColor,
+                        composed.getPixel(view.width / 4, view.height * 3 / 4),
+                    )
+                } finally {
+                    composed.recycle()
+                }
+            } finally {
+                view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, x, moveY))
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+                view.dispose()
+            }
         }
     }
 
@@ -729,6 +766,63 @@ class EpubFlowViewTest {
             )
         } finally {
             view.dispose()
+        }
+    }
+
+    @Test
+    fun `dirty front forces fresh outgoing shot for discrete boundary turn`() {
+        for (style in listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION)) {
+            val view = pagedFlowView(flipStyle = style)
+            try {
+                view.goToLastPage()
+                view.preCachePageTexturesForTest()
+                val staleFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+                val staleMarker = 0xFF5B00FF.toInt()
+                staleFront.eraseColor(staleMarker)
+                view.replacePendingInPlacePageShotRefreshSlotsForTest("FRONT")
+                assertEquals(
+                    "style=$style only FRONT should be dirty for this boundary entry",
+                    setOf("FRONT"),
+                    view.pendingInPlacePageShotRefreshSlotNamesForTest(),
+                )
+
+                val preview = view.newBoundaryPreviewForTest(forward = true, token = 511L)
+                val previewBitmap = preview.bitmap
+                assertTrue(view.offerBoundaryPreviewForTest(preview))
+
+                assertTrue(view.startDiscreteBoundaryTurn(1))
+
+                val drawable: Any = when (style) {
+                    PageFlipStyle.SLIDE -> checkNotNull(
+                        view.privateField("slideDrawable") as PageSlideDrawable?,
+                    ) { "style=$style discrete boundary turn must install PageSlideDrawable" }
+                    PageFlipStyle.SIMULATION -> checkNotNull(
+                        view.privateField("curlDrawable") as PageCurlDrawable?,
+                    ) { "style=$style discrete boundary turn must install PageCurlDrawable" }
+                    else -> error("unsupported test style $style")
+                }
+                val outgoing = drawable.privateBitmap("frontBitmap")
+                val revealed = drawable.privateBitmap("revealedBitmap")
+                assertTrue(
+                    "style=$style dirty FRONT must not transfer the warmed outgoing owner",
+                    outgoing !== staleFront,
+                )
+                assertEquals(
+                    "style=$style fresh outgoing capture must not carry the stale FRONT marker",
+                    0,
+                    outgoing.countExactPixels(staleMarker),
+                )
+                assertTrue(
+                    "style=$style boundary renderer must retain the exact offered preview bitmap",
+                    revealed === previewBitmap,
+                )
+                assertFalse(
+                    "style=$style offered preview must remain live while the boundary renderer owns it",
+                    previewBitmap.isRecycled,
+                )
+            } finally {
+                view.dispose()
+            }
         }
     }
 
@@ -1485,6 +1579,114 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `active page shot overlay covers live synthetic boundary image until settle`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        val sourcePage = fixture.headingPageIndex - 1
+        val liveSyntheticColor = 0xFF16A34A.toInt()
+
+        try {
+            assertTrue("fixture requires a page before the heading preview", sourcePage >= 0)
+            view.goToPage(sourcePage)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            view.updateInteractiveCurl(x = view.width * 0.45f)
+            assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+            assertEquals(
+                "the live page parked under the overlay must be the heading preview page",
+                fixture.headingPageIndex,
+                view.currentPageIndex(),
+            )
+            assertNotNull(view.privateField("slideDrawable"))
+
+            // Cached front/revealed shots already own the old image colour. A new exact colour can
+            // enter this frame only through the live synthetic preview drawn after those page shots.
+            fixture.imageDrawable.color = liveSyntheticColor
+            view.textView.invalidate()
+            view.invalidate()
+            val activeFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val activeLiveHits = activeFrame.countExactPixels(liveSyntheticColor)
+                assertEquals(
+                    "live synthetic boundary pixels must not paint above the active page-shot overlay",
+                    0,
+                    activeLiveHits,
+                )
+            } finally {
+                activeFrame.recycle()
+            }
+
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+            assertEquals(fixture.headingPageIndex, view.currentPageIndex())
+
+            val settledFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val settledLiveHits = settledFrame.countExactPixels(liveSyntheticColor)
+                assertTrue(
+                    "settled heading page must resume its live synthetic boundary preview; hits=$settledLiveHits",
+                    settledLiveHits > 0,
+                )
+            } finally {
+                settledFrame.recycle()
+            }
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `conversion snapshot covers live synthetic boundary image across the full viewport`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        val changedImageColor = 0xFF0891B2.toInt()
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            val solidCover = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).apply {
+                eraseColor(0xFFF5E9D7.toInt())
+            }
+            view.showConversionSnapshotForTest(solidCover)
+            assertNotNull(view.privateField("conversionSnapshotDrawable"))
+
+            fixture.imageDrawable.color = changedImageColor
+            view.textView.invalidate()
+            view.invalidate()
+            val coveredFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                assertEquals(
+                    "the opaque conversion snapshot must cover changed continuation pixels across the viewport",
+                    0,
+                    coveredFrame.countExactPixels(changedImageColor),
+                )
+            } finally {
+                coveredFrame.recycle()
+            }
+
+            view.clearConversionSnapshotForTest()
+            assertNull(view.privateField("conversionSnapshotDrawable"))
+
+            val uncoveredFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val changedHits = uncoveredFrame.countExactPixels(changedImageColor)
+                assertTrue(
+                    "clearing the conversion snapshot must reveal the live continuation pixels; hits=$changedHits",
+                    changedHits > 0,
+                )
+            } finally {
+                uncoveredFrame.recycle()
+            }
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `interactive slide moves incoming paper as a page shot`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -1792,9 +1994,11 @@ class EpubFlowViewTest {
             )
             assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
             val waitingContainer = view.privateField("container") as View
-            assertTrue(
-                "cold horizontal turn must follow the finger before pinned shots are ready",
-                waitingContainer.translationX < 0f,
+            assertEquals(
+                "cold horizontal turn must keep the live page anchored before pinned shots are ready",
+                0f,
+                waitingContainer.translationX,
+                0.001f,
             )
             assertEquals(0f, waitingContainer.translationY, 0.001f)
             chargedSamples += budget.chargedBytes
@@ -6619,112 +6823,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `PIXELS_ONLY scheduled refresh still warms immediate finger turn without LOCAL_SHOTS_WAITING`() {
-        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
-        val view = fixture.view
-        view.flipStyle = PageFlipStyle.SLIDE
-        try {
-            view.goToPage(fixture.headingPageIndex)
-            shadowOf(Looper.getMainLooper()).idle()
-            view.recycleCachedTexturesForTest()
-            view.preCachePageTexturesForTest()
-            val front = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-            val revealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
-            val marker = 0xFF00FF00.toInt()
-            front.eraseColor(marker)
-            revealed.eraseColor(marker)
-            assertFalse(front.isRecycled)
-            assertFalse(revealed.isRecycled)
-
-            // Schedule in-place refresh but do not drain frames — finger arrives in the gap.
-            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
-            assertTrue(
-                "refresh must be scheduled before the gesture",
-                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isNotEmpty(),
-            )
-            assertTrue(
-                "refresh callback must be posted before the gesture",
-                view.privateBool("inPlacePageShotRefreshPosted"),
-            )
-            assertFalse("scheduled refresh must not recycle warm front", front.isRecycled)
-            assertFalse("scheduled refresh must not recycle warm revealed", revealed.isRecycled)
-            assertTrue(view.privateField("cachedFrontBitmap") === front)
-            assertTrue(view.privateField("cachedRevealedBitmap") === revealed)
-
-            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
-            view.updateInteractiveCurl(x = view.width * 0.45f)
-            val state = view.privateField("interactiveTurnState").toString()
-            assertTrue(
-                "finger turn after scheduled PIXELS_ONLY must use warm shots, not cold handoff; state=$state " +
-                    "slide=${view.privateField("slideDrawable")} curl=${view.privateField("curlDrawable")}",
-                state == "SOFTWARE" || state == "SOFTWARE_SETTLING",
-            )
-            assertNotEquals(
-                "must not enter LOCAL_SHOTS_WAITING cold path",
-                "LOCAL_SHOTS_WAITING",
-                state,
-            )
-            assertTrue(
-                "active turn must install a local paper renderer from warm shots",
-                view.privateField("slideDrawable") != null || view.privateField("curlDrawable") != null,
-            )
-            assertFalse(front.isRecycled)
-            assertFalse(revealed.isRecycled)
-            assertTrue(
-                "gesture transfer must clear in-place refresh slots that targeted owners now in the turn",
-                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
-            )
-            assertFalse(
-                "gesture transfer must cancel the in-place refresh callback so it cannot target moved owners",
-                view.privateBool("inPlacePageShotRefreshPosted"),
-            )
-            assertTrue(view.privateBool("activeFlipFrontPixelRefreshPending"))
-            assertTrue(view.privateBool("activeFlipRevealedPixelRefreshPending"))
-
-            // Active-turn invariant: frames may only blit; dirty markers stay pending until settle.
-            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
-            assertEquals(marker, front.getPixel(0, 0))
-            assertEquals(marker, revealed.getPixel(0, 0))
-            assertTrue(view.privateBool("activeFlipFrontPixelRefreshPending"))
-            assertTrue(view.privateBool("activeFlipRevealedPixelRefreshPending"))
-            assertTrue(
-                "mid-turn must not re-arm in-place cache-slot redraws",
-                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
-            )
-
-            // Settle remaps dirty identities into the new current/backward cache slots and drains.
-            view.endInteractiveCurl(velocityX = 0f)
-            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
-
-            assertFalse(view.privateBool("activeFlipFrontPixelRefreshPending"))
-            assertFalse(view.privateBool("activeFlipRevealedPixelRefreshPending"))
-            assertTrue(
-                "settle must remap and drain dirty active owners into their new cache slots",
-                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
-            )
-            assertTrue(
-                "committed forward turn must retain revealed as current",
-                view.privateField("cachedFrontBitmap") === revealed,
-            )
-            assertTrue(
-                "committed forward turn must retain outgoing as backward",
-                view.privateField("cachedBackwardBitmap") === front,
-            )
-            assertNotEquals(marker, front.getPixel(0, 0))
-            assertNotEquals(marker, front.getPixel(front.width / 2, front.height / 2))
-            assertNotEquals(marker, revealed.getPixel(0, 0))
-            assertNotEquals(marker, revealed.getPixel(revealed.width / 2, revealed.height / 2))
-        } finally {
-            if (view.privateField("interactiveTurnState").toString() != "NONE") {
-                view.endInteractiveCurl(velocityX = 0f)
-                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
-            }
-            view.dispose()
-        }
-    }
-
-    @Test
-    fun `PIXELS_ONLY transferred warm owners stay stale until settle then repaint same identity`() {
+    fun `PIXELS_ONLY required refresh slots force immediate finger turn through fresh cold handoff`() {
         for (style in listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION)) {
             val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
             val view = fixture.view
@@ -6734,75 +6833,99 @@ class EpubFlowViewTest {
                 shadowOf(Looper.getMainLooper()).idle()
                 view.recycleCachedTexturesForTest()
                 view.preCachePageTexturesForTest()
+                val staleFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+                val staleRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+                val marker = 0xFF00FF00.toInt()
+                staleFront.eraseColor(marker)
+                staleRevealed.eraseColor(marker)
+
+                // Both current and forward shots depend on the synthetic image continuation. They
+                // remain stale until the posted in-place redraw runs and are not eligible to turn.
+                view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+                val pendingNames = view.pendingInPlacePageShotRefreshSlotNamesForTest()
+                assertTrue("style=$style required FRONT must be pending: $pendingNames", "FRONT" in pendingNames)
+                assertTrue("style=$style required REVEALED must be pending: $pendingNames", "REVEALED" in pendingNames)
+
+                val downX = view.width * 0.85f
+                val moveX = view.width * 0.45f
+                val y = view.height * 0.10f
+                val downTime = SystemClock.uptimeMillis()
+                view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+                assertTrue(
+                    view.onInterceptTouchEvent(
+                        motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                    ),
+                )
+
+                assertEquals(
+                    "style=$style a required dirty owner must reject stale warm transfer",
+                    "LOCAL_SHOTS_WAITING",
+                    view.privateField("interactiveTurnState").toString(),
+                )
+                assertNull("style=$style stale pair must not install slide", view.privateField("slideDrawable"))
+                assertNull("style=$style stale pair must not install curl", view.privateField("curlDrawable"))
+
+                view.drainPendingLocalPageShotHandoffUntilOverlayForTest()
+                val drawable = checkNotNull(
+                    view.privateField("slideDrawable") ?: view.privateField("curlDrawable"),
+                ) { "style=$style fresh split capture must install an overlay" }
+                val freshFront = drawable.privateBitmap("frontBitmap")
+                val freshRevealed = drawable.privateBitmap("revealedBitmap")
+                assertTrue("style=$style outgoing shot must be freshly captured", freshFront !== staleFront)
+                assertTrue("style=$style target shot must be freshly captured", freshRevealed !== staleRevealed)
+                assertTrue(
+                    "style=$style fresh outgoing shot must not carry the stale marker",
+                    freshFront.getPixel(0, 0) != marker ||
+                        freshFront.getPixel(freshFront.width / 2, freshFront.height / 2) != marker,
+                )
+                assertTrue(
+                    "style=$style fresh target shot must not carry the stale marker",
+                    freshRevealed.getPixel(0, 0) != marker ||
+                        freshRevealed.getPixel(freshRevealed.width / 2, freshRevealed.height / 2) != marker,
+                )
+
+                view.onTouchEvent(
+                    motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y),
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            } finally {
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
+    fun `unrelated pending PIXELS_ONLY slot does not block clean warm pair transfer`() {
+        for (style in listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION)) {
+            val view = pagedFlowView(flipStyle = style)
+            try {
+                view.goToPage(1)
+                shadowOf(Looper.getMainLooper()).idle()
+                view.recycleCachedTexturesForTest()
+                view.preCachePageTexturesForTest()
                 val front = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
                 val revealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
-                val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
-                val leasedBefore = budget.leasedBytes
-                val marker = 0xFF00FF00.toInt()
-                front.eraseColor(marker)
-                revealed.eraseColor(marker)
+                val backward = checkNotNull(view.privateField("cachedBackwardBitmap") as Bitmap?)
+                view.replacePendingInPlacePageShotRefreshSlotsForTest("BACKWARD")
 
-                view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
                 assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
-                view.updateInteractiveCurl(x = view.width * 0.45f)
-                assertTrue("style=$style", view.privateBool("activeFlipFrontPixelRefreshPending"))
-                assertTrue("style=$style", view.privateBool("activeFlipRevealedPixelRefreshPending"))
                 assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+                val drawable = checkNotNull(view.privateField("slideDrawable") ?: view.privateField("curlDrawable"))
                 assertTrue(
-                    "style=$style warm transfer must install overlay without LOCAL_SHOTS_WAITING",
-                    view.privateField("slideDrawable") != null || view.privateField("curlDrawable") != null,
-                )
-
-                // Active-turn invariant: no redrawPageShotInto / no allocate-or-recycle of the
-                // transferred warm pair while the finger holds. Third-slot (unused backward) may
-                // drop on transfer; leasedBytes must not grow and pair identities must stay.
-                shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
-                assertEquals("style=$style", marker, front.getPixel(0, 0))
-                assertEquals("style=$style", marker, revealed.getPixel(0, 0))
-                assertFalse("style=$style", front.isRecycled)
-                assertFalse("style=$style", revealed.isRecycled)
-                assertTrue(
-                    "style=$style mid-turn PIXELS_ONLY must not allocate new page shots; " +
-                        "leasedBefore=$leasedBefore leasedNow=${budget.leasedBytes}",
-                    budget.leasedBytes <= leasedBefore,
-                )
-                assertTrue("style=$style", view.privateBool("activeFlipFrontPixelRefreshPending"))
-                assertTrue("style=$style", view.privateBool("activeFlipRevealedPixelRefreshPending"))
-                assertTrue(
-                    "style=$style mid-turn must not schedule cache-slot redraws",
-                    (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
-                )
-                assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
-
-                view.endInteractiveCurl(velocityX = 0f)
-                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
-
-                assertFalse("style=$style", view.privateBool("activeFlipFrontPixelRefreshPending"))
-                assertFalse("style=$style", view.privateBool("activeFlipRevealedPixelRefreshPending"))
-                assertTrue(
-                    "style=$style settle must drain remapped dirty owners",
-                    (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+                    "style=$style clean FRONT must transfer even when BACKWARD is dirty",
+                    drawable.privateBitmap("frontBitmap") === front,
                 )
                 assertTrue(
-                    "style=$style settle must keep revealed identity as current",
-                    view.privateField("cachedFrontBitmap") === revealed,
+                    "style=$style clean REVEALED must transfer even when BACKWARD is dirty",
+                    drawable.privateBitmap("revealedBitmap") === revealed,
                 )
-                assertTrue(
-                    "style=$style settle must keep outgoing identity as backward",
-                    view.privateField("cachedBackwardBitmap") === front,
+                assertFalse("style=$style unrelated BACKWARD owner must not join the overlay", backward === front)
+                assertFalse("style=$style unrelated BACKWARD owner must not join the overlay", backward === revealed)
+                assertFalse("style=$style clean front needs no deferred repaint", view.privateBool("activeFlipFrontPixelRefreshPending"))
+                assertFalse(
+                    "style=$style clean target needs no deferred repaint",
+                    view.privateBool("activeFlipRevealedPixelRefreshPending"),
                 )
-                assertTrue(
-                    "style=$style post-settle front must leave marker fill",
-                    front.getPixel(0, 0) != marker ||
-                        front.getPixel(front.width / 2, front.height / 2) != marker,
-                )
-                assertTrue(
-                    "style=$style post-settle revealed must leave marker fill",
-                    revealed.getPixel(0, 0) != marker ||
-                        revealed.getPixel(revealed.width / 2, revealed.height / 2) != marker,
-                )
-                assertFalse("style=$style", front.isRecycled)
-                assertFalse("style=$style", revealed.isRecycled)
             } finally {
                 if (view.privateField("interactiveTurnState").toString() != "NONE") {
                     view.endInteractiveCurl(velocityX = 0f)
@@ -6814,7 +6937,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `dispose cancels transferred warm owner refresh before recycling active bitmaps`() {
+    fun `dispose cancels required-dirty cold handoff without reviving stale warm owners`() {
         val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
         val view = fixture.view
         view.flipStyle = PageFlipStyle.SLIDE
@@ -6827,9 +6950,20 @@ class EpubFlowViewTest {
         val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
 
         view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
-        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
-        assertTrue(view.privateBool("activeFlipFrontPixelRefreshPending"))
-        assertTrue(view.privateBool("activeFlipRevealedPixelRefreshPending"))
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.45f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        assertTrue(
+            view.onInterceptTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+            ),
+        )
+        assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
+        assertNull(view.privateField("slideDrawable"))
+        assertFalse(view.privateBool("activeFlipFrontPixelRefreshPending"))
+        assertFalse(view.privateBool("activeFlipRevealedPixelRefreshPending"))
 
         view.dispose()
 
@@ -6847,88 +6981,86 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `cold local-shot front capture observes zero container translation after MOVE feedback`() {
-        lateinit var view: EpubFlowView
-        val captureTranslations = mutableListOf<Pair<Float, Float>>()
-        val background = RecordingTargetBitmapDrawable {
+    fun `cold local-shot handoff keeps live container anchored for horizontal and vertical release`() {
+        for (vertical in listOf(false, true)) {
+            lateinit var view: EpubFlowView
+            val captureTranslations = mutableListOf<Pair<Float, Float>>()
+            val background = RecordingTargetBitmapDrawable {
+                val container = view.privateField("container") as View
+                captureTranslations += container.translationX to container.translationY
+            }
+            view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+            view.background = background
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            background.targetBitmaps.clear()
+            captureTranslations.clear()
+
+            val axis = if (vertical) "vertical" else "horizontal"
+            val downX = view.width * 0.85f
+            val downY = if (vertical) view.height * 0.75f else view.height * 0.10f
+            val moveX = if (vertical) downX else view.width * 0.55f
+            val moveY = if (vertical) view.height * 0.45f else downY
+            val downTime = SystemClock.uptimeMillis()
             val container = view.privateField("container") as View
-            captureTranslations += container.translationX to container.translationY
-        }
-        view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
-        view.background = background
-        shadowOf(Looper.getMainLooper()).idle()
-        view.recycleCachedTexturesForTest()
-        background.targetBitmaps.clear()
-        captureTranslations.clear()
 
-        val downX = view.width * 0.85f
-        val moveX = view.width * 0.55f
-        val y = view.height * 0.10f
-        val downTime = SystemClock.uptimeMillis()
-        val container = view.privateField("container") as View
+            try {
+                view.dispatchTouchEvent(
+                    motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, downY),
+                )
+                assertTrue(
+                    "$axis threshold MOVE must be intercepted",
+                    view.onInterceptTouchEvent(
+                        motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, moveY),
+                    ),
+                )
+                assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
+                assertEquals("$axis MOVE must not translate live X", 0f, container.translationX, 0.001f)
+                assertEquals("$axis MOVE must not translate live Y", 0f, container.translationY, 0.001f)
 
-        try {
-            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
-            assertTrue(
-                view.onInterceptTouchEvent(
-                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
-                ),
-            )
-            assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
-            assertTrue(
-                "MOVE feedback must translate the live container before pinned front capture",
-                container.translationX < 0f,
-            )
-            assertEquals(0f, container.translationY, 0.001f)
+                shadowOf(Looper.getMainLooper()).runOneTask()
+                assertTrue("$axis target capture must draw the viewport background", captureTranslations.isNotEmpty())
+                assertTrue(
+                    "$axis target capture must observe an anchored live container: $captureTranslations",
+                    captureTranslations.all { (x, y) -> x == 0f && y == 0f },
+                )
+                assertNull("$axis target-only frame must not install slide", view.privateField("slideDrawable"))
+                assertEquals(0f, container.translationX, 0.001f)
+                assertEquals(0f, container.translationY, 0.001f)
 
-            // Target-only frame: wait feedback is still allowed (front pin not yet capturing).
-            shadowOf(Looper.getMainLooper()).runOneTask()
-            assertTrue(
-                "target capture must draw the viewport background",
-                captureTranslations.isNotEmpty(),
-            )
-            assertTrue(
-                "target capture may still observe wait feedback translation",
-                captureTranslations.last().first < 0f,
-            )
-            assertEquals(0f, captureTranslations.last().second, 0.001f)
-            assertNull(view.privateField("slideDrawable"))
+                view.onTouchEvent(
+                    motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, moveY),
+                )
+                assertEquals(
+                    "$axis ACTION_UP must retain the cold handoff until the front shot is ready",
+                    "LOCAL_SHOTS_WAITING",
+                    view.privateField("interactiveTurnState").toString(),
+                )
+                assertEquals("$axis ACTION_UP must not translate live X", 0f, container.translationX, 0.001f)
+                assertEquals("$axis ACTION_UP must not translate live Y", 0f, container.translationY, 0.001f)
 
-            // Front pin: production clears wait translation before snapshotViewport/conversion capture.
-            shadowOf(Looper.getMainLooper()).runOneTask()
-            assertTrue(
-                "front capture must observe the viewport background draw",
-                captureTranslations.size >= 2,
-            )
-            val frontCapture = captureTranslations.last()
-            assertEquals(
-                "front capture must observe translationX == 0 at snapshot time",
-                0f,
-                frontCapture.first,
-                0.001f,
-            )
-            assertEquals(
-                "front capture must observe translationY == 0 at snapshot time",
-                0f,
-                frontCapture.second,
-                0.001f,
-            )
-            assertEquals(0f, container.translationX, 0.001f)
-            assertEquals(0f, container.translationY, 0.001f)
-            assertNotNull("deferred pair must install the local slide renderer", view.privateField("slideDrawable"))
-        } finally {
-            view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
-            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
-            assertEquals(0f, container.translationX, 0.001f)
-            assertEquals(0f, container.translationY, 0.001f)
-            view.dispose()
-            assertEquals(0f, container.translationX, 0.001f)
-            assertEquals(0f, container.translationY, 0.001f)
+                shadowOf(Looper.getMainLooper()).runOneTask()
+                assertTrue(
+                    "$axis split captures must always observe an anchored live container: $captureTranslations",
+                    captureTranslations.size >= 2 && captureTranslations.all { (x, y) -> x == 0f && y == 0f },
+                )
+                assertNotNull("$axis deferred pair must install the local slide renderer", view.privateField("slideDrawable"))
+                assertEquals(0f, container.translationX, 0.001f)
+                assertEquals(0f, container.translationY, 0.001f)
+
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+                assertEquals(0f, container.translationX, 0.001f)
+                assertEquals(0f, container.translationY, 0.001f)
+            } finally {
+                view.dispose()
+                assertEquals(0f, container.translationX, 0.001f)
+                assertEquals(0f, container.translationY, 0.001f)
+            }
         }
     }
 
     @Test
-    fun `cold local-shot cancel before front capture clears wait translation`() {
+    fun `cold local-shot cancel before front capture keeps live page anchored and clears handoff`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         view.recycleCachedTexturesForTest()
         val downX = view.width * 0.85f
@@ -6945,7 +7077,8 @@ class EpubFlowViewTest {
                 ),
             )
             assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
-            assertTrue(container.translationX < 0f)
+            assertEquals(0f, container.translationX, 0.001f)
+            assertEquals(0f, container.translationY, 0.001f)
 
             view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
 
@@ -10314,6 +10447,7 @@ class EpubFlowViewTest {
         val imageLayoutStart: Int,
         val headingPageIndex: Int,
         val imagePageIndex: Int,
+        val imageDrawable: ColorDrawable,
     )
 
     /**
@@ -10423,6 +10557,7 @@ class EpubFlowViewTest {
             imageLayoutStart = imageSegment.layoutStart,
             headingPageIndex = headingPageIndex,
             imagePageIndex = imagePageIndex,
+            imageDrawable = imageDrawable,
         )
     }
 
@@ -10712,6 +10847,31 @@ class EpubFlowViewTest {
         shadowOf(Looper.getMainLooper()).idle()
     }
 
+    private fun EpubFlowView.pendingInPlacePageShotRefreshSlotNamesForTest(): Set<String> =
+        (privateField("pendingInPlacePageShotRefreshSlots") as Set<*>)
+            .mapTo(linkedSetOf()) { slot -> (slot as Enum<*>).name }
+
+    private fun EpubFlowView.replacePendingInPlacePageShotRefreshSlotsForTest(vararg names: String) {
+        val slotClass = javaClass.declaredClasses.single { it.simpleName == "CachedPageShotSlot" }
+        val constants = checkNotNull(slotClass.enumConstants).associateBy { (it as Enum<*>).name }
+        @Suppress("UNCHECKED_CAST")
+        val pending = privateField("pendingInPlacePageShotRefreshSlots") as MutableSet<Any>
+        pending.clear()
+        names.forEach { name -> pending += checkNotNull(constants[name]) { "unknown page-shot slot $name" } }
+    }
+
+    private fun EpubFlowView.drainPendingLocalPageShotHandoffUntilOverlayForTest(maxFrames: Int = 8) {
+        repeat(maxFrames) {
+            if (privateField("slideDrawable") != null || privateField("curlDrawable") != null) return
+            shadowOf(Looper.getMainLooper()).runOneTask()
+        }
+        assertTrue(
+            "cold local handoff must install an overlay within $maxFrames frames; " +
+                "state=${privateField("interactiveTurnState")}",
+            privateField("slideDrawable") != null || privateField("curlDrawable") != null,
+        )
+    }
+
     private fun EpubFlowView.recycleCachedTexturesForTest() {
         javaClass.getDeclaredMethod("recycleCachedTextures")
             .apply { isAccessible = true }
@@ -10733,6 +10893,12 @@ class EpubFlowViewTest {
         javaClass.getDeclaredMethod("showConversionSnapshot", Bitmap::class.java)
             .apply { isAccessible = true }
             .invoke(this, bitmap)
+    }
+
+    private fun EpubFlowView.clearConversionSnapshotForTest() {
+        javaClass.getDeclaredMethod("clearConversionSnapshot")
+            .apply { isAccessible = true }
+            .invoke(this)
     }
 
     private fun EpubFlowView.drawToBitmapForTest(): Bitmap =
@@ -10772,6 +10938,16 @@ class EpubFlowViewTest {
             y += stepY
         }
         return hits
+    }
+
+    private fun Bitmap.countExactPixels(color: Int): Int {
+        var matches = 0
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                if (getPixel(x, y) == color) matches++
+            }
+        }
+        return matches
     }
 
     private fun assertSampledPixelsEqual(message: String, expected: Bitmap, actual: Bitmap) {

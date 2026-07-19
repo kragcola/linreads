@@ -112,30 +112,24 @@ class PageCurlDrawableTest {
     }
 
     @Test
-    fun `vertical paper turn reveals the target from the gesture edge`() {
-        val width = 24
-        val height = 120
-        val front = yRampBitmap(width, height)
+    fun `paper turn keeps page ownership constant across viewport rows`() {
+        val width = 120
+        val height = 24
+        val front = xRampBitmap(width, height)
         val revealed = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
             eraseColor(Color.rgb(20, 80, 220))
         }
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val drawable = PageCurlDrawable(
-            front,
-            revealed,
-            width,
-            height,
-            forward = true,
-            density = 1f,
-            vertical = true,
-        )
+        val drawable = PageCurlDrawable(front, revealed, width, height, forward = true, density = 1f)
         try {
             drawable.setBounds(0, 0, width, height)
             drawable.progress = 0.5f
             drawable.draw(Canvas(output))
 
-            assertEquals(front.getPixel(width / 2, 10), output.getPixel(width / 2, 10))
-            assertEquals(revealed.getPixel(width / 2, 90), output.getPixel(width / 2, 90))
+            assertEquals(front.getPixel(12, 1), output.getPixel(12, 1))
+            assertEquals(front.getPixel(12, height - 2), output.getPixel(12, height - 2))
+            assertEquals(revealed.getPixel(90, 1), output.getPixel(90, 1))
+            assertEquals(revealed.getPixel(90, height - 2), output.getPixel(90, height - 2))
         } finally {
             drawable.recycle()
             if (!output.isRecycled) output.recycle()
@@ -147,14 +141,6 @@ class PageCurlDrawableTest {
             for (x in 0 until width) {
                 val color = Color.rgb(x.coerceAtMost(255), 30, 10)
                 for (y in 0 until height) setPixel(x, y, color)
-            }
-        }
-
-    private fun yRampBitmap(width: Int, height: Int): Bitmap =
-        Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
-            for (y in 0 until height) {
-                val color = Color.rgb(10, y.coerceAtMost(255), 30)
-                for (x in 0 until width) setPixel(x, y, color)
             }
         }
 }

@@ -36,7 +36,6 @@ internal class PageSlideDrawable(
     private val bitmapRecycler: (Bitmap) -> Unit = { bitmap ->
         if (!bitmap.isRecycled) bitmap.recycle()
     },
-    private val vertical: Boolean = false,
 ) : Drawable() {
 
     private var frontBitmap: Bitmap? = frontBitmap
@@ -63,47 +62,25 @@ internal class PageSlideDrawable(
         0x00000000,
         Shader.TileMode.CLAMP,
     )
-    private val verticalSeamShadowShader = LinearGradient(
-        0f,
-        0f,
-        0f,
-        1f,
-        0x40000000,
-        0x00000000,
-        Shader.TileMode.CLAMP,
-    )
 
     override fun draw(canvas: Canvas) {
         // The host is a ScrollView, so its ViewOverlay draws in CONTENT coordinates (canvas already
         // translated by scrollY). [setBounds] is the live viewport in that space; translate to its
         // top-left, then everything is local 0..W / 0..H.
         val w = viewportW.toFloat()
-        val h = viewportH.toFloat()
+        // Forward: outgoing exits to the left (dx 0 → -W). Backward: exits right (dx 0 → +W).
+        val dx = outgoingLeft(w)
+        val incomingDx = incomingLeft(w)
         val save = canvas.save()
         canvas.translate(bounds.left.toFloat(), bounds.top.toFloat())
-        if (vertical) {
-            // Forward: outgoing exits toward the top; backward: exits toward the bottom.
-            val top = outgoingTop(h)
-            val incomingTop = incomingTop(h)
-            revealedBitmap?.let { drawBitmapWindowVertical(canvas, it, incomingTop, h, w) }
-            frontBitmap?.let { drawBitmapWindowVertical(canvas, it, top, h, w) }
-            drawSeamShadowVertical(canvas, top, h, w)
-        } else {
-            // Forward: outgoing exits to the left (dx 0 → -W). Backward: exits right (dx 0 → +W).
-            val dx = outgoingLeft(w)
-            val incomingDx = incomingLeft(w)
-            revealedBitmap?.let { drawBitmapWindow(canvas, it, incomingDx, w, h) }
-            frontBitmap?.let { drawBitmapWindow(canvas, it, dx, w, h) }
-            drawSeamShadow(canvas, dx, w, h)
-        }
+        revealedBitmap?.let { drawBitmapWindow(canvas, it, incomingDx, w, viewportH.toFloat()) }
+        frontBitmap?.let { drawBitmapWindow(canvas, it, dx, w, viewportH.toFloat()) }
+        drawSeamShadow(canvas, dx, w, viewportH.toFloat())
         canvas.restoreToCount(save)
     }
 
     internal fun incomingSourceXForViewportX(viewportX: Int): Int? =
         sourceXForViewportX(incomingLeft(viewportW.toFloat()), viewportX.toFloat(), viewportW.toFloat())
-
-    internal fun incomingSourceYForViewportY(viewportY: Int): Int? =
-        sourceYForViewportY(incomingTop(viewportH.toFloat()), viewportY.toFloat(), viewportH.toFloat())
 
     private fun outgoingLeft(w: Float): Float =
         if (forward) -progress * w else progress * w
@@ -111,14 +88,6 @@ internal class PageSlideDrawable(
     private fun incomingLeft(w: Float): Float {
         val dx = outgoingLeft(w)
         return if (forward) w + dx else dx - w
-    }
-
-    private fun outgoingTop(h: Float): Float =
-        if (forward) -progress * h else progress * h
-
-    private fun incomingTop(h: Float): Float {
-        val dy = outgoingTop(h)
-        return if (forward) h + dy else dy - h
     }
 
     private fun drawBitmapWindow(canvas: Canvas, bitmap: Bitmap, left: Float, w: Float, h: Float) {
@@ -151,51 +120,10 @@ internal class PageSlideDrawable(
         canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, paint)
     }
 
-    private fun drawBitmapWindowVertical(
-        canvas: Canvas,
-        bitmap: Bitmap,
-        top: Float,
-        h: Float,
-        w: Float,
-    ) {
-        val visibleTop = max(0f, top)
-        val visibleBottom = min(h, top + h)
-        if (visibleBottom <= visibleTop) return
-
-        // Page shots are normally viewport-sized. Keep the common path as a clipped, translated
-        // 1:1 blit so vertical turns have the same GPU-friendly behavior as horizontal turns.
-        if (bitmap.width == viewportW && bitmap.height == viewportH) {
-            val save = canvas.save()
-            try {
-                canvas.clipRect(0f, visibleTop, w, visibleBottom)
-                canvas.translate(0f, top)
-                canvas.drawBitmap(bitmap, 0f, 0f, paint)
-            } finally {
-                canvas.restoreToCount(save)
-            }
-            return
-        }
-
-        val srcTop = sourceYForViewportY(top, visibleTop, h) ?: return
-        val srcBottom = sourceYForViewportY(top, visibleBottom, h)
-            ?.coerceIn(srcTop, viewportH)
-            ?: viewportH
-        if (srcBottom <= srcTop) return
-        bitmapSrc.set(0, srcTop, viewportW, srcBottom)
-        bitmapDst.set(0f, visibleTop, w, visibleBottom)
-        canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, paint)
-    }
-
     private fun sourceXForViewportX(left: Float, viewportX: Float, w: Float): Int? {
         val sourceX = viewportX - left
         if (sourceX < 0f || sourceX > w) return null
         return sourceX.toInt().coerceIn(0, viewportW)
-    }
-
-    private fun sourceYForViewportY(top: Float, viewportY: Float, h: Float): Int? {
-        val sourceY = viewportY - top
-        if (sourceY < 0f || sourceY > h) return null
-        return sourceY.toInt().coerceIn(0, viewportH)
     }
 
     /** A soft drop shadow on the outgoing page's trailing edge — the seam where the incoming page meets it. */
@@ -210,20 +138,6 @@ internal class PageSlideDrawable(
         seamShadowShader.setLocalMatrix(shadowMatrix)
         shadePaint.shader = seamShadowShader
         canvas.drawRect(min(edge, to), 0f, max(edge, to), h, shadePaint)
-        shadePaint.shader = null
-    }
-
-    private fun drawSeamShadowVertical(canvas: Canvas, outgoingTop: Float, h: Float, w: Float) {
-        if (progress <= 0f) return
-        val shadowH = min(14f * density, h * 0.06f)
-        // The incoming page abuts the outgoing edge that faces the slide direction: forward → bottom edge.
-        val edge = outgoingTop + if (forward) h else 0f
-        val to = if (forward) edge + shadowH else edge - shadowH
-        shadowMatrix.setScale(1f, if (forward) shadowH else -shadowH)
-        shadowMatrix.postTranslate(0f, edge)
-        verticalSeamShadowShader.setLocalMatrix(shadowMatrix)
-        shadePaint.shader = verticalSeamShadowShader
-        canvas.drawRect(0f, min(edge, to), w, max(edge, to), shadePaint)
         shadePaint.shader = null
     }
 

@@ -37,7 +37,6 @@ internal class PageCurlDrawable(
     private val bitmapRecycler: (Bitmap) -> Unit = { bitmap ->
         if (!bitmap.isRecycled) bitmap.recycle()
     },
-    private val vertical: Boolean = false,
 ) : Drawable() {
 
     private var frontBitmap: Bitmap? = frontBitmap
@@ -90,12 +89,6 @@ internal class PageCurlDrawable(
             return
         }
 
-        if (vertical) {
-            drawVerticalTurn(canvas, width, height)
-            canvas.restoreToCount(save)
-            return
-        }
-
         val divider = if (forward) {
             (width * (1f - progress)).roundToInt().coerceIn(0, width)
         } else {
@@ -125,38 +118,6 @@ internal class PageCurlDrawable(
         if (right <= left) return
         bitmapSrc.set(left, 0, right, viewportH)
         bitmapDst.set(left, 0, right, viewportH)
-        canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, bitmapPaint)
-    }
-
-    private fun drawVerticalTurn(canvas: Canvas, width: Int, height: Int) {
-        val divider = if (forward) {
-            (height * (1f - progress)).roundToInt().coerceIn(0, height)
-        } else {
-            (height * progress).roundToInt().coerceIn(0, height)
-        }
-
-        if (forward) {
-            frontBitmap?.let { drawPaperHeight(canvas, it, divider, width) }
-        } else {
-            frontBitmap?.let { drawFlatHeight(canvas, it, divider, height, width) }
-            revealedBitmap?.let { drawPaperHeight(canvas, it, divider, width) }
-        }
-        drawSeamShadowVertical(canvas, divider, width, height)
-        if (divider in 1 until height) {
-            canvas.drawLine(0f, divider.toFloat(), width.toFloat(), divider.toFloat(), dividerPaint)
-        }
-    }
-
-    private fun drawFlatHeight(
-        canvas: Canvas,
-        bitmap: Bitmap,
-        top: Int,
-        bottom: Int,
-        width: Int,
-    ) {
-        if (bottom <= top) return
-        bitmapSrc.set(0, top, width, bottom)
-        bitmapDst.set(0, top, width, bottom)
         canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, bitmapPaint)
     }
 
@@ -259,122 +220,11 @@ internal class PageCurlDrawable(
         }
     }
 
-    /** Compresses the full source page into [destinationHeight], bending only its bottom edge. */
-    private fun drawPaperHeight(
-        canvas: Canvas,
-        bitmap: Bitmap,
-        destinationHeight: Int,
-        width: Int,
-    ) {
-        val sourceHeight = viewportH
-        val dstHeight = destinationHeight.coerceIn(0, sourceHeight)
-        if (dstHeight <= 0) return
-        if (dstHeight >= sourceHeight) {
-            drawWholeBitmap(canvas, bitmap)
-            return
-        }
-
-        val maxBendHeight = (sourceHeight * BEND_PERCENT / 100).coerceAtLeast(1)
-        val maxCompressionBeforeFullBend =
-            (maxBendHeight * (HALF_PI_FIXED - TABLE_SCALE) / TABLE_SCALE).coerceAtLeast(1)
-        val maxBentSourceHeight =
-            (maxBendHeight * HALF_PI_FIXED / TABLE_SCALE).coerceAtLeast(1)
-        val compression = sourceHeight - dstHeight
-
-        var bentDestinationHeight = min(compression, maxBendHeight)
-        var bentSrcStart: Int
-        var bentSrcEnd: Int
-        var bentDstStart: Int
-        var bentDstEnd: Int
-        var startAngle: Int
-        var endAngle: Int
-        var flatEnd = -1
-
-        if (compression < maxCompressionBeforeFullBend) {
-            val tableIndex =
-                (compression * TABLE_SIZE / maxCompressionBeforeFullBend).coerceIn(0, TABLE_SIZE)
-            val projectedBend = DST_TABLE[tableIndex] * maxBendHeight / TABLE_SCALE
-            bentSrcStart = dstHeight - projectedBend
-            bentSrcEnd = sourceHeight
-            bentDstStart = bentSrcStart
-            bentDstEnd = dstHeight
-            flatEnd = bentSrcStart
-            startAngle = 0
-            endAngle = SRC_TABLE[tableIndex]
-            bentDestinationHeight = maxBendHeight
-        } else if (dstHeight >= maxBendHeight) {
-            bentSrcStart = dstHeight - maxBendHeight
-            bentSrcEnd = bentSrcStart + maxBentSourceHeight
-            bentDstStart = bentSrcStart
-            bentDstEnd = dstHeight
-            flatEnd = bentSrcStart
-            startAngle = 0
-            endAngle = HALF_PI_FIXED
-        } else {
-            bentDestinationHeight = dstHeight
-            bentSrcStart = 0
-            val hiddenProjection = (maxBendHeight - dstHeight).coerceAtLeast(0)
-            val tableIndex =
-                (TABLE_SIZE * hiddenProjection / maxBendHeight).coerceIn(0, TABLE_SIZE)
-            bentSrcEnd = ASIN_TABLE[tableIndex] * maxBentSourceHeight / TABLE_SCALE
-            bentDstStart = 0
-            bentDstEnd = dstHeight
-            startAngle = ASIN_TABLE[tableIndex]
-            endAngle = HALF_PI_FIXED
-        }
-
-        if (flatEnd > 0) drawFlatHeight(canvas, bitmap, 0, flatEnd, width)
-        if (bentDstStart >= bentDstEnd || bentSrcStart >= bentSrcEnd) return
-
-        val stripCount = (bentDestinationHeight / STRIP_WIDTH_PX + 1).coerceAtLeast(1)
-        val destinationBase =
-            SIN_TABLE[startAngle * TABLE_SIZE / HALF_PI_FIXED] * maxBendHeight / TABLE_SCALE
-        val sourceBase = startAngle * maxBendHeight / TABLE_SCALE
-        val angleDelta = endAngle - startAngle
-
-        for (strip in 0 until stripCount) {
-            val stripStartAngle = startAngle + strip * angleDelta / stripCount
-            val stripEndAngle = startAngle + (strip + 1) * angleDelta / stripCount
-            val sourceStart = stripStartAngle * maxBendHeight / TABLE_SCALE - sourceBase
-            val sourceEnd = stripEndAngle * maxBendHeight / TABLE_SCALE - sourceBase
-            val destinationStart =
-                SIN_TABLE[stripStartAngle * TABLE_SIZE / HALF_PI_FIXED] * maxBendHeight / TABLE_SCALE -
-                    destinationBase
-            val destinationEnd =
-                SIN_TABLE[stripEndAngle * TABLE_SIZE / HALF_PI_FIXED] * maxBendHeight / TABLE_SCALE -
-                    destinationBase
-            bitmapSrc.set(
-                0,
-                (bentSrcStart + sourceStart).coerceIn(0, sourceHeight),
-                width,
-                (bentSrcStart + sourceEnd).coerceIn(0, sourceHeight),
-            )
-            bitmapDst.set(
-                0,
-                (bentDstStart + destinationStart).coerceIn(0, dstHeight),
-                width,
-                (bentDstStart + destinationEnd).coerceIn(0, dstHeight),
-            )
-            if (bitmapSrc.height() <= 0 || bitmapDst.height() <= 0) continue
-            canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, bitmapPaint)
-            val paintIndex =
-                (stripStartAngle * SHADE_LEVELS / HALF_PI_FIXED).coerceIn(0, SHADE_LEVELS - 1)
-            canvas.drawRect(bitmapDst, highlightPaints[paintIndex])
-        }
-    }
-
     private fun drawSeamShadow(canvas: Canvas, divider: Int) {
         if (divider <= 0 || divider >= viewportW) return
         val width = min(viewportW / 10, (32f * density).roundToInt()).coerceAtLeast(1)
         shadeRect.set(divider, 0, (divider + width).coerceAtMost(viewportW), viewportH)
         drawGradient(canvas, shadeRect, shadePaints, SHADE_LEVELS / 2, SHADE_LEVELS / 10)
-    }
-
-    private fun drawSeamShadowVertical(canvas: Canvas, divider: Int, width: Int, height: Int) {
-        if (divider <= 0 || divider >= height) return
-        val shadowHeight = min(height / 10, (32f * density).roundToInt()).coerceAtLeast(1)
-        shadeRect.set(0, divider, width, (divider + shadowHeight).coerceAtMost(height))
-        drawGradientVertical(canvas, shadeRect, shadePaints, SHADE_LEVELS / 2, SHADE_LEVELS / 10)
     }
 
     private fun drawGradient(
@@ -392,25 +242,6 @@ internal class PageCurlDrawable(
             val right = rect.left + width * (index + 1) / count
             if (right <= left) continue
             gradientRect.set(left, rect.top, right, rect.bottom)
-            canvas.drawRect(gradientRect, paints[startIndex + index * direction])
-        }
-    }
-
-    private fun drawGradientVertical(
-        canvas: Canvas,
-        rect: Rect,
-        paints: Array<Paint>,
-        startIndex: Int,
-        endIndex: Int,
-    ) {
-        val count = kotlin.math.abs(endIndex - startIndex) + 1
-        val direction = if (startIndex <= endIndex) 1 else -1
-        val height = rect.height()
-        for (index in 0 until count) {
-            val top = rect.top + height * index / count
-            val bottom = rect.top + height * (index + 1) / count
-            if (bottom <= top) continue
-            gradientRect.set(rect.left, top, rect.right, bottom)
             canvas.drawRect(gradientRect, paints[startIndex + index * direction])
         }
     }
