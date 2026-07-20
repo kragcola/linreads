@@ -34,6 +34,17 @@ jobs:
         working-directory: android
         run: ./gradlew -Preadflow.phase=2 test
 
+      - name: Upload failed test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-diagnostics-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            android/**/build/test-results/**/TEST-*.xml
+            android/**/build/reports/tests/**
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Build OTA APK
         working-directory: android
         run: ./gradlew -Preadflow.phase=2 :app:assembleOta
