@@ -156,9 +156,15 @@ internal class EpubFlowView(
     private var asyncImageWakeListener: android.view.ViewTreeObserver.OnPreDrawListener? = null
     private var asyncImageRefreshPending = false
     private val asyncImagePixelRefreshOffsets = LinkedHashSet<Int>()
+    private var asyncImagePixelTextRebindPending = false
     private val asyncImageRefreshRunnable = object : Runnable {
         override fun run() {
-            if (disposed || (!asyncImageRefreshPending && asyncImagePixelRefreshOffsets.isEmpty())) return
+            if (
+                disposed ||
+                (!asyncImageRefreshPending &&
+                    asyncImagePixelRefreshOffsets.isEmpty() &&
+                    !asyncImagePixelTextRebindPending)
+            ) return
             if (turnInFlight) {
                 postDelayed(this, REFLOW_DEBOUNCE_MS)
                 return
@@ -166,6 +172,7 @@ internal class EpubFlowView(
             if (asyncImageRefreshPending) {
                 asyncImageRefreshPending = false
                 asyncImagePixelRefreshOffsets.clear()
+                asyncImagePixelTextRebindPending = false
                 // Geometry-level async result may also supersede any staged in-place pixel redraws.
                 cancelInPlacePageShotRefreshCallbacks()
                 pendingInPlacePageShotRefreshSlots.clear()
@@ -173,7 +180,9 @@ internal class EpubFlowView(
             } else {
                 val offsets = asyncImagePixelRefreshOffsets.toList()
                 asyncImagePixelRefreshOffsets.clear()
-                applyAsyncImagePixelRefresh(offsets)
+                val rebindText = asyncImagePixelTextRebindPending
+                asyncImagePixelTextRebindPending = false
+                applyAsyncImagePixelRefresh(offsets, rebindText = rebindText)
             }
         }
     }
@@ -1590,33 +1599,59 @@ internal class EpubFlowView(
     }
 
     fun refreshAfterAsyncImageResult() {
-        // Placeholder geometry can stay identical while the visible pixels change. Any cached page shot
-        // from before the decode is therefore stale even when its page/top key still matches.
+        // Geometry changes (or an unknown occurrence) invalidate pagination and every cached page shot.
+        // Same-geometry pixel installs use the incremental path below and preserve warm identities.
         if (turnInFlight) {
             asyncImageRefreshPending = true
             removeCallbacks(asyncImageRefreshRunnable)
             postDelayed(asyncImageRefreshRunnable, REFLOW_DEBOUNCE_MS)
             return
         }
+        removeCallbacks(asyncImageRefreshRunnable)
+        asyncImageRefreshPending = false
+        asyncImagePixelRefreshOffsets.clear()
+        asyncImagePixelTextRebindPending = false
         applyAsyncImageResultRefresh()
     }
 
     fun onAsyncImagePixelsChanged(layoutOffset: Int) {
+        onAsyncImagePixelsChanged(layoutOffset, rebindText = false)
+    }
+
+    fun onAsyncImagePixelsChangedRequiringTextRebind(layoutOffset: Int) {
+        onAsyncImagePixelsChanged(layoutOffset, rebindText = true)
+    }
+
+    private fun onAsyncImagePixelsChanged(layoutOffset: Int, rebindText: Boolean) {
         if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
-            post { onAsyncImagePixelsChanged(layoutOffset) }
+            post { onAsyncImagePixelsChanged(layoutOffset, rebindText) }
             return
         }
-        if (turnInFlight) {
+        if (turnInFlight || rebindText || asyncImagePixelTextRebindPending) {
             asyncImagePixelRefreshOffsets += layoutOffset
+            asyncImagePixelTextRebindPending = asyncImagePixelTextRebindPending || rebindText
             removeCallbacks(asyncImageRefreshRunnable)
-            postDelayed(asyncImageRefreshRunnable, REFLOW_DEBOUNCE_MS)
+            if (turnInFlight) {
+                postDelayed(asyncImageRefreshRunnable, REFLOW_DEBOUNCE_MS)
+            } else {
+                postOnAnimation(asyncImageRefreshRunnable)
+            }
             return
         }
         applyAsyncImagePixelRefresh(listOf(layoutOffset))
     }
 
-    private fun applyAsyncImagePixelRefresh(layoutOffsets: Collection<Int>) {
+    private fun applyAsyncImagePixelRefresh(
+        layoutOffsets: Collection<Int>,
+        rebindText: Boolean = false,
+    ) {
         if (layoutOffsets.isEmpty()) return
+        if (rebindText) {
+            // A full-page AsyncDrawable needs a TextView display-list rebuild even when its reserved
+            // bounds are unchanged. Keep pagination and warm page-shot identities intact; dependent
+            // shots are repainted in place below after this same-geometry rebind settles.
+            textView.text = textView.text
+        }
         // Far-page PIXELS_ONLY must not touch the live viewport's warm shots or restart nearby
         // precache. Boundary-preview pages (preceding text that synthetically crops a next-page
         // image) count as nearby even when the image layout offset sits past the page endOffset.
@@ -1954,6 +1989,7 @@ internal class EpubFlowView(
         removeCallbacks(asyncImageRefreshRunnable)
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
+        asyncImagePixelTextRebindPending = false
         cancelInPlacePageShotRefreshCallbacks()
         pendingInPlacePageShotRefreshSlots.clear()
         invalidateBoundaryPreviews()
@@ -2321,6 +2357,7 @@ internal class EpubFlowView(
         removeCallbacks(asyncImageRefreshRunnable)
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
+        asyncImagePixelTextRebindPending = false
         cancelInPlacePageShotRefreshCallbacks()
         pendingInPlacePageShotRefreshSlots.clear()
         removeCallbacks(conversionSnapshotClearRunnable)

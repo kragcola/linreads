@@ -1233,10 +1233,14 @@ class EpubReflowEngine private constructor(
             imageBoundsProvider = ::epubImageBoundsFor,
             onImageResultChanged = { result ->
                 if (isCurrent()) {
-                    if (result.requiresTextRebind) {
-                        view.refreshAfterAsyncImageResult()
-                    } else {
-                        view.onAsyncImagePixelsChanged(result.layoutStart)
+                    when {
+                        result.kind == EpubAsyncImageResultKind.GEOMETRY_CHANGED || result.layoutStart < 0 -> {
+                            view.refreshAfterAsyncImageResult()
+                        }
+                        result.requiresTextRebind -> {
+                            view.onAsyncImagePixelsChangedRequiringTextRebind(result.layoutStart)
+                        }
+                        else -> view.onAsyncImagePixelsChanged(result.layoutStart)
                     }
                 }
             },
