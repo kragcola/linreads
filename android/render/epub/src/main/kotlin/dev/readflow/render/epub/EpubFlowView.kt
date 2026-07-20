@@ -157,6 +157,7 @@ internal class EpubFlowView(
     private var asyncImageRefreshPending = false
     private val asyncImagePixelRefreshOffsets = LinkedHashSet<Int>()
     private var asyncImagePixelTextRebindPending = false
+    private var asyncImageBatchWaitStartedAtMs = 0L
     private val asyncImageRefreshRunnable = object : Runnable {
         override fun run() {
             if (
@@ -165,12 +166,21 @@ internal class EpubFlowView(
                     asyncImagePixelRefreshOffsets.isEmpty() &&
                     !asyncImagePixelTextRebindPending)
             ) return
-            if (turnInFlight || pendingDecodesProvider?.invoke() == true) {
-                // Freeze the current/adjacent image batch before one TextView display-list rebuild.
-                // The provider ignores far-page work, so unrelated decodes do not hold this queue.
+            if (turnInFlight) {
                 postDelayed(this, REFLOW_DEBOUNCE_MS)
                 return
             }
+            if (pendingDecodesProvider?.invoke() == true) {
+                // Freeze the current/adjacent image batch before one TextView display-list rebuild.
+                // The provider ignores far-page work, so unrelated decodes do not hold this queue.
+                val now = android.os.SystemClock.uptimeMillis()
+                if (asyncImageBatchWaitStartedAtMs == 0L) asyncImageBatchWaitStartedAtMs = now
+                if (now - asyncImageBatchWaitStartedAtMs < ASYNC_IMAGE_BATCH_MAX_WAIT_MS) {
+                    postDelayed(this, REFLOW_DEBOUNCE_MS)
+                    return
+                }
+            }
+            asyncImageBatchWaitStartedAtMs = 0L
             if (asyncImageRefreshPending) {
                 asyncImageRefreshPending = false
                 asyncImagePixelRefreshOffsets.clear()
@@ -1613,6 +1623,7 @@ internal class EpubFlowView(
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
         asyncImagePixelTextRebindPending = false
+        asyncImageBatchWaitStartedAtMs = 0L
         applyAsyncImageResultRefresh()
     }
 
@@ -1992,6 +2003,7 @@ internal class EpubFlowView(
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
         asyncImagePixelTextRebindPending = false
+        asyncImageBatchWaitStartedAtMs = 0L
         cancelInPlacePageShotRefreshCallbacks()
         pendingInPlacePageShotRefreshSlots.clear()
         invalidateBoundaryPreviews()
@@ -2360,6 +2372,7 @@ internal class EpubFlowView(
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
         asyncImagePixelTextRebindPending = false
+        asyncImageBatchWaitStartedAtMs = 0L
         cancelInPlacePageShotRefreshCallbacks()
         pendingInPlacePageShotRefreshSlots.clear()
         removeCallbacks(conversionSnapshotClearRunnable)
@@ -5262,6 +5275,8 @@ internal class EpubFlowView(
 
         /** Coalesce window for async-image reflows: collapses a decode burst into ONE paginate+anchor. */
         const val REFLOW_DEBOUNCE_MS = 80L
+        /** Paint completed images even if another relevant decoder never returns. */
+        const val ASYNC_IMAGE_BATCH_MAX_WAIT_MS = 800L
 
         /** Fade-in for the chapter's first positioned frame — long enough to hide a one-frame settle. */
         const val REVEAL_FADE_MS = 120L
