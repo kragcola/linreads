@@ -432,6 +432,22 @@ class EpubReflowEngineTest {
                     "inline pixel delivery must preserve the warm target-page identity",
                     flowView.privateField("cachedRevealedBitmap") === warmRevealed && !warmRevealed.isRecycled,
                 )
+
+                textRebinds.set(0)
+                relevantDecodePending = true
+                callback(fullPagePixels.copy(destination = "stalled-peer.png"))
+                shadowOf(Looper.getMainLooper()).idleFor(700L, TimeUnit.MILLISECONDS)
+                assertEquals(
+                    "the bounded batch window must still coalesce normally completing peers",
+                    0,
+                    textRebinds.get(),
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(300L, TimeUnit.MILLISECONDS)
+                assertEquals(
+                    "a stuck peer must not keep completed image pixels transparent forever",
+                    1,
+                    textRebinds.get(),
+                )
             } finally {
                 engine.close()
             }
