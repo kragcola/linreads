@@ -374,6 +374,8 @@ class EpubReflowEngineTest {
                 )
 
                 assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, fullPagePixels.kind)
+                var relevantDecodePending = true
+                flowView.pendingDecodesProvider = { relevantDecodePending }
                 callback(fullPagePixels)
                 callback(fullPagePixels.copy(destination = "plate-2.png", layoutStart = 1))
                 assertEquals(
@@ -381,9 +383,16 @@ class EpubReflowEngineTest {
                     0,
                     textRebinds.get(),
                 )
-                shadowOf(Looper.getMainLooper()).idleFor(20L, TimeUnit.MILLISECONDS)
+                shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+                assertEquals(
+                    "the current-page image batch must finish before rebuilding the display list",
+                    0,
+                    textRebinds.get(),
+                )
+                relevantDecodePending = false
+                shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
                 assertTrue(
-                    "same-size full-page pixels must rebind the TextView display owner",
+                    "the completed image batch must rebind the TextView display owner once",
                     textRebinds.get() == 1,
                 )
                 assertTrue(
