@@ -152,6 +152,12 @@ internal class EpubFlowView(
      */
     fun relevantPendingDecodeLayoutRanges(): List<IntRange> =
         relevantPageWindows().map { it.startOffset until it.endOffset }
+
+    /** Decode gate for a prepared boundary surface: only the page that will be revealed must be ready. */
+    fun currentPageDecodeLayoutRanges(): List<IntRange> =
+        paged.getOrNull(currentPage)
+            ?.let { page -> listOf(page.startOffset until page.endOffset) }
+            .orEmpty()
     private var asyncImageWakeObserver: android.view.ViewTreeObserver? = null
     private var asyncImageWakeListener: android.view.ViewTreeObserver.OnPreDrawListener? = null
     private var asyncImageRefreshPending = false
@@ -4709,6 +4715,16 @@ internal class EpubFlowView(
             !keepsPartialViewportSlice(layout, line)
         ) line++
         return layout.getLineStart(line.coerceAtMost(layout.lineCount - 1))
+    }
+
+    /** Publishes and warms a chapter that was fully laid out while owned by a hidden boundary slot. */
+    fun activatePreparedChapter() {
+        if (disposed) return
+        animateChapterReveal = true
+        pageTexturePrecacheEnabled = true
+        reportTopOffset(force = true)
+        preCachePageTextures()
+        onPageSettled?.invoke()
     }
 
     private fun reportTopOffset(force: Boolean = false) {

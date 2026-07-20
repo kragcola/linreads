@@ -142,6 +142,8 @@ internal data class EpubAsyncImageResult(
 internal class EpubFlowImageLoader(
     private val epubFileProvider: () -> File?,
     private val executor: ExecutorService,
+    private val priorityExecutor: ExecutorService? = null,
+    private val priorityLayoutRangesProvider: () -> Collection<IntRange> = { emptyList() },
     private val columnWidthPx: Int,
     private val columnWidthProvider: () -> Int = { columnWidthPx },
     private val pageHeightProvider: () -> Int,
@@ -229,8 +231,14 @@ internal class EpubFlowImageLoader(
             new to old
         }
         superseded?.future?.cancel(true)
+        val decodeExecutor = priorityExecutor?.takeIf {
+            val layoutStart = synchronized(lifecycleLock) { layoutStartByDrawable[drawable] ?: -1 }
+            layoutStart >= 0 && runCatching {
+                priorityLayoutRangesProvider().any { range -> layoutStart in range }
+            }.getOrDefault(false)
+        } ?: executor
         val future = try {
-            executor.submit {
+            decodeExecutor.submit {
                 var bitmap: Bitmap? = null
                 try {
                     bitmap = decodeEpubImage(file, href, maxSide = maxSide)

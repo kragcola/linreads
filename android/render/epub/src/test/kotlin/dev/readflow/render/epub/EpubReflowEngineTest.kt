@@ -18,6 +18,7 @@ import android.text.Spanned
 import android.text.TextPaint
 import android.text.TextWatcher
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -997,7 +998,8 @@ class EpubReflowEngineTest {
         awaitCondition("the prepared preview must settle in the adjacent chapter") {
             (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1
         }
-        val visibleText = flowView.textView.text.toString()
+        val activeView = engine.privateField("flowView") as EpubFlowView
+        val visibleText = activeView.textView.text.toString()
         assertTrue(
             "commit must install the chapter flow already prepared for the accepted preview: $visibleText",
             visibleText.contains(preparedTarget),
@@ -1007,6 +1009,325 @@ class EpubReflowEngineTest {
             visibleText.contains(replacementTarget),
         )
         engine.close()
+    }
+
+    @Test
+    fun `committed boundary preview promotes its prepared view and installed image asset`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        EpubImageDecodeProbe.reset()
+        val epub = tempDir.newFile("prepared-boundary-surface.epub")
+        writeBoundaryImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.NONE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val outgoingView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+
+        val preparedView = awaitBoundaryPreviewSession(engine, forward = true)
+        preparedView.pendingDecodesProvider = { true }
+        val preparedText = preparedView.textView.text as Spanned
+        val preparedImage = preparedText
+            .getSpans(0, preparedText.length, AsyncDrawableSpan::class.java)
+            .single()
+            .drawable
+        awaitCondition("the prepared renderer must install its decoded image asset") {
+            preparedImage.result != null
+        }
+        val installedImageAsset = requireNotNull(preparedImage.result)
+        val decodeCountBeforeCommit = EpubImageDecodeProbe.fullDecodeTotal()
+        assertTrue("the prepared image must be fully decoded before commit", decodeCountBeforeCommit >= 1)
+        assertFalse("the hidden prepared surface must not accept input", preparedView.isEnabled)
+        assertEquals(
+            "the hidden prepared surface must stay out of the accessibility tree",
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            preparedView.importantForAccessibility,
+        )
+
+        try {
+            preparedView.pendingDecodesProvider = { false }
+            preparedView.onAsyncImageDecodeFinished()
+            preparedView.viewTreeObserver.dispatchOnPreDraw()
+            awaitBoundaryPreview(outgoingView, forward = true)
+
+            engine.goToAdjacentPage(1)
+
+            assertEquals("the committed chapter must have one active flow surface", 1, host.childCount)
+            val activeView = host.getChildAt(0) as EpubFlowView
+            assertSame(
+                "commit must promote the exact adjacent renderer that produced the accepted landing preview",
+                preparedView,
+                activeView,
+            )
+            val activeText = activeView.textView.text as Spanned
+            val activeImage = activeText
+                .getSpans(0, activeText.length, AsyncDrawableSpan::class.java)
+                .single()
+                .drawable
+            assertSame("the promoted surface must retain its installed image drawable", preparedImage, activeImage)
+            assertSame("the promoted drawable must retain its decoded pixel asset", installedImageAsset, activeImage.result)
+            assertEquals(
+                "promoting an already decoded image must not trigger a second full decode",
+                decodeCountBeforeCommit,
+                EpubImageDecodeProbe.fullDecodeTotal(),
+            )
+            assertTrue("the promoted surface must accept input", activeView.isEnabled)
+            assertTrue("the promoted text must restore native selection", activeView.textView.isTextSelectable)
+            assertEquals(
+                "the promoted surface must return to the accessibility tree",
+                View.IMPORTANT_FOR_ACCESSIBILITY_AUTO,
+                activeView.importantForAccessibility,
+            )
+        } finally {
+            preparedView.pendingDecodesProvider = { false }
+            engine.close()
+        }
+    }
+
+    @Test
+    fun `prepared boundary landing ignores a pending next page image but waits for landing image`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("prepared-boundary-page-decode-gate.epub")
+        writeBoundaryTwoPageImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.NONE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val blockedBulkExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val blockedPriorityExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val workersStarted = CountDownLatch(2)
+        val releaseWorkers = CountDownLatch(1)
+        listOf(blockedBulkExecutor, blockedPriorityExecutor).forEach { executor ->
+            executor.submit {
+                workersStarted.countDown()
+                releaseWorkers.await()
+            }
+        }
+        assertTrue("fixture must occupy both image decode lanes", workersStarted.await(2, TimeUnit.SECONDS))
+        engine.setPrivateField("flowExecutorInstance", blockedBulkExecutor)
+        engine.setPrivateField("flowCriticalImageExecutorInstance", blockedPriorityExecutor)
+        val host = engine.createView() as FrameLayout
+        val outgoingView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+
+        val preparedView = awaitBoundaryPreviewSession(engine, forward = true)
+        @Suppress("UNCHECKED_CAST")
+        val session = (engine.privateField("boundaryPreviewSessions") as Map<Boolean, Any>).getValue(true)
+        val loader = session.javaClass.getDeclaredField("loader")
+            .apply { isAccessible = true }
+            .get(session) as EpubFlowImageLoader
+
+        try {
+            awaitCondition("fixture must paginate both prepared image pages") {
+                val text = preparedView.textView.text as? Spanned
+                text != null &&
+                    text.getSpans(0, text.length, AsyncDrawableSpan::class.java).size == 2 &&
+                    preparedView.pageCount() >= 2
+            }
+
+            val text = preparedView.textView.text as Spanned
+            val pages = preparedView.privateField("paged") as List<EpubFlowPage>
+            val imageSpans = text.getSpans(0, text.length, AsyncDrawableSpan::class.java)
+            val spansByPage = imageSpans.associateBy { span ->
+                val start = text.getSpanStart(span)
+                pages.indexOfFirst { page -> start >= page.startOffset && start < page.endOffset }
+            }
+            val landingImage = requireNotNull(spansByPage[0]?.drawable)
+            val nextPageImage = requireNotNull(spansByPage[1]?.drawable)
+            assertTrue("fixture image decodes must be queued behind the occupied workers", loader.hasPendingDecodes())
+
+            loader.cancel(nextPageImage)
+            preparedView.tryRevealWhenStable()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            assertTrue("the landing-page image must still be pending", loader.hasPendingDecodes())
+            assertNull(
+                "a pending image on the landing page must block the adjacent preview",
+                outgoingView.privateField("forwardBoundaryPreview"),
+            )
+
+            loader.cancel(landingImage)
+            loader.load(nextPageImage)
+            assertTrue("the next-page image must remain genuinely in flight", loader.hasPendingDecodes())
+            preparedView.tryRevealWhenStable()
+            preparedView.viewTreeObserver.dispatchOnPreDraw()
+            awaitCondition(
+                "a pending image outside the landing page must not block the adjacent preview",
+                timeoutMs = 1_200L,
+            ) {
+                outgoingView.privateField("forwardBoundaryPreview") is BoundaryPagePreview
+            }
+
+            engine.goToAdjacentPage(1)
+
+            assertSame(
+                "the prepared chapter must commit while its next-page decode remains pending",
+                preparedView,
+                engine.privateField("flowView"),
+            )
+            assertTrue("commit must not cancel the promoted chapter's next-page decode", loader.hasPendingDecodes())
+            assertTrue(
+                "after promotion the active decode gate must include its adjacent page",
+                preparedView.pendingDecodesProvider?.invoke() == true,
+            )
+        } finally {
+            loader.cancelAll()
+            releaseWorkers.countDown()
+            engine.close()
+            blockedBulkExecutor.shutdownNow()
+            blockedPriorityExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `adjacent chapter preparation does not queue behind occupied image decode executor`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("boundary-preparation-executor-separation.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Visible text source.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Prepared text target.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val workerStarted = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        val blockedImageExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        blockedImageExecutor.submit {
+            workerStarted.countDown()
+            releaseWorker.await()
+        }
+        assertTrue("fixture must fully occupy the bulk image executor", workerStarted.await(2, TimeUnit.SECONDS))
+        engine.setPrivateField("flowExecutorInstance", blockedImageExecutor)
+
+        try {
+            val host = engine.createView() as FrameLayout
+            val outgoingView = host.getChildAt(0) as EpubFlowView
+            activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+            host.measure(exactly(360), exactly(140))
+            host.layout(0, 0, 360, 140)
+            engine.invokePrivate(
+                "requestBoundaryPreview",
+                true,
+                outgoingView.boundaryPreviewGenerationToken(),
+            )
+
+            awaitCondition(
+                "adjacent text chapter preparation must not queue behind occupied image decoding",
+                timeoutMs = 1_200L,
+            ) {
+                val sessions = engine.privateField("boundaryPreviewSessions") as Map<*, *>
+                sessions.containsKey(true) ||
+                    outgoingView.privateField("forwardBoundaryPreview") is BoundaryPagePreview
+            }
+        } finally {
+            engine.close()
+            releaseWorker.countDown()
+            blockedImageExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `backward boundary decodes its last page image ahead of pending first page image`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("backward-boundary-image-priority.epub")
+        writeBoundaryTwoPageImageEpub(epub, imagesFirst = true)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setInitialLocator(
+            Locator(
+                LocatorStrategy.Section(spineIndex = 1, elementIndex = 1, charOffset = 0),
+                totalProgression = 0.75f,
+            ),
+        )
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val workerStarted = CountDownLatch(1)
+        val releaseWorker = CountDownLatch(1)
+        val blockedBulkExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        blockedBulkExecutor.submit {
+            workerStarted.countDown()
+            releaseWorker.await()
+        }
+        assertTrue("fixture must fully occupy the bulk image executor", workerStarted.await(2, TimeUnit.SECONDS))
+        engine.setPrivateField("flowExecutorInstance", blockedBulkExecutor)
+
+        try {
+            val host = engine.createView() as FrameLayout
+            val outgoingView = host.getChildAt(0) as EpubFlowView
+            activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+            host.measure(exactly(360), exactly(140))
+            host.layout(0, 0, 360, 140)
+            engine.invokePrivate(
+                "requestBoundaryPreview",
+                false,
+                outgoingView.boundaryPreviewGenerationToken(),
+            )
+
+            val preparedView = awaitBoundaryPreviewSession(engine, forward = false)
+            @Suppress("UNCHECKED_CAST")
+            val session = (engine.privateField("boundaryPreviewSessions") as Map<Boolean, Any>).getValue(false)
+            val loader = session.javaClass.getDeclaredField("loader")
+                .apply { isAccessible = true }
+                .get(session) as EpubFlowImageLoader
+            awaitCondition("fixture must paginate the backward target into two image pages") {
+                val text = preparedView.textView.text as? Spanned
+                text != null &&
+                    text.getSpans(0, text.length, AsyncDrawableSpan::class.java).size == 2 &&
+                    preparedView.pageCount() == 2
+            }
+            val text = preparedView.textView.text as Spanned
+            val pages = preparedView.privateField("paged") as List<EpubFlowPage>
+            val spansByPage = text.getSpans(0, text.length, AsyncDrawableSpan::class.java)
+                .associateBy { span ->
+                    val start = text.getSpanStart(span)
+                    pages.indexOfFirst { page -> start >= page.startOffset && start < page.endOffset }
+            }
+            val firstPageImage = requireNotNull(spansByPage[0]?.drawable)
+            val landingImage = requireNotNull(spansByPage[1]?.drawable)
+            assertFalse(
+                "the occupied bulk pool must leave the first-page image unresolved",
+                firstPageImage.result is android.graphics.drawable.BitmapDrawable,
+            )
+            assertFalse(
+                "the backward landing image must start unresolved",
+                landingImage.result is android.graphics.drawable.BitmapDrawable,
+            )
+            assertTrue("the prepared loader must retain pending bulk work", loader.hasPendingDecodes())
+
+            awaitCondition(
+                "the backward landing-page image must decode and produce a preview despite occupied bulk decoding",
+                timeoutMs = 1_200L,
+            ) {
+                outgoingView.privateField("backwardBoundaryPreview") is BoundaryPagePreview
+            }
+
+            assertTrue(
+                "the backward preview must contain decoded last-page pixels",
+                landingImage.result is android.graphics.drawable.BitmapDrawable,
+            )
+            assertFalse(
+                "the off-landing first-page image must remain unresolved",
+                firstPageImage.result is android.graphics.drawable.BitmapDrawable,
+            )
+            assertTrue("off-landing bulk decode must remain in flight after preview", loader.hasPendingDecodes())
+        } finally {
+            engine.close()
+            releaseWorker.countDown()
+            blockedBulkExecutor.shutdownNow()
+        }
     }
 
     @Test
@@ -2267,23 +2588,23 @@ class EpubReflowEngineTest {
         shadowOf(Looper.getMainLooper()).idle()
 
         assertEquals("test fixture should start with a single short page", 1, flowView.pageCount())
+        awaitBoundaryPreview(flowView, forward = true)
 
         engine.goToAdjacentPage(1)
-        awaitCondition("the asynchronous boundary preview must commit and start the slide") {
-            val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
-            strategy?.spineIndex == 1 &&
-                flowView.privateField("pendingBoundaryPageTurn") == null &&
-                flowView.privateField("flipAnimator") != null
+        assertNotNull(
+            "the prepared boundary turn must start the slide on the outgoing surface",
+            flowView.privateField("flipAnimator"),
+        )
+        awaitCondition("the asynchronous boundary preview must commit") {
+            (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1
         }
 
         val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
-        val animator = flowView.privateField("flipAnimator")
-        val pending = flowView.privateField("pendingBoundaryPageTurn")
+        val activeView = engine.privateField("flowView") as EpubFlowView
         assertEquals("the boundary turn should land on the next spine", 1, strategy?.spineIndex)
-        assertEquals("the captured outgoing page shot should be consumed by the target chapter", null, pending)
-        assertNotNull(
-            "cross-spine page turn should be driven by the same slide animator as in-chapter turns",
-            animator,
+        assertTrue(
+            "the promoted target must retain the prepared chapter content",
+            activeView.textView.text.toString().contains("Chapter two start."),
         )
     }
 
@@ -2316,10 +2637,15 @@ class EpubReflowEngineTest {
         engine.goToAdjacentPage(1)
 
         awaitCondition("NONE boundary preview must commit the adjacent chapter") {
-            flowView.textView.text.toString().contains("Chapter two start.")
+            (engine.privateField("flowView") as? EpubFlowView)
+                ?.textView
+                ?.text
+                ?.toString()
+                ?.contains("Chapter two start.") == true
         }
-        assertTrue("NONE must still install the adjacent chapter", flowView.textView.text.toString().contains("Chapter two start."))
-        val continuityOwner = flowView.privateField("conversionSnapshotDrawable")
+        val activeView = engine.privateField("flowView") as EpubFlowView
+        assertTrue("NONE must still install the adjacent chapter", activeView.textView.text.toString().contains("Chapter two start."))
+        val continuityOwner = activeView.privateField("conversionSnapshotDrawable")
         val continuityAlpha = continuityOwner?.let { owner ->
             owner.javaClass.getDeclaredField("alphaValue")
                 .apply { isAccessible = true }
@@ -2332,27 +2658,27 @@ class EpubReflowEngineTest {
         }
         assertTrue(
             "the target may stay hidden only while a live opaque continuity owner covers it",
-            flowView.getChildAt(0).alpha == 1f ||
+            activeView.getChildAt(0).alpha == 1f ||
                 (
                     continuityAlpha == 255 &&
                         continuityBitmap != null &&
                         !continuityBitmap.isRecycled
                     ),
         )
-        assertNull("NONE must not start a page-turn animator", flowView.privateField("flipAnimator"))
+        assertNull("NONE must not start a page-turn animator", activeView.privateField("flipAnimator"))
 
         awaitCondition("NONE boundary commit must finish its stable live-view handoff") {
             val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
             strategy?.spineIndex == 1 &&
-                flowView.getChildAt(0).alpha == 1f &&
-                flowView.privateField("conversionSnapshotDrawable") == null
+                activeView.getChildAt(0).alpha == 1f &&
+                activeView.privateField("conversionSnapshotDrawable") == null
         }
 
         val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
         assertEquals("NONE must settle on the adjacent spine", 1, strategy?.spineIndex)
-        assertEquals("the stable target must fully own the viewport", 1f, flowView.getChildAt(0).alpha)
-        assertNull("the continuity owner must retire after the target is stable", flowView.privateField("conversionSnapshotDrawable"))
-        assertNull("NONE must remain animation-free", flowView.privateField("flipAnimator"))
+        assertEquals("the stable target must fully own the viewport", 1f, activeView.getChildAt(0).alpha)
+        assertNull("the continuity owner must retire after the target is stable", activeView.privateField("conversionSnapshotDrawable"))
+        assertNull("NONE must remain animation-free", activeView.privateField("flipAnimator"))
     }
 
     @Test
@@ -2401,8 +2727,9 @@ class EpubReflowEngineTest {
         shadowOf(Looper.getMainLooper()).idle()
 
         val retriedStrategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+        val activeView = engine.privateField("flowView") as EpubFlowView
         assertEquals("a later healthy request must still cross to chapter two", 1, retriedStrategy?.spineIndex)
-        assertTrue(flowView.textView.text.toString().contains("Chapter two start."))
+        assertTrue(activeView.textView.text.toString().contains("Chapter two start."))
     }
 
     @Test
@@ -2429,7 +2756,7 @@ class EpubReflowEngineTest {
         engine.setMode(ReadingMode.PAGED)
         engine.openBook(Uri.fromFile(epub))
         val host = engine.createView() as FrameLayout
-        val flowView = host.getChildAt(0) as EpubFlowView
+        var flowView = host.getChildAt(0) as EpubFlowView
         activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
         host.measure(exactly(360), exactly(140))
         host.layout(0, 0, 360, 140)
@@ -2447,6 +2774,7 @@ class EpubReflowEngineTest {
         val forwardCommit = requireNotNull(flowView.takeBoundaryPreviewForTest(forward = true))
         assertEquals(forward.token, forwardCommit.token)
         requireNotNull(flowView.onBoundaryTurnCommitted).invoke(forwardCommit)
+        flowView = engine.privateField("flowView") as EpubFlowView
         awaitCondition("forward preview commit must install the next chapter") {
             flowView.textView.text.toString().contains("Next chapter first page.")
         }
@@ -2457,6 +2785,7 @@ class EpubReflowEngineTest {
         val backwardCommit = requireNotNull(flowView.takeBoundaryPreviewForTest(forward = false))
         assertEquals(backward.token, backwardCommit.token)
         requireNotNull(flowView.onBoundaryTurnCommitted).invoke(backwardCommit)
+        flowView = engine.privateField("flowView") as EpubFlowView
         awaitCondition("backward preview commit must restore the previous chapter") {
             flowView.textView.text.toString().contains("middle-260")
         }
@@ -2734,8 +3063,9 @@ class EpubReflowEngineTest {
 
             awaitCondition("the preserved active boundary turn must still commit and settle") {
                 val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
+                val activeView = engine.privateField("flowView") as EpubFlowView
                 strategy?.spineIndex == 1 &&
-                    flowView.textView.text.toString().contains("Incoming chapter survives active trim.")
+                    activeView.textView.text.toString().contains("Incoming chapter survives active trim.")
             }
         } finally {
             engine.close()
@@ -3410,23 +3740,26 @@ class EpubReflowEngineTest {
             runCatching {
                 awaitCondition("the promoted required preview must start or commit the waiting boundary turn") {
                     val strategy = engine.currentLocator.value.strategy as? LocatorStrategy.Section
-                    flowView.privateField("activeBoundaryPreview") is BoundaryPagePreview ||
-                        (strategy?.spineIndex == 1 && flowView.textView.text.toString().contains("Image target begins."))
+                    val activeView = engine.privateField("flowView") as EpubFlowView
+                    activeView.privateField("activeBoundaryPreview") is BoundaryPagePreview ||
+                        (strategy?.spineIndex == 1 && activeView.textView.text.toString().contains("Image target begins."))
                 }
             }.getOrElse { failure ->
                 val budget = checkNotNull(engine.privateField("pageShotBudget") as PageShotBudget?)
+                val activeView = engine.privateField("flowView") as EpubFlowView
                 fail(
-                    "${failure.message}; required=${flowView.boundaryPreviewIsRequired(true)} " +
-                        "state=${flowView.privateField("interactiveTurnState")} " +
+                    "${failure.message}; required=${activeView.boundaryPreviewIsRequired(true)} " +
+                        "state=${activeView.privateField("interactiveTurnState")} " +
                         "sessions=${(engine.privateField("boundaryPreviewSessions") as Map<*, *>).keys} " +
                         "targets=${(engine.privateField("boundaryPreviewTargets") as Map<*, *>).keys} " +
-                        "slot=${flowView.privateField("forwardBoundaryPreview")} " +
-                        "active=${flowView.privateField("activeBoundaryPreview")} " +
+                        "slot=${activeView.privateField("forwardBoundaryPreview")} " +
+                        "active=${activeView.privateField("activeBoundaryPreview")} " +
                         "ownersRecycled=${liveOwners.map(Bitmap::isRecycled)} " +
                         "charged=${budget.chargedBytes} leased=${budget.leasedBytes}",
                 )
             }
-            val offered = flowView.privateField("activeBoundaryPreview") as BoundaryPagePreview?
+            val activeView = engine.privateField("flowView") as EpubFlowView
+            val offered = activeView.privateField("activeBoundaryPreview") as BoundaryPagePreview?
 
             offered?.let {
                 assertFalse("an in-flight promoted required target must remain live", it.bitmap.isRecycled)
@@ -6149,6 +6482,72 @@ class EpubReflowEngineTest {
                 """.trimIndent(),
             )
             add("OEBPS/image.png", imageBytes)
+        }
+    }
+
+    private fun writeBoundaryTwoPageImageEpub(file: File, imagesFirst: Boolean = false) {
+        fun png(color: Int): ByteArray = ByteArrayOutputStream().use { output ->
+            Bitmap.createBitmap(640, 900, Bitmap.Config.ARGB_8888).let { bitmap ->
+                try {
+                    bitmap.eraseColor(color)
+                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output))
+                    output.toByteArray()
+                } finally {
+                    bitmap.recycle()
+                }
+            }
+        }
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun add(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+
+            fun addText(path: String, content: String) = add(path, content.toByteArray(Charsets.UTF_8))
+
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="c0" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="c1" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="landing" href="landing.png" media-type="image/png"/>
+                        <item id="next" href="next.png" media-type="image/png"/>
+                      </manifest>
+                      <spine><itemref idref="c0"/><itemref idref="c1"/></spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/ch1.xhtml",
+                if (imagesFirst) {
+                    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><img src=\"landing.png\"/><img src=\"next.png\"/></body></html>"
+                } else {
+                    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Prepared page gate source.</p></body></html>"
+                },
+            )
+            addText(
+                "OEBPS/ch2.xhtml",
+                if (imagesFirst) {
+                    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>Prepared page gate source.</p></body></html>"
+                } else {
+                    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><img src=\"landing.png\"/><img src=\"next.png\"/></body></html>"
+                },
+            )
+            add("OEBPS/landing.png", png(0xFF1A8F5D.toInt()))
+            add("OEBPS/next.png", png(0xFF2563EB.toInt()))
         }
     }
 }
