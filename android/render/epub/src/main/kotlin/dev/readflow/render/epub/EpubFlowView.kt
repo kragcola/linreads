@@ -165,7 +165,9 @@ internal class EpubFlowView(
                     asyncImagePixelRefreshOffsets.isEmpty() &&
                     !asyncImagePixelTextRebindPending)
             ) return
-            if (turnInFlight) {
+            if (turnInFlight || pendingDecodesProvider?.invoke() == true) {
+                // Freeze the current/adjacent image batch before one TextView display-list rebuild.
+                // The provider ignores far-page work, so unrelated decodes do not hold this queue.
                 postDelayed(this, REFLOW_DEBOUNCE_MS)
                 return
             }

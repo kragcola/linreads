@@ -134,9 +134,9 @@ internal data class EpubAsyncImageResult(
     }
 
     val requiresTextRebind: Boolean
-        get() = kind == EpubAsyncImageResultKind.GEOMETRY_CHANGED ||
-            isFullPage ||
-            layoutStart < 0
+        // HWUI can retain the transparent ReplacementSpan display list when decoded pixels replace
+        // a same-bounds placeholder. This applies to inline and full-page occurrences alike.
+        get() = true
 }
 
 internal class EpubFlowImageLoader(
