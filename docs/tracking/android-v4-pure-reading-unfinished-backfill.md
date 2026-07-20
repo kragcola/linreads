@@ -1,6 +1,6 @@
 # Android v4 纯阅读未完成项验收回填总表
 
-_最后更新：2026-07-19_
+_最后更新：2026-07-20_
 
 本文档只收 Android v4 纯阅读范围内尚未完成或尚缺验收证据的条目，方便逐项实现、验收、回填。完整来源表见
 [`android-v4-pure-reading-gap-checklist.md`](android-v4-pure-reading-gap-checklist.md)。
@@ -47,6 +47,7 @@ _最后更新：2026-07-19_
 | 发现日期 | 范围 | 现象 | 当前证据 | 下一步 |
 | --- | --- | --- | --- | --- |
 | 2026-07-19 | EPUB 跨章节翻页 | 旧 `dev-latest` OTA 在跨章节翻页时，页面先沿手势方向顿挫/位移一次，随后才提交翻页；左右手势与上下手势均触发。 | 根因已确认并由 `4f9f2ea` 修复：boundary preview 等待态不再平移 live `container`，横/纵 slide/PAPER overlay 沿手势轴绘制；run `29676190557` 已通过 full regression、R8 OTA 和 `dev-latest` 发布。release `BUILD_TAG`/`Commit` 指向 `4f9f2ea985132ddd55b7332f3e5116a4c775e045`；APK 10,012,965 bytes，SHA-256 `b48385887aa172382da0062cf4b53bcf01d5da9e6a81e14ee58c2e9d2024e30d`。尚缺物理设备 Perfetto/vsync 与真人手势证据。 | 在真实手机/平板上验证横纵跨章节手势首帧、跟手、单次提交，不同屏幕尺寸/密度/方向，以及真实出版和图片密集 EPUB；通过后分配验收 ID 并闭环。 |
+| 2026-07-20 | EPUB flow 封面 + 分页 ghost | Alice 首 spine 小封面曾空白；标题与大图间 separator-only 窗口曾暴露为空白页；交互翻页曾绕过 canonical authored-page 过滤。 | `e8537b0` 已进入 Dev build `#247`；Actions run `29696377005` 全量回归、R8 与 OTA 均绿，APK `10,012,965` bytes，SHA-256 `7e3d1a5fb7cafcdde6bbeca67b6018f42cc21d2af4b0714ac844defdc65bbca5`。`readflow_test` API 36 AVD 重启后重新安装云端包，以 `alice.epub`、`image-layout-test.epub`、`readflow-real.epub` 验证首封面稳定、标题→整页大图、连续图文页、分页滑动/仿真正反向翻页；`AndroidRuntime`/`dev.readflow` 窄口径错误日志为空。 | 当前证据为 SwiftShader AVD + 真实 EPUB，不关闭 A-02/PAGE-05/F1 长周期 gate；仍需物理手机/平板、Perfetto/vsync、不同密度/方向、真实出版图片密集 EPUB 与 OEM 视觉验收后再分配正式验收 ID。 |
 
 ## 验收队列
 

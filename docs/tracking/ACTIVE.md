@@ -1,6 +1,6 @@
 # Active Work
 
-_最后更新：2026-07-19_
+_最后更新：2026-07-20_
 
 Mode: `task-feature`
 Objective: Android Reader 全量体验打磨：继续排版字体、书架、书签搜索、菜单架构与跨格式能力对齐
@@ -16,6 +16,8 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 > ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
 ## 当前状态
+
+- 2026-07-20 **`e8537b0` 云端发布与真实 EPUB AVD 验收通过**：该提交修复 Alice 类首 spine 小封面空白、separator-only ghost page，以及交互前后翻页绕过 authored-page 过滤的问题。GitHub Actions run `29696377005` 已通过全量 Android 回归、R8 `:app:assembleOta` 与 `dev-latest` 发布；Dev build `#247` 的 `BUILD_TAG`/`Commit` 指向 `e8537b0cd30db7fff1e05e0ac4836b3c35610119`，`app-ota.apk` 为 `10,012,965` bytes，SHA-256 `7e3d1a5fb7cafcdde6bbeca67b6018f42cc21d2af4b0714ac844defdc65bbca5`。设备侧在重启后恢复 `readflow_test` API 36 AVD（`1600x2560`），重新安装该云端 APK 并从 MediaStore 真实 EPUB `alice.epub`、`image-layout-test.epub`、`readflow-real.epub` 导入验收：Alice 首封面启动后静置与关闭 chrome 后保持可见，横向/纵向滑动均一次提交且无异常位移；`readflow-real` 标题页首次翻到整页大图、前后往返 1 秒/5 秒无闪烁或消失；图片布局书在 `分页 + 仿真` 下中间帧仅按进度揭示下一页，松手落到真实连续图文页，正向走到第 4 章、反向回到第 3 章均无稳定空白页。发布 APK 窄口径 `AndroidRuntime`/`dev.readflow` 错误日志为空。证据根：`/tmp/readflow-dev247-*`。边界：这是 SwiftShader AVD + 真实 EPUB 语料，不是物理手机/平板；Perfetto/vsync、OEM 视觉、真人 TalkBack 与物理设备手感仍开放，A-02/PAGE-05/F1 长周期 gate 不关闭。
 
 - 2026-07-19 **新增 OTA 跨章节翻页缺陷（云端 GREEN，待真机验收）**：用户反馈旧 `dev-latest` OTA 在 EPUB 跨章节翻页时，页面会先沿手势方向出现一次顿挫/位移，随后才真正提交翻页；横向左右手势与纵向上下手势均可触发。根因是 boundary preview 等待态直接平移 live `container`，再在 preview 到达时清零并安装 overlay。提交 `4f9f2ea` 已改为等待态保持原帧静止，并让横/纵 slide/PAPER overlay 沿对应轴绘制；GitHub Actions run `29676190557`（8m39s）已通过 `-Preadflow.phase=2 test`、R8 `:app:assembleOta` 和 `dev-latest` 发布。release 正文的 `BUILD_TAG`/`Commit` 均指向 `4f9f2ea985132ddd55b7332f3e5116a4c775e045`；资产 `app-ota.apk` 为 10,012,965 bytes，SHA-256 `b48385887aa172382da0062cf4b53bcf01d5da9e6a81e14ee58c2e9d2024e30d`。剩余边界仅为真实手机/平板横纵跨章节手势、首帧/跟手/单次提交、不同密度/方向及 Perfetto/vsync 验收；该项暂不计入已有 A-02/PAGE-05 数量，待真机证据后分配正式验收 ID。
 
