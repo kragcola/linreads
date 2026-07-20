@@ -318,14 +318,14 @@ class EpubReflowEngineTest {
     }
 
     @Test
-    fun `full page PIXELS_ONLY callback rebinds TextView while inline pixels stay incremental`() =
+    fun `full page PIXELS_ONLY callback rebinds TextView without discarding warm page shots`() =
         runTest(dispatcher) {
             Dispatchers.setMain(dispatcher)
             val epub = tempDir.newFile("flow-image-result-routing.epub")
-            writeEpub(
-                epub,
-                "OEBPS/ch1.xhtml" to "<html><body><p>Image result routing host.</p></body></html>",
-            )
+            val paragraphs = (1..80).joinToString(separator = "") { index ->
+                "<p>Image result routing host paragraph $index keeps the paged surface warm.</p>"
+            }
+            writeEpub(epub, "OEBPS/ch1.xhtml" to "<html><body>$paragraphs</body></html>")
             val context = RuntimeEnvironment.getApplication() as Application
             val engine = EpubReflowEngine(context, flowEngineEnabled = true)
             try {
@@ -335,6 +335,7 @@ class EpubReflowEngineTest {
                 val flowView = host.getChildAt(0) as EpubFlowView
                 host.measure(exactly(360), exactly(240))
                 host.layout(0, 0, 360, 240)
+                shadowOf(Looper.getMainLooper()).idleFor(500L, TimeUnit.MILLISECONDS)
 
                 val loader = checkNotNull(engine.privateField("liveFlowImageLoader") as EpubFlowImageLoader?)
                 @Suppress("UNCHECKED_CAST")
@@ -351,6 +352,12 @@ class EpubReflowEngineTest {
                         textRebinds.incrementAndGet()
                     }
                 })
+                assertTrue("fixture needs an adjacent page-shot target", flowView.pageCount() > 1)
+                flowView.recycleCachedTexturesForTest()
+                flowView.preCachePageTexturesForTest()
+                shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+                val warmFront = checkNotNull(flowView.privateField("cachedFrontBitmap") as Bitmap?)
+                val warmRevealed = checkNotNull(flowView.privateField("cachedRevealedBitmap") as Bitmap?)
                 val stableBounds = Rect(0, 0, 800, 1200)
                 val fullPagePixels = EpubAsyncImageResult(
                     layoutStart = 0,
@@ -366,6 +373,14 @@ class EpubReflowEngineTest {
                 assertTrue(
                     "same-size full-page pixels must rebind the TextView display owner",
                     textRebinds.get() > 0,
+                )
+                assertTrue(
+                    "same-geometry pixel delivery must preserve the warm current-page identity",
+                    flowView.privateField("cachedFrontBitmap") === warmFront && !warmFront.isRecycled,
+                )
+                assertTrue(
+                    "same-geometry pixel delivery must preserve the warm target-page identity",
+                    flowView.privateField("cachedRevealedBitmap") === warmRevealed && !warmRevealed.isRecycled,
                 )
 
                 textRebinds.set(0)
@@ -5486,6 +5501,12 @@ class EpubReflowEngineTest {
 
     private fun EpubFlowView.recycleCachedTexturesForTest() {
         EpubFlowView::class.java.getDeclaredMethod("recycleCachedTextures")
+            .apply { isAccessible = true }
+            .invoke(this)
+    }
+
+    private fun EpubFlowView.preCachePageTexturesForTest() {
+        EpubFlowView::class.java.getDeclaredMethod("preCachePageTextures")
             .apply { isAccessible = true }
             .invoke(this)
     }
