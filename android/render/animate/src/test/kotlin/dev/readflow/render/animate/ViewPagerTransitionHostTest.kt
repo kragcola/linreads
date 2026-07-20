@@ -1,6 +1,7 @@
 package dev.readflow.render.animate
 
 import android.app.Application
+import android.app.Activity
 import android.content.Context
 import android.net.Uri
 import android.os.Looper
@@ -33,6 +34,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Robolectric
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
@@ -203,6 +205,8 @@ class ViewPagerTransitionHostTest {
         val engine = FakePagedEngine(context, initialPageCount = 2)
         val host = ViewPagerTransitionHost(context, TransitionType.NONE)
         val pager = host.hostView() as ViewPager2
+        val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+        activity.addContentView(pager, ViewGroup.LayoutParams(720, 1280))
 
         host.bind(engine)
         runCurrent()
