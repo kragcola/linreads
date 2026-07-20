@@ -214,7 +214,22 @@ class ViewPagerTransitionHost(
         if (widthPx == lastReportedViewportWidth && heightPx == lastReportedViewportHeight) return
         lastReportedViewportWidth = widthPx
         lastReportedViewportHeight = heightPx
-        pagedEngine?.setViewportSize(widthPx, heightPx)
+        val activeEngine = pagedEngine ?: return
+        val pageCountBefore = activeEngine.pageCount.value
+        activeEngine.setViewportSize(widthPx, heightPx)
+        if (activeEngine.pageCount.value == pageCountBefore) {
+            // A viewport repack can replace the active page's child views without changing the
+            // page count. StateFlow then emits nothing, so ViewPager2 must rebind on the next frame
+            // after its current layout traversal has finished.
+            pager.post {
+                if (pagedEngine === activeEngine &&
+                    lastReportedViewportWidth == widthPx &&
+                    lastReportedViewportHeight == heightPx
+                ) {
+                    pager.adapter?.notifyDataSetChanged()
+                }
+            }
+        }
     }
 
     private fun clampCurrentItemTo(pageCount: Int) {

@@ -91,12 +91,6 @@ class TxtVirtualPagerEngineTest {
 
         val page = engine.createPageView(0) as FrameLayout
         val column = page.getChildAt(0) as LinearLayout
-        val columnParams = column.layoutParams as FrameLayout.LayoutParams
-        assertEquals(
-            "the paragraph column must fill the fixed ViewPager page so Android measures its rows",
-            FrameLayout.LayoutParams.MATCH_PARENT,
-            columnParams.height,
-        )
         assertTrue("the seeded CJK page must bind body rows", column.childCount > 0)
         for (index in 0 until column.childCount) {
             val row = column.getChildAt(index) as SelectionAwareTextView

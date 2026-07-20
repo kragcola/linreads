@@ -3,6 +3,7 @@ package dev.readflow.render.animate
 import android.app.Application
 import android.content.Context
 import android.net.Uri
+import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import androidx.recyclerview.widget.RecyclerView
@@ -33,6 +34,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -192,6 +194,40 @@ class ViewPagerTransitionHostTest {
         val reportsAfterUnbind = engine.viewportReports.size
         pager.layout(0, 0, 300, 500)
         assertEquals(reportsAfterUnbind, engine.viewportReports.size)
+    }
+
+    @Test
+    fun `paged host rebinds page content after equal-count viewport layout`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = FakePagedEngine(context, initialPageCount = 2)
+        val host = ViewPagerTransitionHost(context, TransitionType.NONE)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(engine)
+        runCurrent()
+        val adapter = checkNotNull(pager.adapter)
+        var refreshCount = 0
+        adapter.registerAdapterDataObserver(object : RecyclerView.AdapterDataObserver() {
+            override fun onChanged() {
+                refreshCount += 1
+            }
+        })
+
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(1280, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 720, 1280)
+        shadowOf(Looper.getMainLooper()).idle()
+        runCurrent()
+
+        assertEquals(
+            "equal page count still requires a holder rebind after viewport-dependent content changes",
+            1,
+            refreshCount,
+        )
+        host.unbind()
     }
 
     private class FakePagedEngine(
