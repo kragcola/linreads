@@ -318,7 +318,7 @@ class EpubReflowEngineTest {
     }
 
     @Test
-    fun `full page PIXELS_ONLY callback rebinds TextView without discarding warm page shots`() =
+    fun `PIXELS_ONLY callbacks coalesce TextView rebinds without discarding warm page shots`() =
         runTest(dispatcher) {
             Dispatchers.setMain(dispatcher)
             val epub = tempDir.newFile("flow-image-result-routing.epub")
@@ -397,10 +397,31 @@ class EpubReflowEngineTest {
 
                 textRebinds.set(0)
                 callback(fullPagePixels.copy(destination = "inline.png", isFullPage = false))
+                callback(
+                    fullPagePixels.copy(
+                        destination = "inline-2.png",
+                        layoutStart = 1,
+                        isFullPage = false,
+                    ),
+                )
                 assertEquals(
-                    "known inline PIXELS_ONLY must retain the incremental page-shot path",
+                    "same-frame inline pixel installs must wait for one coalesced display-list rebind",
                     0,
                     textRebinds.get(),
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(20L, TimeUnit.MILLISECONDS)
+                assertEquals(
+                    "same-size inline pixels must rebuild the TextView display owner exactly once",
+                    1,
+                    textRebinds.get(),
+                )
+                assertTrue(
+                    "inline pixel delivery must preserve the warm current-page identity",
+                    flowView.privateField("cachedFrontBitmap") === warmFront && !warmFront.isRecycled,
+                )
+                assertTrue(
+                    "inline pixel delivery must preserve the warm target-page identity",
+                    flowView.privateField("cachedRevealedBitmap") === warmRevealed && !warmRevealed.isRecycled,
                 )
             } finally {
                 engine.close()

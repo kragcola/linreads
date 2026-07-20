@@ -557,7 +557,7 @@ class EpubFlowSpannableTest {
     }
 
     @Test
-    fun `full page PIXELS_ONLY result requires TextView rebind while inline pixels stay incremental`() {
+    fun `all PIXELS_ONLY results require TextView rebind`() {
         val stableBounds = Rect(0, 0, 800, 1200)
         val fullPagePixels = EpubAsyncImageResult(
             layoutStart = 42,
@@ -581,8 +581,8 @@ class EpubFlowSpannableTest {
             "same-size full-page bitmap must replace the transparent TextView display-list owner",
             fullPagePixels.requiresTextRebind,
         )
-        assertFalse(
-            "known inline same-size pixels should keep the incremental page-shot refresh path",
+        assertTrue(
+            "same-size inline pixels must also replace the transparent TextView display-list owner",
             inlinePixels.requiresTextRebind,
         )
         assertTrue(changedGeometry.requiresTextRebind)
