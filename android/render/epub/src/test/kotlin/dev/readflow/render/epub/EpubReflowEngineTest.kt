@@ -328,14 +328,19 @@ class EpubReflowEngineTest {
             writeEpub(epub, "OEBPS/ch1.xhtml" to "<html><body>$paragraphs</body></html>")
             val context = RuntimeEnvironment.getApplication() as Application
             val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+            val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
             try {
                 engine.openBook(Uri.fromFile(epub))
                 engine.setMode(ReadingMode.PAGED)
                 val host = engine.createView() as FrameLayout
                 val flowView = host.getChildAt(0) as EpubFlowView
+                activity.addContentView(host, ViewGroup.LayoutParams(360, 240))
                 host.measure(exactly(360), exactly(240))
                 host.layout(0, 0, 360, 240)
                 shadowOf(Looper.getMainLooper()).idleFor(500L, TimeUnit.MILLISECONDS)
+                host.measure(exactly(360), exactly(240))
+                host.layout(0, 0, 360, 240)
+                shadowOf(Looper.getMainLooper()).idle()
 
                 val loader = checkNotNull(engine.privateField("liveFlowImageLoader") as EpubFlowImageLoader?)
                 @Suppress("UNCHECKED_CAST")
@@ -370,9 +375,16 @@ class EpubReflowEngineTest {
 
                 assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, fullPagePixels.kind)
                 callback(fullPagePixels)
+                callback(fullPagePixels.copy(destination = "plate-2.png", layoutStart = 1))
+                assertEquals(
+                    "same-frame full-page pixel installs must wait for one coalesced display-list rebind",
+                    0,
+                    textRebinds.get(),
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(20L, TimeUnit.MILLISECONDS)
                 assertTrue(
                     "same-size full-page pixels must rebind the TextView display owner",
-                    textRebinds.get() > 0,
+                    textRebinds.get() == 1,
                 )
                 assertTrue(
                     "same-geometry pixel delivery must preserve the warm current-page identity",
