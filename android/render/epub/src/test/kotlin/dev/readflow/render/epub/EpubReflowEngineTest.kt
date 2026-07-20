@@ -2887,6 +2887,7 @@ class EpubReflowEngineTest {
         engine.openBook(Uri.fromFile(epub))
         val host = engine.createView() as FrameLayout
         val flowView = host.getChildAt(0) as EpubFlowView
+        val pageShotBudget = checkNotNull(engine.privateField("pageShotBudget") as PageShotBudget?)
         // Instant reveal so child TextView paint is not held at alpha=0 after decode settle.
         flowView.animateChapterReveal = false
         activity.addContentView(host, ViewGroup.LayoutParams(viewportWidth, viewportHeight))
@@ -2967,6 +2968,10 @@ class EpubReflowEngineTest {
 
         flowView.goToPage(headingPageIndex)
         shadowOf(Looper.getMainLooper()).idle()
+        // goToPage may warm all three page-shot slots. This assertion owns a separate direct
+        // snapshot, so release speculative owners first and release its budget lease explicitly.
+        flowView.recycleCachedTexturesForTest()
+        shadowOf(Looper.getMainLooper()).idle()
         val sampleTop = (precedingBottomPainted + 2).coerceIn(padTop + 2, viewportHeight - 2)
         val sampleLeft = viewportWidth / 4
         val sampleRight = (viewportWidth * 3) / 4
@@ -3001,12 +3006,15 @@ class EpubReflowEngineTest {
             )
         } finally {
             headingShot.recycle()
-            headingSnap.recycle()
+            pageShotBudget.release(headingSnap)
+            if (!headingSnap.isRecycled) headingSnap.recycle()
         }
 
         flowView.goToPage(imagePageIndex)
         shadowOf(Looper.getMainLooper()).idle()
         flowView.tryRevealWhenStable()
+        shadowOf(Looper.getMainLooper()).idle()
+        flowView.recycleCachedTexturesForTest()
         shadowOf(Looper.getMainLooper()).idle()
         val imagePageShot = Bitmap.createBitmap(viewportWidth, viewportHeight, Bitmap.Config.ARGB_8888).also {
             host.draw(Canvas(it))
@@ -3083,7 +3091,8 @@ class EpubReflowEngineTest {
             assertEquals(1, text.getSpans(0, text.length, AsyncDrawableSpan::class.java).size)
         } finally {
             imagePageShot.recycle()
-            imagePageSnap.recycle()
+            pageShotBudget.release(imagePageSnap)
+            if (!imagePageSnap.isRecycled) imagePageSnap.recycle()
         }
         engine.close()
     }
@@ -5473,6 +5482,12 @@ class EpubReflowEngineTest {
         EpubFlowView::class.java.getDeclaredField(name)
             .apply { isAccessible = true }
             .set(this, value)
+    }
+
+    private fun EpubFlowView.recycleCachedTexturesForTest() {
+        EpubFlowView::class.java.getDeclaredMethod("recycleCachedTextures")
+            .apply { isAccessible = true }
+            .invoke(this)
     }
 
     private fun EpubFlowView.takeBoundaryPreviewForTest(forward: Boolean): BoundaryPagePreview? =
