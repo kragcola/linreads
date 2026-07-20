@@ -2971,6 +2971,15 @@ internal class EpubFlowView(
         val geometry = EpubLayoutLineGeometry(layout)
         val aligned = activePageWindow?.takeIf { it.topPx == scrollY }
         val metadata = pageLayoutMetadataFor(layout)
+        val canonicalIndex = canonicalPageIndexForWindow(aligned)
+        if (canonicalIndex >= 0) {
+            // Canonical pages already include heading keep-together, widow/orphan handling, and
+            // separator-only filtering. Recomputing the reverse window with the looser dynamic
+            // algorithm is not symmetric: repeated heading/image round trips can shrink the live
+            // window until page clipping hides the text and then the image. Dynamic calculation is
+            // reserved for FREE_REST and raw tail windows that are not members of [paged].
+            return paged.getOrNull(canonicalIndex + if (forward) 1 else -1)
+        }
         return if (forward) {
             val startLine = aligned?.endLineExclusive ?: (lastFullyVisibleLine(layout, scrollY) + 1)
             val headingLines = metadata?.headingLines ?: headingLineSet(layout, f)

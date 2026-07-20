@@ -1644,6 +1644,52 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `repeated heading image round trips keep the canonical live page visible`() {
+        val fixture = visibleHeadingImageContinuationFixture()
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.NONE
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            val baseline = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                repeat(6) { round ->
+                    assertTrue("round=$round forward turn must reach the image page", view.goToAdjacentPage(1))
+                    assertEquals(fixture.imagePageIndex, view.currentPageIndex())
+                    assertEquals(
+                        "round=$round forward turn must park the canonical image window",
+                        pages[fixture.imagePageIndex],
+                        view.privateField("activePageWindow"),
+                    )
+
+                    assertTrue("round=$round backward turn must return to the heading page", view.goToAdjacentPage(-1))
+                    assertEquals(fixture.headingPageIndex, view.currentPageIndex())
+                    assertEquals(
+                        "round=$round backward turn must park the canonical heading window",
+                        pages[fixture.headingPageIndex],
+                        view.privateField("activePageWindow"),
+                    )
+                }
+
+                val settled = view.drawAsScrolledChildToBitmapForTest()
+                try {
+                    assertTrue(
+                        "repeated canonical round trips must preserve the same live heading text and image preview",
+                        bitmapsHaveSamePixels(baseline, settled),
+                    )
+                } finally {
+                    settled.recycle()
+                }
+            } finally {
+                baseline.recycle()
+            }
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `conversion snapshot suppresses live synthetic boundary image until cleared`() {
         val fixture = visibleHeadingImageContinuationFixture()
         val view = fixture.view

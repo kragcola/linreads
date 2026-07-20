@@ -225,7 +225,6 @@ class TxtVirtualPagerEngine(
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT,
                     LinearLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.CENTER_HORIZONTAL.toFloat(),
                 ).apply { gravity = Gravity.CENTER_HORIZONTAL }
                 maxWidth = maxLineWidthPx
                 setPadding((28 * density).toInt(), (10 * density).toInt(), (28 * density).toInt(), (10 * density).toInt())
@@ -615,7 +614,6 @@ class TxtVirtualPagerEngine(
                     layoutParams = LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT,
-                        Gravity.CENTER_HORIZONTAL.toFloat(),
                     ).apply { gravity = Gravity.CENTER_HORIZONTAL }
                     maxWidth = maxLineWidthPx
                     setPadding(

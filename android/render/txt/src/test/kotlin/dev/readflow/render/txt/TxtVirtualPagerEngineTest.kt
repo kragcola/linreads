@@ -6,6 +6,7 @@ import android.text.Spannable
 import android.util.TypedValue
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.ChapterInfo
@@ -68,6 +69,53 @@ class TxtVirtualPagerEngineTest {
             0.001f,
         )
         assertEquals("source_han", engine.privateField("currentFontId"))
+    }
+
+    @Test
+    fun `paged CJK rows are unweighted and measure to visible bounds`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-cjk-page-", suffix = ".txt").toFile()
+        file.writeText(
+            listOf(
+                "围城（节选）\n作者：钱钟书",
+                "红海早过了，船在印度洋面上开驶，但是太阳依然不饶人地迟落早起。",
+                "方鸿渐从船舱的舷窗里看这种情况，觉得眼前的海景好得不落实。",
+            ).joinToString("\n\n"),
+            charset = StandardCharsets.UTF_8,
+        )
+        val engine = TxtVirtualPagerEngine(context)
+        engine.setViewportSize(720, 1280)
+        engine.openBook(Uri.fromFile(file))
+        engine.setMode(ReadingMode.PAGED)
+
+        val page = engine.createPageView(0) as FrameLayout
+        val column = page.getChildAt(0) as LinearLayout
+        assertTrue("the seeded CJK page must bind body rows", column.childCount > 0)
+        for (index in 0 until column.childCount) {
+            val row = column.getChildAt(index) as SelectionAwareTextView
+            val params = row.layoutParams as LinearLayout.LayoutParams
+            assertEquals(
+                "WRAP_CONTENT paragraph rows must not consume vertical weight and collapse under ViewPager measure",
+                0f,
+                params.weight,
+                0f,
+            )
+        }
+
+        page.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(720, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(1280, android.view.View.MeasureSpec.EXACTLY),
+        )
+        page.layout(0, 0, 720, 1280)
+        assertTrue("the paged CJK column must have visible bounds", column.width > 0 && column.height > 0)
+        assertTrue(
+            "every bound paragraph must have visible bounds",
+            (0 until column.childCount).all { index ->
+                val row = column.getChildAt(index)
+                row.width > 0 && row.height > 0
+            },
+        )
     }
 
     @Test
