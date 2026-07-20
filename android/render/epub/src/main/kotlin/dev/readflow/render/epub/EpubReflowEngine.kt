@@ -970,6 +970,37 @@ class EpubReflowEngine private constructor(
         }
     }
 
+    private fun markFlowViewPrepared(view: EpubFlowView) {
+        view.animateChapterReveal = false
+        view.pageTexturePrecacheEnabled = false
+        view.isEnabled = false
+        view.isClickable = false
+        view.isFocusable = false
+        view.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+        view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        view.textView.setTextIsSelectable(false)
+        view.textView.isEnabled = false
+        view.textView.isFocusable = false
+        view.textView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+    }
+
+    private fun markFlowViewRetained(view: EpubFlowView) {
+        markFlowViewPrepared(view)
+        view.visibility = View.INVISIBLE
+    }
+
+    private fun markFlowViewActive(view: EpubFlowView) {
+        view.visibility = View.VISIBLE
+        view.isEnabled = true
+        view.isFocusable = true
+        view.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+        view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        view.textView.isEnabled = true
+        view.textView.setTextIsSelectable(true)
+        view.textView.isFocusable = true
+        view.textView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+    }
+
     private fun configureFlowView(view: EpubFlowView, palette: ReaderPalette) {
         view.mode = if (_pagingKind.value == PagingKind.PAGED) EpubFlowView.Mode.PAGED else EpubFlowView.Mode.SCROLL
         view.flipStyle = flipStyle
@@ -1374,6 +1405,18 @@ class EpubReflowEngine private constructor(
             view.rejectBoundaryPreview(forward, sourceChapterGeneration)
             return
         }
+        val sourceTargets = boundaryPreviewTargets.values.filter { target ->
+            target.sourceSpine == sourceSpine &&
+                target.sourcePreviewGeneration == sourceChapterGeneration
+        }
+        if (sourceTargets.any { target -> target.forward == forward }) return
+        if (sourceTargets.isNotEmpty()) {
+            val oldTargetStillRelevant = sourceTargets.any { target ->
+                view.shouldPrewarmBoundaryPreview(target.forward)
+            }
+            if (oldTargetStillRelevant && !required) return
+            view.evictSpeculativePageShotsForPinnedAllocation(preserveBoundaryDirection = forward)
+        }
         if (!view.preparePageShotBudgetForBoundaryPreview(forward, required)) {
             view.rejectBoundaryPreview(forward, sourceChapterGeneration)
             return
@@ -1510,20 +1553,10 @@ class EpubReflowEngine private constructor(
             },
         ).also {
             configureFlowView(it, palette)
-            it.animateChapterReveal = false
-            it.pageTexturePrecacheEnabled = false
             // Kept behind the opaque live reader. A zero-alpha view may be skipped by ViewRoot and
             // never receive the pre-draw that closes the async-image stability gate.
             it.alpha = 1f
-            it.isEnabled = false
-            it.isClickable = false
-            it.isFocusable = false
-            it.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
-            it.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-            it.textView.setTextIsSelectable(false)
-            it.textView.isEnabled = false
-            it.textView.isFocusable = false
-            it.textView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            markFlowViewPrepared(it)
         }
         host.addView(
             previewView,
@@ -1654,37 +1687,101 @@ class EpubReflowEngine private constructor(
     }
 
     private fun commitBoundaryPreview(preview: BoundaryPagePreview) {
-        if (!canCommitBoundaryPreview(preview)) return
-        val target = boundaryPreviewTargets.remove(preview.token) ?: return
-        invalidateBoundaryPreviewState(clearViewSlots = true)
+        if (!canCommitBoundaryPreview(preview)) {
+            preview.reverseBitmap?.let(::recycleDetachedBoundaryPageShot)
+            return
+        }
+        val target = boundaryPreviewTargets.remove(preview.token) ?: run {
+            preview.reverseBitmap?.let(::recycleDetachedBoundaryPageShot)
+            return
+        }
         val oldView = flowView ?: run {
+            preview.reverseBitmap?.let(::recycleDetachedBoundaryPageShot)
             disposeBoundaryPreviewTarget(target)
             return
         }
         val host = flowHost ?: run {
+            preview.reverseBitmap?.let(::recycleDetachedBoundaryPageShot)
             disposeBoundaryPreviewTarget(target)
             return
         }
-        liveFlowImageLoader?.releaseAll()
-        runCatching { AsyncDrawableScheduler.unschedule(oldView.textView) }
-        oldView.dispose()
-        (oldView.parent as? ViewGroup)?.removeView(oldView)
+        val oldLoader = liveFlowImageLoader
+        val oldFlow = flowCurrentFlow
+        val oldSpine = flowSpineIndex
+        invalidateBoundaryPreviewState(clearViewSlots = true)
+
+        val reverseBitmap = preview.reverseBitmap?.takeUnless(Bitmap::isRecycled)
+        val canRetainOld = reverseBitmap != null && oldLoader != null && oldFlow != null && oldSpine >= 0
+        if (canRetainOld) {
+            oldView.prepareForBoundaryReuse()
+            markFlowViewRetained(oldView)
+        } else {
+            preview.reverseBitmap?.let(::recycleDetachedBoundaryPageShot)
+            oldLoader?.releaseAll()
+            runCatching { AsyncDrawableScheduler.unschedule(oldView.textView) }
+            oldView.dispose()
+            (oldView.parent as? ViewGroup)?.removeView(oldView)
+        }
 
         flowView = target.view
         liveFlowImageLoader = target.loader
         flowSpineIndex = target.targetSpine
         flowCurrentFlow = target.targetFlow
         bindActiveFlowView(target.view)
-        target.view.isEnabled = true
-        target.view.isFocusable = true
-        target.view.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
-        target.view.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
-        target.view.textView.isEnabled = true
-        target.view.textView.setTextIsSelectable(true)
-        target.view.textView.isFocusable = true
-        target.view.textView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        markFlowViewActive(target.view)
         host.bringChildToFront(target.view)
+        if (canRetainOld) {
+            retainOutgoingBoundaryTarget(
+                activeView = target.view,
+                oldView = oldView,
+                oldLoader = checkNotNull(oldLoader),
+                oldFlow = checkNotNull(oldFlow),
+                oldSpine = oldSpine,
+                committedForward = target.forward,
+                bitmap = checkNotNull(reverseBitmap),
+            )
+        }
         target.view.activatePreparedChapter()
+    }
+
+    private fun retainOutgoingBoundaryTarget(
+        activeView: EpubFlowView,
+        oldView: EpubFlowView,
+        oldLoader: EpubFlowImageLoader,
+        oldFlow: EpubChapterFlow,
+        oldSpine: Int,
+        committedForward: Boolean,
+        bitmap: Bitmap,
+    ) {
+        val token = ++nextBoundaryPreviewToken
+        val reverseForward = !committedForward
+        val sourceGeneration = activeView.boundaryPreviewGenerationToken()
+        boundaryPreviewTargets[token] = BoundaryPreviewTarget(
+            generation = boundaryPreviewGeneration,
+            sourceSpine = flowSpineIndex,
+            sourcePreviewGeneration = sourceGeneration,
+            targetSpine = oldSpine,
+            forward = reverseForward,
+            targetFlow = oldFlow,
+            view = oldView,
+            loader = oldLoader,
+        )
+        val accepted = activeView.offerBoundaryPreview(
+            BoundaryPagePreview(
+                token = token,
+                forward = reverseForward,
+                sourceChapterGeneration = sourceGeneration,
+                bitmap = bitmap,
+            ),
+        )
+        if (!accepted) {
+            boundaryPreviewTargets.remove(token)?.let(::disposeBoundaryPreviewTarget)
+        }
+    }
+
+    private fun recycleDetachedBoundaryPageShot(bitmap: Bitmap) {
+        pageShotBudget.release(bitmap)
+        if (!bitmap.isRecycled) bitmap.recycle()
     }
 
     private fun canCommitBoundaryPreview(preview: BoundaryPagePreview): Boolean {

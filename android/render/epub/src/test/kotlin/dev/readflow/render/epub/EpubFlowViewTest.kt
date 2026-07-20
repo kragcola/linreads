@@ -35,6 +35,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -717,6 +718,27 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `boundary turn without a commit owner discards both transferred page shots`() {
+        val discarded = mutableListOf<BoundaryPagePreview>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE).apply {
+            onBoundaryTurnDiscarded = discarded::add
+        }
+        view.goToLastPage()
+        val previewBitmap = view.offerReadyBoundaryPreviewForTest(forward = true, token = 501L)
+
+        try {
+            assertTrue(view.startDiscreteBoundaryTurn(1))
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals("an unowned commit must become one discard", 1, discarded.size)
+            assertTrue("the unowned target page-shot must be recycled", previewBitmap.isRecycled)
+            assertNull("an unowned target must not remain as a continuity cover", view.privateField("conversionSnapshotDrawable"))
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `warmed discrete boundary turn transfers outgoing identity without viewport recapture`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         view.goToLastPage()
@@ -870,6 +892,8 @@ class EpubFlowViewTest {
                 "a boundary tap or key turn must use the same local PAPER drawable as a drag",
                 view.privateField("curlDrawable") as PageCurlDrawable?,
             )
+            val outgoing = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?)
+                .privateBitmap("frontBitmap")
 
             shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
 
@@ -880,6 +904,13 @@ class EpubFlowViewTest {
             )
             assertFalse("the transferred target must remain alive", revealed.isRecycled)
             assertEquals("the boundary transaction must publish exactly once", 1, commits.size)
+            val commit = commits.single() as BoundaryPagePreview
+            assertSame(
+                "the reverse preview must receive the renderer-owned outgoing shot without recapture",
+                outgoing,
+                commit.reverseBitmap,
+            )
+            assertFalse("the transferred outgoing shot must remain alive", outgoing.isRecycled)
         } finally {
             view.dispose()
         }

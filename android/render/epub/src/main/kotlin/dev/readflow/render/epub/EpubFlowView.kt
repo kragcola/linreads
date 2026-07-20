@@ -2822,10 +2822,23 @@ internal class EpubFlowView(
             return
         }
         if (!pageTurnAnimated) {
+            val commitCallback = onBoundaryTurnCommitted ?: run {
+                recyclePageShot(preview.bitmap)
+                onBoundaryTurnDiscarded?.invoke(preview)
+                interactiveTurnState = InteractiveTurnState.NONE
+                return
+            }
+            val fromWindow = activePageWindow?.takeIf { it.topPx == scrollY }
+            val reverseBitmap = takeCachedFrontForBoundaryTurn(
+                fromPage = currentPage,
+                fromTop = scrollY,
+                fromWindow = fromWindow,
+            ) ?: snapshotViewport(PageShotLeaseKind.PINNED, "active.boundary.front")
             showConversionSnapshot(preview.bitmap)
             boundaryContinuityCover = true
             interactiveTurnState = InteractiveTurnState.NONE
-            onBoundaryTurnCommitted?.invoke(preview)
+            preview.reverseBitmap = reverseBitmap
+            commitCallback.invoke(preview)
             return
         }
         activeBoundaryPreview = preview
@@ -4570,14 +4583,17 @@ internal class EpubFlowView(
         val preview = activeBoundaryPreview ?: return
         activeBoundaryPreview = null
         interactiveTurnState = InteractiveTurnState.NONE
-        if (commit && canCommitBoundaryTurn?.invoke(preview) != false) {
-            val revealed = slideDrawable?.takeRevealedBitmap() ?: curlDrawable?.takeRevealedBitmap()
-            if (revealed != null) {
+        val commitCallback = onBoundaryTurnCommitted
+        if (commit && commitCallback != null && canCommitBoundaryTurn?.invoke(preview) != false) {
+            val turnBitmaps = takeActiveFlipBitmaps()
+            if (turnBitmaps != null) {
+                val (front, revealed) = turnBitmaps
                 showConversionSnapshot(revealed)
                 boundaryContinuityCover = true
                 clearFlipOverlay()
                 curlOrigin = null
-                onBoundaryTurnCommitted?.invoke(preview)
+                preview.reverseBitmap = front
+                commitCallback.invoke(preview)
                 return
             }
         }
@@ -4725,6 +4741,15 @@ internal class EpubFlowView(
         reportTopOffset(force = true)
         preCachePageTextures()
         onPageSettled?.invoke()
+    }
+
+    /** Retires active-only page shots while preserving this laid-out chapter for an immediate reverse. */
+    fun prepareForBoundaryReuse() {
+        if (disposed) return
+        animateChapterReveal = false
+        pageTexturePrecacheEnabled = false
+        clearConversionSnapshot()
+        recycleCachedTextures()
     }
 
     private fun reportTopOffset(force: Boolean = false) {
@@ -5386,7 +5411,10 @@ internal data class BoundaryPagePreview(
     val forward: Boolean,
     val sourceChapterGeneration: Long,
     val bitmap: Bitmap,
-)
+) {
+    /** Outgoing page-shot transferred only during a successful commit callback. */
+    var reverseBitmap: Bitmap? = null
+}
 
 private sealed interface ConversionSnapshotCapture {
     data object NoCover : ConversionSnapshotCapture

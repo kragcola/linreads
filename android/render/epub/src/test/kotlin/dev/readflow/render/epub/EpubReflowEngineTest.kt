@@ -1057,8 +1057,13 @@ class EpubReflowEngineTest {
 
             engine.goToAdjacentPage(1)
 
-            assertEquals("the committed chapter must have one active flow surface", 1, host.childCount)
-            val activeView = host.getChildAt(0) as EpubFlowView
+            assertEquals(
+                "commit must retain the outgoing chapter as the prepared reverse surface",
+                2,
+                host.childCount,
+            )
+            val activeView = engine.privateField("flowView") as EpubFlowView
+            assertSame("the promoted chapter must be the visible front child", activeView, host.getChildAt(1))
             assertSame(
                 "commit must promote the exact adjacent renderer that produced the accepted landing preview",
                 preparedView,
@@ -1083,8 +1088,79 @@ class EpubReflowEngineTest {
                 View.IMPORTANT_FOR_ACCESSIBILITY_AUTO,
                 activeView.importantForAccessibility,
             )
+            assertFalse("the retained outgoing surface must stop accepting input", outgoingView.isEnabled)
+            assertEquals(
+                "the retained outgoing surface must stop drawing behind the active image-heavy chapter",
+                View.INVISIBLE,
+                outgoingView.visibility,
+            )
+            assertEquals(
+                "the retained outgoing surface must stay out of the accessibility tree",
+                View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+                outgoingView.importantForAccessibility,
+            )
+            val reversePreview = awaitBoundaryPreview(activeView, forward = false)
+            val reverseCommit = requireNotNull(activeView.takeBoundaryPreviewForTest(forward = false))
+            assertEquals(reversePreview.token, reverseCommit.token)
+            requireNotNull(activeView.onBoundaryTurnCommitted).invoke(reverseCommit)
+            assertSame(
+                "an immediate reverse commit must promote the original outgoing surface without rebuilding it",
+                outgoingView,
+                engine.privateField("flowView"),
+            )
+            assertEquals("reverse promotion must make the retained surface visible again", View.VISIBLE, outgoingView.visibility)
+            assertEquals(
+                "the immediate reverse promotion must not trigger another full image decode",
+                decodeCountBeforeCommit,
+                EpubImageDecodeProbe.fullDecodeTotal(),
+            )
         } finally {
             preparedView.pendingDecodesProvider = { false }
+            engine.close()
+        }
+    }
+
+    @Test
+    fun `retained reverse surface suppresses a speculative third chapter renderer`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("boundary-two-surface-cap.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>First short chapter.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Middle short chapter.</p></body></html>",
+            "OEBPS/ch3.xhtml" to "<html><body><p>Third short chapter.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.NONE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val firstView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+
+        try {
+            awaitBoundaryPreview(firstView, forward = true)
+            engine.goToAdjacentPage(1)
+            awaitCondition("the prepared middle chapter must become active") {
+                (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1
+            }
+            shadowOf(Looper.getMainLooper()).idleFor(500L, TimeUnit.MILLISECONDS)
+
+            @Suppress("UNCHECKED_CAST")
+            val targets = engine.privateField("boundaryPreviewTargets") as Map<Long, Any>
+            @Suppress("UNCHECKED_CAST")
+            val jobs = engine.privateField("boundaryPreviewJobs") as Map<Boolean, Any>
+            @Suppress("UNCHECKED_CAST")
+            val sessions = engine.privateField("boundaryPreviewSessions") as Map<Boolean, Any>
+            assertEquals("active plus one retained prepared surface is the hard View bound", 2, host.childCount)
+            assertEquals("only the retained reverse target may remain", 1, targets.size)
+            assertFalse("a third chapter must not start speculative parsing", jobs.containsKey(true))
+            assertFalse("a third chapter must not install a speculative renderer", sessions.containsKey(true))
+        } finally {
             engine.close()
         }
     }
