@@ -6,6 +6,51 @@ import org.junit.jupiter.api.Test
 class EpubImageDecoderTest {
 
     @Test
+    fun `motion quality reduces decode work quadratically`() {
+        val display = epubImageDecodeBudget(
+            targetWidth = 1600,
+            targetHeight = 2400,
+            quality = EpubImageRenderQuality.DISPLAY,
+        )
+        val motion = epubImageDecodeBudget(
+            targetWidth = 1600,
+            targetHeight = 2400,
+            quality = EpubImageRenderQuality.MOTION,
+        )
+        val rapid = epubImageDecodeBudget(
+            targetWidth = 1600,
+            targetHeight = 2400,
+            quality = EpubImageRenderQuality.RAPID,
+        )
+
+        assertEquals(EpubImageDecodeBudget(maxSide = 2400, maxPixels = 3_840_000), display)
+        assertEquals(EpubImageDecodeBudget(maxSide = 1800, maxPixels = 2_160_000), motion)
+        assertEquals(EpubImageDecodeBudget(maxSide = 1200, maxPixels = 960_000), rapid)
+    }
+
+    @Test
+    fun `quality policy reserves display pixels for the settled current page`() {
+        val currentPage = listOf(100 until 200)
+
+        assertEquals(
+            EpubImageRenderQuality.MOTION,
+            epubImageRenderQualityForOccurrence(150, currentPage, isCurrentChapter = true, visualMotionActive = false),
+        )
+        assertEquals(
+            EpubImageRenderQuality.MOTION,
+            epubImageRenderQualityForOccurrence(250, currentPage, isCurrentChapter = true, visualMotionActive = false),
+        )
+        assertEquals(
+            EpubImageRenderQuality.RAPID,
+            epubImageRenderQualityForOccurrence(150, currentPage, isCurrentChapter = true, visualMotionActive = true),
+        )
+        assertEquals(
+            EpubImageRenderQuality.MOTION,
+            epubImageRenderQualityForOccurrence(150, currentPage, isCurrentChapter = false, visualMotionActive = false),
+        )
+    }
+
+    @Test
     fun `sample size keeps decoded image inside side and pixel budgets`() {
         assertEquals(
             1,

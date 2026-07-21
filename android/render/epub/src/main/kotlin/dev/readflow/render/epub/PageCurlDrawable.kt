@@ -39,6 +39,11 @@ internal class PageCurlDrawable(
     },
 ) : Drawable() {
 
+    internal data class RenderStats(
+        val meshDraws: Int,
+        val bentStripBitmapDraws: Int,
+    )
+
     private var frontBitmap: Bitmap? = frontBitmap
     private var revealedBitmap: Bitmap? = revealedBitmap
 
@@ -71,8 +76,18 @@ internal class PageCurlDrawable(
     private val bitmapDst = Rect()
     private val shadeRect = Rect()
     private val gradientRect = Rect()
+    private val meshVertices = FloatArray((MESH_COLUMNS + 1) * MESH_ROWS * 4)
+    private var meshDrawsInLastFrame = 0
+    private var bentStripBitmapDrawsInLastFrame = 0
+
+    internal fun renderStatsForTest(): RenderStats = RenderStats(
+        meshDraws = meshDrawsInLastFrame,
+        bentStripBitmapDraws = bentStripBitmapDrawsInLastFrame,
+    )
 
     override fun draw(canvas: Canvas) {
+        meshDrawsInLastFrame = 0
+        bentStripBitmapDrawsInLastFrame = 0
         val save = canvas.save()
         canvas.translate(bounds.left.toFloat(), bounds.top.toFloat())
         val width = viewportW.coerceAtLeast(0)
@@ -138,7 +153,6 @@ internal class PageCurlDrawable(
             (maxBendWidth * HALF_PI_FIXED / TABLE_SCALE).coerceAtLeast(1)
         val compression = sourceWidth - dstWidth
 
-        var bentDestinationWidth = min(compression, maxBendWidth)
         var bentSrcStart: Int
         var bentSrcEnd: Int
         var bentDstStart: Int
@@ -158,7 +172,6 @@ internal class PageCurlDrawable(
             flatEnd = bentSrcStart
             startAngle = 0
             endAngle = SRC_TABLE[tableIndex]
-            bentDestinationWidth = maxBendWidth
         } else if (dstWidth >= maxBendWidth) {
             bentSrcStart = dstWidth - maxBendWidth
             bentSrcEnd = bentSrcStart + maxBentSourceWidth
@@ -168,7 +181,6 @@ internal class PageCurlDrawable(
             startAngle = 0
             endAngle = HALF_PI_FIXED
         } else {
-            bentDestinationWidth = dstWidth
             bentSrcStart = 0
             val hiddenProjection = (maxBendWidth - dstWidth).coerceAtLeast(0)
             val tableIndex =
@@ -183,40 +195,75 @@ internal class PageCurlDrawable(
         if (flatEnd > 0) drawFlatRange(canvas, bitmap, 0, flatEnd)
         if (bentDstStart >= bentDstEnd || bentSrcStart >= bentSrcEnd) return
 
-        val stripCount = (bentDestinationWidth / STRIP_WIDTH_PX + 1).coerceAtLeast(1)
         val destinationBase =
             SIN_TABLE[startAngle * TABLE_SIZE / HALF_PI_FIXED] * maxBendWidth / TABLE_SCALE
-        val sourceBase = startAngle * maxBendWidth / TABLE_SCALE
-        val angleDelta = endAngle - startAngle
+        updateMeshVertices(
+            sourceWidth = sourceWidth,
+            sourceHeight = viewportH,
+            bentSrcStart = bentSrcStart,
+            bentSrcEnd = bentSrcEnd,
+            bentDstStart = bentDstStart,
+            bentDstEnd = bentDstEnd,
+            startAngle = startAngle,
+            endAngle = endAngle,
+            maxBendWidth = maxBendWidth,
+            destinationBase = destinationBase,
+        )
+        val meshSave = canvas.save()
+        try {
+            canvas.clipRect(bentDstStart, 0, bentDstEnd, viewportH)
+            meshDrawsInLastFrame++
+            canvas.drawBitmapMesh(
+                bitmap,
+                MESH_COLUMNS,
+                MESH_ROWS,
+                meshVertices,
+                0,
+                null,
+                0,
+                bitmapPaint,
+            )
+        } finally {
+            canvas.restoreToCount(meshSave)
+        }
+        shadeRect.set(bentDstStart, 0, bentDstEnd, viewportH)
+        drawGradient(canvas, shadeRect, highlightPaints, 0, SHADE_LEVELS - 1)
+    }
 
-        for (strip in 0 until stripCount) {
-            val stripStartAngle = startAngle + strip * angleDelta / stripCount
-            val stripEndAngle = startAngle + (strip + 1) * angleDelta / stripCount
-            val sourceStart = stripStartAngle * maxBendWidth / TABLE_SCALE - sourceBase
-            val sourceEnd = stripEndAngle * maxBendWidth / TABLE_SCALE - sourceBase
-            val destinationStart =
-                SIN_TABLE[stripStartAngle * TABLE_SIZE / HALF_PI_FIXED] * maxBendWidth / TABLE_SCALE -
-                    destinationBase
-            val destinationEnd =
-                SIN_TABLE[stripEndAngle * TABLE_SIZE / HALF_PI_FIXED] * maxBendWidth / TABLE_SCALE -
-                    destinationBase
-            bitmapSrc.set(
-                (bentSrcStart + sourceStart).coerceIn(0, sourceWidth),
-                0,
-                (bentSrcStart + sourceEnd).coerceIn(0, sourceWidth),
-                viewportH,
-            )
-            bitmapDst.set(
-                (bentDstStart + destinationStart).coerceIn(0, dstWidth),
-                0,
-                (bentDstStart + destinationEnd).coerceIn(0, dstWidth),
-                viewportH,
-            )
-            if (bitmapSrc.width() <= 0 || bitmapDst.width() <= 0) continue
-            canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, bitmapPaint)
-            val paintIndex =
-                (stripStartAngle * SHADE_LEVELS / HALF_PI_FIXED).coerceIn(0, SHADE_LEVELS - 1)
-            canvas.drawRect(bitmapDst, highlightPaints[paintIndex])
+    private fun updateMeshVertices(
+        sourceWidth: Int,
+        sourceHeight: Int,
+        bentSrcStart: Int,
+        bentSrcEnd: Int,
+        bentDstStart: Int,
+        bentDstEnd: Int,
+        startAngle: Int,
+        endAngle: Int,
+        maxBendWidth: Int,
+        destinationBase: Int,
+    ) {
+        val safeBendWidth = maxBendWidth.coerceAtLeast(1)
+        for (column in 0..MESH_COLUMNS) {
+            val sourceX = sourceWidth * column / MESH_COLUMNS
+            val destinationX = when {
+                sourceX <= bentSrcStart -> bentDstStart
+                sourceX >= bentSrcEnd -> bentDstEnd
+                else -> {
+                    val angle = (
+                        startAngle +
+                            (sourceX - bentSrcStart).toLong() * TABLE_SCALE / safeBendWidth
+                        ).toInt().coerceIn(startAngle, endAngle)
+                    bentDstStart +
+                        SIN_TABLE[angle * TABLE_SIZE / HALF_PI_FIXED] * safeBendWidth / TABLE_SCALE -
+                        destinationBase
+                }
+            }.coerceIn(bentDstStart, bentDstEnd)
+            val top = column * 2
+            meshVertices[top] = destinationX.toFloat()
+            meshVertices[top + 1] = 0f
+            val bottom = ((MESH_COLUMNS + 1) * 2) + top
+            meshVertices[bottom] = destinationX.toFloat()
+            meshVertices[bottom + 1] = sourceHeight.toFloat()
         }
     }
 
@@ -280,7 +327,8 @@ internal class PageCurlDrawable(
         const val TABLE_SIZE = 1024
         const val TABLE_SCALE = 0x10000
         const val BEND_PERCENT = 30
-        const val STRIP_WIDTH_PX = 5
+        const val MESH_COLUMNS = 96
+        const val MESH_ROWS = 1
         const val SHADE_LEVELS = 16
         val HALF_PI_FIXED = (PI / 2.0 * TABLE_SCALE).roundToInt()
         val SIN_TABLE = IntArray(TABLE_SIZE + 1)

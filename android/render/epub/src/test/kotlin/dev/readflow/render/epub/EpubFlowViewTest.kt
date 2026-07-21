@@ -4865,6 +4865,67 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `accepted pending boundary animation pairs one start with one settle`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToLastPage()
+        var startedCount = 0
+        var settledCount = 0
+        view.onPageTurnStarted = { startedCount++ }
+        view.onPageSettled = { settledCount++ }
+        view.pendingDecodesProvider = { true }
+        assertTrue(view.prepareBoundaryPageTurn(1))
+        val incomingText = (1..40).joinToString("\n") { "Incoming chapter line $it." }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+
+        view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
+        assertEquals(0, startedCount)
+        assertEquals(0, settledCount)
+
+        view.pendingDecodesProvider = { false }
+        view.tryRevealWhenStable()
+        val animator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+
+        assertEquals("accepted target capture must publish one start", 1, startedCount)
+        assertEquals(0, settledCount)
+        animator.end()
+        assertEquals(1, startedCount)
+        assertEquals("the same visual transaction must publish one settle", 1, settledCount)
+    }
+
+    @Test
+    fun `rejected pending boundary target capture publishes neither start nor settle`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToLastPage()
+        var startedCount = 0
+        var settledCount = 0
+        view.onPageTurnStarted = { startedCount++ }
+        view.onPageSettled = { settledCount++ }
+        view.pendingDecodesProvider = { true }
+        assertTrue(view.prepareBoundaryPageTurn(1))
+        val incomingText = (1..40).joinToString("\n") { "Rejected chapter line $it." }
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(incomingText, headingLevel = null, paragraphIndex = 0)),
+        )
+
+        view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+        shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
+        view.background = CaptureTargetBitmapThenThrowDrawable()
+        view.pendingDecodesProvider = { false }
+        view.tryRevealWhenStable()
+
+        assertEquals(0, startedCount)
+        assertEquals(0, settledCount)
+        assertNull(view.privateField("slideDrawable"))
+    }
+
+    @Test
     fun `pending boundary turn consumes a second navigation without mutating the target chapter`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -5208,6 +5269,206 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `rapid paper burst starts one coalesced follow-up animation instead of a hard cut`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
+
+        assertTrue(view.goToAdjacentPage(1))
+        val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertEquals(280L, firstAnimator.duration)
+        assertTrue(view.goToAdjacentPage(1))
+        assertTrue(view.goToAdjacentPage(1))
+        assertTrue("queued input must not replace the active transaction", firstAnimator.isRunning)
+
+        firstAnimator.end()
+
+        val followUpAnimator = checkNotNull(
+            view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+        )
+        assertTrue("the queue must start a new visual transaction", followUpAnimator !== firstAnimator)
+        assertTrue("the coalesced follow-up must still be visibly animating", followUpAnimator.isRunning)
+        assertEquals(120L, followUpAnimator.duration)
+        assertNotNull(view.privateField("curlDrawable"))
+        assertEquals("the live page is parked beneath the follow-up overlay", 3, view.currentPageIndex())
+        assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+    }
+
+    @Test
+    fun `rapid next at the chapter edge starts a boundary follow-up animation`() {
+        lateinit var view: EpubFlowView
+        view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            onTapZone = { zone ->
+                if (zone == EpubFlowTapZone.NEXT) assertTrue(view.startDiscreteBoundaryTurn(1))
+            },
+        )
+        val commits = mutableListOf<Long>()
+        view.onBoundaryTurnCommitted = { commits += it.token }
+        val finalPage = view.pageCount() - 1
+        assertTrue("pageCount=${view.pageCount()}", finalPage > 2)
+        view.goToPage(finalPage - 1)
+        view.offerReadyBoundaryPreviewForTest(forward = true, token = 704L)
+
+        assertTrue(view.goToAdjacentPage(1))
+        val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertTrue(view.goToAdjacentPage(1))
+
+        firstAnimator.end()
+
+        val boundaryAnimator = checkNotNull(
+            view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+        )
+        assertTrue(boundaryAnimator !== firstAnimator)
+        assertTrue(boundaryAnimator.isRunning)
+        assertEquals(120L, boundaryAnimator.duration)
+        assertNotNull(view.privateField("slideDrawable"))
+        assertEquals("the boundary must not commit before its follow-up animation settles", emptyList<Long>(), commits)
+
+        boundaryAnimator.end()
+
+        assertEquals(listOf(704L), commits)
+    }
+
+    @Test
+    fun `page turn motion query spans a rapid follow-up and clears after its final settle`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        assertFalse(view.isPageTurnMotionActive())
+
+        assertTrue(view.goToAdjacentPage(1))
+        val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertTrue(view.isPageTurnMotionActive())
+        assertTrue(view.goToAdjacentPage(1))
+
+        firstAnimator.end()
+
+        val followUpAnimator = checkNotNull(
+            view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+        )
+        assertTrue(followUpAnimator !== firstAnimator)
+        assertTrue(view.isPageTurnMotionActive())
+        assertEquals(120L, followUpAnimator.duration)
+        assertNotNull(view.privateField("slideDrawable"))
+
+        followUpAnimator.end()
+
+        assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+        assertFalse("the empty rapid idle window is not visual motion", view.isPageTurnMotionActive())
+    }
+
+    @Test
+    fun `rapid performance mode releases at idle and publishes the final settle`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        var settledCount = 0
+        view.onPageSettled = { settledCount++ }
+
+        assertTrue(view.goToAdjacentPage(1))
+        val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertTrue(view.goToAdjacentPage(1))
+        firstAnimator.end()
+        val followUpAnimator = checkNotNull(
+            view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+        )
+        followUpAnimator.end()
+
+        assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+        assertFalse(view.isPageTurnMotionActive())
+        assertTrue(view.isRapidTurnPerformanceModeActive())
+        val countBeforeIdle = settledCount
+
+        shadowOf(Looper.getMainLooper()).idleFor(319L, TimeUnit.MILLISECONDS)
+        assertTrue(view.isRapidTurnPerformanceModeActive())
+        assertEquals(countBeforeIdle, settledCount)
+
+        shadowOf(Looper.getMainLooper()).idleFor(2L, TimeUnit.MILLISECONDS)
+        assertFalse(view.isRapidTurnPerformanceModeActive())
+        assertEquals(countBeforeIdle + 1, settledCount)
+    }
+
+    @Test
+    fun `page turn started callback covers visual follow-ups and interactive intent`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        var startedCount = 0
+        view.onPageTurnStarted = { startedCount++ }
+
+        assertTrue(view.goToAdjacentPage(1))
+        val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertEquals(1, startedCount)
+
+        assertTrue(view.goToAdjacentPage(1))
+        assertEquals("queueing must not replace or restart the active transaction", 1, startedCount)
+
+        firstAnimator.end()
+        val followUpAnimator = checkNotNull(
+            view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+        )
+        assertEquals(2, startedCount)
+        followUpAnimator.end()
+        shadowOf(Looper.getMainLooper()).idleFor(321L, TimeUnit.MILLISECONDS)
+
+        val downTime = SystemClock.uptimeMillis()
+        val y = view.height * 0.50f
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, view.width * 0.85f, y),
+        )
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, view.width * 0.15f, y),
+        )
+
+        assertEquals(3, startedCount)
+        assertTrue(view.isPageTurnMotionActive())
+        view.dispatchTouchEvent(
+            motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, view.width * 0.15f, y),
+        )
+
+        view.dispose()
+        assertNull(view.onPageTurnStarted)
+    }
+
+    @Test
+    fun `page turn capture preparation runs before any outgoing or target snapshot`() {
+        val events = mutableListOf<String>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        view.recycleCachedTexturesForTest()
+        view.background = RecordingTargetBitmapDrawable { events += "capture" }
+        view.onPageTurnCapturePreparing = { events += "prepare" }
+        view.onPageTurnStarted = { events += "started" }
+
+        assertTrue(view.goToAdjacentPage(1))
+
+        assertEquals("prepare", events.firstOrNull())
+        assertTrue("an accepted turn must capture after preparation: $events", events.indexOf("capture") > 0)
+        assertTrue(
+            "the accepted-start callback remains after both page shots are owned: $events",
+            events.lastIndexOf("started") > events.lastIndexOf("capture"),
+        )
+    }
+
+    @Test
+    fun `page turn started skips NONE turns`() {
+        val none = pagedFlowView(flipStyle = PageFlipStyle.NONE)
+        var noneStarted = 0
+        none.onPageTurnStarted = { noneStarted++ }
+
+        assertTrue(none.goToAdjacentPage(1))
+        assertEquals(0, noneStarted)
+    }
+
+    @Test
+    fun `page turn started skips rejected snapshot capture`() {
+        val rejected = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        var rejectedStarted = 0
+        rejected.recycleCachedTexturesForTest()
+        rejected.background = CaptureTargetBitmapThenThrowDrawable()
+        rejected.onPageTurnStarted = { rejectedStarted++ }
+
+        assertTrue(rejected.goToAdjacentPage(1))
+        assertEquals(0, rejectedStarted)
+        assertEquals(0, rejected.currentPageIndex())
+        assertFalse(rejected.isPageTurnMotionActive())
+    }
+
+    @Test
     fun `rapid paper burst drains every accepted forward request`() {
         val reportedOffsets = mutableListOf<Int>()
         val view = pagedFlowView(
@@ -5294,7 +5555,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `edge tap inside rapid idle window uses a direct follow-up settle`() {
+    fun `edge tap inside rapid idle window starts a visual follow-up settle`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
         assertTrue(view.goToAdjacentPage(1))
@@ -5314,8 +5575,13 @@ class EpubFlowViewTest {
 
         tapNext(firstTapTime + 300L)
 
-        assertEquals("the idle-window tap should settle immediately without another page-shot animator", 3, view.currentPageIndex())
-        assertFalse((view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.isRunning == true)
+        val followUpAnimator = checkNotNull(
+            view.privateField("flipAnimator") as? android.animation.ValueAnimator,
+        )
+        assertEquals("the target page stays parked beneath the visual transaction", 3, view.currentPageIndex())
+        assertTrue(followUpAnimator.isRunning)
+        assertEquals(120L, followUpAnimator.duration)
+        assertNotNull(view.privateField("curlDrawable"))
     }
 
     @Test
@@ -5382,7 +5648,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `swipe released inside rapid idle window settles directly`() {
+    fun `swipe released inside rapid idle window starts a visual follow-up settle`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
 
@@ -5404,8 +5670,13 @@ class EpubFlowViewTest {
             motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, view.width * 0.15f, y),
         )
 
+        val followUpAnimator = checkNotNull(
+            view.privateField("flipAnimator") as? android.animation.ValueAnimator,
+        )
         assertEquals(3, view.currentPageIndex())
-        assertFalse((view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.isRunning == true)
+        assertTrue(followUpAnimator.isRunning)
+        assertEquals(120L, followUpAnimator.duration)
+        assertNotNull(view.privateField("curlDrawable"))
     }
 
     @Test

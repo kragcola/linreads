@@ -18,6 +18,27 @@ import kotlin.math.abs
 class PageCurlDrawableTest {
 
     @Test
+    fun `paper bend is submitted as one persistent mesh instead of per strip bitmap draws`() {
+        val width = 1600
+        val height = 16
+        val front = xRampBitmap(width, height)
+        val revealed = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val drawable = PageCurlDrawable(front, revealed, width, height, forward = true, density = 1f)
+        try {
+            drawable.setBounds(0, 0, width, height)
+            drawable.progress = 0.5f
+            drawable.draw(Canvas(output))
+
+            assertEquals(1, drawable.renderStatsForTest().meshDraws)
+            assertEquals(0, drawable.renderStatsForTest().bentStripBitmapDraws)
+        } finally {
+            drawable.recycle()
+            if (!output.isRecycled) output.recycle()
+        }
+    }
+
+    @Test
     fun `paper turn keeps a flat one to one region and bends only the moving edge`() {
         val width = 120
         val height = 24

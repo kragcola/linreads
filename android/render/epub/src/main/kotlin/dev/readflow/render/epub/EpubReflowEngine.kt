@@ -960,12 +960,32 @@ class EpubReflowEngine private constructor(
         }
         view.onBoundaryPreviewRequestCancelled = ::cancelBoundaryPreviewRequest
         view.onPageShotForeground = ::resumePageShotsAfterForeground
+        view.onPageTurnCapturePreparing = {
+            if (flowView === view) liveFlowImageLoader?.cancelDisplayPromotions()
+        }
+        view.onPageTurnStarted = {
+            if (flowView === view) liveFlowImageLoader?.cancelDisplayPromotions()
+        }
         view.onPageSettled = {
+            if (flowView === view && !view.isRapidTurnPerformanceModeActive()) {
+                val currentPage = view.currentPageDecodeLayoutRanges()
+                liveFlowImageLoader?.demoteDisplayQualityOutside(currentPage)
+                liveFlowImageLoader?.promoteToDisplayQuality(currentPage)
+            }
             prewarmBoundaryPreviews()
             tryDrainPendingFontPrewarmRebuild()
         }
         view.onChapterStable = {
-            if (flowView === view && flowSpineIndex >= 0) prewarmBoundaryPreviews()
+            if (
+                flowView === view &&
+                flowSpineIndex >= 0 &&
+                !view.isRapidTurnPerformanceModeActive()
+            ) {
+                val currentPage = view.currentPageDecodeLayoutRanges()
+                liveFlowImageLoader?.demoteDisplayQualityOutside(currentPage)
+                liveFlowImageLoader?.promoteToDisplayQuality(currentPage)
+                prewarmBoundaryPreviews()
+            }
             tryDrainPendingFontPrewarmRebuild()
         }
     }
@@ -1229,6 +1249,7 @@ class EpubReflowEngine private constructor(
         landOnLast: Boolean = false,
         reportPositionAfterStableReveal: Boolean = false,
         isCurrent: () -> Boolean,
+        isVisible: () -> Boolean = isCurrent,
         onLinkClick: (EpubTextLink) -> Unit,
         pendingDecodeRangesProvider: () -> Collection<IntRange> = view::relevantPendingDecodeLayoutRanges,
     ): EpubFlowImageLoader? {
@@ -1297,6 +1318,14 @@ class EpubReflowEngine private constructor(
             inlineMaxHeightPx = inlineMaxHeightPx,
             fullPageHrefs = fullPageHrefs,
             imageBoundsProvider = ::epubImageBoundsFor,
+            imageQualityProvider = { layoutStart ->
+                epubImageRenderQualityForOccurrence(
+                    layoutStart = layoutStart,
+                    currentPageRanges = view.currentPageDecodeLayoutRanges(),
+                    isCurrentChapter = isVisible(),
+                    visualMotionActive = view.isRapidTurnPerformanceModeActive(),
+                )
+            },
             onImageResultChanged = { result ->
                 if (isCurrent()) {
                     when {
@@ -1583,6 +1612,7 @@ class EpubReflowEngine private constructor(
                     boundaryPreviewTargets.values.any { target -> target.view === previewView } ||
                     flowView === previewView
             },
+            isVisible = { flowView === previewView },
             onLinkClick = { link -> if (flowView === previewView) handleLinkClick(link) },
             pendingDecodeRangesProvider = {
                 if (flowView === previewView) {

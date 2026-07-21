@@ -557,6 +557,279 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `motion decode lowers pixel budget while preserving full display bounds`() {
+        val epub = File.createTempFile("readflow-motion-lod", ".epub")
+        val executor = QueuedExecutorService()
+        var capturedBudget: EpubImageDecodeBudget? = null
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { EpubImageBounds(width = 1600, height = 2400) },
+                imageQualityProvider = { EpubImageRenderQuality.MOTION },
+                imageDecoder = { _, _, budget ->
+                    capturedBudget = budget
+                    android.graphics.Bitmap.createBitmap(800, 1200, android.graphics.Bitmap.Config.ARGB_8888)
+                },
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(EpubImageDecodeBudget(maxSide = 900, maxPixels = 540_000), capturedBudget)
+            assertEquals(
+                "LOD must change pixels only, never the page geometry",
+                Rect(0, 0, 800, 1200),
+                drawable.bounds,
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `settled page promotes pixels in place without changing geometry or rebinding text`() {
+        val epub = File.createTempFile("readflow-display-promotion", ".epub")
+        val executor = QueuedExecutorService()
+        val budgets = mutableListOf<EpubImageDecodeBudget>()
+        val results = mutableListOf<EpubAsyncImageResult>()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { EpubImageBounds(width = 1600, height = 2400) },
+                imageQualityProvider = { EpubImageRenderQuality.MOTION },
+                imageDecoder = { _, _, budget ->
+                    budgets += budget
+                    android.graphics.Bitmap.createBitmap(
+                        budget.maxSide.coerceAtMost(800),
+                        (budget.maxPixels / budget.maxSide).coerceAtLeast(1),
+                        android.graphics.Bitmap.Config.ARGB_8888,
+                    )
+                },
+                onImageResultChanged = results::add,
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            val pixelLayer = drawable.result
+            val stableBounds = Rect(drawable.bounds)
+
+            assertEquals(1, loader.promoteToDisplayQuality(listOf(0 until 100)))
+            assertEquals("promotion must enqueue exactly one display decode", 1, executor.queuedTaskCount)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(
+                listOf(
+                    EpubImageDecodeBudget(maxSide = 900, maxPixels = 540_000),
+                    EpubImageDecodeBudget(maxSide = 1200, maxPixels = 960_000),
+                ),
+                budgets,
+            )
+            assertSame("quality promotion must update the retained pixel layer", pixelLayer, drawable.result)
+            assertEquals("quality promotion must not move content", stableBounds, drawable.bounds)
+            assertEquals(EpubImageRenderQuality.MOTION, results.first().quality)
+            assertTrue(results.first().requiresTextRebind)
+            assertEquals(EpubImageRenderQuality.DISPLAY, results.last().quality)
+            assertFalse("in-place pixel promotion must not rebind the chapter TextView", results.last().requiresTextRebind)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `new motion cancels stale display promotion without discarding motion pixels`() {
+        val epub = File.createTempFile("readflow-cancel-promotion", ".epub")
+        val executor = QueuedExecutorService()
+        val budgets = mutableListOf<EpubImageDecodeBudget>()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { EpubImageBounds(width = 1600, height = 2400) },
+                imageQualityProvider = { EpubImageRenderQuality.MOTION },
+                imageDecoder = { _, _, budget ->
+                    budgets += budget
+                    android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888)
+                },
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            val motionPixels = drawable.result
+
+            assertEquals(1, loader.promoteToDisplayQuality(listOf(0 until 100)))
+            assertEquals(1, loader.cancelDisplayPromotions())
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals("cancelled promotion must never enter the decoder", 1, budgets.size)
+            assertSame("the already-visible motion layer remains installed", motionPixels, drawable.result)
+            assertFalse(loader.hasPendingDecodes())
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `leaving a page restores its retained motion pixels without another decode`() {
+        val epub = File.createTempFile("readflow-demote-display", ".epub")
+        val executor = QueuedExecutorService()
+        val budgets = mutableListOf<EpubImageDecodeBudget>()
+        val results = mutableListOf<EpubAsyncImageResult>()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { EpubImageBounds(width = 1600, height = 2400) },
+                imageQualityProvider = { EpubImageRenderQuality.MOTION },
+                imageDecoder = { _, _, budget ->
+                    budgets += budget
+                    android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888)
+                },
+                onImageResultChanged = results::add,
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            val pixelLayer = drawable.result
+            val stableBounds = Rect(drawable.bounds)
+
+            assertEquals(1, loader.promoteToDisplayQuality(listOf(0 until 100)))
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(1, loader.demoteDisplayQualityOutside(listOf(100 until 200)))
+
+            assertEquals("demotion must reuse retained motion pixels", 2, budgets.size)
+            assertSame(pixelLayer, drawable.result)
+            assertEquals(stableBounds, drawable.bounds)
+            assertEquals(EpubImageRenderQuality.MOTION, results.last().quality)
+            assertFalse(results.last().requiresTextRebind)
+            val resultCountAfterDemotion = results.size
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+            assertEquals("a cancelled fade must not publish stale display pixels", resultCountAfterDemotion, results.size)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `display promotion republishes final pixels when its crossfade completes`() {
+        val epub = File.createTempFile("readflow-promotion-finish", ".epub")
+        val executor = QueuedExecutorService()
+        val results = mutableListOf<EpubAsyncImageResult>()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { EpubImageBounds(width = 1600, height = 2400) },
+                imageQualityProvider = { EpubImageRenderQuality.MOTION },
+                imageDecoder = { _, _, _ ->
+                    android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888)
+                },
+                onImageResultChanged = results::add,
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(1, loader.promoteToDisplayQuality(listOf(0 until 100)))
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(2, results.size)
+
+            shadowOf(Looper.getMainLooper()).idleFor(119L, TimeUnit.MILLISECONDS)
+            assertEquals("the final cache refresh must wait for the complete crossfade", 2, results.size)
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
+
+            assertEquals(3, results.size)
+            assertEquals(EpubImageRenderQuality.DISPLAY, results.last().quality)
+            assertFalse(results.last().requiresTextRebind)
+            assertEquals(Rect(0, 0, 800, 1200), results.last().afterBounds)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `new motion finalizes an installed display fade before page shot capture`() {
+        val epub = File.createTempFile("readflow-promotion-turn", ".epub")
+        val executor = QueuedExecutorService()
+        val results = mutableListOf<EpubAsyncImageResult>()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { EpubImageBounds(width = 1600, height = 2400) },
+                imageQualityProvider = { EpubImageRenderQuality.MOTION },
+                imageDecoder = { _, _, _ ->
+                    android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888)
+                },
+                onImageResultChanged = results::add,
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(1, loader.promoteToDisplayQuality(listOf(0 until 100)))
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(2, results.size)
+
+            loader.cancelDisplayPromotions()
+
+            assertEquals("the page-shot barrier must publish final DISPLAY pixels synchronously", 3, results.size)
+            assertEquals(EpubImageRenderQuality.DISPLAY, results.last().quality)
+            assertFalse(results.last().requiresTextRebind)
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+            assertEquals("the cancelled completion must not publish the same pixels again", 3, results.size)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `all PIXELS_ONLY results require TextView rebind`() {
         val stableBounds = Rect(0, 0, 800, 1200)
         val fullPagePixels = EpubAsyncImageResult(
@@ -888,7 +1161,7 @@ class EpubFlowSpannableTest {
     }
 
     @Test
-    fun `late page height provider exception finishes the request without crashing the handler`() {
+    fun `frozen image geometry survives late page height provider retirement`() {
         val epub = createImageEpub("late-page-height-provider")
         val executor = QueuedExecutorService()
         val completions = AtomicInteger(0)
@@ -913,7 +1186,8 @@ class EpubFlowSpannableTest {
 
             assertNull("a late provider failure must not escape the main handler", handlerFailure)
             assertFalse(loader.hasPendingDecodes())
-            assertFalse("a failed layout provider must not install a bitmap with unknown bounds", drawable.result is BitmapDrawable)
+            assertTrue("request-time geometry lets the decoded pixels install without touching the retired provider", drawable.result is BitmapDrawable)
+            assertEquals(Rect(0, 0, 8, 8), drawable.bounds)
             assertEquals("provider failure must still release reveal gates", 1, completions.get())
         } finally {
             executor.shutdownNow()
