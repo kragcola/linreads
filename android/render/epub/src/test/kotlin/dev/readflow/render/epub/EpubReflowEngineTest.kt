@@ -3449,13 +3449,10 @@ class EpubReflowEngineTest {
             )
 
             (flowView.privateField("flipAnimator") as android.animation.ValueAnimator).cancel()
-            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.SECONDS)
-
-            assertTrue(
-                "the still-relevant preparation may complete as a preview or hidden renderer",
+            awaitCondition("the still-relevant preparation may complete as a preview or hidden renderer") {
                 flowView.privateField("forwardBoundaryPreview") != null ||
-                    (engine.privateField("boundaryPreviewSessions") as Map<*, *>).containsKey(true),
-            )
+                    (engine.privateField("boundaryPreviewSessions") as Map<*, *>).containsKey(true)
+            }
         } finally {
             engine.close()
         }
