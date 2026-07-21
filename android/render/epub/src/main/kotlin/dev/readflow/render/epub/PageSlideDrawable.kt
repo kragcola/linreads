@@ -15,11 +15,9 @@ import kotlin.math.min
 
 /**
  * Hardware-accelerated slide page-turn (滑动翻页, 静读天下「滑动」手感). A snapshot of the OUTGOING
- * page is blitted at a horizontal offset that tracks [progress]; the INCOMING page (the real view
- * content) is slid in alongside it by the host via [android.view.View.setTranslationX]. Both layers
- * are plain GPU transforms (a single [Canvas.drawBitmap] translate here + a render-node translation
- * there), so the turn composites on the GPU and holds 60fps at any resolution — unlike the prior
- * Canvas mesh curl, which warped a full-screen software bitmap on the UI thread every frame.
+ * page is blitted at a horizontal offset that tracks [progress]. Normal turns also carry an incoming
+ * page shot; rapid turns omit it and reveal the already parked live target beneath this drawable.
+ * Both paths avoid the Canvas mesh work used by the PAPER renderer.
  *
  * Forward (next): both pages slide LEFT together — outgoing exits left, incoming enters from the right.
  * Backward (prev): mirrored — both slide RIGHT, incoming enters from the left.
@@ -28,7 +26,7 @@ import kotlin.math.min
  */
 internal class PageSlideDrawable(
     frontBitmap: Bitmap,
-    revealedBitmap: Bitmap,
+    revealedBitmap: Bitmap?,
     private val viewportW: Int,
     private val viewportH: Int,
     private val forward: Boolean,
@@ -80,7 +78,12 @@ internal class PageSlideDrawable(
     }
 
     internal fun incomingSourceXForViewportX(viewportX: Int): Int? =
-        sourceXForViewportX(incomingLeft(viewportW.toFloat()), viewportX.toFloat(), viewportW.toFloat())
+        sourceXForViewportX(
+            incomingLeft(viewportW.toFloat()),
+            viewportX.toFloat(),
+            viewportW.toFloat(),
+            viewportW,
+        )
 
     private fun outgoingLeft(w: Float): Float =
         if (forward) -progress * w else progress * w
@@ -95,7 +98,8 @@ internal class PageSlideDrawable(
         val visibleRight = min(w, left + w)
         if (visibleRight <= visibleLeft) return
 
-        // Page shots are always viewport-sized. Keep this path as a clipped, translated 1:1 blit:
+        // Full-size page shots keep a clipped, translated 1:1 blit. Reduced motion shots use the
+        // scaled source/destination path below:
         // drawBitmap(src,dst) makes the GPU run a filtered scale on every MOVE even when both rects
         // are the same size, which is especially costly for image-heavy EPUB pages.
         if (bitmap.width == viewportW && bitmap.height == viewportH) {
@@ -110,20 +114,25 @@ internal class PageSlideDrawable(
             return
         }
 
-        val srcLeft = sourceXForViewportX(left, visibleLeft, w) ?: return
-        val srcRight = sourceXForViewportX(left, visibleRight, w)
-            ?.coerceIn(srcLeft, viewportW)
-            ?: viewportW
+        val srcLeft = sourceXForViewportX(left, visibleLeft, w, bitmap.width) ?: return
+        val srcRight = sourceXForViewportX(left, visibleRight, w, bitmap.width)
+            ?.coerceIn(srcLeft, bitmap.width)
+            ?: bitmap.width
         if (srcRight <= srcLeft) return
-        bitmapSrc.set(srcLeft, 0, srcRight, viewportH)
+        bitmapSrc.set(srcLeft, 0, srcRight, bitmap.height)
         bitmapDst.set(visibleLeft, 0f, visibleRight, h)
         canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, paint)
     }
 
-    private fun sourceXForViewportX(left: Float, viewportX: Float, w: Float): Int? {
+    private fun sourceXForViewportX(
+        left: Float,
+        viewportX: Float,
+        w: Float,
+        sourceWidth: Int,
+    ): Int? {
         val sourceX = viewportX - left
         if (sourceX < 0f || sourceX > w) return null
-        return sourceX.toInt().coerceIn(0, viewportW)
+        return (sourceX * sourceWidth.toFloat() / w).toInt().coerceIn(0, sourceWidth)
     }
 
     /** A soft drop shadow on the outgoing page's trailing edge — the seam where the incoming page meets it. */

@@ -87,6 +87,7 @@ import io.noties.markwon.image.AsyncDrawableScheduler
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.FutureTask
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -312,6 +313,9 @@ class EpubReflowEngine private constructor(
     @Volatile private var flowCriticalImageExecutorInstance: ExecutorService? = null
     /** Interaction-critical adjacent-spine parsing never queues behind image decoding. */
     @Volatile private var flowPreparationExecutorInstance: ExecutorService? = null
+    private val flowNavigationLock = Any()
+    private val flowNavigationRequestId = AtomicLong(0L)
+    @Volatile private var flowNavigationPreparationJob: Future<*>? = null
     /**
      * Coalesced request to rebuild the flow chapter after book-font prewarm. Set while a page
      * mutation is in flight or while a rebuild is already scheduled/running; drained once idle.
@@ -361,6 +365,31 @@ class EpubReflowEngine private constructor(
             flowPreparationExecutorInstance = null
         }
     }
+
+    private fun beginFlowNavigationRequest(): Long = synchronized(flowNavigationLock) {
+        flowNavigationRequestId.incrementAndGet().also {
+            flowNavigationPreparationJob?.cancel(true)
+            flowNavigationPreparationJob = null
+        }
+    }
+
+    private fun invalidateFlowNavigationRequest() {
+        synchronized(flowNavigationLock) {
+            flowNavigationRequestId.incrementAndGet()
+            flowNavigationPreparationJob?.cancel(true)
+            flowNavigationPreparationJob = null
+        }
+    }
+
+    private fun isCurrentFlowNavigationRequest(requestId: Long, generation: Long): Boolean =
+        requestId == flowNavigationRequestId.get() && generation == bookGeneration.get()
+
+    private fun clearFlowNavigationPreparation(task: Future<*>) {
+        synchronized(flowNavigationLock) {
+            if (flowNavigationPreparationJob === task) flowNavigationPreparationJob = null
+        }
+    }
+
     private val pageShotApplicationContext = context.applicationContext
     private val pageShotBudget = run {
         val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
@@ -472,6 +501,11 @@ class EpubReflowEngine private constructor(
     // Caches the intrinsic-bounds decode per image href (value may be null when undecodable, which
     // is itself worth caching to avoid re-opening the zip on every repagination).
     private data class EpubImageBoundsCacheEntry(val value: EpubImageBounds?)
+
+    private data class PreparedFlowNavigation(
+        val flow: EpubChapterFlow,
+        val imageBounds: Map<String, EpubImageBoundsCacheEntry>,
+    )
 
     private data class PagedTextSelectionPart(
         val paragraphIndex: Int,
@@ -967,10 +1001,14 @@ class EpubReflowEngine private constructor(
             if (flowView === view) liveFlowImageLoader?.cancelDisplayPromotions()
         }
         view.onPageSettled = {
-            if (flowView === view && !view.isRapidTurnPerformanceModeActive()) {
-                val currentPage = view.currentPageDecodeLayoutRanges()
-                liveFlowImageLoader?.demoteDisplayQualityOutside(currentPage)
-                liveFlowImageLoader?.promoteToDisplayQuality(currentPage)
+            if (flowView === view) {
+                val loader = liveFlowImageLoader
+                loader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
+                if (!view.isRapidTurnPerformanceModeActive()) {
+                    val currentPage = view.currentPageDecodeLayoutRanges()
+                    loader?.demoteDisplayQualityOutside(currentPage)
+                    loader?.promoteToDisplayQuality(currentPage)
+                }
             }
             prewarmBoundaryPreviews()
             tryDrainPendingFontPrewarmRebuild()
@@ -978,13 +1016,16 @@ class EpubReflowEngine private constructor(
         view.onChapterStable = {
             if (
                 flowView === view &&
-                flowSpineIndex >= 0 &&
-                !view.isRapidTurnPerformanceModeActive()
+                flowSpineIndex >= 0
             ) {
-                val currentPage = view.currentPageDecodeLayoutRanges()
-                liveFlowImageLoader?.demoteDisplayQualityOutside(currentPage)
-                liveFlowImageLoader?.promoteToDisplayQuality(currentPage)
-                prewarmBoundaryPreviews()
+                val loader = liveFlowImageLoader
+                loader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
+                if (!view.isRapidTurnPerformanceModeActive()) {
+                    val currentPage = view.currentPageDecodeLayoutRanges()
+                    loader?.demoteDisplayQualityOutside(currentPage)
+                    loader?.promoteToDisplayQuality(currentPage)
+                    prewarmBoundaryPreviews()
+                }
             }
             tryDrainPendingFontPrewarmRebuild()
         }
@@ -1386,6 +1427,7 @@ class EpubReflowEngine private constructor(
         // post (single pre-paint placement — no chapter-top→resume jump on entry).
         view.textView.post {
             try {
+                loader.updateDecodeWindow(pendingDecodeRangesProvider())
                 AsyncDrawableScheduler.schedule(view.textView)
             } finally {
                 imageSchedulingPending = false
@@ -2508,6 +2550,8 @@ class EpubReflowEngine private constructor(
     }
 
     private suspend fun goToFlow(locator: Locator) {
+        val navigationRequestId = beginFlowNavigationRequest()
+        val navigationBookGeneration = bookGeneration.get()
         val provisionalSession = startupSession
         val requestedSection = locator.strategy as? LocatorStrategy.Section
         if (provisionalSession != null && requestedSection != null) {
@@ -2520,7 +2564,12 @@ class EpubReflowEngine private constructor(
             if (startupTarget != null) {
                 val (resolved, spine) = startupTarget
                 val remainsProvisional = withContext(Dispatchers.Main) {
-                    if (startupSession !== provisionalSession) return@withContext false
+                    if (
+                        !isCurrentFlowNavigationRequest(navigationRequestId, navigationBookGeneration) ||
+                        startupSession !== provisionalSession
+                    ) {
+                        return@withContext false
+                    }
                     refreshStartupSessionSpine(provisionalSession, spine)
                     navigateFlowOnMain(
                         index = resolved.globalParagraphIndex,
@@ -2529,10 +2578,12 @@ class EpubReflowEngine private constructor(
                     )
                     true
                 }
+                if (!isCurrentFlowNavigationRequest(navigationRequestId, navigationBookGeneration)) return
                 if (remainsProvisional) return
             }
         }
         if (startupSession != null) awaitFullIndexBook()
+        if (!isCurrentFlowNavigationRequest(navigationRequestId, navigationBookGeneration)) return
         val resolved = if (locator.strategy is LocatorStrategy.Page && pagedSlices.isEmpty()) {
             withContext(Dispatchers.IO) { resolveLegacyPageLocator(locator) }
         } else {
@@ -2546,8 +2597,132 @@ class EpubReflowEngine private constructor(
         val targetSpine = spineIndexForParagraph(idx)
         withContext(Dispatchers.IO) { lazyBook?.prefetchAroundParagraph(idx) }
         withContext(Dispatchers.Main) {
-            navigateFlowOnMain(idx, paraOffset, targetSpine)
+            if (!isCurrentFlowNavigationRequest(navigationRequestId, navigationBookGeneration)) {
+                return@withContext
+            }
+            if (flowView != null && targetSpine != flowSpineIndex) {
+                prepareFlowNavigation(
+                    index = idx,
+                    paragraphOffset = paraOffset,
+                    targetSpine = targetSpine,
+                    requestId = navigationRequestId,
+                    generation = navigationBookGeneration,
+                )
+            } else {
+                navigateFlowOnMain(idx, paraOffset, targetSpine)
+            }
         }
+    }
+
+    private fun prepareFlowNavigation(
+        index: Int,
+        paragraphOffset: Int,
+        targetSpine: Int,
+        requestId: Long,
+        generation: Long,
+    ) {
+        val expectedView = flowView ?: return
+        val expectedSourceSpine = flowSpineIndex
+        val expectedFile = epubFile ?: return
+        val blocks = blocksForSpine(targetSpine)
+        if (blocks.isEmpty()) return
+        val cachedImageBounds = blocks.asSequence()
+            .mapNotNull { block -> (block as? EpubDisplayBlock.Image)?.href }
+            .distinct()
+            .mapNotNull { href -> imageBoundsCache[href]?.let { href to it } }
+            .toMap()
+        invalidateBoundaryPreviewState(clearViewSlots = true)
+
+        lateinit var task: FutureTask<Unit>
+        task = FutureTask {
+            val prepared = runCatching {
+                val flow = epubBuildChapterFlow(targetSpine, blocks)
+                val bounds = LinkedHashMap<String, EpubImageBoundsCacheEntry>()
+                flow.segments.asSequence()
+                    .mapNotNull { segment -> (segment.block as? EpubDisplayBlock.Image)?.href }
+                    .distinct()
+                    .forEach { href ->
+                        if (Thread.currentThread().isInterrupted) {
+                            throw CancellationException("EPUB flow navigation preparation was superseded")
+                        }
+                        bounds[href] = cachedImageBounds[href]
+                            ?: EpubImageBoundsCacheEntry(decodeEpubImageBounds(expectedFile, href))
+                    }
+                PreparedFlowNavigation(flow, bounds)
+            }.getOrNull()
+            val posted = flowMainHandler.post {
+                clearFlowNavigationPreparation(task)
+                completeFlowNavigationPreparation(
+                    index = index,
+                    paragraphOffset = paragraphOffset,
+                    targetSpine = targetSpine,
+                    requestId = requestId,
+                    generation = generation,
+                    expectedView = expectedView,
+                    expectedSourceSpine = expectedSourceSpine,
+                    expectedFile = expectedFile,
+                    prepared = prepared,
+                )
+            }
+            if (!posted) clearFlowNavigationPreparation(task)
+        }
+        val executor = flowPreparationExecutor()
+        val shouldExecute = synchronized(flowNavigationLock) {
+            if (isCurrentFlowNavigationRequest(requestId, generation)) {
+                flowNavigationPreparationJob = task
+                true
+            } else {
+                false
+            }
+        }
+        if (shouldExecute) {
+            runCatching { executor.execute(task) }
+                .onFailure {
+                    task.cancel(true)
+                    clearFlowNavigationPreparation(task)
+                    completeFlowNavigationPreparation(
+                        index = index,
+                        paragraphOffset = paragraphOffset,
+                        targetSpine = targetSpine,
+                        requestId = requestId,
+                        generation = generation,
+                        expectedView = expectedView,
+                        expectedSourceSpine = expectedSourceSpine,
+                        expectedFile = expectedFile,
+                        prepared = null,
+                    )
+                }
+        } else {
+            task.cancel(true)
+        }
+    }
+
+    private fun completeFlowNavigationPreparation(
+        index: Int,
+        paragraphOffset: Int,
+        targetSpine: Int,
+        requestId: Long,
+        generation: Long,
+        expectedView: EpubFlowView,
+        expectedSourceSpine: Int,
+        expectedFile: File,
+        prepared: PreparedFlowNavigation?,
+    ) {
+        if (
+            !isCurrentFlowNavigationRequest(requestId, generation) ||
+            flowView !== expectedView ||
+            flowSpineIndex != expectedSourceSpine ||
+            epubFile !== expectedFile
+        ) {
+            return
+        }
+        prepared?.let { imageBoundsCache.putAll(it.imageBounds) }
+        navigateFlowOnMain(
+            index = index,
+            paragraphOffset = paragraphOffset,
+            targetSpine = targetSpine,
+            preparedFlow = prepared?.flow,
+        )
     }
 
     private suspend fun awaitFullIndexBook(): EpubLazyBook? {
@@ -2566,6 +2741,7 @@ class EpubReflowEngine private constructor(
         index: Int,
         paragraphOffset: Int,
         targetSpine: Int,
+        preparedFlow: EpubChapterFlow? = null,
     ) {
         invalidateBoundaryPreviewState(clearViewSlots = true)
         val view = flowView
@@ -2579,6 +2755,7 @@ class EpubReflowEngine private constructor(
                 targetSpine,
                 restoreToParagraph = index,
                 restoreToParagraphOffset = paragraphOffset,
+                preparedFlow = preparedFlow,
             )
         } else {
             val offset = flowCurrentFlow?.offsetForParagraph(index, paragraphOffset) ?: 0
@@ -2852,6 +3029,7 @@ class EpubReflowEngine private constructor(
 
     private fun resetBookStateForOpen() {
         bookGeneration.incrementAndGet()
+        invalidateFlowNavigationRequest()
         clearFontPrewarmRebuildState()
         invalidateBoundaryPreviewState(clearViewSlots = false)
         flowMainHandler.removeCallbacksAndMessages(null)
@@ -2912,6 +3090,7 @@ class EpubReflowEngine private constructor(
 
     override suspend fun close() {
         bookGeneration.incrementAndGet()
+        invalidateFlowNavigationRequest()
         clearFontPrewarmRebuildState()
         unregisterPageShotMemoryCallbacks()
         invalidateBoundaryPreviewState(clearViewSlots = false)

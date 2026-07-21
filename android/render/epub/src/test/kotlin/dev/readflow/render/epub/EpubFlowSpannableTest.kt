@@ -557,6 +557,48 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `first decoded pixels promote the retained placeholder layer without text rebind`() {
+        val epub = createImageEpub("retained-first-pixels")
+        val executor = QueuedExecutorService()
+        val results = mutableListOf<EpubAsyncImageResult>()
+        try {
+            val loader = imageLoader(
+                epub = epub,
+                executor = executor,
+                imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+                onImageResultChanged = results::add,
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            AsyncDrawableSpan(
+                io.noties.markwon.core.MarkwonTheme.create(RuntimeEnvironment.getApplication()),
+                drawable,
+                AsyncDrawableSpan.ALIGN_CENTER,
+                false,
+            ).getSize(Paint(), "\uFFFC", 0, 1, Paint.FontMetricsInt())
+            val reservedLayer = drawable.result
+            assertNotNull("known geometry must install a retained placeholder layer", reservedLayer)
+
+            drawable.setCallback2(attachedDrawableCallback)
+            assertEquals("attach must queue the first pixel decode", 1, executor.queuedTaskCount)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val result = results.single()
+            assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, result.kind)
+            assertTrue(
+                "first pixels with unchanged geometry must update the retained layer and avoid " +
+                    "whole-TextView reassignment; retained=${drawable.result === reservedLayer} " +
+                    "requiresTextRebind=${result.requiresTextRebind}",
+                drawable.result === reservedLayer && !result.requiresTextRebind,
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `motion decode lowers pixel budget while preserving full display bounds`() {
         val epub = File.createTempFile("readflow-motion-lod", ".epub")
         val executor = QueuedExecutorService()
@@ -592,6 +634,45 @@ class EpubFlowSpannableTest {
             executor.shutdownNow()
             epub.delete()
         }
+    }
+
+    @Test
+    fun `upscaled full page motion decode still samples the source pixels`() {
+        val sourceWidth = 811
+        val sourceHeight = 1200
+        val displayWidth = 1576
+        val displayHeight = 2330
+        val motionBudget = epubImageDecodeBudget(
+            targetWidth = displayWidth,
+            targetHeight = displayHeight,
+            quality = EpubImageRenderQuality.MOTION,
+        )
+        val displayBudget = epubImageDecodeBudget(
+            targetWidth = displayWidth,
+            targetHeight = displayHeight,
+            quality = EpubImageRenderQuality.DISPLAY,
+        )
+
+        val motionSample = epubImageSampleSize(
+            width = sourceWidth,
+            height = sourceHeight,
+            maxSide = motionBudget.maxSide,
+            maxPixels = motionBudget.maxPixels,
+        )
+        val displaySample = epubImageSampleSize(
+            width = sourceWidth,
+            height = sourceHeight,
+            maxSide = displayBudget.maxSide,
+            maxPixels = displayBudget.maxPixels,
+        )
+
+        assertEquals("settled display may retain the native Book 86 source pixels", 1, displaySample)
+        assertTrue(
+            "MOTION must request fewer source pixels even when the display box upscales the image; " +
+                "source=${sourceWidth}x$sourceHeight display=${displayWidth}x$displayHeight " +
+                "budget=$motionBudget sample=$motionSample",
+            motionSample > 1,
+        )
     }
 
     @Test
@@ -643,7 +724,7 @@ class EpubFlowSpannableTest {
             assertSame("quality promotion must update the retained pixel layer", pixelLayer, drawable.result)
             assertEquals("quality promotion must not move content", stableBounds, drawable.bounds)
             assertEquals(EpubImageRenderQuality.MOTION, results.first().quality)
-            assertTrue(results.first().requiresTextRebind)
+            assertFalse("first same-size pixels must stay on the retained layer", results.first().requiresTextRebind)
             assertEquals(EpubImageRenderQuality.DISPLAY, results.last().quality)
             assertFalse("in-place pixel promotion must not rebind the chapter TextView", results.last().requiresTextRebind)
         } finally {
@@ -830,7 +911,7 @@ class EpubFlowSpannableTest {
     }
 
     @Test
-    fun `all PIXELS_ONLY results require TextView rebind`() {
+    fun `retained PIXELS_ONLY results do not require TextView rebind`() {
         val stableBounds = Rect(0, 0, 800, 1200)
         val fullPagePixels = EpubAsyncImageResult(
             layoutStart = 42,
@@ -839,6 +920,7 @@ class EpubFlowSpannableTest {
             beforeBounds = stableBounds,
             afterBounds = Rect(stableBounds),
             isFullPage = true,
+            replacesPlaceholder = false,
         )
         val inlinePixels = fullPagePixels.copy(
             destination = "inline.png",
@@ -850,16 +932,16 @@ class EpubFlowSpannableTest {
         val unknownOccurrence = inlinePixels.copy(layoutStart = -1)
 
         assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, fullPagePixels.kind)
-        assertTrue(
-            "same-size full-page bitmap must replace the transparent TextView display-list owner",
+        assertFalse(
+            "same-size full-page pixels must update their retained display-list owner",
             fullPagePixels.requiresTextRebind,
         )
-        assertTrue(
-            "same-size inline pixels must also replace the transparent TextView display-list owner",
+        assertFalse(
+            "same-size inline pixels must update their retained display-list owner",
             inlinePixels.requiresTextRebind,
         )
-        assertTrue(changedGeometry.requiresTextRebind)
-        assertTrue(unknownOccurrence.requiresTextRebind)
+        assertEquals(EpubAsyncImageResultKind.GEOMETRY_CHANGED, changedGeometry.kind)
+        assertFalse(unknownOccurrence.requiresTextRebind)
     }
 
     @Test
@@ -948,6 +1030,186 @@ class EpubFlowSpannableTest {
                 loader.hasRelevantPendingDecodes(listOf(4_900 until 5_100)),
             )
         } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `chapter attach schedules image occurrences only in the current and adjacent page ranges`() {
+        val epub = createImageEpub("attach-page-neighborhood")
+        val backgroundExecutor = QueuedExecutorService()
+        val nearbyExecutor = QueuedExecutorService()
+        val nearbyRanges = listOf(0 until 100, 100 until 200, 200 until 300)
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = backgroundExecutor,
+            priorityExecutor = nearbyExecutor,
+            priorityLayoutRangesProvider = { nearbyRanges },
+            columnWidthPx = 8,
+            pageHeightProvider = { 8 },
+            inlineMaxHeightPx = 8,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+        )
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = 8,
+            pageHeightProvider = { 8 },
+            inlineMaxHeightPx = 8,
+            fullPageHrefs = emptySet(),
+        )
+
+        fun attachOccurrence(destination: String, layoutStart: Int) {
+            val drawable = AsyncDrawable(destination, loader, resolver, null)
+            loader.registerOccurrence(drawable, layoutStart)
+            drawable.setCallback2(attachedDrawableCallback)
+        }
+
+        try {
+            attachOccurrence("previous.png", layoutStart = 50)
+            attachOccurrence("current.png", layoutStart = 150)
+            attachOccurrence("next.png", layoutStart = 250)
+            attachOccurrence("far.png", layoutStart = 5_000)
+
+            assertEquals(
+                "previous, current, and next page occurrences must be scheduled",
+                3,
+                nearbyExecutor.queuedTaskCount,
+            )
+            assertEquals(
+                "chapter attach must not schedule a far-page occurrence",
+                0,
+                backgroundExecutor.queuedTaskCount,
+            )
+        } finally {
+            loader.releaseAll()
+            nearbyExecutor.shutdownNow()
+            backgroundExecutor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `decode window provider is sampled once and explicit updates govern later attaches`() {
+        val epub = createImageEpub("cached-decode-window")
+        val executor = QueuedExecutorService()
+        var providerCalls = 0
+        val initialRanges = listOf(0 until 100)
+        val updatedRanges = listOf(100 until 200)
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = executor,
+            priorityLayoutRangesProvider = {
+                providerCalls += 1
+                initialRanges
+            },
+            columnWidthPx = 8,
+            pageHeightProvider = { 8 },
+            inlineMaxHeightPx = 8,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+        )
+
+        fun registeredOccurrence(layoutStart: Int) =
+            asyncDrawable(loader).also { drawable ->
+                loader.registerOccurrence(drawable, layoutStart)
+            }
+
+        val first = registeredOccurrence(layoutStart = 10)
+        val second = registeredOccurrence(layoutStart = 20)
+        val afterWindowUpdate = registeredOccurrence(layoutStart = 150)
+
+        try {
+            first.setCallback2(attachedDrawableCallback)
+            second.setCallback2(attachedDrawableCallback)
+            loader.updateDecodeWindow(updatedRanges)
+            afterWindowUpdate.setCallback2(attachedDrawableCallback)
+
+            val updatedOccurrenceIsPending = loader.hasRelevantPendingDecodes(updatedRanges)
+            assertEquals(
+                "the expensive decode-window provider must be sampled at most once per loader; " +
+                    "updatedOccurrenceIsPending=$updatedOccurrenceIsPending",
+                1,
+                providerCalls,
+            )
+            assertTrue(
+                "an occurrence attached after updateDecodeWindow must use the explicit updated window",
+                updatedOccurrenceIsPending,
+            )
+        } finally {
+            loader.releaseAll()
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `explicit empty decode window defers attached images until a visible range is published`() {
+        val epub = createImageEpub("empty-decode-window")
+        val executor = QueuedExecutorService()
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = executor,
+            columnWidthPx = 8,
+            pageHeightProvider = { 8 },
+            inlineMaxHeightPx = 8,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+        )
+        val drawable = asyncDrawable(loader)
+        loader.registerOccurrence(drawable, layoutStart = 42)
+
+        try {
+            loader.updateDecodeWindow(emptyList())
+            drawable.setCallback2(attachedDrawableCallback)
+
+            assertEquals(
+                "an explicitly empty window means pagination has not admitted any occurrence yet",
+                0,
+                executor.queuedTaskCount,
+            )
+            assertEquals(1, loader.updateDecodeWindow(listOf(0 until 100)))
+            assertEquals("the first visible window must wake the dormant attached image", 1, executor.queuedTaskCount)
+        } finally {
+            loader.releaseAll()
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `moving decode window cancels multiple distant requests atomically`() {
+        val epub = createImageEpub("moving-page-neighborhood")
+        val executor = QueuedExecutorService()
+        var decodeRanges: Collection<IntRange> = listOf(0 until 400)
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = executor,
+            priorityLayoutRangesProvider = { decodeRanges },
+            columnWidthPx = 8,
+            pageHeightProvider = { 8 },
+            inlineMaxHeightPx = 8,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+        )
+
+        try {
+            listOf(50, 150, 250).forEach { layoutStart ->
+                val drawable = asyncDrawable(loader)
+                loader.registerOccurrence(drawable, layoutStart)
+                drawable.setCallback2(attachedDrawableCallback)
+            }
+            assertEquals(3, executor.queuedTaskCount)
+
+            decodeRanges = listOf(100 until 200)
+            assertEquals(0, loader.updateDecodeWindow(decodeRanges))
+            assertTrue(loader.hasRelevantPendingDecodes(decodeRanges))
+            assertFalse(
+                "both requests outside the new window must leave the active in-flight set",
+                loader.hasRelevantPendingDecodes(listOf(0 until 100, 200 until 300)),
+            )
+        } finally {
+            loader.releaseAll()
             executor.shutdownNow()
             epub.delete()
         }

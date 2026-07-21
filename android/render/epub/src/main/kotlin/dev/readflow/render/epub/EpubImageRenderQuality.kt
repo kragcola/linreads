@@ -2,10 +2,11 @@ package dev.readflow.render.epub
 
 internal enum class EpubImageRenderQuality(
     val linearScale: Float,
+    val maxDecodeSide: Int,
 ) {
-    RAPID(0.5f),
-    MOTION(0.75f),
-    DISPLAY(1f),
+    RAPID(0.5f, 600),
+    MOTION(0.75f, 900),
+    DISPLAY(1f, Int.MAX_VALUE),
 }
 
 internal data class EpubImageDecodeBudget(
@@ -25,7 +26,10 @@ internal fun epubImageDecodeBudget(
         .toLong()
         .coerceIn(1L, EPUB_MAX_IMAGE_PIXELS.toLong())
     return EpubImageDecodeBudget(
-        maxSide = (maxOf(width, height) * scale).toInt().coerceAtLeast(1),
+        maxSide = minOf(
+            (maxOf(width, height) * scale).toInt().coerceAtLeast(1),
+            quality.maxDecodeSide,
+        ),
         maxPixels = scaledPixels.toInt(),
     )
 }

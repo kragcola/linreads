@@ -4,7 +4,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Rect
 import android.graphics.drawable.BitmapDrawable
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Handler
 import android.os.Looper
@@ -140,8 +139,8 @@ internal data class EpubAsyncImageResult(
     }
 
     val requiresTextRebind: Boolean
-        // HWUI can retain the transparent ReplacementSpan display list when decoded pixels replace
-        // a same-bounds placeholder. This applies to inline and full-page occurrences alike.
+        // Unknown geometry has no retained pixel layer, so its first decoded result still replaces
+        // the span owner. Known-geometry placeholders keep one drawable identity and update in place.
         get() = replacesPlaceholder
 }
 
@@ -151,20 +150,20 @@ private object EpubImagePixelDrawableHolder {
 }
 
 internal interface EpubImagePixelSource {
+    val hasDecodedPixels: Boolean
     fun drawPixels(canvas: Canvas, destination: Rect)
 }
 
 private class EpubImagePixelDrawable(
-    bitmap: Bitmap,
     geometry: Rect,
-    private val fallbackQuality: EpubImageRenderQuality,
 ) : BitmapDrawable(null, EpubImagePixelDrawableHolder.bitmap), EpubImagePixelSource {
-    private val fallbackPixels: Bitmap = bitmap
-    private var pixels: Bitmap = bitmap
+    private var fallbackPixels: Bitmap? = null
+    private var fallbackQuality: EpubImageRenderQuality? = null
+    private var pixels: Bitmap = EpubImagePixelDrawableHolder.bitmap
     private var previousPixels: Bitmap? = null
     private var transitionStartedAtMs = 0L
-    private val geometryWidth = geometry.width().coerceAtLeast(1)
-    private val geometryHeight = geometry.height().coerceAtLeast(1)
+    private var geometryWidth = geometry.width().coerceAtLeast(1)
+    private var geometryHeight = geometry.height().coerceAtLeast(1)
 
     init {
         setBounds(geometry)
@@ -197,6 +196,25 @@ private class EpubImagePixelDrawable(
         }
     }
 
+    override val hasDecodedPixels: Boolean
+        get() = fallbackPixels != null
+
+    fun installInitialPixels(bitmap: Bitmap, quality: EpubImageRenderQuality) {
+        fallbackPixels = bitmap
+        fallbackQuality = quality
+        pixels = bitmap
+        previousPixels = null
+        transitionStartedAtMs = 0L
+        invalidateSelf()
+    }
+
+    fun updateGeometry(geometry: Rect) {
+        geometryWidth = geometry.width().coerceAtLeast(1)
+        geometryHeight = geometry.height().coerceAtLeast(1)
+        bounds = geometry
+        invalidateSelf()
+    }
+
     fun promotePixels(bitmap: Bitmap) {
         if (bitmap === pixels) return
         previousPixels = pixels
@@ -206,12 +224,14 @@ private class EpubImagePixelDrawable(
     }
 
     fun restoreFallbackPixels(): EpubImageRenderQuality? {
-        if (pixels === fallbackPixels) return null
+        val fallback = fallbackPixels ?: return null
+        val quality = fallbackQuality ?: return null
+        if (pixels === fallback) return null
         previousPixels = null
-        pixels = fallbackPixels
+        pixels = fallback
         transitionStartedAtMs = 0L
         invalidateSelf()
-        return fallbackQuality
+        return quality
     }
 
     fun finishPromotion() {
@@ -255,6 +275,8 @@ internal class EpubFlowImageLoader(
     private val layoutStartByDrawable = WeakHashMap<AsyncDrawable, Int>()
     private val installedQualityByDrawable = WeakHashMap<AsyncDrawable, EpubImageRenderQuality>()
     private val promotionCompletionByDrawable = WeakHashMap<AsyncDrawable, Runnable>()
+    private var decodeWindowRanges: List<IntRange>? = null
+    private var decodeWindowRestrictsAdmission = false
     private var lifecycleGeneration = 0L
     private var released = false
 
@@ -283,6 +305,44 @@ internal class EpubFlowImageLoader(
         synchronized(lifecycleLock) {
             if (!released) layoutStartByDrawable[drawable] = layoutStart
         }
+    }
+
+    /**
+     * Cancels work outside [layoutRanges] and wakes newly adjacent occurrences. Markwon attaches
+     * every image span in a chapter, so the loader owns viewport admission instead of treating
+     * attachment as permission to decode the whole spine.
+     */
+    fun updateDecodeWindow(layoutRanges: Collection<IntRange>): Int {
+        val ranges = layoutRanges.toList()
+        val (cancelled, candidates, generation) = synchronized(lifecycleLock) {
+            if (released) return 0
+            decodeWindowRanges = ranges
+            decodeWindowRestrictsAdmission = true
+            if (ranges.isEmpty()) return 0
+            val staleRequests = buildList {
+                val iterator = inFlight.entries.iterator()
+                while (iterator.hasNext()) {
+                    val (drawable, request) = iterator.next()
+                    val layoutStart = layoutStartByDrawable[drawable] ?: continue
+                    if (ranges.none { range -> layoutStart in range }) {
+                        add(request)
+                        iterator.remove()
+                    }
+                }
+            }
+            val dormant = layoutStartByDrawable.entries.mapNotNull { (drawable, layoutStart) ->
+                drawable.takeIf {
+                    drawable.isAttached &&
+                        ranges.any { range -> layoutStart in range } &&
+                        installedQualityByDrawable[drawable] == null &&
+                        inFlight[drawable] == null
+                }
+            }
+            Triple(staleRequests, dormant, lifecycleGeneration)
+        }
+        cancelled.forEach { request -> request.future?.cancel(true) }
+        if (cancelled.isNotEmpty()) notifyDecodeFinished(generation)
+        return candidates.count { requestLoad(it, forcedQuality = null) }
     }
 
     fun promoteToDisplayQuality(layoutRanges: Collection<IntRange>): Int {
@@ -388,6 +448,16 @@ internal class EpubFlowImageLoader(
         forcedQuality: EpubImageRenderQuality?,
     ): Boolean {
         if (synchronized(lifecycleLock) { released }) return false
+        val layoutStart = synchronized(lifecycleLock) { layoutStartByDrawable[drawable] ?: -1 }
+        val decodeWindow = if (layoutStart >= 0) {
+            currentDecodeWindow()
+        } else {
+            DecodeWindowSnapshot(emptyList(), restrictsAdmission = false)
+        }
+        if (forcedQuality == null && layoutStart >= 0 && decodeWindow.restrictsAdmission) {
+            val admitted = decodeWindow.ranges.any { range -> layoutStart in range }
+            if (!admitted) return false
+        }
         val file = try {
             epubFileProvider()
         } catch (_: RuntimeException) {
@@ -431,7 +501,6 @@ internal class EpubFlowImageLoader(
             )
             else -> Rect(0, 0, currentColumnWidthPx, pageHeightPx)
         }
-        val layoutStart = synchronized(lifecycleLock) { layoutStartByDrawable[drawable] ?: -1 }
         val quality = forcedQuality ?: try {
             imageQualityProvider(layoutStart)
         } catch (_: RuntimeException) {
@@ -466,10 +535,7 @@ internal class EpubFlowImageLoader(
         }
         superseded?.future?.cancel(true)
         val decodeExecutor = priorityExecutor?.takeIf {
-            val layoutStart = synchronized(lifecycleLock) { layoutStartByDrawable[drawable] ?: -1 }
-            layoutStart >= 0 && runCatching {
-                priorityLayoutRangesProvider().any { range -> layoutStart in range }
-            }.getOrDefault(false)
+            layoutStart >= 0 && decodeWindow.ranges.any { range -> layoutStart in range }
         } ?: executor
         val future = try {
             decodeExecutor.submit {
@@ -490,6 +556,27 @@ internal class EpubFlowImageLoader(
         }
         if (shouldCancel) future.cancel(true)
         return !shouldCancel
+    }
+
+    private fun currentDecodeWindow(): DecodeWindowSnapshot {
+        synchronized(lifecycleLock) {
+            decodeWindowRanges?.let { ranges ->
+                return DecodeWindowSnapshot(ranges, decodeWindowRestrictsAdmission)
+            }
+            if (released) return DecodeWindowSnapshot(emptyList(), restrictsAdmission = true)
+        }
+        val provided = runCatching { priorityLayoutRangesProvider().toList() }
+            .getOrDefault(emptyList())
+        return synchronized(lifecycleLock) {
+            val existing = decodeWindowRanges
+            if (existing != null) {
+                DecodeWindowSnapshot(existing, decodeWindowRestrictsAdmission)
+            } else {
+                decodeWindowRanges = provided
+                decodeWindowRestrictsAdmission = provided.isNotEmpty()
+                DecodeWindowSnapshot(provided, decodeWindowRestrictsAdmission)
+            }
+        }
     }
 
     override fun cancel(drawable: AsyncDrawable) {
@@ -535,9 +622,7 @@ internal class EpubFlowImageLoader(
                 isFullPage = drawable.isFullPageOccurrence(fullPageHrefs),
             ),
         )
-        return ColorDrawable(android.graphics.Color.TRANSPARENT).apply {
-            setBounds(0, 0, target.width(), target.height())
-        }
+        return EpubImagePixelDrawable(target)
     }
 
     private fun postDecodeResult(
@@ -562,10 +647,15 @@ internal class EpubFlowImageLoader(
                         val target = reservedBounds ?: Rect(drawable.bounds)
                         val retainedLayer = drawable.result as? EpubImagePixelDrawable
                         val replacesPlaceholder = retainedLayer == null
-                        val result = retainedLayer ?: EpubImagePixelDrawable(bitmap, target, request.quality)
+                        val result = retainedLayer ?: EpubImagePixelDrawable(target)
                         if (drawable.isAttached) {
                             if (replacesPlaceholder) {
+                                result.installInitialPixels(bitmap, request.quality)
                                 drawable.result = result
+                            } else if (!result.hasDecodedPixels) {
+                                result.updateGeometry(target)
+                                if (drawable.bounds != target) drawable.bounds = target
+                                result.installInitialPixels(bitmap, request.quality)
                             } else {
                                 result.promotePixels(bitmap)
                                 if (request.quality == EpubImageRenderQuality.DISPLAY) {
@@ -712,6 +802,8 @@ internal class EpubFlowImageLoader(
             if (permanently) {
                 layoutStartByDrawable.clear()
                 installedQualityByDrawable.clear()
+                decodeWindowRanges = null
+                decodeWindowRestrictsAdmission = false
             }
             val requests = inFlight.values.toList().also { inFlight.clear() }
             val fadeCompletions = promotionCompletionByDrawable.values.toList().also {
@@ -749,6 +841,11 @@ internal class EpubFlowImageLoader(
         val quality: EpubImageRenderQuality,
         val isPromotion: Boolean,
         var future: Future<*>? = null,
+    )
+
+    private data class DecodeWindowSnapshot(
+        val ranges: List<IntRange>,
+        val restrictsAdmission: Boolean,
     )
 }
 

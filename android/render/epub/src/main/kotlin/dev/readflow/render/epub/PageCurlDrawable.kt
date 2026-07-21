@@ -124,17 +124,25 @@ internal class PageCurlDrawable(
     }
 
     private fun drawWholeBitmap(canvas: Canvas, bitmap: Bitmap) {
-        bitmapSrc.set(0, 0, viewportW, viewportH)
+        bitmapSrc.set(0, 0, bitmap.width, bitmap.height)
         bitmapDst.set(0, 0, viewportW, viewportH)
         canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, bitmapPaint)
     }
 
     private fun drawFlatRange(canvas: Canvas, bitmap: Bitmap, left: Int, right: Int) {
         if (right <= left) return
-        bitmapSrc.set(left, 0, right, viewportH)
+        val sourceLeft = viewportXToBitmapX(left, bitmap.width)
+        val sourceRight = viewportXToBitmapX(right, bitmap.width)
+        if (sourceRight <= sourceLeft) return
+        bitmapSrc.set(sourceLeft, 0, sourceRight, bitmap.height)
         bitmapDst.set(left, 0, right, viewportH)
         canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, bitmapPaint)
     }
+
+    private fun viewportXToBitmapX(viewportX: Int, bitmapWidth: Int): Int =
+        (viewportX.toLong() * bitmapWidth.toLong() / viewportW.coerceAtLeast(1).toLong())
+            .toInt()
+            .coerceIn(0, bitmapWidth)
 
     /** Compresses the full source page into [destinationWidth], bending only its right edge. */
     private fun drawPaperWidth(canvas: Canvas, bitmap: Bitmap, destinationWidth: Int) {

@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Test
 class EpubImageDecoderTest {
 
     @Test
-    fun `motion quality reduces decode work quadratically`() {
+    fun `motion quality caps both decode side and quadratic pixel work`() {
         val display = epubImageDecodeBudget(
             targetWidth = 1600,
             targetHeight = 2400,
@@ -24,8 +24,8 @@ class EpubImageDecoderTest {
         )
 
         assertEquals(EpubImageDecodeBudget(maxSide = 2400, maxPixels = 3_840_000), display)
-        assertEquals(EpubImageDecodeBudget(maxSide = 1800, maxPixels = 2_160_000), motion)
-        assertEquals(EpubImageDecodeBudget(maxSide = 1200, maxPixels = 960_000), rapid)
+        assertEquals(EpubImageDecodeBudget(maxSide = 900, maxPixels = 2_160_000), motion)
+        assertEquals(EpubImageDecodeBudget(maxSide = 600, maxPixels = 960_000), rapid)
     }
 
     @Test
