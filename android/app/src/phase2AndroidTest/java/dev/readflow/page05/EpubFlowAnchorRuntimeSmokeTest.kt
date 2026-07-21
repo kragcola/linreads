@@ -1418,7 +1418,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
     }
 
     @Test
-    fun epubFlowSimulationA2TurnIgnoresRapidSecondTurnRuntime() = runBlocking {
+    fun epubFlowSimulationA2TurnQueuesRapidSecondTurnRuntime() = runBlocking {
         settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
         val title = "flow-a2-rapid-${UUID.randomUUID().toString().take(8)}"
         val uri = createEpubUri("$title.epub")
@@ -1458,13 +1458,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
             assertEquals("second rapid request must not park page 2", 1, rapid.currentPage)
             assertEquals(start.nextPageTop, rapid.scrollY)
 
-            waitForConditionResult("expected rapid A2 turn sequence to settle once on page 1") {
+            waitForConditionResult("expected rapid A2 turn sequence to drain to page 2") {
                 scenario.withActivity {
                     val animatorRunning =
                         (start.view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
                     if (
-                        start.view.reflectInt("currentPageIndex") == 1 &&
-                        start.view.scrollY == start.nextPageTop &&
+                        start.view.reflectInt("currentPageIndex") == 2 &&
                         start.view.reflectPrivateAny("curlDrawable") == null &&
                         !animatorRunning
                     ) true else null
@@ -1480,8 +1479,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     scrollY = start.view.scrollY,
                 )
             }
-            assertEquals("rapid second turn must not queue a later page-2 commit", 1, final.currentPage)
-            assertEquals(start.nextPageTop, final.scrollY)
+            assertEquals("rapid second turn must drain to page 2", 2, final.currentPage)
+            assertEquals(
+                "the queued turn must settle at page 2",
+                start.view.reflectNullableInt("pageTopPxAt", 2),
+                final.scrollY,
+            )
         }
     }
 

@@ -323,6 +323,10 @@ internal class EpubFlowView(
     private var flingStopGesture = false
     /** True when a chapter continuity cover owns DOWN; the whole stream is classified in isolation. */
     private var coverConsumedGesture = false
+    /** A new stream that began while the page-turn renderer still owned the viewport. */
+    private var busyPageTurnGesture = false
+    /** A selectable stream that began after the renderer settled but before rapid coalescing expired. */
+    private var rapidIdlePageTurnGesture = false
 
     /**
      * Page-turn animation style (PAGED only). SLIDE = hardware overlay slide (default, GPU-composited);
@@ -351,6 +355,11 @@ internal class EpubFlowView(
                 interactiveTurnState != InteractiveTurnState.NONE ||
                 pagedMotionState == PagedMotionState.DRAGGING_FREE ||
                 pagedMotionState == PagedMotionState.FLING_FREE
+    private val pageTurnRendererBusy: Boolean
+        get() =
+            flipAnimator?.isRunning == true ||
+                releasedLocalIntentWaiting ||
+                boundaryDiscreteWaiting
 
     /**
      * Public idle gate for external chapter rebuilds (e.g. font prewarm completion).
@@ -377,6 +386,27 @@ internal class EpubFlowView(
     private var pendingBoundaryPageTurn: BoundaryPageTurn? = null
     private var chapterGeneration = 0L
     private val flipDurationMs = 280L
+    private var queuedPageTurnDelta = 0
+    private var rapidTurnSequenceActive = false
+    private val queuedPageTurnDrainRunnable = Runnable {
+        if (drainQueuedPageTurn()) onPageSettled?.invoke() else scheduleRapidTurnIdle()
+    }
+    private val rapidTurnIdleRunnable = object : Runnable {
+        override fun run() {
+            if (queuedPageTurnDelta != 0) {
+                if (drainQueuedPageTurn()) {
+                    onPageSettled?.invoke()
+                } else if (!disposed) {
+                    postDelayed(this, RAPID_TURN_IDLE_TIMEOUT_MS)
+                }
+            } else if (!turnInFlight) {
+                rapidTurnSequenceActive = false
+                preCachePageTextures()
+            } else if (!disposed) {
+                postDelayed(this, RAPID_TURN_IDLE_TIMEOUT_MS)
+            }
+        }
+    }
     /** Finger-owned and boundary software turn states. */
     private enum class InteractiveTurnState {
         NONE,
@@ -412,6 +442,7 @@ internal class EpubFlowView(
     private var forwardBoundaryPreview: BoundaryPagePreview? = null
     private var backwardBoundaryPreview: BoundaryPagePreview? = null
     private var activeBoundaryPreview: BoundaryPagePreview? = null
+    private var deferredBoundaryFinishCommit = false
     private var boundaryPreviewBudgetDirection: Boolean? = null
     private var waitingBoundaryForward = true
     private var waitingBoundaryAxis = InteractiveTurnAxis.HORIZONTAL
@@ -554,6 +585,7 @@ internal class EpubFlowView(
 
     private fun preCachePageTextures() {
         if (disposed) return
+        if (rapidTurnSequenceActive) return
         if (!pageTexturePrecacheEnabled) return
         if (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) return
         if (mode != Mode.PAGED || paged.isEmpty() || width == 0) return
@@ -618,7 +650,10 @@ internal class EpubFlowView(
                     (previousTop ?: -1) == cachedBackwardTopPx &&
                     previousKey == cachedBackwardTextureKey
                 )
-        if (frontMatches && targetMatches && previousMatches) return
+        if (frontMatches && targetMatches && previousMatches) {
+            if (drainQueuedPageTurn()) onPageSettled?.invoke() else scheduleRapidTurnIdle()
+            return
+        }
         val retainedFront = cachedFrontBitmap?.takeIf { frontMatches }
         val retainedTarget = cachedRevealedBitmap?.takeIf { targetMatches && targetWindow != null }
         val retainedPrevious = cachedBackwardBitmap?.takeIf { previousMatches && previousWindow != null }
@@ -818,6 +853,7 @@ internal class EpubFlowView(
         relabelPageShot(front, PageShotLeaseKind.EVICTABLE, "cache.current")
         relabelPageShot(target, PageShotLeaseKind.EVICTABLE, "cache.forward")
         relabelPageShot(previous, PageShotLeaseKind.EVICTABLE, "cache.backward")
+        if (drainQueuedPageTurn()) onPageSettled?.invoke() else scheduleRapidTurnIdle()
     }
 
     private fun discardPendingPageTexturePrecache(request: PendingPageTexturePrecache) {
@@ -1359,7 +1395,7 @@ internal class EpubFlowView(
             if (paged.isNotEmpty()) topLayoutOffset() else -1
         }
         recycleCachedTextures()
-        repaginate(reposition = false)
+        repaginate(reposition = false, preserveQueuedTurns = true)
         if (anchorOffset >= 0) {
             goToOffset(
                 anchorOffset,
@@ -2001,8 +2037,9 @@ internal class EpubFlowView(
         reportPositionAfterStableReveal: Boolean = false,
     ) {
         if (disposed) return
+        val preserveQueuedTurns = pendingBoundaryPageTurn != null || boundaryContinuityCover
         cancelFreeFlingForLifecycle()
-        abortLocalPageShotTurnForExternalMutation()
+        abortLocalPageShotTurnForExternalMutation(preserveQueuedTurns = preserveQueuedTurns)
         pageLayoutMetadata = null
         clearAsyncImageWake()
         removeCallbacks(asyncImageRefreshRunnable)
@@ -2126,7 +2163,9 @@ internal class EpubFlowView(
         }
         // A gesture recognized while the chapter was hidden owns the next visible position. Publishing
         // the transient chapter top first would persist two locators and make the text appear to jump.
-        if (stable && pendingInitialPageTurnDelta == null) publishStableChapterPosition()
+        if (stable && pendingInitialPageTurnDelta == null && queuedPageTurnDelta == 0) {
+            publishStableChapterPosition()
+        }
         val fadingCover = conversionSnapshotDrawable
         if (fadingCover != null) {
             // The stable live page becomes fully opaque under the frozen shot first. Fading both layers
@@ -2142,7 +2181,7 @@ internal class EpubFlowView(
         if (!animateChapterReveal) {
             container.animate().cancel()
             container.alpha = 1f
-            if (!consumePendingInitialPageTurn()) preCachePageTextures()
+            if (!consumePendingInitialPageTurn()) continueQueuedTurnsOrPrecache()
             if (stable) notifyChapterStable()
             return
         }
@@ -2152,7 +2191,7 @@ internal class EpubFlowView(
             .withEndAction {
                 if (stable) notifyChapterStable()
                 if (!consumePendingInitialPageTurn()) {
-                    preCachePageTextures()
+                    continueQueuedTurnsOrPrecache()
                 }
             }
             .start()
@@ -2262,13 +2301,13 @@ internal class EpubFlowView(
     fun boundaryPreviewBudgetAllows(forward: Boolean): Boolean =
         threePageShotsFitOppositeBudget() || boundaryPreviewBudgetDirection == forward
 
-    fun releasePageShotBudgetForBoundaryPreview(forward: Boolean) {
+    fun releasePageShotBudgetForBoundaryPreview(forward: Boolean, resumePrecache: Boolean = true) {
         if (boundaryPreviewBudgetDirection != forward) return
         val slotted = if (forward) forwardBoundaryPreview != null else backwardBoundaryPreview != null
         val active = activeBoundaryPreview?.forward == forward
         if (slotted || active) return
         boundaryPreviewBudgetDirection = null
-        preCachePageTextures()
+        if (resumePrecache) preCachePageTextures()
     }
 
     private fun preparePinnedLocalWorkingPairBudget() {
@@ -2346,6 +2385,7 @@ internal class EpubFlowView(
     }
 
     fun clearBoundaryPreviews() {
+        deferredBoundaryFinishCommit = false
         boundaryPreviewGeneration++
         val boundaryOwnsAnimator =
             activeBoundaryPreview != null ||
@@ -2368,6 +2408,7 @@ internal class EpubFlowView(
     fun dispose() {
         if (disposed) return
         disposed = true
+        deferredBoundaryFinishCommit = false
         boundaryPreviewGeneration++
         cancelFreeFlingForLifecycle()
         abortLocalPageShotTurnForExternalMutation()
@@ -2419,7 +2460,7 @@ internal class EpubFlowView(
         val startAlpha = fadingCover.alphaValue
         if (startAlpha <= 0) {
             if (conversionSnapshotDrawable === fadingCover) clearConversionSnapshot()
-            if (!consumePendingInitialPageTurn()) preCachePageTextures()
+            if (!consumePendingInitialPageTurn()) continueQueuedTurnsOrPrecache()
             return
         }
         conversionFadeAnimator = android.animation.ValueAnimator.ofInt(startAlpha, 0).apply {
@@ -2438,7 +2479,7 @@ internal class EpubFlowView(
                     // installed a fresh snapshot mid-fade (do not recycle someone else's cover).
                     if (!cancelled && conversionSnapshotDrawable === fadingCover) {
                         clearConversionSnapshot()
-                        if (!consumePendingInitialPageTurn()) preCachePageTextures()
+                        if (!consumePendingInitialPageTurn()) continueQueuedTurnsOrPrecache()
                     }
                 }
             })
@@ -2510,9 +2551,15 @@ internal class EpubFlowView(
      * by content offset right after (reflow / size change) pass false, so the page only scrolls ONCE
      * (a [scrollTo] here followed by [goToOffset] is the visible flicker on every image decode).
      */
-    private fun repaginate(reposition: Boolean = true) {
+    private fun repaginate(
+        reposition: Boolean = true,
+        preserveQueuedTurns: Boolean = false,
+    ) {
         if (disposed) return
-        abortLocalPageShotTurnForExternalMutation(restoreOrigin = true)
+        abortLocalPageShotTurnForExternalMutation(
+            restoreOrigin = true,
+            preserveQueuedTurns = preserveQueuedTurns,
+        )
         val layout = textView.layout ?: return
         val f = flow ?: return
         paginatedLayoutHeight = layout.height
@@ -2821,7 +2868,7 @@ internal class EpubFlowView(
             interactiveTurnState = InteractiveTurnState.NONE
             return
         }
-        if (!pageTurnAnimated) {
+        if (!pageTurnAnimated || rapidTurnSequenceActive) {
             val commitCallback = onBoundaryTurnCommitted ?: run {
                 recyclePageShot(preview.bitmap)
                 onBoundaryTurnDiscarded?.invoke(preview)
@@ -2888,7 +2935,7 @@ internal class EpubFlowView(
         }
         applyFlipProgress(0f, preview.forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = flipDurationMs
+            duration = activeFlipDurationMs()
             interpolator = DecelerateInterpolator(1.6f)
             addUpdateListener { applyFlipProgress(it.animatedValue as Float, preview.forward) }
             addListener(object : AnimatorListenerAdapter() {
@@ -2909,7 +2956,10 @@ internal class EpubFlowView(
         // prepared turn is consumed. Likewise, a live local page-shot turn may already have parked the content
         // on this chapter's final page; reporting a boundary from that intermediate state would make the
         // engine replace the chapter mid-animation.
-        if (pendingBoundaryPageTurn != null || (boundaryContinuityCover && awaitingStableChapter) || turnInFlight) return true
+        if (pendingBoundaryPageTurn != null || (boundaryContinuityCover && awaitingStableChapter) || turnInFlight) {
+            enqueuePageTurn(delta)
+            return true
+        }
         if (mode == Mode.PAGED) {
             if (awaitingReveal && flow != null && (height <= 0 || paged.isEmpty())) {
                 pendingInitialPageTurnDelta = delta.coerceIn(-1, 1)
@@ -2923,7 +2973,19 @@ internal class EpubFlowView(
                 }
                 return false
             }
+            val cancelsQueuedDirection =
+                (queuedPageTurnDelta > 0 && delta < 0) || (queuedPageTurnDelta < 0 && delta > 0)
+            if (cancelsQueuedDirection) {
+                enqueuePageTurn(delta)
+                if (drainQueuedPageTurn()) onPageSettled?.invoke()
+                return true
+            }
             val target = pageWindowForTurn(forward = delta > 0) ?: return false
+            if (rapidTurnSequenceActive || rapidIdlePageTurnGesture) {
+                enqueuePageTurn(delta)
+                if (drainQueuedPageTurn()) onPageSettled?.invoke()
+                return true
+            }
             goToPageAnimated(target, forward = delta > 0)
             return true
         }
@@ -2935,6 +2997,92 @@ internal class EpubFlowView(
         reportTopOffset()
         return true
     }
+
+    private fun enqueuePageTurn(delta: Int) {
+        val step = delta.coerceIn(-1, 1)
+        if (step == 0) return
+        queuedPageTurnDelta = (queuedPageTurnDelta + step).coerceIn(
+            -MAX_QUEUED_PAGE_TURNS,
+            MAX_QUEUED_PAGE_TURNS,
+        )
+        armRapidTurnSequence()
+    }
+
+    private fun clearQueuedPageTurns() {
+        removeCallbacks(queuedPageTurnDrainRunnable)
+        removeCallbacks(rapidTurnIdleRunnable)
+        queuedPageTurnDelta = 0
+        rapidTurnSequenceActive = false
+        busyPageTurnGesture = false
+        rapidIdlePageTurnGesture = false
+    }
+
+    fun takeQueuedPageTurnsForPromotion(): Pair<Int, Boolean> {
+        val state = queuedPageTurnDelta to rapidTurnSequenceActive
+        clearQueuedPageTurns()
+        return state
+    }
+
+    fun acceptPromotedPageTurns(delta: Int, rapidSequence: Boolean) {
+        if (disposed || (delta == 0 && !rapidSequence)) return
+        queuedPageTurnDelta = (queuedPageTurnDelta + delta).coerceIn(
+            -MAX_QUEUED_PAGE_TURNS,
+            MAX_QUEUED_PAGE_TURNS,
+        )
+        if (rapidSequence || queuedPageTurnDelta != 0) armRapidTurnSequence()
+    }
+
+    private fun armRapidTurnSequence() {
+        removeCallbacks(rapidTurnIdleRunnable)
+        rapidTurnSequenceActive = true
+        postDelayed(rapidTurnIdleRunnable, RAPID_TURN_IDLE_TIMEOUT_MS)
+    }
+
+    private fun scheduleRapidTurnIdle() {
+        if (!rapidTurnSequenceActive) return
+        removeCallbacks(rapidTurnIdleRunnable)
+        postDelayed(rapidTurnIdleRunnable, RAPID_TURN_IDLE_TIMEOUT_MS)
+    }
+
+    private fun continueQueuedTurnsOrPrecache() {
+        if (drainQueuedPageTurn()) return
+        if (rapidTurnSequenceActive) scheduleRapidTurnIdle() else preCachePageTextures()
+    }
+
+    private fun drainQueuedPageTurn(): Boolean {
+        if (
+            queuedPageTurnDelta == 0 ||
+            disposed ||
+            turnInFlight ||
+            mode != Mode.PAGED ||
+            paged.isEmpty() ||
+            initialRevealActive() ||
+            awaitingStableChapter ||
+            pendingDecodesProvider?.invoke() == true ||
+            textView.isLayoutRequested
+        ) return false
+        val delta = if (queuedPageTurnDelta > 0) 1 else -1
+        armRapidTurnSequence()
+        val availableLocalSteps = if (delta > 0) paged.lastIndex - currentPage else currentPage
+        if (availableLocalSteps > 0) {
+            val coalescedSteps = minOf(kotlin.math.abs(queuedPageTurnDelta), availableLocalSteps)
+            val targetPage = currentPage + delta * coalescedSteps
+            queuedPageTurnDelta -= delta * coalescedSteps
+            scrollToPage(targetPage, report = true)
+            if (queuedPageTurnDelta != 0) {
+                removeCallbacks(queuedPageTurnDrainRunnable)
+                postOnAnimation(queuedPageTurnDrainRunnable)
+            }
+            return true
+        }
+        queuedPageTurnDelta -= delta
+        onTapZone(if (delta > 0) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
+        if (!turnInFlight && queuedPageTurnDelta != 0) queuedPageTurnDelta = 0
+        return true
+    }
+
+    private fun activeFlipDurationMs(): Long =
+        if (rapidTurnSequenceActive) RAPID_FLIP_DURATION_MS else flipDurationMs
 
     fun prepareBoundaryPageTurn(delta: Int): Boolean =
         prepareBoundaryPageTurnResult(delta) == BoundaryPageTurnPreparation.PREPARED
@@ -3753,7 +3901,7 @@ internal class EpubFlowView(
         }
         applyFlipProgress(0f, forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = flipDurationMs
+            duration = activeFlipDurationMs()
             interpolator = DecelerateInterpolator(1.6f)
             addUpdateListener { a -> applyFlipProgress(a.animatedValue as Float, forward) }
             addListener(object : AnimatorListenerAdapter() {
@@ -3763,7 +3911,7 @@ internal class EpubFlowView(
                     if (cancelled) return
                     onCommitted()
                     clearFlipOverlay()
-                    preCachePageTextures()
+                    continueQueuedTurnsOrPrecache()
                     onPageSettled?.invoke()
                 }
 
@@ -3771,7 +3919,7 @@ internal class EpubFlowView(
                     cancelled = true
                     onCancelled()
                     clearFlipOverlay()
-                    preCachePageTextures()
+                    continueQueuedTurnsOrPrecache()
                     onPageSettled?.invoke()
                 }
             })
@@ -3783,7 +3931,15 @@ internal class EpubFlowView(
      * Gives an external viewport mutation final ownership. Unlike an input CANCEL, this must not
      * restore the gesture origin or publish the page silently parked beneath the overlay.
      */
-    private fun abortLocalPageShotTurnForExternalMutation(restoreOrigin: Boolean = false) {
+    private fun abortLocalPageShotTurnForExternalMutation(
+        restoreOrigin: Boolean = false,
+        preserveQueuedTurns: Boolean = false,
+    ) {
+        if (deferredBoundaryFinishCommit) {
+            finishBoundaryInteractiveTurn(commit = false, resumeIdle = false)
+            busyPageTurnGesture = false
+        }
+        if (!preserveQueuedTurns) clearQueuedPageTurns()
         cancelPendingLocalPageShotHandoff(consumeGesture = true)
         val state = interactiveTurnState
         if (
@@ -4550,7 +4706,7 @@ internal class EpubFlowView(
                         if (commit) reportTopOffset()
                         curlOrigin = null
                         curlTargetWindow = null
-                        preCachePageTextures()
+                        continueQueuedTurnsOrPrecache()
                         onPageSettled?.invoke()
                     }
                 }
@@ -4570,7 +4726,7 @@ internal class EpubFlowView(
                         clearFlipOverlay()
                         curlOrigin = null
                         curlTargetWindow = null
-                        preCachePageTextures()
+                        continueQueuedTurnsOrPrecache()
                         onPageSettled?.invoke()
                     }
                 }
@@ -4579,7 +4735,12 @@ internal class EpubFlowView(
         }
     }
 
-    private fun finishBoundaryInteractiveTurn(commit: Boolean) {
+    private fun finishBoundaryInteractiveTurn(commit: Boolean, resumeIdle: Boolean = true) {
+        if (commit && busyPageTurnGesture) {
+            deferredBoundaryFinishCommit = true
+            return
+        }
+        deferredBoundaryFinishCommit = false
         val preview = activeBoundaryPreview ?: return
         activeBoundaryPreview = null
         interactiveTurnState = InteractiveTurnState.NONE
@@ -4600,8 +4761,16 @@ internal class EpubFlowView(
         curlOrigin?.let(::restorePageTurnOrigin)
         clearFlipOverlay()
         curlOrigin = null
-        onBoundaryTurnDiscarded?.invoke(preview)
-        releasePageShotBudgetForBoundaryPreview(preview.forward)
+        if (resumeIdle) {
+            onBoundaryTurnDiscarded?.invoke(preview)
+        } else {
+            onBoundaryPreviewEvicted?.invoke(preview)
+        }
+        releasePageShotBudgetForBoundaryPreview(preview.forward, resumePrecache = resumeIdle)
+        if (resumeIdle) {
+            preCachePageTextures()
+            onPageSettled?.invoke()
+        }
     }
 
     /** Jumps to the final page (PAGED) or the bottom of the chapter (SCROLL) — back-into-prev-spine. */
@@ -4739,7 +4908,7 @@ internal class EpubFlowView(
         animateChapterReveal = true
         pageTexturePrecacheEnabled = true
         reportTopOffset(force = true)
-        preCachePageTextures()
+        continueQueuedTurnsOrPrecache()
         onPageSettled?.invoke()
     }
 
@@ -4785,13 +4954,21 @@ internal class EpubFlowView(
             if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
                 if (ev.actionMasked == MotionEvent.ACTION_UP) {
                     val decision = releasedPageTurnDecision(ev)
-                    decision.intent?.let { intent ->
-                        if (boundaryContinuityCover && awaitingStableChapter) {
-                            // G1/R1: gesture recognition stays live while chapter execution is busy.
-                            // Keep one latest direction as backpressure; reveal consumes it atomically.
-                            pendingInitialPageTurnDelta = if (intent.forward) 1 else -1
-                        } else if (!turnInFlight) {
-                            startReleasedPageTurn(intent, decision.velocity, ev)
+                    if (boundaryContinuityCover && awaitingStableChapter) {
+                        val delta = decision.intent?.let { if (it.forward) 1 else -1 }
+                            ?: if (!decision.handled) {
+                                when (pagedTapZone(ev.x)) {
+                                    EpubFlowTapZone.PREV -> -1
+                                    EpubFlowTapZone.NEXT -> 1
+                                    EpubFlowTapZone.MENU -> 0
+                                }
+                            } else {
+                                0
+                            }
+                        if (delta != 0) enqueuePageTurn(delta)
+                    } else {
+                        decision.intent?.let { intent ->
+                            if (!turnInFlight) startReleasedPageTurn(intent, decision.velocity, ev)
                         }
                     }
                 }
@@ -4819,10 +4996,61 @@ internal class EpubFlowView(
             }
             return true
         }
+        if (busyPageTurnGesture) {
+            pendingCleanTapX = null
+            trackVelocity(ev)
+            if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) {
+                if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                    val decision = releasedPageTurnDecision(ev)
+                    val delta = decision.intent?.let { if (it.forward) 1 else -1 }
+                        ?: if (!decision.handled) {
+                            when (pagedTapZone(ev.x)) {
+                                EpubFlowTapZone.PREV -> -1
+                                EpubFlowTapZone.NEXT -> 1
+                                EpubFlowTapZone.MENU -> 0
+                            }
+                        } else {
+                            0
+                        }
+                    if (delta != 0) {
+                        enqueuePageTurn(delta)
+                        if (!turnInFlight && drainQueuedPageTurn()) onPageSettled?.invoke()
+                    } else if (!decision.handled) {
+                        onTapZone(EpubFlowTapZone.MENU)
+                    }
+                }
+                recycleTracker()
+                busyPageTurnGesture = false
+                if (deferredBoundaryFinishCommit) {
+                    deferredBoundaryFinishCommit = false
+                    finishBoundaryInteractiveTurn(commit = true)
+                }
+            }
+            return true
+        }
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN && pageTurnRendererBusy) {
+            pendingCleanTapX = null
+            busyPageTurnGesture = true
+            rapidIdlePageTurnGesture = false
+            downX = ev.x
+            downY = ev.y
+            lastY = ev.y
+            classified = false
+            freeScrolling = false
+            centerDeadGesture = false
+            flipped = false
+            inSelectionMode = false
+            stealing = false
+            setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, true)
+            textView.setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, true)
+            trackVelocity(ev)
+            return true
+        }
         if (releasedLocalIntentWaiting) return true
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             cancelPendingLocalPageShotHandoff(consumeGesture = false)
             flingStopGesture = stopFreeFlingForTouch()
+            rapidIdlePageTurnGesture = rapidTurnSequenceActive
             pendingCleanTapX = null
             setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, false)
             textView.setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, false)
@@ -4853,11 +5081,13 @@ internal class EpubFlowView(
                         setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, true)
                     }
                 }
+                rapidIdlePageTurnGesture = false
                 recycleTracker()
                 flingStopGesture = false
             }
             MotionEvent.ACTION_CANCEL -> {
                 pendingCleanTapX = null
+                rapidIdlePageTurnGesture = false
                 flingStopGesture = false
             }
         }
@@ -4976,8 +5206,12 @@ internal class EpubFlowView(
             MotionEvent.ACTION_UP -> {
                 clearSuppressClassifiedMoveRedelivery()
                 if (!classified && !inSelectionMode && tryStartReleasedMicroTurn(ev)) {
+                    rapidIdlePageTurnGesture = false
                     recycleTracker()
                     return true
+                } else if (rapidIdlePageTurnGesture && classified && !inSelectionMode) {
+                    val decision = releasedPageTurnDecision(ev)
+                    decision.intent?.let { startReleasedPageTurn(it, decision.velocity, ev) }
                 } else if (interactiveCurl) {
                     endInteractiveCurl(computeTurnVelocity())
                 } else if (localShotsWaiting) {
@@ -4993,6 +5227,7 @@ internal class EpubFlowView(
                         reportTopOffset()
                     }
                 }
+                rapidIdlePageTurnGesture = false
                 recycleTracker()
                 return true
             }
@@ -5012,6 +5247,7 @@ internal class EpubFlowView(
                 centerDeadGesture = false
                 inSelectionMode = false
                 stealing = false
+                rapidIdlePageTurnGesture = false
                 recycleTracker()
                 return true
             }
@@ -5143,9 +5379,15 @@ internal class EpubFlowView(
     }
 
     private fun startReleasedPageTurn(intent: PageTurnIntent, velocity: Float, ev: MotionEvent) {
-        // A live gesture that reaches execution owns the single G1/R1 slot. Any intent buffered by
-        // the retiring chapter cover is older and must not survive a fade cancellation as ghost work.
+        // A live gesture that reaches execution retires any pre-layout initial-reveal fallback.
         pendingInitialPageTurnDelta = null
+        if (rapidIdlePageTurnGesture) {
+            val delta = if (intent.forward) 1 else -1
+            if (!goToAdjacentPage(delta)) {
+                onTapZone(if (intent.forward) EpubFlowTapZone.NEXT else EpubFlowTapZone.PREV)
+            }
+            return
+        }
         startPageTurnIntent(intent, ev)
         when {
             interactiveCurl -> endInteractiveCurl(velocity)
@@ -5195,6 +5437,7 @@ internal class EpubFlowView(
             waitingBoundaryY = ev.y
             return
         }
+        if (rapidIdlePageTurnGesture) return
         if (flipped) return
         val horizontalDominant = abs(dx) >= abs(dy)
         val intent = if (horizontalDominant) {
@@ -5297,16 +5540,27 @@ internal class EpubFlowView(
         lastVelocityY = Float.NaN
     }
 
+    private fun pagedTapZone(x: Float): EpubFlowTapZone = when {
+        mode != Mode.PAGED -> EpubFlowTapZone.MENU
+        x < width / 3f -> EpubFlowTapZone.PREV
+        x > width * 2f / 3f -> EpubFlowTapZone.NEXT
+        else -> EpubFlowTapZone.MENU
+    }
+
     private fun handleTap(x: Float): EpubFlowTapZone {
         // SCROLL mode has no pages: navigation is by finger scroll, so edge taps must not page-jump.
         // Any tap toggles the menu instead (matches mainstream readers' scroll/webtoon mode).
-        val zone = when {
-            mode != Mode.PAGED -> EpubFlowTapZone.MENU
-            x < width / 3f -> EpubFlowTapZone.PREV
-            x > width * 2f / 3f -> EpubFlowTapZone.NEXT
-            else -> EpubFlowTapZone.MENU
+        val zone = pagedTapZone(x)
+        val rapidDelta = if (rapidIdlePageTurnGesture) {
+            when (zone) {
+                EpubFlowTapZone.PREV -> -1
+                EpubFlowTapZone.NEXT -> 1
+                EpubFlowTapZone.MENU -> 0
+            }
+        } else {
+            0
         }
-        onTapZone(zone)
+        if (rapidDelta == 0 || !goToAdjacentPage(rapidDelta)) onTapZone(zone)
         return zone
     }
 
@@ -5327,6 +5581,9 @@ internal class EpubFlowView(
         const val MICRO_TURN_MIN_VELOCITY_DP_PER_SEC = 90f
         const val MICRO_TURN_PROJECTION_SECONDS = 0.04f
         const val MICRO_TURN_MAX_CROSS_AXIS_RATIO = 0.5f
+        const val MAX_QUEUED_PAGE_TURNS = 12
+        const val RAPID_FLIP_DURATION_MS = 120L
+        const val RAPID_TURN_IDLE_TIMEOUT_MS = 320L
         const val FREE_FLING_MIN_SETTLE_MS = 64L
         const val FREE_FLING_STABLE_FRAMES = 2
     }

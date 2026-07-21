@@ -2685,6 +2685,89 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `rapid next burst continues across promoted short chapters`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("rapid-short-chapter-boundaries.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body><p>Rapid chapter one.</p></body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Rapid chapter two.</p></body></html>",
+            "OEBPS/ch3.xhtml" to "<html><body><p>Rapid chapter three.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val outgoingView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(1, outgoingView.pageCount())
+        awaitBoundaryPreview(outgoingView, forward = true)
+
+        engine.goToAdjacentPage(1)
+        engine.goToAdjacentPage(1)
+
+        awaitCondition("the queued turn must cross the next prepared chapter too", timeoutMs = 3_000L) {
+            (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 2
+        }
+
+        val activeView = engine.privateField("flowView") as EpubFlowView
+        assertTrue(activeView.textView.text.toString().contains("Rapid chapter three."))
+        assertEquals(0, activeView.privateField("queuedPageTurnDelta") as Int)
+        engine.close()
+    }
+
+    @Test
+    fun `rapid burst drains local remainder across a chapter boundary and book end`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("rapid-multipage-chapter-boundary.epub")
+        val firstChapter = (1..80).joinToString("") { index ->
+            "<p>Rapid multipage line $index has enough text to occupy layout space.</p>"
+        }
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to "<html><body>$firstChapter</body></html>",
+            "OEBPS/ch2.xhtml" to "<html><body><p>Rapid final chapter.</p></body></html>",
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        engine.setPageFlipStyle(PageFlipStyle.SIMULATION)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val outgoingView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertTrue("pageCount=${outgoingView.pageCount()}", outgoingView.pageCount() > 4)
+        outgoingView.goToPage(outgoingView.pageCount() - 3)
+        awaitBoundaryPreview(outgoingView, forward = true)
+
+        repeat(4) { engine.goToAdjacentPage(1) }
+
+        awaitCondition("the local remainder must continue through the chapter boundary", timeoutMs = 2_000L) {
+            (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1
+        }
+        val activeView = engine.privateField("flowView") as EpubFlowView
+        awaitCondition("book-end backpressure must retire the remaining accepted intent") {
+            activeView.privateField("queuedPageTurnDelta") as Int == 0
+        }
+        assertTrue(activeView.textView.text.toString().contains("Rapid final chapter."))
+        engine.close()
+    }
+
+    @Test
     fun `flow NONE turn crosses a short chapter boundary with an opaque owner throughout`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("short-chapter-boundary-none.epub")

@@ -30,3 +30,17 @@
 
 - Report the outcome first, then changed files, verification evidence, and remaining risks.
 - If a task cannot finish, name the exact blocker and the last verified state.
+
+## Emulator Screenshot Evidence Budget
+
+- The top-level/main agent must not attach, embed, forward, or otherwise load screenshots, images, contact sheets, or video frames into the main conversation context. It must not call image-returning inspection tools from the main thread.
+- This hard gate applies to the current task as soon as these instructions are loaded. It does not prohibit capturing or generating image files on disk; the main agent may reference absolute evidence paths and consume text, JSON, hashes, OCR, UI hierarchy, frame metrics, and pixel-diff summaries.
+- Visual inspection must be delegated to a background subagent with `fork_turns="none"`. That subagent may inspect the minimum necessary local images, but its handoff to the main agent must contain text/JSON conclusions and evidence paths only, with no attached or embedded images.
+- Only an explicit user instruction in the current turn may waive the main-agent image-context prohibition for named evidence.
+- Keep raw emulator screenshots on disk and reference their evidence directory in the handoff; do not attach the full capture set to the conversation.
+- A delegated visual-inspection subagent may inspect at most 4 screenshots per turn and must keep its combined image payload under 20 MB.
+- Do not re-attach screenshots already inspected. For animations or page turns, attach only before, first-frame, one representative middle frame, and after.
+- Prefer `gfxinfo`, Perfetto/frame-timeline data, PSS, UI hierarchy XML, OCR, and pixel-diff summaries over repeated full-screen images.
+- Resize full-screen captures to a 1280 px long edge when legibility allows; use small cropped regions for text or control details.
+- After 8-12 cumulative screenshots in one visual-inspection context, or when its serialized request approaches 60 MB, write a checkpoint containing conclusions, failures, and evidence paths before continuing with a fresh `fork_turns="none"` subagent.
+- If a tool produces a large screenshot batch, select representative frames locally before showing images to the model. Never use the conversation as the raw evidence store.

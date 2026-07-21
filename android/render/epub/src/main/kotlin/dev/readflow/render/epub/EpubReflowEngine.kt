@@ -1708,6 +1708,7 @@ class EpubReflowEngine private constructor(
         val oldLoader = liveFlowImageLoader
         val oldFlow = flowCurrentFlow
         val oldSpine = flowSpineIndex
+        val (queuedPageTurns, rapidTurnSequence) = oldView.takeQueuedPageTurnsForPromotion()
         invalidateBoundaryPreviewState(clearViewSlots = true)
 
         val reverseBitmap = preview.reverseBitmap?.takeUnless(Bitmap::isRecycled)
@@ -1730,6 +1731,7 @@ class EpubReflowEngine private constructor(
         bindActiveFlowView(target.view)
         markFlowViewActive(target.view)
         host.bringChildToFront(target.view)
+        target.view.acceptPromotedPageTurns(queuedPageTurns, rapidTurnSequence)
         if (canRetainOld) {
             retainOutgoingBoundaryTarget(
                 activeView = target.view,
