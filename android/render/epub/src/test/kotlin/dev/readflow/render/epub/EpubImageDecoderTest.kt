@@ -29,23 +29,23 @@ class EpubImageDecoderTest {
     }
 
     @Test
-    fun `quality policy reserves display pixels for the settled current page`() {
+    fun `runtime quality policy keeps every visible occurrence at display quality`() {
         val currentPage = listOf(100 until 200)
 
         assertEquals(
-            EpubImageRenderQuality.MOTION,
+            EpubImageRenderQuality.DISPLAY,
             epubImageRenderQualityForOccurrence(150, currentPage, isCurrentChapter = true, visualMotionActive = false),
         )
         assertEquals(
-            EpubImageRenderQuality.MOTION,
+            EpubImageRenderQuality.DISPLAY,
             epubImageRenderQualityForOccurrence(250, currentPage, isCurrentChapter = true, visualMotionActive = false),
         )
         assertEquals(
-            EpubImageRenderQuality.RAPID,
+            EpubImageRenderQuality.DISPLAY,
             epubImageRenderQualityForOccurrence(150, currentPage, isCurrentChapter = true, visualMotionActive = true),
         )
         assertEquals(
-            EpubImageRenderQuality.MOTION,
+            EpubImageRenderQuality.DISPLAY,
             epubImageRenderQualityForOccurrence(150, currentPage, isCurrentChapter = false, visualMotionActive = false),
         )
     }

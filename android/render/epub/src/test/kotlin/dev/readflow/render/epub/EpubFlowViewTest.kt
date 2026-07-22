@@ -558,6 +558,40 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `chapter replacement discards an active boundary finger turn before recycling its frame`() {
+        val discardedTokens = mutableListOf<Long>()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION).apply {
+            onBoundaryTurnDiscarded = { discardedTokens += it.token }
+        }
+        view.goToLastPage()
+        val preview = view.newBoundaryPreviewForTest(forward = true, token = 501L)
+        assertTrue(view.offerBoundaryPreviewForTest(preview))
+        val downX = view.width * 0.75f
+        val moveX = view.width * 0.10f
+        val y = view.height * 0.10f
+        val downTime = SystemClock.uptimeMillis()
+        val replacementText = (1..40).joinToString("\n") { "Replacement chapter line $it." }
+        val replacementFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(EpubDisplayBlock.Text(replacementText, headingLevel = null, paragraphIndex = 0)),
+        )
+
+        view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+        view.onTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
+        assertEquals("BOUNDARY_SOFTWARE", view.privateField("interactiveTurnState").toString())
+        assertTrue(view.privateField("activeBoundaryPreview") === preview)
+        assertFalse(preview.bitmap.isRecycled)
+
+        view.setChapter(replacementFlow, replacementFlow.text, pageHeightPx = view.height)
+
+        assertNull("the old engine target must no longer look active", view.privateField("activeBoundaryPreview"))
+        assertEquals(listOf(501L), discardedTokens)
+        assertTrue("the detached boundary frame must be recycled exactly once", preview.bitmap.isRecycled)
+        assertNull(view.privateField("curlDrawable"))
+        assertEquals("NONE", view.privateField("interactiveTurnState").toString())
+    }
+
+    @Test
     fun `cancelling cache ready boundary drag leaves logical position silent and unchanged`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val reportedOffsets = mutableListOf<Int>()
@@ -2289,6 +2323,79 @@ class EpubFlowViewTest {
                     evictedPreviews.isEmpty() &&
                     view.privateField("boundaryPreviewBudgetDirection") == true,
             )
+        } finally {
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `retained reverse boundary preview is pinned against speculative eviction`() {
+        val oneShotBytes = 360L * 120L * 4L
+        val budget = PageShotBudget(oneShotBytes)
+        val view = pagedFlowView(pageShotBudget = budget)
+        view.recycleCachedTexturesForTest()
+        val bitmap = requireNotNull(view.snapshotPageAt(view.scrollY))
+        val preview = BoundaryPagePreview(
+            token = 54L,
+            forward = false,
+            sourceChapterGeneration = view.boundaryPreviewGenerationToken(),
+            bitmap = bitmap,
+        )
+
+        try {
+            assertTrue(view.offerRetainedBoundaryPreview(preview))
+            assertTrue(
+                "the retained reverse frame must be relabelled PINNED before any trim can run",
+                budget.evictEvictable().isEmpty(),
+            )
+            assertFalse(bitmap.isRecycled)
+            assertTrue(view.privateField("backwardBoundaryPreview") === preview)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `retained reverse boundary preview yields to a local working pair under one shot budget`() {
+        val oneShotBytes = 360L * 120L * 2L
+        val budget = PageShotBudget(oneShotBytes)
+        val evicted = mutableListOf<Long>()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            pageShotBudget = budget,
+        ).apply {
+            onBoundaryPreviewEvicted = { evicted += it.token }
+        }
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
+        view.recycleCachedTexturesForTest()
+        val reverse = requireNotNull(
+            view.snapshotViewportForTest(
+                kind = PageShotLeaseKind.EVICTABLE,
+                label = "test.retained.reverse",
+                fullResolution = false,
+            ),
+        )
+        val preview = BoundaryPagePreview(
+            token = 55L,
+            forward = false,
+            sourceChapterGeneration = view.boundaryPreviewGenerationToken(),
+            bitmap = reverse,
+        )
+
+        try {
+            assertTrue(view.offerRetainedBoundaryPreview(preview))
+
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            assertFalse(slide.privateBitmap("frontBitmap").isRecycled)
+            assertFalse(slide.privateBitmap("revealedBitmap").isRecycled)
+            assertNull("the optional reverse owner must release the active pair's slot", view.privateField("backwardBoundaryPreview"))
+            assertTrue(reverse.isRecycled)
+            assertEquals(listOf(55L), evicted)
+            assertEquals(oneShotBytes * 2L, budget.leasedBytes)
         } finally {
             view.endInteractiveCurl(velocityX = 0f)
             shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
@@ -5850,6 +5957,99 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `rapid follow-up prefetch tracks net queued direction and clears when intent cancels`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.goToAdjacentPage(-1))
+
+            assertEquals(1, view.privateInt("queuedPageTurnDelta"))
+            val netForward = checkNotNull(view.privateField("rapidFollowUpPageShot"))
+            assertEquals(
+                "the speculative target must follow the remaining queue, not the latest opposite key",
+                true,
+                netForward.reflectedField("forward"),
+            )
+
+            assertTrue(view.goToAdjacentPage(-1))
+
+            assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+            assertNull(
+                "a fully cancelled queue must release its now-unreachable speculative target",
+                view.privateField("rapidFollowUpPageShot"),
+            )
+            assertNull(view.privateField("captureRapidFollowUpRunnable"))
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `rapid follow-up prefetch is skipped when the queued target depends on an image`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        try {
+            assertTrue("fixture needs a local page before the heading", fixture.headingPageIndex > 0)
+            assertEquals(fixture.headingPageIndex + 1, fixture.imagePageIndex)
+            view.flipStyle = PageFlipStyle.SIMULATION
+            view.goToPage(fixture.headingPageIndex - 1)
+
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.goToAdjacentPage(1))
+
+            assertEquals(1, view.privateInt("queuedPageTurnDelta"))
+            assertNull(
+                "an image-dependent target must stay on the existing decode/page-shot path",
+                view.privateField("rapidFollowUpPageShot"),
+            )
+            assertNull(view.privateField("captureRapidFollowUpRunnable"))
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `resize and dispose release a captured rapid follow-up page shot`() {
+        data class Scenario(
+            val name: String,
+            val mutate: (EpubFlowView) -> Unit,
+        )
+        val scenarios = listOf(
+            Scenario("resize") { view ->
+                view.measure(exactly(view.width), exactly(view.height + 20))
+                view.layout(0, 0, view.width, view.height + 20)
+            },
+            Scenario("dispose", EpubFlowView::dispose),
+        )
+
+        scenarios.forEach { scenario ->
+            val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+            try {
+                assertTrue("scenario=${scenario.name}", view.goToAdjacentPage(1))
+                assertTrue("scenario=${scenario.name}", view.goToAdjacentPage(1))
+                shadowOf(Looper.getMainLooper()).idleFor(40L, TimeUnit.MILLISECONDS)
+                val request = checkNotNull(view.privateField("rapidFollowUpPageShot")) {
+                    "scenario=${scenario.name} must create the speculative owner"
+                }
+                val bitmap = checkNotNull(request.reflectedField("bitmap") as Bitmap?) {
+                    "scenario=${scenario.name} must finish its delayed capture"
+                }
+
+                scenario.mutate(view)
+
+                assertNull("scenario=${scenario.name}", view.privateField("rapidFollowUpPageShot"))
+                assertNull("scenario=${scenario.name}", view.privateField("captureRapidFollowUpRunnable"))
+                assertTrue("scenario=${scenario.name} must recycle the detached page shot", bitmap.isRecycled)
+            } finally {
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
     fun `swipe released while paper animation is active queues another turn`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -5894,7 +6094,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `edge tap inside rapid idle window preserves simulation renderer`() {
+    fun `edge tap inside rapid idle window reuses prefetched simulation target`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         try {
             assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
@@ -5931,8 +6131,8 @@ class EpubFlowViewTest {
                 paper.reflectedField("revealedBitmap"),
             )
             assertEquals(
-                "each rapid follow-up reuses its outgoing artifact and captures only the next target",
-                1,
+                "rapid input must prefetch its next text target before the follow-up starts",
+                0,
                 EpubPageShotCaptureProbe.total(),
             )
             assertNull("SIMULATION rapid follow-up must never degrade to slide", view.privateField("slideDrawable"))
@@ -12136,6 +12336,12 @@ class EpubFlowViewTest {
 
     private fun EpubFlowView.recycleCachedTexturesForTest() {
         javaClass.getDeclaredMethod("recycleCachedTextures")
+            .apply { isAccessible = true }
+            .invoke(this)
+    }
+
+    private fun EpubFlowView.preparePinnedLocalWorkingPairBudgetForTest() {
+        javaClass.getDeclaredMethod("preparePinnedLocalWorkingPairBudget")
             .apply { isAccessible = true }
             .invoke(this)
     }

@@ -911,6 +911,93 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `runtime quality selection returns DISPLAY for motion rapid current and prepared without changing geometry`() {
+        // Temporary product contract: eliminate visible LOD by decoding first visible pixels at
+        // DISPLAY quality for every runtime case (motion/rapid/current/prepared). Geometry must
+        // stay at the full display box regardless of former RAPID/MOTION budgets.
+        val currentPage = listOf(100 until 200)
+        val selectionCases = listOf(
+            "rapid motion on current page" to
+                arrayOf(150, currentPage, true, true),
+            "settled current page" to
+                arrayOf(150, currentPage, true, false),
+            "current chapter off-page (prepared neighborhood)" to
+                arrayOf(250, currentPage, true, false),
+            "hidden / non-current prepared chapter" to
+                arrayOf(150, currentPage, false, false),
+            "hidden prepared chapter under motion" to
+                arrayOf(150, currentPage, false, true),
+        )
+        for ((label, args) in selectionCases) {
+            val quality = epubImageRenderQualityForOccurrence(
+                layoutStart = args[0] as Int,
+                currentPageRanges = args[1] as Collection<IntRange>,
+                isCurrentChapter = args[2] as Boolean,
+                visualMotionActive = args[3] as Boolean,
+            )
+            assertEquals(
+                "runtime quality selection must return DISPLAY for $label",
+                EpubImageRenderQuality.DISPLAY,
+                quality,
+            )
+        }
+
+        val epub = File.createTempFile("readflow-display-only-lod", ".epub")
+        val executor = QueuedExecutorService()
+        val budgets = mutableListOf<EpubImageDecodeBudget>()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { EpubImageBounds(width = 1600, height = 2400) },
+                imageQualityProvider = { layoutStart ->
+                    epubImageRenderQualityForOccurrence(
+                        layoutStart = layoutStart,
+                        currentPageRanges = listOf(0 until 100),
+                        isCurrentChapter = true,
+                        visualMotionActive = true,
+                    )
+                },
+                imageDecoder = { _, _, budget ->
+                    budgets += budget
+                    android.graphics.Bitmap.createBitmap(
+                        budget.maxSide.coerceAtMost(800),
+                        (budget.maxPixels / budget.maxSide.coerceAtLeast(1)).coerceAtLeast(1),
+                        android.graphics.Bitmap.Config.ARGB_8888,
+                    )
+                },
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(
+                listOf(epubImageDecodeBudget(800, 1200, EpubImageRenderQuality.DISPLAY)),
+                budgets,
+            )
+            assertEquals(
+                "DISPLAY-only decode must preserve full display geometry",
+                Rect(0, 0, 800, 1200),
+                drawable.bounds,
+            )
+            assertEquals(
+                "first decode must not enqueue a quality promotion step",
+                0,
+                loader.promoteToDisplayQuality(listOf(0 until 100)),
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `retained PIXELS_ONLY results do not require TextView rebind`() {
         val stableBounds = Rect(0, 0, 800, 1200)
         val fullPagePixels = EpubAsyncImageResult(

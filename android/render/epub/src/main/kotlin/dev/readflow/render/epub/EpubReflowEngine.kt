@@ -994,12 +994,6 @@ class EpubReflowEngine private constructor(
         }
         view.onBoundaryPreviewRequestCancelled = ::cancelBoundaryPreviewRequest
         view.onPageShotForeground = ::resumePageShotsAfterForeground
-        view.onPageTurnCapturePreparing = {
-            if (flowView === view) liveFlowImageLoader?.cancelDisplayPromotions()
-        }
-        view.onPageTurnStarted = {
-            if (flowView === view) liveFlowImageLoader?.cancelDisplayPromotions()
-        }
         view.onPageTurnTargetParked = {
             if (flowView === view) {
                 liveFlowImageLoader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
@@ -1007,13 +1001,7 @@ class EpubReflowEngine private constructor(
         }
         view.onPageSettled = {
             if (flowView === view) {
-                val loader = liveFlowImageLoader
-                loader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
-                if (!view.isRapidTurnPerformanceModeActive()) {
-                    val currentPage = view.currentPageDecodeLayoutRanges()
-                    loader?.demoteDisplayQualityOutside(currentPage)
-                    loader?.promoteToDisplayQuality(currentPage)
-                }
+                liveFlowImageLoader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
             }
             prewarmBoundaryPreviews()
             tryDrainPendingFontPrewarmRebuild()
@@ -1023,12 +1011,8 @@ class EpubReflowEngine private constructor(
                 flowView === view &&
                 flowSpineIndex >= 0
             ) {
-                val loader = liveFlowImageLoader
-                loader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
+                liveFlowImageLoader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
                 if (!view.isRapidTurnPerformanceModeActive()) {
-                    val currentPage = view.currentPageDecodeLayoutRanges()
-                    loader?.demoteDisplayQualityOutside(currentPage)
-                    loader?.promoteToDisplayQuality(currentPage)
                     prewarmBoundaryPreviews()
                 }
             }
@@ -1768,6 +1752,12 @@ class EpubReflowEngine private constructor(
             preview.reverseBitmap?.let(::recycleDetachedBoundaryPageShot)
             return
         }
+        val reverseBitmap = preview.reverseBitmap?.takeUnless(Bitmap::isRecycled) ?: run {
+            boundaryPreviewTargets.remove(preview.token)?.let(::disposeBoundaryPreviewTarget)
+            recycleDetachedBoundaryPageShot(preview.bitmap)
+            flowView?.rejectBoundaryPreview(preview.forward, preview.sourceChapterGeneration)
+            return
+        }
         val target = boundaryPreviewTargets.remove(preview.token) ?: run {
             preview.reverseBitmap?.let(::recycleDetachedBoundaryPageShot)
             return
@@ -1788,8 +1778,7 @@ class EpubReflowEngine private constructor(
         val (queuedPageTurns, rapidTurnSequence) = oldView.takeQueuedPageTurnsForPromotion()
         invalidateBoundaryPreviewState(clearViewSlots = true)
 
-        val reverseBitmap = preview.reverseBitmap?.takeUnless(Bitmap::isRecycled)
-        val canRetainOld = reverseBitmap != null && oldLoader != null && oldFlow != null && oldSpine >= 0
+        val canRetainOld = oldLoader != null && oldFlow != null && oldSpine >= 0
         if (canRetainOld) {
             oldView.prepareForBoundaryReuse()
             markFlowViewRetained(oldView)
@@ -1817,7 +1806,7 @@ class EpubReflowEngine private constructor(
                 oldFlow = checkNotNull(oldFlow),
                 oldSpine = oldSpine,
                 committedForward = target.forward,
-                bitmap = checkNotNull(reverseBitmap),
+                bitmap = reverseBitmap,
             )
         }
         target.view.activatePreparedChapter()
@@ -1845,7 +1834,7 @@ class EpubReflowEngine private constructor(
             view = oldView,
             loader = oldLoader,
         )
-        val accepted = activeView.offerBoundaryPreview(
+        val accepted = activeView.offerRetainedBoundaryPreview(
             BoundaryPagePreview(
                 token = token,
                 forward = reverseForward,

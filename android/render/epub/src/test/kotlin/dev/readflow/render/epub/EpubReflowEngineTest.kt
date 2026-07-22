@@ -993,7 +993,17 @@ class EpubReflowEngineTest {
 
         val canCommit = requireNotNull(flowView.canCommitBoundaryTurn)
         assertTrue("the completed preview must remain committable after index promotion", canCommit(preparedPreview))
-        requireNotNull(flowView.onBoundaryTurnCommitted).invoke(preparedPreview)
+        val commitPreview = requireNotNull(flowView.takeBoundaryPreviewForTest(forward = true))
+        assertEquals(preparedPreview.token, commitPreview.token)
+        flowView.setPrivateField("activeBoundaryPreview", commitPreview)
+        try {
+            commitPreview.reverseBitmap = requireNotNull(
+                flowView.snapshotBoundaryLandingPage(landOnLast = false, required = true),
+            )
+        } finally {
+            flowView.setPrivateField("activeBoundaryPreview", null)
+        }
+        requireNotNull(flowView.onBoundaryTurnCommitted).invoke(commitPreview)
 
         awaitCondition("the prepared preview must settle in the adjacent chapter") {
             (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1
@@ -1087,13 +1097,11 @@ class EpubReflowEngineTest {
                 .drawable
             assertSame("the promoted surface must retain its installed image drawable", preparedImage, activeImage)
             assertSame("the promoted drawable must retain its decoded pixel asset", installedImageAsset, activeImage.result)
-            awaitCondition("the stable promoted page must request DISPLAY pixels once") {
-                EpubImageDecodeProbe.fullDecodeTotal() == decodeCountBeforeCommit + 1
-            }
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
             val decodeCountAfterPromotion = EpubImageDecodeProbe.fullDecodeTotal()
             assertEquals(
-                "promotion may decode DISPLAY pixels once while retaining the same drawable layer",
-                decodeCountBeforeCommit + 1,
+                "DISPLAY-first prepared pixels must survive promotion without a second decode",
+                decodeCountBeforeCommit,
                 decodeCountAfterPromotion,
             )
             assertTrue("the promoted surface must accept input", activeView.isEnabled)
@@ -1117,6 +1125,9 @@ class EpubReflowEngineTest {
             val reversePreview = awaitBoundaryPreview(activeView, forward = false)
             val reverseCommit = requireNotNull(activeView.takeBoundaryPreviewForTest(forward = false))
             assertEquals(reversePreview.token, reverseCommit.token)
+            reverseCommit.reverseBitmap = requireNotNull(
+                activeView.snapshotBoundaryLandingPage(landOnLast = false, required = true),
+            )
             requireNotNull(activeView.onBoundaryTurnCommitted).invoke(reverseCommit)
             assertSame(
                 "an immediate reverse commit must promote the original outgoing surface without rebuilding it",
@@ -1129,6 +1140,107 @@ class EpubReflowEngineTest {
                 decodeCountAfterPromotion,
                 EpubImageDecodeProbe.fullDecodeTotal(),
             )
+        } finally {
+            preparedView.pendingDecodesProvider = { false }
+            engine.close()
+        }
+    }
+
+    @Test
+    fun `boundary commit without reverse bitmap must not dispose outgoing surface or loader`() = runTest(dispatcher) {
+        // Cross-chapter reverse ownership: a boundary commit that lacks a usable reverse page
+        // artifact must abort/refuse promotion so the outgoing view+loader stay owned and
+        // immediately reversible — never release/dispose them just because reverseBitmap is null.
+        Dispatchers.setMain(dispatcher)
+        EpubImageDecodeProbe.reset()
+        val epub = tempDir.newFile("boundary-no-reverse-bitmap.epub")
+        writeBoundaryImageEpub(epub)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        engine.setPageFlipStyle(PageFlipStyle.NONE)
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val outgoingView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 140))
+        host.measure(exactly(360), exactly(140))
+        host.layout(0, 0, 360, 140)
+
+        val preparedView = awaitBoundaryPreviewSession(engine, forward = true)
+        preparedView.pendingDecodesProvider = { true }
+        try {
+            val preparedText = preparedView.textView.text as Spanned
+            val preparedImage = preparedText
+                .getSpans(0, preparedText.length, AsyncDrawableSpan::class.java)
+                .single()
+                .drawable
+            val preparedImageStart = preparedText.getSpanStart(
+                preparedText.getSpans(0, preparedText.length, AsyncDrawableSpan::class.java).single(),
+            )
+            awaitCondition("prepared landing decode window must contain its image occurrence") {
+                preparedView.currentPageDecodeLayoutRanges().any { preparedImageStart in it }
+            }
+            awaitCondition("the prepared renderer must install its decoded image asset") {
+                EpubImageDecodeProbe.fullDecodeTotal() >= 1 && preparedImage.result != null
+            }
+            preparedView.pendingDecodesProvider = { false }
+            preparedView.onAsyncImageDecodeFinished()
+            preparedView.viewTreeObserver.dispatchOnPreDraw()
+            val preparedPreview = awaitBoundaryPreview(outgoingView, forward = true)
+            val commitPreview = requireNotNull(outgoingView.takeBoundaryPreviewForTest(forward = true))
+            assertEquals(preparedPreview.token, commitPreview.token)
+            // Simulate the commit path that receives no usable reverse page-shot artifact.
+            commitPreview.reverseBitmap = null
+            assertNull("fixture must commit without a reverse page artifact", commitPreview.reverseBitmap)
+
+            val outgoingLoaderBefore = checkNotNull(
+                engine.privateField("liveFlowImageLoader") as EpubFlowImageLoader?,
+            )
+            fun loaderReleased(loader: EpubFlowImageLoader): Boolean =
+                EpubFlowImageLoader::class.java.getDeclaredField("released")
+                    .apply { isAccessible = true }
+                    .getBoolean(loader)
+            assertFalse(
+                "fixture outgoing loader must still be live before commit",
+                loaderReleased(outgoingLoaderBefore),
+            )
+            assertFalse(
+                "fixture outgoing surface must still be live before commit",
+                outgoingView.privateField("disposed") as Boolean,
+            )
+
+            requireNotNull(outgoingView.onBoundaryTurnCommitted).invoke(commitPreview)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertSame(
+                "commit without reverse bitmap must refuse promotion and keep the outgoing surface active",
+                outgoingView,
+                engine.privateField("flowView"),
+            )
+            assertFalse(
+                "outgoing surface must remain owned (not disposed) when reverse bitmap is missing",
+                outgoingView.privateField("disposed") as Boolean,
+            )
+            val liveLoader = engine.privateField("liveFlowImageLoader") as EpubFlowImageLoader?
+            assertSame(
+                "outgoing loader must remain the live owner after a refused boundary commit",
+                outgoingLoaderBefore,
+                liveLoader,
+            )
+            assertFalse(
+                "outgoing loader must not be released when reverse bitmap is missing",
+                loaderReleased(checkNotNull(liveLoader)),
+            )
+            assertTrue(
+                "outgoing surface must stay attached for immediate reverse navigation",
+                outgoingView.parent === host,
+            )
+            @Suppress("UNCHECKED_CAST")
+            val targets = engine.privateField("boundaryPreviewTargets") as Map<Long, Any>
+            assertTrue("the unusable target must not suppress the next boundary request", targets.isEmpty())
+            assertEquals("only the still-active outgoing surface may remain attached", 1, host.childCount)
+            assertTrue("the rejected target page-shot must release its lease", commitPreview.bitmap.isRecycled)
         } finally {
             preparedView.pendingDecodesProvider = { false }
             engine.close()
@@ -3082,6 +3194,9 @@ class EpubReflowEngineTest {
         val forward = awaitBoundaryPreview(flowView, forward = true)
         val forwardCommit = requireNotNull(flowView.takeBoundaryPreviewForTest(forward = true))
         assertEquals(forward.token, forwardCommit.token)
+        forwardCommit.reverseBitmap = requireNotNull(
+            flowView.snapshotBoundaryLandingPage(landOnLast = true, required = true),
+        )
         requireNotNull(flowView.onBoundaryTurnCommitted).invoke(forwardCommit)
         flowView = engine.privateField("flowView") as EpubFlowView
         awaitCondition("forward preview commit must install the next chapter") {
@@ -3093,6 +3208,9 @@ class EpubReflowEngineTest {
         val backward = awaitBoundaryPreview(flowView, forward = false)
         val backwardCommit = requireNotNull(flowView.takeBoundaryPreviewForTest(forward = false))
         assertEquals(backward.token, backwardCommit.token)
+        backwardCommit.reverseBitmap = requireNotNull(
+            flowView.snapshotBoundaryLandingPage(landOnLast = false, required = true),
+        )
         requireNotNull(flowView.onBoundaryTurnCommitted).invoke(backwardCommit)
         flowView = engine.privateField("flowView") as EpubFlowView
         awaitCondition("backward preview commit must restore the previous chapter") {

@@ -39,5 +39,4 @@ internal fun epubImageRenderQualityForOccurrence(
     currentPageRanges: Collection<IntRange>,
     isCurrentChapter: Boolean,
     visualMotionActive: Boolean,
-): EpubImageRenderQuality =
-    if (visualMotionActive) EpubImageRenderQuality.RAPID else EpubImageRenderQuality.MOTION
+): EpubImageRenderQuality = EpubImageRenderQuality.DISPLAY

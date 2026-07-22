@@ -579,6 +579,22 @@ internal class EpubFlowView(
     private var pendingLocalPageShotHandoff: PendingLocalPageShotHandoff? = null
     private var capturePendingLocalTargetRunnable: Runnable? = null
     private var capturePendingLocalFrontRunnable: Runnable? = null
+    private data class RapidFollowUpPageShot(
+        val generation: Long,
+        val chapterGeneration: Long,
+        val pageGeneration: Long,
+        val sourcePage: Int,
+        val sourceTop: Int,
+        val sourceWindow: EpubFlowPage?,
+        val targetPage: Int,
+        val targetWindow: EpubFlowPage,
+        val targetKey: PageTextureKey,
+        val forward: Boolean,
+        var bitmap: Bitmap? = null,
+    )
+    private var rapidFollowUpGeneration = 0L
+    private var rapidFollowUpPageShot: RapidFollowUpPageShot? = null
+    private var captureRapidFollowUpRunnable: Runnable? = null
 
     private fun postPrecacheFrontShot(request: PendingPageTexturePrecache) {
         val runnable = Runnable { capturePrecacheFrontShot(request) }
@@ -626,9 +642,150 @@ internal class EpubFlowView(
         capturePendingLocalFrontRunnable = null
     }
 
+    private fun clearRapidFollowUpPageShot() {
+        rapidFollowUpGeneration += 1L
+        captureRapidFollowUpRunnable?.let(::removeCallbacks)
+        captureRapidFollowUpRunnable = null
+        rapidFollowUpPageShot?.bitmap?.let(::recyclePageShot)
+        rapidFollowUpPageShot = null
+    }
+
+    private fun scheduleRapidFollowUpPageShot(forward: Boolean) {
+        if (
+            disposed ||
+            !rapidTurnSequenceActive ||
+            !turnInFlight ||
+            mode != Mode.PAGED ||
+            pendingDecodesProvider?.invoke() == true ||
+            hasPendingPageArtifactRefresh() ||
+            textView.isLayoutRequested
+        ) {
+            clearRapidFollowUpPageShot()
+            return
+        }
+        val sourceWindow = activePageWindow?.takeIf { it.topPx == scrollY }
+        val targetWindow = pageWindowForTurn(forward) ?: run {
+            clearRapidFollowUpPageShot()
+            return
+        }
+        if (pageWindowHasImageDependency(targetWindow)) {
+            clearRapidFollowUpPageShot()
+            return
+        }
+        val targetPage = canonicalFloorPageIndexForTopPx(targetWindow.topPx)
+        val targetKey = pageTextureKey(targetWindow.topPx, targetWindow)
+        val existing = rapidFollowUpPageShot
+        if (
+            existing != null &&
+            existing.sourcePage == currentPage &&
+            existing.sourceTop == scrollY &&
+            existing.targetPage == targetPage &&
+            existing.targetKey == targetKey &&
+            existing.forward == forward
+        ) return
+        clearRapidFollowUpPageShot()
+        val request = RapidFollowUpPageShot(
+            generation = rapidFollowUpGeneration,
+            chapterGeneration = chapterGeneration,
+            pageGeneration = pageLayoutGeneration,
+            sourcePage = currentPage,
+            sourceTop = scrollY,
+            sourceWindow = sourceWindow,
+            targetPage = targetPage,
+            targetWindow = targetWindow,
+            targetKey = targetKey,
+            forward = forward,
+        )
+        rapidFollowUpPageShot = request
+        val runnable = Runnable { captureRapidFollowUpPageShot(request) }
+        captureRapidFollowUpRunnable = runnable
+        postDelayed(runnable, RAPID_FOLLOW_UP_PREFETCH_DELAY_MS)
+    }
+
+    private fun rapidFollowUpPageShotIsValid(request: RapidFollowUpPageShot): Boolean =
+        rapidFollowUpPageShot === request &&
+            request.generation == rapidFollowUpGeneration &&
+            request.chapterGeneration == chapterGeneration &&
+            request.pageGeneration == pageLayoutGeneration &&
+            !disposed &&
+            rapidTurnSequenceActive &&
+            turnInFlight &&
+            mode == Mode.PAGED &&
+            currentPage == request.sourcePage &&
+            scrollY == request.sourceTop &&
+            activePageWindow?.takeIf { it.topPx == scrollY } == request.sourceWindow &&
+            pageWindowForTurn(request.forward) == request.targetWindow &&
+            pageTextureKey(request.targetWindow.topPx, request.targetWindow) == request.targetKey &&
+            pendingDecodesProvider?.invoke() != true &&
+            !hasPendingPageArtifactRefresh() &&
+            !textView.isLayoutRequested
+
+    private fun captureRapidFollowUpPageShot(request: RapidFollowUpPageShot) {
+        if (!rapidFollowUpPageShotIsValid(request)) {
+            if (rapidFollowUpPageShot === request) clearRapidFollowUpPageShot()
+            return
+        }
+        val bitmap = snapshotPageAt(
+            request.targetWindow.topPx,
+            request.targetWindow,
+            PageShotLeaseKind.EVICTABLE,
+            "rapid.follow-up",
+        ) ?: run {
+            clearRapidFollowUpPageShot()
+            return
+        }
+        if (!rapidFollowUpPageShotIsValid(request)) {
+            recyclePageShot(bitmap)
+            if (rapidFollowUpPageShot === request) clearRapidFollowUpPageShot()
+            return
+        }
+        request.bitmap = bitmap
+        captureRapidFollowUpRunnable = null
+    }
+
+    private fun takeRapidFollowUpPageShot(
+        targetPage: Int,
+        targetWindow: EpubFlowPage,
+        forward: Boolean,
+    ): Bitmap? {
+        val request = rapidFollowUpPageShot ?: return null
+        val bitmap = request.bitmap?.takeUnless(Bitmap::isRecycled)
+        val matches =
+            request.chapterGeneration == chapterGeneration &&
+                request.pageGeneration == pageLayoutGeneration &&
+                request.sourcePage == currentPage &&
+                request.sourceTop == scrollY &&
+                request.sourceWindow == activePageWindow?.takeIf { it.topPx == scrollY } &&
+                request.targetPage == targetPage &&
+                request.targetWindow == targetWindow &&
+                request.targetKey == pageTextureKey(targetWindow.topPx, targetWindow) &&
+                request.forward == forward &&
+                bitmap != null
+        if (!matches) {
+            clearRapidFollowUpPageShot()
+            return null
+        }
+        captureRapidFollowUpRunnable?.let(::removeCallbacks)
+        captureRapidFollowUpRunnable = null
+        request.bitmap = null
+        rapidFollowUpPageShot = null
+        relabelPageShot(bitmap, PageShotLeaseKind.PINNED, "active.target")
+        return bitmap
+    }
+
+    private fun pageWindowHasImageDependency(window: EpubFlowPage): Boolean {
+        val chapter = flow ?: return true
+        val ranges = decodeLayoutRangesFor(listOf(window))
+        return chapter.segments.any { segment ->
+            segment.block is EpubDisplayBlock.Image &&
+                ranges.any { range -> segment.layoutStart in range }
+        }
+    }
+
     private fun preCachePageTextures() {
         if (disposed) return
         if (rapidTurnSequenceActive) return
+        clearRapidFollowUpPageShot()
         if (!pageTexturePrecacheEnabled) return
         if (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) return
         if (mode != Mode.PAGED || paged.isEmpty() || width == 0) return
@@ -914,7 +1071,10 @@ internal class EpubFlowView(
         request.previousBitmap = null
     }
 
-    private fun recycleCachedTextures() {
+    private fun recycleCachedTextures() = recycleCachedTextures(preserveRapidFollowUp = false)
+
+    private fun recycleCachedTextures(preserveRapidFollowUp: Boolean) {
+        if (!preserveRapidFollowUp) clearRapidFollowUpPageShot()
         pageTexturePrecacheGeneration += 1L
         pageTexturePrecachePending = false
         clearPendingPageTexturePrecacheCallbacks()
@@ -1269,9 +1429,6 @@ internal class EpubFlowView(
         cachedFromTextureKey = null
         cachedTargetTextureKey = null
         cachedBackwardTextureKey = null
-        // A boundary outgoing shot is terminal for the old chapter: commit recycles it, while
-        // cancel reveals the already-updated live viewport. Redrawing it synchronously here would
-        // put a full-page capture back on the gesture path, so dirty cache-slot state ends here.
         pendingInPlacePageShotRefreshSlots.clear()
         relabelPageShot(front, PageShotLeaseKind.PINNED, "active.front")
         return front
@@ -2092,9 +2249,8 @@ internal class EpubFlowView(
         asyncImageBatchWaitStartedAtMs = 0L
         cancelInPlacePageShotRefreshCallbacks()
         pendingInPlacePageShotRefreshSlots.clear()
-        invalidateBoundaryPreviews()
+        clearBoundaryPreviews()
         chapterGeneration++
-        boundaryPreviewGeneration++
         val supersededBoundaryTurn = pendingBoundaryPageTurn?.let {
             it.expectedChapterGeneration != chapterGeneration
         } == true
@@ -2364,14 +2520,20 @@ internal class EpubFlowView(
             backwardBoundaryPreview == null &&
             boundaryPreviewBudgetDirection == null
         ) return
-        onBoundaryPreviewConfigurationChanged?.invoke()
-        listOfNotNull(forwardBoundaryPreview, backwardBoundaryPreview).forEach { preview ->
+        val slotted = listOfNotNull(forwardBoundaryPreview, backwardBoundaryPreview)
+        val slottedDirections = slotted.mapTo(HashSet()) {
+            it.forward
+        }
+        val pendingDirection = boundaryPreviewBudgetDirection
+        if (pendingDirection != null && pendingDirection !in slottedDirections) {
+            onBoundaryPreviewRequestCancelled?.invoke(pendingDirection)
+        }
+        boundaryPreviewBudgetDirection = null
+        slotted.forEach { preview ->
+            if (preview.forward) forwardBoundaryPreview = null else backwardBoundaryPreview = null
             onBoundaryPreviewEvicted?.invoke(preview)
             recyclePageShot(preview.bitmap)
         }
-        forwardBoundaryPreview = null
-        backwardBoundaryPreview = null
-        boundaryPreviewBudgetDirection = null
     }
 
     /** Drops only speculative owners; active turns and continuity covers keep their PINNED frames. */
@@ -2395,7 +2557,8 @@ internal class EpubFlowView(
     fun evictSpeculativePageShotsForPinnedAllocation(preserveBoundaryDirection: Boolean? = null) {
         recycleCachedTextures()
         val preservedDirection = preserveBoundaryDirection ?: activeBoundaryPreview?.forward
-        listOfNotNull(forwardBoundaryPreview, backwardBoundaryPreview)
+        val slotted = listOfNotNull(forwardBoundaryPreview, backwardBoundaryPreview)
+        slotted
             .filterNot { it.forward == preservedDirection }
             .forEach { preview ->
                 if (preview.forward) forwardBoundaryPreview = null else backwardBoundaryPreview = null
@@ -2403,7 +2566,10 @@ internal class EpubFlowView(
                 recyclePageShot(preview.bitmap)
             }
         val budgetDirection = boundaryPreviewBudgetDirection
-        if (budgetDirection != null && budgetDirection != preservedDirection) {
+        if (
+            budgetDirection != null &&
+            budgetDirection != preservedDirection
+        ) {
             onBoundaryPreviewRequestCancelled?.invoke(budgetDirection)
             boundaryPreviewBudgetDirection = null
         }
@@ -2799,7 +2965,13 @@ internal class EpubFlowView(
     fun currentPageIndex(): Int = currentPage
 
     /** Installs one exclusively owned adjacent-chapter frame in the matching direction slot. */
-    fun offerBoundaryPreview(preview: BoundaryPagePreview): Boolean {
+    fun offerBoundaryPreview(preview: BoundaryPagePreview): Boolean =
+        offerBoundaryPreview(preview, forcePinned = false)
+
+    fun offerRetainedBoundaryPreview(preview: BoundaryPagePreview): Boolean =
+        offerBoundaryPreview(preview, forcePinned = true)
+
+    private fun offerBoundaryPreview(preview: BoundaryPagePreview, forcePinned: Boolean): Boolean {
         if (
             disposed ||
             preview.bitmap.isRecycled ||
@@ -2809,12 +2981,13 @@ internal class EpubFlowView(
             recyclePageShot(preview.bitmap)
             return false
         }
+        preview.retainedSurface = forcePinned
         val replaced = if (preview.forward) forwardBoundaryPreview else backwardBoundaryPreview
         if (replaced !== preview && replaced != null) {
             onBoundaryTurnDiscarded?.invoke(replaced)
             recyclePageShot(replaced.bitmap)
         }
-        val kind = if (boundaryPreviewIsRequired(preview.forward)) {
+        val kind = if (forcePinned || boundaryPreviewIsRequired(preview.forward)) {
             PageShotLeaseKind.PINNED
         } else {
             PageShotLeaseKind.EVICTABLE
@@ -2863,8 +3036,13 @@ internal class EpubFlowView(
             onBoundaryTurnDiscarded?.invoke(replaced)
             recyclePageShot(replaced.bitmap)
         }
-        relabelPageShot(preview.bitmap, PageShotLeaseKind.EVICTABLE, "boundary.preview")
-        if (pageShotBudget.chargedBytes > pageShotBudget.capacityBytes) {
+        val kind = if (preview.retainedSurface) PageShotLeaseKind.PINNED else PageShotLeaseKind.EVICTABLE
+        relabelPageShot(
+            preview.bitmap,
+            kind,
+            if (kind == PageShotLeaseKind.PINNED) "active.boundary.target" else "boundary.preview",
+        )
+        if (kind == PageShotLeaseKind.EVICTABLE && pageShotBudget.chargedBytes > pageShotBudget.capacityBytes) {
             recyclePageShot(preview.bitmap)
             return false
         }
@@ -2927,6 +3105,14 @@ internal class EpubFlowView(
                 fromTop = scrollY,
                 fromWindow = fromWindow,
             ) ?: snapshotViewport(PageShotLeaseKind.PINNED, "active.boundary.front")
+            if (reverseBitmap == null) {
+                if (!restoreBoundaryPreviewAfterOutgoingFailure(preview)) {
+                    recyclePageShot(preview.bitmap)
+                    onBoundaryTurnDiscarded?.invoke(preview)
+                }
+                interactiveTurnState = InteractiveTurnState.NONE
+                return
+            }
             showConversionSnapshot(preview.bitmap)
             boundaryContinuityCover = true
             interactiveTurnState = InteractiveTurnState.NONE
@@ -3054,10 +3240,18 @@ internal class EpubFlowView(
             MAX_QUEUED_PAGE_TURNS,
         )
         armRapidTurnSequence()
+        if (turnInFlight) {
+            if (queuedPageTurnDelta == 0) {
+                clearRapidFollowUpPageShot()
+            } else {
+                scheduleRapidFollowUpPageShot(forward = queuedPageTurnDelta > 0)
+            }
+        }
     }
 
     private fun clearQueuedPageTurns() {
         removeCallbacks(rapidTurnIdleRunnable)
+        clearRapidFollowUpPageShot()
         queuedPageTurnDelta = 0
         rapidTurnSequenceActive = false
         busyPageTurnGesture = false
@@ -3428,6 +3622,11 @@ internal class EpubFlowView(
         val targetTop = targetWindow.topPx
         val fromTop = origin.topPx
         val rapidTurn = rapidTurnSequenceActive
+        val prefetchedTarget = if (frozenOutgoing == null && rapidTurn) {
+            takeRapidFollowUpPageShot(targetPage, targetWindow, forward)
+        } else {
+            null
+        }
         val cached = if (frozenOutgoing == null && !rapidTurn) {
             takeCachedTexturesForTurn(
                 origin.pageProjection,
@@ -3450,10 +3649,11 @@ internal class EpubFlowView(
             PageShotLeaseKind.PINNED,
             "active.front",
         ) ?: run {
+            prefetchedTarget?.let(::recyclePageShot)
             cached?.second?.let(::recyclePageShot)
             return false
         }
-        val revealed = cached?.second ?: snapshotPageAt(
+        val revealed = prefetchedTarget ?: cached?.second ?: snapshotPageAt(
             targetTop,
             targetWindow,
             PageShotLeaseKind.PINNED,
@@ -3481,6 +3681,7 @@ internal class EpubFlowView(
                 restorePageTurnOrigin(origin)
             },
         )
+        if (rapidTurnSequenceActive) scheduleRapidFollowUpPageShot(forward)
         return true
     }
 
@@ -3759,7 +3960,13 @@ internal class EpubFlowView(
             val clipTop = snapshotClipTopFor(topPx, window)
             val clipBottom = snapshotClipBottomFor(topPx, window)
             canvas.clipRect(0, clipTop, width, clipBottom)
-            container.draw(canvas)
+            val skipContentDraw = container.skipContentDraw
+            container.skipContentDraw = false
+            try {
+                container.draw(canvas)
+            } finally {
+                container.skipContentDraw = skipContentDraw
+            }
             canvas.restoreToCount(contentSave)
             window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx = 0) }
         }
@@ -3913,7 +4120,7 @@ internal class EpubFlowView(
         committed: Boolean,
     ) {
         val (front, revealed) = takeActiveFlipBitmaps() ?: return
-        recycleCachedTextures()
+        recycleCachedTextures(preserveRapidFollowUp = true)
         val targetPage = canonicalFloorPageIndexForTopPx(targetWindow.topPx)
         val originKey = pageTextureKey(origin.topPx, origin.window)
         val targetKey = pageTextureKey(targetWindow.topPx, targetWindow)
@@ -5727,6 +5934,7 @@ internal class EpubFlowView(
         const val MICRO_TURN_MAX_CROSS_AXIS_RATIO = 0.5f
         const val MAX_QUEUED_PAGE_TURNS = 12
         const val RAPID_TURN_IDLE_TIMEOUT_MS = 320L
+        const val RAPID_FOLLOW_UP_PREFETCH_DELAY_MS = 32L
         const val FREE_FLING_MIN_SETTLE_MS = 64L
         const val FREE_FLING_STABLE_FRAMES = 2
     }
@@ -5844,6 +6052,8 @@ internal data class BoundaryPagePreview(
     val sourceChapterGeneration: Long,
     val bitmap: Bitmap,
 ) {
+    /** True when the engine retained the adjacent chapter surface for an immediate reverse turn. */
+    var retainedSurface: Boolean = false
     /** Outgoing page-shot transferred only during a successful commit callback. */
     var reverseBitmap: Bitmap? = null
 }
