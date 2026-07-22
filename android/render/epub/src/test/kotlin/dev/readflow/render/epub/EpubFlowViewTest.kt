@@ -5367,7 +5367,7 @@ class EpubFlowViewTest {
         )
         assertTrue("the queue must start a new visual transaction", followUpAnimator !== firstAnimator)
         assertTrue("the adjacent follow-up must still be visibly animating", followUpAnimator.isRunning)
-        assertEquals(120L, followUpAnimator.duration)
+        assertEquals(280L, followUpAnimator.duration)
         assertTrue(
             "a rapid burst must keep constant velocity between adjacent page artifacts",
             followUpAnimator.interpolator is LinearInterpolator,
@@ -5602,7 +5602,7 @@ class EpubFlowViewTest {
         )
         assertTrue(boundaryAnimator !== firstAnimator)
         assertTrue(boundaryAnimator.isRunning)
-        assertEquals(120L, boundaryAnimator.duration)
+        assertEquals(280L, boundaryAnimator.duration)
         assertNotNull(view.privateField("slideDrawable"))
         assertEquals("the boundary must not commit before its follow-up animation settles", emptyList<Long>(), commits)
 
@@ -5635,7 +5635,7 @@ class EpubFlowViewTest {
             view.privateField("flipAnimator") as android.animation.ValueAnimator?,
         )
         assertTrue(boundaryAnimator.isRunning)
-        assertEquals(120L, boundaryAnimator.duration)
+        assertEquals(280L, boundaryAnimator.duration)
         assertNotNull("rapid boundary SIMULATION must keep PAPER", view.privateField("curlDrawable"))
         assertNull("rapid boundary SIMULATION must never degrade to slide", view.privateField("slideDrawable"))
     }
@@ -5658,7 +5658,7 @@ class EpubFlowViewTest {
         )
         assertTrue(followUpAnimator !== firstAnimator)
         assertTrue(view.isPageTurnMotionActive())
-        assertEquals(120L, followUpAnimator.duration)
+        assertEquals(280L, followUpAnimator.duration)
         assertNotNull(view.privateField("slideDrawable"))
 
         followUpAnimator.end()
@@ -5922,7 +5922,7 @@ class EpubFlowViewTest {
             )
             assertEquals("the target page stays parked beneath the visual transaction", 3, view.currentPageIndex())
             assertTrue(followUpAnimator.isRunning)
-            assertEquals(120L, followUpAnimator.duration)
+            assertEquals(280L, followUpAnimator.duration)
             val paper = checkNotNull(view.privateField("curlDrawable")) {
                 "SIMULATION must keep the paper renderer throughout a rapid sequence"
             }
@@ -6032,9 +6032,70 @@ class EpubFlowViewTest {
         )
         assertEquals(3, view.currentPageIndex())
         assertTrue(followUpAnimator.isRunning)
-        assertEquals(120L, followUpAnimator.duration)
+        assertEquals(280L, followUpAnimator.duration)
         assertNotNull("rapid SIMULATION swipe must keep PAPER", view.privateField("curlDrawable"))
         assertNull("rapid SIMULATION swipe must not install slide", view.privateField("slideDrawable"))
+    }
+
+    @Test
+    fun `rapid idle swipe release keeps outgoing artifact on first frame and uses full follow-up duration`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        val outgoingColor = 0xFF16A34A.toInt()
+        try {
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.goToAdjacentPage(1))
+            shadowOf(Looper.getMainLooper()).idleFor(300L, TimeUnit.MILLISECONDS)
+
+            assertEquals(2, view.currentPageIndex())
+            assertTrue(view.privateBool("rapidTurnSequenceActive"))
+            assertFalse((view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.isRunning == true)
+
+            val downTime = SystemClock.uptimeMillis()
+            val y = view.height * 0.50f
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, view.width * 0.85f, y),
+            )
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, view.width * 0.15f, y),
+            )
+
+            val outgoing = checkNotNull(view.privateField("cachedFrontBitmap") as? Bitmap) {
+                "rapid idle settle must retain a live outgoing artifact before release"
+            }
+            outgoing.eraseColor(outgoingColor)
+            assertFalse("the held outgoing artifact must be live before release", outgoing.isRecycled)
+            assertEquals(outgoingColor, outgoing.getPixel(0, 0))
+
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, view.width * 0.15f, y),
+            )
+
+            val followUpAnimator = checkNotNull(
+                view.privateField("flipAnimator") as? android.animation.ValueAnimator,
+            )
+            val firstFramePaper = checkNotNull(
+                view.privateField("curlDrawable") as? PageCurlDrawable,
+            )
+            val firstFrameOutgoing = firstFramePaper.privateBitmap("frontBitmap")
+            assertSame(
+                "the first released frame must retain the held outgoing artifact",
+                outgoing,
+                firstFrameOutgoing,
+            )
+            assertFalse(
+                "the first released frame must keep its outgoing artifact unrecycled",
+                firstFrameOutgoing.isRecycled,
+            )
+            assertEquals(
+                "the first released frame must still contain outgoing content",
+                outgoingColor,
+                firstFrameOutgoing.getPixel(0, 0),
+            )
+            assertEquals("rapid follow-up animation must use the ordinary 280ms duration", 280L, followUpAnimator.duration)
+        } finally {
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
+            view.dispose()
+        }
     }
 
     @Test

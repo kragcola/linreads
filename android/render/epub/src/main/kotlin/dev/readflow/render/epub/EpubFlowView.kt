@@ -3138,8 +3138,7 @@ internal class EpubFlowView(
         return true
     }
 
-    private fun activeFlipDurationMs(): Long =
-        if (rapidTurnSequenceActive) RAPID_FLIP_DURATION_MS else flipDurationMs
+    private fun activeFlipDurationMs(): Long = flipDurationMs
 
     private fun activeFlipInterpolator(): android.animation.TimeInterpolator =
         if (rapidTurnSequenceActive) LinearInterpolator() else DecelerateInterpolator(1.6f)
@@ -5727,7 +5726,6 @@ internal class EpubFlowView(
         const val MICRO_TURN_PROJECTION_SECONDS = 0.04f
         const val MICRO_TURN_MAX_CROSS_AXIS_RATIO = 0.5f
         const val MAX_QUEUED_PAGE_TURNS = 12
-        const val RAPID_FLIP_DURATION_MS = 120L
         const val RAPID_TURN_IDLE_TIMEOUT_MS = 320L
         const val FREE_FLING_MIN_SETTLE_MS = 64L
         const val FREE_FLING_STABLE_FRAMES = 2
