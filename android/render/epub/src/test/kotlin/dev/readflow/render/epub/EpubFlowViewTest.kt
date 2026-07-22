@@ -21,6 +21,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.animation.LinearInterpolator
 import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.render.api.READER_SEARCH_HIGHLIGHT_COLOR
@@ -5348,7 +5349,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `rapid paper burst starts one lightweight follow-up animation instead of a hard cut`() {
+    fun `rapid paper burst starts an adjacent follow-up animation instead of jumping to a far page`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
 
@@ -5365,12 +5366,16 @@ class EpubFlowViewTest {
             view.privateField("flipAnimator") as android.animation.ValueAnimator?,
         )
         assertTrue("the queue must start a new visual transaction", followUpAnimator !== firstAnimator)
-        assertTrue("the coalesced follow-up must still be visibly animating", followUpAnimator.isRunning)
+        assertTrue("the adjacent follow-up must still be visibly animating", followUpAnimator.isRunning)
         assertEquals(120L, followUpAnimator.duration)
+        assertTrue(
+            "a rapid burst must keep constant velocity between adjacent page artifacts",
+            followUpAnimator.interpolator is LinearInterpolator,
+        )
         assertNotNull(view.privateField("slideDrawable"))
         assertNull(view.privateField("curlDrawable"))
-        assertEquals("the live page is parked beneath the follow-up overlay", 3, view.currentPageIndex())
-        assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+        assertEquals("one follow-up animation may park only its adjacent target", 2, view.currentPageIndex())
+        assertEquals("the remaining rapid request must wait for its own animation", 1, view.privateInt("queuedPageTurnDelta"))
     }
 
     @Test
@@ -5455,13 +5460,18 @@ class EpubFlowViewTest {
 
     @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
-    fun `rapid local follow-up clips live boundary image preview to the revealed half`() {
+    fun `rapid image follow-up renders outgoing and target from one frozen generation`() {
         val fixture = visibleHeadingImageContinuationFixture(minHeadingPageIndex = 2)
         val view = fixture.view
         val outgoingColor = 0xFF16A34A.toInt()
-        val targetImageColor = 0xFF2563EB.toInt()
+        val frozenTargetColor = 0xFF2563EB.toInt()
+        val liveMutationColor = 0xFFE11D48.toInt()
         view.flipStyle = PageFlipStyle.SIMULATION
         view.goToPage(fixture.headingPageIndex - 2)
+        fixture.imageDrawable.color = frozenTargetColor
+        view.textView.invalidate()
+        view.invalidate()
+        view.recycleCachedTexturesForTest()
 
         try {
             assertTrue(view.goToAdjacentPage(1))
@@ -5481,7 +5491,7 @@ class EpubFlowViewTest {
             )
             followUpSlide.privateBitmap("frontBitmap").eraseColor(outgoingColor)
             view.getChildAt(0).visibility = View.INVISIBLE
-            fixture.imageDrawable.color = targetImageColor
+            fixture.imageDrawable.color = liveMutationColor
             view.textView.invalidate()
             view.invalidate()
 
@@ -5494,18 +5504,70 @@ class EpubFlowViewTest {
                 val outgoingHalf = Rect(0, 0, view.width / 2, view.height)
                 val revealedHalf = Rect(view.width / 2, 0, view.width, view.height)
                 val outgoingHits = midFrame.countExactPixels(outgoingColor, outgoingHalf)
-                val leakedImageHits = midFrame.countExactPixels(targetImageColor, outgoingHalf)
-                val revealedImageHits = midFrame.countExactPixels(targetImageColor, revealedHalf)
+                val frozenTargetHits = midFrame.countExactPixels(frozenTargetColor, revealedHalf)
+                val liveMutationHits = midFrame.countExactPixels(liveMutationColor, revealedHalf)
                 assertTrue(
-                    "the live boundary image preview must stay inside the target half while the outgoing " +
-                        "artifact owns the other half; outgoingHits=$outgoingHits " +
-                        "leakedImageHits=$leakedImageHits revealedImageHits=$revealedImageHits",
-                    outgoingHits > 0 && leakedImageHits == 0 && revealedImageHits > 0,
+                    "a rapid image turn must render both halves from artifacts frozen before live pixels mutate; " +
+                        "outgoingHits=$outgoingHits frozenTargetHits=$frozenTargetHits " +
+                        "liveMutationHits=$liveMutationHits",
+                    outgoingHits > 0 && frozenTargetHits > 0 && liveMutationHits == 0,
                 )
             } finally {
                 midFrame.recycle()
             }
         } finally {
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `rapid image landing waits for decoded target artifact before parking the page`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        var decodePending = false
+        view.pendingDecodesProvider = { decodePending }
+
+        try {
+            assertTrue(view.goToAdjacentPage(1))
+            val firstAnimator = checkNotNull(
+                view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+            )
+            assertTrue(view.goToAdjacentPage(1))
+            decodePending = true
+
+            firstAnimator.end()
+
+            assertEquals(
+                "a rapid image target must not park while its decoded pixels are pending",
+                1,
+                view.currentPageIndex(),
+            )
+            assertEquals("the blocked landing request must remain queued", 1, view.privateInt("queuedPageTurnDelta"))
+            assertFalse(
+                "no follow-up animation may expose the transparent live target",
+                (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.isRunning == true,
+            )
+            assertNull(view.privateField("slideDrawable"))
+            assertNull(view.privateField("curlDrawable"))
+
+            decodePending = false
+            view.onAsyncImageDecodeFinished()
+            view.textView.viewTreeObserver.dispatchOnPreDraw()
+
+            val landingAnimator = checkNotNull(
+                view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+            )
+            assertTrue("decoded target pixels must release the queued landing animation", landingAnimator.isRunning)
+            assertEquals(2, view.currentPageIndex())
+            assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+            val slide = checkNotNull(view.privateField("slideDrawable"))
+            assertNotNull(
+                "the released landing must own a frozen target artifact",
+                slide.reflectedField("revealedBitmap"),
+            )
+        } finally {
+            decodePending = false
             (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
             view.dispose()
         }
@@ -5706,11 +5768,38 @@ class EpubFlowViewTest {
 
         assertEquals("all accepted burst turns must drain in order", 4, view.currentPageIndex())
         assertEquals(
-            "queued local pages should coalesce into one follow-up settle",
-            2,
+            "each accepted local page must publish one adjacent settle",
+            4,
             reportedOffsets.size,
         )
         assertFalse((view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.isRunning == true)
+    }
+
+    @Test
+    fun `rapid burst resumes a transferred dirty artifact before starting its next page`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
+
+        assertTrue(view.goToAdjacentPage(1))
+        val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        // Simulate a PIXELS_ONLY completion that arrived while the active pair owned the warm
+        // current artifact. Settle must return that owner to the one-slot refresh queue.
+        view.setPrivateField("activeFlipFrontPixelRefreshPending", true)
+        assertTrue(view.goToAdjacentPage(1))
+
+        firstAnimator.end()
+        assertEquals(1, view.currentPageIndex())
+        assertEquals(1, view.privateInt("queuedPageTurnDelta"))
+        assertNull("the next turn waits for the dirty artifact refresh", view.privateField("slideDrawable"))
+
+        shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+
+        assertEquals(2, view.currentPageIndex())
+        assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+        assertTrue(
+            "the queued turn must start after the transferred artifact is refreshed",
+            view.privateField("slideDrawable") != null || view.privateInt("cachedFromPage") == 2,
+        )
     }
 
     @Test
@@ -5805,12 +5894,12 @@ class EpubFlowViewTest {
             val slide = checkNotNull(view.privateField("slideDrawable")) {
                 "a rapid follow-up must use the lightweight slide renderer"
             }
-            assertNull(
-                "a rapid follow-up must reveal the live target without retaining a target page-shot",
+            assertNotNull(
+                "a rapid follow-up must retain a frozen target page artifact",
                 slide.reflectedField("revealedBitmap"),
             )
             assertEquals(
-                "each rapid follow-up step may capture only its unique outgoing page, never its target",
+                "each rapid follow-up reuses its outgoing artifact and captures only the next target",
                 1,
                 EpubPageShotCaptureProbe.total(),
             )

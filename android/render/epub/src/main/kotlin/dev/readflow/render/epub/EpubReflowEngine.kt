@@ -1000,6 +1000,11 @@ class EpubReflowEngine private constructor(
         view.onPageTurnStarted = {
             if (flowView === view) liveFlowImageLoader?.cancelDisplayPromotions()
         }
+        view.onPageTurnTargetParked = {
+            if (flowView === view) {
+                liveFlowImageLoader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
+            }
+        }
         view.onPageSettled = {
             if (flowView === view) {
                 val loader = liveFlowImageLoader

@@ -15,9 +15,9 @@ import kotlin.math.min
 
 /**
  * Hardware-accelerated slide page-turn (滑动翻页, 静读天下「滑动」手感). A snapshot of the OUTGOING
- * page is blitted at a horizontal offset that tracks [progress]. Normal turns also carry an incoming
- * page shot; rapid turns omit it and reveal the already parked live target beneath this drawable.
- * Both paths avoid the Canvas mesh work used by the PAPER renderer.
+ * page is blitted at a horizontal offset that tracks [progress]. Every turn also carries the frozen
+ * incoming page artifact so a frame never mixes a bitmap generation with the parked live view.
+ * This avoids the Canvas mesh work used by the PAPER renderer.
  *
  * Forward (next): both pages slide LEFT together — outgoing exits left, incoming enters from the right.
  * Backward (prev): mirrored — both slide RIGHT, incoming enters from the left.
@@ -26,7 +26,7 @@ import kotlin.math.min
  */
 internal class PageSlideDrawable(
     frontBitmap: Bitmap,
-    revealedBitmap: Bitmap?,
+    revealedBitmap: Bitmap,
     private val viewportW: Int,
     private val viewportH: Int,
     private val forward: Boolean,
@@ -38,10 +38,6 @@ internal class PageSlideDrawable(
 
     private var frontBitmap: Bitmap? = frontBitmap
     private var revealedBitmap: Bitmap? = revealedBitmap
-
-    /** True when the host must draw the parked target page beneath this outgoing-only slide. */
-    internal val revealsLiveTarget: Boolean
-        get() = revealedBitmap == null
 
     /** 0 = outgoing page fully covers the viewport, 1 = outgoing fully slid off (turn complete). */
     var progress: Float = 0f

@@ -22,6 +22,7 @@ import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import android.widget.FrameLayout
 import android.widget.ScrollView
 import dev.readflow.render.api.SelectionAwareTextView
@@ -411,13 +412,8 @@ internal class EpubFlowView(
     private var curlDrawable: PageCurlDrawable? = null
     private val pageShotOverlayActive: Boolean
         get() = slideDrawable != null || curlDrawable != null
-    /** A rapid outgoing-only slide leaves the parked target to the live child draw pass. */
-    private val pageShotOverlaySuppressesContent: Boolean
-        get() = curlDrawable != null || slideDrawable?.revealsLiveTarget == false
-    private val pageShotOverlayRevealsLiveTarget: Boolean
-        get() = slideDrawable?.revealsLiveTarget == true
     private val fullViewportOverlayActive: Boolean
-        get() = pageShotOverlaySuppressesContent || conversionSnapshotDrawable != null
+        get() = pageShotOverlayActive || conversionSnapshotDrawable != null
     /** Defensive settle bookkeeping; dirty cache owners are rejected before an active turn starts. */
     private var activeFlipFrontPixelRefreshPending = false
     private var activeFlipRevealedPixelRefreshPending = false
@@ -505,6 +501,8 @@ internal class EpubFlowView(
     var onPageTurnCapturePreparing: (() -> Unit)? = null
     /** Called after a new visual turn has acquired both page shots and accepted ownership. */
     var onPageTurnStarted: (() -> Unit)? = null
+    /** Called after a local target is parked so its image window can prepare the following page. */
+    var onPageTurnTargetParked: (() -> Unit)? = null
     var onPageSettled: (() -> Unit)? = null
 
     // ---- Pre-cache page textures (Moon+ Reader model) ------------------------------------------
@@ -1376,10 +1374,7 @@ internal class EpubFlowView(
         drawLiveViewportBackground(canvas)
         super.draw(canvas)
         settledWindowAtTop(scrollY)?.takeIf {
-            mode == Mode.PAGED &&
-                pageClipActive &&
-                !fullViewportOverlayActive &&
-                !pageShotOverlayRevealsLiveTarget
+            mode == Mode.PAGED && pageClipActive && !fullViewportOverlayActive
         }
             // A parent draws this scrolled View with a -scrollY canvas transform. Keep the preview
             // in content coordinates so it lands in the visible viewport after that transform.
@@ -1483,16 +1478,8 @@ internal class EpubFlowView(
         // The page-turn overlay owns the complete viewport and draws cached page shots. Avoid
         // repainting the parked TextView (including all image spans) underneath it on every finger
         // MOVE; EpubFlowContainer keeps the parent ViewGroup overlay in the draw pass.
-        container.skipContentDraw = pageShotOverlaySuppressesContent
+        container.skipContentDraw = pageShotOverlayActive
         try {
-            // ViewGroupOverlay is painted inside super.dispatchDraw(). A rapid follow-up has no
-            // incoming page shot, so place the target's synthetic cross-page image crop first: the
-            // live child then paints normally and the outgoing page shot plus seam shadow stay on top.
-            if (pageShotOverlayRevealsLiveTarget && mode == Mode.PAGED && pageClipActive) {
-                settledWindowAtTop(scrollY)?.let {
-                    drawPageBoundaryImagePreview(canvas, scrollY, it, canvasViewportTopPx = scrollY)
-                }
-            }
             if (clipBottom == null && topClip <= scrollY) {
                 super.dispatchDraw(canvas)
                 return
@@ -1872,10 +1859,9 @@ internal class EpubFlowView(
         if (pendingInPlacePageShotRefreshSlots.isNotEmpty()) {
             scheduleInPlacePageShotRefresh()
         } else {
-            // Queue drained: refill any current/adjacent slots missing after a discarded partial
-            // pending precache (retained warm owners were refreshed in place; incomplete cache must
-            // not stay permanent).
-            preCachePageTextures()
+            // A queued rapid target may now consume this refreshed artifact. Without queued input,
+            // the normal current/adjacent precache path still runs through the same dispatcher.
+            continueQueuedTurnsOrPrecache()
         }
     }
 
@@ -2060,7 +2046,7 @@ internal class EpubFlowView(
                     asyncImageWakeListener = null
                     asyncImageWakeObserver = null
                 }
-                if (awaitingStableChapter) tryRevealWhenStable() else preCachePageTextures()
+                if (awaitingStableChapter) tryRevealWhenStable() else continueQueuedTurnsOrPrecache()
                 return true
             }
         }
@@ -2503,6 +2489,7 @@ internal class EpubFlowView(
         onPageShotForeground = null
         onPageTurnCapturePreparing = null
         onPageTurnStarted = null
+        onPageTurnTargetParked = null
         onPageSettled = null
         awaitingReveal = false
         awaitingStableChapter = false
@@ -2997,7 +2984,7 @@ internal class EpubFlowView(
         applyFlipProgress(0f, preview.forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = activeFlipDurationMs()
-            interpolator = DecelerateInterpolator(1.6f)
+            interpolator = activeFlipInterpolator()
             addUpdateListener { applyFlipProgress(it.animatedValue as Float, preview.forward) }
             addListener(object : AnimatorListenerAdapter() {
                 override fun onAnimationEnd(animation: Animator) = finishBoundaryInteractiveTurn(commit = true)
@@ -3105,9 +3092,22 @@ internal class EpubFlowView(
     }
 
     private fun continueQueuedTurnsOrPrecache() {
+        // A transferred warm owner may still need one in-place pixel refresh after settle. The
+        // normal precache path intentionally returns during a rapid sequence, so explicitly drain
+        // this queue before trying to start the next visual transaction.
+        if (!turnInFlight && pendingInPlacePageShotRefreshSlots.isNotEmpty()) {
+            resumeDeferredInPlacePageShotRefresh()
+            return
+        }
         if (drainQueuedPageTurn()) return
         if (rapidTurnSequenceActive) scheduleRapidTurnIdle() else preCachePageTextures()
     }
+
+    private fun hasPendingPageArtifactRefresh(): Boolean =
+        asyncImageRefreshPending ||
+            asyncImagePixelRefreshOffsets.isNotEmpty() ||
+            asyncImagePixelTextRebindPending ||
+            pendingInPlacePageShotRefreshSlots.isNotEmpty()
 
     private fun drainQueuedPageTurn(): Boolean {
         if (
@@ -3119,17 +3119,17 @@ internal class EpubFlowView(
             initialRevealActive() ||
             awaitingStableChapter ||
             pendingDecodesProvider?.invoke() == true ||
+            hasPendingPageArtifactRefresh() ||
             textView.isLayoutRequested
         ) return false
         val delta = if (queuedPageTurnDelta > 0) 1 else -1
         armRapidTurnSequence()
         val availableLocalSteps = if (delta > 0) paged.lastIndex - currentPage else currentPage
         if (availableLocalSteps > 0) {
-            val coalescedSteps = minOf(kotlin.math.abs(queuedPageTurnDelta), availableLocalSteps)
-            val targetPage = currentPage + delta * coalescedSteps
+            val targetPage = currentPage + delta
             val targetWindow = paged[targetPage]
             if (!goToPageAnimated(targetWindow, forward = delta > 0)) return false
-            queuedPageTurnDelta -= delta * coalescedSteps
+            queuedPageTurnDelta -= delta
             return true
         }
         queuedPageTurnDelta -= delta
@@ -3140,6 +3140,9 @@ internal class EpubFlowView(
 
     private fun activeFlipDurationMs(): Long =
         if (rapidTurnSequenceActive) RAPID_FLIP_DURATION_MS else flipDurationMs
+
+    private fun activeFlipInterpolator(): android.animation.TimeInterpolator =
+        if (rapidTurnSequenceActive) LinearInterpolator() else DecelerateInterpolator(1.6f)
 
     private fun useSimulationDiscreteRenderer(): Boolean =
         flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION && !rapidTurnSequenceActive
@@ -3425,8 +3428,8 @@ internal class EpubFlowView(
         }
         val targetTop = targetWindow.topPx
         val fromTop = origin.topPx
-        val revealLiveTarget = rapidTurnSequenceActive
-        val cached = if (frozenOutgoing == null && !revealLiveTarget) {
+        val rapidTurn = rapidTurnSequenceActive
+        val cached = if (frozenOutgoing == null && !rapidTurn) {
             takeCachedTexturesForTurn(
                 origin.pageProjection,
                 fromTop,
@@ -3438,12 +3441,12 @@ internal class EpubFlowView(
         } else {
             null
         }
-        val rapidOutgoing = if (frozenOutgoing == null && revealLiveTarget) {
+        val rapidOutgoing = if (frozenOutgoing == null && rapidTurn) {
             takeCachedFrontForBoundaryTurn(origin.pageProjection, fromTop, origin.window)
         } else {
             null
         }
-        if (revealLiveTarget && frozenOutgoing != null) recycleCachedTextures()
+        if (rapidTurn && frozenOutgoing != null) recycleCachedTextures()
         val outgoing = frozenOutgoing ?: rapidOutgoing ?: cached?.first ?: snapshotViewport(
             PageShotLeaseKind.PINNED,
             "active.front",
@@ -3451,22 +3454,20 @@ internal class EpubFlowView(
             cached?.second?.let(::recyclePageShot)
             return false
         }
-        val revealed = if (revealLiveTarget) {
-            null
-        } else {
-            cached?.second ?: snapshotPageAt(
-                targetTop,
-                targetWindow,
-                PageShotLeaseKind.PINNED,
-                "active.target",
-            ) ?: run {
-                recyclePageShot(outgoing)
-                return false
-            }
+        val revealed = cached?.second ?: snapshotPageAt(
+            targetTop,
+            targetWindow,
+            PageShotLeaseKind.PINNED,
+            "active.target",
+            fullResolution = frozenOutgoing != null,
+        ) ?: run {
+            recyclePageShot(outgoing)
+            return false
         }
         // Park the incoming page silently beneath the page-shot overlay. Locator publication belongs
         // to the completed visual transaction; cancellation restores the exact outgoing viewport.
         parkOnPageWindow(targetWindow, report = false)
+        onPageTurnTargetParked?.invoke()
         onPageTurnStarted?.invoke()
         startFlip(
             outgoing = outgoing,
@@ -3882,9 +3883,9 @@ internal class EpubFlowView(
     /**
      * Drives the active page-turn animation to [progress] (0 = outgoing covers viewport, 1 = complete).
      * SLIDE: the outgoing snapshot moves inside [PageSlideDrawable] AND the incoming page (the real
-     * [container]) is already parked on the target page. Normal turns use two captured strips; rapid
-     * turns slide only the outgoing strip and reveal the live target beneath it. SIMULATION draws the
-     * revealed shot flat inside [PageCurlDrawable], while only the outgoing shot warps over it.
+     * [container]) is already parked on the target page. Both normal and rapid turns use one frozen
+     * outgoing/target pair so a visual transaction cannot mix image quality generations. SIMULATION
+     * draws the revealed shot flat inside [PageCurlDrawable], while only the outgoing shot warps over it.
      */
     private fun applyFlipProgress(progress: Float, forward: Boolean) {
         slideDrawable?.let {
@@ -3990,7 +3991,7 @@ internal class EpubFlowView(
 
     private fun startFlip(
         outgoing: Bitmap,
-        revealed: Bitmap?,
+        revealed: Bitmap,
         forward: Boolean,
         onCommitted: () -> Unit = {},
         onCancelled: () -> Unit = {},
@@ -4026,7 +4027,7 @@ internal class EpubFlowView(
         applyFlipProgress(0f, forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = activeFlipDurationMs()
-            interpolator = DecelerateInterpolator(1.6f)
+            interpolator = activeFlipInterpolator()
             addUpdateListener { a -> applyFlipProgress(a.animatedValue as Float, forward) }
             addListener(object : AnimatorListenerAdapter() {
                 private var cancelled = false
@@ -4522,6 +4523,7 @@ internal class EpubFlowView(
         finishInitialRevealForTurn()
         // Park content on the incoming page beneath the overlay; stays silent until the turn commits.
         parkOnPageWindow(targetWindow, report = false)
+        onPageTurnTargetParked?.invoke()
         flipAnimator?.cancel()
         clearFlipOverlay(preserveActivePixelRefreshes = true)
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
