@@ -5372,8 +5372,8 @@ class EpubFlowViewTest {
             "a rapid burst must keep constant velocity between adjacent page artifacts",
             followUpAnimator.interpolator is LinearInterpolator,
         )
-        assertNotNull(view.privateField("slideDrawable"))
-        assertNull(view.privateField("curlDrawable"))
+        assertNotNull("rapid SIMULATION follow-up must keep PAPER", view.privateField("curlDrawable"))
+        assertNull("rapid SIMULATION follow-up must not install slide", view.privateField("slideDrawable"))
         assertEquals("one follow-up animation may park only its adjacent target", 2, view.currentPageIndex())
         assertEquals("the remaining rapid request must wait for its own animation", 1, view.privateInt("queuedPageTurnDelta"))
     }
@@ -5428,10 +5428,11 @@ class EpubFlowViewTest {
             val followUpAnimator = checkNotNull(
                 view.privateField("flipAnimator") as android.animation.ValueAnimator?,
             )
-            val followUpSlide = checkNotNull(
-                view.privateField("slideDrawable") as PageSlideDrawable?,
+            val followUpPaper = checkNotNull(
+                view.privateField("curlDrawable") as PageCurlDrawable?,
             )
-            followUpSlide.privateBitmap("frontBitmap").eraseColor(outgoingTextColor)
+            assertNull("SIMULATION rapid text turn must not degrade to slide", view.privateField("slideDrawable"))
+            followUpPaper.privateBitmap("frontBitmap").eraseColor(outgoingTextColor)
             followUpAnimator.currentPlayTime = followUpAnimator.duration / 2L
             val midFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
@@ -5486,19 +5487,19 @@ class EpubFlowViewTest {
             val followUpAnimator = checkNotNull(
                 view.privateField("flipAnimator") as android.animation.ValueAnimator?,
             )
-            val followUpSlide = checkNotNull(
-                view.privateField("slideDrawable") as PageSlideDrawable?,
+            val followUpPaper = checkNotNull(
+                view.privateField("curlDrawable") as PageCurlDrawable?,
             )
-            followUpSlide.privateBitmap("frontBitmap").eraseColor(outgoingColor)
+            assertNull("SIMULATION rapid image turn must not degrade to slide", view.privateField("slideDrawable"))
+            followUpPaper.privateBitmap("frontBitmap").eraseColor(outgoingColor)
             view.getChildAt(0).visibility = View.INVISIBLE
             fixture.imageDrawable.color = liveMutationColor
             view.textView.invalidate()
             view.invalidate()
 
             followUpAnimator.currentPlayTime = followUpAnimator.duration / 2L
-            // DecelerateInterpolator is already well past 50% geometry at half play time. Pin the
-            // drawable itself so the two sampled halves match the actual outgoing/revealed seam.
-            followUpSlide.progress = 0.5f
+            // Pin the renderer itself so the two sampled halves match the paper seam exactly.
+            followUpPaper.progress = 0.5f
             val midFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
                 val outgoingHalf = Rect(0, 0, view.width / 2, view.height)
@@ -5561,11 +5562,12 @@ class EpubFlowViewTest {
             assertTrue("decoded target pixels must release the queued landing animation", landingAnimator.isRunning)
             assertEquals(2, view.currentPageIndex())
             assertEquals(0, view.privateInt("queuedPageTurnDelta"))
-            val slide = checkNotNull(view.privateField("slideDrawable"))
+            val paper = checkNotNull(view.privateField("curlDrawable"))
             assertNotNull(
                 "the released landing must own a frozen target artifact",
-                slide.reflectedField("revealedBitmap"),
+                paper.reflectedField("revealedBitmap"),
             )
+            assertNull("decoded SIMULATION landing must not degrade to slide", view.privateField("slideDrawable"))
         } finally {
             decodePending = false
             (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
@@ -5607,6 +5609,35 @@ class EpubFlowViewTest {
         boundaryAnimator.end()
 
         assertEquals(listOf(704L), commits)
+    }
+
+    @Test
+    fun `rapid simulation next at the chapter edge preserves paper renderer`() {
+        lateinit var view: EpubFlowView
+        view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            onTapZone = { zone ->
+                if (zone == EpubFlowTapZone.NEXT) assertTrue(view.startDiscreteBoundaryTurn(1))
+            },
+        )
+        val finalPage = view.pageCount() - 1
+        assertTrue("pageCount=${view.pageCount()}", finalPage > 2)
+        view.goToPage(finalPage - 1)
+        view.offerReadyBoundaryPreviewForTest(forward = true, token = 705L)
+
+        assertTrue(view.goToAdjacentPage(1))
+        val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+        assertTrue(view.goToAdjacentPage(1))
+
+        firstAnimator.end()
+
+        val boundaryAnimator = checkNotNull(
+            view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+        )
+        assertTrue(boundaryAnimator.isRunning)
+        assertEquals(120L, boundaryAnimator.duration)
+        assertNotNull("rapid boundary SIMULATION must keep PAPER", view.privateField("curlDrawable"))
+        assertNull("rapid boundary SIMULATION must never degrade to slide", view.privateField("slideDrawable"))
     }
 
     @Test
@@ -5791,6 +5822,7 @@ class EpubFlowViewTest {
         assertEquals(1, view.currentPageIndex())
         assertEquals(1, view.privateInt("queuedPageTurnDelta"))
         assertNull("the next turn waits for the dirty artifact refresh", view.privateField("slideDrawable"))
+        assertNull("the next paper turn also waits for the dirty artifact refresh", view.privateField("curlDrawable"))
 
         shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
 
@@ -5798,7 +5830,7 @@ class EpubFlowViewTest {
         assertEquals(0, view.privateInt("queuedPageTurnDelta"))
         assertTrue(
             "the queued turn must start after the transferred artifact is refreshed",
-            view.privateField("slideDrawable") != null || view.privateInt("cachedFromPage") == 2,
+            view.privateField("curlDrawable") != null || view.privateInt("cachedFromPage") == 2,
         )
     }
 
@@ -5862,7 +5894,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `edge tap inside rapid idle window starts a visual follow-up settle`() {
+    fun `edge tap inside rapid idle window preserves simulation renderer`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         try {
             assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
@@ -5891,19 +5923,19 @@ class EpubFlowViewTest {
             assertEquals("the target page stays parked beneath the visual transaction", 3, view.currentPageIndex())
             assertTrue(followUpAnimator.isRunning)
             assertEquals(120L, followUpAnimator.duration)
-            val slide = checkNotNull(view.privateField("slideDrawable")) {
-                "a rapid follow-up must use the lightweight slide renderer"
+            val paper = checkNotNull(view.privateField("curlDrawable")) {
+                "SIMULATION must keep the paper renderer throughout a rapid sequence"
             }
             assertNotNull(
                 "a rapid follow-up must retain a frozen target page artifact",
-                slide.reflectedField("revealedBitmap"),
+                paper.reflectedField("revealedBitmap"),
             )
             assertEquals(
                 "each rapid follow-up reuses its outgoing artifact and captures only the next target",
                 1,
                 EpubPageShotCaptureProbe.total(),
             )
-            assertNull("a rapid follow-up must skip the heavier paper renderer", view.privateField("curlDrawable"))
+            assertNull("SIMULATION rapid follow-up must never degrade to slide", view.privateField("slideDrawable"))
         } finally {
             EpubPageShotCaptureProbe.stop()
         }
@@ -6001,8 +6033,8 @@ class EpubFlowViewTest {
         assertEquals(3, view.currentPageIndex())
         assertTrue(followUpAnimator.isRunning)
         assertEquals(120L, followUpAnimator.duration)
-        assertNotNull(view.privateField("slideDrawable"))
-        assertNull(view.privateField("curlDrawable"))
+        assertNotNull("rapid SIMULATION swipe must keep PAPER", view.privateField("curlDrawable"))
+        assertNull("rapid SIMULATION swipe must not install slide", view.privateField("slideDrawable"))
     }
 
     @Test

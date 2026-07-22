@@ -3145,7 +3145,7 @@ internal class EpubFlowView(
         if (rapidTurnSequenceActive) LinearInterpolator() else DecelerateInterpolator(1.6f)
 
     private fun useSimulationDiscreteRenderer(): Boolean =
-        flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION && !rapidTurnSequenceActive
+        flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION
 
     fun prepareBoundaryPageTurn(delta: Int): Boolean =
         prepareBoundaryPageTurnResult(delta) == BoundaryPageTurnPreparation.PREPARED
