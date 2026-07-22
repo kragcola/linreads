@@ -62,14 +62,14 @@ _最后更新：2026-07-22_
 - settle 后 active front/target 按 bitmap identity 重标为下一稳定 cache；离散跨章复用 warmed outgoing，不再额外抓第六张。continuity cover 存在时，会在 cold handoff 前逐出 inactive boundary，确保 cover+target+front 峰值仍为三张。
 - boundary owner 时序已闭环：preview 在 outgoing/conversion 分配前即成为 `activeBoundaryPreview`；失败先撤销 active owner 再恢复原 token。已运行的 speculative hidden renderer 若随后升级为真实边界等待，会在 capture 时动态读取 required 状态，转入 PINNED admission，避免三槽满时 EVICTABLE 失败后等待到超时。
 - background trim 可前台恢复，OOM/severe pressure 在本 session 保持 backoff；active boundary token/方向与 continuity cover 不被 speculative trim 误删。等待失败会退出 view waiting 状态但保留可重试 token；异常无 drawable settle 会清空旧 `curlOrigin/curlTargetWindow`。
-- 生产与测试修改仍未提交、未推送、未发布 OTA；用户明确暂不做物理设备验证。
+- 2026-07-22 本轮生产与测试修改已提交 `09adca9`、推送并由 Actions run `29890749225` 发布为 Dev build `#268`；物理设备手感验证仍待用户验收。
 
 ## Next
 
 1. 保持 A1 的统一预算/三 identity ownership 与既有 FREE_REST/完整行裁切语义；motion 使用全分辨率、按背景 alpha 选择 `RGB_565`/`ARGB_8888`，conversion/continuity 固定 `ARGB_8888`，不引入无界 bitmap pool。
 2. 下一轮 OTA 由 Actions 完成 full regression、R8 与发布；之后在物理平板复验书籍 86 目录到“幼态延续”及正反连续快翻，只以真实 FrameTimeline/PSS 和手感关闭性能门。
 3. `snapshotPageAt()` 的裸 Bitmap lease/release 契约与未入账 preview 的防御性校验属于非阻断 API hardening；当前无 production caller，可在下一轮测试接口收窄时处理。
-4. 提交、推送与 OTA 仅在用户明确要求后执行；当前保持 dirty worktree。
+4. 本轮 OTA 已完成；后续提交、推送与 OTA 仍需用户明确要求，保持未跟踪缓存文件不纳入版本控制。
 
 ## Mature Project Source Audit
 
@@ -120,6 +120,7 @@ _最后更新：2026-07-22_
 | 2026-07-22 rapid/blur RED -> GREEN | rapid live target mid-frame、synthetic boundary crop ownership、1px spatial-detail preservation | 三项先分别暴露硬切、跨半屏泄漏与 `staticEdges=343 motionEdges=0`；实现后均 GREEN | live target 合成与全分辨率 motion artifact 两条根因闭环 |
 | 2026-07-22 pre-OTA targeted | `EpubFlowViewTest` + `PageCurlDrawableTest` + `PageShotBudgetTest`，`--rerun-tasks` | `248 + 5 + 13 = 266` tests，0 failures / 0 errors / 0 skipped；45/45 tasks；`BUILD SUCCESSFUL in 57s` | rapid lifecycle、正反 PAPER、清晰度、格式预算与 bitmap ownership 定向通过；full regression/R8 留给 Actions |
 | 2026-07-22 pre-OTA review | 独立只读 production/test review + P1 focused re-review | 首轮发现透明 full-size ARGB 的 pinned `3x` ceiling 可绕过设备预算；RED/GREEN 改为仅 active pair 可越限，复核 PASS、0 Critical/Important | 三帧 ARGB OOM 峰值关闭，正常 active pair、continuity 与 boundary owner 流程保持 |
+| 2026-07-22 OTA | `git push origin main`；Actions run `29890749225`（重跑 build job `88831368351`） | full Android regression、`:app:assembleOta`、`dev-latest` 均成功；Dev build `#268`，APK `10,029,349` bytes，SHA-256 `7458ef8be9002dd1b858dae89157d8c734b1fbe99d5732134675432adeea7591` | 已发布，待物理设备验收 |
 
 ## Rollback
 
