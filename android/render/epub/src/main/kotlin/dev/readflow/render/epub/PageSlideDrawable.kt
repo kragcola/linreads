@@ -39,6 +39,10 @@ internal class PageSlideDrawable(
     private var frontBitmap: Bitmap? = frontBitmap
     private var revealedBitmap: Bitmap? = revealedBitmap
 
+    /** True when the host must draw the parked target page beneath this outgoing-only slide. */
+    internal val revealsLiveTarget: Boolean
+        get() = revealedBitmap == null
+
     /** 0 = outgoing page fully covers the viewport, 1 = outgoing fully slid off (turn complete). */
     var progress: Float = 0f
         set(value) {

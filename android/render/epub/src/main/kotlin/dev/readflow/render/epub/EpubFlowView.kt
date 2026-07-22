@@ -270,7 +270,7 @@ internal class EpubFlowView(
     private var conversionFadeAnimator: android.animation.ValueAnimator? = null
     /** First page turn requested before the initial layout exists; replayed once pagination is ready. */
     private var pendingInitialPageTurnDelta: Int? = null
-    private val pageShotConfig = Bitmap.Config.ARGB_8888
+    private val continuityPageShotConfig = Bitmap.Config.ARGB_8888
     private val pageBoundaryBitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val pageBoundaryDestination = Rect()
     /** Reused by non-BitmapDrawable crop paint (main-thread draw only; no concurrent access). */
@@ -411,8 +411,13 @@ internal class EpubFlowView(
     private var curlDrawable: PageCurlDrawable? = null
     private val pageShotOverlayActive: Boolean
         get() = slideDrawable != null || curlDrawable != null
+    /** A rapid outgoing-only slide leaves the parked target to the live child draw pass. */
+    private val pageShotOverlaySuppressesContent: Boolean
+        get() = curlDrawable != null || slideDrawable?.revealsLiveTarget == false
+    private val pageShotOverlayRevealsLiveTarget: Boolean
+        get() = slideDrawable?.revealsLiveTarget == true
     private val fullViewportOverlayActive: Boolean
-        get() = pageShotOverlayActive || conversionSnapshotDrawable != null
+        get() = pageShotOverlaySuppressesContent || conversionSnapshotDrawable != null
     /** Defensive settle bookkeeping; dirty cache owners are rejected before an active turn starts. */
     private var activeFlipFrontPixelRefreshPending = false
     private var activeFlipRevealedPixelRefreshPending = false
@@ -1371,7 +1376,10 @@ internal class EpubFlowView(
         drawLiveViewportBackground(canvas)
         super.draw(canvas)
         settledWindowAtTop(scrollY)?.takeIf {
-            mode == Mode.PAGED && pageClipActive && !fullViewportOverlayActive
+            mode == Mode.PAGED &&
+                pageClipActive &&
+                !fullViewportOverlayActive &&
+                !pageShotOverlayRevealsLiveTarget
         }
             // A parent draws this scrolled View with a -scrollY canvas transform. Keep the preview
             // in content coordinates so it lands in the visible viewport after that transform.
@@ -1475,8 +1483,16 @@ internal class EpubFlowView(
         // The page-turn overlay owns the complete viewport and draws cached page shots. Avoid
         // repainting the parked TextView (including all image spans) underneath it on every finger
         // MOVE; EpubFlowContainer keeps the parent ViewGroup overlay in the draw pass.
-        container.skipContentDraw = pageShotOverlayActive
+        container.skipContentDraw = pageShotOverlaySuppressesContent
         try {
+            // ViewGroupOverlay is painted inside super.dispatchDraw(). A rapid follow-up has no
+            // incoming page shot, so place the target's synthetic cross-page image crop first: the
+            // live child then paints normally and the outgoing page shot plus seam shadow stay on top.
+            if (pageShotOverlayRevealsLiveTarget && mode == Mode.PAGED && pageClipActive) {
+                settledWindowAtTop(scrollY)?.let {
+                    drawPageBoundaryImagePreview(canvas, scrollY, it, canvasViewportTopPx = scrollY)
+                }
+            }
             if (clipBottom == null && topClip <= scrollY) {
                 super.dispatchDraw(canvas)
                 return
@@ -3473,19 +3489,29 @@ internal class EpubFlowView(
         heightPx: Int,
         kind: PageShotLeaseKind,
         label: String,
+        config: Bitmap.Config = continuityPageShotConfig,
         draw: (Bitmap) -> Unit,
     ): Bitmap? {
+        val bytesPerPixel = pageShotBytesPerPixel(config)
         var reservation = pageShotBudget.tryReserve(
             widthPx = widthPx,
             heightPx = heightPx,
             kind = kind,
             label = label,
+            bytesPerPixel = bytesPerPixel,
         )
         if (reservation == null && kind == PageShotLeaseKind.PINNED) {
             evictSpeculativePageShotsForPinnedAllocation()
             onPinnedPageShotAdmissionNeeded?.invoke()
-            val estimatedBytes = widthPx.toLong() * heightPx.toLong() * 4L
-            val pinnedCeilingBytes = maxOf(pageShotBudget.capacityBytes, estimatedBytes * 3L)
+            val estimatedBytes = widthPx.toLong() * heightPx.toLong() * bytesPerPixel
+            val activePairBytes = if (estimatedBytes > Long.MAX_VALUE / ACTIVE_PAGE_SHOT_PAIR_SIZE) {
+                Long.MAX_VALUE
+            } else {
+                estimatedBytes * ACTIVE_PAGE_SHOT_PAIR_SIZE
+            }
+            // Only the two frames required by an active turn may exceed the soft device budget.
+            // A third continuity/directional frame must fit the real budget or free/reuse an owner.
+            val pinnedCeilingBytes = maxOf(pageShotBudget.capacityBytes, activePairBytes)
             if (pageShotBudget.chargedBytes + estimatedBytes > pinnedCeilingBytes) return null
             reservation = pageShotBudget.tryReserve(
                 widthPx = widthPx,
@@ -3493,12 +3519,13 @@ internal class EpubFlowView(
                 kind = kind,
                 label = label,
                 allowOverCapacity = true,
+                bytesPerPixel = bytesPerPixel,
             )
         }
         val admittedReservation = reservation ?: return null
         var allocated: Bitmap? = null
         return try {
-            val bitmap = Bitmap.createBitmap(widthPx, heightPx, pageShotConfig)
+            val bitmap = Bitmap.createBitmap(widthPx, heightPx, config)
             allocated = bitmap
             val lease = admittedReservation.commit(bitmap, bitmap.allocationByteCount)
             if (lease == null) {
@@ -3676,7 +3703,8 @@ internal class EpubFlowView(
         if (width == 0 || height == 0) return null
         val shotWidth = if (fullResolution) width else motionPageShotWidthPx()
         val shotHeight = if (fullResolution) height else motionPageShotHeightPx()
-        return allocatePageShot(shotWidth, shotHeight, kind, label) { bmp ->
+        val config = if (fullResolution) continuityPageShotConfig else motionPageShotConfig()
+        return allocatePageShot(shotWidth, shotHeight, kind, label, config) { bmp ->
             val canvas = Canvas(bmp)
             scalePageShotCanvasToViewport(canvas, bmp)
             drawSnapshotBackground(canvas)
@@ -3721,7 +3749,8 @@ internal class EpubFlowView(
         if (width == 0 || height == 0) return null
         val shotWidth = if (fullResolution) width else motionPageShotWidthPx()
         val shotHeight = if (fullResolution) height else motionPageShotHeightPx()
-        return allocatePageShot(shotWidth, shotHeight, kind, label) { bmp ->
+        val config = if (fullResolution) continuityPageShotConfig else motionPageShotConfig()
+        return allocatePageShot(shotWidth, shotHeight, kind, label, config) { bmp ->
             val canvas = Canvas(bmp)
             scalePageShotCanvasToViewport(canvas, bmp)
             drawSnapshotBackground(canvas)
@@ -5681,9 +5710,7 @@ internal class EpubFlowView(
     private companion object {
         /** The opposite speculative frame is admitted only while all three fit this tighter cap. */
         const val PAGE_SHOT_OPPOSITE_BUDGET_BYTES = 32L * 1024L * 1024L
-        const val SLIDE_MOTION_PAGE_SHOT_DIVISOR = 2
-        const val SIMULATION_MOTION_PAGE_SHOT_DIVISOR = 4
-
+        const val ACTIVE_PAGE_SHOT_PAIR_SIZE = 2L
         /** Coalesce window for async-image reflows: collapses a decode burst into ONE paginate+anchor. */
         const val REFLOW_DEBOUNCE_MS = 80L
         /** Paint completed images even if another relevant decoder never returns. */
@@ -5732,25 +5759,37 @@ internal class EpubFlowView(
         return bytesPerShot * 3L <= minOf(pageShotBudget.capacityBytes, PAGE_SHOT_OPPOSITE_BUDGET_BYTES)
     }
 
-    private fun motionPageShotDivisor(): Int =
-        if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
-            SIMULATION_MOTION_PAGE_SHOT_DIVISOR
+    @Suppress("DEPRECATION")
+    private fun motionPageShotConfig(): Bitmap.Config =
+        if (viewportBackground?.opacity == PixelFormat.OPAQUE) {
+            Bitmap.Config.RGB_565
         } else {
-            SLIDE_MOTION_PAGE_SHOT_DIVISOR
+            Bitmap.Config.ARGB_8888
         }
 
+    private fun motionPageShotBytesPerPixel(): Int = pageShotBytesPerPixel(motionPageShotConfig())
+
+    private fun pageShotBytesPerPixel(config: Bitmap.Config): Int = when (config) {
+        Bitmap.Config.ALPHA_8 -> 1
+        Bitmap.Config.RGB_565,
+        @Suppress("DEPRECATION") Bitmap.Config.ARGB_4444,
+        -> 2
+        Bitmap.Config.RGBA_F16 -> 8
+        else -> 4
+    }
+
     private fun motionPageShotWidthPx(): Int {
-        val divisor = motionPageShotDivisor()
-        return ((width + divisor - 1) / divisor).coerceAtLeast(1)
+        return width.coerceAtLeast(1)
     }
 
     private fun motionPageShotHeightPx(): Int {
-        val divisor = motionPageShotDivisor()
-        return ((height + divisor - 1) / divisor).coerceAtLeast(1)
+        return height.coerceAtLeast(1)
     }
 
     private fun motionPageShotByteCount(): Long =
-        motionPageShotWidthPx().toLong() * motionPageShotHeightPx().toLong() * 4L
+        motionPageShotWidthPx().toLong() *
+            motionPageShotHeightPx().toLong() *
+            motionPageShotBytesPerPixel()
 
     private fun usablePageHeightPx(): Int {
         if (height <= 0) return pageHeightPx.coerceAtLeast(1)

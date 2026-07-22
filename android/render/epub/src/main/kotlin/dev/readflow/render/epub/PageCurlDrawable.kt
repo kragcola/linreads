@@ -97,7 +97,6 @@ internal class PageCurlDrawable(
             return
         }
 
-        revealedBitmap?.let { drawWholeBitmap(canvas, it) }
         if (progress <= 0f) {
             frontBitmap?.let { drawWholeBitmap(canvas, it) }
             canvas.restoreToCount(save)
@@ -111,6 +110,7 @@ internal class PageCurlDrawable(
         }
 
         if (forward) {
+            revealedBitmap?.let { drawFlatRange(canvas, it, divider, width) }
             frontBitmap?.let { drawPaperWidth(canvas, it, divider) }
         } else {
             frontBitmap?.let { drawFlatRange(canvas, it, divider, width) }

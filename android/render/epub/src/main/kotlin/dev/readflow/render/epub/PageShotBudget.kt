@@ -40,10 +40,11 @@ internal class PageShotBudget(
         kind: PageShotLeaseKind,
         label: String = "",
         allowOverCapacity: Boolean = false,
+        bytesPerPixel: Int = ARGB_8888_BYTES_PER_PIXEL,
     ): Reservation? {
         if (kind == PageShotLeaseKind.EVICTABLE && isSpeculativeAdmissionPaused) return null
         if (activeReservations.size + activeLeases.size >= maxActiveShots) return null
-        val estimatedBytes = estimatedArgb8888Bytes(widthPx, heightPx) ?: return null
+        val estimatedBytes = estimatedBitmapBytes(widthPx, heightPx, bytesPerPixel) ?: return null
         val mayExceedCapacity = allowOverCapacity && kind == PageShotLeaseKind.PINNED
         if (!mayExceedCapacity && estimatedBytes > capacityBytes - chargedBytes) return null
         activeReservedBytes += estimatedBytes
@@ -141,11 +142,11 @@ internal class PageShotBudget(
 
 private const val DEFAULT_MAX_ACTIVE_SHOTS = 3
 
-private fun estimatedArgb8888Bytes(widthPx: Int, heightPx: Int): Long? {
-    if (widthPx <= 0 || heightPx <= 0) return null
+private fun estimatedBitmapBytes(widthPx: Int, heightPx: Int, bytesPerPixel: Int): Long? {
+    if (widthPx <= 0 || heightPx <= 0 || bytesPerPixel <= 0) return null
     val pixels = widthPx.toLong() * heightPx.toLong()
-    if (pixels > Long.MAX_VALUE / ARGB_8888_BYTES_PER_PIXEL) return null
-    return pixels * ARGB_8888_BYTES_PER_PIXEL
+    if (pixels > Long.MAX_VALUE / bytesPerPixel) return null
+    return pixels * bytesPerPixel
 }
 
 internal fun pageShotBudgetCapacityBytes(
@@ -169,4 +170,4 @@ private const val NORMAL_RAM_FLOOR_BYTES = 32L * MIB
 private const val LOW_RAM_CEILING_BYTES = 24L * MIB
 private const val NORMAL_RAM_DIVISOR = 8L
 private const val LOW_RAM_DIVISOR = 10L
-private const val ARGB_8888_BYTES_PER_PIXEL = 4L
+private const val ARGB_8888_BYTES_PER_PIXEL = 4

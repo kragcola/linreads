@@ -1580,6 +1580,41 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `simulation text turn preserves viewport spatial detail when motion starts`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.background = OnePixelDetailDrawable()
+        view.textView.setTextColor(0x00000000)
+        view.goToPage(1)
+        view.recycleCachedTexturesForTest()
+        view.preCachePageTexturesForTest()
+        val staticFrame = view.drawAsScrolledChildToBitmapForTest()
+
+        try {
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val motionStartFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val sampleY = view.height / 2
+                val staticEdges = staticFrame.countHighContrastHorizontalTransitions(sampleY, 8, view.width - 8)
+                val motionEdges = motionStartFrame.countHighContrastHorizontalTransitions(sampleY, 8, view.width - 8)
+                assertTrue(
+                    "a text page motion layer must preserve viewport 1-to-1 high-frequency detail; " +
+                        "staticEdges=$staticEdges motionEdges=$motionEdges sampleY=$sampleY",
+                    staticEdges > 0 && motionEdges >= staticEdges * 9 / 10,
+                )
+            } finally {
+                motionStartFrame.recycle()
+            }
+        } finally {
+            view.endInteractiveCurl(velocityX = 0f)
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
+            staticFrame.recycle()
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `first slide frame preserves real paper texture under the finger`() {
         val context = RuntimeEnvironment.getApplication() as Application
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
@@ -2133,7 +2168,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `one shot soft budget still admits an interactive working pair`() {
-        val oneShotBytes = 180L * 60L * 4L
+        val oneShotBytes = 360L * 120L * 2L
         val budget = PageShotBudget(oneShotBytes)
         var pinnedAdmissionRequests = 0
         val view = pagedFlowView(
@@ -2142,6 +2177,8 @@ class EpubFlowViewTest {
             onPinnedPageShotAdmissionNeeded = { pinnedAdmissionRequests += 1 },
         )
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
+        view.recycleCachedTexturesForTest()
 
         try {
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
@@ -2151,6 +2188,10 @@ class EpubFlowViewTest {
             assertTrue("the active working frames must have distinct owners", front !== revealed)
             assertFalse("the outgoing working frame must remain live", front.isRecycled)
             assertFalse("the target working frame must remain live", revealed.isRecycled)
+            assertMotionPageShotSize(view, front)
+            assertMotionPageShotSize(view, revealed)
+            assertEquals(Bitmap.Config.RGB_565, front.config)
+            assertEquals(Bitmap.Config.RGB_565, revealed.config)
             assertEquals(
                 "a one-shot soft limit may be exceeded only by the two pinned working frames",
                 oneShotBytes * 2L,
@@ -2172,6 +2213,45 @@ class EpubFlowViewTest {
         } finally {
             view.endInteractiveCurl(velocityX = 0f)
             shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `full size argb pinned admission cannot exceed one active working pair`() {
+        val oneShotBytes = 360L * 120L * 4L
+        val budget = PageShotBudget(oneShotBytes)
+        val view = pagedFlowView(pageShotBudget = budget)
+        view.recycleCachedTexturesForTest()
+
+        val first = view.snapshotViewportForTest(
+            kind = PageShotLeaseKind.PINNED,
+            label = "test.active.front",
+            fullResolution = true,
+        )
+        val second = view.snapshotViewportForTest(
+            kind = PageShotLeaseKind.PINNED,
+            label = "test.active.target",
+            fullResolution = true,
+        )
+        val third = view.snapshotViewportForTest(
+            kind = PageShotLeaseKind.PINNED,
+            label = "test.continuity.extra",
+            fullResolution = true,
+        )
+
+        try {
+            assertNotNull(first)
+            assertNotNull(second)
+            assertEquals(Bitmap.Config.ARGB_8888, first!!.config)
+            assertEquals(Bitmap.Config.ARGB_8888, second!!.config)
+            assertNull("a third full-size ARGB pinned frame must not bypass the device budget", third)
+            assertEquals(oneShotBytes * 2L, budget.leasedBytes)
+        } finally {
+            listOfNotNull(first, second, third).forEach { bitmap ->
+                budget.release(bitmap)
+                if (!bitmap.isRecycled) bitmap.recycle()
+            }
             view.dispose()
         }
     }
@@ -5294,6 +5374,144 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `rapid local follow-up mid frame keeps outgoing and revealed target text visible`() {
+        val outgoingTextColor = 0xFF16A34A.toInt()
+        val targetTextColor = 0xFF2563EB.toInt()
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SIMULATION,
+            text = (1..120).joinToString("\n") { line ->
+                "Line $line carries marked EPUB body text across the full viewport width."
+            },
+        )
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val markedText = SpannableString(view.textView.text).apply {
+            setSpan(
+                BackgroundColorSpan(outgoingTextColor),
+                pages[1].startOffset,
+                pages[1].endOffset,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+            setSpan(
+                BackgroundColorSpan(targetTextColor),
+                pages[2].startOffset,
+                pages[2].endOffset,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+        val flow = checkNotNull(view.privateField("flow") as EpubChapterFlow?)
+        view.recycleCachedTexturesForTest()
+        view.setChapter(flow, markedText, pageHeightPx = view.height)
+        view.measure(exactly(view.width), exactly(view.height))
+        view.layout(0, 0, view.width, view.height)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.measure(exactly(view.width), exactly(view.height))
+        view.layout(0, 0, view.width, view.height)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        view.invalidate()
+
+        try {
+            assertTrue(view.goToAdjacentPage(1))
+            val firstAnimator = checkNotNull(
+                view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+            )
+            assertTrue(view.goToAdjacentPage(1))
+
+            firstAnimator.end()
+
+            val followUpAnimator = checkNotNull(
+                view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+            )
+            val followUpSlide = checkNotNull(
+                view.privateField("slideDrawable") as PageSlideDrawable?,
+            )
+            followUpSlide.privateBitmap("frontBitmap").eraseColor(outgoingTextColor)
+            followUpAnimator.currentPlayTime = followUpAnimator.duration / 2L
+            val midFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val outgoingHits = midFrame.countExactPixels(
+                    outgoingTextColor,
+                    Rect(0, 0, view.width / 2, view.height),
+                )
+                val targetHits = midFrame.countExactPixels(
+                    targetTextColor,
+                    Rect(view.width / 2, 0, view.width, view.height),
+                )
+                assertTrue(
+                    "a rapid local turn must move the old body while revealing the new body before settle; " +
+                        "outgoingHits=$outgoingHits targetHits=$targetHits " +
+                        "playTime=${followUpAnimator.currentPlayTime}/${followUpAnimator.duration}",
+                    outgoingHits > 0 && targetHits > 0,
+                )
+            } finally {
+                midFrame.recycle()
+            }
+        } finally {
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
+            view.dispose()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `rapid local follow-up clips live boundary image preview to the revealed half`() {
+        val fixture = visibleHeadingImageContinuationFixture(minHeadingPageIndex = 2)
+        val view = fixture.view
+        val outgoingColor = 0xFF16A34A.toInt()
+        val targetImageColor = 0xFF2563EB.toInt()
+        view.flipStyle = PageFlipStyle.SIMULATION
+        view.goToPage(fixture.headingPageIndex - 2)
+
+        try {
+            assertTrue(view.goToAdjacentPage(1))
+            val firstAnimator = checkNotNull(
+                view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+            )
+            assertTrue(view.goToAdjacentPage(1))
+
+            firstAnimator.end()
+
+            assertEquals(fixture.headingPageIndex, view.currentPageIndex())
+            val followUpAnimator = checkNotNull(
+                view.privateField("flipAnimator") as android.animation.ValueAnimator?,
+            )
+            val followUpSlide = checkNotNull(
+                view.privateField("slideDrawable") as PageSlideDrawable?,
+            )
+            followUpSlide.privateBitmap("frontBitmap").eraseColor(outgoingColor)
+            view.getChildAt(0).visibility = View.INVISIBLE
+            fixture.imageDrawable.color = targetImageColor
+            view.textView.invalidate()
+            view.invalidate()
+
+            followUpAnimator.currentPlayTime = followUpAnimator.duration / 2L
+            // DecelerateInterpolator is already well past 50% geometry at half play time. Pin the
+            // drawable itself so the two sampled halves match the actual outgoing/revealed seam.
+            followUpSlide.progress = 0.5f
+            val midFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val outgoingHalf = Rect(0, 0, view.width / 2, view.height)
+                val revealedHalf = Rect(view.width / 2, 0, view.width, view.height)
+                val outgoingHits = midFrame.countExactPixels(outgoingColor, outgoingHalf)
+                val leakedImageHits = midFrame.countExactPixels(targetImageColor, outgoingHalf)
+                val revealedImageHits = midFrame.countExactPixels(targetImageColor, revealedHalf)
+                assertTrue(
+                    "the live boundary image preview must stay inside the target half while the outgoing " +
+                        "artifact owns the other half; outgoingHits=$outgoingHits " +
+                        "leakedImageHits=$leakedImageHits revealedImageHits=$revealedImageHits",
+                    outgoingHits > 0 && leakedImageHits == 0 && revealedImageHits > 0,
+                )
+            } finally {
+                midFrame.recycle()
+            }
+        } finally {
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `rapid next at the chapter edge starts a boundary follow-up animation`() {
         lateinit var view: EpubFlowView
         view = pagedFlowView(
@@ -6791,13 +7009,17 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `large viewport reduced precache keeps all three directional owners within budget`() {
+    fun `large viewport full RGB565 precache keeps all three directional owners within 32 MiB`() {
+        val oppositeCapBytes = 32L * 1024L * 1024L
+        val budget = PageShotBudget(oppositeCapBytes)
         val view = pagedFlowView(
             text = (1..800).joinToString("\n") { "Line $it marker text." },
             viewportWidth = 1_600,
             viewportHeight = 2_560,
+            pageShotBudget = budget,
         )
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
         view.goToPage(1)
         view.recycleCachedTexturesForTest()
 
@@ -6807,11 +7029,14 @@ class EpubFlowViewTest {
         val forward = view.privateField("cachedRevealedBitmap") as Bitmap?
         val opposite = view.privateField("cachedBackwardBitmap") as Bitmap?
         val owners = listOfNotNull(current, forward, opposite)
-        assertEquals("reduced motion shots must keep current, previous, and next warm", 3, owners.size)
+        assertEquals("full-resolution motion shots must keep current, previous, and next warm", 3, owners.size)
         owners.forEach { bitmap ->
-            assertEquals(Bitmap.Config.ARGB_8888, bitmap.config)
+            assertEquals(Bitmap.Config.RGB_565, bitmap.config)
             assertMotionPageShotSize(view, bitmap)
         }
+        val threeFullRgb565Bytes = view.width.toLong() * view.height.toLong() * 2L * 3L
+        assertEquals(threeFullRgb565Bytes, budget.leasedBytes)
+        assertTrue("three full RGB565 owners must fit the opposite cache cap", budget.leasedBytes <= oppositeCapBytes)
     }
 
     @Test
@@ -6866,13 +7091,14 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `chapter entry precache uses reduced motion artifacts without three full viewport allocations`() {
+    fun `chapter entry precache keeps three full viewport RGB565 motion artifacts`() {
         val budget = PageShotBudget(48L * 1024L * 1024L)
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SLIDE,
             pageShotBudget = budget,
         )
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
         val pages = view.privateField("paged") as List<EpubFlowPage>
         val flow = view.privateField("flow") as EpubChapterFlow
         val chapterText = view.textView.text
@@ -6896,23 +7122,13 @@ class EpubFlowViewTest {
                 view.privateField("cachedBackwardBitmap") as Bitmap?,
                 view.privateField("cachedRevealedBitmap") as Bitmap?,
             )
-            val fullResolutionCount = owners.count { bitmap ->
-                bitmap.width == view.width && bitmap.height == view.height
+            assertEquals("chapter entry must warm current, previous, and next", 3, owners.size)
+            owners.forEach { bitmap ->
+                assertMotionPageShotSize(view, bitmap)
+                assertEquals(Bitmap.Config.RGB_565, bitmap.config)
             }
-            val reducedResolutionCount = owners.count { bitmap ->
-                bitmap.width < view.width || bitmap.height < view.height
-            }
-            val threeFullArgbBytes = view.width.toLong() * view.height.toLong() * 4L * 3L
-
-            assertTrue(
-                "chapter-entry precache must retain reduced-resolution motion artifacts instead of " +
-                    "three full viewport bitmaps; owners=${owners.map { "${it.width}x${it.height}:${it.config}" }} " +
-                    "leased=${budget.leasedBytes} threeFullArgbBytes=$threeFullArgbBytes",
-                owners.isNotEmpty() &&
-                    reducedResolutionCount > 0 &&
-                    fullResolutionCount < 3 &&
-                    budget.leasedBytes < threeFullArgbBytes,
-            )
+            val threeFullRgb565Bytes = view.width.toLong() * view.height.toLong() * 2L * 3L
+            assertEquals(threeFullRgb565Bytes, budget.leasedBytes)
         } finally {
             view.dispose()
         }
@@ -11324,12 +11540,15 @@ class EpubFlowViewTest {
         )
     }
 
-    private fun visibleHeadingImageContinuationFixture(): HeadingImageContinuationFixture {
+    private fun visibleHeadingImageContinuationFixture(
+        minHeadingPageIndex: Int = 0,
+    ): HeadingImageContinuationFixture {
         var lastDiagnostics: String? = null
         for (lines in 2..32) {
             val fixture = buildHeadingImageContinuationFixture(leadingBodyLines = lines)
             val pages = fixture.view.privateField("paged") as List<EpubFlowPage>
             val adjacentImagePage =
+                fixture.headingPageIndex >= minHeadingPageIndex &&
                 fixture.imagePageIndex == fixture.headingPageIndex + 1 &&
                     fixture.imagePageIndex < pages.size
             val visibleCropHits = if (adjacentImagePage) {
@@ -11746,15 +11965,28 @@ class EpubFlowViewTest {
     }
 
     private fun assertMotionPageShotSize(view: EpubFlowView, bitmap: Bitmap) {
-        val divisor = if (view.flipStyle == PageFlipStyle.SIMULATION) 4 else 2
-        assertEquals((view.width + divisor - 1) / divisor, bitmap.width)
-        assertEquals((view.height + divisor - 1) / divisor, bitmap.height)
+        assertEquals(view.width, bitmap.width)
+        assertEquals(view.height, bitmap.height)
     }
 
     private fun EpubFlowView.snapshotViewportForTest(): Bitmap? =
         javaClass.getDeclaredMethod("snapshotViewport")
             .apply { isAccessible = true }
             .invoke(this) as Bitmap?
+
+    private fun EpubFlowView.snapshotViewportForTest(
+        kind: PageShotLeaseKind,
+        label: String,
+        fullResolution: Boolean,
+    ): Bitmap? =
+        javaClass.getDeclaredMethod(
+            "snapshotViewport",
+            PageShotLeaseKind::class.java,
+            String::class.java,
+            Boolean::class.javaPrimitiveType,
+        )
+            .apply { isAccessible = true }
+            .invoke(this, kind, label, fullResolution) as Bitmap?
 
     private fun EpubFlowView.showConversionSnapshotForTest(bitmap: Bitmap) {
         javaClass.getDeclaredMethod("showConversionSnapshot", Bitmap::class.java)
@@ -11821,6 +12053,33 @@ class EpubFlowViewTest {
             }
         }
         return matches
+    }
+
+    private fun Bitmap.countExactPixels(color: Int, area: Rect): Int {
+        var matches = 0
+        for (y in area.top.coerceAtLeast(0) until area.bottom.coerceAtMost(height)) {
+            for (x in area.left.coerceAtLeast(0) until area.right.coerceAtMost(width)) {
+                if (getPixel(x, y) == color) matches++
+            }
+        }
+        return matches
+    }
+
+    private fun Bitmap.countHighContrastHorizontalTransitions(y: Int, startX: Int, endX: Int): Int {
+        val sampleY = y.coerceIn(0, height - 1)
+        val left = startX.coerceIn(0, width - 1)
+        val right = endX.coerceIn(left + 1, width)
+        var edges = 0
+        for (x in left + 1 until right) {
+            val before = getPixel(x - 1, sampleY)
+            val after = getPixel(x, sampleY)
+            val rgbDistance =
+                kotlin.math.abs(((before shr 16) and 0xFF) - ((after shr 16) and 0xFF)) +
+                    kotlin.math.abs(((before shr 8) and 0xFF) - ((after shr 8) and 0xFF)) +
+                    kotlin.math.abs((before and 0xFF) - (after and 0xFF))
+            if (rgbDistance >= 600) edges++
+        }
+        return edges
     }
 
     private fun assertSampledPixelsEqual(message: String, expected: Bitmap, actual: Bitmap) {
@@ -12063,6 +12322,31 @@ class EpubFlowViewTest {
                     paint,
                 )
                 y += 6
+            }
+        }
+
+        override fun setAlpha(alpha: Int) = Unit
+
+        override fun setColorFilter(colorFilter: ColorFilter?) = Unit
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.OPAQUE
+    }
+
+    private class OnePixelDetailDrawable : Drawable() {
+        private val paint = Paint()
+
+        override fun draw(canvas: Canvas) {
+            val b = bounds
+            for (x in b.left until b.right) {
+                paint.color = if ((x - b.left) % 2 == 0) 0xFF151515.toInt() else 0xFFEAEAEA.toInt()
+                canvas.drawRect(
+                    x.toFloat(),
+                    b.top.toFloat(),
+                    (x + 1).toFloat(),
+                    b.bottom.toFloat(),
+                    paint,
+                )
             }
         }
 

@@ -1,6 +1,6 @@
 # Android EPUB FREE_REST Pagination
 
-_最后更新：2026-07-14_
+_最后更新：2026-07-22_
 
 ## Objective
 
@@ -15,7 +15,7 @@ _最后更新：2026-07-14_
 - 取消翻页恢复事务开始时精确 `scrollY`；提交动画结束后才发布 locator。
 - oversized image/block 保留为单行不可分割例外。
 - 用户选择 cold-cache 方案 B：本地 page shots 每帧最多生成一张；手指保持按下时记录最新坐标，shots ready 后续接同一次手势，不要求重拖。
-- 用户选择 A1：page-shot 始终使用 `ARGB_8888`；低内存只减少或关闭 speculative prewarm，不用 RGB_565 降画质。local 与 hidden boundary renderer 共用 session byte-budget，并以三个 distinct identity 为硬上限：两张 active working frames + 一张 continuity/方向帧。
+- 2026-07-14 用户选择的 A1 原为 page-shot 始终使用 `ARGB_8888`。该像素格式部分已于 2026-07-22 被用户批准的清晰度/性能修复显式替代：motion artifact 保持 viewport 原尺寸，背景不透明时使用 `RGB_565`、需要 alpha 时使用 `ARGB_8888`；conversion/continuity snapshot 始终保留全分辨率 `ARGB_8888`。统一 session byte-budget、最多三个 distinct identity、低内存减少 speculative prewarm 的 ownership 约束不变。
 
 ## Scope
 
@@ -57,6 +57,8 @@ _最后更新：2026-07-14_
 - 方案 B correctness/lifecycle 复审已收口，无剩余确定性 P0-P2。后续源码级内存审计发现原“只计算本地三槽”的 A/B 前提不完整：`cachedFront/cachedRevealed/cachedBackward` 可与前后两个 `BoundaryPagePreview` 同时常驻，稳定态是五张；离散跨章路径再抓 outgoing 时可达六张。1080×2400 ARGB_8888 对应约 49.44/59.33 MiB，1600×2560 对应约 78.13/93.75 MiB。
 - Moon+ Reader Pro 9.7 的 Java + smali 链路确认其稳定态只有 `current + 单向 next` 两张 RGB_565，后翻丢弃 next 后现场生成 previous；跨章也只缓存下一章一张。CoolReader、FBReaderJ、Legado 与 android-PageFlip 的单页路径同样以 current+本次 target 两工作帧和 identity/slot 转交为主；KOReader、Glide、Coil、Fresco 则提供按字节预算、方向预取、LRU/trim/low-memory 降级证据。没有成熟证据支持 LinReads 固定三张 ARGB，更不支持章内三张之外再无预算地保留双向跨章 preview。
 - A1 已落地：`PageShotBudget` normal 为 `min(memoryClass / 8, 48 MiB)`，low-RAM 为 `min(memoryClass / 10, 24 MiB)`；分配前 reservation、commit 后按 `allocationByteCount` 计费，speculative admission 受软预算与 trim/backoff 控制。PINNED active 帧可越软字节上限，但不能越三个 identity 的硬上限；第四张会先走 owner-aware speculative eviction，再决定是否拒绝。
+- 2026-07-22 motion artifact 不再通过 SLIDE `/2`、SIMULATION `/4` 边长降采样；这种整页低清位图双线性放大会让纯文本翻页首帧也出现全屏硬模糊。新策略以 1:1 viewport artifact 保留文字空间细节，并在不透明页面用 `RGB_565` 把单帧字节数减半；`PageShotBudget` reservation 按实际格式 bpp 预记账，commit 后仍以 `allocationByteCount` 校正。1600x2560 的三张 motion artifact 为 `23.4375 MiB`，仍低于 32 MiB opposite-cache cap。
+- rapid follow-up 的 outgoing-only slide 现在让 parked live target 参与绘制，不再因 overlay 存在而跳过整个 `TextView`，因此不会退化为直到 overlay 清除才突然出现目标页的硬切。synthetic 跨页图片 crop 在 rapid 路径中先于 `ViewGroupOverlay` 合成，仍被 outgoing artifact 与 seam shadow 正确遮挡。
 - settle 后 active front/target 按 bitmap identity 重标为下一稳定 cache；离散跨章复用 warmed outgoing，不再额外抓第六张。continuity cover 存在时，会在 cold handoff 前逐出 inactive boundary，确保 cover+target+front 峰值仍为三张。
 - boundary owner 时序已闭环：preview 在 outgoing/conversion 分配前即成为 `activeBoundaryPreview`；失败先撤销 active owner 再恢复原 token。已运行的 speculative hidden renderer 若随后升级为真实边界等待，会在 capture 时动态读取 required 状态，转入 PINNED admission，避免三槽满时 EVICTABLE 失败后等待到超时。
 - background trim 可前台恢复，OOM/severe pressure 在本 session 保持 backoff；active boundary token/方向与 continuity cover 不被 speculative trim 误删。等待失败会退出 view waiting 状态但保留可重试 token；异常无 drawable settle 会清空旧 `curlOrigin/curlTargetWindow`。
@@ -64,8 +66,8 @@ _最后更新：2026-07-14_
 
 ## Next
 
-1. 保持 A1 与既有 FREE_REST/完整行裁切语义不变；不再引入 RGB_565 fallback 或无界 bitmap pool。
-2. 物理手机/平板继续 deferred；后续实机只验手感、真实帧/PSS、系统 trim/OOM 行为，不把本轮 AVD 结果冒充实机。
+1. 保持 A1 的统一预算/三 identity ownership 与既有 FREE_REST/完整行裁切语义；motion 使用全分辨率、按背景 alpha 选择 `RGB_565`/`ARGB_8888`，conversion/continuity 固定 `ARGB_8888`，不引入无界 bitmap pool。
+2. 下一轮 OTA 由 Actions 完成 full regression、R8 与发布；之后在物理平板复验书籍 86 目录到“幼态延续”及正反连续快翻，只以真实 FrameTimeline/PSS 和手感关闭性能门。
 3. `snapshotPageAt()` 的裸 Bitmap lease/release 契约与未入账 preview 的防御性校验属于非阻断 API hardening；当前无 production caller，可在下一轮测试接口收窄时处理。
 4. 提交、推送与 OTA 仅在用户明确要求后执行；当前保持 dirty worktree。
 
@@ -115,6 +117,9 @@ _最后更新：2026-07-14_
 | 2026-07-14 A1 integration | Reader + Animate tests、EPUB lint、AndroidTest compile、debug assemble | Reader 83/83；Animate 13/13；lint 0 errors / 8 warnings；434 tasks；`BUILD SUCCESSFUL in 1m14s` | 跨模块静态、测试与构建门通过 |
 | 2026-07-14 A1 AVD | Android 16 AVD：短章节边界、continuity cover、cold handoff 三条 runtime | `OK (3 tests)` / `41.85s`；critical logcat grep 无匹配 | 运行态关键链路通过；非物理设备 |
 | 2026-07-14 A1 final review | owner replacement + completion code review | Critical 0 / Important 0；`git diff --check` clean | P0/P1 收口；仅保留 test-only Bitmap lease API Minor |
+| 2026-07-22 rapid/blur RED -> GREEN | rapid live target mid-frame、synthetic boundary crop ownership、1px spatial-detail preservation | 三项先分别暴露硬切、跨半屏泄漏与 `staticEdges=343 motionEdges=0`；实现后均 GREEN | live target 合成与全分辨率 motion artifact 两条根因闭环 |
+| 2026-07-22 pre-OTA targeted | `EpubFlowViewTest` + `PageCurlDrawableTest` + `PageShotBudgetTest`，`--rerun-tasks` | `248 + 5 + 13 = 266` tests，0 failures / 0 errors / 0 skipped；45/45 tasks；`BUILD SUCCESSFUL in 57s` | rapid lifecycle、正反 PAPER、清晰度、格式预算与 bitmap ownership 定向通过；full regression/R8 留给 Actions |
+| 2026-07-22 pre-OTA review | 独立只读 production/test review + P1 focused re-review | 首轮发现透明 full-size ARGB 的 pinned `3x` ceiling 可绕过设备预算；RED/GREEN 改为仅 active pair 可越限，复核 PASS、0 Critical/Important | 三帧 ARGB OOM 峰值关闭，正常 active pair、continuity 与 boundary owner 流程保持 |
 
 ## Rollback
 

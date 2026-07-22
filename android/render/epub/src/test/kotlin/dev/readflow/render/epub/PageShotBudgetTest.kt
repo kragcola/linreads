@@ -75,6 +75,32 @@ class PageShotBudgetTest {
     }
 
     @Test
+    fun `reservation charges the declared bitmap format bytes before allocation`() {
+        val budget = PageShotBudget(capacityBytes = 32L)
+
+        val reservation = budget.tryReserve(
+            widthPx = 4,
+            heightPx = 4,
+            kind = PageShotLeaseKind.PINNED,
+            bytesPerPixel = 2,
+        )
+
+        assertNotNull(reservation)
+        assertEquals(32L, budget.reservedBytes)
+        assertNull(
+            budget.tryReserve(
+                widthPx = 1,
+                heightPx = 1,
+                kind = PageShotLeaseKind.EVICTABLE,
+                bytesPerPixel = 2,
+            ),
+        )
+
+        reservation!!.cancel()
+        assertEquals(0L, budget.chargedBytes)
+    }
+
+    @Test
     fun `commit replaces estimate with actual allocation bytes until release`() {
         val budget = PageShotBudget(capacityBytes = 96L)
         val identity = Any()
