@@ -1,6 +1,6 @@
 # Active Work
 
-_最后更新：2026-07-23_
+_最后更新：2026-07-24_
 
 Mode: `task-feature`
 Objective: Android Reader 全量体验打磨：继续排版字体、书架、书签搜索、菜单架构与跨格式能力对齐
@@ -16,6 +16,8 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 > ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
 ## 当前状态
+
+- 2026-07-24 **Dev build #276 收口在线书库空态并已发布 OTA**：关闭动作移入标题行并保持 48dp 触摸目标与“关闭在线书库”语义；无书源时不再渲染无效的选择器、搜索、筛选及固定 `280dp` 空列表，改为紧凑说明与“添加第一个书源”主动作，同时保留书源管理菜单中的添加与 JSON 导入；结果非空时才创建 `LazyColumn`，使用 `heightIn(max = 280.dp)`，已有书源但无结果时显示紧凑提示。新增源码视觉契约先 RED 后 GREEN，完整 `LibraryScreenVisualContractTest` 通过，生产 Kotlin 随测试任务重新编译，`git diff --check` 通过；cost-saving Grok 派发会话 `422ada09-15bc-40b8-ace4-f7310b0c7fab` 因服务端连续 `503/524` 无法交付且未写工作树，按用户授权回退 Codex。`readflow_test` API 36 AVD 的 debug 与云端 minified APK 均验证空态完整可见、关闭节点为 `126x126px@420dpi`、点击后窗口节点归零，书源管理仍暴露添加/导入，定向日志无 FATAL/ANR；独立视觉复审无 P0/P1/P2，证据 `/tmp/readflow-goal-audit-276/01-online-library-empty-fixed-1280.png`，边界为未覆盖大字体、深色主题、TalkBack speech 与已有书源无结果的视觉态。提交 `0d15f2ad782e2add71573bcf4b8efe175eb5e30b` 的 Actions run `30048910443`（build job `89346399792`）耗时 `11m24s`，full Android regression、R8 `:app:assembleOta` 与 `dev-latest` 发布全部通过；Dev build `#276` / `app-ota.apk` 为 `10,160,437` bytes，GitHub asset digest 与本地 SHA-256 均为 `dd33aaf73a46bb1d7aad123eef742c8810478864793d8020fb77a56869efd992`，ZIP、包名 `dev.readflow`、v2 签名及证书 `eba4adbe463ceb98377ae9b8e67f6aab4694a16be9df6338f05001f529b86ffd` 校验通过，DEX 内 `BUILD_TAG=dev-276-0d15f2ad782e2add71573bcf4b8efe175eb5e30b`。
 
 - 2026-07-23 **Dev build #275 发布 Android 字体管理、通用在线书源与排版/书架修复，已发布 OTA**：书内字体改为独立全屏管理窗口，按真实 EPUB CSS 字体族展示原文例句、出现次数与实际字体预览；本地字体按 SHA-256 去重，删除采用文件 tombstone + DataStore pending ledger 两阶段事务，正文/全局/本书引用与 pending 标记同一次 edit，所有晚到写入在 repository 与 ReaderViewModel 两层被拒绝。应用启动在任何字体目录访问前统一完成 pending 文件删除并恢复无 ledger 的孤立 tombstone；重复删除不能取得第二个 owner，取消或文件失败保持字体隐藏并留待下次启动。在线书库移除 Calibre-only 占位逻辑，使用 versioned adapter/config 支持 Calibre、OPDS、HTML 规则和第三方 JSON 配置，补齐 URL/host/charset/JSON identity 规范化、严格 UTF-8、禁用源重启用及 Calibre 删除/迁移互斥。书架加载失败恢复为明确错误态；EPUB flow 的 0.8/0.9 行距真实生效。发布前本地 phase-2 聚焦验证已覆盖 app 启动恢复、字体事务、reader、prefs、core-ui、书源、在线书库、设置、书架、数据库排版契约与 EPUB flow，均为 `BUILD SUCCESSFUL`；`git diff --check` 通过。`readflow_test` AVD 已完成纯文本运行时验收：冷启动正常，在线书库可进入，导入真实 `typography-test.epub` 后字体管理窗口可进入并返回，UI hierarchy、活动栈与定向 logcat 未发现 FATAL/ANR。提交 `b82d80c153c36525b1033b163d3a913a9de158c1` 的 Actions run `30022195728`（build job `89257543423`）耗时 `11m35s`，full Android regression、R8 `:app:assembleOta` 与 `dev-latest` 发布全部通过；Dev build `#275` / `app-ota.apk` 为 `10,160,437` bytes，SHA-256 `f765132a663580806d6ece2ac127cdea30ae948df74a67af4a4201eff73652ff`，ZIP 与 v2 签名校验通过，dex 内 `BUILD_TAG=dev-275-b82d80c153c36525b1033b163d3a913a9de158c1`。
 
