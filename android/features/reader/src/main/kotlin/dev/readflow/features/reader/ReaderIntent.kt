@@ -19,6 +19,9 @@ sealed interface ReaderIntent {
     data class PreviewZoom(val scale: Float) : ReaderIntent
     data class SetLineSpacing(val multiplier: Float) : ReaderIntent
     data class SetFontChoice(val choice: FontChoice) : ReaderIntent
+    /** Book-scoped CSS family -> reader font for the currently open book. */
+    data class SetEpubBookFontReplacement(val family: String, val choice: FontChoice) : ReaderIntent
+    data class ClearEpubBookFontReplacement(val family: String) : ReaderIntent
     data class SetMode(val mode: ReadingMode) : ReaderIntent
     data class SetPageFlipStyle(val style: dev.readflow.core.model.PageFlipStyle) : ReaderIntent
     data class SetTheme(val theme: ThemeMode) : ReaderIntent

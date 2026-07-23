@@ -6,10 +6,11 @@ import org.jsoup.nodes.Node
 import org.jsoup.nodes.TextNode
 import org.jsoup.parser.Parser
 
-/** Spine HTML parse result: display items plus book-scoped @font-face map from linked CSS. */
+/** Spine HTML parse result: display items plus CSS font families used by this spine. */
 internal data class EpubParsedHtmlContent(
     val items: List<EpubReaderItem>,
     val bookFontMap: EpubBookFontMap = EpubBookFontMap.EMPTY,
+    val referencedFontFamilies: Set<String> = emptySet(),
 )
 
 internal fun parseReaderItemsFromHtml(
@@ -60,7 +61,27 @@ internal fun parseReaderItemsContent(
             css = css,
         )
     }
-    EpubParsedHtmlContent(items = items, bookFontMap = css.bookFontMap)
+    EpubParsedHtmlContent(
+        items = items,
+        bookFontMap = css.bookFontMap,
+        referencedFontFamilies = referencedFontFamilies(items),
+    )
+}
+
+private fun referencedFontFamilies(items: List<EpubReaderItem>): Set<String> = buildSet {
+    items.forEach { item ->
+        val spans = when (item) {
+            is EpubReaderItem.Text -> item.styleSpans
+            is EpubReaderItem.Heading -> item.styleSpans
+            else -> emptyList()
+        }
+        spans.asSequence()
+            .filter { it.style == EpubTextStyle.FontFamily }
+            .flatMap { splitCssFontFamilyList(it.fontFamily.orEmpty()).asSequence() }
+            .mapNotNull(::normalizeFontFamilyKey)
+            .filter { it !in GENERIC_FONT_FAMILIES }
+            .forEach { add(it) }
+    }
 }
 
 private data class TextWithLinks(

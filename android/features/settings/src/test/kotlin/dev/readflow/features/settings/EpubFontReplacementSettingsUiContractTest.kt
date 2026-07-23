@@ -4,60 +4,50 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Source/UI contract for the compact Settings EPUB font-replacement surface:
- * section chrome, add/remove entry points, and Android 48dp minimum interactive sizing.
+ * Source/UI contract for the reader-first font workflow. Settings may explain or clear legacy
+ * rules, but must never ask a reader to type an EPUB/CSS family name.
  */
 class EpubFontReplacementSettingsUiContractTest {
 
     @Test
-    fun `settings screen exposes compact epub font replacement controls`() {
+    fun `settings points readers to the in-book font menu without technical input`() {
         val screen = settingsScreenSource()
         assertTrue(
-            "Reading category must expose the EPUB 字体替换 section",
-            screen.contains("EPUB 字体替换") &&
+            "Reading category must point to the in-book font menu",
+            screen.contains("书籍字体") &&
                 screen.contains("epubFontReplacements") &&
-                screen.contains("添加替换") &&
-                screen.contains("setEpubFontReplacement") &&
-                screen.contains("removeEpubFontReplacement"),
+                screen.contains("在阅读菜单中设置") &&
+                screen.contains("字体与排版") &&
+                screen.contains("clearEpubFontReplacements"),
         )
         assertTrue(
-            "Delete control must expose a TalkBack label for the mapped family",
-            screen.contains("Icons.Outlined.Delete") &&
-                screen.contains("contentDescription") &&
-                screen.contains("字体替换") &&
-                screen.contains("\$family"),
+            "Settings must not expose the retired manual family-name form",
+            !screen.contains("书中 CSS 字体名") &&
+                !screen.contains("showFontReplacementDialog") &&
+                !screen.contains("fontReplacementFamily"),
+        )
+        val importBlock = screen
+            .substringAfter("val fontImportLauncher")
+            .substringBefore("// Poll DownloadManager progress")
+        assertTrue(
+            "Settings font import must share the validated background importer",
+            importBlock.contains("withContext(Dispatchers.IO)") &&
+                importBlock.contains("FontProvider.importFont") &&
+                !importBlock.contains("vm.importFont"),
         )
     }
 
     @Test
-    fun `add and remove controls keep android 48dp minimum interactive size`() {
+    fun `legacy reset control keeps android 48dp minimum interactive size`() {
         val screen = settingsScreenSource()
         val replacementBlock = screen
-            .substringAfter("EPUB 字体替换")
+            .substringAfter("书籍字体")
             .substringBefore("TXT 编码")
 
-        // Compact list rows + icon delete + outline add must all meet 48dp.
         assertTrue(
-            "Replacement rows must declare min 48dp height",
-            replacementBlock.contains("heightIn(min = 48.dp)"),
-        )
-        assertTrue(
-            "Remove IconButton must be explicitly 48dp",
-            replacementBlock.contains("removeEpubFontReplacement") &&
-                replacementBlock.contains("IconButton") &&
-                replacementBlock.contains("size(48.dp)"),
-        )
-        assertTrue(
-            "Add-replacement button must keep 48dp min height",
-            replacementBlock.contains("添加替换") &&
-                replacementBlock.contains("heightIn(min = 48.dp)"),
-        )
-        // Dialog save/cancel/chips also stay tappable.
-        assertTrue(
-            "Dialog interactive targets must declare 48dp min height",
-            replacementBlock.contains("保存") &&
-                replacementBlock.contains("取消") &&
-                replacementBlock.contains("FilterChip") &&
+            "Legacy reset button must remain accessible and explicit",
+            replacementBlock.contains("清除旧版字体规则") &&
+                replacementBlock.contains("clearEpubFontReplacements") &&
                 replacementBlock.contains("heightIn(min = 48.dp)"),
         )
     }
@@ -69,6 +59,7 @@ class EpubFontReplacementSettingsUiContractTest {
             "ViewModel must expose add/remove writers backed by repository persistence",
             vm.contains("fun setEpubFontReplacement") &&
                 vm.contains("fun removeEpubFontReplacement") &&
+                vm.contains("fun clearEpubFontReplacements") &&
                 vm.contains("settings.setEpubFontReplacements") &&
                 vm.contains("epubFontReplacements"),
         )

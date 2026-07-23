@@ -9,6 +9,9 @@ android {
 
 dependencies {
     implementation(project(":core:model"))
+    implementation(project(":core:database"))
+    implementation(project(":core:prefs"))
+    implementation(project(":extensions:api"))
     implementation(libs.bundles.ktor)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.coroutines.core)
@@ -16,4 +19,6 @@ dependencies {
     testImplementation(libs.junit4)
     testImplementation(libs.ktor.client.mock)
     testImplementation(libs.coroutines.test)
+    // Real XmlPullParser for JVM unit tests (Android framework API is stubbed otherwise).
+    testImplementation(libs.kxml2)
 }

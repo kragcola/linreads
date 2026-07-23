@@ -75,6 +75,11 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
             resolvedEpubFontReplacements(preferences[KEY_EPUB_FONT_REPLACEMENTS])
         }
 
+    override val epubBookFontReplacements: Flow<Map<String, Map<String, String>>> =
+        context.dataStore.data.map { preferences ->
+            resolvedEpubBookFontReplacements(preferences[KEY_EPUB_BOOK_FONT_REPLACEMENTS])
+        }
+
     override val readerGuideShown: Flow<Boolean> =
         context.dataStore.data.map { it[KEY_READER_GUIDE_SHOWN] ?: false }
 
@@ -150,6 +155,20 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         }
     }
 
+    override suspend fun setEpubBookFontReplacements(bookId: String, replacements: Map<String, String>) {
+        val normalizedBookId = canonicalBookIdentity(bookId) ?: return
+        context.dataStore.edit { preferences ->
+            val current = resolvedEpubBookFontReplacements(preferences[KEY_EPUB_BOOK_FONT_REPLACEMENTS])
+            val nextInner = canonicalEpubFontReplacements(replacements)
+            val nextOuter = if (nextInner.isEmpty()) {
+                current - normalizedBookId
+            } else {
+                current + (normalizedBookId to nextInner)
+            }
+            preferences[KEY_EPUB_BOOK_FONT_REPLACEMENTS] = encodeEpubBookFontReplacements(nextOuter)
+        }
+    }
+
     override suspend fun setReaderGuideShown(shown: Boolean) {
         context.dataStore.edit { it[KEY_READER_GUIDE_SHOWN] = shown }
     }
@@ -193,6 +212,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_TXT_ENCODING = stringPreferencesKey("txt_encoding")
         val KEY_FONT_CHOICE = stringPreferencesKey("font_choice")
         val KEY_EPUB_FONT_REPLACEMENTS = stringPreferencesKey("epub_font_replacements")
+        val KEY_EPUB_BOOK_FONT_REPLACEMENTS = stringPreferencesKey("epub_book_font_replacements")
         val KEY_READER_GUIDE_SHOWN = booleanPreferencesKey("reader_guide_shown")
         val KEY_PAGE_FLIP_STYLE = stringPreferencesKey("page_flip_style")
         val KEY_TYPOGRAPHY_BASELINE_VERSION = intPreferencesKey("typography_baseline_version")
@@ -217,18 +237,66 @@ internal fun resolvedEpubFontReplacements(stored: String?): Map<String, String> 
     return canonicalEpubFontReplacements(decoded)
 }
 
-private fun canonicalEpubFontReplacements(replacements: Map<String, String>): Map<String, String> =
+internal fun encodeEpubBookFontReplacements(byBook: Map<String, Map<String, String>>): String =
+    Json.encodeToString(canonicalEpubBookFontReplacements(byBook))
+
+internal fun resolvedEpubBookFontReplacements(stored: String?): Map<String, Map<String, String>> {
+    if (stored.isNullOrBlank()) return emptyMap()
+    val decoded = runCatching {
+        Json.decodeFromString<Map<String, Map<String, String>>>(stored)
+    }.getOrNull() ?: return emptyMap()
+    return canonicalEpubBookFontReplacements(decoded)
+}
+
+/**
+ * Effective EPUB family replacements for one open book.
+ * Priority: book-scoped map > global map (same family key; book wins).
+ */
+fun mergedEpubFontReplacements(
+    global: Map<String, String>,
+    bookScoped: Map<String, String>,
+): Map<String, String> {
+    val globalCanonical = canonicalEpubFontReplacements(global)
+    val bookCanonical = canonicalEpubFontReplacements(bookScoped)
+    if (bookCanonical.isEmpty()) return globalCanonical
+    if (globalCanonical.isEmpty()) return bookCanonical
+    return (globalCanonical + bookCanonical).toSortedMap()
+}
+
+internal fun canonicalEpubFontReplacements(replacements: Map<String, String>): Map<String, String> =
     buildMap {
         replacements.forEach { (rawFamily, rawFontId) ->
-            val family = rawFamily.trim().trim('"', '\'')
-                .replace(Regex("\\s+"), " ")
-                .lowercase()
-                .takeIf { it.isNotEmpty() && it.length <= 96 && it.none(Char::isISOControl) }
-                ?: return@forEach
+            val family = canonicalEpubFontFamilyKey(rawFamily) ?: return@forEach
             val fontId = canonicalReplacementFontId(rawFontId) ?: return@forEach
             put(family, fontId)
         }
     }.toSortedMap()
+
+internal fun canonicalEpubBookFontReplacements(
+    byBook: Map<String, Map<String, String>>,
+): Map<String, Map<String, String>> =
+    buildMap {
+        byBook.forEach { (rawBookId, inner) ->
+            val bookId = canonicalBookIdentity(rawBookId) ?: return@forEach
+            val canonicalInner = canonicalEpubFontReplacements(inner)
+            if (canonicalInner.isNotEmpty()) put(bookId, canonicalInner)
+        }
+    }.toSortedMap(compareBy { it })
+
+/** Stable book identity for per-book prefs: trimmed non-blank, length-capped, no control chars. */
+fun canonicalBookIdentity(raw: String?): String? {
+    val value = raw?.trim().orEmpty()
+    if (value.isEmpty() || value.length > 256 || value.any(Char::isISOControl)) return null
+    return value
+}
+
+/** Same family key rules as global replacements (quotes, case, whitespace). */
+fun canonicalEpubFontFamilyKey(raw: String?): String? {
+    val family = raw.orEmpty().trim().trim('"', '\'')
+        .replace(Regex("\\s+"), " ")
+        .lowercase()
+    return family.takeIf { it.isNotEmpty() && it.length <= 96 && it.none(Char::isISOControl) }
+}
 
 private fun canonicalReplacementFontId(raw: String): String? {
     val value = raw.trim()

@@ -53,6 +53,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -67,8 +68,10 @@ import dev.readflow.core.model.FontChoice
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.ui.AccessibleSlider
 import dev.readflow.core.ui.FontProvider
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.koin.androidx.compose.koinViewModel
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -168,17 +171,24 @@ fun SettingsScreen(
             vm.importTheme(input)
         }
     }
+    var fontImportError by remember { mutableStateOf<String?>(null) }
     val fontImportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
-        val cr = context.contentResolver
-        val rawName = cr.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
-            ?: uri.lastPathSegment
-        val safeName = rawName?.let { FontProvider.sanitizeFontFileName(it) }
-            ?: return@rememberLauncherForActivityResult  // 非法/非 ttf,otf 文件名，忽略
-        val dest = java.io.File(FontProvider.customFontsDir(context.applicationContext), safeName)
-        val input = cr.openInputStream(uri) ?: return@rememberLauncherForActivityResult
-        vm.importFont(input, dest, FontChoice.Custom(safeName))
+        scope.launch {
+            val result = withContext(Dispatchers.IO) {
+                FontProvider.importFont(context.applicationContext, uri)
+            }
+            result.onSuccess { choice ->
+                fontImportError = null
+                vm.setFontChoice(choice)
+            }.onFailure { error ->
+                fontImportError = when (error) {
+                    is IllegalArgumentException ->
+                        error.message ?: "请选择可用的 TTF 或 OTF 字体文件"
+                    else -> "字体导入失败，请重新选择字体文件"
+                }
+            }
+        }
     }
 
 
@@ -334,13 +344,23 @@ fun SettingsScreen(
                     .fillMaxWidth()
                     .heightIn(min = 48.dp),
             )
+            val previewFontFamily by produceState<FontFamily>(
+                initialValue = FontFamily.Serif,
+                key1 = fontChoice,
+                key2 = context.applicationContext,
+            ) {
+                value = withContext(Dispatchers.IO) {
+                    FontProvider.fontFamilyFor(
+                        context.applicationContext,
+                        fontChoice.serialize(),
+                    )
+                }
+            }
             Text(
                 text = "这是 ${fontSize}sp 的正文效果。The quick brown fox.",
                 fontSize = fontSize.sp,
                 lineHeight = (fontSize * ReaderTypography.clampLineSpacing(lineSpacing)).sp,
-                fontFamily = remember(fontChoice) {
-                    FontProvider.fontFamilyFor(context.applicationContext, fontChoice.serialize())
-                },
+                fontFamily = previewFontFamily,
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -465,12 +485,14 @@ fun SettingsScreen(
             var customFonts by remember { mutableStateOf(emptyList<String>()) }
             // key 于 fontChoice：导入成功会更新 fontChoice，从而刷新列表显示新字体
             LaunchedEffect(fontChoice) {
-                customFonts = FontProvider.listCustomFonts(context.applicationContext)
+                customFonts = withContext(Dispatchers.IO) {
+                    FontProvider.listCustomFonts(context.applicationContext)
+                }
             }
             SettingItemHeader(
                 icon = Icons.Outlined.FontDownload,
                 title = "正文字体",
-                currentValue = FontProvider.label(fontChoice),
+                currentValue = FontProvider.displayName(fontChoice),
             )
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 FlowRow(
@@ -486,7 +508,7 @@ fun SettingsScreen(
                             onClick = { vm.setFontChoice(choice) },
                             label = {
                                 Text(
-                                    text = FontProvider.label(choice),
+                                    text = FontProvider.displayName(choice),
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                 )
@@ -499,6 +521,7 @@ fun SettingsScreen(
                 }
                 OutlinedButton(
                     onClick = {
+                        fontImportError = null
                         fontImportLauncher.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream"))
                     },
                     modifier = Modifier.heightIn(min = 48.dp),
@@ -507,116 +530,44 @@ fun SettingsScreen(
                     Spacer(Modifier.width(8.dp))
                     Text("导入字体")
                 }
+                fontImportError?.let { message ->
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
 
-            var showFontReplacementDialog by rememberSaveable { mutableStateOf(false) }
-            var fontReplacementFamily by rememberSaveable { mutableStateOf("") }
-            var fontReplacementTarget by rememberSaveable { mutableStateOf(FontChoice.System.serialize()) }
             SettingItemHeader(
                 icon = Icons.Outlined.FontDownload,
-                title = "EPUB 字体替换",
-                currentValue = "${epubFontReplacements.size} 条",
+                title = "书籍字体",
+                currentValue = "在阅读菜单中设置",
             )
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                epubFontReplacements.forEach { (family, targetId) ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = family,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onBackground,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = FontProvider.label(FontChoice.parse(targetId)),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        IconButton(
-                            onClick = { vm.removeEpubFontReplacement(family) },
-                            modifier = Modifier.size(48.dp),
-                        ) {
-                            Icon(Icons.Outlined.Delete, contentDescription = "删除 $family 字体替换")
-                        }
-                    }
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "打开书籍后，在底部菜单的“字体与排版”中选择和导入字体。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (epubFontReplacements.isNotEmpty()) {
+                    Text(
+                        text = "检测到 ${epubFontReplacements.size} 条旧版字体规则，它们仍会生效。清除后可按每本书重新选择。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
                 OutlinedButton(
-                    onClick = {
-                        fontReplacementFamily = ""
-                        fontReplacementTarget = fontChoice.serialize()
-                        showFontReplacementDialog = true
-                    },
-                    modifier = Modifier.heightIn(min = 48.dp),
+                    onClick = vm::clearEpubFontReplacements,
+                    enabled = epubFontReplacements.isNotEmpty(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp),
                 ) {
-                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Icon(Icons.Outlined.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("添加替换")
+                    Text("清除旧版字体规则")
                 }
-            }
-
-            if (showFontReplacementDialog) {
-                AlertDialog(
-                    onDismissRequest = { showFontReplacementDialog = false },
-                    title = { Text("EPUB 字体替换") },
-                    text = {
-                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            OutlinedTextField(
-                                value = fontReplacementFamily,
-                                onValueChange = { fontReplacementFamily = it },
-                                label = { Text("书中 CSS 字体名") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                FontProvider.availableChoices(customFonts).forEach { choice ->
-                                    FilterChip(
-                                        selected = fontReplacementTarget == choice.serialize(),
-                                        onClick = { fontReplacementTarget = choice.serialize() },
-                                        label = {
-                                            Text(
-                                                FontProvider.label(choice),
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                            )
-                                        },
-                                        modifier = Modifier.heightIn(min = 48.dp),
-                                    )
-                                }
-                            }
-                        }
-                    },
-                    confirmButton = {
-                        TextButton(
-                            onClick = {
-                                vm.setEpubFontReplacement(
-                                    fontReplacementFamily,
-                                    FontChoice.parse(fontReplacementTarget),
-                                )
-                                showFontReplacementDialog = false
-                            },
-                            enabled = normalizedEpubFontFamily(fontReplacementFamily) != null,
-                            modifier = Modifier.heightIn(min = 48.dp),
-                        ) { Text("保存") }
-                    },
-                    dismissButton = {
-                        TextButton(
-                            onClick = { showFontReplacementDialog = false },
-                            modifier = Modifier.heightIn(min = 48.dp),
-                        ) { Text("取消") }
-                    },
-                )
             }
 
             SettingItemHeader(

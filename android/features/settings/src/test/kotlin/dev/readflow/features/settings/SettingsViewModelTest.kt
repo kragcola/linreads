@@ -484,6 +484,24 @@ class SettingsViewModelTest {
     }
 
     @Test
+    fun clearLegacyEpubFontReplacementsRemovesAllRules() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository().apply {
+            epubFontReplacements.value = mapOf(
+                "serif" to FontChoice.System.serialize(),
+                "sans" to FontChoice.SystemSans.serialize(),
+            )
+        }
+        val viewModel = createViewModel(settings)
+
+        viewModel.clearEpubFontReplacements()
+        advanceUntilIdle()
+
+        assertTrue(settings.epubFontReplacements.value.isEmpty())
+        assertEquals(1, settings.setEpubFontReplacementsCalls)
+    }
+
+    @Test
     fun moveReaderMenuCommandUpPersistsOrderWhileKeepingVisibility() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val settings = FakeSettingsRepository().apply {

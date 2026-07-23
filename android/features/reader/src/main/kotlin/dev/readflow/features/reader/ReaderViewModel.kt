@@ -25,8 +25,12 @@ import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.ReaderMenuConfig
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.prefs.SettingsRepository
+import dev.readflow.core.prefs.canonicalBookIdentity
+import dev.readflow.core.prefs.canonicalEpubFontFamilyKey
+import dev.readflow.core.prefs.mergedEpubFontReplacements
 import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.EngineStateStore
+import dev.readflow.render.api.EpubCssFontFamilyInfo
 import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PageTransitionHostFactory
 import dev.readflow.render.api.ReaderSearchHit
@@ -100,6 +104,10 @@ data class ReaderUiState(
     val showGuide: Boolean = false,
     /** Resolved bottom-menu order/visibility from [SettingsRepository]; defaults match legacy row. */
     val menuConfig: ReaderMenuConfig = ReaderMenuConfig.v1Defaults(),
+    /** CSS family catalog for the open EPUB (empty for non-EPUB). */
+    val epubCssFontCatalog: List<EpubCssFontFamilyInfo> = emptyList(),
+    /** Book-scoped CSS family -> fontId for the open book (canonical keys). */
+    val epubBookFontReplacements: Map<String, String> = emptyMap(),
 )
 
 class ReaderViewModel(
@@ -173,6 +181,8 @@ class ReaderViewModel(
     private var settingsFontJob: Job? = null
     private var settingsLineSpacingJob: Job? = null
     private var settingsEpubFontReplacementJob: Job? = null
+    /** Serializes book-scoped font map mutations for the open book. */
+    private val epubBookFontMutex = Mutex()
     private var openJob: Job? = null
     private var activeEngine: ReaderEngine? = _uiState.value.engine
     /**
@@ -211,6 +221,8 @@ class ReaderViewModel(
         is ReaderIntent.PreviewZoom -> previewZoom(intent.scale)
         is ReaderIntent.SetLineSpacing -> setLineSpacing(intent.multiplier)
         is ReaderIntent.SetFontChoice -> setFontChoice(intent.choice)
+        is ReaderIntent.SetEpubBookFontReplacement -> setEpubBookFontReplacement(intent.family, intent.choice)
+        is ReaderIntent.ClearEpubBookFontReplacement -> clearEpubBookFontReplacement(intent.family)
         is ReaderIntent.SetMode -> setMode(intent.mode)
         is ReaderIntent.SetPageFlipStyle -> setPageFlipStyle(intent.style)
         is ReaderIntent.SetTheme -> setTheme(intent.theme)
@@ -261,7 +273,10 @@ class ReaderViewModel(
         val theme: ThemeMode,
         val useSourceHanFont: Boolean,
         val fontChoice: FontChoice,
+        /** Merged global + book-scoped replacements already applied (book wins). */
         val epubFontReplacements: Map<String, String>,
+        val epubBookFontReplacements: Map<String, String>,
+        val epubGlobalFontReplacements: Map<String, String>,
         val flipStyle: PageFlipStyle,
         val txtEncodingCharsetName: String?,
         val readingMode: ReadingMode?,
@@ -459,13 +474,23 @@ class ReaderViewModel(
         val requestedMode = (restoredForBook?.readingMode ?: settings.readingMode.first())
             .toReadingMode()
             ?.takeIf { it in engine.supportedModes }
+        val globalEpub = settings.epubFontReplacements.first()
+        val bookId = currentBookId
+        val bookKey = canonicalBookIdentity(bookId)
+        val bookScoped = if (bookKey != null) {
+            settings.epubBookFontReplacements.first()[bookKey].orEmpty()
+        } else {
+            emptyMap()
+        }
         return ReaderOpenSettings(
             fontSize = restoredForBook?.fontSize?.toFloat() ?: settings.fontSize.first().toFloat(),
             lineSpacing = clampedReaderLineSpacing(restoredForBook?.lineSpacing ?: settings.lineSpacing.first()),
             theme = restoredForBook?.theme ?: settings.themeMode.first(),
             useSourceHanFont = settings.useSourceHanFont.first(),
             fontChoice = FontChoice.parse(settings.fontChoice.first().serialize()),
-            epubFontReplacements = settings.epubFontReplacements.first(),
+            epubFontReplacements = mergedEpubFontReplacements(globalEpub, bookScoped),
+            epubBookFontReplacements = bookScoped,
+            epubGlobalFontReplacements = globalEpub,
             flipStyle = settings.pageFlipStyle.first(),
             txtEncodingCharsetName = settings.txtEncoding.first().charsetName,
             readingMode = requestedMode,
@@ -494,6 +519,16 @@ class ReaderViewModel(
             } catch (_: Throwable) {
                 Unit
             }
+        }
+        val catalog = engine.epubCssFontCatalog(
+            bookReplacements = openSettings.epubBookFontReplacements,
+            globalReplacements = openSettings.epubGlobalFontReplacements,
+        )
+        _uiState.update {
+            it.copy(
+                epubCssFontCatalog = catalog,
+                epubBookFontReplacements = openSettings.epubBookFontReplacements,
+            )
         }
     }
 
@@ -739,13 +774,40 @@ class ReaderViewModel(
         settingsEpubFontReplacementJob?.cancel()
         settingsEpubFontReplacementJob = viewModelScope.launch {
             var firstEmission = true
-            settings.epubFontReplacements.collect { replacements ->
+            combine(
+                settings.epubFontReplacements,
+                settings.epubBookFontReplacements,
+            ) { global, byBook ->
+                val bookKey = canonicalBookIdentity(currentBookId)
+                val bookScoped = if (bookKey != null) byBook[bookKey].orEmpty() else emptyMap()
+                Triple(global, bookScoped, mergedEpubFontReplacements(global, bookScoped))
+            }.collect { (global, bookScoped, merged) ->
                 if (firstEmission) {
                     firstEmission = false
+                    // Still refresh catalog/status for the open book after first open apply.
+                    refreshEpubFontUi(engine, bookScoped, global)
                     return@collect
                 }
-                engine.setEpubFontReplacements(replacements)
+                engine.setEpubFontReplacements(merged)
+                refreshEpubFontUi(engine, bookScoped, global)
             }
+        }
+    }
+
+    private fun refreshEpubFontUi(
+        engine: ReaderEngine,
+        bookScoped: Map<String, String>,
+        global: Map<String, String>,
+    ) {
+        val catalog = engine.epubCssFontCatalog(
+            bookReplacements = bookScoped,
+            globalReplacements = global,
+        )
+        _uiState.update {
+            it.copy(
+                epubCssFontCatalog = catalog,
+                epubBookFontReplacements = bookScoped,
+            )
         }
     }
 
@@ -1164,6 +1226,31 @@ class ReaderViewModel(
         viewModelScope.launch {
             engine?.setFont(canonical.serialize())
             settings.setFontChoice(canonical)
+        }
+    }
+
+    private fun setEpubBookFontReplacement(family: String, choice: FontChoice) {
+        val familyKey = canonicalEpubFontFamilyKey(family) ?: return
+        val bookKey = canonicalBookIdentity(currentBookId) ?: return
+        val fontId = choice.serialize()
+        viewModelScope.launch {
+            epubBookFontMutex.withLock {
+                val current = settings.epubBookFontReplacements.first()[bookKey].orEmpty()
+                val next = current + (familyKey to fontId)
+                settings.setEpubBookFontReplacements(bookKey, next)
+            }
+        }
+    }
+
+    private fun clearEpubBookFontReplacement(family: String) {
+        val familyKey = canonicalEpubFontFamilyKey(family) ?: return
+        val bookKey = canonicalBookIdentity(currentBookId) ?: return
+        viewModelScope.launch {
+            epubBookFontMutex.withLock {
+                val current = settings.epubBookFontReplacements.first()[bookKey].orEmpty()
+                if (familyKey !in current) return@withLock
+                settings.setEpubBookFontReplacements(bookKey, current - familyKey)
+            }
         }
     }
 

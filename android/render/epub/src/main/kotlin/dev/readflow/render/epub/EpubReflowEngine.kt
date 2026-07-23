@@ -69,6 +69,8 @@ import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.TocEntry
+import dev.readflow.render.api.EpubCssFontFamilyInfo
+import dev.readflow.render.api.EpubCssFontMappingStatus as ApiEpubCssFontMappingStatus
 import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.PagingKind
@@ -3209,9 +3211,11 @@ class EpubReflowEngine private constructor(
             key to fontId
         }.toMap()
         val loaded = withContext(Dispatchers.IO) {
-            canonicalIds.values.distinct().associateWith { fontId ->
-                dev.readflow.core.ui.FontProvider.typefaceFor(context, fontId)
-            }
+            canonicalIds.values.distinct().mapNotNull { fontId ->
+                // A missing imported font must fall through to an embedded face/default.
+                dev.readflow.core.ui.FontProvider.typefaceForOrNull(context, fontId)
+                    ?.let { fontId to it }
+            }.toMap()
         }
         withContext(Dispatchers.Main) {
             if (
@@ -3221,6 +3225,34 @@ class EpubReflowEngine private constructor(
             epubFontReplacementIds = canonicalIds
             epubFontReplacementTypefaces = loaded
             if (flowEngineEnabled && flowView != null) rebuildFlowChapter()
+        }
+    }
+
+    /**
+     * In-memory CSS family catalog for the open book. Does not touch disk or the flip path.
+     * Status layers: book replacements > global replacements > embedded faces > unresolved.
+     */
+    override fun epubCssFontCatalog(
+        bookReplacements: Map<String, String>,
+        globalReplacements: Map<String, String>,
+    ): List<EpubCssFontFamilyInfo> {
+        val book = lazyBook ?: return emptyList()
+        return book.cssFontCatalog(
+            bookReplacements = bookReplacements,
+            globalReplacements = globalReplacements,
+        ).map { entry ->
+            EpubCssFontFamilyInfo(
+                family = entry.family,
+                displayName = entry.displayName,
+                status = when (entry.status) {
+                    EpubCssFontMappingStatus.BOOK_MAPPED -> ApiEpubCssFontMappingStatus.BOOK_MAPPED
+                    EpubCssFontMappingStatus.GLOBAL_MAPPED -> ApiEpubCssFontMappingStatus.GLOBAL_MAPPED
+                    EpubCssFontMappingStatus.EMBEDDED -> ApiEpubCssFontMappingStatus.EMBEDDED
+                    EpubCssFontMappingStatus.UNRESOLVED -> ApiEpubCssFontMappingStatus.UNRESOLVED
+                },
+                mappedFontId = entry.mappedFontId,
+                embeddedSrcPath = entry.embeddedSrcPath,
+            )
         }
     }
 

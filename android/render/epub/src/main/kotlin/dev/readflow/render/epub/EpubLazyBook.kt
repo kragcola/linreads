@@ -27,6 +27,7 @@ internal class EpubLazyBook(
     private val paragraphBlockIndexes: List<Int>,
     private val layoutBlocks: List<EpubDisplayBlock>,
     private val bookFontMapsBySpine: Map<Int, EpubBookFontMap>,
+    private val referencedFontFamiliesBySpine: Map<Int, Set<String>>,
     maxCachedSpines: Int,
 ) {
     private val cacheLimit = maxCachedSpines.coerceAtLeast(1)
@@ -106,6 +107,26 @@ internal class EpubLazyBook(
     fun bookFontMapForSpine(spineIndex: Int): EpubBookFontMap =
         bookFontMapsBySpine[spineIndex] ?: EpubBookFontMap.EMPTY
 
+    /** Union of all spine `@font-face` maps (first face per family wins). Pure memory. */
+    fun mergedBookFontMap(): EpubBookFontMap = mergeEpubBookFontMaps(bookFontMapsBySpine.values)
+
+    /**
+     * CSS family catalog for UI: embedded faces + optional mapping layers.
+     * Must not perform disk IO; safe to call off the page-turn critical path.
+     */
+    fun cssFontCatalog(
+        bookReplacements: Map<String, String> = emptyMap(),
+        globalReplacements: Map<String, String> = emptyMap(),
+    ): List<EpubCssFontFamilyEntry> {
+        val merged = mergedBookFontMap()
+        return buildEpubCssFontCatalog(
+            embeddedFaces = merged.facesByFamily,
+            bookReplacements = bookReplacements,
+            globalReplacements = globalReplacements,
+            referencedFamilies = referencedFontFamiliesBySpine.values.flatten(),
+        )
+    }
+
     private fun loadSpine(ref: EpubSpineRef): EpubSpineContent {
         cache[ref.spineIndex]?.let { return it }
         loadCounts[ref.spineIndex] = loadCount(ref.spineIndex) + 1
@@ -171,6 +192,7 @@ internal class EpubLazyBook(
                 paragraphBlockIndexes = emptyList(),
                 layoutBlocks = emptyList(),
                 bookFontMapsBySpine = emptyMap(),
+                referencedFontFamiliesBySpine = emptyMap(),
                 maxCachedSpines = maxCachedSpines,
             )
     }

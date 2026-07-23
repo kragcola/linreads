@@ -6,6 +6,7 @@ import androidx.room.withTransaction
 import dev.readflow.core.calibre.CalibreClient
 import dev.readflow.core.calibre.CalibreRepository
 import dev.readflow.core.calibre.CalibreRepositoryImpl
+import dev.readflow.core.calibre.DefaultSourceRegistry
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.database.LibraryStore
 import dev.readflow.core.database.CompleteBookDeletionStore
@@ -13,7 +14,10 @@ import dev.readflow.core.database.CoroutineBookAssetOperationCoordinator
 import dev.readflow.core.database.FileManagedBookAssetDeletionStore
 import dev.readflow.core.database.LibraryDeletionTransactionRunner
 import dev.readflow.core.database.ReadflowDatabase
+import dev.readflow.core.database.RoomSourceConfigStore
+import dev.readflow.core.database.SourceConfigStore
 import dev.readflow.core.database.MIGRATION_4_5
+import dev.readflow.core.database.MIGRATION_5_6
 import dev.readflow.core.prefs.DataStoreSettingsRepository
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.model.BookAssetOperationCoordinator
@@ -24,6 +28,7 @@ import dev.readflow.extensions.api.FirstLaunchSeeder
 import dev.readflow.extensions.api.LocalBookImporter
 import dev.readflow.extensions.api.LocalFileBookSource
 import dev.readflow.extensions.api.ReaderEventBus
+import dev.readflow.extensions.api.SourceRegistry
 import dev.readflow.features.library.LibraryViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,7 +58,7 @@ val databaseModule = module {
             ReadflowDatabase::class.java,
             "readflow.db",
         )
-            .addMigrations(MIGRATION_4_5)
+            .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
             .build()
     }
     single { get<ReadflowDatabase>().bookDao() }
@@ -63,6 +68,8 @@ val databaseModule = module {
     single { get<ReadflowDatabase>().inkStrokeDao() }
     single { get<ReadflowDatabase>().bookmarkDao() }
     single { get<ReadflowDatabase>().readingSessionDao() }
+    single { get<ReadflowDatabase>().bookSourceDao() }
+    single<SourceConfigStore> { RoomSourceConfigStore(get()) }
     single {
         val database = get<ReadflowDatabase>()
         CompleteBookDeletionStore(
@@ -94,10 +101,17 @@ val settingsModule = module {
             )
         }
     }
+    single<SourceRegistry> {
+        DefaultSourceRegistry(
+            settings = get(),
+            sourceConfigStore = get(),
+            booksDir = File(androidContext().filesDir, "books"),
+        )
+    }
 }
 
 val featureModule = module {
-    viewModel { LibraryViewModel(get(), get(), get(), get(), get()) }
+    viewModel { LibraryViewModel(get(), get(), get(), get(), get(), get()) }
 }
 
 val appModules = listOf(coreModule, databaseModule, extensionsModule, settingsModule, featureModule)

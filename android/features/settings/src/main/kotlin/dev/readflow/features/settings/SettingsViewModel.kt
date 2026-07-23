@@ -20,12 +20,8 @@ import dev.readflow.core.model.ReaderMenuConfig
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.sync.SyncBackend
-import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
-import java.nio.file.AtomicMoveNotSupportedException
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -352,6 +348,17 @@ class SettingsViewModel(
         }
     }
 
+    /** Removes legacy global rules after the reader menu has become the user-facing entry point. */
+    fun clearEpubFontReplacements() {
+        viewModelScope.launch {
+            epubFontReplacementMutex.withLock {
+                if (settings.epubFontReplacements.first().isNotEmpty()) {
+                    settings.setEpubFontReplacements(emptyMap())
+                }
+            }
+        }
+    }
+
     /**
      * Toggle one reader bottom-bar command visibility and persist a resolved catalog.
      * Order is preserved; unknown IDs cannot be introduced from this surface.
@@ -413,41 +420,6 @@ class SettingsViewModel(
         }
     }
 
-    /**
-     * 导入自定义字体：把 [input] 拷贝到 [dest]（已由调用方清洗为 fonts 目录内的安全文件名），
-     * 成功后选用该字体。IO 在 [backupDispatcher] 上跑，避免阻塞主线程。
-     */
-    fun importFont(input: InputStream, dest: File, choice: FontChoice.Custom) {
-        viewModelScope.launch {
-            var staging: File? = null
-            try {
-                runCatching {
-                    withContext(backupDispatcher) {
-                        dest.parentFile?.mkdirs()
-                        val temp = File.createTempFile("font-", ".part", dest.parentFile).also { staging = it }
-                        input.use { ins -> temp.outputStream().use { ins.copyTo(it) } }
-                        require(temp.length() > 0L) { "字体文件为空" }
-                        try {
-                            Files.move(
-                                temp.toPath(),
-                                dest.toPath(),
-                                StandardCopyOption.ATOMIC_MOVE,
-                                StandardCopyOption.REPLACE_EXISTING,
-                            )
-                        } catch (_: AtomicMoveNotSupportedException) {
-                            Files.move(temp.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
-                        }
-                    }
-                }.onSuccess {
-                    settings.setFontChoice(choice)
-                }.onFailure { error ->
-                    if (error is CancellationException) throw error
-                }
-            } finally {
-                staging?.delete()
-            }
-        }
-    }
 }
 
 internal fun normalizedEpubFontFamily(raw: String): String? =

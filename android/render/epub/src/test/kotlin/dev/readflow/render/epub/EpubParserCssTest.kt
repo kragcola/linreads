@@ -46,7 +46,8 @@ class EpubParserCssTest {
 
         val parser = EpubParser()
         val eagerItem = parser.parseBook(epub).items.single() as EpubReaderItem.Text
-        val lazyBlock = parser.parseLazyBook(epub).blockAt(0) as EpubDisplayBlock.Text
+        val lazyBook = parser.parseLazyBook(epub)
+        val lazyBlock = lazyBook.blockAt(0) as EpubDisplayBlock.Text
 
         listOf(eagerItem.styleSpans, lazyBlock.styleSpans).forEach { spans ->
             assertTrue(spans.any { it.style == EpubTextStyle.Bold })
@@ -58,6 +59,10 @@ class EpubParserCssTest {
         }
         assertEquals(EpubTextAlign.Center, eagerItem.blockStyle.textAlign)
         assertEquals(EpubTextAlign.Center, lazyBlock.blockStyle.textAlign)
+        assertEquals(
+            EpubCssFontMappingStatus.UNRESOLVED,
+            lazyBook.cssFontCatalog().single { it.family == "missing face" }.status,
+        )
     }
 
     private fun writeEpub(file: File) {
@@ -95,7 +100,10 @@ class EpubParserCssTest {
                     <body><p class="chapter">Styled chapter</p></body></html>
                 """.trimIndent(),
             )
-            add("OEBPS/styles/book.css", ".chapter { color: #13579b; font-weight: 700; text-align: center; }")
+            add(
+                "OEBPS/styles/book.css",
+                ".chapter { color: #13579b; font-weight: 700; text-align: center; font-family: 'Missing Face', serif; }",
+            )
         }
     }
 

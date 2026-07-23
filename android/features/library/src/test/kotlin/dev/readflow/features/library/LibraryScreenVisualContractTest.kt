@@ -33,6 +33,22 @@ class LibraryScreenVisualContractTest {
         )
     }
 
+    @Test
+    fun `online library sheet keeps all controls reachable on compact screens`() {
+        val source = libraryScreenSource()
+        val sheet = source.substringAfter("private fun OnlineLibrarySheet(")
+            .substringBefore("private fun OnlineCatalogResultRow(")
+
+        assertTrue(
+            "the tall online-library sheet must scroll vertically",
+            sheet.contains(".verticalScroll(rememberScrollState())"),
+        )
+        assertTrue(
+            "the source picker must scroll horizontally when many sources are configured",
+            sheet.contains(".horizontalScroll(rememberScrollState())"),
+        )
+    }
+
     private fun libraryScreenSource(): String {
         val workingDir = File(System.getProperty("user.dir") ?: ".")
         val candidates = listOf(

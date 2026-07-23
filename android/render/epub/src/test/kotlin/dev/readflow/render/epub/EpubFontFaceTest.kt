@@ -96,10 +96,12 @@ class EpubFontFaceTest {
               <style>
                 @font-face { font-family: "Story"; src: url("fonts/Story.ttf"); }
                 .decorated { font-family: "Story", serif; }
+                .missing { font-family: "Missing Face", serif; }
               </style>
             </head>
             <body>
               <p class="decorated">你好</p>
+              <p class="missing">缺失字体</p>
               <p style="font-family: monospace">code-like</p>
             </body></html>
         """.trimIndent()
@@ -109,6 +111,7 @@ class EpubFontFaceTest {
         val familySpan = body.styleSpans.firstOrNull { it.style == EpubTextStyle.FontFamily }
         assertTrue(familySpan != null)
         assertTrue(familySpan!!.fontFamily!!.contains("Story", ignoreCase = true))
+        assertEquals(setOf("story", "missing face"), content.referencedFontFamilies)
     }
 
     @Test

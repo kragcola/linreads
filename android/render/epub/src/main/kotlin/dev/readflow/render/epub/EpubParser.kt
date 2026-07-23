@@ -85,6 +85,7 @@ internal class EpubParser(
                     paragraphBlockIndexes = index.paragraphBlockIndexes,
                     layoutBlocks = index.layoutBlocks,
                     bookFontMapsBySpine = index.bookFontMapsBySpine,
+                    referencedFontFamiliesBySpine = index.referencedFontFamiliesBySpine,
                     maxCachedSpines = maxCachedSpines,
                 )
             }
@@ -108,6 +109,7 @@ internal class EpubParser(
         val paragraphBlockIndexes: List<Int>,
         val layoutBlocks: List<EpubDisplayBlock>,
         val bookFontMapsBySpine: Map<Int, EpubBookFontMap>,
+        val referencedFontFamiliesBySpine: Map<Int, Set<String>>,
         val fragmentTargetIndexes: Map<String, EpubTargetPosition>,
     )
 
@@ -170,6 +172,7 @@ internal class EpubParser(
         val paragraphBlockIndexes = mutableListOf<Int>()
         val layoutBlocks = mutableListOf<EpubDisplayBlock>()
         val bookFontMapsBySpine = mutableMapOf<Int, EpubBookFontMap>()
+        val referencedFontFamiliesBySpine = mutableMapOf<Int, Set<String>>()
         var firstParagraphIndex = 0
         var firstBlockIndex = 0
         var documentOffset = 0
@@ -180,6 +183,7 @@ internal class EpubParser(
             val content = parseSpineContent(zip, spineIndex, item)
             val items = content.items
             bookFontMapsBySpine[spineIndex] = content.bookFontMap
+            referencedFontFamiliesBySpine[spineIndex] = content.referencedFontFamilies
             val localParas = epubParasFromReaderItems(items)
             val blocks = epubDisplayBlocks(items)
             val localParagraphBlockIndexes = firstBlockIndexesByParagraph(blocks, localParas.size)
@@ -220,6 +224,7 @@ internal class EpubParser(
             paragraphBlockIndexes = paragraphBlockIndexes,
             layoutBlocks = layoutBlocks,
             bookFontMapsBySpine = bookFontMapsBySpine,
+            referencedFontFamiliesBySpine = referencedFontFamiliesBySpine,
             fragmentTargetIndexes = fragmentTargetIndexes,
         )
     }

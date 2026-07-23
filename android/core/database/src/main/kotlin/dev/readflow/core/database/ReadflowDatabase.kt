@@ -6,7 +6,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-/** Room database aggregating the 5 tables (§7.8). */
+/** Room database aggregating library + reading tables (§7.8) and online source configs. */
 @Database(
     entities = [
         BookEntity::class,
@@ -15,8 +15,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         InkStrokeEntity::class,
         BookmarkEntity::class,
         ReadingSessionEntity::class,
+        BookSourceEntity::class,
     ],
-    version = 5,
+    version = 6,
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 1, to = 2),
@@ -32,6 +33,7 @@ abstract class ReadflowDatabase : RoomDatabase() {
     abstract fun inkStrokeDao(): InkStrokeDao
     abstract fun bookmarkDao(): BookmarkDao
     abstract fun readingSessionDao(): ReadingSessionDao
+    abstract fun bookSourceDao(): BookSourceDao
 }
 
 val MIGRATION_4_5 = object : Migration(4, 5) {
@@ -43,6 +45,25 @@ val MIGRATION_4_5 = object : Migration(4, 5) {
             UPDATE books
             SET collectionId = 'legacy:' || lower(hex(collectionName))
             WHERE collectionName IS NOT NULL
+            """.trimIndent(),
+        )
+    }
+}
+
+val MIGRATION_5_6 = object : Migration(5, 6) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `book_sources` (
+                `id` TEXT NOT NULL,
+                `kind` TEXT NOT NULL,
+                `name` TEXT NOT NULL,
+                `baseUrl` TEXT NOT NULL,
+                `enabled` INTEGER NOT NULL DEFAULT 1,
+                `sortOrder` INTEGER NOT NULL DEFAULT 0,
+                `createdAt` INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(`id`)
+            )
             """.trimIndent(),
         )
     }

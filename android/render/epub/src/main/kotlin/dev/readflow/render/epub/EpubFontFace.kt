@@ -112,6 +112,38 @@ internal fun resolveCssFontFamily(
     bookFonts: EpubBookFontMap,
 ): EpubFontFace? = bookFonts.faceForFamily(cssFontFamily)
 
+/**
+ * Resolves a CSS `font-family` list against layered replacements and embedded faces.
+ *
+ * Priority per token: [bookReplacements] > [globalReplacements] > embedded [bookFonts] >
+ * (null → caller uses user/system default). Missing replacement typefaces fall through
+ * safely without throwing.
+ */
+internal fun resolveEpubCssTypeface(
+    cssFontFamily: String?,
+    bookReplacements: Map<String, String>,
+    globalReplacements: Map<String, String>,
+    bookFonts: EpubBookFontMap,
+    replacementResolver: (String) -> Typeface?,
+    embeddedResolver: (EpubFontFace) -> Typeface?,
+): Typeface? {
+    val layered = mergeReplacementLayers(bookReplacements, globalReplacements)
+    return resolveEpubCssTypeface(
+        cssFontFamily = cssFontFamily,
+        replacements = layered,
+        bookFonts = bookFonts,
+        replacementResolver = replacementResolver,
+        embeddedResolver = embeddedResolver,
+    )
+}
+
+/**
+ * Resolves a CSS `font-family` list against a pre-merged [replacements] map (book already
+ * folded over global) and [bookFonts]. Returns the book face when valid;
+ * otherwise null so the caller can fall back to the user-selected / system typeface.
+ *
+ * Priority: exact replacement → Moon-style base replacement → embedded face.
+ */
 internal fun resolveEpubCssTypeface(
     cssFontFamily: String?,
     replacements: Map<String, String>,
@@ -138,6 +170,16 @@ internal fun resolveEpubCssTypeface(
         }
     }
     return null
+}
+
+/** Book map entries override global for the same canonical family key. */
+internal fun mergeReplacementLayers(
+    bookReplacements: Map<String, String>,
+    globalReplacements: Map<String, String>,
+): Map<String, String> {
+    if (bookReplacements.isEmpty()) return globalReplacements
+    if (globalReplacements.isEmpty()) return bookReplacements
+    return globalReplacements + bookReplacements
 }
 
 /**
