@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -486,7 +487,21 @@ private fun OnlineLibrarySheet(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("在线书库", style = MaterialTheme.typography.titleMedium)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("在线书库", style = MaterialTheme.typography.titleMedium)
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .semantics { contentDescription = "关闭在线书库" },
+                ) {
+                    Icon(Icons.Default.Close, contentDescription = null)
+                }
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -538,131 +553,150 @@ private fun OnlineLibrarySheet(
                     }
                 }
             }
-            ExposedDropdownMenuBox(
-                expanded = sourceMenuExpanded,
-                onExpandedChange = { sourceMenuExpanded = it },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .semantics { contentDescription = "书源选择器" },
-            ) {
-                OutlinedTextField(
-                    value = selected?.name ?: "选择书源",
-                    onValueChange = {},
-                    readOnly = true,
-                    singleLine = true,
-                    label = { Text("当前书源") },
-                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = sourceMenuExpanded) },
-                    modifier = Modifier
-                        .menuAnchor()
-                        .fillMaxWidth()
-                        .semantics {
-                            contentDescription = "当前书源：${selected?.name ?: "未选择"}"
-                            role = Role.DropdownList
-                        },
-                )
-                ExposedDropdownMenu(
-                    expanded = sourceMenuExpanded,
-                    onDismissRequest = { sourceMenuExpanded = false },
+            if (state.sources.isEmpty()) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    state.sources.forEach { source ->
-                        DropdownMenuItem(
-                            text = { Text(source.name) },
-                            onClick = {
-                                sourceMenuExpanded = false
-                                if (source.enabled) onSelectSource(source.id)
+                    Text("还没有书源", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        text = "添加网页书源、OPDS、JSON 或 Calibre 后即可搜索和预览。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Button(onClick = onOpenSourceEditor) {
+                        Icon(Icons.Outlined.Add, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("添加第一个书源")
+                    }
+                }
+            } else {
+                ExposedDropdownMenuBox(
+                    expanded = sourceMenuExpanded,
+                    onExpandedChange = { sourceMenuExpanded = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .semantics { contentDescription = "书源选择器" },
+                ) {
+                    OutlinedTextField(
+                        value = selected?.name ?: "选择书源",
+                        onValueChange = {},
+                        readOnly = true,
+                        singleLine = true,
+                        label = { Text("当前书源") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = sourceMenuExpanded) },
+                        modifier = Modifier
+                            .menuAnchor()
+                            .fillMaxWidth()
+                            .semantics {
+                                contentDescription = "当前书源：${selected?.name ?: "未选择"}"
+                                role = Role.DropdownList
                             },
-                            enabled = source.enabled,
-                            trailingIcon = {
-                                if (source.id == state.selectedSourceId) {
-                                    Text("✓", color = MaterialTheme.colorScheme.primary)
+                    )
+                    ExposedDropdownMenu(
+                        expanded = sourceMenuExpanded,
+                        onDismissRequest = { sourceMenuExpanded = false },
+                    ) {
+                        state.sources.forEach { source ->
+                            DropdownMenuItem(
+                                text = { Text(source.name) },
+                                onClick = {
+                                    sourceMenuExpanded = false
+                                    if (source.enabled) onSelectSource(source.id)
+                                },
+                                enabled = source.enabled,
+                                trailingIcon = {
+                                    if (source.id == state.selectedSourceId) {
+                                        Text("✓", color = MaterialTheme.colorScheme.primary)
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = state.query,
+                    onValueChange = onQueryChange,
+                    label = { Text("搜索书名或作者") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    trailingIcon = {
+                        IconButton(
+                            onClick = onSearch,
+                            enabled = !state.isSearching,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .semantics { contentDescription = "搜索" },
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Search,
+                                contentDescription = null,
+                            )
+                        }
+                    },
+                )
+
+                if (hasSecondaryFilters) {
+                    OutlinedButton(
+                        onClick = { filtersExpanded = !filtersExpanded },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .semantics {
+                                contentDescription = if (activeFilterCount > 0) {
+                                    "筛选条件，已启用 $activeFilterCount 项"
+                                } else {
+                                    "筛选条件"
                                 }
                             },
-                        )
-                    }
-                }
-            }
-
-            OutlinedTextField(
-                value = state.query,
-                onValueChange = onQueryChange,
-                label = { Text("搜索书名或作者") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-                trailingIcon = {
-                    IconButton(
-                        onClick = onSearch,
-                        enabled = !state.isSearching,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .semantics { contentDescription = "搜索" },
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Search,
-                            contentDescription = null,
-                        )
-                    }
-                },
-            )
-
-            if (hasSecondaryFilters) {
-                OutlinedButton(
-                    onClick = { filtersExpanded = !filtersExpanded },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .semantics {
-                            contentDescription = if (activeFilterCount > 0) {
-                                "筛选条件，已启用 $activeFilterCount 项"
+                        Text(
+                            if (filtersExpanded) {
+                                "收起筛选"
+                            } else if (activeFilterCount > 0) {
+                                "筛选条件（$activeFilterCount）"
                             } else {
                                 "筛选条件"
-                            }
-                        },
-                ) {
-                    Text(
-                        if (filtersExpanded) {
-                            "收起筛选"
-                        } else if (activeFilterCount > 0) {
-                            "筛选条件（$activeFilterCount）"
-                        } else {
-                            "筛选条件"
-                        },
-                    )
-                }
-                if (filtersExpanded) {
-                    if (canFilterAuthor) {
-                        OutlinedTextField(
-                            value = state.filter.author,
-                            onValueChange = { onFilterChange(state.filter.copy(author = it)) },
-                            label = { Text("作者") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
+                            },
                         )
                     }
-                    if (canFilterSeries) {
-                        OutlinedTextField(
-                            value = state.filter.series,
-                            onValueChange = { onFilterChange(state.filter.copy(series = it)) },
-                            label = { Text("系列") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                    if (canFilterFormat) {
-                        OutlinedTextField(
-                            value = state.filter.format,
-                            onValueChange = { onFilterChange(state.filter.copy(format = it)) },
-                            label = { Text("格式") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                    if (canFilterTag) {
-                        OutlinedTextField(
-                            value = state.filter.tag,
-                            onValueChange = { onFilterChange(state.filter.copy(tag = it)) },
-                            label = { Text("标签") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                    if (filtersExpanded) {
+                        if (canFilterAuthor) {
+                            OutlinedTextField(
+                                value = state.filter.author,
+                                onValueChange = { onFilterChange(state.filter.copy(author = it)) },
+                                label = { Text("作者") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        if (canFilterSeries) {
+                            OutlinedTextField(
+                                value = state.filter.series,
+                                onValueChange = { onFilterChange(state.filter.copy(series = it)) },
+                                label = { Text("系列") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        if (canFilterFormat) {
+                            OutlinedTextField(
+                                value = state.filter.format,
+                                onValueChange = { onFilterChange(state.filter.copy(format = it)) },
+                                label = { Text("格式") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                        if (canFilterTag) {
+                            OutlinedTextField(
+                                value = state.filter.tag,
+                                onValueChange = { onFilterChange(state.filter.copy(tag = it)) },
+                                label = { Text("标签") },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
                     }
                 }
             }
@@ -705,31 +739,44 @@ private fun OnlineLibrarySheet(
                 }
             }
 
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(280.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(state.results, key = { it.selectionKey() }) { entry ->
-                    OnlineCatalogResultRow(
-                        entry = entry,
-                        selected = entry.selectionKey() in state.selectedEntryKeys,
-                        isDownloading = entry.selectionKey() in state.downloadingKeys,
-                        canDownload = selected?.capabilities?.canDownload == true,
-                        canPreview = selected?.capabilities?.canPreviewText == true,
-                        canBatchAcrossSource = selected?.capabilities?.canBatchAcrossSource == true,
-                        onToggleSelect = { onToggleSelect(entry) },
-                        onDownload = { onDownloadEntry(entry) },
-                        onPreview = { onPreview(entry) },
-                        onAuthorBatch = { onSelectAuthor(entry.meta.author) },
-                        onSeriesBatch = { entry.series?.let(onSelectSeries) },
-                    )
+            if (state.results.isNotEmpty()) {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 280.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(state.results, key = { it.selectionKey() }) { entry ->
+                        OnlineCatalogResultRow(
+                            entry = entry,
+                            selected = entry.selectionKey() in state.selectedEntryKeys,
+                            isDownloading = entry.selectionKey() in state.downloadingKeys,
+                            canDownload = selected?.capabilities?.canDownload == true,
+                            canPreview = selected?.capabilities?.canPreviewText == true,
+                            canBatchAcrossSource = selected?.capabilities?.canBatchAcrossSource == true,
+                            onToggleSelect = { onToggleSelect(entry) },
+                            onDownload = { onDownloadEntry(entry) },
+                            onPreview = { onPreview(entry) },
+                            onAuthorBatch = { onSelectAuthor(entry.meta.author) },
+                            onSeriesBatch = { entry.series?.let(onSelectSeries) },
+                        )
+                    }
                 }
-            }
-
-            TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
-                Text("关闭")
+            } else if (
+                state.sources.isNotEmpty() &&
+                !state.isSearching &&
+                statusError == null &&
+                statusMessage == null
+            ) {
+                Text(
+                    text = if (selected == null) {
+                        "选择书源后即可搜索"
+                    } else {
+                        "输入书名或作者开始搜索"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

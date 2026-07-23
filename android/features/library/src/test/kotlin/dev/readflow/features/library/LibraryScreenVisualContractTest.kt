@@ -230,6 +230,38 @@ class LibraryScreenVisualContractTest {
         )
     }
 
+    @Test
+    fun `online library empty states stay compact and immediately dismissible`() {
+        val sheet = libraryScreenSource()
+            .substringAfter("private fun OnlineLibrarySheet(")
+            .substringBefore("private fun OnlineBookPreviewWindow(")
+
+        assertFalse(
+            "an empty catalog must not reserve a fixed 280dp result viewport",
+            sheet.contains(".height(280.dp)"),
+        )
+        assertTrue(
+            "the sheet title bar must expose an always-visible 48dp close action",
+            sheet.contains("contentDescription = \"关闭在线书库\"") &&
+                sheet.substringBefore("Text(\"书源\"")
+                    .contains(".size(48.dp)"),
+        )
+        assertTrue(
+            "a source-less catalog must show a compact primary action",
+            sheet.contains("if (state.sources.isEmpty())") &&
+                sheet.contains("Text(\"添加第一个书源\")"),
+        )
+        assertTrue(
+            "the bounded result list must only exist when results are available",
+            sheet.contains("if (state.results.isNotEmpty())") &&
+                sheet.contains(".heightIn(max = 280.dp)"),
+        )
+        assertFalse(
+            "dismiss must not be pushed below the catalog as a footer text button",
+            sheet.contains("TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End))"),
+        )
+    }
+
     private fun libraryScreenSource(): String {
         val workingDir = File(System.getProperty("user.dir") ?: ".")
         val candidates = listOf(
