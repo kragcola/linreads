@@ -14,10 +14,10 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 
 @RunWith(RobolectricTestRunner::class)
-class ReadflowDatabaseMigration1To6Test {
+class ReadflowDatabaseMigration1To7Test {
 
     @Test
-    fun `official version 1 schema migrates through Room to version 6`() = runBlocking {
+    fun `official version 1 schema migrates through Room to version 7`() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
         val databaseName = "migration-1-6-${UUID.randomUUID()}.db"
         createVersion1Database(databaseName)
@@ -26,7 +26,7 @@ class ReadflowDatabaseMigration1To6Test {
             ReadflowDatabase::class.java,
             databaseName,
         )
-            .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
+            .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
             .allowMainThreadQueries()
             .build()
 
@@ -48,16 +48,16 @@ class ReadflowDatabaseMigration1To6Test {
                 database.bookDao().getById("legacy-book"),
             )
 
-            // v6: book_sources must exist and be queryable after 1→6 migration path.
+            // v7: book_sources must exist and expose versioned adapter configuration.
             val master = database.openHelper.readableDatabase.query(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='book_sources'",
             )
             master.use {
-                assertTrue("book_sources table missing after 1→6 migration", it.moveToFirst())
+                assertTrue("book_sources table missing after 1→7 migration", it.moveToFirst())
                 assertEquals("book_sources", it.getString(0))
             }
             val sources = database.openHelper.readableDatabase.query(
-                "SELECT COUNT(*) FROM book_sources",
+                "SELECT COUNT(*), adapterId, configJson, configVersion, updatedAt FROM book_sources",
             )
             sources.use {
                 assertTrue(it.moveToFirst())

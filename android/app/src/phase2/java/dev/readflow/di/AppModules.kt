@@ -4,10 +4,8 @@ import androidx.room.Room
 import androidx.room.withTransaction
 import dev.readflow.core.calibre.CalibreEndpointProbe
 import dev.readflow.core.calibre.CalibreConnectionTester
-import dev.readflow.core.calibre.CalibreClient
-import dev.readflow.core.calibre.CalibreRepository
-import dev.readflow.core.calibre.CalibreRepositoryImpl
 import dev.readflow.core.calibre.DefaultSourceRegistry
+import dev.readflow.core.calibre.defaultSourceAdapterRegistry
 import dev.readflow.core.calibre.GuidedCalibreEndpointProbe
 import dev.readflow.core.calibre.createCalibreConnectionTester
 import dev.readflow.core.database.LibraryRepository
@@ -28,7 +26,9 @@ import dev.readflow.core.database.RoomSourceConfigStore
 import dev.readflow.core.database.SourceConfigStore
 import dev.readflow.core.database.MIGRATION_4_5
 import dev.readflow.core.database.MIGRATION_5_6
+import dev.readflow.core.database.MIGRATION_6_7
 import dev.readflow.extensions.api.SourceRegistry
+import dev.readflow.extensions.api.SourceAdapterRegistry
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.BookAssetOperationCoordinator
 import dev.readflow.core.sync.NoOpSyncBackend
@@ -74,7 +74,7 @@ val coreModule = module {
 val databaseModule = module {
     single {
         Room.databaseBuilder(androidContext(), ReadflowDatabase::class.java, "readflow.db")
-            .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
+            .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
             .build()
     }
     single { get<ReadflowDatabase>().bookDao() }
@@ -188,25 +188,21 @@ val settingsModule = module {
     single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
     single<CalibreConnectionTester> { createCalibreConnectionTester() }
     single<CalibreEndpointProbe> { GuidedCalibreEndpointProbe(get()) }
-    single<(String) -> CalibreRepository> {
-        { baseUrl ->
-            CalibreRepositoryImpl(
-                client = CalibreClient(baseUrl),
-                booksDir = File(androidContext().filesDir, "books"),
-            )
-        }
+    single<SourceAdapterRegistry> {
+        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"))
     }
     single<SourceRegistry> {
         DefaultSourceRegistry(
             settings = get(),
             sourceConfigStore = get(),
             booksDir = File(androidContext().filesDir, "books"),
+            sourceAdapters = get(),
         )
     }
 }
 
 val featureModule = module {
-    viewModel { LibraryViewModel(get(), get(), get(), get(), get(), get()) }
+    viewModel { LibraryViewModel(get(), get(), get(), get()) }
     viewModel { SettingsViewModel(get(), get(), get(), get(), get(), get(), get()) }
     viewModel { ReaderViewModel(get(), get(), get(), get(), get(), get(), get(), get(), get(), get(), get()) }
 }

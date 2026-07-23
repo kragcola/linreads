@@ -24,26 +24,35 @@ enum class EpubCssFontMappingStatus {
  * [family] is the canonical key (lowercase, unquoted). [displayName] prefers the
  * first raw family token as seen in CSS when available.
  */
-data class EpubCssFontFamilyEntry(
+internal data class EpubCssFontFamilyEntry(
     val family: String,
     val displayName: String,
+    val fontFamilyChain: List<String> = listOf(family),
     val status: EpubCssFontMappingStatus,
+    val effectiveSource: EpubCssFontEffectiveSource = EpubCssFontEffectiveSource.DEFAULT,
+    val effectiveFamily: String? = null,
     val mappedFontId: String? = null,
     val embeddedSrcPath: String? = null,
+    val occurrenceCount: Int = 0,
+    val coveredChars: Int = 0,
+    val excerpt: String = "",
+    val excerptMatchStart: Int = 0,
+    val excerptMatchEnd: Int = 0,
+    val excerptSpineIndex: Int = 0,
 )
 
 /**
  * Builds a deterministic CSS family catalog for the current book.
  *
- * [embeddedFaces] supplies families from `@font-face`. [referencedFamilies] may
- * add CSS families seen in content (without faces). Mapping maps must already use
- * canonical family keys (or will be re-normalized).
+ * [embeddedFaces] only supplies resolution status for families present in [fontUsages];
+ * an unused `@font-face` never becomes a reader-facing row. Mapping maps are normalized here.
  */
 internal fun buildEpubCssFontCatalog(
     embeddedFaces: Map<String, EpubFontFace>,
     bookReplacements: Map<String, String>,
     globalReplacements: Map<String, String>,
-    referencedFamilies: Collection<String> = emptyList(),
+    fontUsages: Collection<EpubCssFontUsage> = emptyList(),
+    availableReplacementIds: Set<String>? = null,
 ): List<EpubCssFontFamilyEntry> {
     val book = normalizeReplacementMap(bookReplacements)
     val global = normalizeReplacementMap(globalReplacements)
@@ -53,34 +62,41 @@ internal fun buildEpubCssFontCatalog(
         if (key in GENERIC_FONT_FAMILIES) continue
         if (key !in embedded) embedded[key] = face
     }
-    val orderedKeys = LinkedHashSet<String>()
-    embedded.keys.forEach { orderedKeys += it }
-    referencedFamilies.forEach { raw ->
-        val key = normalizeFontFamilyKey(raw) ?: return@forEach
-        if (key !in GENERIC_FONT_FAMILIES) orderedKeys += key
-    }
-    book.keys.forEach { orderedKeys += it }
-    // Do not list global-only families unless the book CSS references them —
-    // catalog is book-scoped for the reader UI.
-
-    return orderedKeys.sorted().map { key ->
-        val face = embedded[key]
-        val bookMapped = book[key]
-        val globalMapped = global[key]
-        val (status, mappedId) = when {
-            bookMapped != null -> EpubCssFontMappingStatus.BOOK_MAPPED to bookMapped
-            globalMapped != null -> EpubCssFontMappingStatus.GLOBAL_MAPPED to globalMapped
-            face != null -> EpubCssFontMappingStatus.EMBEDDED to null
-            else -> EpubCssFontMappingStatus.UNRESOLVED to null
+    return fontUsages.map { usage ->
+        val resolution = resolveEpubCssFontEffectiveSource(
+            fontFamilyChain = usage.fontFamilyChain,
+            bookReplacements = book,
+            globalReplacements = global,
+            bookFonts = EpubBookFontMap(embedded),
+            availableReplacementIds = availableReplacementIds,
+        )
+        val status = when (resolution.source) {
+            EpubCssFontEffectiveSource.BOOK_MAPPING -> EpubCssFontMappingStatus.BOOK_MAPPED
+            EpubCssFontEffectiveSource.GLOBAL_MAPPING -> EpubCssFontMappingStatus.GLOBAL_MAPPED
+            EpubCssFontEffectiveSource.EMBEDDED -> EpubCssFontMappingStatus.EMBEDDED
+            EpubCssFontEffectiveSource.DEFAULT -> EpubCssFontMappingStatus.UNRESOLVED
         }
         EpubCssFontFamilyEntry(
-            family = key,
-            displayName = face?.family?.takeIf { it.isNotBlank() } ?: key,
+            family = usage.family,
+            displayName = usage.displayName,
+            fontFamilyChain = usage.fontFamilyChain,
             status = status,
-            mappedFontId = mappedId,
-            embeddedSrcPath = face?.srcPath,
+            effectiveSource = resolution.source,
+            effectiveFamily = resolution.effectiveFamily,
+            mappedFontId = resolution.mappedFontId,
+            embeddedSrcPath = resolution.embeddedFace?.srcPath,
+            occurrenceCount = usage.occurrenceCount,
+            coveredChars = usage.coveredChars,
+            excerpt = usage.excerpt,
+            excerptMatchStart = usage.excerptMatchStart,
+            excerptMatchEnd = usage.excerptMatchEnd,
+            excerptSpineIndex = usage.excerptSpineIndex,
         )
-    }
+    }.sortedWith(
+        compareByDescending<EpubCssFontFamilyEntry> { it.coveredChars }
+            .thenByDescending { it.occurrenceCount }
+            .thenBy { it.family },
+    )
 }
 
 /**

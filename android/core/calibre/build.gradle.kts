@@ -13,8 +13,10 @@ dependencies {
     implementation(project(":core:prefs"))
     implementation(project(":extensions:api"))
     implementation(libs.bundles.ktor)
+    implementation(libs.ktor.client.okhttp)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.coroutines.core)
+    implementation(libs.jsoup)
 
     testImplementation(libs.junit4)
     testImplementation(libs.ktor.client.mock)

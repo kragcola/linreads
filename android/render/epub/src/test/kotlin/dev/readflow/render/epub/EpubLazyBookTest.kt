@@ -186,6 +186,36 @@ class EpubLazyBookTest {
     }
 
     @Test
+    fun `font usage catalog is precomputed without loading cold spines`() {
+        val epub = tempDir.resolve("indexed-font-usages.epub").toFile()
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><head><style>
+                  @font-face { font-family: Story; src: url("fonts/story.ttf"); }
+                  @font-face { font-family: Unused; src: url("fonts/unused.ttf"); }
+                  p { font-family: Story, Fallback, serif; }
+                </style></head><body><p>第一章的真实字体例句。</p></body></html>
+            """.trimIndent(),
+            "OEBPS/ch2.xhtml" to """
+                <html><head><style>p { font-family: Story, serif; }</style></head>
+                <body><p>第二章继续使用同一种字体。</p></body></html>
+            """.trimIndent(),
+        )
+        val book = EpubParser().parseLazyBook(epub, maxCachedSpines = 1)
+
+        val catalog = book.cssFontCatalog()
+
+        assertEquals(listOf("story"), catalog.map { it.family })
+        assertEquals(2, catalog.single().occurrenceCount)
+        assertTrue(catalog.single().coveredChars > 0)
+        assertTrue(catalog.single().excerpt.contains("真实字体例句"))
+        assertEquals(0, book.loadCount(0))
+        assertEquals(0, book.loadCount(1))
+        assertEquals(emptySet<Int>(), book.cachedSpineIndexes())
+    }
+
+    @Test
     fun `close clears lazy cache and load counters`() {
         val epub = tempDir.resolve("close.epub").toFile()
         writeEpub(

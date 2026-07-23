@@ -1,11 +1,12 @@
 package dev.readflow.features.library
 
-import android.content.Intent
-import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
@@ -19,19 +20,23 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -46,6 +51,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -64,6 +70,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.BookBundle
 import dev.readflow.core.ui.BookCover
@@ -86,7 +95,6 @@ fun LibraryScreen(
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val scanProgress by viewModel.scanProgress.collectAsStateWithLifecycle()
-    val calibreSearchState by viewModel.calibreSearchState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(state.notice) {
@@ -98,6 +106,7 @@ fun LibraryScreen(
 
     var openedBundle by remember { mutableStateOf<BookBundle?>(null) }
     var showOnlineLibrary by remember { mutableStateOf(false) }
+    var showSourceEditor by remember { mutableStateOf(false) }
     val onlineLibraryState by viewModel.onlineLibraryState.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
@@ -283,7 +292,7 @@ fun LibraryScreen(
                     state.error != null && state.items.isEmpty() ->
                         Text("加载失败：${state.error}", color = MaterialTheme.colorScheme.onBackground)
                     state.items.isEmpty() && state.filter == LibraryFilter.ALL -> EmptyState(
-                        onConnectCalibre = onSettings,
+                        onOpenOnlineLibrary = { showOnlineLibrary = true },
                         onImportLocal = { fileLauncher.launch(SUPPORTED_MIMES) },
                     )
                     else -> Column(
@@ -343,7 +352,6 @@ fun LibraryScreen(
         if (showOnlineLibrary) {
             OnlineLibrarySheet(
                 state = onlineLibraryState,
-                calibreCompat = calibreSearchState,
                 onSelectSource = viewModel::selectOnlineSource,
                 onQueryChange = viewModel::updateOnlineQuery,
                 onFilterChange = viewModel::updateOnlineFilter,
@@ -354,11 +362,30 @@ fun LibraryScreen(
                 onDownloadEntry = viewModel::downloadOnlineEntry,
                 onDownloadSelected = viewModel::downloadSelectedOnlineBooks,
                 onPreview = viewModel::previewOnlineEntry,
-                onClearPreview = viewModel::clearOnlinePreview,
-                onAddSourceForm = viewModel::updateAddSourceForm,
-                onAddSource = viewModel::addOnlineSource,
+                onOpenSourceEditor = { showSourceEditor = true },
                 onRemoveSource = viewModel::removeOnlineSource,
-                onDismiss = { showOnlineLibrary = false },
+                onDismiss = {
+                    showOnlineLibrary = false
+                    showSourceEditor = false
+                    viewModel.clearOnlinePreview()
+                },
+            )
+        }
+        onlineLibraryState.preview?.let { preview ->
+            OnlineBookPreviewWindow(
+                preview = preview,
+                onDismiss = viewModel::clearOnlinePreview,
+            )
+        }
+        if (showSourceEditor) {
+            SourceEditorWindow(
+                state = onlineLibraryState,
+                onFormChange = viewModel::updateAddSourceForm,
+                onHtmlDraftChange = viewModel::updateHtmlSourceDraft,
+                onSave = {
+                    viewModel.addOnlineSource { showSourceEditor = false }
+                },
+                onDismiss = { showSourceEditor = false },
             )
         }
     }
@@ -382,7 +409,7 @@ private fun OfflineEmptyState(
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "下载 Calibre 书籍或导入本地文件后，会出现在这里。",
+            text = "从在线书库下载或导入本地文件后，会出现在这里。",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -397,7 +424,6 @@ private fun OfflineEmptyState(
 @Composable
 private fun OnlineLibrarySheet(
     state: OnlineLibraryUiState,
-    calibreCompat: CalibreSearchUiState,
     onSelectSource: (String) -> Unit,
     onQueryChange: (String) -> Unit,
     onFilterChange: (dev.readflow.extensions.api.OnlineCatalogFilter) -> Unit,
@@ -408,13 +434,10 @@ private fun OnlineLibrarySheet(
     onDownloadEntry: (dev.readflow.extensions.api.OnlineCatalogEntry) -> Unit,
     onDownloadSelected: () -> Unit,
     onPreview: (dev.readflow.extensions.api.OnlineCatalogEntry) -> Unit,
-    onClearPreview: () -> Unit,
-    onAddSourceForm: (name: String?, url: String?, kind: dev.readflow.extensions.api.SourceKind?) -> Unit,
-    onAddSource: () -> Unit,
+    onOpenSourceEditor: () -> Unit,
     onRemoveSource: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val context = LocalContext.current
     val selected = state.sources.firstOrNull { it.id == state.selectedSourceId }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -425,9 +448,7 @@ private fun OnlineLibrarySheet(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text("在线书库", style = MaterialTheme.typography.titleMedium)
-            if (selected?.kind == dev.readflow.extensions.api.SourceKind.CALIBRE) {
-                Text("Calibre 书源", style = MaterialTheme.typography.titleSmall)
-            }
+            selected?.let { Text(it.name, style = MaterialTheme.typography.titleSmall) }
 
             // Source picker
             Text("书源", style = MaterialTheme.typography.labelLarge)
@@ -441,7 +462,7 @@ private fun OnlineLibrarySheet(
                     val selectedSource = source.id == state.selectedSourceId
                     OutlinedButton(
                         onClick = { onSelectSource(source.id) },
-                        enabled = source.enabled || source.baseUrl.isNotBlank() || source.isBuiltin,
+                        enabled = source.enabled,
                     ) {
                         Text(
                             text = if (selectedSource) "✓ ${source.name}" else source.name,
@@ -470,54 +491,63 @@ private fun OnlineLibrarySheet(
                 }
             }
 
-            // Result filters
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (selected?.capabilities?.canFilterByAuthor == true) {
                 OutlinedTextField(
                     value = state.filter.author,
                     onValueChange = { onFilterChange(state.filter.copy(author = it)) },
                     label = { Text("作者") },
                     singleLine = true,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.fillMaxWidth(),
                 )
+            }
+            if (selected?.capabilities?.canFilterBySeries == true) {
                 OutlinedTextField(
                     value = state.filter.series,
                     onValueChange = { onFilterChange(state.filter.copy(series = it)) },
                     label = { Text("系列") },
                     singleLine = true,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.fillMaxWidth(),
                 )
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (selected?.capabilities?.canFilterByFormat == true) {
                 OutlinedTextField(
                     value = state.filter.format,
                     onValueChange = { onFilterChange(state.filter.copy(format = it)) },
                     label = { Text("格式") },
                     singleLine = true,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.fillMaxWidth(),
                 )
+            }
+            if (selected?.capabilities?.canFilterByTag == true) {
                 OutlinedTextField(
                     value = state.filter.tag,
                     onValueChange = { onFilterChange(state.filter.copy(tag = it)) },
                     label = { Text("标签") },
                     singleLine = true,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.fillMaxWidth(),
                 )
             }
 
-            val statusError = state.error ?: calibreCompat.error
-            val statusMessage = state.message ?: calibreCompat.message
+            val statusError = state.error
+            val statusMessage = state.message
             when {
-                state.isSearching || calibreCompat.isSearching -> Row(
+                state.isSearching || state.isSelectingBatch -> Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Text(if (selected?.kind == dev.readflow.extensions.api.SourceKind.CALIBRE) "正在搜索 Calibre" else "正在搜索书源")
+                    Text(
+                        if (state.isSelectingBatch) "正在汇总匹配书籍"
+                        else "正在搜索${selected?.name?.let { "「$it」" }.orEmpty()}",
+                    )
                 }
                 statusError != null -> Text(
                     text = statusError,
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.semantics {
+                        contentDescription = "在线书库错误：$statusError"
+                    },
                 )
                 statusMessage != null -> Text(
                     text = statusMessage,
@@ -525,13 +555,13 @@ private fun OnlineLibrarySheet(
                 )
             }
 
-            if (state.selectedEntryKeys.isNotEmpty()) {
+            if (state.selectedEntryKeys.isNotEmpty() && selected?.capabilities?.canDownload == true) {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text("已选 ${state.selectedEntryKeys.size} 本")
-                    Button(onClick = onDownloadSelected) { Text("批量下载") }
+                    Button(onClick = onDownloadSelected) { Text("下载所选") }
                 }
             }
 
@@ -545,8 +575,10 @@ private fun OnlineLibrarySheet(
                     OnlineCatalogResultRow(
                         entry = entry,
                         selected = entry.selectionKey() in state.selectedEntryKeys,
-                        isDownloading = entry.selectionKey() in state.downloadingKeys ||
-                            calibreCompat.downloadingBookId == entry.meta.id,
+                        isDownloading = entry.selectionKey() in state.downloadingKeys,
+                        canDownload = selected?.capabilities?.canDownload == true,
+                        canPreview = selected?.capabilities?.canPreviewText == true,
+                        canBatchAcrossSource = selected?.capabilities?.canBatchAcrossSource == true,
                         onToggleSelect = { onToggleSelect(entry) },
                         onDownload = { onDownloadEntry(entry) },
                         onPreview = { onPreview(entry) },
@@ -556,57 +588,12 @@ private fun OnlineLibrarySheet(
                 }
             }
 
-            val previewUrl = state.previewUrl
-            if (previewUrl != null) {
-                Text(
-                    text = "预览：$previewUrl",
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = {
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(previewUrl))
-                            runCatching { context.startActivity(intent) }
-                        },
-                    ) {
-                        Text("打开预览")
-                    }
-                    TextButton(onClick = onClearPreview) { Text("清除预览") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onOpenSourceEditor) {
+                    Icon(Icons.Outlined.Add, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("添加书源")
                 }
-            }
-
-            // Add generic user source (OPDS / JSON HTTP)
-            Text("添加书源（OPDS / JSON）", style = MaterialTheme.typography.labelLarge)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = {
-                        onAddSourceForm(null, null, dev.readflow.extensions.api.SourceKind.JSON_HTTP)
-                    },
-                ) { Text(if (state.addSourceKind == dev.readflow.extensions.api.SourceKind.JSON_HTTP) "✓ JSON" else "JSON") }
-                OutlinedButton(
-                    onClick = {
-                        onAddSourceForm(null, null, dev.readflow.extensions.api.SourceKind.OPDS)
-                    },
-                ) { Text(if (state.addSourceKind == dev.readflow.extensions.api.SourceKind.OPDS) "✓ OPDS" else "OPDS") }
-            }
-            OutlinedTextField(
-                value = state.addSourceName,
-                onValueChange = { onAddSourceForm(it, null, null) },
-                label = { Text("书源名称") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = state.addSourceUrl,
-                onValueChange = { onAddSourceForm(null, it, null) },
-                label = { Text("书源地址") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onAddSource) { Text("保存书源") }
                 selected?.takeIf { !it.isBuiltin }?.let { userSource ->
                     OutlinedButton(onClick = { onRemoveSource(userSource.id) }) {
                         Text("删除当前书源")
@@ -621,11 +608,303 @@ private fun OnlineLibrarySheet(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun OnlineBookPreviewWindow(
+    preview: dev.readflow.extensions.api.OnlineBookPreview,
+    onDismiss: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = false,
+        ),
+    ) {
+        BackHandler(onBack = onDismiss)
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.surface,
+        ) {
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        title = {
+                            Text(
+                                text = preview.title,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        },
+                        navigationIcon = {
+                            IconButton(onClick = onDismiss) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = "退出正文预览",
+                                )
+                            }
+                        },
+                    )
+                },
+            ) { innerPadding ->
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                        start = 20.dp,
+                        top = 16.dp,
+                        end = 20.dp,
+                        bottom = 32.dp,
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    item(key = "meta") {
+                        Text(
+                            text = listOfNotNull(preview.author, preview.chapterTitle).joinToString(" · "),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    item(key = "body") {
+                        Text(
+                            text = preview.body,
+                            fontSize = 16.sp,
+                            lineHeight = 27.sp,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SourceEditorWindow(
+    state: OnlineLibraryUiState,
+    onFormChange: (name: String?, url: String?, adapterId: String?) -> Unit,
+    onHtmlDraftChange: (HtmlSourceDraft) -> Unit,
+    onSave: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val adapterOptions = listOf(
+        dev.readflow.extensions.api.SourceAdapterIds.HTML_RULES_V1 to "网页书源",
+        dev.readflow.extensions.api.SourceAdapterIds.OPDS to "OPDS",
+        dev.readflow.extensions.api.SourceAdapterIds.JSON_HTTP to "JSON",
+        dev.readflow.extensions.api.SourceAdapterIds.CALIBRE to "Calibre",
+    )
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            dismissOnBackPress = true,
+            dismissOnClickOutside = false,
+        ),
+    ) {
+        BackHandler(onBack = onDismiss)
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.surface,
+        ) {
+            Scaffold(
+                topBar = {
+                    TopAppBar(
+                        title = { Text("添加书源") },
+                        navigationIcon = {
+                            IconButton(onClick = onDismiss) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = "返回在线书库",
+                                )
+                            }
+                        },
+                        actions = {
+                            TextButton(
+                                onClick = onSave,
+                                enabled = !state.isAddingSource,
+                            ) {
+                                Text(if (state.isAddingSource) "保存中" else "保存")
+                            }
+                        },
+                    )
+                },
+            ) { innerPadding ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 20.dp, vertical = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text("书源类型", style = MaterialTheme.typography.labelLarge)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        adapterOptions.forEach { (adapterId, label) ->
+                            FilterChip(
+                                selected = state.addSourceAdapterId == adapterId,
+                                onClick = { onFormChange(null, null, adapterId) },
+                                label = { Text(label, maxLines = 1) },
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = state.addSourceName,
+                        onValueChange = { onFormChange(it, null, null) },
+                        label = { Text("书源名称") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (state.addSourceAdapterId == dev.readflow.extensions.api.SourceAdapterIds.HTML_RULES_V1) {
+                        HtmlSourceRuleFields(
+                            draft = state.htmlSourceDraft,
+                            onChange = onHtmlDraftChange,
+                        )
+                    } else {
+                        val addressLabel = when (state.addSourceAdapterId) {
+                            dev.readflow.extensions.api.SourceAdapterIds.CALIBRE -> "Calibre 服务器地址"
+                            dev.readflow.extensions.api.SourceAdapterIds.OPDS -> "OPDS 地址"
+                            else -> "JSON 目录地址"
+                        }
+                        OutlinedTextField(
+                            value = state.addSourceUrl,
+                            onValueChange = { onFormChange(null, it, null) },
+                            label = { Text(addressLabel) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    state.error?.let { message ->
+                        Text(
+                            text = message,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                    Spacer(Modifier.height(24.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HtmlSourceRuleFields(
+    draft: HtmlSourceDraft,
+    onChange: (HtmlSourceDraft) -> Unit,
+) {
+    Text("搜索页规则", style = MaterialTheme.typography.labelLarge)
+    SourceRuleField(
+        value = draft.searchUrlTemplate,
+        label = "搜索地址模板",
+        onValueChange = { onChange(draft.copy(searchUrlTemplate = it)) },
+    )
+    SourceRuleField(
+        value = draft.itemSelector,
+        label = "结果条目选择器",
+        onValueChange = { onChange(draft.copy(itemSelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.titleSelector,
+        label = "书名选择器",
+        onValueChange = { onChange(draft.copy(titleSelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.authorSelector,
+        label = "作者选择器",
+        onValueChange = { onChange(draft.copy(authorSelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.detailLinkSelector,
+        label = "详情链接选择器",
+        onValueChange = { onChange(draft.copy(detailLinkSelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.seriesSelector,
+        label = "系列选择器（可选）",
+        onValueChange = { onChange(draft.copy(seriesSelector = it)) },
+    )
+    Text("目录与正文规则", style = MaterialTheme.typography.labelLarge)
+    SourceRuleField(
+        value = draft.chapterItemSelector,
+        label = "章节条目选择器",
+        onValueChange = { onChange(draft.copy(chapterItemSelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.chapterLinkSelector,
+        label = "章节链接选择器",
+        onValueChange = { onChange(draft.copy(chapterLinkSelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.chapterTitleSelector,
+        label = "章节标题选择器（可选）",
+        onValueChange = { onChange(draft.copy(chapterTitleSelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.bodySelector,
+        label = "正文选择器",
+        onValueChange = { onChange(draft.copy(bodySelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.nextPageSelector,
+        label = "章节下一页选择器（可选）",
+        onValueChange = { onChange(draft.copy(nextPageSelector = it)) },
+    )
+    SourceRuleField(
+        value = draft.additionalAllowedHosts,
+        label = "额外允许域名（可选）",
+        onValueChange = { onChange(draft.copy(additionalAllowedHosts = it)) },
+    )
+    SourceRuleField(
+        value = draft.charset,
+        label = "字符编码",
+        onValueChange = { onChange(draft.copy(charset = it)) },
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("允许局域网 HTTP", style = MaterialTheme.typography.bodyLarge)
+        Switch(
+            checked = draft.allowLanHttp,
+            onCheckedChange = { onChange(draft.copy(allowLanHttp = it)) },
+            modifier = Modifier.semantics { contentDescription = "允许局域网 HTTP" },
+        )
+    }
+}
+
+@Composable
+private fun SourceRuleField(
+    value: String,
+    label: String,
+    onValueChange: (String) -> Unit,
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun OnlineCatalogResultRow(
     entry: dev.readflow.extensions.api.OnlineCatalogEntry,
     selected: Boolean,
     isDownloading: Boolean,
+    canDownload: Boolean,
+    canPreview: Boolean,
+    canBatchAcrossSource: Boolean,
     onToggleSelect: () -> Unit,
     onDownload: () -> Unit,
     onPreview: () -> Unit,
@@ -633,56 +912,90 @@ private fun OnlineCatalogResultRow(
     onSeriesBatch: () -> Unit,
 ) {
     val book = entry.meta
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        OutlinedButton(onClick = onToggleSelect) {
-            Text(if (selected) "已选" else "选择")
-        }
-        BookCover(
-            book = book,
-            showProgress = false,
-            modifier = Modifier
-                .width(44.dp)
-                .height(64.dp),
-        )
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = book.title,
-                style = MaterialTheme.typography.titleSmall,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (canDownload) {
+                Checkbox(
+                    checked = selected,
+                    onCheckedChange = { onToggleSelect() },
+                    modifier = Modifier.semantics {
+                        contentDescription = if (selected) {
+                            "取消选择《${book.title}》"
+                        } else {
+                            "选择《${book.title}》"
+                        }
+                    },
+                )
+            }
+            BookCover(
+                book = book,
+                showProgress = false,
+                modifier = Modifier
+                    .width(44.dp)
+                    .height(64.dp),
             )
-            Text(
-                text = buildString {
-                    append(book.author)
-                    append(" · ")
-                    append(book.format.name)
-                    entry.series?.takeIf { it.isNotBlank() }?.let {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = book.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = buildString {
+                        append(book.author)
                         append(" · ")
-                        append(it)
-                    }
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = onAuthorBatch) { Text("同作者") }
-                if (!entry.series.isNullOrBlank()) {
-                    TextButton(onClick = onSeriesBatch) { Text("同系列") }
+                        append(book.format.name)
+                        entry.series?.takeIf { it.isNotBlank() }?.let {
+                            append(" · ")
+                            append(it)
+                        }
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (canDownload) {
+                OutlinedButton(
+                    onClick = onDownload,
+                    enabled = !isDownloading,
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Text(if (isDownloading) "下载中" else "下载")
                 }
-                TextButton(onClick = onPreview) { Text("预览") }
             }
         }
-        OutlinedButton(
-            onClick = onDownload,
-            enabled = !isDownloading,
-        ) {
-            Text(if (isDownloading) "下载中" else "下载")
+        if (canDownload || canPreview) {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                if (canDownload) {
+                    TextButton(onClick = onAuthorBatch) {
+                        Text(if (canBatchAcrossSource) "同作者全选" else "当前结果同作者")
+                    }
+                    if (!entry.series.isNullOrBlank()) {
+                        TextButton(onClick = onSeriesBatch) {
+                            Text(if (canBatchAcrossSource) "同系列全选" else "当前结果同系列")
+                        }
+                    }
+                }
+                if (canPreview) {
+                    TextButton(onClick = onPreview) { Text("正文预览") }
+                }
+            }
         }
     }
 }

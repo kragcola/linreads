@@ -22,7 +22,7 @@ import androidx.compose.ui.unit.dp
  */
 @Composable
 fun EmptyState(
-    onConnectCalibre: () -> Unit,
+    onOpenOnlineLibrary: () -> Unit,
     onImportLocal: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -47,7 +47,7 @@ fun EmptyState(
                 color = palette.ink,
             )
             Text(
-                "连接 Calibre，或导入本地文件",
+                "从在线书库下载，或导入本地文件",
                 style = ReadflowType.meta,
                 color = palette.inkSoft,
             )
@@ -59,10 +59,10 @@ fun EmptyState(
                 horizontalArrangement = Arrangement.spacedBy(Dimens.spaceMd),
             ) {
                 OutlinedButton(
-                    onClick = onConnectCalibre,
+                    onClick = onOpenOnlineLibrary,
                     border = BorderStroke(1.dp, palette.ink),
                 ) {
-                    Text("连接 Calibre", color = palette.ink, style = ReadflowType.ui)
+                    Text("在线书库", color = palette.ink, style = ReadflowType.ui)
                 }
                 OutlinedButton(
                     onClick = onImportLocal,

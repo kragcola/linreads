@@ -5,6 +5,7 @@ import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.extensions.api.OnlineCatalogEntry
+import dev.readflow.extensions.api.RemoteBookKey
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.SourceKind
 import dev.readflow.extensions.api.stableRemoteBookId
@@ -30,6 +31,15 @@ class GenericHttpOnlineCatalogTest {
 
     @get:Rule
     val tempFolder = TemporaryFolder()
+
+    @Test
+    fun htmlRulesV1AdapterIsAvailableAsADeclarativeSource() {
+        val adapterExists = runCatching {
+            Class.forName("dev.readflow.core.calibre.HtmlRulesV1SourceAdapterFactory")
+        }.isSuccess
+
+        assertTrue("HTML_RULES_V1 adapter must be registered as a first-class source", adapterExists)
+    }
 
     @Test
     fun searchParsesJsonCatalogAndAppliesQueryFilter() = runTest {
@@ -74,6 +84,38 @@ class GenericHttpOnlineCatalogTest {
         assertEquals(expectedId, entries.single().meta.id)
         assertEquals("Saga", entries.single().series)
         assertEquals("http://192.168.1.40:8080/covers/a1.jpg", entries.single().meta.coverUrl)
+        catalog.close()
+    }
+
+    @Test
+    fun pagedSearchFetchesAndParsesStaticCatalogOnlyOncePerSession() = runTest {
+        val base = "http://192.168.1.40:8080/catalog.json"
+        var requestCount = 0
+        val catalog = catalog(
+            kind = SourceKind.JSON_HTTP,
+            baseUrl = base,
+            engine = MockEngine {
+                requestCount += 1
+                respond(
+                    """
+                    {"books":[
+                      {"id":"a","title":"A","author":"Ann","format":"epub"},
+                      {"id":"b","title":"B","author":"Ann","format":"epub"}
+                    ]}
+                    """.trimIndent(),
+                    headers = headersOf(HttpHeaders.ContentType, "application/json"),
+                )
+            },
+        )
+
+        val first = catalog.search(query = "", offset = 0, limit = 1)
+        val second = catalog.search(query = "", offset = 1, limit = 1)
+
+        assertTrue(first is ReadflowResult.Success)
+        assertTrue(second is ReadflowResult.Success)
+        assertEquals("A", (first as ReadflowResult.Success).value.single().meta.title)
+        assertEquals("B", (second as ReadflowResult.Success).value.single().meta.title)
+        assertEquals(1, requestCount)
         catalog.close()
     }
 
@@ -176,6 +218,39 @@ class GenericHttpOnlineCatalogTest {
         val downloaded = catalog.download(entry) as ReadflowResult.Success
         assertEquals(expected, downloaded.value.id)
         assertEquals(DownloadStatus.DOWNLOADED, downloaded.value.downloadStatus)
+        catalog.close()
+    }
+
+    @Test
+    fun downloadRejectsEntryFromAnotherSource() = runTest {
+        val base = "http://192.168.1.42:8080/catalog.json"
+        val booksDir = tempFolder.newFolder("books-cross-source")
+        var requestCount = 0
+        val catalog = catalog(
+            kind = SourceKind.JSON_HTTP,
+            baseUrl = base,
+            booksDir = booksDir,
+            engine = MockEngine {
+                requestCount += 1
+                respond("unexpected")
+            },
+        )
+        val entry = OnlineCatalogEntry(
+            meta = BookMeta(
+                id = stableRemoteBookId("source-other", "shared"),
+                title = "Other",
+                author = "Author",
+                format = BookFormat.EPUB,
+            ),
+            remoteKey = RemoteBookKey("source-other", "shared"),
+            downloadUrl = "http://192.168.1.42:8080/files/shared.epub",
+        )
+
+        val result = catalog.download(entry)
+
+        assertTrue(result is ReadflowResult.Failure)
+        assertEquals(0, requestCount)
+        assertTrue(booksDir.listFiles().isNullOrEmpty())
         catalog.close()
     }
 
@@ -313,7 +388,7 @@ class GenericHttpOnlineCatalogTest {
     }
 
     @Test
-    fun previewUrlRejectsCrossOriginAndPublicHttp() = runTest {
+    fun genericCatalogDoesNotClaimApplicationOwnedTextPreview() = runTest {
         val base = "http://192.168.1.43:8080/catalog.json"
         val catalog = catalog(
             kind = SourceKind.JSON_HTTP,
@@ -321,7 +396,7 @@ class GenericHttpOnlineCatalogTest {
             engine = MockEngine { respond("[]") },
         )
 
-        val crossOrigin = catalog.previewUrl(
+        val crossOrigin = catalog.preview(
             OnlineCatalogEntry(
                 meta = BookMeta(id = "1", title = "t", author = "a", format = BookFormat.EPUB),
                 previewUrl = "http://192.168.1.99:8080/cover.jpg",
@@ -329,7 +404,7 @@ class GenericHttpOnlineCatalogTest {
         )
         assertTrue(crossOrigin is ReadflowResult.Failure)
 
-        val publicHttp = catalog.previewUrl(
+        val publicHttp = catalog.preview(
             OnlineCatalogEntry(
                 meta = BookMeta(id = "2", title = "t", author = "a", format = BookFormat.EPUB),
                 previewUrl = "http://example.com/cover.jpg",
@@ -337,14 +412,14 @@ class GenericHttpOnlineCatalogTest {
         )
         assertTrue(publicHttp is ReadflowResult.Failure)
 
-        val safe = catalog.previewUrl(
+        val safe = catalog.preview(
             OnlineCatalogEntry(
                 meta = BookMeta(id = "3", title = "t", author = "a", format = BookFormat.EPUB),
                 previewUrl = "http://192.168.1.43:8080/cover.jpg",
             ),
         )
-        assertTrue(safe is ReadflowResult.Success)
-        assertEquals("http://192.168.1.43:8080/cover.jpg", (safe as ReadflowResult.Success).value)
+        assertTrue(safe is ReadflowResult.Failure)
+        assertFalse(catalog.capabilities.canPreviewText)
         catalog.close()
     }
 
@@ -375,6 +450,10 @@ class GenericHttpOnlineCatalogTest {
         assertEquals(
             "http://192.168.1.40:8080/covers/x.jpg",
             sanitizeCatalogMediaUrl("http://192.168.1.40:8080/covers/x.jpg", base),
+        )
+        assertEquals(
+            "http://192.168.1.40:8080/covers/relative.jpg",
+            sanitizeCatalogMediaUrl("/covers/relative.jpg", base),
         )
     }
 

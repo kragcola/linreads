@@ -70,6 +70,7 @@ import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.EpubCssFontFamilyInfo
+import dev.readflow.render.api.EpubCssFontEffectiveSource as ApiEpubCssFontEffectiveSource
 import dev.readflow.render.api.EpubCssFontMappingStatus as ApiEpubCssFontMappingStatus
 import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PagedReaderEngine
@@ -282,6 +283,8 @@ class EpubReflowEngine private constructor(
     /** Book-scoped embedded fonts for the open EPUB; cleared on close/reset. */
     private var bookFontTypefaceCache: EpubBookFontTypefaceCache? = null
     private var flowBookFontMap: EpubBookFontMap = EpubBookFontMap.EMPTY
+    private var epubBookFontReplacementIds: Map<String, String> = emptyMap()
+    private var epubGlobalFontReplacementIds: Map<String, String> = emptyMap()
     private var epubFontReplacementIds: Map<String, String> = emptyMap()
     private var epubFontReplacementTypefaces: Map<String, Typeface> = emptyMap()
     private var internalLinkTargetIndexes: Map<String, EpubTargetPosition> = emptyMap()
@@ -1312,7 +1315,8 @@ class EpubReflowEngine private constructor(
                 { cssFamily ->
                     resolveEpubCssTypeface(
                         cssFontFamily = cssFamily,
-                        replacements = epubFontReplacementIds,
+                        bookReplacements = epubBookFontReplacementIds,
+                        globalReplacements = epubGlobalFontReplacementIds,
                         bookFonts = bookFonts,
                         replacementResolver = epubFontReplacementTypefaces::get,
                         embeddedResolver = { face -> fontCache?.typefaceFor(face) },
@@ -3205,11 +3209,25 @@ class EpubReflowEngine private constructor(
     }
 
     override suspend fun setEpubFontReplacements(replacements: Map<String, String>) {
-        val canonicalIds = replacements.mapNotNull { (family, fontId) ->
+        setEpubFontReplacementLayers(
+            bookReplacements = replacements,
+            globalReplacements = emptyMap(),
+        )
+    }
+
+    override suspend fun setEpubFontReplacementLayers(
+        bookReplacements: Map<String, String>,
+        globalReplacements: Map<String, String>,
+    ) {
+        fun canonicalize(replacements: Map<String, String>): Map<String, String> =
+            replacements.mapNotNull { (family, fontId) ->
             val key = normalizeFontFamilyKey(family) ?: return@mapNotNull null
             if (key in GENERIC_FONT_FAMILIES) return@mapNotNull null
             key to fontId
         }.toMap()
+        val canonicalBook = canonicalize(bookReplacements)
+        val canonicalGlobal = canonicalize(globalReplacements)
+        val canonicalIds = mergeReplacementLayers(canonicalBook, canonicalGlobal)
         val loaded = withContext(Dispatchers.IO) {
             canonicalIds.values.distinct().mapNotNull { fontId ->
                 // A missing imported font must fall through to an embedded face/default.
@@ -3220,8 +3238,12 @@ class EpubReflowEngine private constructor(
         withContext(Dispatchers.Main) {
             if (
                 canonicalIds == epubFontReplacementIds &&
+                canonicalBook == epubBookFontReplacementIds &&
+                canonicalGlobal == epubGlobalFontReplacementIds &&
                 loaded.keys == epubFontReplacementTypefaces.keys
             ) return@withContext
+            epubBookFontReplacementIds = canonicalBook
+            epubGlobalFontReplacementIds = canonicalGlobal
             epubFontReplacementIds = canonicalIds
             epubFontReplacementTypefaces = loaded
             if (flowEngineEnabled && flowView != null) rebuildFlowChapter()
@@ -3240,19 +3262,65 @@ class EpubReflowEngine private constructor(
         return book.cssFontCatalog(
             bookReplacements = bookReplacements,
             globalReplacements = globalReplacements,
+            availableReplacementIds = epubFontReplacementTypefaces.keys,
         ).map { entry ->
             EpubCssFontFamilyInfo(
                 family = entry.family,
                 displayName = entry.displayName,
+                fontFamilyChain = entry.fontFamilyChain,
                 status = when (entry.status) {
                     EpubCssFontMappingStatus.BOOK_MAPPED -> ApiEpubCssFontMappingStatus.BOOK_MAPPED
                     EpubCssFontMappingStatus.GLOBAL_MAPPED -> ApiEpubCssFontMappingStatus.GLOBAL_MAPPED
                     EpubCssFontMappingStatus.EMBEDDED -> ApiEpubCssFontMappingStatus.EMBEDDED
                     EpubCssFontMappingStatus.UNRESOLVED -> ApiEpubCssFontMappingStatus.UNRESOLVED
                 },
+                effectiveSource = when (entry.effectiveSource) {
+                    EpubCssFontEffectiveSource.BOOK_MAPPING -> ApiEpubCssFontEffectiveSource.BOOK_MAPPING
+                    EpubCssFontEffectiveSource.GLOBAL_MAPPING -> ApiEpubCssFontEffectiveSource.GLOBAL_MAPPING
+                    EpubCssFontEffectiveSource.EMBEDDED -> ApiEpubCssFontEffectiveSource.EMBEDDED
+                    EpubCssFontEffectiveSource.DEFAULT -> ApiEpubCssFontEffectiveSource.DEFAULT
+                },
+                effectiveFamily = entry.effectiveFamily,
                 mappedFontId = entry.mappedFontId,
                 embeddedSrcPath = entry.embeddedSrcPath,
+                occurrenceCount = entry.occurrenceCount,
+                coveredChars = entry.coveredChars,
+                excerpt = entry.excerpt,
+                excerptMatchStart = entry.excerptMatchStart,
+                excerptMatchEnd = entry.excerptMatchEnd,
+                excerptSpineIndex = entry.excerptSpineIndex,
             )
+        }
+    }
+
+    override suspend fun epubCssFontPreviewTypeface(entry: EpubCssFontFamilyInfo): Typeface? {
+        val book = lazyBook ?: return null
+        val cache = bookFontTypefaceCache
+        val bookFonts = book.bookFontMapForSpine(entry.excerptSpineIndex).let { spineFonts ->
+            if (spineFonts.facesByFamily.isNotEmpty()) spineFonts else book.mergedBookFontMap()
+        }
+        val bookReplacements = epubBookFontReplacementIds
+        val globalReplacements = epubGlobalFontReplacementIds
+        val replacementTypefaces = epubFontReplacementTypefaces
+        val defaultFontId = currentFontId
+        return withContext(Dispatchers.IO) {
+            if (cache != null) {
+                val embeddedCandidates = epubCssFontResolutionCandidates(
+                    fontFamilyChain = entry.fontFamilyChain,
+                    bookReplacements = bookReplacements,
+                    globalReplacements = globalReplacements,
+                    bookFonts = bookFonts,
+                ).mapNotNull(EpubCssFontResolutionCandidate::embeddedFace).toList()
+                cache.prewarm(embeddedCandidates)
+            }
+            resolveEpubCssTypeface(
+                cssFontFamily = entry.fontFamilyChain.joinToString(", "),
+                bookReplacements = bookReplacements,
+                globalReplacements = globalReplacements,
+                bookFonts = bookFonts,
+                replacementResolver = replacementTypefaces::get,
+                embeddedResolver = { face -> cache?.typefaceFor(face) },
+            ) ?: dev.readflow.core.ui.FontProvider.typefaceFor(context, defaultFontId)
         }
     }
 

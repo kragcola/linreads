@@ -112,6 +112,113 @@ internal fun resolveCssFontFamily(
     bookFonts: EpubBookFontMap,
 ): EpubFontFace? = bookFonts.faceForFamily(cssFontFamily)
 
+internal enum class EpubCssFontEffectiveSource {
+    BOOK_MAPPING,
+    GLOBAL_MAPPING,
+    EMBEDDED,
+    DEFAULT,
+}
+
+internal data class EpubCssFontResolutionCandidate(
+    val source: EpubCssFontEffectiveSource,
+    val effectiveFamily: String,
+    val mappedFontId: String? = null,
+    val embeddedFace: EpubFontFace? = null,
+)
+
+internal data class EpubCssFontEffectiveResolution(
+    val source: EpubCssFontEffectiveSource,
+    val effectiveFamily: String?,
+    val mappedFontId: String? = null,
+    val embeddedFace: EpubFontFace? = null,
+)
+
+internal fun epubCssFontResolutionCandidates(
+    fontFamilyChain: List<String>,
+    bookReplacements: Map<String, String>,
+    globalReplacements: Map<String, String>,
+    bookFonts: EpubBookFontMap,
+): Sequence<EpubCssFontResolutionCandidate> = sequence {
+    fontFamilyChain.forEach { token ->
+        val key = normalizeFontFamilyKey(token) ?: return@forEach
+        if (key in GENERIC_FONT_FAMILIES) return@forEach
+        val replacementKeys = buildList {
+            add(key)
+            moonStyleBaseFontReplacementKey(key)
+                ?.takeIf { it != key && it.isNotEmpty() }
+                ?.let(::add)
+        }
+        replacementKeys.forEach { replacementKey ->
+            bookReplacements[replacementKey]?.let { fontId ->
+                yield(
+                    EpubCssFontResolutionCandidate(
+                        source = EpubCssFontEffectiveSource.BOOK_MAPPING,
+                        effectiveFamily = key,
+                        mappedFontId = fontId,
+                    ),
+                )
+            }
+        }
+        replacementKeys.forEach { replacementKey ->
+            globalReplacements[replacementKey]?.let { fontId ->
+                yield(
+                    EpubCssFontResolutionCandidate(
+                        source = EpubCssFontEffectiveSource.GLOBAL_MAPPING,
+                        effectiveFamily = key,
+                        mappedFontId = fontId,
+                    ),
+                )
+            }
+        }
+        bookFonts.facesByFamily[key]?.let { face ->
+            yield(
+                EpubCssFontResolutionCandidate(
+                    source = EpubCssFontEffectiveSource.EMBEDDED,
+                    effectiveFamily = key,
+                    embeddedFace = face,
+                ),
+            )
+        }
+    }
+}
+
+internal fun resolveEpubCssFontEffectiveSource(
+    fontFamilyChain: List<String>,
+    bookReplacements: Map<String, String>,
+    globalReplacements: Map<String, String>,
+    bookFonts: EpubBookFontMap,
+    availableReplacementIds: Set<String>? = null,
+    availableEmbeddedPaths: Set<String>? = null,
+): EpubCssFontEffectiveResolution {
+    epubCssFontResolutionCandidates(
+        fontFamilyChain = fontFamilyChain,
+        bookReplacements = bookReplacements,
+        globalReplacements = globalReplacements,
+        bookFonts = bookFonts,
+    ).forEach { candidate ->
+        val available = when (candidate.source) {
+            EpubCssFontEffectiveSource.BOOK_MAPPING,
+            EpubCssFontEffectiveSource.GLOBAL_MAPPING,
+            -> availableReplacementIds?.let { candidate.mappedFontId in it } ?: true
+            EpubCssFontEffectiveSource.EMBEDDED ->
+                availableEmbeddedPaths?.let { candidate.embeddedFace?.srcPath in it } ?: true
+            EpubCssFontEffectiveSource.DEFAULT -> false
+        }
+        if (available) {
+            return EpubCssFontEffectiveResolution(
+                source = candidate.source,
+                effectiveFamily = candidate.effectiveFamily,
+                mappedFontId = candidate.mappedFontId,
+                embeddedFace = candidate.embeddedFace,
+            )
+        }
+    }
+    return EpubCssFontEffectiveResolution(
+        source = EpubCssFontEffectiveSource.DEFAULT,
+        effectiveFamily = fontFamilyChain.firstOrNull { it !in GENERIC_FONT_FAMILIES },
+    )
+}
+
 /**
  * Resolves a CSS `font-family` list against layered replacements and embedded faces.
  *
@@ -127,14 +234,23 @@ internal fun resolveEpubCssTypeface(
     replacementResolver: (String) -> Typeface?,
     embeddedResolver: (EpubFontFace) -> Typeface?,
 ): Typeface? {
-    val layered = mergeReplacementLayers(bookReplacements, globalReplacements)
-    return resolveEpubCssTypeface(
-        cssFontFamily = cssFontFamily,
-        replacements = layered,
+    val chain = splitCssFontFamilyList(cssFontFamily.orEmpty()).mapNotNull(::normalizeFontFamilyKey)
+    epubCssFontResolutionCandidates(
+        fontFamilyChain = chain,
+        bookReplacements = bookReplacements,
+        globalReplacements = globalReplacements,
         bookFonts = bookFonts,
-        replacementResolver = replacementResolver,
-        embeddedResolver = embeddedResolver,
-    )
+    ).forEach { candidate ->
+        when (candidate.source) {
+            EpubCssFontEffectiveSource.BOOK_MAPPING,
+            EpubCssFontEffectiveSource.GLOBAL_MAPPING,
+            -> candidate.mappedFontId?.let(replacementResolver)?.let { return it }
+            EpubCssFontEffectiveSource.EMBEDDED ->
+                candidate.embeddedFace?.let(embeddedResolver)?.let { return it }
+            EpubCssFontEffectiveSource.DEFAULT -> Unit
+        }
+    }
+    return null
 }
 
 /**
@@ -151,25 +267,14 @@ internal fun resolveEpubCssTypeface(
     replacementResolver: (String) -> Typeface?,
     embeddedResolver: (EpubFontFace) -> Typeface?,
 ): Typeface? {
-    for (token in splitCssFontFamilyList(cssFontFamily.orEmpty())) {
-        val key = normalizeFontFamilyKey(token) ?: continue
-        if (key in GENERIC_FONT_FAMILIES) continue
-        // Exact replacement first; if mapped but resolver returns null, still try Moon base key.
-        replacements[key]?.let { replacementId ->
-            replacementResolver(replacementId)?.let { return it }
-        }
-        // MoonReader-compatible base key for replacement lookup only (never for embedded faces).
-        val baseKey = moonStyleBaseFontReplacementKey(key)
-        if (baseKey != null && baseKey != key && baseKey.isNotEmpty()) {
-            replacements[baseKey]?.let { replacementId ->
-                replacementResolver(replacementId)?.let { return it }
-            }
-        }
-        bookFonts.facesByFamily[key]?.let { face ->
-            embeddedResolver(face)?.let { return it }
-        }
-    }
-    return null
+    return resolveEpubCssTypeface(
+        cssFontFamily = cssFontFamily,
+        bookReplacements = replacements,
+        globalReplacements = emptyMap(),
+        bookFonts = bookFonts,
+        replacementResolver = replacementResolver,
+        embeddedResolver = embeddedResolver,
+    )
 }
 
 /** Book map entries override global for the same canonical family key. */

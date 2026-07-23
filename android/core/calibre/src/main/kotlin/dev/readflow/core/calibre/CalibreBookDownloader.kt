@@ -21,7 +21,10 @@ class CalibreBookDownloader(
     private val client: CalibreClient,
     private val booksDir: File,
 ) {
-    suspend fun download(meta: CalibreBookMeta): ReadflowResult<CalibreDownloadedBook> =
+    suspend fun download(
+        meta: CalibreBookMeta,
+        localBookId: String = "calibre-${meta.id}",
+    ): ReadflowResult<CalibreDownloadedBook> =
         withContext(Dispatchers.IO) {
             val choice = meta.bestDownloadFormat()
                 ?: return@withContext ReadflowResult.Failure(
@@ -29,7 +32,7 @@ class CalibreBookDownloader(
                 )
             runCatching {
                 booksDir.mkdirs()
-                val bookId = "calibre-${meta.id}"
+                val bookId = localBookId
                 val outFile = File(booksDir, "$bookId.${choice.remoteFormat.lowercase()}")
                 val stagingFile = File.createTempFile("$bookId-", ".part", booksDir)
                 try {

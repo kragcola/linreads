@@ -27,7 +27,7 @@ internal class EpubLazyBook(
     private val paragraphBlockIndexes: List<Int>,
     private val layoutBlocks: List<EpubDisplayBlock>,
     private val bookFontMapsBySpine: Map<Int, EpubBookFontMap>,
-    private val referencedFontFamiliesBySpine: Map<Int, Set<String>>,
+    private val cssFontUsages: List<EpubCssFontUsage>,
     maxCachedSpines: Int,
 ) {
     private val cacheLimit = maxCachedSpines.coerceAtLeast(1)
@@ -117,13 +117,15 @@ internal class EpubLazyBook(
     fun cssFontCatalog(
         bookReplacements: Map<String, String> = emptyMap(),
         globalReplacements: Map<String, String> = emptyMap(),
+        availableReplacementIds: Set<String>? = null,
     ): List<EpubCssFontFamilyEntry> {
         val merged = mergedBookFontMap()
         return buildEpubCssFontCatalog(
             embeddedFaces = merged.facesByFamily,
             bookReplacements = bookReplacements,
             globalReplacements = globalReplacements,
-            referencedFamilies = referencedFontFamiliesBySpine.values.flatten(),
+            fontUsages = cssFontUsages,
+            availableReplacementIds = availableReplacementIds,
         )
     }
 
@@ -192,7 +194,7 @@ internal class EpubLazyBook(
                 paragraphBlockIndexes = emptyList(),
                 layoutBlocks = emptyList(),
                 bookFontMapsBySpine = emptyMap(),
-                referencedFontFamiliesBySpine = emptyMap(),
+                cssFontUsages = emptyList(),
                 maxCachedSpines = maxCachedSpines,
             )
     }

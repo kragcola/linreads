@@ -3,10 +3,8 @@ package dev.readflow.di
 import android.app.Application
 import androidx.room.Room
 import androidx.room.withTransaction
-import dev.readflow.core.calibre.CalibreClient
-import dev.readflow.core.calibre.CalibreRepository
-import dev.readflow.core.calibre.CalibreRepositoryImpl
 import dev.readflow.core.calibre.DefaultSourceRegistry
+import dev.readflow.core.calibre.defaultSourceAdapterRegistry
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.database.LibraryStore
 import dev.readflow.core.database.CompleteBookDeletionStore
@@ -18,6 +16,7 @@ import dev.readflow.core.database.RoomSourceConfigStore
 import dev.readflow.core.database.SourceConfigStore
 import dev.readflow.core.database.MIGRATION_4_5
 import dev.readflow.core.database.MIGRATION_5_6
+import dev.readflow.core.database.MIGRATION_6_7
 import dev.readflow.core.prefs.DataStoreSettingsRepository
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.model.BookAssetOperationCoordinator
@@ -29,6 +28,7 @@ import dev.readflow.extensions.api.LocalBookImporter
 import dev.readflow.extensions.api.LocalFileBookSource
 import dev.readflow.extensions.api.ReaderEventBus
 import dev.readflow.extensions.api.SourceRegistry
+import dev.readflow.extensions.api.SourceAdapterRegistry
 import dev.readflow.features.library.LibraryViewModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -58,7 +58,7 @@ val databaseModule = module {
             ReadflowDatabase::class.java,
             "readflow.db",
         )
-            .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
+            .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
             .build()
     }
     single { get<ReadflowDatabase>().bookDao() }
@@ -93,25 +93,21 @@ val extensionsModule = module {
 
 val settingsModule = module {
     single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
-    single<(String) -> CalibreRepository> {
-        { baseUrl ->
-            CalibreRepositoryImpl(
-                client = CalibreClient(baseUrl),
-                booksDir = File(androidContext().filesDir, "books"),
-            )
-        }
+    single<SourceAdapterRegistry> {
+        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"))
     }
     single<SourceRegistry> {
         DefaultSourceRegistry(
             settings = get(),
             sourceConfigStore = get(),
             booksDir = File(androidContext().filesDir, "books"),
+            sourceAdapters = get(),
         )
     }
 }
 
 val featureModule = module {
-    viewModel { LibraryViewModel(get(), get(), get(), get(), get(), get()) }
+    viewModel { LibraryViewModel(get(), get(), get(), get()) }
 }
 
 val appModules = listOf(coreModule, databaseModule, extensionsModule, settingsModule, featureModule)

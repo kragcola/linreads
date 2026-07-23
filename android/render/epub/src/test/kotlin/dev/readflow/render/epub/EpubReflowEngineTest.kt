@@ -5874,6 +5874,7 @@ class EpubReflowEngineTest {
                 runCurrent()
             }
             awaitCondition("prewarm rebuild must install an EpubTypefaceSpan on the CSS family span") {
+                runCurrent()
                 flowTypefaceSpans(flowView).any { epubTypefaceSpanBase(it) === embedded }
             }
             val hotSpan = flowTypefaceSpans(flowView).single {
@@ -5961,6 +5962,49 @@ class EpubReflowEngineTest {
             assertSame(restoredMeasure.typeface, restoredDraw.typeface)
             assertNotNull(restoredMeasure.typeface)
 
+            engine.close()
+        }
+
+    @Test
+    fun `font preview resolver returns the actual later embedded fallback typeface`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val epub = tempDir.newFile("font-preview-fallback.epub")
+            writeFontEmbeddedEpub(epub, cssFamily = "Unknown, Story, serif")
+            val context = RuntimeEnvironment.getApplication() as Application
+            val engine = EpubReflowEngine(
+                context = context,
+                flowEngineEnabled = true,
+                epubParserFactory = { EpubParser() },
+                fullIndexDispatcher = dispatcher,
+            )
+            engine.openBook(Uri.fromFile(epub))
+            awaitCondition("font catalog full index must promote on Main") {
+                runCurrent()
+                engine.privateField("startupSession") == null
+            }
+            val embeddedTypeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
+            engine.setPrivateField(
+                "bookFontTypefaceCache",
+                EpubBookFontTypefaceCache(
+                    cacheRoot = tempDir.newFolder("font-preview-cache"),
+                    bookCacheKey = "font-preview-fallback",
+                    bytesForPath = { byteArrayOf(1, 2, 3, 4) },
+                    typefaceFromFile = { embeddedTypeface },
+                ),
+            )
+
+            val entry = engine.epubCssFontCatalog().single()
+            val preview = engine.epubCssFontPreviewTypeface(entry)
+
+            assertEquals("unknown", entry.family)
+            assertEquals(listOf("unknown", "story", "serif"), entry.fontFamilyChain)
+            assertEquals(
+                dev.readflow.render.api.EpubCssFontMappingStatus.EMBEDDED,
+                entry.status,
+            )
+            assertEquals("story", entry.effectiveFamily)
+            assertSame(embeddedTypeface, preview)
             engine.close()
         }
 
@@ -6402,7 +6446,7 @@ class EpubReflowEngineTest {
     }
 
     /** Minimal real-zip EPUB with CSS @font-face + a non-generic family span. */
-    private fun writeFontEmbeddedEpub(file: File) {
+    private fun writeFontEmbeddedEpub(file: File, cssFamily: String = "\"Story\", serif") {
         ZipOutputStream(file.outputStream()).use { zip ->
             fun add(path: String, bytes: ByteArray) {
                 zip.putNextEntry(ZipEntry(path))
@@ -6444,7 +6488,7 @@ class EpubReflowEngineTest {
                             font-family: "Story";
                             src: url("fonts/story.ttf") format("truetype");
                           }
-                          .story { font-family: "Story", serif; }
+                          .story { font-family: $cssFamily; }
                         </style>
                       </head>
                       <body>

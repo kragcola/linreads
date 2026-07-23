@@ -6,10 +6,12 @@ import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.extensions.api.OnlineBookCatalog
+import dev.readflow.extensions.api.OnlineBookPreview
 import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.RemoteBookKey
+import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceDescriptor
-import dev.readflow.extensions.api.SourceKind
 import dev.readflow.extensions.api.applyCatalogFilter
 import dev.readflow.extensions.api.stableRemoteBookId
 import io.ktor.client.HttpClient
@@ -33,6 +35,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
@@ -48,11 +51,19 @@ import org.xmlpull.v1.XmlPullParserFactory
  * { "id","title","author","format","series","tags","downloadUrl","coverUrl","previewUrl" }
  * ```
  */
+enum class GenericCatalogWireFormat { OPDS, JSON }
+
 class GenericHttpOnlineCatalog(
     override val descriptor: SourceDescriptor,
     private val booksDir: File,
+    private val wireFormat: GenericCatalogWireFormat = when (descriptor.adapterId) {
+        SourceAdapterIds.OPDS -> GenericCatalogWireFormat.OPDS
+        else -> GenericCatalogWireFormat.JSON
+    },
     private val http: HttpClient = defaultGenericSourceHttpClient(descriptor.baseUrl),
 ) : OnlineBookCatalog {
+    private val entriesMutex = Mutex()
+    private var cachedEntries: List<OnlineCatalogEntry>? = null
 
     override suspend fun search(
         query: String,
@@ -60,39 +71,52 @@ class GenericHttpOnlineCatalog(
         offset: Int,
         limit: Int,
     ): ReadflowResult<List<OnlineCatalogEntry>> =
-        runCatching {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val q = query.trim()
+                val filtered = loadEntries()
+                    .filter { entry ->
+                        q.isEmpty() ||
+                            entry.meta.title.contains(q, ignoreCase = true) ||
+                            entry.meta.author.contains(q, ignoreCase = true) ||
+                            entry.series?.contains(q, ignoreCase = true) == true ||
+                            entry.tags.any { it.contains(q, ignoreCase = true) }
+                    }
+                    .applyCatalogFilter(filter)
+                    .drop(offset.coerceAtLeast(0))
+                    .take(limit.coerceAtLeast(1))
+                ReadflowResult.Success(filtered)
+            }.getOrElse { error ->
+                if (error is CancellationException) throw error
+                ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "书源请求失败"))
+            }
+        }
+
+    private suspend fun loadEntries(): List<OnlineCatalogEntry> {
+        entriesMutex.lock()
+        try {
+            cachedEntries?.let { return it }
             requireAllowedCalibreRequestUrl(descriptor.baseUrl)
             val body = http.prepareGet(descriptor.baseUrl).execute { response ->
                 readCatalogBody(response.bodyAsChannel())
             }
-            val entries = when (descriptor.kind) {
-                SourceKind.OPDS -> parseOpdsFeed(body, descriptor)
-                SourceKind.JSON_HTTP -> parseJsonCatalog(body, descriptor)
-                SourceKind.CALIBRE -> error("Use CalibreOnlineCatalog for Calibre")
-            }
-            val q = query.trim()
-            val filtered = entries
-                .filter { entry ->
-                    q.isEmpty() ||
-                        entry.meta.title.contains(q, ignoreCase = true) ||
-                        entry.meta.author.contains(q, ignoreCase = true) ||
-                        entry.series?.contains(q, ignoreCase = true) == true ||
-                        entry.tags.any { it.contains(q, ignoreCase = true) }
-                }
-                .applyCatalogFilter(filter)
-                .drop(offset.coerceAtLeast(0))
-                .take(limit.coerceAtLeast(1))
-            ReadflowResult.Success(filtered)
-        }.getOrElse { error ->
-            if (error is CancellationException) throw error
-            ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "书源请求失败"))
+            return when (wireFormat) {
+                GenericCatalogWireFormat.OPDS -> parseOpdsFeed(body, descriptor)
+                GenericCatalogWireFormat.JSON -> parseJsonCatalog(body, descriptor)
+            }.also { cachedEntries = it }
+        } finally {
+            entriesMutex.unlock()
         }
+    }
 
     override suspend fun download(entry: OnlineCatalogEntry): ReadflowResult<BookMeta> =
         withContext(Dispatchers.IO) {
             val downloadUrl = entry.downloadUrl
                 ?: return@withContext ReadflowResult.Failure(ReadflowError.unsupported("该条目没有下载地址"))
             runCatching {
+                entry.remoteKey?.let { key ->
+                    require(key.sourceId == descriptor.id) { "搜索结果不属于当前书源" }
+                }
                 requireAllowedCalibreRequestUrl(downloadUrl)
                 requireSameCalibreOrigin(downloadUrl, descriptor.baseUrl)
                 booksDir.mkdirs()
@@ -101,8 +125,9 @@ class GenericHttpOnlineCatalog(
                     BookFormat.UNKNOWN -> extensionFromUrl(downloadUrl) ?: "bin"
                     else -> format.name.lowercase()
                 }
-                // Search parse already assigns stableRemoteBookId; raw ids (tests / manual) still hash once.
-                val bookId = shelfBookId(descriptor.id, entry.meta.id)
+                val bookId = entry.remoteKey
+                    ?.let { stableRemoteBookId(descriptor.id, it.remoteId) }
+                    ?: shelfBookId(descriptor.id, entry.meta.id)
                 val outFile = File(booksDir, "$bookId.$ext")
                 val stagingFile = File.createTempFile("$bookId-", ".part", booksDir)
                 try {
@@ -150,17 +175,8 @@ class GenericHttpOnlineCatalog(
             }
         }
 
-    override suspend fun previewUrl(entry: OnlineCatalogEntry): ReadflowResult<String> =
-        runCatching {
-            val url = entry.previewUrl ?: entry.meta.coverUrl
-                ?: return ReadflowResult.Failure(ReadflowError.notFound("preview", entry.meta.id))
-            requireAllowedCalibreRequestUrl(url)
-            requireSameCalibreOrigin(url, descriptor.baseUrl)
-            ReadflowResult.Success(url)
-        }.getOrElse { error ->
-            if (error is CancellationException) throw error
-            ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "预览地址不安全"))
-        }
+    override suspend fun preview(entry: OnlineCatalogEntry): ReadflowResult<OnlineBookPreview> =
+        ReadflowResult.Failure(ReadflowError.unsupported("该目录不提供应用内正文预览，请先下载"))
 
     override fun close() {
         http.close()
@@ -239,10 +255,12 @@ private fun parseJsonCatalog(body: String, descriptor: SourceDescriptor): List<O
                 coverUrl = safeCover,
                 downloadStatus = DownloadStatus.NOT_DOWNLOADED,
             ),
+            remoteKey = RemoteBookKey(descriptor.id, rawId),
             series = book.series,
             tags = book.tags,
             availableFormats = listOfNotNull(book.format),
-            downloadUrl = book.downloadUrl,
+            downloadUrl = book.downloadUrl?.let { resolveAgainstBase(it, descriptor.baseUrl) },
+            detailReference = null,
             previewUrl = safePreview,
         )
     }
@@ -287,6 +305,7 @@ private fun parseOpdsFeed(body: String, descriptor: SourceDescriptor): List<Onli
                 coverUrl = safeCover,
                 downloadStatus = DownloadStatus.NOT_DOWNLOADED,
             ),
+            remoteKey = RemoteBookKey(descriptor.id, rawId),
             series = series,
             tags = tags.toList(),
             availableFormats = listOfNotNull(formatHint) +
@@ -389,9 +408,10 @@ private fun acquisitionPreferenceRank(candidate: OpdsAcquisitionCandidate): Int 
 internal fun sanitizeCatalogMediaUrl(url: String?, baseUrl: String): String? {
     if (url.isNullOrBlank()) return null
     return runCatching {
-        requireAllowedCalibreRequestUrl(url)
-        requireSameCalibreOrigin(url, baseUrl)
-        url
+        val resolved = resolveAgainstBase(url, baseUrl)
+        requireAllowedCalibreRequestUrl(resolved)
+        requireSameCalibreOrigin(resolved, baseUrl)
+        resolved
     }.getOrNull()
 }
 

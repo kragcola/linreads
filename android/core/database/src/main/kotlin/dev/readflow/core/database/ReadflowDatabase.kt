@@ -5,6 +5,8 @@ import androidx.room.Database
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 
 /** Room database aggregating library + reading tables (§7.8) and online source configs. */
 @Database(
@@ -17,7 +19,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ReadingSessionEntity::class,
         BookSourceEntity::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 1, to = 2),
@@ -67,4 +69,38 @@ val MIGRATION_5_6 = object : Migration(5, 6) {
             """.trimIndent(),
         )
     }
+}
+
+val MIGRATION_6_7 = object : Migration(6, 7) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE book_sources ADD COLUMN adapterId TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE book_sources ADD COLUMN configJson TEXT NOT NULL DEFAULT '{}'")
+        db.execSQL("ALTER TABLE book_sources ADD COLUMN configVersion INTEGER NOT NULL DEFAULT 1")
+        db.execSQL("ALTER TABLE book_sources ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0")
+        db.query("SELECT id, kind, baseUrl, enabled, createdAt FROM book_sources").use { cursor ->
+            while (cursor.moveToNext()) {
+                val id = cursor.getString(0)
+                val adapterId = cursor.getString(1).legacySourceAdapterId()
+                val configJson = JsonObject(mapOf("baseUrl" to JsonPrimitive(cursor.getString(2)))).toString()
+                val enabled = cursor.getInt(3) == 1 && !adapterId.startsWith("unknown:")
+                val updatedAt = cursor.getLong(4).coerceAtLeast(0L)
+                db.execSQL(
+                    """
+                    UPDATE book_sources
+                    SET adapterId = ?, configJson = ?, configVersion = 1, updatedAt = ?, enabled = ?
+                    WHERE id = ?
+                    """.trimIndent(),
+                    arrayOf(adapterId, configJson, updatedAt, if (enabled) 1 else 0, id),
+                )
+            }
+        }
+    }
+}
+
+private fun String.legacySourceAdapterId(): String = when (uppercase()) {
+    "CALIBRE" -> "calibre"
+    "OPDS" -> "opds"
+    "JSON_HTTP" -> "json-http"
+    "HTML_RULES_V1" -> "html-rules-v1"
+    else -> "unknown:${lowercase()}"
 }

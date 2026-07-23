@@ -1,6 +1,7 @@
 package dev.readflow.core.database
 
 import androidx.room.Dao
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
@@ -18,6 +19,10 @@ data class BookSourceEntity(
     val enabled: Boolean = true,
     val sortOrder: Int = 0,
     val createdAt: Long = 0L,
+    @ColumnInfo(defaultValue = "''") val adapterId: String = "",
+    @ColumnInfo(defaultValue = "'{}'") val configJson: String = "{}",
+    @ColumnInfo(defaultValue = "1") val configVersion: Int = 1,
+    @ColumnInfo(defaultValue = "0") val updatedAt: Long = 0L,
 )
 
 @Dao

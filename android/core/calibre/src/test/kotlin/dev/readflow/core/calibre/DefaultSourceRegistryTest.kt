@@ -11,9 +11,13 @@ import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.extensions.api.BUILTIN_CALIBRE_SOURCE_ID
+import dev.readflow.extensions.api.DefaultSourceAdapterRegistry
 import dev.readflow.extensions.api.OnlineBookCatalog
 import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.SourceAdapterFactory
+import dev.readflow.extensions.api.SourceAdapterIds
+import dev.readflow.extensions.api.SourceCapabilities
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.SourceKind
 import java.io.File
@@ -52,16 +56,15 @@ class DefaultSourceRegistryTest {
             settings = settings,
             sourceConfigStore = store,
             booksDir = tempFolder.root,
-            calibreCatalogFactory = { FakeCatalog(SourceKind.CALIBRE, it) },
-            genericCatalogFactory = { FakeCatalog(it.kind, it.baseUrl) },
+            calibreCatalogFactory = { FakeCatalog(it) },
+            genericCatalogFactory = { FakeCatalog(checkNotNull(it.kind), it.baseUrl) },
         )
 
         val sources = registry.observeSources().first()
+        val sourcesById = sources.associateBy(SourceDescriptor::id)
         assertEquals(2, sources.size)
-        assertEquals(BUILTIN_CALIBRE_SOURCE_ID, sources[0].id)
-        assertEquals(true, sources[0].enabled)
-        assertEquals("source-json-1", sources[1].id)
-        assertEquals(SourceKind.JSON_HTTP, sources[1].kind)
+        assertEquals(true, sourcesById.getValue(BUILTIN_CALIBRE_SOURCE_ID).enabled)
+        assertEquals(SourceKind.JSON_HTTP, sourcesById.getValue("source-json-1").kind)
     }
 
     @Test
@@ -83,13 +86,13 @@ class DefaultSourceRegistryTest {
             settings = settings,
             sourceConfigStore = store,
             booksDir = tempFolder.root,
-            calibreCatalogFactory = { url ->
-                opened += "calibre:$url"
-                FakeCatalog(SourceKind.CALIBRE, url)
+            calibreCatalogFactory = { descriptor ->
+                opened += "calibre:${descriptor.baseUrl}"
+                FakeCatalog(descriptor)
             },
             genericCatalogFactory = { descriptor ->
                 opened += "generic:${descriptor.id}"
-                FakeCatalog(descriptor.kind, descriptor.baseUrl)
+                FakeCatalog(checkNotNull(descriptor.kind), descriptor.baseUrl)
             },
         )
 
@@ -104,7 +107,7 @@ class DefaultSourceRegistryTest {
     }
 
     @Test
-    fun addUserSourceRejectsCalibreAndInvalidHttpPublicHosts() = runTest {
+    fun addUserSourceAcceptsCalibreAndRejectsInvalidHttpPublicHosts() = runTest {
         val registry = DefaultSourceRegistry(
             settings = FakeSettingsRepository(),
             sourceConfigStore = InMemorySourceConfigStore(),
@@ -112,7 +115,7 @@ class DefaultSourceRegistryTest {
         )
 
         val calibreAdd = registry.addUserSource(SourceKind.CALIBRE, "Calibre", "http://192.168.1.5:8080")
-        assertTrue(calibreAdd is ReadflowResult.Failure)
+        assertTrue(calibreAdd is ReadflowResult.Success)
 
         val publicHttp = registry.addUserSource(
             SourceKind.JSON_HTTP,
@@ -155,16 +158,129 @@ class DefaultSourceRegistryTest {
         assertEquals(null, store.getUserSource("source-x"))
     }
 
+    @Test
+    fun twoCalibreSourcesOpenWithTheirOwnDescriptors() = runTest {
+        val store = InMemorySourceConfigStore(
+            listOf(
+                calibreSource("source-calibre-a", "http://192.168.1.5:8080"),
+                calibreSource("source-calibre-b", "http://192.168.1.6:8080"),
+            ),
+        )
+        val opened = mutableListOf<SourceDescriptor>()
+        val adapter = object : SourceAdapterFactory {
+            override val adapterId = SourceAdapterIds.CALIBRE
+            override val latestConfigVersion = 1
+            override fun capabilities(configVersion: Int, configJson: String) =
+                SourceCapabilities(canSearch = true, canDownload = true)
+            override fun validate(configVersion: Int, configJson: String) = ReadflowResult.Success(Unit)
+            override fun open(descriptor: SourceDescriptor): ReadflowResult<OnlineBookCatalog> {
+                opened += descriptor
+                return ReadflowResult.Success(FakeCatalog(descriptor))
+            }
+        }
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            sourceAdapters = DefaultSourceAdapterRegistry(setOf(adapter)),
+        )
+
+        val first = registry.openCatalog("source-calibre-a")
+        val second = registry.openCatalog("source-calibre-b")
+
+        assertTrue(first is ReadflowResult.Success)
+        assertTrue(second is ReadflowResult.Success)
+        assertEquals(listOf("source-calibre-a", "source-calibre-b"), opened.map(SourceDescriptor::id))
+        assertEquals(
+            listOf("http://192.168.1.5:8080", "http://192.168.1.6:8080"),
+            opened.map(SourceDescriptor::baseUrl),
+        )
+    }
+
+    @Test
+    fun compatibilityRegistryPreservesCalibreSourceDescriptor() = runTest {
+        val source = calibreSource("source-calibre-user", "http://192.168.1.5:8080")
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = InMemorySourceConfigStore(listOf(source)),
+            booksDir = tempFolder.root,
+        )
+
+        val result = registry.openCatalog(source.id)
+
+        assertTrue(result is ReadflowResult.Success)
+        assertEquals(source.id, (result as ReadflowResult.Success).value.descriptor.id)
+    }
+
+    @Test
+    fun unknownAdapterIsDescribedAsDisabledAndFailsClosed() = runTest {
+        val store = InMemorySourceConfigStore(
+            listOf(
+                PersistedBookSource(
+                    id = "source-unknown",
+                    kind = "THIRD_PARTY",
+                    name = "Unknown",
+                    baseUrl = "https://example.com/catalog",
+                    enabled = true,
+                    adapterId = "missing-adapter",
+                    configJson = "{}",
+                ),
+            ),
+        )
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            sourceAdapters = DefaultSourceAdapterRegistry(emptySet()),
+        )
+
+        assertEquals(false, registry.observeSources().first().single().enabled)
+        assertTrue(registry.openCatalog("source-unknown") is ReadflowResult.Failure)
+    }
+
+    @Test
+    fun legacyCalibreImportIsIdempotent() = runTest {
+        val settings = FakeSettingsRepository(calibreUrl = "http://192.168.1.5:8080")
+        val store = InMemorySourceConfigStore()
+        val registry = DefaultSourceRegistry(
+            settings = settings,
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+        )
+
+        registry.observeSources().first()
+        registry.observeSources().first()
+        assertEquals(1, store.upsertCalls)
+
+        settings.calibreBaseUrl.value = "http://192.168.1.6:8080"
+        registry.observeSources().first()
+        registry.observeSources().first()
+
+        val builtin = store.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)
+        assertEquals(2, store.upsertCalls)
+        assertEquals("http://192.168.1.6:8080", builtin?.baseUrl)
+        assertEquals(calibreSourceConfigJson("http://192.168.1.6:8080"), builtin?.configJson)
+    }
+
     private class FakeCatalog(
         kind: SourceKind,
         baseUrl: String,
     ) : OnlineBookCatalog {
-        override val descriptor = SourceDescriptor(
+        constructor(descriptor: SourceDescriptor) : this(
+            kind = checkNotNull(descriptor.kind),
+            baseUrl = descriptor.baseUrl,
+        ) {
+            sourceDescriptor = descriptor
+        }
+
+        private var sourceDescriptor = SourceDescriptor(
             id = "fake",
             kind = kind,
             name = "fake",
             baseUrl = baseUrl,
         )
+        override val descriptor: SourceDescriptor
+            get() = sourceDescriptor
 
         override suspend fun search(
             query: String,
@@ -178,14 +294,14 @@ class DefaultSourceRegistryTest {
                 BookMeta(id = "d", title = "t", author = "a", format = BookFormat.EPUB),
             )
 
-        override suspend fun previewUrl(entry: OnlineCatalogEntry) =
-            ReadflowResult.Failure(dev.readflow.core.model.ReadflowError.notFound("preview", "x"))
     }
 
     private class InMemorySourceConfigStore(
         initial: List<PersistedBookSource> = emptyList(),
     ) : SourceConfigStore {
         private val sources = MutableStateFlow(initial)
+        var upsertCalls = 0
+            private set
 
         override fun observeUserSources(): Flow<List<PersistedBookSource>> = sources
 
@@ -193,6 +309,7 @@ class DefaultSourceRegistryTest {
             sources.value.firstOrNull { it.id == id }
 
         override suspend fun upsertUserSource(source: PersistedBookSource) {
+            upsertCalls += 1
             sources.value = sources.value.filterNot { it.id == source.id } + source
         }
 
@@ -203,6 +320,17 @@ class DefaultSourceRegistryTest {
         override suspend fun nextSortOrder(): Int =
             (sources.value.maxOfOrNull { it.sortOrder } ?: -1) + 1
     }
+
+    private fun calibreSource(id: String, baseUrl: String) = PersistedBookSource(
+        id = id,
+        kind = "CALIBRE",
+        name = id,
+        baseUrl = baseUrl,
+        enabled = true,
+        adapterId = SourceAdapterIds.CALIBRE,
+        configVersion = 1,
+        configJson = calibreSourceConfigJson(baseUrl),
+    )
 
     private class FakeSettingsRepository(
         calibreUrl: String? = "http://192.168.1.5:8080",

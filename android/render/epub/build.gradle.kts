@@ -16,6 +16,9 @@ android {
             providers.systemProperty("readflow.epubCorpusDir").orNull?.let { corpusDir ->
                 it.systemProperty("readflow.epubCorpusDir", corpusDir)
             }
+            providers.systemProperty("readflow.realMultiFontEpub").orNull?.let { epubPath ->
+                it.systemProperty("readflow.realMultiFontEpub", epubPath)
+            }
         }
     }
 }

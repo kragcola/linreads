@@ -61,8 +61,8 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             connectCalibreThroughExplicitUrl()
 
             waitForObject(By.desc("导入书籍")).click()
-            waitForObject(By.text("Calibre 搜索")).click()
-            waitForObject(By.text("Calibre 书源"))
+            waitForObject(By.text("在线书库")).click()
+            waitForObject(By.text("书源"))
 
             replaceSingleLineText("smoke")
             waitForObject(By.text("搜索")).click()
@@ -72,7 +72,11 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             shutdownFakeCalibreServer()
             waitForCalibreServerUnavailable()
             waitForObject(By.text("下载")).click()
-            val errorText = waitForObject(By.textContains("Calibre:")).text.orEmpty()
+            val errorText = waitForObject(By.descContains("在线书库错误："))
+                .contentDescription
+                .orEmpty()
+                .removePrefix("在线书库错误：")
+            assertTrue("download failure must expose a useful error", errorText.isNotBlank())
             waitForObject(By.text("下载"))
             takeScreenshot("download-failure-message.png")
 
@@ -87,7 +91,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             device.pressBack()
             waitForLibraryLoaded()
             waitForObject(By.text("还没有书"))
-            waitForObject(By.text("连接 Calibre，或导入本地文件"))
+            waitForObject(By.text("从在线书库下载，或导入本地文件"))
             takeScreenshot("shelf-empty-after-download-failure.png")
 
             writeTextEvidence(
@@ -100,7 +104,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
                     appendLine("bookRowAfterFailure=${failedBook?.id}")
                     appendLine("orphanFilesAfterFailure=${orphanFiles.joinToString(",") { file -> file.name }}")
                     appendLine("allShelfEmptyState=还没有书")
-                    appendLine("allShelfEmptyHint=连接 Calibre，或导入本地文件")
+                    appendLine("allShelfEmptyHint=从在线书库下载，或导入本地文件")
                 },
             )
             copyDatabaseSnapshot("after-download-failure")

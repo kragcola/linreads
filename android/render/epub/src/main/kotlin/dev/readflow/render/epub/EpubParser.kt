@@ -85,7 +85,7 @@ internal class EpubParser(
                     paragraphBlockIndexes = index.paragraphBlockIndexes,
                     layoutBlocks = index.layoutBlocks,
                     bookFontMapsBySpine = index.bookFontMapsBySpine,
-                    referencedFontFamiliesBySpine = index.referencedFontFamiliesBySpine,
+                    cssFontUsages = index.cssFontUsages,
                     maxCachedSpines = maxCachedSpines,
                 )
             }
@@ -109,7 +109,7 @@ internal class EpubParser(
         val paragraphBlockIndexes: List<Int>,
         val layoutBlocks: List<EpubDisplayBlock>,
         val bookFontMapsBySpine: Map<Int, EpubBookFontMap>,
-        val referencedFontFamiliesBySpine: Map<Int, Set<String>>,
+        val cssFontUsages: List<EpubCssFontUsage>,
         val fragmentTargetIndexes: Map<String, EpubTargetPosition>,
     )
 
@@ -172,7 +172,7 @@ internal class EpubParser(
         val paragraphBlockIndexes = mutableListOf<Int>()
         val layoutBlocks = mutableListOf<EpubDisplayBlock>()
         val bookFontMapsBySpine = mutableMapOf<Int, EpubBookFontMap>()
-        val referencedFontFamiliesBySpine = mutableMapOf<Int, Set<String>>()
+        val fontUsageAccumulator = EpubCssFontUsageAccumulator()
         var firstParagraphIndex = 0
         var firstBlockIndex = 0
         var documentOffset = 0
@@ -183,7 +183,7 @@ internal class EpubParser(
             val content = parseSpineContent(zip, spineIndex, item)
             val items = content.items
             bookFontMapsBySpine[spineIndex] = content.bookFontMap
-            referencedFontFamiliesBySpine[spineIndex] = content.referencedFontFamilies
+            fontUsageAccumulator.addSpine(spineIndex, items)
             val localParas = epubParasFromReaderItems(items)
             val blocks = epubDisplayBlocks(items)
             val localParagraphBlockIndexes = firstBlockIndexesByParagraph(blocks, localParas.size)
@@ -224,7 +224,7 @@ internal class EpubParser(
             paragraphBlockIndexes = paragraphBlockIndexes,
             layoutBlocks = layoutBlocks,
             bookFontMapsBySpine = bookFontMapsBySpine,
-            referencedFontFamiliesBySpine = referencedFontFamiliesBySpine,
+            cssFontUsages = fontUsageAccumulator.build(),
             fragmentTargetIndexes = fragmentTargetIndexes,
         )
     }

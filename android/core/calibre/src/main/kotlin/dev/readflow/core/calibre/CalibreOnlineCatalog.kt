@@ -6,12 +6,15 @@ import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.extensions.api.OnlineBookCatalog
+import dev.readflow.extensions.api.OnlineBookPreview
 import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.RemoteBookKey
+import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceDescriptor
-import dev.readflow.extensions.api.SourceKind
 import dev.readflow.extensions.api.BUILTIN_CALIBRE_SOURCE_ID
 import dev.readflow.extensions.api.applyCatalogFilter
+import dev.readflow.extensions.api.stableRemoteBookId
 import java.io.File
 import kotlinx.coroutines.CancellationException
 
@@ -24,8 +27,10 @@ class CalibreOnlineCatalog(
     booksDir: File?,
     override val descriptor: SourceDescriptor = SourceDescriptor(
         id = BUILTIN_CALIBRE_SOURCE_ID,
-        kind = SourceKind.CALIBRE,
+        adapterId = SourceAdapterIds.CALIBRE,
         name = "Calibre",
+        configVersion = 1,
+        configJson = calibreSourceConfigJson(""),
         baseUrl = "",
         isBuiltin = true,
     ),
@@ -42,8 +47,10 @@ class CalibreOnlineCatalog(
         booksDir = booksDir,
         descriptor = SourceDescriptor(
             id = BUILTIN_CALIBRE_SOURCE_ID,
-            kind = SourceKind.CALIBRE,
+            adapterId = SourceAdapterIds.CALIBRE,
             name = name,
+            configVersion = 1,
+            configJson = calibreSourceConfigJson(requireValidCalibreBaseUrl(baseUrl)),
             baseUrl = requireValidCalibreBaseUrl(baseUrl),
             isBuiltin = true,
         ),
@@ -60,7 +67,8 @@ class CalibreOnlineCatalog(
             val entries = ids.map { id ->
                 val wire = client.bookMeta(id)
                 OnlineCatalogEntry(
-                    meta = wire.toCatalogMeta(client),
+                    meta = wire.toCatalogMeta(client, descriptor.id),
+                    remoteKey = RemoteBookKey(descriptor.id, id.toString()),
                     series = wire.series,
                     tags = wire.tags,
                     availableFormats = wire.formats,
@@ -78,11 +86,20 @@ class CalibreOnlineCatalog(
         runCatching {
             val downloader = downloader
                 ?: return ReadflowResult.Failure(ReadflowError.io("Calibre 下载目录未配置"))
-            val remoteId = entry.meta.id.removePrefix("calibre-").toIntOrNull()
+            entry.remoteKey?.let { key ->
+                require(key.sourceId == descriptor.id) { "搜索结果不属于当前书源" }
+            }
+            val remoteId = entry.remoteKey?.remoteId?.toIntOrNull()
+                ?: entry.meta.id.removePrefix("calibre-").toIntOrNull()
                 ?: entry.meta.id.toIntOrNull()
                 ?: return ReadflowResult.Failure(ReadflowError.parse("无效的 Calibre 书籍 ID"))
             val wire = client.bookMeta(remoteId)
-            when (val result = downloader.download(wire)) {
+            val localBookId = if (descriptor.id == BUILTIN_CALIBRE_SOURCE_ID) {
+                "calibre-$remoteId"
+            } else {
+                stableRemoteBookId(descriptor.id, remoteId.toString())
+            }
+            when (val result = downloader.download(wire, localBookId)) {
                 is ReadflowResult.Success -> ReadflowResult.Success(result.value.meta)
                 is ReadflowResult.Failure -> result
             }
@@ -91,26 +108,8 @@ class CalibreOnlineCatalog(
             ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "Calibre error"))
         }
 
-    override suspend fun previewUrl(entry: OnlineCatalogEntry): ReadflowResult<String> =
-        runCatching {
-            val url = entry.previewUrl ?: entry.meta.coverUrl
-                ?: return ReadflowResult.Failure(ReadflowError.notFound("preview", entry.meta.id))
-            requireAllowedCalibreRequestUrl(url)
-            val base = descriptor.baseUrl.ifBlank {
-                val uri = java.net.URI(url)
-                buildString {
-                    append(uri.scheme)
-                    append("://")
-                    append(uri.host)
-                    if (uri.port > 0) append(':').append(uri.port)
-                }
-            }
-            requireSameCalibreOrigin(url, base)
-            ReadflowResult.Success(url)
-        }.getOrElse { error ->
-            if (error is CancellationException) throw error
-            ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "预览地址不安全"))
-        }
+    override suspend fun preview(entry: OnlineCatalogEntry): ReadflowResult<OnlineBookPreview> =
+        ReadflowResult.Failure(ReadflowError.unsupported("Calibre 不提供在线正文预览，请先下载"))
 
     override fun close() {
         client.close()
@@ -208,8 +207,8 @@ class CatalogBackedCalibreRepository(
     override fun close() = catalog.close()
 }
 
-private fun CalibreBookMeta.toCatalogMeta(client: CalibreClient) = BookMeta(
-    id = id.toString(),
+private fun CalibreBookMeta.toCatalogMeta(client: CalibreClient, sourceId: String) = BookMeta(
+    id = if (sourceId == BUILTIN_CALIBRE_SOURCE_ID) id.toString() else stableRemoteBookId(sourceId, id.toString()),
     title = title,
     author = authors.joinToString(", ").ifEmpty { "Unknown" },
     format = bestDownloadFormat()?.bookFormat ?: BookFormat.UNKNOWN,

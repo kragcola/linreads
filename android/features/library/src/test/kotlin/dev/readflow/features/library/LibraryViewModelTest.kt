@@ -1,7 +1,6 @@
 package dev.readflow.features.library
 
 import android.net.Uri
-import dev.readflow.core.calibre.CalibreRepository
 import dev.readflow.core.database.LibraryStore
 import dev.readflow.core.database.CoroutineBookAssetOperationCoordinator
 import dev.readflow.core.model.BookBundle
@@ -10,21 +9,26 @@ import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.BookRemovalMode
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.DownloadedAsset
-import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.LibraryItem
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
-import dev.readflow.core.model.ReaderReadingMode
-import dev.readflow.core.model.ThemeMode
-import dev.readflow.core.model.TxtEncoding
-import dev.readflow.core.prefs.SettingsRepository
+import dev.readflow.extensions.api.BUILTIN_CALIBRE_SOURCE_ID
 import dev.readflow.extensions.api.LocalBookImporter
+import dev.readflow.extensions.api.OnlineBookCatalog
+import dev.readflow.extensions.api.OnlineCatalogEntry
+import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.RemoteBookKey
+import dev.readflow.extensions.api.SourceAdapterIds
+import dev.readflow.extensions.api.SourceCapabilities
+import dev.readflow.extensions.api.SourceDescriptor
+import dev.readflow.extensions.api.SourceRegistry
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -84,30 +88,35 @@ class LibraryViewModelTest {
     }
 
     @Test
-    fun searchCalibreShowsRemoteResultsWithoutAddingThemToShelf() = runTest(dispatcher) {
+    fun calibreAdapterSearchShowsRemoteResultsWithoutAddingThemToShelf() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val store = FakeLibraryStore()
-        val calibre = FakeCalibreRepository(
+        val calibre = FakeCalibreCatalog(
             searchResults = listOf(remoteBook("42", "Remote EPUB")),
         )
         val viewModel = viewModel(store = store, calibre = calibre)
 
-        viewModel.updateCalibreQuery("remote")
-        viewModel.searchCalibre()
+        advanceUntilIdle()
+        viewModel.selectOnlineSource(BUILTIN_CALIBRE_SOURCE_ID)
+        viewModel.updateOnlineQuery("remote")
+        viewModel.searchOnlineLibrary()
         advanceUntilIdle()
 
         assertEquals("remote", calibre.searchedQuery)
-        assertEquals(listOf(remoteBook("42", "Remote EPUB")), viewModel.calibreSearchState.value.results)
+        assertEquals(
+            listOf(remoteBook("42", "Remote EPUB")),
+            viewModel.onlineLibraryState.value.results.map(OnlineCatalogEntry::meta),
+        )
         assertEquals(emptyList<BookMeta>(), store.upsertedBooks)
         assertTrue(viewModel.uiState.value.items.isEmpty())
     }
 
     @Test
-    fun latestCalibreSearchWinsWhenEarlierSearchIsStillRunning() = runTest(dispatcher) {
+    fun latestCalibreAdapterSearchWinsWhenEarlierSearchIsStillRunning() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val firstSearchStarted = CompletableDeferred<Unit>()
         val releaseFirstSearch = CompletableDeferred<Unit>()
-        val calibre = FakeCalibreRepository(
+        val calibre = FakeCalibreCatalog(
             searchHandler = { query ->
                 if (query == "a") {
                     firstSearchStarted.complete(Unit)
@@ -118,18 +127,23 @@ class LibraryViewModelTest {
         )
         val viewModel = viewModel(calibre = calibre)
 
-        viewModel.updateCalibreQuery("a")
-        viewModel.searchCalibre()
+        advanceUntilIdle()
+        viewModel.selectOnlineSource(BUILTIN_CALIBRE_SOURCE_ID)
+        viewModel.updateOnlineQuery("a")
+        viewModel.searchOnlineLibrary()
         runCurrent()
         firstSearchStarted.await()
-        viewModel.updateCalibreQuery("abc")
-        viewModel.searchCalibre()
+        viewModel.updateOnlineQuery("abc")
+        viewModel.searchOnlineLibrary()
         runCurrent()
         releaseFirstSearch.complete(Unit)
         advanceUntilIdle()
 
-        assertEquals("abc", viewModel.calibreSearchState.value.query)
-        assertEquals(listOf(remoteBook("abc", "Result abc")), viewModel.calibreSearchState.value.results)
+        assertEquals("abc", viewModel.onlineLibraryState.value.query)
+        assertEquals(
+            listOf(remoteBook("abc", "Result abc")),
+            viewModel.onlineLibraryState.value.results.map(OnlineCatalogEntry::meta),
+        )
     }
 
     @Test
@@ -162,22 +176,29 @@ class LibraryViewModelTest {
     }
 
     @Test
-    fun downloadCalibreBookAddsDownloadedBookToShelf() = runTest(dispatcher) {
+    fun calibreAdapterDownloadAddsDownloadedBookToShelf() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val store = FakeLibraryStore()
         val downloaded = remoteBook("calibre-42", "Remote EPUB").copy(
             downloadStatus = DownloadStatus.DOWNLOADED,
             localUri = "file:///books/calibre-42.epub",
         )
-        val calibre = FakeCalibreRepository(downloadResult = downloaded)
+        val calibre = FakeCalibreCatalog(
+            searchResults = listOf(remoteBook("42", "Remote EPUB")),
+            downloadResult = downloaded,
+        )
         val viewModel = viewModel(store = store, calibre = calibre)
 
-        viewModel.downloadCalibreBook("42")
+        advanceUntilIdle()
+        viewModel.selectOnlineSource(BUILTIN_CALIBRE_SOURCE_ID)
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.downloadOnlineEntry(viewModel.onlineLibraryState.value.results.single())
         advanceUntilIdle()
 
         assertEquals("42", calibre.downloadedBookId)
         assertEquals(listOf(downloaded), store.upsertedBooks)
-        assertEquals("已下载《Remote EPUB》", viewModel.calibreSearchState.value.message)
+        assertEquals("已下载《Remote EPUB》", viewModel.onlineLibraryState.value.message)
     }
 
     @Test
@@ -186,7 +207,8 @@ class LibraryViewModelTest {
         val downloadStarted = CompletableDeferred<Unit>()
         val downloadCancelled = CompletableDeferred<Unit>()
         val store = FakeLibraryStore()
-        val calibre = FakeCalibreRepository(
+        val calibre = FakeCalibreCatalog(
+            searchResults = listOf(remoteBook("42", "Remote EPUB")),
             downloadHandler = {
                 downloadStarted.complete(Unit)
                 try {
@@ -198,7 +220,11 @@ class LibraryViewModelTest {
         )
         val viewModel = viewModel(store = store, calibre = calibre)
 
-        viewModel.downloadCalibreBook("42")
+        advanceUntilIdle()
+        viewModel.selectOnlineSource(BUILTIN_CALIBRE_SOURCE_ID)
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.downloadOnlineEntry(viewModel.onlineLibraryState.value.results.single())
         runCurrent()
         downloadStarted.await()
         viewModel.deleteBook("calibre-42", BookRemovalMode.DELETE_ALL)
@@ -219,7 +245,7 @@ class LibraryViewModelTest {
         advanceUntilIdle()
 
         assertEquals(listOf("calibre-42"), store.removedDownloadedAssetIds)
-        assertEquals("已移除本地下载", viewModel.calibreSearchState.value.message)
+        assertEquals("已移除本地下载", viewModel.onlineLibraryState.value.message)
     }
 
     @Test
@@ -594,15 +620,13 @@ class LibraryViewModelTest {
 
     private fun viewModel(
         store: FakeLibraryStore = FakeLibraryStore(),
-        settings: FakeSettingsRepository = FakeSettingsRepository(),
-        calibre: FakeCalibreRepository = FakeCalibreRepository(),
+        calibre: FakeCalibreCatalog = FakeCalibreCatalog(),
         localSource: LocalBookImporter = FakeLocalBookImporter(),
     ) = LibraryViewModel(
         repository = store,
         localSource = localSource,
-        settings = settings,
-        calibreRepositoryFactory = { calibre },
         assetOperations = CoroutineBookAssetOperationCoordinator(),
+        sourceRegistry = FakeCalibreSourceRegistry(calibre),
     )
 
     private class FakeLibraryStore(
@@ -675,55 +699,57 @@ class LibraryViewModelTest {
         }
     }
 
-    private class FakeSettingsRepository : SettingsRepository {
-        override val calibreBaseUrl = MutableStateFlow<String?>("http://192.168.1.5:8080")
-        override val fontSize = MutableStateFlow(18)
-        override val lineSpacing = MutableStateFlow(1.75f)
-        override val readingMode = MutableStateFlow(ReaderReadingMode.SCROLL)
-        override val themeMode = MutableStateFlow(ThemeMode.SYSTEM)
-        override val deviceId = MutableStateFlow("device")
-        override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
-        override val useSourceHanFont = MutableStateFlow(true)
-        override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
-        override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
-        override val readerGuideShown = MutableStateFlow(true)
-        override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
-        override suspend fun setCalibreBaseUrl(url: String) {
-            calibreBaseUrl.value = url
-        }
-        override suspend fun setFontSize(size: Int) = Unit
-        override suspend fun setLineSpacing(multiplier: Float) = Unit
-        override suspend fun setReadingMode(mode: ReaderReadingMode) = Unit
-        override suspend fun setThemeMode(mode: ThemeMode) = Unit
-        override suspend fun setEngineOverride(format: BookFormat, engineId: String?) = Unit
-        override suspend fun setUseSourceHanFont(enabled: Boolean) = Unit
-        override suspend fun setTxtEncoding(encoding: TxtEncoding) = Unit
-        override suspend fun setFontChoice(choice: FontChoice) = Unit
-        override suspend fun setReaderGuideShown(shown: Boolean) = Unit
-        override suspend fun setPageFlipStyle(style: dev.readflow.core.model.PageFlipStyle) = Unit
-    }
-
-    private class FakeCalibreRepository(
+    private class FakeCalibreCatalog(
         private val searchResults: List<BookMeta> = emptyList(),
         private val downloadResult: BookMeta = remoteBook("calibre-42", "Remote EPUB"),
         private val searchHandler: (suspend (String) -> ReadflowResult<List<BookMeta>>)? = null,
         private val downloadHandler: (suspend (String) -> ReadflowResult<BookMeta>)? = null,
-    ) : CalibreRepository {
+    ) : OnlineBookCatalog {
+        override val descriptor = CALIBRE_DESCRIPTOR
         var searchedQuery: String? = null
         var downloadedBookId: String? = null
 
-        override suspend fun search(query: String, offset: Int, limit: Int): ReadflowResult<List<BookMeta>> {
+        override suspend fun search(
+            query: String,
+            filter: OnlineCatalogFilter,
+            offset: Int,
+            limit: Int,
+        ): ReadflowResult<List<OnlineCatalogEntry>> {
             searchedQuery = query
-            return searchHandler?.invoke(query) ?: ReadflowResult.Success(searchResults)
+            return when (val result = searchHandler?.invoke(query) ?: ReadflowResult.Success(searchResults)) {
+                is ReadflowResult.Success -> ReadflowResult.Success(
+                    result.value.map { book ->
+                        OnlineCatalogEntry(
+                            meta = book,
+                            remoteKey = RemoteBookKey(BUILTIN_CALIBRE_SOURCE_ID, book.id.removePrefix("calibre-")),
+                        )
+                    },
+                )
+                is ReadflowResult.Failure -> result
+            }
         }
 
-        override suspend fun metadata(bookId: String): ReadflowResult<BookMeta> =
-            ReadflowResult.Success(remoteBook(bookId, "Remote EPUB"))
-
-        override suspend fun download(bookId: String): ReadflowResult<BookMeta> {
+        override suspend fun download(entry: OnlineCatalogEntry): ReadflowResult<BookMeta> {
+            val bookId = entry.remoteKey?.remoteId ?: entry.meta.id.removePrefix("calibre-")
             downloadedBookId = bookId
             return downloadHandler?.invoke(bookId) ?: ReadflowResult.Success(downloadResult)
         }
+    }
+
+    private class FakeCalibreSourceRegistry(
+        private val catalog: OnlineBookCatalog,
+    ) : SourceRegistry {
+        override fun observeSources(): Flow<List<SourceDescriptor>> = flowOf(listOf(CALIBRE_DESCRIPTOR))
+
+        override suspend fun openCatalog(sourceId: String): ReadflowResult<OnlineBookCatalog> =
+            if (sourceId == BUILTIN_CALIBRE_SOURCE_ID) {
+                ReadflowResult.Success(catalog)
+            } else {
+                ReadflowResult.Failure(ReadflowError.notFound("source", sourceId))
+            }
+
+        override suspend fun removeUserSource(sourceId: String) =
+            ReadflowResult.Failure(ReadflowError.unsupported("unused"))
     }
 
     private class FakeLocalBookImporter(
@@ -734,6 +760,18 @@ class LibraryViewModelTest {
     }
 
     private companion object {
+        val CALIBRE_DESCRIPTOR = SourceDescriptor(
+            id = BUILTIN_CALIBRE_SOURCE_ID,
+            adapterId = SourceAdapterIds.CALIBRE,
+            name = "Calibre",
+            configVersion = 1,
+            configJson = "{\"baseUrl\":\"http://192.168.1.5:8080\"}",
+            baseUrl = "http://192.168.1.5:8080",
+            enabled = true,
+            isBuiltin = true,
+            capabilities = SourceCapabilities(canSearch = true, canDownload = true),
+        )
+
         fun localBook(id: String, title: String) = BookMeta(
             id = id,
             title = title,

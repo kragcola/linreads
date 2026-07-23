@@ -169,8 +169,8 @@ class CalibreCacheLruRuntimeSmokeTest {
 
     private fun openCalibreSearchSheet() {
         waitForObject(By.desc("导入书籍")).click()
-        waitForObject(By.text("Calibre 搜索")).click()
-        waitForObject(By.text("Calibre 书源"))
+        waitForObject(By.text("在线书库")).click()
+        waitForObject(By.text("书源"))
     }
 
     private fun downloadRemoteBook(

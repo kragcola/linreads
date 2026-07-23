@@ -1,7 +1,6 @@
 package dev.readflow.features.library
 
 import android.net.Uri
-import dev.readflow.core.calibre.CalibreRepository
 import dev.readflow.core.database.CoroutineBookAssetOperationCoordinator
 import dev.readflow.core.database.LibraryStore
 import dev.readflow.core.model.BookAssetOperationCoordinator
@@ -9,21 +8,18 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.DownloadedAsset
-import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.LibraryItem
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
-import dev.readflow.core.model.ReaderReadingMode
-import dev.readflow.core.model.ThemeMode
-import dev.readflow.core.model.TxtEncoding
-import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.extensions.api.BUILTIN_CALIBRE_SOURCE_ID
 import dev.readflow.extensions.api.LocalBookImporter
 import dev.readflow.extensions.api.OnlineBookCatalog
+import dev.readflow.extensions.api.OnlineBookPreview
 import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceDescriptor
-import dev.readflow.extensions.api.SourceKind
+import dev.readflow.extensions.api.SourceCapabilities
 import dev.readflow.extensions.api.SourceRegistry
 import dev.readflow.extensions.api.stableRemoteBookId
 import kotlinx.coroutines.CompletableDeferred
@@ -75,7 +71,7 @@ class OnlineLibraryViewModelTest {
             },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceKind.CALIBRE)),
+            sources = listOf(enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceAdapterIds.CALIBRE)),
             catalogs = mapOf(BUILTIN_CALIBRE_SOURCE_ID to catalog),
         )
         val viewModel = viewModel(registry = registry)
@@ -95,7 +91,6 @@ class OnlineLibraryViewModelTest {
 
         assertEquals("new", viewModel.onlineLibraryState.value.query)
         assertEquals(listOf("new"), viewModel.onlineLibraryState.value.results.map { it.meta.id })
-        assertEquals(listOf("new"), viewModel.calibreSearchState.value.results.map { it.id })
     }
 
     @Test
@@ -109,8 +104,8 @@ class OnlineLibraryViewModelTest {
         )
         val registry = FakeSourceRegistry(
             sources = listOf(
-                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceKind.CALIBRE),
-                enabledSource("source-json", SourceKind.JSON_HTTP, "JSON"),
+                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceAdapterIds.CALIBRE),
+                enabledSource("source-json", SourceAdapterIds.JSON_HTTP, "JSON"),
             ),
             catalogs = mapOf(
                 BUILTIN_CALIBRE_SOURCE_ID to calibre,
@@ -149,7 +144,7 @@ class OnlineLibraryViewModelTest {
             searchHandler = { _, _ -> ReadflowResult.Success(results) },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource("source-json", SourceKind.JSON_HTTP)),
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
             catalogs = mapOf("source-json" to catalog),
         )
         val viewModel = viewModel(registry = registry)
@@ -181,6 +176,172 @@ class OnlineLibraryViewModelTest {
     }
 
     @Test
+    fun sourceWideAuthorSelectionEnumeratesPagesWhenAdapterSupportsIt() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val requestedOffsets = mutableListOf<Int>()
+        val first = entry("1", "Book One", author = "Ann")
+        val second = entry("2", "Book Two", author = "Ann")
+        val third = entry("3", "Book Three", author = "Ann")
+        val catalog = FakeOnlineCatalog(
+            searchPageHandler = { _, filter, offset, _ ->
+                requestedOffsets += offset
+                assertEquals("Ann", filter.author)
+                ReadflowResult.Success(
+                    when (offset) {
+                        0 -> listOf(first, second)
+                        100 -> listOf(third)
+                        else -> emptyList()
+                    },
+                )
+            },
+        )
+        val source = enabledSource("source-json", SourceAdapterIds.JSON_HTTP).copy(
+            capabilities = SourceCapabilities(
+                canSearch = true,
+                canFilterByAuthor = true,
+                canDownload = true,
+                canBatchAcrossSource = true,
+            ),
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = mapOf("source-json" to catalog),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+        viewModel.selectOnlineSource("source-json")
+
+        viewModel.selectOnlineByAuthor("Ann")
+        advanceUntilIdle()
+
+        assertEquals(listOf(0, 100, 200), requestedOffsets)
+        assertEquals(listOf("1", "2", "3"), viewModel.onlineLibraryState.value.results.map { it.meta.id })
+        assertEquals(
+            setOf(first.selectionKey(), second.selectionKey(), third.selectionKey()),
+            viewModel.onlineLibraryState.value.selectedEntryKeys,
+        )
+        assertFalse(viewModel.onlineLibraryState.value.isSelectingBatch)
+    }
+
+    @Test
+    fun sourceWideSelectionContinuesPastAnUnmatchedPage() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val matching = entry("2", "Matching", author = "Ann")
+        val requestedOffsets = mutableListOf<Int>()
+        val catalog = FakeOnlineCatalog(
+            searchPageHandler = { _, _, offset, _ ->
+                requestedOffsets += offset
+                ReadflowResult.Success(
+                    when (offset) {
+                        0 -> listOf(entry("1", "Unmatched", author = "Bob"))
+                        100 -> listOf(matching)
+                        else -> emptyList()
+                    },
+                )
+            },
+        )
+        val source = enabledSource("source-json", SourceAdapterIds.JSON_HTTP).copy(
+            capabilities = SourceCapabilities(
+                canSearch = true,
+                canFilterByAuthor = true,
+                canDownload = true,
+                canBatchAcrossSource = true,
+            ),
+        )
+        val viewModel = viewModel(
+            registry = FakeSourceRegistry(
+                sources = listOf(source),
+                catalogs = mapOf(source.id to catalog),
+            ),
+        )
+        advanceUntilIdle()
+
+        viewModel.selectOnlineByAuthor("Ann")
+        advanceUntilIdle()
+
+        assertEquals(listOf(0, 100, 200), requestedOffsets)
+        assertEquals(setOf(matching.selectionKey()), viewModel.onlineLibraryState.value.selectedEntryKeys)
+    }
+
+    @Test
+    fun sourceEditorClosesOnlyAfterRegistryAcceptsTheSource() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val added = enabledSource("source-added", SourceAdapterIds.JSON_HTTP, name = "JSON")
+        val registry = FakeSourceRegistry(
+            sources = emptyList(),
+            catalogs = emptyMap(),
+            addHandler = { _, _, _, _ -> ReadflowResult.Success(added) },
+        )
+        val viewModel = viewModel(registry = registry)
+        var successCallbacks = 0
+        viewModel.updateAddSourceForm(
+            name = "JSON",
+            url = "https://books.example/catalog.json",
+            adapterId = SourceAdapterIds.JSON_HTTP,
+        )
+
+        viewModel.addOnlineSource { successCallbacks += 1 }
+        advanceUntilIdle()
+
+        assertEquals(1, successCallbacks)
+        assertFalse(viewModel.onlineLibraryState.value.isAddingSource)
+        assertEquals("source-added", viewModel.onlineLibraryState.value.selectedSourceId)
+    }
+
+    @Test
+    fun sourceEditorStaysOpenWhenRegistryRejectsTheSource() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val registry = FakeSourceRegistry(
+            sources = emptyList(),
+            catalogs = emptyMap(),
+            addHandler = { _, _, _, _ -> ReadflowResult.Failure(ReadflowError.parse("规则无效")) },
+        )
+        val viewModel = viewModel(registry = registry)
+        var successCallbacks = 0
+        viewModel.updateAddSourceForm(
+            name = "Broken",
+            url = "https://books.example/catalog.json",
+            adapterId = SourceAdapterIds.JSON_HTTP,
+        )
+
+        viewModel.addOnlineSource { successCallbacks += 1 }
+        advanceUntilIdle()
+
+        assertEquals(0, successCallbacks)
+        assertFalse(viewModel.onlineLibraryState.value.isAddingSource)
+        assertEquals("规则无效", viewModel.onlineLibraryState.value.error)
+    }
+
+    @Test
+    fun htmlSourceDraftBuildsStructuredRulesAndDerivesPrimaryHost() {
+        val draft = HtmlSourceDraft(
+            searchUrlTemplate = "https://books.example/search?q={query}&page={page}",
+            additionalAllowedHosts = "cdn.books.example, chapters.example",
+            itemSelector = ".book",
+            titleSelector = ".title",
+            authorSelector = ".author",
+            detailLinkSelector = ".detail",
+            seriesSelector = ".series",
+            chapterItemSelector = ".chapter",
+            chapterLinkSelector = "a",
+            chapterTitleSelector = "h1",
+            bodySelector = ".content",
+            nextPageSelector = ".next",
+        )
+
+        val config = draft.toConfig()
+
+        assertEquals(
+            listOf("books.example", "cdn.books.example", "chapters.example"),
+            config.allowedHosts,
+        )
+        assertEquals(".book", config.search.itemSelector)
+        assertEquals(".series", config.search.seriesSelector)
+        assertEquals(".content", config.chapter.bodySelector)
+        assertEquals(".next", config.chapter.nextPageSelector)
+    }
+
+    @Test
     fun seriesAuthorBatchDownloadUpsertsSelectedEntriesOnly() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val store = FakeLibraryStore()
@@ -203,7 +364,7 @@ class OnlineLibraryViewModelTest {
             },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource("source-json", SourceKind.JSON_HTTP)),
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
             catalogs = mapOf("source-json" to catalog),
         )
         val viewModel = viewModel(store = store, registry = registry)
@@ -233,7 +394,7 @@ class OnlineLibraryViewModelTest {
             },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource("source-json", SourceKind.JSON_HTTP)),
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
             catalogs = mapOf("source-json" to catalog),
         )
         val viewModel = viewModel(store = store, registry = registry)
@@ -250,7 +411,7 @@ class OnlineLibraryViewModelTest {
     }
 
     @Test
-    fun previewUrlSurfacesValidatedUrlAndRejectsUnsafeFailure() = runTest(dispatcher) {
+    fun previewSurfacesApplicationOwnedTextAndRejectsFailure() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val safeEntry = entry("p1", "Preview Safe")
         val unsafeEntry = entry("p2", "Preview Unsafe")
@@ -258,14 +419,16 @@ class OnlineLibraryViewModelTest {
             searchHandler = { _, _ -> ReadflowResult.Success(listOf(safeEntry, unsafeEntry)) },
             previewHandler = { entry ->
                 if (entry.meta.id == "p1") {
-                    ReadflowResult.Success("http://192.168.1.5:8080/cover/p1.jpg")
+                    ReadflowResult.Success(
+                        OnlineBookPreview("Preview Safe", "Author", "第一章", "正文"),
+                    )
                 } else {
                     ReadflowResult.Failure(ReadflowError.network(null, "预览地址不安全"))
                 }
             },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource("source-json", SourceKind.JSON_HTTP)),
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
             catalogs = mapOf("source-json" to catalog),
         )
         val viewModel = viewModel(registry = registry)
@@ -274,11 +437,11 @@ class OnlineLibraryViewModelTest {
 
         viewModel.previewOnlineEntry(safeEntry)
         advanceUntilIdle()
-        assertEquals("http://192.168.1.5:8080/cover/p1.jpg", viewModel.onlineLibraryState.value.previewUrl)
+        assertEquals("正文", viewModel.onlineLibraryState.value.preview?.body)
 
         viewModel.previewOnlineEntry(unsafeEntry)
         advanceUntilIdle()
-        assertEquals(null, viewModel.onlineLibraryState.value.previewUrl)
+        assertEquals(null, viewModel.onlineLibraryState.value.preview)
         assertTrue(viewModel.onlineLibraryState.value.error?.contains("不安全") == true)
     }
 
@@ -293,18 +456,18 @@ class OnlineLibraryViewModelTest {
             previewHandler = {
                 oldStarted.complete(Unit)
                 releaseOld.await()
-                ReadflowResult.Success("http://192.168.1.5:8080/old.jpg")
+                ReadflowResult.Success(OnlineBookPreview("Old", "A", null, "old"))
             },
         )
         val newCatalog = FakeOnlineCatalog(
             previewHandler = {
-                ReadflowResult.Success("http://192.168.1.6:8080/new.jpg")
+                ReadflowResult.Success(OnlineBookPreview("New", "A", null, "new"))
             },
         )
         val registry = FakeSourceRegistry(
             sources = listOf(
-                enabledSource("source-old", SourceKind.JSON_HTTP),
-                enabledSource("source-new", SourceKind.JSON_HTTP),
+                enabledSource("source-old", SourceAdapterIds.JSON_HTTP),
+                enabledSource("source-new", SourceAdapterIds.JSON_HTTP),
             ),
             catalogs = mapOf("source-old" to oldCatalog, "source-new" to newCatalog),
         )
@@ -323,9 +486,49 @@ class OnlineLibraryViewModelTest {
 
         assertEquals("source-new", viewModel.onlineLibraryState.value.selectedSourceId)
         assertEquals(
-            "http://192.168.1.6:8080/new.jpg",
-            viewModel.onlineLibraryState.value.previewUrl,
+            "new",
+            viewModel.onlineLibraryState.value.preview?.body,
         )
+    }
+
+    @Test
+    fun staleDownloadCompletionCannotOverwriteNewSourceState() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val downloadStarted = CompletableDeferred<Unit>()
+        val releaseDownload = CompletableDeferred<Unit>()
+        val oldEntry = entry("old", "Old")
+        val oldCatalog = FakeOnlineCatalog(
+            downloadHandler = { entry ->
+                downloadStarted.complete(Unit)
+                releaseDownload.await()
+                ReadflowResult.Success(entry.meta.copy(downloadStatus = DownloadStatus.DOWNLOADED))
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(
+                enabledSource("source-old", SourceAdapterIds.JSON_HTTP),
+                enabledSource("source-new", SourceAdapterIds.JSON_HTTP),
+            ),
+            catalogs = mapOf(
+                "source-old" to oldCatalog,
+                "source-new" to FakeOnlineCatalog(),
+            ),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.selectOnlineSource("source-old")
+        viewModel.downloadOnlineEntry(oldEntry)
+        runCurrent()
+        downloadStarted.await()
+        viewModel.selectOnlineSource("source-new")
+        releaseDownload.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals("source-new", viewModel.onlineLibraryState.value.selectedSourceId)
+        assertNull(viewModel.onlineLibraryState.value.message)
+        assertNull(viewModel.onlineLibraryState.value.error)
+        assertTrue(viewModel.onlineLibraryState.value.downloadingKeys.isEmpty())
     }
 
     @Test
@@ -336,7 +539,7 @@ class OnlineLibraryViewModelTest {
             downloadHandler = { throw IllegalStateException("database write failed") },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource("source-json", SourceKind.JSON_HTTP)),
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
             catalogs = mapOf("source-json" to catalog),
         )
         val viewModel = viewModel(registry = registry)
@@ -358,8 +561,8 @@ class OnlineLibraryViewModelTest {
         val resultEntry = entry("old", "Old Source Book")
         val registry = FakeSourceRegistry(
             sources = listOf(
-                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceKind.CALIBRE),
-                enabledSource("source-json", SourceKind.JSON_HTTP),
+                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceAdapterIds.CALIBRE),
+                enabledSource("source-json", SourceAdapterIds.JSON_HTTP),
             ),
             catalogs = mapOf(
                 "source-json" to FakeOnlineCatalog(
@@ -409,7 +612,7 @@ class OnlineLibraryViewModelTest {
             },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource(sourceId, SourceKind.JSON_HTTP)),
+            sources = listOf(enabledSource(sourceId, SourceAdapterIds.JSON_HTTP)),
             catalogs = mapOf(sourceId to catalog),
         )
         val viewModel = viewModel(
@@ -450,7 +653,7 @@ class OnlineLibraryViewModelTest {
             },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource(sourceId, SourceKind.JSON_HTTP)),
+            sources = listOf(enabledSource(sourceId, SourceAdapterIds.JSON_HTTP)),
             catalogs = mapOf(sourceId to catalog),
         )
         val viewModel = viewModel(
@@ -486,8 +689,8 @@ class OnlineLibraryViewModelTest {
         )
         val registry = FakeSourceRegistry(
             sources = listOf(
-                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceKind.CALIBRE),
-                enabledSource("source-json", SourceKind.JSON_HTTP, "JSON"),
+                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceAdapterIds.CALIBRE),
+                enabledSource("source-json", SourceAdapterIds.JSON_HTTP, "JSON"),
             ),
             catalogs = mapOf(
                 BUILTIN_CALIBRE_SOURCE_ID to calibre,
@@ -542,8 +745,8 @@ class OnlineLibraryViewModelTest {
         )
         val registry = FakeSourceRegistry(
             sources = listOf(
-                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceKind.CALIBRE),
-                enabledSource("source-json", SourceKind.JSON_HTTP),
+                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceAdapterIds.CALIBRE),
+                enabledSource("source-json", SourceAdapterIds.JSON_HTTP),
             ),
             catalogs = mapOf(
                 BUILTIN_CALIBRE_SOURCE_ID to calibre,
@@ -603,7 +806,7 @@ class OnlineLibraryViewModelTest {
             },
         )
         val registry = FakeSourceRegistry(
-            sources = listOf(enabledSource("source-json", SourceKind.JSON_HTTP)),
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
             catalogs = mapOf("source-json" to catalog),
         )
         val viewModel = viewModel(store = store, registry = registry)
@@ -639,14 +842,11 @@ class OnlineLibraryViewModelTest {
 
     private fun viewModel(
         store: FakeLibraryStore = FakeLibraryStore(),
-        settings: FakeSettingsRepository = FakeSettingsRepository(),
         registry: SourceRegistry,
         assetOperations: BookAssetOperationCoordinator = CoroutineBookAssetOperationCoordinator(),
     ) = LibraryViewModel(
         repository = store,
         localSource = FakeLocalBookImporter(),
-        settings = settings,
-        calibreRepositoryFactory = { FakeCalibreRepository() },
         assetOperations = assetOperations,
         sourceRegistry = registry,
     )
@@ -667,16 +867,24 @@ class OnlineLibraryViewModelTest {
 
     private fun enabledSource(
         id: String,
-        kind: SourceKind,
-        name: String = kind.name,
+        adapterId: String,
+        name: String = adapterId,
         baseUrl: String = "http://192.168.1.5:8080",
     ) = SourceDescriptor(
         id = id,
-        kind = kind,
+        adapterId = adapterId,
         name = name,
+        configVersion = 1,
+        configJson = "{\"baseUrl\":\"$baseUrl\"}",
         baseUrl = baseUrl,
         enabled = true,
         isBuiltin = id == BUILTIN_CALIBRE_SOURCE_ID,
+    ).copy(
+        capabilities = SourceCapabilities(
+            canSearch = true,
+            canPreviewText = true,
+            canDownload = true,
+        ),
     )
 
     private fun entry(
@@ -699,6 +907,14 @@ class OnlineLibraryViewModelTest {
     private class FakeSourceRegistry(
         sources: List<SourceDescriptor>,
         private val catalogs: Map<String, OnlineBookCatalog>,
+        private val addHandler: suspend (
+            String,
+            String,
+            Int,
+            String,
+        ) -> ReadflowResult<SourceDescriptor> = { _, _, _, _ ->
+            ReadflowResult.Failure(ReadflowError.unsupported("not used"))
+        },
     ) : SourceRegistry {
         private val sourceFlow = MutableStateFlow(sources)
         val openedSourceIds = mutableListOf<String>()
@@ -713,11 +929,11 @@ class OnlineLibraryViewModelTest {
         }
 
         override suspend fun addUserSource(
-            kind: SourceKind,
+            adapterId: String,
             name: String,
-            baseUrl: String,
-        ): ReadflowResult<SourceDescriptor> =
-            ReadflowResult.Failure(ReadflowError.unsupported("not used"))
+            configVersion: Int,
+            configJson: String,
+        ): ReadflowResult<SourceDescriptor> = addHandler(adapterId, name, configVersion, configJson)
 
         override suspend fun removeUserSource(sourceId: String): ReadflowResult<Unit> =
             ReadflowResult.Success(Unit).also {
@@ -728,17 +944,25 @@ class OnlineLibraryViewModelTest {
     private class FakeOnlineCatalog(
         private val searchHandler: suspend (String, OnlineCatalogFilter) -> ReadflowResult<List<OnlineCatalogEntry>> =
             { _, _ -> ReadflowResult.Success(emptyList()) },
+        private val searchPageHandler: (suspend (
+            String,
+            OnlineCatalogFilter,
+            Int,
+            Int,
+        ) -> ReadflowResult<List<OnlineCatalogEntry>>)? = null,
         private val downloadHandler: suspend (OnlineCatalogEntry) -> ReadflowResult<BookMeta> = {
             ReadflowResult.Success(it.meta.copy(downloadStatus = DownloadStatus.DOWNLOADED))
         },
-        private val previewHandler: suspend (OnlineCatalogEntry) -> ReadflowResult<String> = {
-            ReadflowResult.Success(it.previewUrl.orEmpty())
+        private val previewHandler: suspend (OnlineCatalogEntry) -> ReadflowResult<OnlineBookPreview> = {
+            ReadflowResult.Success(OnlineBookPreview(it.meta.title, it.meta.author, null, "preview"))
         },
     ) : OnlineBookCatalog {
         override val descriptor = SourceDescriptor(
             id = "fake",
-            kind = SourceKind.JSON_HTTP,
+            adapterId = SourceAdapterIds.JSON_HTTP,
             name = "fake",
+            configVersion = 1,
+            configJson = "{\"baseUrl\":\"http://192.168.1.5:8080\"}",
             baseUrl = "http://192.168.1.5:8080",
         )
 
@@ -747,11 +971,11 @@ class OnlineLibraryViewModelTest {
             filter: OnlineCatalogFilter,
             offset: Int,
             limit: Int,
-        ) = searchHandler(query, filter)
+        ) = searchPageHandler?.invoke(query, filter, offset, limit) ?: searchHandler(query, filter)
 
         override suspend fun download(entry: OnlineCatalogEntry) = downloadHandler(entry)
 
-        override suspend fun previewUrl(entry: OnlineCatalogEntry) = previewHandler(entry)
+        override suspend fun preview(entry: OnlineCatalogEntry) = previewHandler(entry)
     }
 
     private class FakeLibraryStore : LibraryStore {
@@ -776,43 +1000,6 @@ class OnlineLibraryViewModelTest {
         override suspend fun renameBundle(collectionId: String, newName: String) = Unit
         override suspend fun ungroupBundle(collectionId: String) = Unit
         override suspend fun updateShelfOrder(ids: List<String>) = Unit
-    }
-
-    private class FakeSettingsRepository : SettingsRepository {
-        override val calibreBaseUrl = MutableStateFlow<String?>("http://192.168.1.5:8080")
-        override val fontSize = MutableStateFlow(18)
-        override val lineSpacing = MutableStateFlow(1.75f)
-        override val readingMode = MutableStateFlow(ReaderReadingMode.SCROLL)
-        override val themeMode = MutableStateFlow(ThemeMode.SYSTEM)
-        override val deviceId = MutableStateFlow("device")
-        override val engineOverrides = MutableStateFlow(emptyMap<BookFormat, String>())
-        override val useSourceHanFont = MutableStateFlow(true)
-        override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
-        override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.SourceHan)
-        override val readerGuideShown = MutableStateFlow(true)
-        override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
-        override suspend fun setCalibreBaseUrl(url: String) {
-            calibreBaseUrl.value = url
-        }
-        override suspend fun setFontSize(size: Int) = Unit
-        override suspend fun setLineSpacing(multiplier: Float) = Unit
-        override suspend fun setReadingMode(mode: ReaderReadingMode) = Unit
-        override suspend fun setThemeMode(mode: ThemeMode) = Unit
-        override suspend fun setEngineOverride(format: BookFormat, engineId: String?) = Unit
-        override suspend fun setUseSourceHanFont(enabled: Boolean) = Unit
-        override suspend fun setTxtEncoding(encoding: TxtEncoding) = Unit
-        override suspend fun setFontChoice(choice: FontChoice) = Unit
-        override suspend fun setReaderGuideShown(shown: Boolean) = Unit
-        override suspend fun setPageFlipStyle(style: dev.readflow.core.model.PageFlipStyle) = Unit
-    }
-
-    private class FakeCalibreRepository : CalibreRepository {
-        override suspend fun search(query: String, offset: Int, limit: Int) =
-            ReadflowResult.Success(emptyList<BookMeta>())
-        override suspend fun metadata(bookId: String) =
-            ReadflowResult.Failure(ReadflowError.notFound("book", bookId))
-        override suspend fun download(bookId: String) =
-            ReadflowResult.Failure(ReadflowError.unsupported("unused"))
     }
 
     private class FakeLocalBookImporter : LocalBookImporter {

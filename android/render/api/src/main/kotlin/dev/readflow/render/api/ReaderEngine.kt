@@ -1,5 +1,6 @@
 package dev.readflow.render.api
 
+import android.graphics.Typeface
 import android.net.Uri
 import android.view.View
 import dev.readflow.core.model.BookFormat
@@ -100,6 +101,13 @@ interface ReaderEngine {
     suspend fun setFont(fontId: String) {}
     /** EPUB CSS family -> reader font id replacements. Other formats ignore this setting. */
     suspend fun setEpubFontReplacements(replacements: Map<String, String>) {}
+    /** Layered EPUB replacements; engines can preserve book-base precedence over global exact keys. */
+    suspend fun setEpubFontReplacementLayers(
+        bookReplacements: Map<String, String>,
+        globalReplacements: Map<String, String>,
+    ) {
+        setEpubFontReplacements(globalReplacements + bookReplacements)
+    }
     /**
      * Optional CSS `@font-face` family catalog for the open EPUB (empty for other engines).
      * Pure in-memory snapshot; never performs disk IO on the page-turn path.
@@ -109,6 +117,8 @@ interface ReaderEngine {
         bookReplacements: Map<String, String> = emptyMap(),
         globalReplacements: Map<String, String> = emptyMap(),
     ): List<EpubCssFontFamilyInfo> = emptyList()
+    /** Resolves the actual Typeface used for this catalog entry; implementations perform IO off-main. */
+    suspend fun epubCssFontPreviewTypeface(entry: EpubCssFontFamilyInfo): Typeface? = null
     /** TXT 用户编码覆盖：传 charset 名强制重解码，null=沿用自动检测。默认空实现，仅 TXT 引擎实现。 */
     suspend fun setTxtEncodingOverride(charsetName: String?) {}
     suspend fun setTheme(mode: ThemeMode) {}

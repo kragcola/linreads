@@ -27,7 +27,6 @@ import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.prefs.canonicalBookIdentity
 import dev.readflow.core.prefs.canonicalEpubFontFamilyKey
-import dev.readflow.core.prefs.mergedEpubFontReplacements
 import dev.readflow.core.sync.SyncManager
 import dev.readflow.render.api.EngineStateStore
 import dev.readflow.render.api.EpubCssFontFamilyInfo
@@ -273,8 +272,6 @@ class ReaderViewModel(
         val theme: ThemeMode,
         val useSourceHanFont: Boolean,
         val fontChoice: FontChoice,
-        /** Merged global + book-scoped replacements already applied (book wins). */
-        val epubFontReplacements: Map<String, String>,
         val epubBookFontReplacements: Map<String, String>,
         val epubGlobalFontReplacements: Map<String, String>,
         val flipStyle: PageFlipStyle,
@@ -488,7 +485,6 @@ class ReaderViewModel(
             theme = restoredForBook?.theme ?: settings.themeMode.first(),
             useSourceHanFont = settings.useSourceHanFont.first(),
             fontChoice = FontChoice.parse(settings.fontChoice.first().serialize()),
-            epubFontReplacements = mergedEpubFontReplacements(globalEpub, bookScoped),
             epubBookFontReplacements = bookScoped,
             epubGlobalFontReplacements = globalEpub,
             flipStyle = settings.pageFlipStyle.first(),
@@ -506,7 +502,10 @@ class ReaderViewModel(
         engine.setTheme(openSettings.theme)
         engine.setSerifFont(openSettings.useSourceHanFont)
         engine.setFont(openSettings.fontChoice.serialize())
-        engine.setEpubFontReplacements(openSettings.epubFontReplacements)
+        engine.setEpubFontReplacementLayers(
+            bookReplacements = openSettings.epubBookFontReplacements,
+            globalReplacements = openSettings.epubGlobalFontReplacements,
+        )
         engine.setPageFlipStyle(openSettings.flipStyle)
         if (openSettings.txtEncodingCharsetName != null) {
             engine.setTxtEncodingOverride(openSettings.txtEncodingCharsetName)
@@ -780,15 +779,18 @@ class ReaderViewModel(
             ) { global, byBook ->
                 val bookKey = canonicalBookIdentity(currentBookId)
                 val bookScoped = if (bookKey != null) byBook[bookKey].orEmpty() else emptyMap()
-                Triple(global, bookScoped, mergedEpubFontReplacements(global, bookScoped))
-            }.collect { (global, bookScoped, merged) ->
+                global to bookScoped
+            }.collect { (global, bookScoped) ->
                 if (firstEmission) {
                     firstEmission = false
                     // Still refresh catalog/status for the open book after first open apply.
                     refreshEpubFontUi(engine, bookScoped, global)
                     return@collect
                 }
-                engine.setEpubFontReplacements(merged)
+                engine.setEpubFontReplacementLayers(
+                    bookReplacements = bookScoped,
+                    globalReplacements = global,
+                )
                 refreshEpubFontUi(engine, bookScoped, global)
             }
         }
