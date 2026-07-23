@@ -213,6 +213,14 @@ interface SourceRegistry {
     )
 
     suspend fun removeUserSource(sourceId: String): ReadflowResult<Unit>
+
+    /**
+     * Import a versioned source-configuration envelope (JSON text).
+     * Implementations must parse, validate against registered adapters, and avoid
+     * duplicate sources for identical adapterId/configVersion/configJson when practical.
+     */
+    suspend fun importUserSourceConfig(rawJson: String): ReadflowResult<SourceDescriptor> =
+        ReadflowResult.Failure(ReadflowError.unsupported("书源注册器不支持配置导入"))
 }
 
 const val BUILTIN_CALIBRE_SOURCE_ID = "calibre-builtin"

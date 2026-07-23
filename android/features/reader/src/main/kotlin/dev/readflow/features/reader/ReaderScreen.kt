@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
@@ -61,7 +62,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -82,8 +82,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.stateDescription
@@ -126,6 +128,9 @@ import dev.readflow.render.api.SelfPagingReaderEngine
 import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.ZoomableReaderEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -383,6 +388,16 @@ fun ReaderScreen(
     val readerPaperColor = Color(readerPaletteFor(state.themeMode, systemNight).paper)
     ReaderSystemBarAppearance(state.themeMode, systemNight)
 
+    LaunchedEffect(viewModel) {
+        try {
+            viewModel.recoverPendingImportedFontDeletions()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Throwable) {
+            // Startup coordinator retains the durable ledger; this screen only mirrors its block.
+        }
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -411,10 +426,10 @@ fun ReaderScreen(
                             readerFeaturesFor(engine, hasSavedAnnotations = hasSavedAnnotations),
                         )
                     }
-                    var fontImportError by remember(engine) { mutableStateOf<String?>(null) }
+                    var fontActionError by remember(engine) { mutableStateOf<String?>(null) }
                     var fontCatalogRevision by remember(engine) { mutableIntStateOf(0) }
                     var pendingFontImportFamily by remember(engine) { mutableStateOf<String?>(null) }
-                    var showBookFontWindow by remember(engine) { mutableStateOf(false) }
+                    var showFontManagementWindow by remember(engine) { mutableStateOf(false) }
                     val fontImportLauncher = rememberLauncherForActivityResult(
                         ActivityResultContracts.OpenDocument(),
                     ) { uri ->
@@ -428,7 +443,7 @@ fun ReaderScreen(
                             }
                             result.onSuccess { choice ->
                                 fontCatalogRevision++
-                                fontImportError = null
+                                fontActionError = null
                                 val family = pendingFontImportFamily
                                 pendingFontImportFamily = null
                                 if (family == null) {
@@ -440,7 +455,7 @@ fun ReaderScreen(
                                 }
                             }.onFailure { error ->
                                 pendingFontImportFamily = null
-                                fontImportError = when (error) {
+                                fontActionError = when (error) {
                                     is IllegalArgumentException ->
                                         error.message ?: "请选择可用的 TTF 或 OTF 字体文件"
                                     else -> "字体导入失败，请重新选择字体文件"
@@ -667,8 +682,6 @@ fun ReaderScreen(
                         pageFlipStyle = state.pageFlipStyle,
                         themeMode = state.themeMode,
                         epubCssFontCatalog = state.epubCssFontCatalog,
-                        fontCatalogRevision = fontCatalogRevision,
-                        fontImportError = fontImportError,
                         searchState = state.search,
                         bookmarkState = state.bookmarks,
                         annotationState = state.annotations,
@@ -684,15 +697,7 @@ fun ReaderScreen(
                         onSearchClear = { viewModel.onIntent(ReaderIntent.ClearSearch) },
                         onFontSizeChange = { viewModel.onIntent(ReaderIntent.SetFontSize(it)) },
                         onLineSpacingChange = { viewModel.onIntent(ReaderIntent.SetLineSpacing(it)) },
-                        onFontChoiceChange = { viewModel.onIntent(ReaderIntent.SetFontChoice(it)) },
-                        onImportFont = { family ->
-                            fontImportError = null
-                            pendingFontImportFamily = family
-                            fontImportLauncher.launch(
-                                arrayOf("font/ttf", "font/otf", "application/octet-stream"),
-                            )
-                        },
-                        onOpenBookFonts = { showBookFontWindow = true },
+                        onOpenFontManagement = { showFontManagementWindow = true },
                         onModeChange = { viewModel.onIntent(ReaderIntent.SetMode(it)) },
                         onPageFlipStyleChange = { viewModel.onIntent(ReaderIntent.SetPageFlipStyle(it)) },
                         onThemeChange = { viewModel.onIntent(ReaderIntent.SetTheme(it)) },
@@ -705,14 +710,17 @@ fun ReaderScreen(
                             .padding(bottom = panelBottomPadding),
                     )
 
-                    if (showBookFontWindow && state.epubCssFontCatalog.isNotEmpty()) {
-                        BookFontManagementWindow(
+                    if (showFontManagementWindow) {
+                        FontManagementWindow(
                             catalog = state.epubCssFontCatalog,
-                            defaultFontChoice = state.fontChoice,
+                            currentFontChoice = state.fontChoice,
                             previewTypefaceResolver = engine::epubCssFontPreviewTypeface,
                             fontCatalogRevision = fontCatalogRevision,
-                            fontImportError = fontImportError,
-                            onDismiss = { showBookFontWindow = false },
+                            fontActionError = fontActionError,
+                            onDismiss = { showFontManagementWindow = false },
+                            onSelectBodyFont = { choice ->
+                                viewModel.onIntent(ReaderIntent.SetFontChoice(choice))
+                            },
                             onMapFamily = { family, choice ->
                                 viewModel.onIntent(ReaderIntent.SetEpubBookFontReplacement(family, choice))
                             },
@@ -720,11 +728,56 @@ fun ReaderScreen(
                                 viewModel.onIntent(ReaderIntent.ClearEpubBookFontReplacement(family))
                             },
                             onImportFont = { family ->
-                                fontImportError = null
+                                fontActionError = null
                                 pendingFontImportFamily = family
                                 fontImportLauncher.launch(
                                     arrayOf("font/ttf", "font/otf", "application/octet-stream"),
                                 )
+                            },
+                            onDeleteFont = { choice ->
+                                scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                                    withContext(NonCancellable) {
+                                        val stagedResult = withContext(Dispatchers.IO) {
+                                            FontProvider.stageImportedFontDeletion(
+                                                context.applicationContext,
+                                                choice,
+                                            )
+                                        }
+                                        val staged = stagedResult.getOrElse {
+                                            fontActionError = "字体删除失败，请稍后重试"
+                                            return@withContext
+                                        }
+                                        try {
+                                            val referencesCleared =
+                                                viewModel.removeImportedFontReferences(choice)
+                                            if (referencesCleared.isFailure) {
+                                                withContext(Dispatchers.IO) {
+                                                    FontProvider.rollbackImportedFontDeletion(staged)
+                                                }
+                                                fontActionError = "无法清除字体设置，字体文件已保留"
+                                                return@withContext
+                                            }
+                                            val deleted = withContext(Dispatchers.IO) {
+                                                FontProvider.commitImportedFontDeletion(staged)
+                                            }
+                                            fontCatalogRevision++
+                                            fontActionError = if (deleted.isSuccess) {
+                                                val completed =
+                                                    viewModel.completeImportedFontDeletion(choice)
+                                                if (completed.isSuccess) {
+                                                    null
+                                                } else {
+                                                    "字体已删除，剩余清理将在下次打开时继续"
+                                                }
+                                            } else {
+                                                "字体引用已清除，文件将在下次打开时继续删除"
+                                            }
+                                        } catch (error: CancellationException) {
+                                            // NonCancellable owns the committed transaction; preserve cause semantics.
+                                            throw error
+                                        }
+                                    }
+                                }
                             },
                         )
                     }
@@ -957,8 +1010,6 @@ private fun ReaderControlPanel(
     pageFlipStyle: dev.readflow.core.model.PageFlipStyle,
     themeMode: ThemeMode,
     epubCssFontCatalog: List<EpubCssFontFamilyInfo>,
-    fontCatalogRevision: Int,
-    fontImportError: String?,
     searchState: ReaderSearchState,
     bookmarkState: ReaderBookmarkState,
     annotationState: ReaderAnnotationState,
@@ -974,9 +1025,7 @@ private fun ReaderControlPanel(
     onSearchClear: () -> Unit,
     onFontSizeChange: (Float) -> Unit,
     onLineSpacingChange: (Float) -> Unit,
-    onFontChoiceChange: (FontChoice) -> Unit,
-    onImportFont: (String?) -> Unit,
-    onOpenBookFonts: () -> Unit,
+    onOpenFontManagement: () -> Unit,
     onModeChange: (ReadingMode) -> Unit,
     onPageFlipStyleChange: (dev.readflow.core.model.PageFlipStyle) -> Unit,
     onThemeChange: (ThemeMode) -> Unit,
@@ -1054,13 +1103,9 @@ private fun ReaderControlPanel(
                         supportedModes = supportedModes,
                         pageFlipStyle = pageFlipStyle,
                         epubCssFontCatalog = epubCssFontCatalog,
-                        fontCatalogRevision = fontCatalogRevision,
-                        fontImportError = fontImportError,
                         onFontSizeChange = onFontSizeChange,
                         onLineSpacingChange = onLineSpacingChange,
-                        onFontChoiceChange = onFontChoiceChange,
-                        onImportFont = onImportFont,
-                        onOpenBookFonts = onOpenBookFonts,
+                        onOpenFontManagement = onOpenFontManagement,
                         onModeChange = onModeChange,
                         onPageFlipStyleChange = onPageFlipStyleChange,
                     )
@@ -1632,13 +1677,9 @@ private fun ReaderTypographyPanel(
     supportedModes: Set<ReadingMode>,
     pageFlipStyle: dev.readflow.core.model.PageFlipStyle,
     epubCssFontCatalog: List<EpubCssFontFamilyInfo>,
-    fontCatalogRevision: Int,
-    fontImportError: String?,
     onFontSizeChange: (Float) -> Unit,
     onLineSpacingChange: (Float) -> Unit,
-    onFontChoiceChange: (FontChoice) -> Unit,
-    onImportFont: (String?) -> Unit,
-    onOpenBookFonts: () -> Unit,
+    onOpenFontManagement: () -> Unit,
     onModeChange: (ReadingMode) -> Unit,
     onPageFlipStyleChange: (dev.readflow.core.model.PageFlipStyle) -> Unit,
 ) {
@@ -1646,16 +1687,6 @@ private fun ReaderTypographyPanel(
     val clampedLineSpacing = ReaderTypography.clampLineSpacing(lineSpacing)
     val fontValue = readerFontSizeText(clampedFontSize)
     val lineSpacingValue = readerLineSpacingText(clampedLineSpacing)
-    val context = LocalContext.current
-    var availableFonts by remember { mutableStateOf(FontProvider.builtInChoices) }
-    LaunchedEffect(fontCatalogRevision, context.applicationContext) {
-        availableFonts = withContext(Dispatchers.IO) {
-            FontProvider.availableChoices(
-                FontProvider.listCustomFonts(context.applicationContext),
-            )
-        }
-    }
-
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
         val useExpandedLayout = maxWidth >= 600.dp
         Column(
@@ -1692,13 +1723,8 @@ private fun ReaderTypographyPanel(
                     TypographyControls(
                         fontSizeSp = clampedFontSize,
                         lineSpacing = clampedLineSpacing,
-                        fontChoice = fontChoice,
-                        availableFonts = availableFonts,
                         onFontSizeChange = onFontSizeChange,
                         onLineSpacingChange = onLineSpacingChange,
-                        onFontChoiceChange = onFontChoiceChange,
-                        onImportFont = { onImportFont(null) },
-                        fontImportError = fontImportError,
                         modifier = Modifier.weight(1.3f),
                     )
                     TypographyPreview(
@@ -1712,13 +1738,8 @@ private fun ReaderTypographyPanel(
                 TypographyControls(
                     fontSizeSp = clampedFontSize,
                     lineSpacing = clampedLineSpacing,
-                    fontChoice = fontChoice,
-                    availableFonts = availableFonts,
                     onFontSizeChange = onFontSizeChange,
                     onLineSpacingChange = onLineSpacingChange,
-                    onFontChoiceChange = onFontChoiceChange,
-                    onImportFont = { onImportFont(null) },
-                    fontImportError = fontImportError,
                 )
                 TypographyPreview(
                     fontSizeSp = clampedFontSize,
@@ -1727,13 +1748,12 @@ private fun ReaderTypographyPanel(
                 )
             }
 
-            if (epubCssFontCatalog.isNotEmpty()) {
-                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
-                BookFontCatalogEntry(
-                    fontCount = epubCssFontCatalog.size,
-                    onClick = onOpenBookFonts,
-                )
-            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+            FontManagementEntry(
+                fontChoice = fontChoice,
+                bookFontCount = epubCssFontCatalog.size,
+                onClick = onOpenFontManagement,
+            )
 
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
             ReaderOptionRow(label = "阅读模式") {
@@ -1769,17 +1789,19 @@ private fun ReaderTypographyPanel(
 }
 
 @Composable
-private fun BookFontCatalogEntry(
-    fontCount: Int,
+private fun FontManagementEntry(
+    fontChoice: FontChoice,
+    bookFontCount: Int,
     onClick: () -> Unit,
 ) {
+    val summary = readerFontManagementSummary(fontChoice, bookFontCount)
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 56.dp)
             .clickable(onClick = onClick)
             .semantics {
-                contentDescription = "本书字体，共 $fontCount 种"
+                contentDescription = "字体，$summary"
                 role = Role.Button
             }
             .padding(vertical = 4.dp),
@@ -1787,9 +1809,9 @@ private fun BookFontCatalogEntry(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Text("本书字体（$fontCount）", style = MaterialTheme.typography.labelLarge)
+            Text("字体", style = MaterialTheme.typography.labelLarge)
             Text(
-                text = "查看书中例句并更换字体",
+                text = summary,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -1804,21 +1826,24 @@ private fun BookFontCatalogEntry(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun BookFontManagementWindow(
+private fun FontManagementWindow(
     catalog: List<EpubCssFontFamilyInfo>,
-    defaultFontChoice: FontChoice,
+    currentFontChoice: FontChoice,
     previewTypefaceResolver: suspend (EpubCssFontFamilyInfo) -> android.graphics.Typeface?,
     fontCatalogRevision: Int,
-    fontImportError: String?,
+    fontActionError: String?,
     onDismiss: () -> Unit,
+    onSelectBodyFont: (FontChoice) -> Unit,
     onMapFamily: (String, FontChoice) -> Unit,
     onClearFamily: (String) -> Unit,
-    onImportFont: (String) -> Unit,
+    onImportFont: (String?) -> Unit,
+    onDeleteFont: (FontChoice.Custom) -> Unit,
 ) {
+    var selectedTabIndex by remember { mutableIntStateOf(0) }
     var selectedFamily by remember { mutableStateOf<String?>(null) }
+    var pendingDeleteFont by remember { mutableStateOf<FontChoice.Custom?>(null) }
     val context = LocalContext.current
     var availableFonts by remember { mutableStateOf(FontProvider.builtInChoices) }
-    val previewFonts = remember(context.applicationContext) { mutableStateMapOf<String, FontFamily>() }
     LaunchedEffect(fontCatalogRevision, context.applicationContext) {
         availableFonts = withContext(Dispatchers.IO) {
             FontProvider.availableChoices(
@@ -1829,26 +1854,12 @@ private fun BookFontManagementWindow(
     val availableFontIds = remember(availableFonts) {
         availableFonts.mapTo(mutableSetOf()) { it.serialize() }
     }
-    val previewEntries = remember(catalog, defaultFontChoice) {
-        catalog.distinctBy { entry ->
-            bookFontPreviewCacheKey(entry, defaultFontChoice.serialize())
-        }
-    }
-    LaunchedEffect(context.applicationContext, previewEntries) {
-        previewEntries.forEach { entry ->
-            val previewKey = bookFontPreviewCacheKey(entry, defaultFontChoice.serialize())
-            if (previewFonts[previewKey] == null) {
-                val typeface = withContext(Dispatchers.IO) {
-                    previewTypefaceResolver(entry)
-                }
-                if (typeface != null) {
-                    previewFonts[previewKey] = FontFamily(ComposeTypeface(typeface))
-                }
-            }
-        }
-    }
     fun handleBack() {
-        if (selectedFamily != null) selectedFamily = null else onDismiss()
+        when {
+            pendingDeleteFont != null -> pendingDeleteFont = null
+            selectedFamily != null -> selectedFamily = null
+            else -> onDismiss()
+        }
     }
     Dialog(
         onDismissRequest = ::handleBack,
@@ -1866,7 +1877,7 @@ private fun BookFontManagementWindow(
             Scaffold(
                 topBar = {
                     TopAppBar(
-                        title = { Text("本书字体（${catalog.size}）") },
+                        title = { Text("字体") },
                         navigationIcon = {
                             IconButton(
                                 onClick = onDismiss,
@@ -1881,47 +1892,88 @@ private fun BookFontManagementWindow(
                     )
                 },
             ) { innerPadding ->
-                LazyColumn(
-                    state = rememberLazyListState(),
+                Column(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(innerPadding),
-                    contentPadding = PaddingValues(bottom = 24.dp),
                 ) {
-                    fontImportError?.let {
-                        item(key = "font-import-error") {
+                    PrimaryTabRow(selectedTabIndex = selectedTabIndex) {
+                        Tab(
+                            selected = selectedTabIndex == 0,
+                            onClick = { selectedTabIndex = 0 },
+                            text = { Text("我的字体") },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        )
+                        Tab(
+                            selected = selectedTabIndex == 1,
+                            onClick = { selectedTabIndex = 1 },
+                            text = { Text("本书字体（${catalog.size}）") },
+                            modifier = Modifier.heightIn(min = 48.dp),
+                        )
+                    }
+                    fontActionError?.let { message ->
+                        Text(
+                            text = message,
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp)
+                                .semantics {
+                                    contentDescription = "字体操作错误：$fontActionError"
+                                    liveRegion = LiveRegionMode.Polite
+                                },
+                        )
+                    }
+                    if (selectedTabIndex == 0) {
+                        ImportedFontCatalogContent(
+                            availableFonts = availableFonts,
+                            currentFontChoice = currentFontChoice,
+                            onSelect = onSelectBodyFont,
+                            onImport = { onImportFont(null) },
+                            onDelete = { pendingDeleteFont = it },
+                            modifier = Modifier.weight(1f),
+                        )
+                    } else if (catalog.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(24.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
                             Text(
-                                text = fontImportError,
-                                color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.bodyMedium,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 12.dp)
-                                    .semantics {
-                                        contentDescription = "字体导入错误：$fontImportError"
-                                    },
+                                text = "本书没有可配置的字体",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
-                    }
-                    items(
-                        items = catalog,
-                        key = { it.family },
-                    ) { entry ->
-                        BookFontUsageRow(
-                            entry = entry,
-                            previewKey = bookFontPreviewCacheKey(
-                                entry,
-                                defaultFontChoice.serialize(),
-                            ),
-                            availableFontIds = availableFontIds,
-                            previewFonts = previewFonts,
-                            onChoose = { selectedFamily = entry.family },
-                            onClear = { onClearFamily(entry.family) },
-                        )
-                        HorizontalDivider(
-                            modifier = Modifier.padding(horizontal = 16.dp),
-                            color = MaterialTheme.colorScheme.outlineVariant,
-                        )
+                    } else {
+                        LazyColumn(
+                            state = rememberLazyListState(),
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(bottom = 24.dp),
+                        ) {
+                            items(
+                                items = catalog,
+                                key = { it.family },
+                            ) { entry ->
+                                BookFontUsageRow(
+                                    entry = entry,
+                                    previewKey = bookFontPreviewCacheKey(
+                                        entry,
+                                        currentFontChoice.serialize(),
+                                    ),
+                                    availableFontIds = availableFontIds,
+                                    previewTypefaceResolver = previewTypefaceResolver,
+                                    onChoose = { selectedFamily = entry.family },
+                                    onClear = { onClearFamily(entry.family) },
+                                )
+                                HorizontalDivider(
+                                    modifier = Modifier.padding(horizontal = 16.dp),
+                                    color = MaterialTheme.colorScheme.outlineVariant,
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1945,6 +1997,144 @@ private fun BookFontManagementWindow(
             )
         }
     }
+
+    pendingDeleteFont?.let { choice ->
+        DeleteImportedFontDialog(
+            choice = choice,
+            onDismiss = { pendingDeleteFont = null },
+            onConfirm = {
+                pendingDeleteFont = null
+                onDeleteFont(choice)
+            },
+        )
+    }
+}
+
+@Composable
+private fun ImportedFontCatalogContent(
+    availableFonts: List<FontChoice>,
+    currentFontChoice: FontChoice,
+    onSelect: (FontChoice) -> Unit,
+    onImport: () -> Unit,
+    onDelete: (FontChoice.Custom) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LazyColumn(
+        modifier = modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        item(key = "import-font") {
+            OutlinedButton(
+                onClick = onImport,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp),
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(Modifier.width(8.dp))
+                Text("导入字体")
+            }
+        }
+        items(availableFonts, key = { it.serialize() }) { choice ->
+            ImportedFontRow(
+                choice = choice,
+                selected = currentFontChoice == choice,
+                onSelect = { onSelect(choice) },
+                onDelete = (choice as? FontChoice.Custom)?.let { custom ->
+                    { onDelete(custom) }
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ImportedFontRow(
+    choice: FontChoice,
+    selected: Boolean,
+    onSelect: () -> Unit,
+    onDelete: (() -> Unit)?,
+) {
+    val context = LocalContext.current
+    val label = FontProvider.displayName(choice)
+    val previewFont by produceState<FontFamily>(
+        initialValue = FontFamily.Serif,
+        key1 = choice,
+        key2 = context.applicationContext,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            FontProvider.fontFamilyFor(context.applicationContext, choice.serialize())
+        }
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 64.dp)
+            .clickable(onClick = onSelect)
+            .semantics {
+                contentDescription = "正文字体，$label"
+                stateDescription = if (selected) "已选择" else "未选择"
+                role = Role.RadioButton
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RadioButton(selected = selected, onClick = null)
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+        ) {
+            Text(label, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
+            Text(
+                text = "山川湖海，阅读使人自由",
+                style = MaterialTheme.typography.bodyMedium,
+                fontFamily = previewFont,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        onDelete?.let {
+            IconButton(
+                onClick = it,
+                modifier = Modifier.sizeIn(minWidth = 48.dp, minHeight = 48.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Delete,
+                    contentDescription = "删除字体 $label",
+                    tint = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DeleteImportedFontDialog(
+    choice: FontChoice.Custom,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("删除“${FontProvider.displayName(choice)}”？") },
+        text = { Text("删除字体后会清除正文和书籍中的全部引用；正在使用时会改回系统衬线。") },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text("删除", color = MaterialTheme.colorScheme.error)
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) { Text("取消") }
+        },
+    )
 }
 
 @Composable
@@ -1952,11 +2142,17 @@ private fun BookFontUsageRow(
     entry: EpubCssFontFamilyInfo,
     previewKey: String,
     availableFontIds: Set<String>,
-    previewFonts: MutableMap<String, FontFamily>,
+    previewTypefaceResolver: suspend (EpubCssFontFamilyInfo) -> android.graphics.Typeface?,
     onChoose: () -> Unit,
     onClear: () -> Unit,
 ) {
-    val previewFont = previewFonts[previewKey] ?: FontFamily.Serif
+    val previewFont by produceState<FontFamily>(
+        initialValue = FontFamily.Serif,
+        key1 = previewKey,
+    ) {
+        val typeface = withContext(Dispatchers.IO) { previewTypefaceResolver(entry) }
+        if (typeface != null) value = FontFamily(ComposeTypeface(typeface))
+    }
     val previewText = remember(entry.excerpt, entry.excerptMatchStart, entry.excerptMatchEnd, previewFont) {
         buildAnnotatedString {
             append(entry.excerpt)
@@ -2164,13 +2360,8 @@ internal fun epubCssMappedFontLabel(fontId: String): String =
 private fun TypographyControls(
     fontSizeSp: Float,
     lineSpacing: Float,
-    fontChoice: FontChoice,
-    availableFonts: List<FontChoice>,
     onFontSizeChange: (Float) -> Unit,
     onLineSpacingChange: (Float) -> Unit,
-    onFontChoiceChange: (FontChoice) -> Unit,
-    onImportFont: () -> Unit,
-    fontImportError: String?,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -2203,79 +2394,6 @@ private fun TypographyControls(
             decreaseEnabled = lineSpacing > ReaderTypography.MIN_LINE_SPACING,
             increaseEnabled = lineSpacing < ReaderTypography.MAX_LINE_SPACING,
         )
-        ReaderFontSelector(
-            fontChoice = fontChoice,
-            availableFonts = availableFonts,
-            onFontChoiceChange = onFontChoiceChange,
-            onImportFont = onImportFont,
-            fontImportError = fontImportError,
-        )
-    }
-}
-
-@Composable
-private fun ReaderFontSelector(
-    fontChoice: FontChoice,
-    availableFonts: List<FontChoice>,
-    onFontChoiceChange: (FontChoice) -> Unit,
-    onImportFont: () -> Unit,
-    fontImportError: String?,
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text("字体", style = MaterialTheme.typography.labelLarge)
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            availableFonts.forEach { choice ->
-                val label = FontProvider.displayName(choice)
-                val selected = fontChoice == choice
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 56.dp)
-                        .clickable { onFontChoiceChange(choice) }
-                        .semantics {
-                            contentDescription = "正文字体，$label"
-                            stateDescription = if (selected) "已选择" else "未选择"
-                            role = Role.RadioButton
-                        },
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    RadioButton(selected = selected, onClick = null)
-                    Text(
-                        text = label,
-                        modifier = Modifier.padding(start = 8.dp),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-        }
-        OutlinedButton(
-            onClick = onImportFont,
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 48.dp),
-        ) {
-            Icon(Icons.Default.Add, contentDescription = null)
-            Spacer(Modifier.width(8.dp))
-            Text("导入字体")
-        }
-        fontImportError?.let { message ->
-            Text(
-                text = message,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
-        if (fontChoice is FontChoice.Custom && fontChoice !in availableFonts) {
-            Text(
-                text = "之前选择的字体暂不可用，当前使用系统衬线",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
     }
 }
 
@@ -2448,6 +2566,11 @@ internal fun steppedReaderLineSpacing(current: Float, direction: Int): Float {
 
 internal fun readerTypographyPreviewLineHeightSp(fontSizeSp: Float, lineSpacing: Float): Float =
     ReaderTypography.clampFontSp(fontSizeSp) * ReaderTypography.clampLineSpacing(lineSpacing)
+
+internal fun readerFontManagementSummary(fontChoice: FontChoice, bookFontCount: Int): String {
+    val current = FontProvider.displayName(fontChoice)
+    return if (bookFontCount > 0) "$current · 本书 $bookFontCount 种字体" else current
+}
 
 internal fun readerTypographyStepDescription(label: String, value: String, increase: Boolean): String =
     "${if (increase) "增大" else "减小"}$label，当前 $value"

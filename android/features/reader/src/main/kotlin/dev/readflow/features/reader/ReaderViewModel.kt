@@ -180,8 +180,10 @@ class ReaderViewModel(
     private var settingsFontJob: Job? = null
     private var settingsLineSpacingJob: Job? = null
     private var settingsEpubFontReplacementJob: Job? = null
-    /** Serializes book-scoped font map mutations for the open book. */
-    private val epubBookFontMutex = Mutex()
+    /** Serializes every settings write that can reference an imported font. */
+    private val fontSettingsMutex = Mutex()
+    /** Kept until file deletion is durably completed so queued UI writes cannot revive an id. */
+    private val deletingImportedFontIds = mutableSetOf<String>()
     private var openJob: Job? = null
     private var activeEngine: ReaderEngine? = _uiState.value.engine
     /**
@@ -1223,20 +1225,99 @@ class ReaderViewModel(
 
     private fun setFontChoice(choice: FontChoice) {
         val canonical = FontChoice.parse(choice.serialize())
-        val engine = _uiState.value.engine
-        updateUiStateAndPersist { it.copy(fontChoice = canonical) }
         viewModelScope.launch {
-            engine?.setFont(canonical.serialize())
-            settings.setFontChoice(canonical)
+            fontSettingsMutex.withLock {
+                if (
+                    canonical is FontChoice.Custom &&
+                    canonical.serialize() in deletingImportedFontIds
+                ) {
+                    return@withLock
+                }
+                val engine = _uiState.value.engine
+                updateUiStateAndPersist { it.copy(fontChoice = canonical) }
+                engine?.setFont(canonical.serialize())
+                settings.setFontChoice(canonical)
+            }
+        }
+    }
+
+    /** Clears durable references before the caller is allowed to delete the backing font file. */
+    internal suspend fun removeImportedFontReferences(choice: FontChoice.Custom): Result<Unit> {
+        val canonical = FontChoice.parse(choice.serialize()) as? FontChoice.Custom
+            ?: return Result.failure(IllegalArgumentException("字体标识无效"))
+        val fontId = canonical.serialize()
+        return fontSettingsMutex.withLock {
+            if (!deletingImportedFontIds.add(fontId)) {
+                return@withLock Result.failure(IllegalStateException("字体正在删除"))
+            }
+            try {
+                settings.removeImportedFont(canonical)
+            } catch (error: CancellationException) {
+                deletingImportedFontIds -= fontId
+                throw error
+            } catch (error: Throwable) {
+                deletingImportedFontIds -= fontId
+                return@withLock Result.failure(error)
+            }
+            withContext(Dispatchers.Main.immediate) {
+                val engine = _uiState.value.engine
+                val wasCurrent = _uiState.value.fontChoice == canonical
+                if (wasCurrent) {
+                    updateUiStateAndPersist { it.copy(fontChoice = FontChoice.System) }
+                    try {
+                        engine?.setFont(FontChoice.System.serialize())
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (_: Throwable) {
+                        // Durable settings are authoritative; the next reader attach resolves from them.
+                    }
+                }
+            }
+            Result.success(Unit)
+        }
+    }
+
+    /** Marks persisted deletion work as blocked before the file layer replays it after startup. */
+    internal suspend fun recoverPendingImportedFontDeletions(): Set<FontChoice.Custom> =
+        fontSettingsMutex.withLock {
+            val pending = settings.pendingImportedFontDeletions.first()
+                .mapNotNullTo(linkedSetOf()) { choice ->
+                    FontChoice.parse(choice.serialize()) as? FontChoice.Custom
+                }
+            deletingImportedFontIds += pending.map(FontChoice.Custom::serialize)
+            pending
+        }
+
+    /** Releases the runtime block only after both the file and persistent ledger are complete. */
+    internal suspend fun completeImportedFontDeletion(choice: FontChoice.Custom): Result<Unit> {
+        val canonical = FontChoice.parse(choice.serialize()) as? FontChoice.Custom
+            ?: return Result.failure(IllegalArgumentException("字体标识无效"))
+        return fontSettingsMutex.withLock {
+            try {
+                settings.completeImportedFontDeletion(canonical)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                return@withLock Result.failure(error)
+            }
+            deletingImportedFontIds -= canonical.serialize()
+            Result.success(Unit)
         }
     }
 
     private fun setEpubBookFontReplacement(family: String, choice: FontChoice) {
         val familyKey = canonicalEpubFontFamilyKey(family) ?: return
         val bookKey = canonicalBookIdentity(currentBookId) ?: return
-        val fontId = choice.serialize()
+        val canonical = FontChoice.parse(choice.serialize())
+        val fontId = canonical.serialize()
         viewModelScope.launch {
-            epubBookFontMutex.withLock {
+            fontSettingsMutex.withLock {
+                if (
+                    canonical is FontChoice.Custom &&
+                    fontId in deletingImportedFontIds
+                ) {
+                    return@withLock
+                }
                 val current = settings.epubBookFontReplacements.first()[bookKey].orEmpty()
                 val next = current + (familyKey to fontId)
                 settings.setEpubBookFontReplacements(bookKey, next)
@@ -1248,7 +1329,7 @@ class ReaderViewModel(
         val familyKey = canonicalEpubFontFamilyKey(family) ?: return
         val bookKey = canonicalBookIdentity(currentBookId) ?: return
         viewModelScope.launch {
-            epubBookFontMutex.withLock {
+            fontSettingsMutex.withLock {
                 val current = settings.epubBookFontReplacements.first()[bookKey].orEmpty()
                 if (familyKey !in current) return@withLock
                 settings.setEpubBookFontReplacements(bookKey, current - familyKey)

@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import dev.readflow.core.calibre.calibreSourceConfigJson
 import dev.readflow.core.calibre.htmlRulesV1ConfigJson
 import dev.readflow.core.calibre.httpCatalogSourceConfigJson
+import dev.readflow.core.calibre.readBoundedSourceConfigBytes
 import dev.readflow.core.calibre.HtmlChapterRules
 import dev.readflow.core.calibre.HtmlDetailRules
 import dev.readflow.core.calibre.HtmlRulesV1Config
@@ -32,6 +33,7 @@ import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceRegistry
 import dev.readflow.extensions.api.BUILTIN_CALIBRE_SOURCE_ID
 import dev.readflow.extensions.api.stableRemoteBookId
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
@@ -49,6 +51,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import java.net.URI
@@ -81,7 +84,7 @@ data class OnlineLibraryUiState(
     val error: String? = null,
     val addSourceName: String = "",
     val addSourceUrl: String = "",
-    val addSourceAdapterId: String = SourceAdapterIds.JSON_HTTP,
+    val addSourceAdapterId: String = SourceAdapterIds.HTML_RULES_V1,
     val htmlSourceDraft: HtmlSourceDraft = HtmlSourceDraft(),
 )
 
@@ -203,6 +206,9 @@ class LibraryViewModel(
                     val currentSelection = _onlineLibraryState.value.selectedSourceId
                     val resolvedSelection = currentSelection
                         ?.takeIf { id -> sources.any { it.id == id } }
+                        ?: sources.firstOrNull {
+                            it.enabled && it.baseUrl.isNotBlank() && it.adapterId != SourceAdapterIds.CALIBRE
+                        }?.id
                         ?: sources.firstOrNull { it.enabled && it.baseUrl.isNotBlank() }?.id
                         ?: sources.firstOrNull()?.id
                     val sourceChanged = resolvedSelection != currentSelection
@@ -980,6 +986,97 @@ class LibraryViewModel(
                 is ReadflowResult.Failure -> _onlineLibraryState.update {
                     it.copy(error = result.error.message, message = null)
                 }
+            }
+        }
+    }
+
+    /**
+     * Import a versioned source-configuration JSON via document picker.
+     * UI performs a bounded stream read; registry validates the JSON string only.
+     * Never executes file contents as code.
+     */
+    fun importSourceConfigFromUri(context: Context, uri: Uri) {
+        val registry = sourceRegistry ?: run {
+            _onlineLibraryState.update { it.copy(error = "书源服务未配置", message = null) }
+            return
+        }
+        if (_onlineLibraryState.value.isAddingSource) return
+        _onlineLibraryState.update { it.copy(isAddingSource = true, error = null, message = null) }
+        viewModelScope.launch {
+            val result = try {
+                withContext(Dispatchers.IO) {
+                    val input = context.contentResolver.openInputStream(uri)
+                        ?: return@withContext ReadflowResult.Failure(
+                            dev.readflow.core.model.ReadflowError.io("无法打开配置文件"),
+                        )
+                    input.use { stream ->
+                        val raw = when (val read = readBoundedSourceConfigBytes(stream)) {
+                            is ReadflowResult.Failure -> return@use read
+                            is ReadflowResult.Success -> read.value
+                        }
+                        registry.importUserSourceConfig(raw)
+                    }
+                }
+            } catch (error: CancellationException) {
+                _onlineLibraryState.update { it.copy(isAddingSource = false) }
+                throw error
+            } catch (error: Throwable) {
+                _onlineLibraryState.update {
+                    it.copy(
+                        isAddingSource = false,
+                        error = error.message ?: "导入书源配置失败",
+                        message = null,
+                    )
+                }
+                return@launch
+            }
+            applySourceConfigImportResult(result)
+        }
+    }
+
+    /** Imports already-bounded JSON and applies the same selection/error state as document import. */
+    internal fun importSourceConfigText(rawJson: String) {
+        val registry = sourceRegistry ?: run {
+            _onlineLibraryState.update { it.copy(error = "书源服务未配置", message = null) }
+            return
+        }
+        if (_onlineLibraryState.value.isAddingSource) return
+        _onlineLibraryState.update { it.copy(isAddingSource = true, error = null, message = null) }
+        viewModelScope.launch {
+            // Already-read JSON string: stay on viewModelScope (Main under tests) so
+            // StandardTestDispatcher.advanceUntilIdle observes registry + selection updates.
+            // URI import keeps Dispatchers.IO for ContentResolver stream I/O.
+            val result = try {
+                registry.importUserSourceConfig(rawJson)
+            } catch (error: CancellationException) {
+                _onlineLibraryState.update { it.copy(isAddingSource = false) }
+                throw error
+            } catch (error: Throwable) {
+                _onlineLibraryState.update {
+                    it.copy(
+                        isAddingSource = false,
+                        error = error.message ?: "导入书源配置失败",
+                        message = null,
+                    )
+                }
+                return@launch
+            }
+            applySourceConfigImportResult(result)
+        }
+    }
+
+    private fun applySourceConfigImportResult(result: ReadflowResult<SourceDescriptor>) {
+        when (result) {
+            is ReadflowResult.Success -> _onlineLibraryState.update {
+                it.copy(
+                    isAddingSource = false,
+                    message = "已导入书源「${result.value.name}」",
+                    error = null,
+                    selectedSourceId = result.value.id,
+                )
+            }
+            is ReadflowResult.Failure -> _onlineLibraryState.update {
+                it.copy(isAddingSource = false, error = result.error.message, message = null)
             }
         }
     }

@@ -8,9 +8,11 @@ class ReaderLineSpacingTest {
 
     @Test
     fun `line spacing is clamped to readable range`() {
-        // Floor lowered to 1.0 to reach Moon+ 静读天下's 1.3 default (and tighter).
+        // Keep the recommended 1.6 default while allowing large text to use a compact rhythm.
         assertEquals(ReaderTypography.MIN_LINE_SPACING, clampedReaderLineSpacing(0.5f), 0.001f)
-        assertEquals(ReaderTypography.MAX_LINE_SPACING, clampedReaderLineSpacing(3f), 0.001f)
+        assertEquals(ReaderTypography.MAX_LINE_SPACING, clampedReaderLineSpacing(3.5f), 0.001f)
+        assertEquals(0.8f, ReaderTypography.MIN_LINE_SPACING, 0.001f)
+        assertEquals(3.0f, ReaderTypography.MAX_LINE_SPACING, 0.001f)
     }
 
     @Test

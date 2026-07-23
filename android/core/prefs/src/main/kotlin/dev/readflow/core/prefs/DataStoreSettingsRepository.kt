@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import dev.readflow.core.model.BookFormat
@@ -80,6 +81,11 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
             resolvedEpubBookFontReplacements(preferences[KEY_EPUB_BOOK_FONT_REPLACEMENTS])
         }
 
+    override val pendingImportedFontDeletions: Flow<Set<FontChoice.Custom>> =
+        context.dataStore.data.map { preferences ->
+            resolvedPendingImportedFontDeletions(preferences[KEY_PENDING_IMPORTED_FONT_DELETIONS])
+        }
+
     override val readerGuideShown: Flow<Boolean> =
         context.dataStore.data.map { it[KEY_READER_GUIDE_SHOWN] ?: false }
 
@@ -146,12 +152,53 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     }
 
     override suspend fun setFontChoice(choice: FontChoice) {
-        context.dataStore.edit { it[KEY_FONT_CHOICE] = choice.serialize() }
+        context.dataStore.edit { preferences ->
+            val fontId = choice.serialize()
+            if (fontId !in pendingImportedFontDeletionIds(preferences)) {
+                preferences[KEY_FONT_CHOICE] = fontId
+            }
+        }
+    }
+
+    override suspend fun removeImportedFont(choice: FontChoice.Custom) {
+        val removedFontId = canonicalReplacementFontId(choice.serialize())
+            ?: throw IllegalArgumentException("字体标识无效")
+        context.dataStore.edit { preferences ->
+            val cleaned = removedImportedFontReferences(
+                currentFontId = preferences[KEY_FONT_CHOICE] ?: FontChoice.System.serialize(),
+                globalReplacements = resolvedEpubFontReplacements(preferences[KEY_EPUB_FONT_REPLACEMENTS]),
+                bookReplacements = resolvedEpubBookFontReplacements(
+                    preferences[KEY_EPUB_BOOK_FONT_REPLACEMENTS],
+                ),
+                removedFontId = removedFontId,
+            )
+            preferences[KEY_FONT_CHOICE] = cleaned.currentFontId
+            preferences[KEY_EPUB_FONT_REPLACEMENTS] = encodeEpubFontReplacements(
+                cleaned.globalReplacements,
+            )
+            preferences[KEY_EPUB_BOOK_FONT_REPLACEMENTS] = encodeEpubBookFontReplacements(
+                cleaned.bookReplacements,
+            )
+            preferences[KEY_PENDING_IMPORTED_FONT_DELETIONS] =
+                pendingImportedFontDeletionIds(preferences) + removedFontId
+        }
+    }
+
+    override suspend fun completeImportedFontDeletion(choice: FontChoice.Custom) {
+        val removedFontId = canonicalReplacementFontId(choice.serialize())
+            ?: throw IllegalArgumentException("字体标识无效")
+        context.dataStore.edit { preferences ->
+            preferences[KEY_PENDING_IMPORTED_FONT_DELETIONS] =
+                pendingImportedFontDeletionIds(preferences) - removedFontId
+        }
     }
 
     override suspend fun setEpubFontReplacements(replacements: Map<String, String>) {
-        context.dataStore.edit {
-            it[KEY_EPUB_FONT_REPLACEMENTS] = encodeEpubFontReplacements(replacements)
+        context.dataStore.edit { preferences ->
+            val pending = pendingImportedFontDeletionIds(preferences)
+            preferences[KEY_EPUB_FONT_REPLACEMENTS] = encodeEpubFontReplacements(
+                replacements.filterValues { it !in pending },
+            )
         }
     }
 
@@ -159,7 +206,9 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val normalizedBookId = canonicalBookIdentity(bookId) ?: return
         context.dataStore.edit { preferences ->
             val current = resolvedEpubBookFontReplacements(preferences[KEY_EPUB_BOOK_FONT_REPLACEMENTS])
+            val pending = pendingImportedFontDeletionIds(preferences)
             val nextInner = canonicalEpubFontReplacements(replacements)
+                .filterValues { it !in pending }
             val nextOuter = if (nextInner.isEmpty()) {
                 current - normalizedBookId
             } else {
@@ -201,6 +250,11 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         emitAll(context.dataStore.data.map(transform))
     }
 
+    private fun pendingImportedFontDeletionIds(preferences: Preferences): Set<String> =
+        resolvedPendingImportedFontDeletions(
+            preferences[KEY_PENDING_IMPORTED_FONT_DELETIONS],
+        ).mapTo(linkedSetOf()) { it.serialize() }
+
     private companion object {
         val KEY_CALIBRE_URL = stringPreferencesKey("calibre_url")
         val KEY_FONT_SIZE = intPreferencesKey("font_size")
@@ -213,11 +267,20 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         val KEY_FONT_CHOICE = stringPreferencesKey("font_choice")
         val KEY_EPUB_FONT_REPLACEMENTS = stringPreferencesKey("epub_font_replacements")
         val KEY_EPUB_BOOK_FONT_REPLACEMENTS = stringPreferencesKey("epub_book_font_replacements")
+        val KEY_PENDING_IMPORTED_FONT_DELETIONS =
+            stringSetPreferencesKey("pending_imported_font_deletions")
         val KEY_READER_GUIDE_SHOWN = booleanPreferencesKey("reader_guide_shown")
         val KEY_PAGE_FLIP_STYLE = stringPreferencesKey("page_flip_style")
         val KEY_TYPOGRAPHY_BASELINE_VERSION = intPreferencesKey("typography_baseline_version")
         val KEY_READER_MENU_CONFIG = stringPreferencesKey("reader_menu_config")
     }
+}
+
+internal fun resolvedPendingImportedFontDeletions(
+    stored: Set<String>?,
+): Set<FontChoice.Custom> = stored.orEmpty().mapNotNullTo(linkedSetOf()) { rawId ->
+    val canonical = canonicalReplacementFontId(rawId) ?: return@mapNotNullTo null
+    FontChoice.parse(canonical) as? FontChoice.Custom
 }
 
 /** Pure adapter: DataStore string payload → resolved [ReaderMenuConfig] via model codec. */
@@ -246,6 +309,32 @@ internal fun resolvedEpubBookFontReplacements(stored: String?): Map<String, Map<
         Json.decodeFromString<Map<String, Map<String, String>>>(stored)
     }.getOrNull() ?: return emptyMap()
     return canonicalEpubBookFontReplacements(decoded)
+}
+
+internal data class ImportedFontReferenceState(
+    val currentFontId: String,
+    val globalReplacements: Map<String, String>,
+    val bookReplacements: Map<String, Map<String, String>>,
+)
+
+internal fun removedImportedFontReferences(
+    currentFontId: String,
+    globalReplacements: Map<String, String>,
+    bookReplacements: Map<String, Map<String, String>>,
+    removedFontId: String,
+): ImportedFontReferenceState {
+    val removed = (FontChoice.parse(removedFontId) as? FontChoice.Custom)?.serialize()
+        ?: return ImportedFontReferenceState(currentFontId, globalReplacements, bookReplacements)
+    val cleanedGlobal = globalReplacements.filterValues { it != removed }
+    val cleanedBooks = bookReplacements.mapNotNull { (bookId, mappings) ->
+        val retained = mappings.filterValues { it != removed }
+        if (retained.isEmpty()) null else bookId to retained
+    }.toMap()
+    return ImportedFontReferenceState(
+        currentFontId = if (currentFontId == removed) FontChoice.System.serialize() else currentFontId,
+        globalReplacements = cleanedGlobal,
+        bookReplacements = cleanedBooks,
+    )
 }
 
 /**

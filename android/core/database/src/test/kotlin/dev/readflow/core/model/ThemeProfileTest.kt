@@ -45,7 +45,7 @@ class ThemeProfileTest {
         val bad = ThemeProfile(fontSize = 100, lineSpacing = 5f, themeMode = "BOGUS", txtEncoding = "BOGUS")
         val safe = ThemeProfile.validated(bad)
         assertEquals(32, safe.fontSize)
-        assertEquals(2.2f, safe.lineSpacing)
+        assertEquals(ReaderTypographyRange.MAX_LINE_SPACING, safe.lineSpacing)
         assertEquals("SYSTEM", safe.themeMode)
         assertEquals("AUTO", safe.txtEncoding)
     }
@@ -62,7 +62,13 @@ class ThemeProfileTest {
 
     @Test
     fun `validated clamps line spacing to reader typography range`() {
-        assertEquals(1.0f, ThemeProfile.validated(ThemeProfile(lineSpacing = 0.8f)).lineSpacing)
-        assertEquals(2.2f, ThemeProfile.validated(ThemeProfile(lineSpacing = 3.0f)).lineSpacing)
+        assertEquals(
+            ReaderTypographyRange.MIN_LINE_SPACING,
+            ThemeProfile.validated(ThemeProfile(lineSpacing = 0.5f)).lineSpacing,
+        )
+        assertEquals(
+            ReaderTypographyRange.MAX_LINE_SPACING,
+            ThemeProfile.validated(ThemeProfile(lineSpacing = 3.5f)).lineSpacing,
+        )
     }
 }

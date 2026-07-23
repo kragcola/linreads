@@ -58,6 +58,7 @@ import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.TextSelectableReaderEngine
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -605,6 +606,151 @@ class ReaderSavedStateHandleTest {
         assertEquals(FontChoice.SystemSans, viewModel.uiState.value.fontChoice)
         assertEquals(FontChoice.SystemSans, settings.fontChoice.value)
         assertTrue("events=$events", "setFont:system_sans" in events)
+    }
+
+    @Test
+    fun `removing active imported font falls back live reader and clears settings reference`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val custom = FontChoice.Custom("Novel.ttf")
+        val settings = FakeSettingsRepository().apply {
+            useSourceHanFont.value = false
+            fontChoice.value = custom
+        }
+        val events = mutableListOf<String>()
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = events,
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        assertTrue(viewModel.removeImportedFontReferences(custom).isSuccess)
+
+        assertEquals(FontChoice.System, viewModel.uiState.value.fontChoice)
+        assertEquals(FontChoice.System, settings.fontChoice.value)
+        assertEquals(listOf(custom), settings.removedImportedFonts)
+        assertTrue("events=$events", "setFont:${FontChoice.System.serialize()}" in events)
+    }
+
+    @Test
+    fun `font removal does not expose fallback before settings references are cleared`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val custom = FontChoice.Custom("Novel.ttf")
+        val settings = FakeSettingsRepository().apply {
+            useSourceHanFont.value = false
+            fontChoice.value = custom
+            removeImportedFontStarted = CompletableDeferred()
+            releaseRemoveImportedFont = CompletableDeferred()
+        }
+        val events = mutableListOf<String>()
+        val engine = FakeInitialLocatorAwareReaderEngine(
+            initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+            events = events,
+        )
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = engine,
+            settings = settings,
+        )
+
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+        val removalResult = CompletableDeferred<Result<Unit>>()
+        backgroundScope.launch {
+            removalResult.complete(viewModel.removeImportedFontReferences(custom))
+        }
+        runCurrent()
+
+        assertEquals(custom, viewModel.uiState.value.fontChoice)
+        assertTrue("settings cleanup should have started", settings.removeImportedFontStarted!!.isCompleted)
+        assertEquals(
+            "engine must not switch while durable references are still pending",
+            false,
+            events.contains("setFont:${FontChoice.System.serialize()}"),
+        )
+
+        settings.releaseRemoveImportedFont!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(removalResult.await().isSuccess)
+        assertEquals(FontChoice.System, viewModel.uiState.value.fontChoice)
+        assertEquals(FontChoice.System, settings.fontChoice.value)
+        assertTrue("events=$events", "setFont:${FontChoice.System.serialize()}" in events)
+    }
+
+    @Test
+    fun `font removal blocks body and book mapping writes after durable cleanup`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val custom = FontChoice.Custom("Novel.ttf")
+        val settings = FakeSettingsRepository().apply {
+            useSourceHanFont.value = false
+            fontChoice.value = custom
+            epubBookFontReplacements.value = mapOf(
+                "book-1" to mapOf("story" to custom.serialize()),
+            )
+            removeImportedFontCleared = CompletableDeferred()
+            finishRemoveImportedFont = CompletableDeferred()
+        }
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = FakeInitialLocatorAwareReaderEngine(
+                initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+                events = mutableListOf(),
+            ),
+            settings = settings,
+        )
+        viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+        advanceUntilIdle()
+
+        val removalResult = CompletableDeferred<Result<Unit>>()
+        backgroundScope.launch {
+            removalResult.complete(viewModel.removeImportedFontReferences(custom))
+        }
+        runCurrent()
+        settings.removeImportedFontCleared!!.await()
+        viewModel.onIntent(ReaderIntent.SetFontChoice(custom))
+        viewModel.onIntent(ReaderIntent.SetEpubBookFontReplacement("story", custom))
+        runCurrent()
+
+        settings.finishRemoveImportedFont!!.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(removalResult.await().isSuccess)
+        assertEquals(FontChoice.System, settings.fontChoice.value)
+        assertTrue(settings.epubBookFontReplacements.value["book-1"].orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `pending font deletion stays blocked until file completion is acknowledged`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val custom = FontChoice.Custom("Novel.ttf")
+        val settings = FakeSettingsRepository().apply {
+            pendingImportedFontDeletions.value = setOf(custom)
+        }
+        val viewModel = readerViewModel(
+            handle = SavedStateHandle(),
+            engine = FakeInitialLocatorAwareReaderEngine(
+                initialLocator = Locator(LocatorStrategy.Page(index = 0, total = 10), totalProgression = 0f),
+                events = mutableListOf(),
+            ),
+            settings = settings,
+        )
+
+        assertEquals(setOf(custom), viewModel.recoverPendingImportedFontDeletions())
+        viewModel.onIntent(ReaderIntent.SetFontChoice(custom))
+        advanceUntilIdle()
+        assertEquals(FontChoice.System, settings.fontChoice.value)
+
+        viewModel.completeImportedFontDeletion(custom).getOrThrow()
+        assertEquals(emptySet<FontChoice.Custom>(), settings.pendingImportedFontDeletions.value)
+        viewModel.onIntent(ReaderIntent.SetFontChoice(custom))
+        advanceUntilIdle()
+        assertEquals(custom, settings.fontChoice.value)
     }
 
     @Test
@@ -2207,9 +2353,18 @@ class ReaderSavedStateHandleTest {
         override val txtEncoding = MutableStateFlow(TxtEncoding.AUTO)
         override val fontChoice = MutableStateFlow<FontChoice>(FontChoice.System)
         override val epubFontReplacements = MutableStateFlow<Map<String, String>>(emptyMap())
+        override val epubBookFontReplacements =
+            MutableStateFlow<Map<String, Map<String, String>>>(emptyMap())
+        override val pendingImportedFontDeletions =
+            MutableStateFlow<Set<FontChoice.Custom>>(emptySet())
         override val readerGuideShown = MutableStateFlow(true)
         override val pageFlipStyle = MutableStateFlow(dev.readflow.core.model.PageFlipStyle.SLIDE)
         override val readerMenuConfig = MutableStateFlow(ReaderMenuConfig.v1Defaults())
+        val removedImportedFonts = mutableListOf<FontChoice.Custom>()
+        var removeImportedFontStarted: CompletableDeferred<Unit>? = null
+        var releaseRemoveImportedFont: CompletableDeferred<Unit>? = null
+        var removeImportedFontCleared: CompletableDeferred<Unit>? = null
+        var finishRemoveImportedFont: CompletableDeferred<Unit>? = null
 
         override suspend fun setCalibreBaseUrl(url: String) {
             calibreBaseUrl.value = url
@@ -2246,8 +2401,39 @@ class ReaderSavedStateHandleTest {
             fontChoice.value = choice
         }
 
+        override suspend fun removeImportedFont(choice: FontChoice.Custom) {
+            removeImportedFontStarted?.complete(Unit)
+            releaseRemoveImportedFont?.await()
+            removedImportedFonts += choice
+            if (fontChoice.value == choice) fontChoice.value = FontChoice.System
+            epubFontReplacements.value = epubFontReplacements.value.filterValues {
+                it != choice.serialize()
+            }
+            epubBookFontReplacements.value = epubBookFontReplacements.value.mapValues { (_, replacements) ->
+                replacements.filterValues { it != choice.serialize() }
+            }.filterValues(Map<String, String>::isNotEmpty)
+            pendingImportedFontDeletions.value += choice
+            removeImportedFontCleared?.complete(Unit)
+            finishRemoveImportedFont?.await()
+        }
+
+        override suspend fun completeImportedFontDeletion(choice: FontChoice.Custom) {
+            pendingImportedFontDeletions.value -= choice
+        }
+
         override suspend fun setEpubFontReplacements(replacements: Map<String, String>) {
             epubFontReplacements.value = replacements
+        }
+
+        override suspend fun setEpubBookFontReplacements(
+            bookId: String,
+            replacements: Map<String, String>,
+        ) {
+            epubBookFontReplacements.value = if (replacements.isEmpty()) {
+                epubBookFontReplacements.value - bookId
+            } else {
+                epubBookFontReplacements.value + (bookId to replacements)
+            }
         }
 
         override suspend fun setReaderGuideShown(shown: Boolean) {

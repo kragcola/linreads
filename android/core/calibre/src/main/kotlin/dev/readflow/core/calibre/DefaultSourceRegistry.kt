@@ -17,6 +17,7 @@ import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.SourceKind
 import dev.readflow.extensions.api.SourceRegistry
 import java.io.File
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
@@ -130,16 +131,88 @@ class DefaultSourceRegistry(
         return addUserSource(kind.adapterId, name, 1, configJson)
     }
 
-    override suspend fun removeUserSource(sourceId: String): ReadflowResult<Unit> {
-        if (sourceId == BUILTIN_CALIBRE_SOURCE_ID) {
-            return ReadflowResult.Failure(ReadflowError.unsupported("迁移的 Calibre 源请在设置中修改"))
+    override suspend fun removeUserSource(sourceId: String): ReadflowResult<Unit> =
+        importMutex.withLock {
+            try {
+                if (sourceId == BUILTIN_CALIBRE_SOURCE_ID) {
+                    // Clearing the legacy value is the durable deletion marker. A later observer
+                    // removes any fixed-id row left by interruption between these two writes.
+                    settings.setCalibreBaseUrl("")
+                }
+                sourceConfigStore.deleteUserSource(sourceId)
+                ReadflowResult.Success(Unit)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                ReadflowResult.Failure(ReadflowError.io(error.message ?: "删除书源失败"))
+            }
         }
-        sourceConfigStore.deleteUserSource(sourceId)
-        return ReadflowResult.Success(Unit)
+
+    /**
+     * Import a versioned source-configuration envelope.
+     * Order: parse → schema/name → registered adapter → factory.validate →
+     * canonicalize → dedup → persist. Concurrent imports are serialized.
+     * Never executes scripts or code from the configuration payload.
+     */
+    override suspend fun importUserSourceConfig(rawJson: String): ReadflowResult<SourceDescriptor> =
+        importMutex.withLock {
+            val parsed = when (val parseResult = parseSourceConfigImportEnvelope(rawJson)) {
+                is ReadflowResult.Failure -> return@withLock parseResult
+                is ReadflowResult.Success -> parseResult.value
+            }
+            val factory = adapters.factory(parsed.adapterId)
+                ?: return@withLock ReadflowResult.Failure(
+                    ReadflowError.unsupported("未安装书源适配器：${parsed.adapterId}"),
+                )
+            when (val validation = factory.validate(parsed.configVersion, parsed.configJson)) {
+                is ReadflowResult.Failure -> return@withLock validation
+                is ReadflowResult.Success -> Unit
+            }
+            val canonicalConfig = canonicalizeImportedConfigJson(parsed.adapterId, parsed.configJson)
+            val existing = sourceConfigStore.observeUserSources().first().firstOrNull { row ->
+                row.adapterId == parsed.adapterId &&
+                    row.configVersion == parsed.configVersion &&
+                    canonicalizeImportedConfigJson(row.adapterId, row.configJson) == canonicalConfig
+            }
+            if (existing != null) {
+                val reusable = if (existing.enabled) {
+                    existing
+                } else {
+                    existing.copy(
+                        baseUrl = displayBaseUrl(parsed.adapterId, canonicalConfig),
+                        enabled = true,
+                        configJson = canonicalConfig,
+                        updatedAt = System.currentTimeMillis(),
+                    ).also { sourceConfigStore.upsertUserSource(it) }
+                }
+                return@withLock ReadflowResult.Success(adapters.describe(reusable.toDescriptor()))
+            }
+            addUserSource(
+                adapterId = parsed.adapterId,
+                name = parsed.name,
+                configVersion = parsed.configVersion,
+                configJson = canonicalConfig,
+            )
+        }
+
+    /** Document-picker entry: bound the read size before parsing. */
+    suspend fun importUserSourceConfig(input: java.io.InputStream): ReadflowResult<SourceDescriptor> {
+        val raw = when (val read = readBoundedSourceConfigBytes(input)) {
+            is ReadflowResult.Failure -> return read
+            is ReadflowResult.Success -> read.value
+        }
+        return importUserSourceConfig(raw)
     }
 
     private suspend fun ensureLegacyCalibreImported(rawUrl: String?) {
-        if (rawUrl.isNullOrBlank()) return
+        if (rawUrl.isNullOrBlank()) {
+            importMutex.withLock {
+                sourceConfigStore.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)?.let {
+                    sourceConfigStore.deleteUserSource(BUILTIN_CALIBRE_SOURCE_ID)
+                }
+            }
+            return
+        }
         importMutex.withLock {
             val normalized = runCatching { requireValidCalibreBaseUrl(rawUrl) }.getOrNull() ?: return
             val existing = sourceConfigStore.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)

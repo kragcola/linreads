@@ -19,8 +19,8 @@ object ReaderTypography {
     const val MIN_LINE_SPACING = ReaderTypographyRange.MIN_LINE_SPACING
     const val MAX_LINE_SPACING = ReaderTypographyRange.MAX_LINE_SPACING
     const val DEFAULT_LINE_SPACING = ReaderTypographyRange.DEFAULT_LINE_SPACING
-    /** 1.0..2.2，0.1 步进 → Slider steps（不含两端）。 */
-    const val LINE_SPACING_SLIDER_STEPS = 11
+    /** 0.8..3.0，0.1 步进 → Slider steps（不含两端）。 */
+    const val LINE_SPACING_SLIDER_STEPS = 21
 
     fun clampFontSp(sp: Float): Float =
         if (!sp.isFinite()) DEFAULT_FONT_SP.toFloat() else sp.coerceIn(MIN_FONT_SP, MAX_FONT_SP)

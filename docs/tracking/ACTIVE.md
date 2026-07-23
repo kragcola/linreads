@@ -1,6 +1,6 @@
 # Active Work
 
-_最后更新：2026-07-22_
+_最后更新：2026-07-23_
 
 Mode: `task-feature`
 Objective: Android Reader 全量体验打磨：继续排版字体、书架、书签搜索、菜单架构与跨格式能力对齐
@@ -16,6 +16,8 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 > ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
 ## 当前状态
+
+- 2026-07-23 **Android 字体管理、通用在线书源与排版/书架缺陷已收口为 OTA 发布候选**：书内字体改为独立全屏管理窗口，按真实 EPUB CSS 字体族展示原文例句、出现次数与实际字体预览；本地字体按 SHA-256 去重，删除采用文件 tombstone + DataStore pending ledger 两阶段事务，正文/全局/本书引用与 pending 标记同一次 edit，所有晚到写入在 repository 与 ReaderViewModel 两层被拒绝。应用启动在任何字体目录访问前统一完成 pending 文件删除并恢复无 ledger 的孤立 tombstone；重复删除不能取得第二个 owner，取消或文件失败保持字体隐藏并留待下次启动。在线书库移除 Calibre-only 占位逻辑，使用 versioned adapter/config 支持 Calibre、OPDS、HTML 规则和第三方 JSON 配置，补齐 URL/host/charset/JSON identity 规范化、严格 UTF-8、禁用源重启用及 Calibre 删除/迁移互斥。书架加载失败恢复为明确错误态；EPUB flow 的 0.8/0.9 行距真实生效。发布前本地 phase-2 聚焦验证已覆盖 app 启动恢复、字体事务、reader、prefs、core-ui、书源、在线书库、设置、书架、数据库排版契约与 EPUB flow，均为 `BUILD SUCCESSFUL`；`git diff --check` 通过。`readflow_test` AVD 已完成纯文本运行时验收：冷启动正常，在线书库可进入，导入真实 `typography-test.epub` 后字体管理窗口可进入并返回，UI hierarchy、活动栈与定向 logcat 未发现 FATAL/ANR。CI full regression、R8、OTA 构建与 `dev-latest` 资产验证待本提交推送后执行。
 
 - 2026-07-22 **Dev build #271 统一 rapid 翻页时长并修复松手瞬间内容消失观感，已发布 OTA**：根因不是 page-shot 被提前回收；rapid idle 手势在 `DOWN/MOVE` 期间继续显示 live page，`UP` 才切换到 PAPER overlay，并沿用 120ms rapid duration，导致 release 时整页过快折走，表现为按下有内容、松手内容消失。现在 `EpubFlowView.activeFlipDurationMs()` 直接复用普通 `flipDurationMs=280ms`，页内 rapid、跨章节 boundary 和 decode landing 全部共享同一时长；保留 rapid 的线性插值、逐相邻页队列、冻结 outgoing/revealed 双 artifact 与 decode/dirty-refresh gate。新增 RED→GREEN 覆盖 rapid idle release 的 outgoing identity、未回收状态、首帧内容和 280ms 时长；本地 `EpubFlowViewTest` 全类、`PageCurlDrawableTest`、`PageSlideDrawableTest`、`PageDrawableOwnershipTest`、`PageShotBudgetTest` 定向回归通过，CI full Android regression、R8、`:app:assembleOta` 全部通过。提交 `26d87720d9402838b68d170eea69ee6b904ec6de` 的 Actions run `29923231559`（build job `88933700707`）耗时 `9m47s` 并发布 `dev-latest`；资产为 Dev build `#271` / `app-ota.apk`，大小 `10,029,349` bytes，CI `BUILD_TAG=dev-271-26d87720d9402838b68d170eea69ee6b904ec6de`。当前环境无 `adb`，未执行物理设备或模拟器运行时手感/帧时验收；请在书籍 86 从目录到“幼态延续”连续正反快翻验收。
 

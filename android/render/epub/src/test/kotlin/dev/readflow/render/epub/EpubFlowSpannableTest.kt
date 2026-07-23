@@ -68,6 +68,13 @@ class EpubFlowSpannableTest {
         EpubDisplayBlock.Image(href = href, altText = alt, paragraphIndex = p)
 
     @Test
+    fun `flow line spacing preserves compact multipliers below one`() {
+        assertEquals(-4f, epubFlowLineSpacingAdd(fontHeightPx = 20, multiplier = 0.8f), 0.001f)
+        assertEquals(-2f, epubFlowLineSpacingAdd(fontHeightPx = 20, multiplier = 0.9f), 0.001f)
+        assertEquals(12f, epubFlowLineSpacingAdd(fontHeightPx = 20, multiplier = 1.6f), 0.001f)
+    }
+
+    @Test
     fun `embedded typeface span preserves an existing bold style`() {
         val paint = android.text.TextPaint().apply { typeface = Typeface.DEFAULT_BOLD }
 

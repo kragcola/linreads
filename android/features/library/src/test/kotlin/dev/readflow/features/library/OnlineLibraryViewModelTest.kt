@@ -57,6 +57,24 @@ class OnlineLibraryViewModelTest {
     }
 
     @Test
+    fun initialSourceSelectionPrefersGenericWebSourceOverMigratedCalibre() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val registry = FakeSourceRegistry(
+            sources = listOf(
+                enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceAdapterIds.CALIBRE),
+                enabledSource("source-web", SourceAdapterIds.HTML_RULES_V1, "网页小说站"),
+            ),
+            catalogs = emptyMap(),
+        )
+
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        assertEquals("source-web", viewModel.onlineLibraryState.value.selectedSourceId)
+        assertEquals(SourceAdapterIds.HTML_RULES_V1, viewModel.onlineLibraryState.value.addSourceAdapterId)
+    }
+
+    @Test
     fun latestOnlineSearchWinsWhenEarlierSearchIsStillRunning() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val firstStarted = CompletableDeferred<Unit>()
@@ -310,6 +328,51 @@ class OnlineLibraryViewModelTest {
         assertEquals(0, successCallbacks)
         assertFalse(viewModel.onlineLibraryState.value.isAddingSource)
         assertEquals("规则无效", viewModel.onlineLibraryState.value.error)
+    }
+
+    /** Registry/parser tests cover validation; these cover post-read selection and error state. */
+    @Test
+    fun importSourceConfigSuccessSelectsImportedSource() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val imported = enabledSource("source-imported", SourceAdapterIds.JSON_HTTP, name = "Imported LAN")
+        val registry = FakeSourceRegistry(
+            sources = emptyList(),
+            catalogs = emptyMap(),
+            importHandler = { ReadflowResult.Success(imported) },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.importSourceConfigText("""{"schemaVersion":1,"name":"Imported LAN"}""")
+        advanceUntilIdle()
+
+        assertEquals("source-imported", viewModel.onlineLibraryState.value.selectedSourceId)
+        assertTrue(viewModel.onlineLibraryState.value.message?.contains("Imported LAN") == true)
+        assertNull(viewModel.onlineLibraryState.value.error)
+        assertFalse(viewModel.onlineLibraryState.value.isAddingSource)
+        assertEquals(1, registry.importCalls)
+    }
+
+    @Test
+    fun importSourceConfigFailureSurfacesRegistryError() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val registry = FakeSourceRegistry(
+            sources = emptyList(),
+            catalogs = emptyMap(),
+            importHandler = {
+                ReadflowResult.Failure(ReadflowError.parse("配置 JSON 格式无效"))
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.importSourceConfigText("not-json")
+        advanceUntilIdle()
+
+        assertEquals("配置 JSON 格式无效", viewModel.onlineLibraryState.value.error)
+        assertNull(viewModel.onlineLibraryState.value.message)
+        assertFalse(viewModel.onlineLibraryState.value.isAddingSource)
+        assertEquals(1, registry.importCalls)
     }
 
     @Test
@@ -915,9 +978,14 @@ class OnlineLibraryViewModelTest {
         ) -> ReadflowResult<SourceDescriptor> = { _, _, _, _ ->
             ReadflowResult.Failure(ReadflowError.unsupported("not used"))
         },
+        private val importHandler: suspend (String) -> ReadflowResult<SourceDescriptor> = {
+            ReadflowResult.Failure(ReadflowError.unsupported("not used"))
+        },
     ) : SourceRegistry {
         private val sourceFlow = MutableStateFlow(sources)
         val openedSourceIds = mutableListOf<String>()
+        var importCalls = 0
+            private set
 
         override fun observeSources(): Flow<List<SourceDescriptor>> = sourceFlow
 
@@ -939,6 +1007,11 @@ class OnlineLibraryViewModelTest {
             ReadflowResult.Success(Unit).also {
                 sourceFlow.value = sourceFlow.value.filterNot { source -> source.id == sourceId }
             }
+
+        override suspend fun importUserSourceConfig(rawJson: String): ReadflowResult<SourceDescriptor> {
+            importCalls += 1
+            return importHandler(rawJson)
+        }
     }
 
     private class FakeOnlineCatalog(

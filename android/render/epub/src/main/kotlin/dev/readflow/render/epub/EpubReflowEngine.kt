@@ -133,6 +133,9 @@ internal fun epubHeadingBoost(headingLevel: Int?): Float =
         else -> 0f
     }
 
+internal fun epubFlowLineSpacingAdd(fontHeightPx: Int, multiplier: Float): Float =
+    (multiplier - 1f) * fontHeightPx.coerceAtLeast(1)
+
 /**
  * EPUB native reflow engine (v4 §12.3 ADR-EPUB-Engine).
  * ZipFile + jsoup → typed ReaderItem model → TextView paragraph stream.
@@ -1105,7 +1108,7 @@ class EpubReflowEngine private constructor(
     private fun applyFlowLineSpacing(tv: TextView) {
         val fm = tv.paint.fontMetricsInt
         val fontHeight = (fm.descent - fm.ascent).coerceAtLeast(1)
-        val spacingAdd = ((lineSpacingMultiplier - 1f) * fontHeight).coerceAtLeast(0f)
+        val spacingAdd = epubFlowLineSpacingAdd(fontHeight, lineSpacingMultiplier)
         tv.setLineSpacing(spacingAdd, 1f)
     }
 

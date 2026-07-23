@@ -84,9 +84,6 @@ fun SettingsScreen(
     buildTag: String = "",
 ) {
     val vm = koinViewModel<SettingsViewModel>()
-    val url by vm.calibreBaseUrl.collectAsStateWithLifecycle()
-    val urlError by vm.calibreUrlError.collectAsStateWithLifecycle()
-    val connectionState by vm.calibreConnectionState.collectAsStateWithLifecycle()
     val fontSize by vm.fontSize.collectAsStateWithLifecycle()
     val theme by vm.themeMode.collectAsStateWithLifecycle()
     val lineSpacing by vm.lineSpacing.collectAsStateWithLifecycle()
@@ -103,7 +100,6 @@ fun SettingsScreen(
     val themeImportState by vm.themeImportState.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
-    var urlDraft by remember(url) { mutableStateOf(url ?: "") }
     var selectedCategory by rememberSaveable { mutableStateOf(SettingsCategory.READING) }
     val scope = rememberCoroutineScope()
     var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
@@ -247,81 +243,18 @@ fun SettingsScreen(
             onCategorySelected = { selectedCategory = it },
             sourceContent = {
             SettingsSection(
-                title = "书源连接",
+                title = "在线书源",
             ) {
             SettingItemHeader(
                 icon = Icons.Outlined.Link,
-                title = "Calibre 服务器",
-                currentValue = if (url.isNullOrBlank()) "未配置" else "已配置",
+                title = "统一书源管理",
+                currentValue = "在书架的在线书库中管理",
             )
-            OutlinedTextField(
-                value = urlDraft,
-                onValueChange = {
-                    urlDraft = it
-                    vm.clearCalibreConnectionState()
-                },
-                label = { Text("Calibre 服务器地址") },
-                placeholder = { Text("http://192.168.1.x:8080") },
-                isError = urlError != null,
-                supportingText = {
-                    if (urlError != null) {
-                        Text(urlError.orEmpty())
-                    }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                shape = MaterialTheme.shapes.extraSmall,
+            Text(
+                text = "支持网页小说站、OPDS / Atom、JSON 目录与 Calibre；每个来源都可独立添加、切换和删除。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedButton(
-                    onClick = { vm.testCalibreConnection(urlDraft) },
-                    enabled = connectionState !is CalibreConnectionUiState.Checking,
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) {
-                    Icon(Icons.Outlined.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("测试连接")
-                }
-                OutlinedButton(
-                    onClick = { vm.probeCalibreConnection(urlDraft) },
-                    enabled = connectionState !is CalibreConnectionUiState.Checking,
-                    modifier = Modifier.heightIn(min = 48.dp),
-                ) {
-                    Icon(Icons.Outlined.Link, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("探测常用端口")
-                }
-                if (urlDraft != (url ?: "")) {
-                    TextButton(
-                        onClick = { vm.setCalibreUrl(urlDraft) },
-                        modifier = Modifier.heightIn(min = 48.dp),
-                    ) { Text("仅保存") }
-                }
-            }
-            when (val state = connectionState) {
-                CalibreConnectionUiState.Idle -> Unit
-                CalibreConnectionUiState.Checking -> Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Text("正在测试 Calibre 连接", style = MaterialTheme.typography.bodyMedium)
-                }
-                is CalibreConnectionUiState.Success -> ConnectionResultText(
-                    title = state.message,
-                    detail = state.nextStep,
-                    isError = false,
-                )
-                is CalibreConnectionUiState.Failure -> ConnectionResultText(
-                    title = state.message,
-                    detail = state.nextStep,
-                    isError = true,
-                )
-            }
             }
             },
             readingContent = {

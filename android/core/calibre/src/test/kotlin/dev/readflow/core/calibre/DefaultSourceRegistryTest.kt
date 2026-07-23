@@ -135,7 +135,8 @@ class DefaultSourceRegistryTest {
     }
 
     @Test
-    fun removeUserSourceBlocksBuiltinCalibre() = runTest {
+    fun migratedCalibreCanBeRemovedWithoutBeingRecreated() = runTest {
+        val settings = FakeSettingsRepository(calibreUrl = "http://192.168.1.5:8080")
         val store = InMemorySourceConfigStore(
             listOf(
                 PersistedBookSource(
@@ -148,14 +149,34 @@ class DefaultSourceRegistryTest {
             ),
         )
         val registry = DefaultSourceRegistry(
-            settings = FakeSettingsRepository(),
+            settings = settings,
             sourceConfigStore = store,
             booksDir = tempFolder.root,
         )
 
-        assertTrue(registry.removeUserSource(BUILTIN_CALIBRE_SOURCE_ID) is ReadflowResult.Failure)
+        registry.observeSources().first()
+        assertTrue(registry.removeUserSource(BUILTIN_CALIBRE_SOURCE_ID) is ReadflowResult.Success)
+        assertEquals(null, store.getUserSource(BUILTIN_CALIBRE_SOURCE_ID))
+        assertEquals("", settings.calibreBaseUrl.value)
         assertTrue(registry.removeUserSource("source-x") is ReadflowResult.Success)
         assertEquals(null, store.getUserSource("source-x"))
+    }
+
+    @Test
+    fun blankLegacySettingCleansInterruptedBuiltinDeletion() = runTest {
+        val store = InMemorySourceConfigStore(
+            listOf(calibreSource(BUILTIN_CALIBRE_SOURCE_ID, "http://192.168.1.5:8080")),
+        )
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = ""),
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+        )
+
+        val sources = registry.observeSources().first()
+
+        assertTrue(sources.isEmpty())
+        assertEquals(null, store.getUserSource(BUILTIN_CALIBRE_SOURCE_ID))
     }
 
     @Test

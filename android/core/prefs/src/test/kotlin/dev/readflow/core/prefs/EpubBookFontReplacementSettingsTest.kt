@@ -1,5 +1,6 @@
 package dev.readflow.core.prefs
 
+import dev.readflow.core.model.FontChoice
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -17,6 +18,16 @@ class EpubBookFontReplacementSettingsTest {
         assertTrue(
             SettingsRepository::class.java.methods.any { method ->
                 method.name == "setEpubBookFontReplacements"
+            },
+        )
+        assertTrue(
+            SettingsRepository::class.java.methods.any { method ->
+                method.name == "getPendingImportedFontDeletions"
+            },
+        )
+        assertTrue(
+            SettingsRepository::class.java.methods.any { method ->
+                method.name == "completeImportedFontDeletion"
             },
         )
     }
@@ -87,5 +98,46 @@ class EpubBookFontReplacementSettingsTest {
     fun `empty book map encode roundtrip stays empty`() {
         val payload = encodeEpubBookFontReplacements(emptyMap())
         assertEquals(emptyMap<String, Map<String, String>>(), resolvedEpubBookFontReplacements(payload))
+    }
+
+    @Test
+    fun `deleting an imported font removes every reference and falls back current text`() {
+        val removed = "custom:Novel.ttf"
+
+        val cleaned = removedImportedFontReferences(
+            currentFontId = removed,
+            globalReplacements = mapOf(
+                "body" to removed,
+                "code" to "system_monospace",
+            ),
+            bookReplacements = mapOf(
+                "book-a" to mapOf("story" to removed, "code" to "system_monospace"),
+                "book-b" to mapOf("title" to removed),
+            ),
+            removedFontId = removed,
+        )
+
+        assertEquals("system_serif", cleaned.currentFontId)
+        assertEquals(mapOf("code" to "system_monospace"), cleaned.globalReplacements)
+        assertEquals(
+            mapOf("book-a" to mapOf("code" to "system_monospace")),
+            cleaned.bookReplacements,
+        )
+    }
+
+    @Test
+    fun `pending deletion codec retains only valid imported font ids`() {
+        assertEquals(
+            setOf(FontChoice.Custom("Novel.ttf"), FontChoice.Custom("Code.otf")),
+            resolvedPendingImportedFontDeletions(
+                setOf(
+                    "custom:Novel.ttf",
+                    "custom:Code.otf",
+                    "system_serif",
+                    "custom:../../unsafe.ttf",
+                    "custom:not-a-font.txt",
+                ),
+            ),
+        )
     }
 }

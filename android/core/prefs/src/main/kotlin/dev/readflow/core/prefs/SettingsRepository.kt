@@ -37,6 +37,9 @@ interface SettingsRepository {
      */
     val epubBookFontReplacements: Flow<Map<String, Map<String, String>>>
         get() = flowOf(emptyMap())
+    /** Fonts whose settings references are cleared but whose private files may still need deletion. */
+    val pendingImportedFontDeletions: Flow<Set<FontChoice.Custom>>
+        get() = flowOf(emptySet())
     /** 阅读器首次手势引导是否已展示过（一次性）。 */
     val readerGuideShown: Flow<Boolean>
     /** 分页模式翻页动画风格（滑动/仿真/无）。 */
@@ -60,6 +63,10 @@ interface SettingsRepository {
     suspend fun setUseSourceHanFont(enabled: Boolean)
     suspend fun setTxtEncoding(encoding: TxtEncoding)
     suspend fun setFontChoice(choice: FontChoice)
+    /** Atomically clears every reference and records a durable pending file deletion. */
+    suspend fun removeImportedFont(choice: FontChoice.Custom) = Unit
+    /** Clears the durable deletion marker after the private font file is gone. */
+    suspend fun completeImportedFontDeletion(choice: FontChoice.Custom) = Unit
     suspend fun setEpubFontReplacements(replacements: Map<String, String>) = Unit
     /**
      * Replace the entire book-scoped EPUB font map for [bookId].
