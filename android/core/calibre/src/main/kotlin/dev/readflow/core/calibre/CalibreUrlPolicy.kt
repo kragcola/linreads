@@ -2,6 +2,8 @@ package dev.readflow.core.calibre
 
 import java.net.URI
 
+const val CALIBRE_COVER_SOURCE_QUERY_PARAMETER = "__readflow_calibre_source"
+
 data class CalibreUrlValidation(
     val normalizedUrl: String,
     val errorMessage: String?,
@@ -23,7 +25,7 @@ fun validateCalibreBaseUrl(rawUrl: String): CalibreUrlValidation {
     if (scheme != "http" && scheme != "https") {
         return invalid("Calibre 地址只支持 http:// 或 https://")
     }
-    val host = uri.host
+    val host = uri.host?.withoutIpv6Brackets()
         ?: return invalid("地址缺少主机名或 IP")
     if (uri.userInfo != null) {
         return invalid("请不要把用户名密码写在地址里")
@@ -49,7 +51,7 @@ fun requireAllowedCalibreRequestUrl(url: String) {
     requireNotNull(uri) { "Calibre 请求地址格式不正确" }
     val scheme = uri.scheme?.lowercase()
     require(scheme == "http" || scheme == "https") { "Calibre 请求只支持 HTTP 或 HTTPS" }
-    val host = uri.host
+    val host = uri.host?.withoutIpv6Brackets()
     require(!host.isNullOrBlank()) { "Calibre 请求地址缺少主机" }
     require(uri.userInfo == null) { "Calibre 请求地址不得包含凭据" }
     require(scheme != "http" || host.isLocalhost() || host.isRfc1918Ipv4()) {
@@ -65,6 +67,33 @@ fun requireSameCalibreOrigin(url: String, baseUrl: String) {
             request.host.equals(base.host, ignoreCase = true) &&
             request.effectivePort() == base.effectivePort()
     ) { "Calibre 重定向不得离开已配置的服务器" }
+}
+
+fun authenticatedCalibreCoverUrl(coverUrl: String, sourceId: String): String {
+    require(sourceId.isNotBlank() && sourceId.all { it.isLetterOrDigit() || it in "-_." }) {
+        "Invalid Calibre source id"
+    }
+    val uri = URI(coverUrl)
+    require(uri.rawQuery == null && uri.rawFragment == null && uri.userInfo == null) {
+        "Calibre cover URL must not contain query, fragment, or credentials"
+    }
+    requireAllowedCalibreRequestUrl(coverUrl)
+    return "$coverUrl?$CALIBRE_COVER_SOURCE_QUERY_PARAMETER=$sourceId"
+}
+
+fun calibreCredentialScopeForRequestUrl(requestUrl: String): String {
+    val uri = URI(requestUrl)
+    val scheme = uri.scheme?.lowercase().orEmpty()
+    val host = uri.host?.withoutIpv6Brackets()?.lowercase().orEmpty()
+    require(scheme.isNotBlank() && host.isNotBlank()) { "Invalid Calibre request URL" }
+    val canonicalHost = if (':' in host) "[$host]" else host
+    val port = when {
+        uri.port < 0 -> ""
+        scheme == "http" && uri.port == 80 -> ""
+        scheme == "https" && uri.port == 443 -> ""
+        else -> ":${uri.port}"
+    }
+    return requireValidCalibreBaseUrl("$scheme://$canonicalHost$port")
 }
 
 private fun URI.effectivePort(): Int = when {
@@ -84,7 +113,9 @@ private fun String.isLocalhost(): Boolean =
     equals("localhost", ignoreCase = true) ||
         equals("ip6-localhost", ignoreCase = true) ||
         this == "127.0.0.1" ||
-        this == "::1"
+    this == "::1"
+
+private fun String.withoutIpv6Brackets(): String = removePrefix("[").removeSuffix("]")
 
 private fun String.isRfc1918Ipv4(): Boolean {
     val octets = split('.')

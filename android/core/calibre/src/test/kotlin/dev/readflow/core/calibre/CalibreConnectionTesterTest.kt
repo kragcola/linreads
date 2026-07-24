@@ -38,7 +38,8 @@ class CalibreConnectionTesterTest {
         assertEquals(
             CalibreConnectionCheckResult.Failure(
                 message = "Calibre 服务器需要认证",
-                nextStep = "当前版本暂未接入用户名密码，请先关闭 Content Server 认证或稍后配置凭据",
+                nextStep = "请在书源设置中填写 Calibre 用户名和密码",
+                kind = CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED,
             ),
             result,
         )

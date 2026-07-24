@@ -8,11 +8,13 @@ import dev.readflow.extensions.api.SourceAdapterFactory
 import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceAdapterRegistry
 import dev.readflow.extensions.api.SourceCapabilities
+import dev.readflow.extensions.api.SourceCredentials
 import dev.readflow.extensions.api.SourceDescriptor
 import java.io.File
 
 class CalibreSourceAdapterFactory(
     private val booksDir: File,
+    private val credentialProvider: (String, String) -> SourceCredentials? = { _, _ -> null },
 ) : SourceAdapterFactory {
     override val adapterId = SourceAdapterIds.CALIBRE
     override val latestConfigVersion = 1
@@ -39,11 +41,21 @@ class CalibreSourceAdapterFactory(
 
     override fun open(descriptor: SourceDescriptor): ReadflowResult<OnlineBookCatalog> = runCatching {
         val config = descriptor.calibreConfig()
+        val baseUrl = requireValidCalibreBaseUrl(config.baseUrl)
+        val credentials = credentialProvider(
+            descriptor.id,
+            calibreCredentialScopeForRequestUrl(baseUrl),
+        )
         ReadflowResult.Success(
             CalibreOnlineCatalog(
-                client = CalibreClient(config.baseUrl, libraryId = config.libraryId),
+                client = CalibreClient(
+                    baseUrl = baseUrl,
+                    username = credentials?.username.orEmpty(),
+                    password = credentials?.password.orEmpty(),
+                    libraryId = config.libraryId,
+                ),
                 booksDir = booksDir,
-                descriptor = descriptor.copy(baseUrl = requireValidCalibreBaseUrl(config.baseUrl)),
+                descriptor = descriptor.copy(baseUrl = baseUrl),
             ),
         )
     }.getOrElse(::sourceOpenFailure)
@@ -113,10 +125,13 @@ class JsonHttpSourceAdapterFactory(
     }.getOrElse(::sourceOpenFailure)
 }
 
-fun defaultSourceAdapterRegistry(booksDir: File): SourceAdapterRegistry =
+fun defaultSourceAdapterRegistry(
+    booksDir: File,
+    credentialStore: SourceCredentialStore = NoOpSourceCredentialStore,
+): SourceAdapterRegistry =
     DefaultSourceAdapterRegistry(
         setOf(
-            CalibreSourceAdapterFactory(booksDir),
+            CalibreSourceAdapterFactory(booksDir, credentialStore::get),
             OpdsSourceAdapterFactory(booksDir),
             JsonHttpSourceAdapterFactory(booksDir),
             HtmlRulesV1SourceAdapterFactory(booksDir),

@@ -188,8 +188,15 @@ internal suspend fun discoverReachableCalibre(
                 serviceName = candidate.serviceName,
             )
             is CalibreConnectionCheckResult.Failure -> {
-                lastFailure = CalibreDiscoveryResult.Unavailable(result.message)
-                null
+                if (result.kind == CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED) {
+                    CalibreDiscoveryResult.Found(
+                        baseUrl = baseUrl,
+                        serviceName = candidate.serviceName,
+                    )
+                } else {
+                    lastFailure = CalibreDiscoveryResult.Unavailable(result.message)
+                    null
+                }
             }
             null -> {
                 lastFailure = CalibreDiscoveryResult.Unavailable("Calibre 连接探测超时")

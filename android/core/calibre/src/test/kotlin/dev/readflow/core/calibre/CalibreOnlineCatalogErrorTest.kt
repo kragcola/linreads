@@ -47,8 +47,8 @@ class CalibreOnlineCatalogErrorTest {
         val error = (result as ReadflowResult.Failure).error
         assertEquals(ReadflowError.Kind.AUTH, error.kind)
         assertEquals(401, error.code)
-        assertTrue(error.message.contains("需要认证"))
-        assertTrue(error.message.contains("尚未支持登录凭据"))
+        assertTrue(error.message.contains("认证失败"))
+        assertTrue(error.message.contains("填写或检查用户名和密码"))
         assertFalse(error.message.contains("Client request"))
         catalog.close()
     }

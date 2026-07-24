@@ -13,12 +13,14 @@ import dev.readflow.extensions.api.SourceAdapterFactory
 import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceAdapterRegistry
 import dev.readflow.extensions.api.SourceCapabilities
+import dev.readflow.extensions.api.SourceCredentials
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.SourceKind
 import dev.readflow.extensions.api.SourceRegistry
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
@@ -30,21 +32,16 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /** Persistent registry. Every source, including migrated Calibre, is opened by adapter id. */
 class DefaultSourceRegistry(
     private val settings: SettingsRepository,
     private val sourceConfigStore: SourceConfigStore,
     private val booksDir: File,
+    private val credentialStore: SourceCredentialStore = NoOpSourceCredentialStore,
     private val calibreServiceDiscovery: CalibreServiceDiscovery? = null,
-    private val calibreCatalogFactory: (SourceDescriptor) -> OnlineBookCatalog = { descriptor ->
-        val config = descriptor.calibreConfig()
-        CalibreOnlineCatalog(
-            client = CalibreClient(config.baseUrl, libraryId = config.libraryId),
-            booksDir = booksDir,
-            descriptor = descriptor.copy(baseUrl = requireValidCalibreBaseUrl(config.baseUrl)),
-        )
-    },
+    private val calibreCatalogFactory: ((SourceDescriptor) -> OnlineBookCatalog)? = null,
     private val genericCatalogFactory: (SourceDescriptor) -> OnlineBookCatalog = { descriptor ->
         val wireFormat = if (descriptor.adapterId == SourceAdapterIds.OPDS) {
             GenericCatalogWireFormat.OPDS
@@ -89,7 +86,11 @@ class DefaultSourceRegistry(
         if (!stored.enabled) {
             return ReadflowResult.Failure(ReadflowError.unsupported("书源已禁用或适配器不可用"))
         }
-        return adapters.open(stored.toDescriptor())
+        return if (stored.adapterId == SourceAdapterIds.CALIBRE) {
+            withContext(Dispatchers.IO) { adapters.open(stored.toDescriptor()) }
+        } else {
+            adapters.open(stored.toDescriptor())
+        }
     }
 
     override suspend fun addUserSource(
@@ -97,8 +98,9 @@ class DefaultSourceRegistry(
         name: String,
         configVersion: Int,
         configJson: String,
+        credentials: SourceCredentials?,
     ): ReadflowResult<SourceDescriptor> = importMutex.withLock {
-        addUserSourceLocked(adapterId, name, configVersion, configJson)
+        addUserSourceLocked(adapterId, name, configVersion, configJson, credentials)
     }
 
     private suspend fun addUserSourceLocked(
@@ -106,6 +108,7 @@ class DefaultSourceRegistry(
         name: String,
         configVersion: Int,
         configJson: String,
+        credentials: SourceCredentials? = null,
     ): ReadflowResult<SourceDescriptor> {
         val trimmedName = name.trim()
         if (trimmedName.isBlank()) {
@@ -134,9 +137,99 @@ class DefaultSourceRegistry(
             configJson = configJson,
             updatedAt = now,
         )
-        sourceConfigStore.upsertUserSource(persisted)
+        try {
+            sourceConfigStore.upsertUserSource(persisted)
+            if (adapterId == SourceAdapterIds.CALIBRE && credentials != null) {
+                withContext(Dispatchers.IO) {
+                    credentialStore.put(id, calibreCredentialScopeForRequestUrl(baseUrl), credentials)
+                }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            runCatching { sourceConfigStore.deleteUserSource(id) }
+            runCatching { withContext(Dispatchers.IO) { credentialStore.remove(id) } }
+            return ReadflowResult.Failure(ReadflowError.io(error.message ?: "保存书源失败"))
+        }
         return ReadflowResult.Success(adapters.describe(persisted.toDescriptor()))
     }
+
+    override suspend fun updateUserSource(
+        sourceId: String,
+        name: String,
+        configVersion: Int,
+        configJson: String,
+        credentials: SourceCredentials?,
+    ): ReadflowResult<SourceDescriptor> = importMutex.withLock {
+        val existing = sourceConfigStore.getUserSource(sourceId)
+            ?: return@withLock ReadflowResult.Failure(ReadflowError.notFound("source", sourceId))
+        val trimmedName = name.trim()
+        if (trimmedName.isBlank()) {
+            return@withLock ReadflowResult.Failure(ReadflowError.parse("请填写书源名称"))
+        }
+        val factory = adapters.factory(existing.adapterId)
+            ?: return@withLock ReadflowResult.Failure(
+                ReadflowError.unsupported("未安装书源适配器：${existing.adapterId}"),
+            )
+        when (val validation = factory.validate(configVersion, configJson)) {
+            is ReadflowResult.Failure -> return@withLock validation
+            is ReadflowResult.Success -> Unit
+        }
+        val updated = existing.copy(
+            name = trimmedName,
+            baseUrl = displayBaseUrl(existing.adapterId, configJson),
+            configVersion = configVersion,
+            configJson = configJson,
+            updatedAt = System.currentTimeMillis(),
+        )
+        try {
+            sourceConfigStore.upsertUserSource(updated)
+            if (sourceId == BUILTIN_CALIBRE_SOURCE_ID) {
+                settings.setCalibreBaseUrl(updated.baseUrl)
+            }
+            if (existing.adapterId == SourceAdapterIds.CALIBRE && credentials != null) {
+                withContext(Dispatchers.IO) {
+                    credentialStore.put(
+                        sourceId,
+                        calibreCredentialScopeForRequestUrl(updated.baseUrl),
+                        credentials,
+                    )
+                }
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            runCatching { sourceConfigStore.upsertUserSource(existing) }
+            if (sourceId == BUILTIN_CALIBRE_SOURCE_ID) {
+                runCatching { settings.setCalibreBaseUrl(existing.baseUrl) }
+            }
+            return@withLock ReadflowResult.Failure(ReadflowError.io(error.message ?: "更新书源失败"))
+        }
+        ReadflowResult.Success(adapters.describe(updated.toDescriptor()))
+    }
+
+    override suspend fun sourceCredentials(sourceId: String): SourceCredentials? {
+        val source = sourceConfigStore.getUserSource(sourceId) ?: return null
+        if (source.adapterId != SourceAdapterIds.CALIBRE) return null
+        return withContext(Dispatchers.IO) {
+            credentialStore.get(sourceId, calibreCredentialScopeForRequestUrl(source.baseUrl))
+        }
+    }
+
+    override suspend fun clearSourceCredentials(sourceId: String): ReadflowResult<Unit> =
+        importMutex.withLock {
+            if (sourceConfigStore.getUserSource(sourceId) == null) {
+                return@withLock ReadflowResult.Failure(ReadflowError.notFound("source", sourceId))
+            }
+            try {
+                withContext(Dispatchers.IO) { credentialStore.remove(sourceId) }
+                ReadflowResult.Success(Unit)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                ReadflowResult.Failure(ReadflowError.io(error.message ?: "重置书源凭据失败"))
+            }
+        }
 
     @Suppress("DEPRECATION")
     override suspend fun addUserSource(
@@ -152,7 +245,7 @@ class DefaultSourceRegistry(
             )
             else -> return ReadflowResult.Failure(ReadflowError.unsupported("未安装书源适配器：${kind.adapterId}"))
         }
-        return addUserSource(kind.adapterId, name, 1, configJson)
+        return addUserSource(kind.adapterId, name, 1, configJson, credentials = null)
     }
 
     override suspend fun removeUserSource(sourceId: String): ReadflowResult<Unit> =
@@ -160,9 +253,10 @@ class DefaultSourceRegistry(
             try {
                 if (sourceId == BUILTIN_CALIBRE_SOURCE_ID) {
                     // Clearing the legacy value is the durable deletion marker. A later observer
-                    // removes any fixed-id row left by interruption between these two writes.
+                    // removes any fixed-id row or credential left by an interrupted deletion.
                     settings.setCalibreBaseUrl("")
                 }
+                withContext(Dispatchers.IO) { credentialStore.remove(sourceId) }
                 sourceConfigStore.deleteUserSource(sourceId)
                 ReadflowResult.Success(Unit)
             } catch (error: CancellationException) {
@@ -232,6 +326,9 @@ class DefaultSourceRegistry(
         if (rawUrl == null) return
         if (rawUrl.isBlank()) {
             importMutex.withLock {
+                withContext(Dispatchers.IO) {
+                    credentialStore.remove(BUILTIN_CALIBRE_SOURCE_ID)
+                }
                 sourceConfigStore.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)?.let {
                     sourceConfigStore.deleteUserSource(BUILTIN_CALIBRE_SOURCE_ID)
                 }
@@ -314,13 +411,14 @@ class DefaultSourceRegistry(
 
     private fun compatibilityAdapterRegistry(): SourceAdapterRegistry = DefaultSourceAdapterRegistry(
         setOf(
-            DelegatingSourceAdapterFactory(
-                adapterId = SourceAdapterIds.CALIBRE,
-                capabilities = CalibreSourceAdapterFactory(booksDir).capabilities(1, "{}"),
-                validate = CalibreSourceAdapterFactory(booksDir)::validate,
-            ) { descriptor ->
-                ReadflowResult.Success(calibreCatalogFactory(descriptor))
-            },
+            calibreCatalogFactory?.let { catalogFactory ->
+                val calibreFactory = CalibreSourceAdapterFactory(booksDir, credentialStore::get)
+                DelegatingSourceAdapterFactory(
+                    adapterId = SourceAdapterIds.CALIBRE,
+                    capabilities = calibreFactory.capabilities(1, "{}"),
+                    validate = calibreFactory::validate,
+                ) { descriptor -> ReadflowResult.Success(catalogFactory(descriptor)) }
+            } ?: CalibreSourceAdapterFactory(booksDir, credentialStore::get),
             DelegatingSourceAdapterFactory(
                 adapterId = SourceAdapterIds.OPDS,
                 capabilities = OpdsSourceAdapterFactory(booksDir).capabilities(1, "{}"),

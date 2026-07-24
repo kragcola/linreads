@@ -4,6 +4,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -44,6 +46,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -82,6 +85,7 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -378,20 +382,25 @@ fun LibraryScreen(
                 state = onlineLibraryState,
                 onSelectSource = viewModel::selectOnlineSource,
                 onQueryChange = viewModel::updateOnlineQuery,
-                onFilterChange = viewModel::updateOnlineFilter,
                 onSearch = viewModel::searchOnlineLibrary,
                 onToggleSelect = viewModel::toggleOnlineSelection,
+                onToggleAllCurrent = viewModel::toggleAllCurrentOnlineResults,
+                onApplyFacet = viewModel::applyOnlineFacet,
                 onSelectAuthor = viewModel::selectOnlineByAuthor,
                 onSelectSeries = viewModel::selectOnlineBySeries,
                 onDownloadEntry = viewModel::downloadOnlineEntry,
                 onDownloadSelected = viewModel::downloadSelectedOnlineBooks,
                 onPreview = viewModel::previewOnlineEntry,
-                onOpenSourceEditor = { showSourceEditor = true },
+                onOpenSourceEditor = { sourceId ->
+                    viewModel.prepareSourceEditor(sourceId)
+                    showSourceEditor = true
+                },
                 onImportSourceConfig = { sourceConfigLauncher.launch(SOURCE_CONFIG_MIMES) },
                 onRemoveSource = viewModel::removeOnlineSource,
                 onDismiss = {
                     showOnlineLibrary = false
                     showSourceEditor = false
+                    viewModel.clearSourceEditor()
                     viewModel.clearOnlinePreview()
                 },
             )
@@ -406,11 +415,16 @@ fun LibraryScreen(
             SourceEditorWindow(
                 state = onlineLibraryState,
                 onFormChange = viewModel::updateAddSourceForm,
+                onCredentialsChange = viewModel::updateSourceCredentials,
+                onResetCredentials = viewModel::resetSourceCredentials,
                 onHtmlDraftChange = viewModel::updateHtmlSourceDraft,
                 onSave = {
-                    viewModel.addOnlineSource { showSourceEditor = false }
+                    viewModel.saveOnlineSource { showSourceEditor = false }
                 },
-                onDismiss = { showSourceEditor = false },
+                onDismiss = {
+                    viewModel.clearSourceEditor()
+                    showSourceEditor = false
+                },
             )
         }
     }
@@ -451,15 +465,16 @@ private fun OnlineLibrarySheet(
     state: OnlineLibraryUiState,
     onSelectSource: (String) -> Unit,
     onQueryChange: (String) -> Unit,
-    onFilterChange: (dev.readflow.extensions.api.OnlineCatalogFilter) -> Unit,
     onSearch: () -> Unit,
     onToggleSelect: (dev.readflow.extensions.api.OnlineCatalogEntry) -> Unit,
+    onToggleAllCurrent: () -> Unit,
+    onApplyFacet: (dev.readflow.extensions.api.OnlineCatalogFilter) -> Unit,
     onSelectAuthor: (String) -> Unit,
     onSelectSeries: (String) -> Unit,
     onDownloadEntry: (dev.readflow.extensions.api.OnlineCatalogEntry) -> Unit,
     onDownloadSelected: () -> Unit,
     onPreview: (dev.readflow.extensions.api.OnlineCatalogEntry) -> Unit,
-    onOpenSourceEditor: () -> Unit,
+    onOpenSourceEditor: (String?) -> Unit,
     onImportSourceConfig: () -> Unit,
     onRemoveSource: (String) -> Unit,
     onDismiss: () -> Unit,
@@ -528,7 +543,7 @@ private fun OnlineLibrarySheet(
                             text = { Text("添加书源") },
                             onClick = {
                                 sourceActionsExpanded = false
-                                onOpenSourceEditor()
+                                onOpenSourceEditor(null)
                             },
                             leadingIcon = { Icon(Icons.Outlined.Add, contentDescription = null) },
                         )
@@ -543,6 +558,16 @@ private fun OnlineLibrarySheet(
                             leadingIcon = { Icon(Icons.Default.KeyboardArrowDown, contentDescription = null) },
                         )
                         selected?.let { userSource ->
+                            if (userSource.adapterId == dev.readflow.extensions.api.SourceAdapterIds.CALIBRE) {
+                                DropdownMenuItem(
+                                    text = { Text("编辑 Calibre 连接") },
+                                    onClick = {
+                                        sourceActionsExpanded = false
+                                        onOpenSourceEditor(userSource.id)
+                                    },
+                                    leadingIcon = { Icon(Icons.Outlined.Settings, contentDescription = null) },
+                                )
+                            }
                             DropdownMenuItem(
                                 text = { Text("删除当前书源") },
                                 onClick = {
@@ -566,7 +591,7 @@ private fun OnlineLibrarySheet(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Button(onClick = onOpenSourceEditor) {
+                    Button(onClick = { onOpenSourceEditor(null) }) {
                         Icon(Icons.Outlined.Add, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("添加第一个书源")
@@ -664,40 +689,92 @@ private fun OnlineLibrarySheet(
                     }
                     if (filtersExpanded) {
                         if (canFilterAuthor) {
-                            OutlinedTextField(
-                                value = state.filter.author,
-                                onValueChange = { onFilterChange(state.filter.copy(author = it)) },
-                                label = { Text("作者") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
+                            MetadataFacetRow(
+                                title = "作者",
+                                facets = state.metadataFacets.authors,
+                                selectedValue = state.filter.author,
+                                onSelect = { value ->
+                                    onApplyFacet(
+                                        state.filter.copy(
+                                            author = value.takeUnless {
+                                                it.equals(state.filter.author, ignoreCase = true)
+                                            }.orEmpty(),
+                                        ),
+                                    )
+                                },
                             )
                         }
                         if (canFilterSeries) {
-                            OutlinedTextField(
-                                value = state.filter.series,
-                                onValueChange = { onFilterChange(state.filter.copy(series = it)) },
-                                label = { Text("系列") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
+                            MetadataFacetRow(
+                                title = "系列",
+                                facets = state.metadataFacets.series,
+                                selectedValue = state.filter.series,
+                                onSelect = { value ->
+                                    onApplyFacet(
+                                        state.filter.copy(
+                                            series = value.takeUnless {
+                                                it.equals(state.filter.series, ignoreCase = true)
+                                            }.orEmpty(),
+                                        ),
+                                    )
+                                },
                             )
                         }
                         if (canFilterFormat) {
-                            OutlinedTextField(
-                                value = state.filter.format,
-                                onValueChange = { onFilterChange(state.filter.copy(format = it)) },
-                                label = { Text("格式") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
+                            MetadataFacetRow(
+                                title = "格式",
+                                facets = state.metadataFacets.formats,
+                                selectedValue = state.filter.format,
+                                onSelect = { value ->
+                                    onApplyFacet(
+                                        state.filter.copy(
+                                            format = value.takeUnless {
+                                                it.equals(state.filter.format, ignoreCase = true)
+                                            }.orEmpty(),
+                                        ),
+                                    )
+                                },
                             )
                         }
                         if (canFilterTag) {
-                            OutlinedTextField(
-                                value = state.filter.tag,
-                                onValueChange = { onFilterChange(state.filter.copy(tag = it)) },
-                                label = { Text("标签") },
-                                singleLine = true,
-                                modifier = Modifier.fillMaxWidth(),
+                            MetadataFacetRow(
+                                title = "标签",
+                                facets = state.metadataFacets.tags,
+                                selectedValue = state.filter.tag,
+                                onSelect = { value ->
+                                    onApplyFacet(
+                                        state.filter.copy(
+                                            tag = value.takeUnless {
+                                                it.equals(state.filter.tag, ignoreCase = true)
+                                            }.orEmpty(),
+                                        ),
+                                    )
+                                },
                             )
+                        }
+                        if (
+                            state.filter.author.isNotBlank() &&
+                            selected?.capabilities?.canDownload == true
+                        ) {
+                            OutlinedButton(
+                                onClick = { onSelectAuthor(state.filter.author) },
+                                enabled = !state.isSelectingBatch,
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                            ) {
+                                Text("选择该作者全部书籍")
+                            }
+                        }
+                        if (
+                            state.filter.series.isNotBlank() &&
+                            selected?.capabilities?.canDownload == true
+                        ) {
+                            OutlinedButton(
+                                onClick = { onSelectSeries(state.filter.series) },
+                                enabled = !state.isSelectingBatch,
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                            ) {
+                                Text("选择该系列全部书籍")
+                            }
                         }
                     }
                 }
@@ -731,6 +808,34 @@ private fun OnlineLibrarySheet(
                 )
             }
 
+            if (state.results.isNotEmpty() && selected?.capabilities?.canDownload == true) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .toggleable(
+                            value = state.allCurrentResultsSelected,
+                            role = Role.Checkbox,
+                            onValueChange = { onToggleAllCurrent() },
+                        )
+                        .semantics(mergeDescendants = true) {
+                            contentDescription = if (state.allCurrentResultsSelected) {
+                                "取消全选当前结果"
+                            } else {
+                                "全选当前结果"
+                            }
+                            stateDescription = if (state.allCurrentResultsSelected) "已全选" else "未全选"
+                        },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = state.allCurrentResultsSelected,
+                        onCheckedChange = null,
+                    )
+                    Text("全选当前结果（${state.results.size}）")
+                }
+            }
+
             if (state.selectedEntryKeys.isNotEmpty() && selected?.capabilities?.canDownload == true) {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -759,7 +864,7 @@ private fun OnlineLibrarySheet(
                             onToggleSelect = { onToggleSelect(entry) },
                             onDownload = { onDownloadEntry(entry) },
                             onPreview = { onPreview(entry) },
-                            onAuthorBatch = { onSelectAuthor(entry.meta.author) },
+                            onAuthorBatch = onSelectAuthor,
                             onSeriesBatch = { entry.series?.let(onSelectSeries) },
                         )
                     }
@@ -805,6 +910,42 @@ private fun OnlineLibrarySheet(
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun MetadataFacetRow(
+    title: String,
+    facets: List<MetadataFacet>,
+    selectedValue: String,
+    onSelect: (String) -> Unit,
+) {
+    val visibleFacets = if (
+        selectedValue.isNotBlank() && facets.none { it.value.equals(selectedValue, ignoreCase = true) }
+    ) {
+        listOf(MetadataFacet(selectedValue, 0)) + facets
+    } else {
+        facets
+    }
+    if (visibleFacets.isEmpty()) return
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(title, style = MaterialTheme.typography.labelLarge)
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(visibleFacets, key = { "${title}:${it.value.lowercase()}" }) { facet ->
+                val selected = facet.value.equals(selectedValue, ignoreCase = true)
+                FilterChip(
+                    selected = selected,
+                    onClick = { onSelect(facet.value) },
+                    label = { Text("${facet.value} · ${facet.count}") },
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .semantics {
+                            contentDescription = "$title${facet.value}，${facet.count} 本"
+                            stateDescription = if (selected) "已选择" else "未选择"
+                        },
+                )
+            }
+        }
     }
 }
 
@@ -886,6 +1027,8 @@ private fun OnlineBookPreviewWindow(
 private fun SourceEditorWindow(
     state: OnlineLibraryUiState,
     onFormChange: (name: String?, url: String?, adapterId: String?) -> Unit,
+    onCredentialsChange: (username: String, password: String) -> Unit,
+    onResetCredentials: () -> Unit,
     onHtmlDraftChange: (HtmlSourceDraft) -> Unit,
     onSave: () -> Unit,
     onDismiss: () -> Unit,
@@ -932,7 +1075,7 @@ private fun SourceEditorWindow(
             Scaffold(
                 topBar = {
                     TopAppBar(
-                        title = { Text("添加书源") },
+                        title = { Text(if (state.editingSourceId == null) "添加书源" else "编辑 Calibre 连接") },
                         navigationIcon = {
                             IconButton(onClick = onDismiss) {
                                 Icon(
@@ -944,7 +1087,9 @@ private fun SourceEditorWindow(
                         actions = {
                             TextButton(
                                 onClick = onSave,
-                                enabled = !state.isAddingSource,
+                                enabled = !state.isAddingSource &&
+                                    !state.isLoadingSourceCredentials &&
+                                    !state.sourceCredentialsLoadFailed,
                             ) {
                                 Text(if (state.isAddingSource) "保存中" else "保存")
                             }
@@ -960,9 +1105,10 @@ private fun SourceEditorWindow(
                         .padding(horizontal = 20.dp, vertical = 16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Text("书源类型", style = MaterialTheme.typography.labelLarge)
-                    Column {
-                        adapterOptions.forEach { option ->
+                    if (state.editingSourceId == null) {
+                        Text("书源类型", style = MaterialTheme.typography.labelLarge)
+                        Column {
+                            adapterOptions.forEach { option ->
                             val selected = state.addSourceAdapterId == option.adapterId
                             Row(
                                 modifier = Modifier
@@ -987,7 +1133,10 @@ private fun SourceEditorWindow(
                                     )
                                 }
                             }
+                            }
                         }
+                    } else {
+                        Text("Calibre 内容服务器", style = MaterialTheme.typography.titleSmall)
                     }
                     Text(
                         text = if (
@@ -1045,6 +1194,40 @@ private fun SourceEditorWindow(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                     )
+                    if (state.addSourceAdapterId == dev.readflow.extensions.api.SourceAdapterIds.CALIBRE) {
+                        OutlinedTextField(
+                            value = state.sourceUsername,
+                            onValueChange = { onCredentialsChange(it, state.sourcePassword) },
+                            label = { Text("用户名（可选）") },
+                            supportingText = { Text("未开启 Calibre 认证时留空") },
+                            singleLine = true,
+                            enabled = !state.isLoadingSourceCredentials,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = state.sourcePassword,
+                            onValueChange = { onCredentialsChange(state.sourceUsername, it) },
+                            label = { Text("密码") },
+                            supportingText = { Text("凭据仅保存在本机加密存储中") },
+                            singleLine = true,
+                            enabled = !state.isLoadingSourceCredentials,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            text = "HTTP Basic Auth 不会加密网络传输，请仅在可信的局域网中使用。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (state.sourceCredentialsLoadFailed) {
+                            OutlinedButton(
+                                onClick = onResetCredentials,
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                            ) {
+                                Text("重置登录凭据")
+                            }
+                        }
+                    }
                     if (
                         state.addSourceAdapterId ==
                         dev.readflow.extensions.api.SourceAdapterIds.HTML_RULES_V1
@@ -1230,10 +1413,11 @@ private fun OnlineCatalogResultRow(
     onToggleSelect: () -> Unit,
     onDownload: () -> Unit,
     onPreview: () -> Unit,
-    onAuthorBatch: () -> Unit,
+    onAuthorBatch: (String) -> Unit,
     onSeriesBatch: () -> Unit,
 ) {
     val book = entry.meta
+    val batchAuthors = entry.individualAuthors()
     var overflowExpanded by remember { mutableStateOf(false) }
     val hasOverflowActions = canDownload || canPreview
     val downloadLabel = if (isDownloading) "正在下载《${book.title}》" else "下载《${book.title}》"
@@ -1321,17 +1505,25 @@ private fun OnlineCatalogResultRow(
                         onDismissRequest = { overflowExpanded = false },
                     ) {
                         if (canDownload) {
-                            DropdownMenuItem(
-                                text = {
-                                    Text(
-                                        if (canBatchAcrossSource) "同作者全选" else "当前结果同作者",
-                                    )
-                                },
-                                onClick = {
-                                    overflowExpanded = false
-                                    onAuthorBatch()
-                                },
-                            )
+                            batchAuthors.forEach { author ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            if (batchAuthors.size == 1) {
+                                                if (canBatchAcrossSource) "同作者全选" else "当前结果同作者"
+                                            } else if (canBatchAcrossSource) {
+                                                "全选作者：$author"
+                                            } else {
+                                                "当前结果：$author"
+                                            },
+                                        )
+                                    },
+                                    onClick = {
+                                        overflowExpanded = false
+                                        onAuthorBatch(author)
+                                    },
+                                )
+                            }
                             if (!entry.series.isNullOrBlank()) {
                                 DropdownMenuItem(
                                     text = {

@@ -20,6 +20,7 @@ data class CalibreDownloadedBook(
 class CalibreBookDownloader(
     private val client: CalibreClient,
     private val booksDir: File,
+    private val coverUrl: (Int) -> String = client::coverUrl,
 ) {
     suspend fun download(
         meta: CalibreBookMeta,
@@ -64,7 +65,7 @@ class CalibreBookDownloader(
                             title = meta.title,
                             author = meta.authors.joinToString(", ").ifEmpty { "Unknown" },
                             format = choice.bookFormat,
-                            coverUrl = client.coverUrl(meta.id),
+                            coverUrl = coverUrl(meta.id),
                             downloadStatus = DownloadStatus.DOWNLOADED,
                             localUri = outFile.toURI().toString(),
                         ),

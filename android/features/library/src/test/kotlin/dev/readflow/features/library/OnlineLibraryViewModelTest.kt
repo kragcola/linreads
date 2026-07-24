@@ -20,6 +20,7 @@ import dev.readflow.extensions.api.OnlineCatalogFilter
 import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.SourceCapabilities
+import dev.readflow.extensions.api.SourceCredentials
 import dev.readflow.extensions.api.SourceRegistry
 import dev.readflow.extensions.api.stableRemoteBookId
 import kotlinx.coroutines.CompletableDeferred
@@ -139,9 +140,11 @@ class OnlineLibraryViewModelTest {
         advanceUntilIdle()
         assertEquals(listOf("c1"), viewModel.onlineLibraryState.value.results.map { it.meta.id })
 
+        viewModel.updateOnlineFilter(OnlineCatalogFilter(author = "Old author"))
         viewModel.selectOnlineSource("source-json")
         assertTrue(viewModel.onlineLibraryState.value.results.isEmpty())
         assertEquals("source-json", viewModel.onlineLibraryState.value.selectedSourceId)
+        assertTrue(viewModel.onlineLibraryState.value.filter.isEmpty)
 
         viewModel.updateOnlineQuery("q2")
         viewModel.searchOnlineLibrary()
@@ -154,7 +157,7 @@ class OnlineLibraryViewModelTest {
     fun batchSelectionAndSeriesAuthorOperationsSelectMatchingEntries() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val results = listOf(
-            entry("1", "Book One", author = "Ann", series = "Saga"),
+            entry("1", "Book One", author = "Ann, Bob", authors = listOf("Ann", "Bob"), series = "Saga"),
             entry("2", "Book Two", author = "Ann", series = "Other"),
             entry("3", "Book Three", author = "Bob", series = "Saga"),
         )
@@ -191,6 +194,59 @@ class OnlineLibraryViewModelTest {
 
         viewModel.clearOnlineSelection()
         assertTrue(viewModel.onlineLibraryState.value.selectedEntryKeys.isEmpty())
+    }
+
+    @Test
+    fun currentResultsCanBeSelectedAndDeselectedAsOneSet() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val results = listOf(entry("1", "One"), entry("2", "Two"), entry("3", "Three"))
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = mapOf(
+                "source-json" to FakeOnlineCatalog(
+                    searchHandler = { _, _ -> ReadflowResult.Success(results) },
+                ),
+            ),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+
+        viewModel.toggleAllCurrentOnlineResults()
+        assertEquals(results.mapTo(linkedSetOf(), OnlineCatalogEntry::selectionKey), viewModel.onlineLibraryState.value.selectedEntryKeys)
+
+        viewModel.toggleAllCurrentOnlineResults()
+        assertTrue(viewModel.onlineLibraryState.value.selectedEntryKeys.isEmpty())
+    }
+
+    @Test
+    fun metadataFacetsDeduplicatePerBookCountAndSortDeterministically() {
+        val multiAuthorEntry = entry(
+            "1",
+            "One",
+            author = "Ann, Bob",
+            authors = listOf(" Ann ", "Bob", "ann"),
+            series = "Saga",
+            tags = listOf("Classic", "classic"),
+            formats = listOf("EPUB", "PDF"),
+        )
+        val facets = buildOnlineMetadataFacets(
+            listOf(
+                multiAuthorEntry,
+                entry("2", "Two", author = "Ann", series = "Saga", tags = listOf("Classic"), formats = listOf("EPUB")),
+                entry("3", "Three", author = "Bob", series = "Other", tags = listOf("New"), formats = listOf("MOBI")),
+            ),
+        )
+
+        assertEquals(listOf("Ann", "Bob"), multiAuthorEntry.individualAuthors())
+        assertEquals(listOf(MetadataFacet("Ann", 2), MetadataFacet("Bob", 2)), facets.authors)
+        assertEquals(listOf(MetadataFacet("Saga", 2), MetadataFacet("Other", 1)), facets.series)
+        assertEquals(
+            listOf(MetadataFacet("EPUB", 2), MetadataFacet("MOBI", 1), MetadataFacet("PDF", 1)),
+            facets.formats,
+        )
+        assertEquals(listOf(MetadataFacet("Classic", 2), MetadataFacet("New", 1)), facets.tags)
     }
 
     @Test
@@ -288,7 +344,7 @@ class OnlineLibraryViewModelTest {
         val registry = FakeSourceRegistry(
             sources = emptyList(),
             catalogs = emptyMap(),
-            addHandler = { _, _, _, _ -> ReadflowResult.Success(added) },
+            addHandler = { _, _, _, _, _ -> ReadflowResult.Success(added) },
         )
         val viewModel = viewModel(registry = registry)
         var successCallbacks = 0
@@ -314,7 +370,7 @@ class OnlineLibraryViewModelTest {
         val registry = FakeSourceRegistry(
             sources = emptyList(),
             catalogs = emptyMap(),
-            addHandler = { _, name, _, _ ->
+            addHandler = { _, name, _, _, _ ->
                 persistedName = name
                 ReadflowResult.Success(added)
             },
@@ -338,7 +394,7 @@ class OnlineLibraryViewModelTest {
         val registry = FakeSourceRegistry(
             sources = emptyList(),
             catalogs = emptyMap(),
-            addHandler = { _, _, _, _ -> ReadflowResult.Failure(ReadflowError.parse("规则无效")) },
+            addHandler = { _, _, _, _, _ -> ReadflowResult.Failure(ReadflowError.parse("规则无效")) },
         )
         val viewModel = viewModel(registry = registry)
         var successCallbacks = 0
@@ -354,6 +410,80 @@ class OnlineLibraryViewModelTest {
         assertEquals(0, successCallbacks)
         assertFalse(viewModel.onlineLibraryState.value.isAddingSource)
         assertEquals("规则无效", viewModel.onlineLibraryState.value.error)
+    }
+
+    @Test
+    fun calibreSourceEditorLoadsAndPersistsCredentialsForAddAndEdit() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-calibre", SourceAdapterIds.CALIBRE, name = "Calibre")
+        var addedCredentials: SourceCredentials? = null
+        var updatedCredentials: SourceCredentials? = null
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = emptyMap(),
+            credentials = mutableMapOf(source.id to SourceCredentials("existing", "old-secret")),
+            addHandler = { _, _, _, _, supplied ->
+                addedCredentials = supplied
+                ReadflowResult.Success(source.copy(id = "source-added"))
+            },
+            updateHandler = { _, _, _, _, supplied ->
+                updatedCredentials = supplied
+                ReadflowResult.Success(source)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.prepareSourceEditor()
+        viewModel.updateSourceCredentials("new-user", "new-secret")
+        viewModel.updateAddSourceForm(
+            url = "http://192.168.1.5:8080",
+            adapterId = SourceAdapterIds.CALIBRE,
+        )
+        viewModel.saveOnlineSource()
+        advanceUntilIdle()
+        assertEquals(SourceCredentials("new-user", "new-secret"), addedCredentials)
+
+        viewModel.prepareSourceEditor(source.id)
+        advanceUntilIdle()
+        assertEquals("existing", viewModel.onlineLibraryState.value.sourceUsername)
+        assertEquals("old-secret", viewModel.onlineLibraryState.value.sourcePassword)
+
+        viewModel.updateSourceCredentials("updated-user", "updated-secret")
+        viewModel.saveOnlineSource()
+        advanceUntilIdle()
+        assertEquals(SourceCredentials("updated-user", "updated-secret"), updatedCredentials)
+
+        viewModel.clearSourceEditor()
+        assertEquals("", viewModel.onlineLibraryState.value.sourceUsername)
+        assertEquals("", viewModel.onlineLibraryState.value.sourcePassword)
+        assertEquals(null, viewModel.onlineLibraryState.value.editingSourceId)
+    }
+
+    @Test
+    fun credentialReadFailureBlocksSaveUntilUserExplicitlyResetsCredentials() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-calibre", SourceAdapterIds.CALIBRE, name = "Calibre")
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = emptyMap(),
+            credentialReadHandler = { throw IllegalStateException("keystore unavailable") },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.prepareSourceEditor(source.id)
+        advanceUntilIdle()
+        assertTrue(viewModel.onlineLibraryState.value.sourceCredentialsLoadFailed)
+
+        viewModel.saveOnlineSource()
+        advanceUntilIdle()
+        assertEquals(0, registry.updateCalls)
+
+        viewModel.resetSourceCredentials()
+        advanceUntilIdle()
+        assertFalse(viewModel.onlineLibraryState.value.sourceCredentialsLoadFailed)
+        assertTrue(registry.credentialsCleared)
     }
 
     /** Registry/parser tests cover validation; these cover post-read selection and error state. */
@@ -996,7 +1126,10 @@ class OnlineLibraryViewModelTest {
         id: String,
         title: String,
         author: String = "Author",
+        authors: List<String> = emptyList(),
         series: String? = null,
+        tags: List<String> = emptyList(),
+        formats: List<String> = emptyList(),
     ) = OnlineCatalogEntry(
         meta = BookMeta(
             id = id,
@@ -1004,7 +1137,10 @@ class OnlineLibraryViewModelTest {
             author = author,
             format = BookFormat.EPUB,
         ),
+        authors = authors,
         series = series,
+        tags = tags,
+        availableFormats = formats,
         downloadUrl = "http://192.168.1.5:8080/get/$id.epub",
         previewUrl = "http://192.168.1.5:8080/cover/$id.jpg",
     )
@@ -1017,9 +1153,21 @@ class OnlineLibraryViewModelTest {
             String,
             Int,
             String,
-        ) -> ReadflowResult<SourceDescriptor> = { _, _, _, _ ->
+            SourceCredentials?,
+        ) -> ReadflowResult<SourceDescriptor> = { _, _, _, _, _ ->
             ReadflowResult.Failure(ReadflowError.unsupported("not used"))
         },
+        private val updateHandler: suspend (
+            String,
+            String,
+            Int,
+            String,
+            SourceCredentials?,
+        ) -> ReadflowResult<SourceDescriptor> = { _, _, _, _, _ ->
+            ReadflowResult.Failure(ReadflowError.unsupported("not used"))
+        },
+        private val credentials: MutableMap<String, SourceCredentials> = mutableMapOf(),
+        private val credentialReadHandler: (suspend (String) -> SourceCredentials?)? = null,
         private val importHandler: suspend (String) -> ReadflowResult<SourceDescriptor> = {
             ReadflowResult.Failure(ReadflowError.unsupported("not used"))
         },
@@ -1027,6 +1175,10 @@ class OnlineLibraryViewModelTest {
         private val sourceFlow = MutableStateFlow(sources)
         val openedSourceIds = mutableListOf<String>()
         var importCalls = 0
+            private set
+        var updateCalls = 0
+            private set
+        var credentialsCleared = false
             private set
 
         override fun observeSources(): Flow<List<SourceDescriptor>> = sourceFlow
@@ -1043,7 +1195,28 @@ class OnlineLibraryViewModelTest {
             name: String,
             configVersion: Int,
             configJson: String,
-        ): ReadflowResult<SourceDescriptor> = addHandler(adapterId, name, configVersion, configJson)
+            credentials: SourceCredentials?,
+        ): ReadflowResult<SourceDescriptor> = addHandler(adapterId, name, configVersion, configJson, credentials)
+
+        override suspend fun updateUserSource(
+            sourceId: String,
+            name: String,
+            configVersion: Int,
+            configJson: String,
+            credentials: SourceCredentials?,
+        ): ReadflowResult<SourceDescriptor> {
+            updateCalls += 1
+            return updateHandler(sourceId, name, configVersion, configJson, credentials)
+        }
+
+        override suspend fun sourceCredentials(sourceId: String): SourceCredentials? =
+            credentialReadHandler?.invoke(sourceId) ?: credentials[sourceId]
+
+        override suspend fun clearSourceCredentials(sourceId: String): ReadflowResult<Unit> {
+            credentials.remove(sourceId)
+            credentialsCleared = true
+            return ReadflowResult.Success(Unit)
+        }
 
         override suspend fun removeUserSource(sourceId: String): ReadflowResult<Unit> =
             ReadflowResult.Success(Unit).also {

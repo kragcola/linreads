@@ -4,6 +4,8 @@ import android.app.Application
 import androidx.room.Room
 import androidx.room.withTransaction
 import dev.readflow.core.calibre.DefaultSourceRegistry
+import dev.readflow.core.calibre.AndroidSourceCredentialStore
+import dev.readflow.core.calibre.SourceCredentialStore
 import dev.readflow.core.calibre.defaultSourceAdapterRegistry
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.database.LibraryStore
@@ -93,14 +95,16 @@ val extensionsModule = module {
 
 val settingsModule = module {
     single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
+    single<SourceCredentialStore> { AndroidSourceCredentialStore(androidContext()) }
     single<SourceAdapterRegistry> {
-        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"))
+        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"), get())
     }
     single<SourceRegistry> {
         DefaultSourceRegistry(
             settings = get(),
             sourceConfigStore = get(),
             booksDir = File(androidContext().filesDir, "books"),
+            credentialStore = get(),
             sourceAdapters = get(),
         )
     }

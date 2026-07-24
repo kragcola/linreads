@@ -7,6 +7,9 @@ import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import dev.readflow.core.calibre.requireAllowedCalibreRequestUrl
+import dev.readflow.core.calibre.CALIBRE_COVER_SOURCE_QUERY_PARAMETER
+import dev.readflow.core.calibre.SourceCredentialStore
+import dev.readflow.core.calibre.calibreCredentialScopeForRequestUrl
 import dev.readflow.core.database.BookDeletionRecoveryFailure
 import dev.readflow.core.database.CompleteBookDeletionStore
 import dev.readflow.core.model.FontChoice
@@ -19,6 +22,8 @@ import org.koin.android.ext.android.inject
 import org.koin.android.ext.koin.androidContext
 import org.koin.core.context.startKoin
 import okhttp3.OkHttpClient
+import okhttp3.Credentials
+import okhttp3.Request
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -66,8 +71,9 @@ class ReadflowApplication : Application(), SingletonImageLoader.Factory {
         seedIfFirstLaunch(this, seeder)
     }
 
-    override fun newImageLoader(context: Context): ImageLoader =
-        ImageLoader.Builder(context)
+    override fun newImageLoader(context: Context): ImageLoader {
+        val credentialStore: SourceCredentialStore by inject()
+        return ImageLoader.Builder(context)
             .components {
                 add(
                     OkHttpNetworkFetcherFactory(
@@ -76,8 +82,9 @@ class ReadflowApplication : Application(), SingletonImageLoader.Factory {
                                 .followRedirects(false)
                                 .followSslRedirects(false)
                                 .addNetworkInterceptor { chain ->
-                                    requireAllowedCalibreRequestUrl(chain.request().url.toString())
-                                    chain.proceed(chain.request())
+                                    chain.proceed(
+                                        authenticatedCalibreCoverRequest(chain.request(), credentialStore),
+                                    )
                                 }
                                 .build()
                         },
@@ -85,6 +92,31 @@ class ReadflowApplication : Application(), SingletonImageLoader.Factory {
                 )
             }
             .build()
+    }
+}
+
+internal fun authenticatedCalibreCoverRequest(
+    request: Request,
+    credentialStore: SourceCredentialStore,
+): Request {
+    val sourceId = request.url.queryParameter(CALIBRE_COVER_SOURCE_QUERY_PARAMETER)
+        ?.takeIf(String::isNotBlank)
+        ?: return request.also { requireAllowedCalibreRequestUrl(it.url.toString()) }
+    val sanitizedUrl = request.url.newBuilder()
+        .removeAllQueryParameters(CALIBRE_COVER_SOURCE_QUERY_PARAMETER)
+        .build()
+    requireAllowedCalibreRequestUrl(sanitizedUrl.toString())
+    val scope = calibreCredentialScopeForRequestUrl(sanitizedUrl.toString())
+    val credentials = credentialStore.get(sourceId, scope)
+    return request.newBuilder()
+        .url(sanitizedUrl)
+        .removeHeader("Authorization")
+        .apply {
+            if (credentials != null) {
+                header("Authorization", Credentials.basic(credentials.username, credentials.password))
+            }
+        }
+        .build()
 }
 
 internal suspend fun recoverImportedFontDeletionsAtStartup(

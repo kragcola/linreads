@@ -36,7 +36,11 @@ class CalibreOnlineCatalog(
     ),
 ) : OnlineBookCatalog {
 
-    private val downloader = booksDir?.let { CalibreBookDownloader(client, it) }
+    private val downloader = booksDir?.let { directory ->
+        CalibreBookDownloader(client, directory) { id ->
+            authenticatedCalibreCoverUrl(client.coverUrl(id), descriptor.id)
+        }
+    }
 
     constructor(
         baseUrl: String,
@@ -67,13 +71,14 @@ class CalibreOnlineCatalog(
             val entries = ids.map { id ->
                 val wire = client.bookMeta(id)
                 OnlineCatalogEntry(
-                    meta = wire.toCatalogMeta(client, descriptor.id),
+                    meta = wire.toCatalogMeta(client, descriptor),
                     remoteKey = RemoteBookKey(descriptor.id, id.toString()),
+                    authors = wire.authors,
                     series = wire.series,
                     tags = wire.tags,
                     availableFormats = wire.formats,
                     downloadUrl = wire.bestDownloadFormat()?.let { client.downloadUrl(id, it.remoteFormat) },
-                    previewUrl = client.coverUrl(id),
+                    previewUrl = authenticatedCalibreCoverUrl(client.coverUrl(id), descriptor.id),
                 )
             }
             ReadflowResult.Success(entries.applyCatalogFilter(filter))
@@ -207,11 +212,11 @@ class CatalogBackedCalibreRepository(
     override fun close() = catalog.close()
 }
 
-private fun CalibreBookMeta.toCatalogMeta(client: CalibreClient, sourceId: String) = BookMeta(
-    id = if (sourceId == BUILTIN_CALIBRE_SOURCE_ID) id.toString() else stableRemoteBookId(sourceId, id.toString()),
+private fun CalibreBookMeta.toCatalogMeta(client: CalibreClient, descriptor: SourceDescriptor) = BookMeta(
+    id = if (descriptor.id == BUILTIN_CALIBRE_SOURCE_ID) id.toString() else stableRemoteBookId(descriptor.id, id.toString()),
     title = title,
     author = authors.joinToString(", ").ifEmpty { "Unknown" },
     format = bestDownloadFormat()?.bookFormat ?: BookFormat.UNKNOWN,
-    coverUrl = client.coverUrl(id),
+    coverUrl = authenticatedCalibreCoverUrl(client.coverUrl(id), descriptor.id),
     downloadStatus = DownloadStatus.NOT_DOWNLOADED,
 )

@@ -7,6 +7,8 @@ import dev.readflow.core.calibre.CalibreConnectionTester
 import dev.readflow.core.calibre.CalibreServiceDiscovery
 import dev.readflow.core.calibre.AndroidCalibreServiceDiscovery
 import dev.readflow.core.calibre.DefaultSourceRegistry
+import dev.readflow.core.calibre.AndroidSourceCredentialStore
+import dev.readflow.core.calibre.SourceCredentialStore
 import dev.readflow.core.calibre.defaultSourceAdapterRegistry
 import dev.readflow.core.calibre.GuidedCalibreEndpointProbe
 import dev.readflow.core.calibre.createCalibreConnectionTester
@@ -188,17 +190,19 @@ val renderModule = module {
 
 val settingsModule = module {
     single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
+    single<SourceCredentialStore> { AndroidSourceCredentialStore(androidContext()) }
     single<CalibreConnectionTester> { createCalibreConnectionTester() }
     single<CalibreServiceDiscovery> { AndroidCalibreServiceDiscovery(androidContext(), get()) }
     single<CalibreEndpointProbe> { GuidedCalibreEndpointProbe(get()) }
     single<SourceAdapterRegistry> {
-        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"))
+        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"), get())
     }
     single<SourceRegistry> {
         DefaultSourceRegistry(
             settings = get(),
             sourceConfigStore = get(),
             booksDir = File(androidContext().filesDir, "books"),
+            credentialStore = get(),
             calibreServiceDiscovery = get(),
             sourceAdapters = get(),
         )

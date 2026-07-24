@@ -52,6 +52,29 @@ class CalibreServiceDiscoveryTest {
     }
 
     @Test
+    fun authenticationRequiredStillIdentifiesAReachableCalibreServer() = kotlinx.coroutines.runBlocking {
+        val result = discoverReachableCalibre(
+            candidates = kotlinx.coroutines.flow.flowOf(
+                CalibreDiscoveryCandidate(
+                    "Protected calibre",
+                    InetAddress.getByName("192.168.2.1"),
+                    8080,
+                ),
+            ),
+            connectionTester = CalibreConnectionTester {
+                CalibreConnectionCheckResult.Failure(
+                    message = "Calibre 服务器需要认证",
+                    nextStep = "请填写用户名和密码",
+                    kind = CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED,
+                )
+            },
+        )
+
+        assertTrue(result is CalibreDiscoveryResult.Found)
+        assertEquals("http://192.168.2.1:8080", (result as CalibreDiscoveryResult.Found).baseUrl)
+    }
+
+    @Test
     fun stalledCandidateHasItsOwnBudgetAndDoesNotConsumeTheDiscoveryWindow() =
         kotlinx.coroutines.runBlocking {
             val candidates = listOf(

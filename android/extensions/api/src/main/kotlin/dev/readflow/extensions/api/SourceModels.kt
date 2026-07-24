@@ -41,6 +41,15 @@ data class SourceCapabilities(
     val canBatchAcrossSource: Boolean = false,
 )
 
+/** Authentication material kept outside source config JSON and UI-safe descriptors. */
+data class SourceCredentials(
+    val username: String,
+    val password: String,
+) {
+    val isEmpty: Boolean
+        get() = username.isBlank()
+}
+
 /** Persistable and UI-safe source descriptor. Secrets are referenced outside [configJson]. */
 data class SourceDescriptor(
     val id: String,
@@ -85,6 +94,8 @@ data class RemoteBookKey(
 data class OnlineCatalogEntry(
     val meta: BookMeta,
     val remoteKey: RemoteBookKey? = null,
+    /** Individual author names when the source exposes structured authorship. */
+    val authors: List<String> = emptyList(),
     val series: String? = null,
     val tags: List<String> = emptyList(),
     val availableFormats: List<String> = emptyList(),
@@ -197,6 +208,7 @@ interface SourceRegistry {
         name: String,
         configVersion: Int,
         configJson: String,
+        credentials: SourceCredentials? = null,
     ): ReadflowResult<SourceDescriptor> =
         ReadflowResult.Failure(ReadflowError.unsupported("书源注册器不支持添加配置"))
 
@@ -210,7 +222,22 @@ interface SourceRegistry {
         name = name,
         configVersion = 1,
         configJson = legacyBaseUrlConfigJson(baseUrl),
+        credentials = null,
     )
+
+    suspend fun updateUserSource(
+        sourceId: String,
+        name: String,
+        configVersion: Int,
+        configJson: String,
+        credentials: SourceCredentials? = null,
+    ): ReadflowResult<SourceDescriptor> =
+        ReadflowResult.Failure(ReadflowError.unsupported("书源注册器不支持编辑配置"))
+
+    suspend fun sourceCredentials(sourceId: String): SourceCredentials? = null
+
+    suspend fun clearSourceCredentials(sourceId: String): ReadflowResult<Unit> =
+        ReadflowResult.Failure(ReadflowError.unsupported("书源注册器不支持重置凭据"))
 
     suspend fun removeUserSource(sourceId: String): ReadflowResult<Unit>
 

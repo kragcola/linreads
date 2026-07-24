@@ -39,6 +39,9 @@ class CalibreOnlineCatalogIdentityTest {
         assertNotEquals(firstEntry.meta.id, secondEntry.meta.id)
         assertEquals("42", builtinEntry.meta.id)
         assertEquals(BUILTIN_CALIBRE_SOURCE_ID, builtinEntry.remoteKey?.sourceId)
+        assertTrue(
+            firstEntry.meta.coverUrl?.contains("$CALIBRE_COVER_SOURCE_QUERY_PARAMETER=source-a") == true,
+        )
 
         first.close()
         second.close()

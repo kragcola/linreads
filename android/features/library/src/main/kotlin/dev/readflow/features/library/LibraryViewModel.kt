@@ -29,6 +29,7 @@ import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
 import dev.readflow.extensions.api.ScannedBook
 import dev.readflow.extensions.api.SourceDescriptor
+import dev.readflow.extensions.api.SourceCredentials
 import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceRegistry
 import dev.readflow.extensions.api.BUILTIN_CALIBRE_SOURCE_ID
@@ -86,7 +87,73 @@ data class OnlineLibraryUiState(
     val addSourceUrl: String = "",
     val addSourceAdapterId: String = SourceAdapterIds.HTML_RULES_V1,
     val htmlSourceDraft: HtmlSourceDraft = HtmlSourceDraft(),
+    val metadataFacets: OnlineMetadataFacets = OnlineMetadataFacets(),
+    val editingSourceId: String? = null,
+    val sourceUsername: String = "",
+    val sourcePassword: String = "",
+    val isLoadingSourceCredentials: Boolean = false,
+    val sourceCredentialsLoadFailed: Boolean = false,
+) {
+    val allCurrentResultsSelected: Boolean
+        get() = results.isNotEmpty() && results.all { it.selectionKey() in selectedEntryKeys }
+}
+
+data class MetadataFacet(val value: String, val count: Int)
+
+data class OnlineMetadataFacets(
+    val authors: List<MetadataFacet> = emptyList(),
+    val series: List<MetadataFacet> = emptyList(),
+    val formats: List<MetadataFacet> = emptyList(),
+    val tags: List<MetadataFacet> = emptyList(),
 )
+
+internal fun buildOnlineMetadataFacets(entries: List<OnlineCatalogEntry>): OnlineMetadataFacets =
+    OnlineMetadataFacets(
+        authors = buildMetadataFacet(entries.map(OnlineCatalogEntry::individualAuthors)),
+        series = buildMetadataFacet(entries.map { listOfNotNull(it.series) }),
+        formats = buildMetadataFacet(
+            entries.map { entry ->
+                entry.availableFormats.ifEmpty { listOf(entry.meta.format.name) }
+            },
+        ),
+        tags = buildMetadataFacet(entries.map(OnlineCatalogEntry::tags)),
+    )
+
+internal fun OnlineCatalogEntry.individualAuthors(): List<String> =
+    authors
+        .map(String::trim)
+        .filter(String::isNotBlank)
+        .distinctBy { it.lowercase() }
+        .ifEmpty { listOf(meta.author.trim()).filter(String::isNotBlank) }
+
+private fun buildMetadataFacet(valuesByBook: List<List<String>>): List<MetadataFacet> {
+    data class Counter(var displayValue: String, var count: Int)
+
+    val counters = mutableMapOf<String, Counter>()
+    valuesByBook.forEach { rawValues ->
+        rawValues
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinctBy { it.lowercase() }
+            .forEach { value ->
+                val key = value.lowercase()
+                val counter = counters[key]
+                if (counter == null) {
+                    counters[key] = Counter(value, 1)
+                } else {
+                    counter.count += 1
+                    if (value < counter.displayValue) counter.displayValue = value
+                }
+            }
+    }
+    return counters.values
+        .map { MetadataFacet(it.displayValue, it.count) }
+        .sortedWith(
+            compareByDescending<MetadataFacet> { it.count }
+                .thenBy { it.value.lowercase() }
+                .thenBy(MetadataFacet::value),
+        )
+}
 
 data class HtmlSourceDraft(
     val searchUrlTemplate: String = "",
@@ -227,9 +294,11 @@ class LibraryViewModel(
                         state.copy(
                             sources = sources,
                             selectedSourceId = resolvedSelection,
+                            filter = if (sourceChanged) OnlineCatalogFilter() else state.filter,
                             isSearching = if (sourceChanged) false else state.isSearching,
                             isSelectingBatch = if (sourceChanged) false else state.isSelectingBatch,
                             results = if (sourceChanged) emptyList() else state.results,
+                            metadataFacets = if (sourceChanged) OnlineMetadataFacets() else state.metadataFacets,
                             selectedEntryKeys = if (sourceChanged) emptySet() else state.selectedEntryKeys,
                             downloadingKeys = if (sourceChanged) emptySet() else state.downloadingKeys,
                             preview = if (sourceChanged) null else state.preview,
@@ -478,9 +547,11 @@ class LibraryViewModel(
         _onlineLibraryState.update {
             it.copy(
                 selectedSourceId = sourceId,
+                filter = OnlineCatalogFilter(),
                 isSearching = false,
                 isSelectingBatch = false,
                 results = emptyList(),
+                metadataFacets = OnlineMetadataFacets(),
                 selectedEntryKeys = emptySet(),
                 downloadingKeys = emptySet(),
                 preview = null,
@@ -566,11 +637,30 @@ class LibraryViewModel(
         _onlineLibraryState.update { it.copy(selectedEntryKeys = emptySet()) }
     }
 
+    fun toggleAllCurrentOnlineResults() {
+        _onlineLibraryState.update { state ->
+            val currentKeys = state.results.mapTo(linkedSetOf(), OnlineCatalogEntry::selectionKey)
+            val nextSelection = if (currentKeys.isNotEmpty() && currentKeys.all(state.selectedEntryKeys::contains)) {
+                state.selectedEntryKeys - currentKeys
+            } else {
+                state.selectedEntryKeys + currentKeys
+            }
+            state.copy(selectedEntryKeys = nextSelection, error = null, message = null)
+        }
+    }
+
+    fun applyOnlineFacet(filter: OnlineCatalogFilter) {
+        updateOnlineFilter(filter)
+        searchOnlineLibrary()
+    }
+
     fun selectOnlineByAuthor(author: String) {
         selectOnlineBatch(
             query = author,
             filter = OnlineCatalogFilter(author = author),
-            matches = { it.meta.author.equals(author, ignoreCase = true) },
+            matches = { entry ->
+                entry.individualAuthors().any { it.equals(author, ignoreCase = true) }
+            },
         )
     }
 
@@ -654,6 +744,7 @@ class LibraryViewModel(
                                     state.copy(
                                         isSelectingBatch = false,
                                         results = merged,
+                                        metadataFacets = buildOnlineMetadataFacets(merged),
                                         selectedEntryKeys = entries.mapTo(linkedSetOf(), OnlineCatalogEntry::selectionKey),
                                         message = if (entries.isEmpty()) "没有找到匹配的书籍" else "已选择 ${entries.size} 本",
                                         error = null,
@@ -904,16 +995,146 @@ class LibraryViewModel(
         }
     }
 
+    fun updateSourceCredentials(username: String, password: String) {
+        _onlineLibraryState.update {
+            it.copy(sourceUsername = username, sourcePassword = password, error = null, message = null)
+        }
+    }
+
+    fun prepareSourceEditor(sourceId: String? = null) {
+        val registry = sourceRegistry
+        if (sourceId == null) {
+            _onlineLibraryState.update {
+                it.copy(
+                    editingSourceId = null,
+                    addSourceName = "",
+                    addSourceUrl = "",
+                    addSourceAdapterId = SourceAdapterIds.HTML_RULES_V1,
+                    htmlSourceDraft = HtmlSourceDraft(),
+                    sourceUsername = "",
+                    sourcePassword = "",
+                    isLoadingSourceCredentials = false,
+                    sourceCredentialsLoadFailed = false,
+                    error = null,
+                    message = null,
+                )
+            }
+            return
+        }
+        val source = _onlineLibraryState.value.sources.firstOrNull { it.id == sourceId } ?: return
+        _onlineLibraryState.update {
+            it.copy(
+                editingSourceId = source.id,
+                addSourceName = source.name,
+                addSourceUrl = source.baseUrl,
+                addSourceAdapterId = source.adapterId,
+                sourceUsername = "",
+                sourcePassword = "",
+                isLoadingSourceCredentials = source.adapterId == SourceAdapterIds.CALIBRE,
+                sourceCredentialsLoadFailed = false,
+                error = null,
+                message = null,
+            )
+        }
+        if (source.adapterId != SourceAdapterIds.CALIBRE || registry == null) return
+        viewModelScope.launch {
+            try {
+                val credentials = registry.sourceCredentials(source.id)
+                _onlineLibraryState.update { state ->
+                    if (state.editingSourceId != source.id) state else {
+                        state.copy(
+                            sourceUsername = credentials?.username.orEmpty(),
+                            sourcePassword = credentials?.password.orEmpty(),
+                            isLoadingSourceCredentials = false,
+                            sourceCredentialsLoadFailed = false,
+                        )
+                    }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                _onlineLibraryState.update { state ->
+                    if (state.editingSourceId != source.id) state else {
+                        state.copy(
+                            isLoadingSourceCredentials = false,
+                            sourceCredentialsLoadFailed = true,
+                            error = "无法读取已保存的 Calibre 凭据，请重试或重置登录凭据",
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    fun resetSourceCredentials() {
+        val registry = sourceRegistry ?: return
+        val sourceId = _onlineLibraryState.value.editingSourceId ?: return
+        viewModelScope.launch {
+            when (val result = registry.clearSourceCredentials(sourceId)) {
+                is ReadflowResult.Success -> _onlineLibraryState.update { state ->
+                    if (state.editingSourceId != sourceId) state else {
+                        state.copy(
+                            sourceUsername = "",
+                            sourcePassword = "",
+                            sourceCredentialsLoadFailed = false,
+                            error = null,
+                            message = "已重置登录凭据",
+                        )
+                    }
+                }
+                is ReadflowResult.Failure -> _onlineLibraryState.update { state ->
+                    if (state.editingSourceId != sourceId) state else {
+                        state.copy(error = result.error.message, message = null)
+                    }
+                }
+            }
+        }
+    }
+
+    fun clearSourceEditor() {
+        _onlineLibraryState.update {
+            it.copy(
+                editingSourceId = null,
+                addSourceName = "",
+                addSourceUrl = "",
+                addSourceAdapterId = SourceAdapterIds.HTML_RULES_V1,
+                htmlSourceDraft = HtmlSourceDraft(),
+                sourceUsername = "",
+                sourcePassword = "",
+                isLoadingSourceCredentials = false,
+                sourceCredentialsLoadFailed = false,
+                error = null,
+            )
+        }
+    }
+
     fun updateHtmlSourceDraft(draft: HtmlSourceDraft) {
         _onlineLibraryState.update { it.copy(htmlSourceDraft = draft, error = null, message = null) }
     }
 
-    fun addOnlineSource(onSuccess: () -> Unit = {}) {
+    fun addOnlineSource(onSuccess: () -> Unit = {}) = saveOnlineSource(onSuccess)
+
+    fun saveOnlineSource(onSuccess: () -> Unit = {}) {
         val registry = sourceRegistry ?: run {
             _onlineLibraryState.update { it.copy(error = "书源服务未配置", message = null) }
             return
         }
         if (_onlineLibraryState.value.isAddingSource) return
+        val editorState = _onlineLibraryState.value
+        if (editorState.sourceCredentialsLoadFailed) {
+            _onlineLibraryState.update {
+                it.copy(error = "请先重试或重置登录凭据", message = null)
+            }
+            return
+        }
+        if (
+            editorState.addSourceAdapterId == SourceAdapterIds.CALIBRE &&
+            editorState.sourceUsername.isBlank() &&
+            editorState.sourcePassword.isNotEmpty()
+        ) {
+            _onlineLibraryState.update { it.copy(error = "请填写用户名，或清空密码", message = null) }
+            return
+        }
         _onlineLibraryState.update { it.copy(isAddingSource = true, error = null, message = null) }
         viewModelScope.launch {
             val state = _onlineLibraryState.value
@@ -935,13 +1156,28 @@ class LibraryViewModel(
                 return@launch
             }
             val result = try {
-                registry.addUserSource(
+                val name = state.addSourceName.trim().ifBlank {
+                    defaultSourceName(state.addSourceAdapterId)
+                }
+                val credentials = if (state.addSourceAdapterId == SourceAdapterIds.CALIBRE) {
+                    SourceCredentials(state.sourceUsername.trim(), state.sourcePassword)
+                } else {
+                    null
+                }
+                state.editingSourceId?.let { sourceId ->
+                    registry.updateUserSource(
+                        sourceId = sourceId,
+                        name = name,
+                        configVersion = 1,
+                        configJson = configJson,
+                        credentials = credentials,
+                    )
+                } ?: registry.addUserSource(
                     adapterId = state.addSourceAdapterId,
-                    name = state.addSourceName.trim().ifBlank {
-                        defaultSourceName(state.addSourceAdapterId)
-                    },
+                    name = name,
                     configVersion = 1,
                     configJson = configJson,
+                    credentials = credentials,
                 )
             } catch (error: CancellationException) {
                 _onlineLibraryState.update { it.copy(isAddingSource = false) }
@@ -958,15 +1194,29 @@ class LibraryViewModel(
             }
             when (result) {
                 is ReadflowResult.Success -> {
+                    val wasEditing = state.editingSourceId != null
                     _onlineLibraryState.update {
                         it.copy(
-                            message = "已添加书源「${result.value.name}」",
+                            message = if (wasEditing) {
+                                "已更新书源「${result.value.name}」"
+                            } else {
+                                "已添加书源「${result.value.name}」"
+                            },
                             error = null,
                             isAddingSource = false,
                             addSourceName = "",
                             addSourceUrl = "",
                             htmlSourceDraft = HtmlSourceDraft(),
+                            editingSourceId = null,
+                            sourceUsername = "",
+                            sourcePassword = "",
+                            isLoadingSourceCredentials = false,
+                            sourceCredentialsLoadFailed = false,
                             selectedSourceId = result.value.id,
+                            filter = OnlineCatalogFilter(),
+                            results = emptyList(),
+                            metadataFacets = OnlineMetadataFacets(),
+                            selectedEntryKeys = emptySet(),
                         )
                     }
                     onSuccess()
@@ -1075,6 +1325,10 @@ class LibraryViewModel(
                     message = "已导入书源「${result.value.name}」",
                     error = null,
                     selectedSourceId = result.value.id,
+                    filter = OnlineCatalogFilter(),
+                    results = emptyList(),
+                    metadataFacets = OnlineMetadataFacets(),
+                    selectedEntryKeys = emptySet(),
                 )
             }
             is ReadflowResult.Failure -> _onlineLibraryState.update {
@@ -1098,6 +1352,7 @@ class LibraryViewModel(
             it.copy(
                 isSearching = false,
                 results = entries,
+                metadataFacets = buildOnlineMetadataFacets(entries),
                 message = if (entries.isEmpty()) "没有找到匹配的书籍" else null,
                 error = null,
             )

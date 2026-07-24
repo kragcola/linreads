@@ -222,7 +222,7 @@ class LibraryScreenVisualContractTest {
         )
         assertTrue(
             "the source editor must close only after the registry accepts the source",
-            source.contains("viewModel.addOnlineSource { showSourceEditor = false }"),
+            source.contains("viewModel.saveOnlineSource { showSourceEditor = false }"),
         )
         assertTrue(
             "online-library errors must expose a stable accessible semantic label",

@@ -25,7 +25,13 @@ import kotlinx.serialization.SerializationException
 
 sealed interface CalibreConnectionCheckResult {
     data class Success(val bookCount: Int) : CalibreConnectionCheckResult
-    data class Failure(val message: String, val nextStep: String) : CalibreConnectionCheckResult
+    data class Failure(
+        val message: String,
+        val nextStep: String,
+        val kind: Kind = Kind.OTHER,
+    ) : CalibreConnectionCheckResult {
+        enum class Kind { AUTHENTICATION_REQUIRED, OTHER }
+    }
 }
 
 fun interface CalibreConnectionTester {
@@ -94,7 +100,8 @@ private fun Throwable.toConnectionFailure(): CalibreConnectionCheckResult.Failur
     is ClientRequestException -> when (response.status) {
         HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden -> CalibreConnectionCheckResult.Failure(
             message = "Calibre 服务器需要认证",
-            nextStep = "当前版本暂未接入用户名密码，请先关闭 Content Server 认证或稍后配置凭据",
+            nextStep = "请在书源设置中填写 Calibre 用户名和密码",
+            kind = CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED,
         )
         HttpStatusCode.NotFound -> CalibreConnectionCheckResult.Failure(
             message = "没有找到 Calibre API",
@@ -135,7 +142,7 @@ internal fun Throwable.toCalibreReadflowError(): ReadflowError = when (this) {
     is ClientRequestException -> when (response.status) {
         HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden -> ReadflowError(
             kind = ReadflowError.Kind.AUTH,
-            message = "Calibre 服务器需要认证；当前版本尚未支持登录凭据",
+            message = "Calibre 认证失败，请在当前书源设置中填写或检查用户名和密码",
             code = response.status.value,
         )
         HttpStatusCode.NotFound -> ReadflowError.network(

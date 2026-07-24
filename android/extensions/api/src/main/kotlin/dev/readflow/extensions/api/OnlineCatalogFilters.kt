@@ -13,6 +13,7 @@ fun List<OnlineCatalogEntry>.applyCatalogFilter(filter: OnlineCatalogFilter): Li
 
 private fun matchesAuthor(entry: OnlineCatalogEntry, author: String): Boolean {
     if (author.isBlank()) return true
+    if (entry.authors.any { it.contains(author, ignoreCase = true) }) return true
     return entry.meta.author.contains(author, ignoreCase = true)
 }
 

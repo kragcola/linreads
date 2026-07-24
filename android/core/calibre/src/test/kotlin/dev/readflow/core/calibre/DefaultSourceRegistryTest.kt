@@ -20,6 +20,7 @@ import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceCapabilities
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.SourceKind
+import dev.readflow.extensions.api.SourceCredentials
 import java.io.File
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -143,6 +144,69 @@ class DefaultSourceRegistryTest {
     }
 
     @Test
+    fun calibreCredentialsFollowAddUpdateAndDeleteLifecycleWithoutEnteringConfigJson() = runTest {
+        val credentials = InMemorySourceCredentialStore()
+        val store = InMemorySourceConfigStore()
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            credentialStore = credentials,
+        )
+
+        val added = registry.addUserSource(
+            adapterId = SourceAdapterIds.CALIBRE,
+            name = "Protected Calibre",
+            configVersion = 1,
+            configJson = calibreSourceConfigJson("http://192.168.1.5:8080"),
+            credentials = SourceCredentials("reader", "initial-secret"),
+        ) as ReadflowResult.Success
+
+        assertEquals(SourceCredentials("reader", "initial-secret"), registry.sourceCredentials(added.value.id))
+        assertTrue(store.getUserSource(added.value.id)?.configJson?.contains("initial-secret") == false)
+
+        val updated = registry.updateUserSource(
+            sourceId = added.value.id,
+            name = "Updated Calibre",
+            configVersion = 1,
+            configJson = calibreSourceConfigJson("http://192.168.1.6:8080"),
+            credentials = SourceCredentials("reader-2", "updated-secret"),
+        )
+
+        assertTrue(updated is ReadflowResult.Success)
+        assertEquals(SourceCredentials("reader-2", "updated-secret"), registry.sourceCredentials(added.value.id))
+        assertEquals("Updated Calibre", store.getUserSource(added.value.id)?.name)
+        assertTrue(store.getUserSource(added.value.id)?.configJson?.contains("updated-secret") == false)
+
+        assertTrue(registry.removeUserSource(added.value.id) is ReadflowResult.Success)
+        assertEquals(null, registry.sourceCredentials(added.value.id))
+    }
+
+    @Test
+    fun editingBuiltinCalibreAlsoUpdatesLegacyUrlSoItIsNotReverted() = runTest {
+        val settings = FakeSettingsRepository(calibreUrl = "http://192.168.1.5:8080")
+        val store = InMemorySourceConfigStore()
+        val registry = DefaultSourceRegistry(
+            settings = settings,
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+        )
+        registry.observeSources().first()
+
+        val updated = registry.updateUserSource(
+            sourceId = BUILTIN_CALIBRE_SOURCE_ID,
+            name = "Calibre",
+            configVersion = 1,
+            configJson = calibreSourceConfigJson("http://192.168.1.6:8080"),
+        )
+        registry.openCatalog(BUILTIN_CALIBRE_SOURCE_ID)
+
+        assertTrue(updated is ReadflowResult.Success)
+        assertEquals("http://192.168.1.6:8080", settings.calibreBaseUrl.value)
+        assertEquals("http://192.168.1.6:8080", store.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)?.baseUrl)
+    }
+
+    @Test
     fun migratedCalibreCanBeRemovedWithoutBeingRecreated() = runTest {
         val settings = FakeSettingsRepository(calibreUrl = "http://192.168.1.5:8080")
         val store = InMemorySourceConfigStore(
@@ -175,16 +239,25 @@ class DefaultSourceRegistryTest {
         val store = InMemorySourceConfigStore(
             listOf(calibreSource(BUILTIN_CALIBRE_SOURCE_ID, "http://192.168.1.5:8080")),
         )
+        val credentials = InMemorySourceCredentialStore().apply {
+            put(
+                BUILTIN_CALIBRE_SOURCE_ID,
+                "http://192.168.1.5:8080",
+                SourceCredentials("reader", "secret"),
+            )
+        }
         val registry = DefaultSourceRegistry(
             settings = FakeSettingsRepository(calibreUrl = ""),
             sourceConfigStore = store,
             booksDir = tempFolder.root,
+            credentialStore = credentials,
         )
 
         val sources = registry.observeSources().first()
 
         assertTrue(sources.isEmpty())
         assertEquals(null, store.getUserSource(BUILTIN_CALIBRE_SOURCE_ID))
+        assertEquals(null, credentials.get(BUILTIN_CALIBRE_SOURCE_ID, "http://192.168.1.5:8080"))
     }
 
     @Test
@@ -632,6 +705,21 @@ class DefaultSourceRegistryTest {
         override suspend fun nextSortOrder(): Int {
             beforeNextSortOrder?.invoke()
             return (sources.value.maxOfOrNull { it.sortOrder } ?: -1) + 1
+        }
+    }
+
+    private class InMemorySourceCredentialStore : SourceCredentialStore {
+        private val values = mutableMapOf<String, Pair<String, SourceCredentials>>()
+
+        override fun get(sourceId: String, scope: String): SourceCredentials? =
+            values[sourceId]?.takeIf { it.first == scope }?.second
+
+        override fun put(sourceId: String, scope: String, credentials: SourceCredentials) {
+            if (credentials.isEmpty) values.remove(sourceId) else values[sourceId] = scope to credentials
+        }
+
+        override fun remove(sourceId: String) {
+            values.remove(sourceId)
         }
     }
 
