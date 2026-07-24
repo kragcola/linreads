@@ -70,6 +70,30 @@ class CalibreCoverAuthenticationTest {
         )
     }
 
+    @Test
+    fun expandedTailscaleIpv6CoverKeepsCredentialsAfterOkHttpCanonicalization() {
+        val configuredBaseUrl = "http://[fd7a:115c:a1e0:0:0:0:0:1234]:8080"
+        val store = RecordingCredentialStore(
+            expectedScope = calibreCredentialScopeForRequestUrl(configuredBaseUrl),
+            credentials = SourceCredentials("reader", "secret"),
+        )
+        val markedUrl = authenticatedCalibreCoverUrl(
+            "$configuredBaseUrl/get/cover/42/calibre-library",
+            "source-calibre",
+        )
+
+        val authenticated = authenticatedCalibreCoverRequest(
+            Request.Builder().url(markedUrl).build(),
+            store,
+        )
+
+        assertEquals(Credentials.basic("reader", "secret"), authenticated.header("Authorization"))
+        assertEquals(
+            calibreCredentialScopeForRequestUrl("http://[fd7a:115c:a1e0::1234]:8080"),
+            store.requestedScope,
+        )
+    }
+
     private class RecordingCredentialStore(
         private val expectedScope: String,
         private val credentials: SourceCredentials,

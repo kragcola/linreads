@@ -10,6 +10,8 @@ import io.ktor.client.engine.mock.respond
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.headersOf
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -63,19 +65,51 @@ class CalibreOnlineCatalogIdentityTest {
         second.close()
     }
 
-    private fun catalog(sourceId: String, booksDir: java.io.File? = null): CalibreOnlineCatalog {
-        val baseUrl = "http://192.168.1.5:8080"
+    @Test
+    fun metadataRequestsAreBoundedAndResultsKeepCalibreSearchOrder() = runTest {
+        val activeRequests = AtomicInteger(0)
+        val peakRequests = AtomicInteger(0)
+        val ids = (1..12).toList()
         val engine = MockEngine { request ->
-            val body = if (request.url.encodedPath == "/ajax/search") {
-                """{"total_num":1,"book_ids":[42]}"""
+            if (request.url.encodedPath == "/ajax/search") {
+                respond(
+                    content = """{"total_num":12,"book_ids":${ids.joinToString(prefix = "[", postfix = "]")}}""",
+                    headers = JSON_HEADERS,
+                )
             } else {
-                """{"id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}"""
+                val id = request.url.encodedPath.substringAfter("/ajax/book/").substringBefore('/').toInt()
+                val active = activeRequests.incrementAndGet()
+                peakRequests.accumulateAndGet(active, ::maxOf)
+                try {
+                    delay((13 - id) * 5L)
+                    respond(
+                        content = """{"id":$id,"title":"Book $id","authors":["Author"],"formats":["EPUB"]}""",
+                        headers = JSON_HEADERS,
+                    )
+                } finally {
+                    activeRequests.decrementAndGet()
+                }
             }
-            respond(
-                content = body,
-                headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
-            )
         }
+        val catalog = catalog("source-a", engine = engine)
+
+        val entries = catalog.search("").successValue()
+
+        assertTrue("metadata requests should overlap", peakRequests.get() > 1)
+        assertTrue(
+            "metadata concurrency must stay bounded",
+            peakRequests.get() <= CalibreOnlineCatalog.METADATA_REQUEST_CONCURRENCY,
+        )
+        assertEquals(ids.map { "Book $it" }, entries.map { it.meta.title })
+        catalog.close()
+    }
+
+    private fun catalog(
+        sourceId: String,
+        booksDir: java.io.File? = null,
+        engine: MockEngine = defaultEngine(),
+    ): CalibreOnlineCatalog {
+        val baseUrl = "http://192.168.1.5:8080"
         val client = CalibreClient(
             baseUrl = baseUrl,
             username = "",
@@ -98,8 +132,24 @@ class CalibreOnlineCatalogIdentityTest {
         )
     }
 
+    private fun defaultEngine() = MockEngine { request ->
+        val body = if (request.url.encodedPath == "/ajax/search") {
+            """{"total_num":1,"book_ids":[42]}"""
+        } else {
+            """{"id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}"""
+        }
+        respond(
+            content = body,
+            headers = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString()),
+        )
+    }
+
     private fun <T> ReadflowResult<T>.successValue(): T {
         assertTrue(this is ReadflowResult.Success)
         return (this as ReadflowResult.Success).value
+    }
+
+    private companion object {
+        val JSON_HEADERS = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
     }
 }

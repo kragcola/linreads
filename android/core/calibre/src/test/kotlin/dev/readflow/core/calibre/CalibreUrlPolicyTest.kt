@@ -26,17 +26,69 @@ class CalibreUrlPolicyTest {
     }
 
     @Test
+    fun acceptsTailscaleIpv4HttpAcrossConfigurationRequestRedirectAndCoverPolicies() {
+        listOf(
+            "http://100.64.0.0:8080",
+            "http://100.67.26.101:8080",
+            "http://100.127.255.255:8080",
+        ).forEach { url ->
+            assertValid(url)
+            requireAllowedCalibreRequestUrl("$url/ajax/search")
+        }
+
+        requireSameCalibreOrigin(
+            "http://100.67.26.101:8080/get/EPUB/1/library",
+            "http://100.67.26.101:8080",
+        )
+        assertEquals(
+            "http://100.67.26.101:8080/get/cover/1/library?$CALIBRE_COVER_SOURCE_QUERY_PARAMETER=source-1",
+            authenticatedCalibreCoverUrl(
+                "http://100.67.26.101:8080/get/cover/1/library",
+                "source-1",
+            ),
+        )
+    }
+
+    @Test
+    fun acceptsTailscaleIpv6HttpAcrossConfigurationRequestRedirectAndCoverPolicies() {
+        val baseUrl = "http://[fd7a:115c:a1e0::1234]:8080"
+        assertValid(baseUrl)
+        requireAllowedCalibreRequestUrl("$baseUrl/ajax/search")
+        requireSameCalibreOrigin("$baseUrl/get/EPUB/1/library", baseUrl)
+        assertEquals(
+            "$baseUrl/get/cover/1/library?$CALIBRE_COVER_SOURCE_QUERY_PARAMETER=source-1",
+            authenticatedCalibreCoverUrl("$baseUrl/get/cover/1/library", "source-1"),
+        )
+    }
+
+    @Test
+    fun equivalentTailscaleIpv6SpellingsShareOriginAndCredentialScope() {
+        val expandedBaseUrl = "http://[fd7a:115c:a1e0:0:0:0:0:1234]:8080"
+        val compressedRequestUrl = "http://[fd7a:115c:a1e0::1234]:8080/get/EPUB/1/library"
+
+        requireSameCalibreOrigin(compressedRequestUrl, expandedBaseUrl)
+        assertEquals(
+            calibreCredentialScopeForRequestUrl(expandedBaseUrl),
+            calibreCredentialScopeForRequestUrl(compressedRequestUrl),
+        )
+    }
+
+    @Test
     fun rejectsPublicOrNonPrivateHttpHosts() {
         listOf(
             "http://8.8.8.8:8080",
             "http://172.15.0.1:8080",
             "http://172.32.0.1:8080",
+            "http://100.63.255.255:8080",
+            "http://100.128.0.0:8080",
+            "http://[fd7a:115c:a1df:ffff::1]:8080",
+            "http://[fd7a:115c:a1e1::1]:8080",
             "http://example.com:8080",
         ).forEach { url ->
             val validation = validateCalibreBaseUrl(url)
             assertEquals(false, validation.isValid)
             assertEquals(
-                "HTTP 只允许局域网私有地址：10.x、172.16-31.x、192.168.x，公网地址请使用 HTTPS",
+                "HTTP 仅允许本机、局域网或 Tailscale 地址；其他地址请使用 HTTPS",
                 validation.errorMessage,
             )
         }

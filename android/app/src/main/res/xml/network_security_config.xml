@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Cleartext HTTP is needed for user-configured LAN Calibre servers on Android 9+.
+  Cleartext HTTP is needed for user-configured LAN and Tailscale Calibre servers on Android 9+.
   Network Security Config cannot express RFC1918 CIDR ranges or runtime user hosts,
   so Calibre HTTP is constrained in code by CalibreUrlPolicy:
-  only localhost and RFC1918 IPv4 hosts (10/8, 172.16/12, 192.168/16) are accepted.
+  only localhost, RFC1918 IPv4, and Tailscale IPv4/IPv6 ranges are accepted.
   Do NOT hardcode a real baseUrl (C2).
 -->
 <network-security-config>

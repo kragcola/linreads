@@ -60,7 +60,7 @@ class SettingsViewModelTest {
         advanceUntilIdle()
 
         assertEquals(
-            "HTTP 只允许局域网私有地址：10.x、172.16-31.x、192.168.x，公网地址请使用 HTTPS",
+            "HTTP 仅允许本机、局域网或 Tailscale 地址；其他地址请使用 HTTPS",
             viewModel.calibreUrlError.value,
         )
         assertNull(settings.savedCalibreUrl)

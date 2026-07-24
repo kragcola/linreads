@@ -37,8 +37,7 @@ import dev.readflow.extensions.api.stableRemoteBookId
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -76,6 +75,7 @@ data class OnlineLibraryUiState(
     val filter: OnlineCatalogFilter = OnlineCatalogFilter(),
     val isSearching: Boolean = false,
     val isSelectingBatch: Boolean = false,
+    val isDownloadingBatch: Boolean = false,
     val isAddingSource: Boolean = false,
     val results: List<OnlineCatalogEntry> = emptyList(),
     val selectedEntryKeys: Set<String> = emptySet(),
@@ -223,6 +223,16 @@ class LibraryViewModel(
     private val sourceRegistry: SourceRegistry? = null,
 ) : ViewModel() {
 
+    private data class OnlineDownloadKey(
+        val sourceId: String,
+        val selectionKey: String,
+    )
+
+    private data class OnlineDownloadReservation(
+        val key: OnlineDownloadKey,
+        val ownerId: Long,
+    )
+
     private val _uiState = MutableStateFlow(LibraryUiState(isLoading = true))
     val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
 
@@ -242,16 +252,22 @@ class LibraryViewModel(
     private var onlineSearchJob: Job? = null
     private var onlinePreviewJob: Job? = null
     private var onlineBatchSelectionJob: Job? = null
+    private var onlineBatchDownloadJob: Job? = null
+    private val onlineSingleDownloadJobs = mutableMapOf<Long, Job>()
+    private val activeOnlineDownloads = mutableMapOf<OnlineDownloadKey, OnlineDownloadReservation>()
+    private var nextOnlineDownloadOwnerId = 0L
     /** Generation token so stale search success/failure cannot mutate a newer source/query. */
     private var onlineSearchGeneration: Long = 0L
     private var onlinePreviewGeneration: Long = 0L
     private var onlineBatchSelectionGeneration: Long = 0L
+    private var onlineBatchDownloadGeneration: Long = 0L
     private var allShelfItems: List<LibraryItem> = emptyList()
     private var libraryFilter: LibraryFilter = LibraryFilter.ALL
     private var clearDeleteFailureOnNextShelfEmission = false
+    private val onlineDownloadSemaphore = Semaphore(ONLINE_BATCH_DOWNLOAD_CONCURRENCY)
 
     companion object {
-        /** Peak concurrent online-library batch downloads. */
+        /** Peak concurrent online-library downloads across single and batch requests. */
         const val ONLINE_BATCH_DOWNLOAD_CONCURRENCY = 3
         internal const val ONLINE_BATCH_PAGE_SIZE = 100
         internal const val ONLINE_BATCH_MAX_PAGES = 10
@@ -289,6 +305,10 @@ class LibraryViewModel(
                         onlineBatchSelectionJob?.cancel()
                         onlineBatchSelectionJob = null
                         onlineBatchSelectionGeneration += 1L
+                        onlineBatchDownloadJob?.cancel()
+                        onlineBatchDownloadJob = null
+                        onlineBatchDownloadGeneration += 1L
+                        cancelSingleDownloadsForSource(currentSelection)
                     }
                     _onlineLibraryState.update { state ->
                         state.copy(
@@ -297,10 +317,15 @@ class LibraryViewModel(
                             filter = if (sourceChanged) OnlineCatalogFilter() else state.filter,
                             isSearching = if (sourceChanged) false else state.isSearching,
                             isSelectingBatch = if (sourceChanged) false else state.isSelectingBatch,
+                            isDownloadingBatch = if (sourceChanged) false else state.isDownloadingBatch,
                             results = if (sourceChanged) emptyList() else state.results,
                             metadataFacets = if (sourceChanged) OnlineMetadataFacets() else state.metadataFacets,
                             selectedEntryKeys = if (sourceChanged) emptySet() else state.selectedEntryKeys,
-                            downloadingKeys = if (sourceChanged) emptySet() else state.downloadingKeys,
+                            downloadingKeys = if (sourceChanged) {
+                                activeDownloadKeysForSource(resolvedSelection)
+                            } else {
+                                state.downloadingKeys
+                            },
                             preview = if (sourceChanged) null else state.preview,
                             error = if (sourceChanged) null else state.error,
                             message = if (sourceChanged) null else state.message,
@@ -544,16 +569,21 @@ class LibraryViewModel(
         onlineBatchSelectionJob?.cancel()
         onlineBatchSelectionJob = null
         onlineBatchSelectionGeneration += 1L
+        onlineBatchDownloadJob?.cancel()
+        onlineBatchDownloadJob = null
+        onlineBatchDownloadGeneration += 1L
+        cancelSingleDownloadsForSource(_onlineLibraryState.value.selectedSourceId)
         _onlineLibraryState.update {
             it.copy(
                 selectedSourceId = sourceId,
                 filter = OnlineCatalogFilter(),
                 isSearching = false,
                 isSelectingBatch = false,
+                isDownloadingBatch = false,
                 results = emptyList(),
                 metadataFacets = OnlineMetadataFacets(),
                 selectedEntryKeys = emptySet(),
-                downloadingKeys = emptySet(),
+                downloadingKeys = activeDownloadKeysForSource(sourceId),
                 preview = null,
                 error = null,
                 message = null,
@@ -562,7 +592,20 @@ class LibraryViewModel(
     }
 
     fun updateOnlineQuery(query: String) {
-        _onlineLibraryState.update { it.copy(query = query, error = null, message = null) }
+        val current = _onlineLibraryState.value
+        if (query != current.query && current.isSearching) {
+            onlineSearchJob?.cancel()
+            onlineSearchJob = null
+            onlineSearchGeneration += 1L
+        }
+        _onlineLibraryState.update {
+            it.copy(
+                query = query,
+                isSearching = if (query != current.query) false else it.isSearching,
+                error = null,
+                message = null,
+            )
+        }
     }
 
     fun updateOnlineFilter(filter: OnlineCatalogFilter) {
@@ -779,10 +822,19 @@ class LibraryViewModel(
             _onlineLibraryState.value.selectedSourceId == sourceId
 
     fun downloadSelectedOnlineBooks() {
-        val selected = _onlineLibraryState.value.selectedEntryKeys
-        val entries = _onlineLibraryState.value.results.filter { it.selectionKey() in selected }
+        val state = _onlineLibraryState.value
+        if (state.isDownloadingBatch) return
+        val selected = state.selectedEntryKeys
+        val entries = state.results.filter {
+            it.selectionKey() in selected && it.selectionKey() !in state.downloadingKeys
+        }
         if (entries.isEmpty()) {
-            _onlineLibraryState.update { it.copy(error = "请先选择要下载的书籍", message = null) }
+            _onlineLibraryState.update {
+                it.copy(
+                    error = if (selected.isEmpty()) "请先选择要下载的书籍" else "所选书籍已在下载中",
+                    message = null,
+                )
+            }
             return
         }
         val registry = sourceRegistry
@@ -790,48 +842,129 @@ class LibraryViewModel(
             _onlineLibraryState.update { it.copy(error = "书源服务未配置") }
             return
         }
-        val sourceId = _onlineLibraryState.value.selectedSourceId ?: return
-        // Cap peak concurrency; each selected entry downloads exactly once.
-        viewModelScope.launch {
-            val successCount = AtomicInteger(0)
-            val failureCount = AtomicInteger(0)
-            val lastError = AtomicReference<String?>(null)
-            val semaphore = Semaphore(ONLINE_BATCH_DOWNLOAD_CONCURRENCY)
-            coroutineScope {
-                entries.map { entry ->
-                    async {
-                        semaphore.withPermit {
-                            when (val outcome = downloadOnlineEntryInternal(entry, sourceId, registry, clearMessages = false)) {
-                                is OnlineDownloadOutcome.Success -> successCount.incrementAndGet()
-                                is OnlineDownloadOutcome.Failure -> {
-                                    failureCount.incrementAndGet()
-                                    lastError.set(outcome.message)
+        val sourceId = state.selectedSourceId ?: return
+        val requests = entries.mapNotNull { entry ->
+            reserveOnlineDownload(sourceId, entry)?.let { reservation -> entry to reservation }
+        }
+        if (requests.isEmpty()) {
+            _onlineLibraryState.update {
+                it.copy(error = "所选书籍已在下载中", message = null)
+            }
+            return
+        }
+        val reservedKeys = requests.mapTo(linkedSetOf()) { it.second.key.selectionKey }
+        val generation = ++onlineBatchDownloadGeneration
+        _onlineLibraryState.update {
+            it.copy(
+                isDownloadingBatch = true,
+                downloadingKeys = it.downloadingKeys + reservedKeys,
+                error = null,
+                message = null,
+            )
+        }
+        onlineBatchDownloadJob = viewModelScope.launch {
+            try {
+                val successCount = AtomicInteger(0)
+                val failureCount = AtomicInteger(0)
+                val lastError = AtomicReference<String?>(null)
+                val nextEntryIndex = AtomicInteger(0)
+                coroutineScope {
+                    repeat(minOf(ONLINE_BATCH_DOWNLOAD_CONCURRENCY, requests.size)) {
+                        launch {
+                            while (true) {
+                                val index = nextEntryIndex.getAndIncrement()
+                                if (index >= requests.size) break
+                                val (entry, reservation) = requests[index]
+                                when (
+                                    val outcome = downloadOnlineEntryInternal(
+                                        entry,
+                                        reservation,
+                                        registry,
+                                        clearMessages = false,
+                                    )
+                                ) {
+                                    is OnlineDownloadOutcome.Success -> successCount.incrementAndGet()
+                                    is OnlineDownloadOutcome.Failure -> {
+                                        failureCount.incrementAndGet()
+                                        lastError.set(outcome.message)
+                                    }
+                                    OnlineDownloadOutcome.Skipped -> Unit
                                 }
-                                OnlineDownloadOutcome.Skipped -> Unit
                             }
                         }
                     }
-                }.awaitAll()
-            }
-            val ok = successCount.get()
-            val fail = failureCount.get()
-            val summary = when {
-                fail == 0 && ok > 0 -> "已下载 $ok 本"
-                ok == 0 && fail > 0 -> "批量下载失败：$fail 本${lastError.get()?.let { "（$it）" } ?: ""}"
-                ok > 0 && fail > 0 -> "已下载 $ok 本，$fail 本失败${lastError.get()?.let { "（$it）" } ?: ""}"
-                else -> null
-            }
-            if (summary != null) {
-                _onlineLibraryState.update {
-                    if (it.selectedSourceId != sourceId) it else {
-                        it.copy(
-                            message = if (fail == 0) summary else null,
-                            error = if (fail > 0) summary else null,
-                        )
+                }
+                val ok = successCount.get()
+                val fail = failureCount.get()
+                val summary = when {
+                    fail == 0 && ok > 0 -> "已下载 $ok 本"
+                    ok == 0 && fail > 0 -> "批量下载失败：$fail 本${lastError.get()?.let { "（$it）" } ?: ""}"
+                    ok > 0 && fail > 0 -> "已下载 $ok 本，$fail 本失败${lastError.get()?.let { "（$it）" } ?: ""}"
+                    else -> null
+                }
+                if (summary != null) {
+                    _onlineLibraryState.update {
+                        if (!isCurrentBatchDownload(sourceId, generation)) it else {
+                            it.copy(
+                                message = if (fail == 0) summary else null,
+                                error = if (fail > 0) summary else null,
+                            )
+                        }
                     }
+                }
+            } finally {
+                requests.forEach { (_, reservation) -> releaseOnlineDownload(reservation) }
+                if (isCurrentBatchDownload(sourceId, generation)) {
+                    _onlineLibraryState.update {
+                        it.copy(isDownloadingBatch = false)
+                    }
+                    onlineBatchDownloadJob = null
                 }
             }
         }
+    }
+
+    private fun isCurrentBatchDownload(sourceId: String, generation: Long): Boolean =
+        generation == onlineBatchDownloadGeneration &&
+            _onlineLibraryState.value.selectedSourceId == sourceId
+
+    private fun reserveOnlineDownload(
+        sourceId: String,
+        entry: OnlineCatalogEntry,
+    ): OnlineDownloadReservation? {
+        val key = OnlineDownloadKey(sourceId, entry.selectionKey())
+        if (key in activeOnlineDownloads) return null
+        val reservation = OnlineDownloadReservation(key, ++nextOnlineDownloadOwnerId)
+        activeOnlineDownloads[key] = reservation
+        return reservation
+    }
+
+    private fun releaseOnlineDownload(reservation: OnlineDownloadReservation) {
+        if (activeOnlineDownloads[reservation.key]?.ownerId != reservation.ownerId) return
+        activeOnlineDownloads.remove(reservation.key)
+        _onlineLibraryState.update { state ->
+            if (state.selectedSourceId != reservation.key.sourceId) state else {
+                state.copy(downloadingKeys = state.downloadingKeys - reservation.key.selectionKey)
+            }
+        }
+    }
+
+    private fun activeDownloadKeysForSource(sourceId: String?): Set<String> {
+        if (sourceId == null) return emptySet()
+        return activeOnlineDownloads.keys
+            .asSequence()
+            .filter { it.sourceId == sourceId }
+            .mapTo(linkedSetOf(), OnlineDownloadKey::selectionKey)
+    }
+
+    private fun cancelSingleDownloadsForSource(sourceId: String?) {
+        if (sourceId == null) return
+        activeOnlineDownloads.values
+            .asSequence()
+            .filter { it.key.sourceId == sourceId }
+            .map(OnlineDownloadReservation::ownerId)
+            .toList()
+            .forEach { ownerId -> onlineSingleDownloadJobs[ownerId]?.cancel() }
     }
 
     fun downloadOnlineEntry(entry: OnlineCatalogEntry) {
@@ -841,72 +974,84 @@ class LibraryViewModel(
             return
         }
         val sourceId = _onlineLibraryState.value.selectedSourceId ?: return
-        viewModelScope.launch {
-            downloadOnlineEntryInternal(entry, sourceId, registry, clearMessages = true)
+        val state = _onlineLibraryState.value
+        if (state.isDownloadingBatch) return
+        val reservation = reserveOnlineDownload(sourceId, entry) ?: return
+        val key = reservation.key.selectionKey
+        _onlineLibraryState.update {
+            it.copy(
+                downloadingKeys = it.downloadingKeys + key,
+                error = null,
+                message = null,
+            )
         }
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            downloadOnlineEntryInternal(entry, reservation, registry, clearMessages = true)
+        }
+        onlineSingleDownloadJobs[reservation.ownerId] = job
+        job.invokeOnCompletion {
+            onlineSingleDownloadJobs.remove(reservation.ownerId)
+            releaseOnlineDownload(reservation)
+        }
+        job.start()
     }
 
     private suspend fun downloadOnlineEntryInternal(
         entry: OnlineCatalogEntry,
-        sourceId: String,
+        reservation: OnlineDownloadReservation,
         registry: SourceRegistry,
         clearMessages: Boolean,
     ): OnlineDownloadOutcome {
-        val key = entry.selectionKey()
-        return assetOperations.produce(bookId = shelfBookIdFor(entry, sourceId)) {
-            _onlineLibraryState.update {
-                if (it.selectedSourceId != sourceId) it else {
-                    it.copy(
-                        downloadingKeys = it.downloadingKeys + key,
-                        error = if (clearMessages) null else it.error,
-                        message = if (clearMessages) null else it.message,
-                    )
-                }
-            }
-            try {
-                when (val opened = registry.openCatalog(sourceId)) {
-                    is ReadflowResult.Failure -> {
-                        publishDownloadFailure(sourceId, entry, opened.error.message, publishUiMessage = clearMessages)
-                        OnlineDownloadOutcome.Failure(opened.error.message)
-                    }
-                    is ReadflowResult.Success -> {
-                        val catalog = opened.value
-                        try {
-                            when (val result = catalog.download(entry)) {
-                                is ReadflowResult.Success -> {
-                                    repository.upsertBook(result.value)
-                                    publishDownloadSuccess(
-                                        sourceId,
-                                        entry,
-                                        result.value,
-                                        publishUiMessage = clearMessages,
-                                    )
-                                    OnlineDownloadOutcome.Success
+        val sourceId = reservation.key.sourceId
+        return try {
+            onlineDownloadSemaphore.withPermit {
+                assetOperations.produce(bookId = shelfBookIdFor(entry, sourceId)) {
+                    when (val opened = registry.openCatalog(sourceId)) {
+                        is ReadflowResult.Failure -> {
+                            publishDownloadFailure(
+                                reservation,
+                                opened.error.message,
+                                publishUiMessage = clearMessages,
+                            )
+                            OnlineDownloadOutcome.Failure(opened.error.message)
+                        }
+                        is ReadflowResult.Success -> {
+                            val catalog = opened.value
+                            try {
+                                when (val result = catalog.download(entry)) {
+                                    is ReadflowResult.Success -> {
+                                        repository.upsertBook(result.value)
+                                        publishDownloadSuccess(
+                                            reservation,
+                                            result.value,
+                                            publishUiMessage = clearMessages,
+                                        )
+                                        OnlineDownloadOutcome.Success
+                                    }
+                                    is ReadflowResult.Failure -> {
+                                        publishDownloadFailure(
+                                            reservation,
+                                            result.error.message,
+                                            publishUiMessage = clearMessages,
+                                        )
+                                        OnlineDownloadOutcome.Failure(result.error.message)
+                                    }
                                 }
-                                is ReadflowResult.Failure -> {
-                                    publishDownloadFailure(
-                                        sourceId,
-                                        entry,
-                                        result.error.message,
-                                        publishUiMessage = clearMessages,
-                                    )
-                                    OnlineDownloadOutcome.Failure(result.error.message)
-                                }
+                            } finally {
+                                catalog.close()
                             }
-                        } finally {
-                            catalog.close()
                         }
                     }
                 }
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Throwable) {
-                val message = error.message ?: "下载失败"
-                publishDownloadFailure(sourceId, entry, message, publishUiMessage = clearMessages)
-                OnlineDownloadOutcome.Failure(message)
-            } finally {
-                clearDownloadProgress(sourceId, entry)
             }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Throwable) {
+            val message = error.message ?: "下载失败"
+            publishDownloadFailure(reservation, message, publishUiMessage = clearMessages)
+            OnlineDownloadOutcome.Failure(message)
+        } finally {
+            releaseOnlineDownload(reservation)
         }
     }
 
@@ -1037,16 +1182,39 @@ class LibraryViewModel(
             )
         }
         if (source.adapterId != SourceAdapterIds.CALIBRE || registry == null) return
+        loadSourceCredentials(source.id, announceSuccess = false)
+    }
+
+    fun retrySourceCredentials() {
+        val sourceId = _onlineLibraryState.value.editingSourceId ?: return
+        if (sourceRegistry == null) return
+        _onlineLibraryState.update { state ->
+            if (state.editingSourceId != sourceId) state else {
+                state.copy(
+                    isLoadingSourceCredentials = true,
+                    sourceCredentialsLoadFailed = false,
+                    error = null,
+                    message = null,
+                )
+            }
+        }
+        loadSourceCredentials(sourceId, announceSuccess = true)
+    }
+
+    private fun loadSourceCredentials(sourceId: String, announceSuccess: Boolean) {
+        val registry = sourceRegistry ?: return
         viewModelScope.launch {
             try {
-                val credentials = registry.sourceCredentials(source.id)
+                val credentials = registry.sourceCredentials(sourceId)
                 _onlineLibraryState.update { state ->
-                    if (state.editingSourceId != source.id) state else {
+                    if (state.editingSourceId != sourceId) state else {
                         state.copy(
                             sourceUsername = credentials?.username.orEmpty(),
                             sourcePassword = credentials?.password.orEmpty(),
                             isLoadingSourceCredentials = false,
                             sourceCredentialsLoadFailed = false,
+                            error = null,
+                            message = if (announceSuccess) "已重新读取登录凭据" else state.message,
                         )
                     }
                 }
@@ -1054,11 +1222,12 @@ class LibraryViewModel(
                 throw error
             } catch (_: Throwable) {
                 _onlineLibraryState.update { state ->
-                    if (state.editingSourceId != source.id) state else {
+                    if (state.editingSourceId != sourceId) state else {
                         state.copy(
                             isLoadingSourceCredentials = false,
                             sourceCredentialsLoadFailed = true,
                             error = "无法读取已保存的 Calibre 凭据，请重试或重置登录凭据",
+                            message = null,
                         )
                     }
                 }
@@ -1375,15 +1544,20 @@ class LibraryViewModel(
     }
 
     private fun publishDownloadSuccess(
-        sourceId: String,
-        entry: OnlineCatalogEntry,
+        reservation: OnlineDownloadReservation,
         downloaded: BookMeta,
         publishUiMessage: Boolean = true,
     ) {
-        val key = entry.selectionKey()
+        val sourceId = reservation.key.sourceId
+        val key = reservation.key.selectionKey
         val message = "已下载《${downloaded.title}》"
         _onlineLibraryState.update {
-            if (it.selectedSourceId != sourceId) it else {
+            if (
+                it.selectedSourceId != sourceId ||
+                activeOnlineDownloads[reservation.key]?.ownerId != reservation.ownerId
+            ) {
+                it
+            } else {
                 it.copy(
                     downloadingKeys = it.downloadingKeys - key,
                     message = if (publishUiMessage) message else it.message,
@@ -1395,28 +1569,24 @@ class LibraryViewModel(
     }
 
     private fun publishDownloadFailure(
-        sourceId: String,
-        entry: OnlineCatalogEntry,
+        reservation: OnlineDownloadReservation,
         message: String,
         publishUiMessage: Boolean = true,
     ) {
-        val key = entry.selectionKey()
+        val sourceId = reservation.key.sourceId
+        val key = reservation.key.selectionKey
         _onlineLibraryState.update {
-            if (it.selectedSourceId != sourceId) it else {
+            if (
+                it.selectedSourceId != sourceId ||
+                activeOnlineDownloads[reservation.key]?.ownerId != reservation.ownerId
+            ) {
+                it
+            } else {
                 it.copy(
                     downloadingKeys = it.downloadingKeys - key,
                     error = if (publishUiMessage) message else it.error,
                     message = if (publishUiMessage) null else it.message,
                 )
-            }
-        }
-    }
-
-    private fun clearDownloadProgress(sourceId: String, entry: OnlineCatalogEntry) {
-        val key = entry.selectionKey()
-        _onlineLibraryState.update {
-            if (it.selectedSourceId != sourceId) it else {
-                it.copy(downloadingKeys = it.downloadingKeys - key)
             }
         }
     }

@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -86,6 +87,9 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -416,6 +420,7 @@ fun LibraryScreen(
                 state = onlineLibraryState,
                 onFormChange = viewModel::updateAddSourceForm,
                 onCredentialsChange = viewModel::updateSourceCredentials,
+                onRetryCredentials = viewModel::retrySourceCredentials,
                 onResetCredentials = viewModel::resetSourceCredentials,
                 onHtmlDraftChange = viewModel::updateHtmlSourceDraft,
                 onSave = {
@@ -647,6 +652,10 @@ private fun OnlineLibrarySheet(
                     onValueChange = onQueryChange,
                     label = { Text("搜索书名或作者") },
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = {
+                        if (!state.isSearching) onSearch()
+                    }),
                     modifier = Modifier.fillMaxWidth(),
                     trailingIcon = {
                         IconButton(
@@ -675,6 +684,7 @@ private fun OnlineLibrarySheet(
                                 } else {
                                     "筛选条件"
                                 }
+                                stateDescription = if (filtersExpanded) "已展开" else "已收起"
                             },
                     ) {
                         Text(
@@ -783,14 +793,20 @@ private fun OnlineLibrarySheet(
             val statusError = state.error
             val statusMessage = state.message
             when {
-                state.isSearching || state.isSelectingBatch -> Row(
+                state.isSearching || state.isSelectingBatch || state.isDownloadingBatch -> Row(
+                    modifier = Modifier.semantics {
+                        liveRegion = LiveRegionMode.Polite
+                    },
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                     Text(
-                        if (state.isSelectingBatch) "正在汇总匹配书籍"
-                        else "正在搜索${selected?.name?.let { "「$it」" }.orEmpty()}",
+                        when {
+                            state.isDownloadingBatch -> "正在批量下载"
+                            state.isSelectingBatch -> "正在汇总匹配书籍"
+                            else -> "正在搜索${selected?.name?.let { "「$it」" }.orEmpty()}"
+                        },
                     )
                 }
                 statusError != null -> Text(
@@ -805,6 +821,7 @@ private fun OnlineLibrarySheet(
                 statusMessage != null -> Text(
                     text = statusMessage,
                     style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                 )
             }
 
@@ -842,7 +859,13 @@ private fun OnlineLibrarySheet(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text("已选 ${state.selectedEntryKeys.size} 本")
-                    Button(onClick = onDownloadSelected) { Text("下载所选") }
+                    Button(
+                        onClick = onDownloadSelected,
+                        enabled = !state.isDownloadingBatch,
+                        modifier = Modifier.widthIn(min = 96.dp).heightIn(min = 48.dp),
+                    ) {
+                        Text(if (state.isDownloadingBatch) "下载中" else "下载所选")
+                    }
                 }
             }
 
@@ -859,6 +882,7 @@ private fun OnlineLibrarySheet(
                             selected = entry.selectionKey() in state.selectedEntryKeys,
                             isDownloading = entry.selectionKey() in state.downloadingKeys,
                             canDownload = selected?.capabilities?.canDownload == true,
+                            downloadEnabled = !state.isDownloadingBatch,
                             canPreview = selected?.capabilities?.canPreviewText == true,
                             canBatchAcrossSource = selected?.capabilities?.canBatchAcrossSource == true,
                             onToggleSelect = { onToggleSelect(entry) },
@@ -1028,6 +1052,7 @@ private fun SourceEditorWindow(
     state: OnlineLibraryUiState,
     onFormChange: (name: String?, url: String?, adapterId: String?) -> Unit,
     onCredentialsChange: (username: String, password: String) -> Unit,
+    onRetryCredentials: () -> Unit,
     onResetCredentials: () -> Unit,
     onHtmlDraftChange: (HtmlSourceDraft) -> Unit,
     onSave: () -> Unit,
@@ -1144,6 +1169,11 @@ private fun SourceEditorWindow(
                             dev.readflow.extensions.api.SourceAdapterIds.HTML_RULES_V1
                         ) {
                             "只需填写地址；常用解析规则已有通用默认值，网站结构不同再到高级设置调整。"
+                        } else if (
+                            state.addSourceAdapterId ==
+                            dev.readflow.extensions.api.SourceAdapterIds.CALIBRE
+                        ) {
+                            "填写服务器地址即可；启用登录保护时再填写用户名和密码，显示名称可留空。"
                         } else {
                             "只需填写地址；名称会自动生成，已有自定义配置仍可通过 JSON 导入。"
                         },
@@ -1173,7 +1203,7 @@ private fun SourceEditorWindow(
                                 Text(
                                     when (state.addSourceAdapterId) {
                                         dev.readflow.extensions.api.SourceAdapterIds.CALIBRE ->
-                                            "局域网通常使用 http://电脑IP:8080"
+                                            "同一 Wi-Fi：http://192.168.x.x:8080；Tailscale：http://100.x.x.x:8080（无需 Serve）"
                                         dev.readflow.extensions.api.SourceAdapterIds.OPDS ->
                                             "填写服务提供的 OPDS / Atom 目录地址"
                                         else -> "填写兼容 LinReads 目录协议的 JSON 地址"
@@ -1215,16 +1245,36 @@ private fun SourceEditorWindow(
                             modifier = Modifier.fillMaxWidth(),
                         )
                         Text(
-                            text = "HTTP Basic Auth 不会加密网络传输，请仅在可信的局域网中使用。",
+                            text = "同一 Wi-Fi 的 HTTP 本身不加密；Tailscale 链路会加密。其他网络请使用 HTTPS。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         if (state.sourceCredentialsLoadFailed) {
-                            OutlinedButton(
-                                onClick = onResetCredentials,
-                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                             ) {
-                                Text("重置登录凭据")
+                                OutlinedButton(
+                                    onClick = onRetryCredentials,
+                                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                ) {
+                                    Text("重试读取")
+                                }
+                                OutlinedButton(
+                                    onClick = onResetCredentials,
+                                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                ) {
+                                    Text("重置凭据")
+                                }
+                            }
+                        } else if (state.isLoadingSourceCredentials) {
+                            Row(
+                                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                                Text("正在读取登录凭据")
                             }
                         }
                     }
@@ -1269,6 +1319,14 @@ private fun SourceEditorWindow(
                             text = message,
                             color = MaterialTheme.colorScheme.error,
                             style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                        )
+                    }
+                    state.message?.let { message ->
+                        Text(
+                            text = message,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
                         )
                     }
                     Spacer(Modifier.height(24.dp))
@@ -1408,6 +1466,7 @@ private fun OnlineCatalogResultRow(
     selected: Boolean,
     isDownloading: Boolean,
     canDownload: Boolean,
+    downloadEnabled: Boolean,
     canPreview: Boolean,
     canBatchAcrossSource: Boolean,
     onToggleSelect: () -> Unit,
@@ -1478,7 +1537,7 @@ private fun OnlineCatalogResultRow(
             if (canDownload) {
                 IconButton(
                     onClick = onDownload,
-                    enabled = !isDownloading,
+                    enabled = downloadEnabled && !isDownloading,
                     modifier = Modifier
                         .size(48.dp)
                         .semantics { contentDescription = downloadLabel },

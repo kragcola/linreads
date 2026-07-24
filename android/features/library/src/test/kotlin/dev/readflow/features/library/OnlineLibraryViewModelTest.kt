@@ -26,6 +26,7 @@ import dev.readflow.extensions.api.stableRemoteBookId
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -38,6 +39,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -109,6 +111,42 @@ class OnlineLibraryViewModelTest {
         advanceUntilIdle()
 
         assertEquals("new", viewModel.onlineLibraryState.value.query)
+        assertEquals(listOf("new"), viewModel.onlineLibraryState.value.results.map { it.meta.id })
+    }
+
+    @Test
+    fun editingQueryCancelsActiveSearchAndLeavesSearchReady() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val catalog = FakeOnlineCatalog(
+            searchHandler = { query, _ ->
+                if (query == "old") {
+                    firstStarted.complete(Unit)
+                    releaseFirst.await()
+                }
+                ReadflowResult.Success(listOf(entry(query, "Result $query")))
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceAdapterIds.CALIBRE)),
+            catalogs = mapOf(BUILTIN_CALIBRE_SOURCE_ID to catalog),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.updateOnlineQuery("old")
+        viewModel.searchOnlineLibrary()
+        runCurrent()
+        firstStarted.await()
+
+        viewModel.updateOnlineQuery("new")
+        releaseFirst.complete(Unit)
+        advanceUntilIdle()
+
+        assertFalse(viewModel.onlineLibraryState.value.isSearching)
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
         assertEquals(listOf("new"), viewModel.onlineLibraryState.value.results.map { it.meta.id })
     }
 
@@ -486,6 +524,38 @@ class OnlineLibraryViewModelTest {
         assertTrue(registry.credentialsCleared)
     }
 
+    @Test
+    fun credentialReadFailureCanRetryWithoutDestructiveReset() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-calibre", SourceAdapterIds.CALIBRE, name = "Calibre")
+        var readAttempts = 0
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = emptyMap(),
+            credentialReadHandler = {
+                readAttempts += 1
+                if (readAttempts == 1) throw IllegalStateException("temporary keystore failure")
+                SourceCredentials("reader", "secret")
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.prepareSourceEditor(source.id)
+        advanceUntilIdle()
+        assertTrue(viewModel.onlineLibraryState.value.sourceCredentialsLoadFailed)
+
+        viewModel.retrySourceCredentials()
+        advanceUntilIdle()
+
+        assertEquals(2, readAttempts)
+        assertFalse(viewModel.onlineLibraryState.value.sourceCredentialsLoadFailed)
+        assertEquals("reader", viewModel.onlineLibraryState.value.sourceUsername)
+        assertEquals("secret", viewModel.onlineLibraryState.value.sourcePassword)
+        assertEquals("已重新读取登录凭据", viewModel.onlineLibraryState.value.message)
+        assertFalse(registry.credentialsCleared)
+    }
+
     /** Registry/parser tests cover validation; these cover post-read selection and error state. */
     @Test
     fun importSourceConfigSuccessSelectsImportedSource() = runTest(dispatcher) {
@@ -764,6 +834,124 @@ class OnlineLibraryViewModelTest {
         assertNull(viewModel.onlineLibraryState.value.message)
         assertNull(viewModel.onlineLibraryState.value.error)
         assertTrue(viewModel.onlineLibraryState.value.downloadingKeys.isEmpty())
+    }
+
+    @Test
+    fun sourceRoundTripKeepsActiveReservationAndRejectsDuplicateDownload() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        val releaseUnexpectedDuplicate = CompletableDeferred<Unit>()
+        val entry = entry("same", "Same Book")
+        val downloadCalls = AtomicInteger(0)
+        val catalog = FakeOnlineCatalog(
+            downloadHandler = { requested ->
+                when (downloadCalls.incrementAndGet()) {
+                    1 -> {
+                        firstStarted.complete(Unit)
+                        withContext(NonCancellable) { releaseFirst.await() }
+                    }
+                    else -> releaseUnexpectedDuplicate.await()
+                }
+                ReadflowResult.Success(requested.meta.copy(downloadStatus = DownloadStatus.DOWNLOADED))
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(
+                enabledSource("source-a", SourceAdapterIds.JSON_HTTP),
+                enabledSource("source-b", SourceAdapterIds.JSON_HTTP),
+            ),
+            catalogs = mapOf("source-a" to catalog, "source-b" to FakeOnlineCatalog()),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.selectOnlineSource("source-a")
+        viewModel.downloadOnlineEntry(entry)
+        runCurrent()
+        firstStarted.await()
+
+        viewModel.selectOnlineSource("source-b")
+        viewModel.selectOnlineSource("source-a")
+        val reservationRestored = entry.selectionKey() in
+            viewModel.onlineLibraryState.value.downloadingKeys
+        viewModel.downloadOnlineEntry(entry)
+        runCurrent()
+        val observedCalls = downloadCalls.get()
+
+        releaseFirst.complete(Unit)
+        releaseUnexpectedDuplicate.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue("active source reservation was lost across A-B-A", reservationRestored)
+        assertEquals(1, observedCalls)
+        assertTrue(viewModel.onlineLibraryState.value.downloadingKeys.isEmpty())
+    }
+
+    @Test
+    fun staleBatchCompletionCannotClearNewSourceBatchWithSameEntryKey() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val oldStarted = CompletableDeferred<Unit>()
+        val releaseOld = CompletableDeferred<Unit>()
+        val newStarted = CompletableDeferred<Unit>()
+        val releaseNew = CompletableDeferred<Unit>()
+        val oldEntry = entry("same", "Old")
+        val newEntry = entry("same", "New")
+        val oldCatalog = FakeOnlineCatalog(
+            searchHandler = { _, _ -> ReadflowResult.Success(listOf(oldEntry)) },
+            downloadHandler = { entry ->
+                oldStarted.complete(Unit)
+                withContext(NonCancellable) { releaseOld.await() }
+                ReadflowResult.Success(entry.meta.copy(downloadStatus = DownloadStatus.DOWNLOADED))
+            },
+        )
+        val newCatalog = FakeOnlineCatalog(
+            searchHandler = { _, _ -> ReadflowResult.Success(listOf(newEntry)) },
+            downloadHandler = { entry ->
+                newStarted.complete(Unit)
+                releaseNew.await()
+                ReadflowResult.Success(entry.meta.copy(downloadStatus = DownloadStatus.DOWNLOADED))
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(
+                enabledSource("source-old", SourceAdapterIds.JSON_HTTP),
+                enabledSource("source-new", SourceAdapterIds.JSON_HTTP),
+            ),
+            catalogs = mapOf("source-old" to oldCatalog, "source-new" to newCatalog),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.selectOnlineSource("source-old")
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.toggleOnlineSelection(oldEntry)
+        viewModel.downloadSelectedOnlineBooks()
+        runCurrent()
+        oldStarted.await()
+
+        viewModel.selectOnlineSource("source-new")
+        viewModel.searchOnlineLibrary()
+        runCurrent()
+        viewModel.toggleOnlineSelection(newEntry)
+        viewModel.downloadSelectedOnlineBooks()
+        runCurrent()
+        newStarted.await()
+
+        releaseOld.complete(Unit)
+        runCurrent()
+
+        assertEquals("source-new", viewModel.onlineLibraryState.value.selectedSourceId)
+        assertTrue(viewModel.onlineLibraryState.value.isDownloadingBatch)
+        assertEquals(setOf(newEntry.selectionKey()), viewModel.onlineLibraryState.value.downloadingKeys)
+
+        releaseNew.complete(Unit)
+        advanceUntilIdle()
+
+        assertFalse(viewModel.onlineLibraryState.value.isDownloadingBatch)
+        assertTrue(viewModel.onlineLibraryState.value.downloadingKeys.isEmpty())
+        assertTrue(viewModel.onlineLibraryState.value.message?.contains("已下载 1") == true)
     }
 
     @Test
@@ -1053,6 +1241,14 @@ class OnlineLibraryViewModelTest {
         assertEquals(6, viewModel.onlineLibraryState.value.selectedEntryKeys.size)
 
         viewModel.downloadSelectedOnlineBooks()
+        assertTrue(viewModel.onlineLibraryState.value.isDownloadingBatch)
+        assertEquals(
+            results.mapTo(linkedSetOf(), OnlineCatalogEntry::selectionKey),
+            viewModel.onlineLibraryState.value.downloadingKeys,
+        )
+        runCurrent()
+        viewModel.downloadOnlineEntry(results[3])
+        viewModel.downloadSelectedOnlineBooks()
         advanceUntilIdle()
 
         assertTrue(
@@ -1063,6 +1259,66 @@ class OnlineLibraryViewModelTest {
         assertTrue(downloadCounts.values.all { it == 1 })
         assertEquals(6, store.upsertedBooks.size)
         assertTrue(viewModel.onlineLibraryState.value.message?.contains("已下载 6") == true)
+    }
+
+    @Test
+    fun singleAndBatchDownloadsShareOneConcurrencyCap() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val results = (1..6).map { entry("$it", "Book $it", author = "Ann", series = "Saga") }
+        val inFlight = AtomicInteger(0)
+        val peak = AtomicInteger(0)
+        val releaseDownloads = CompletableDeferred<Unit>()
+        val downloadCounts = mutableMapOf<String, Int>()
+        val lock = Mutex()
+        val catalog = FakeOnlineCatalog(
+            searchHandler = { _, _ -> ReadflowResult.Success(results) },
+            downloadHandler = { entry ->
+                val current = inFlight.incrementAndGet()
+                peak.updateAndGet { maxOf(it, current) }
+                try {
+                    releaseDownloads.await()
+                    lock.withLock {
+                        downloadCounts[entry.meta.id] = (downloadCounts[entry.meta.id] ?: 0) + 1
+                    }
+                    ReadflowResult.Success(
+                        entry.meta.copy(
+                            id = stableRemoteBookId("source-json", entry.meta.id),
+                            downloadStatus = DownloadStatus.DOWNLOADED,
+                            localUri = "file:///books/${entry.meta.id}.epub",
+                        ),
+                    )
+                } finally {
+                    inFlight.decrementAndGet()
+                }
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = mapOf("source-json" to catalog),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+        viewModel.selectOnlineSource("source-json")
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+
+        viewModel.downloadOnlineEntry(results.first())
+        runCurrent()
+        viewModel.selectOnlineBySeries("Saga")
+        viewModel.toggleOnlineSelection(results.first())
+        viewModel.downloadSelectedOnlineBooks()
+        runCurrent()
+        val observedPeak = peak.get()
+
+        releaseDownloads.complete(Unit)
+        advanceUntilIdle()
+
+        assertTrue(
+            "peak concurrent downloads was $observedPeak, expected <= 3",
+            observedPeak <= LibraryViewModel.ONLINE_BATCH_DOWNLOAD_CONCURRENCY,
+        )
+        assertEquals(6, downloadCounts.size)
+        assertTrue(downloadCounts.values.all { it == 1 })
     }
 
     @Test

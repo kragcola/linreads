@@ -51,7 +51,7 @@ internal class KtorCalibreConnectionTester(
         if (!validation.isValid || validation.normalizedUrl.isBlank()) {
             return CalibreConnectionCheckResult.Failure(
                 message = validation.errorMessage ?: "请先填写 Calibre 服务器地址",
-                nextStep = "示例：http://192.168.1.5:8080",
+                nextStep = "同一 Wi-Fi 可填电脑局域网地址；远程连接可填 Tailscale 100.x 地址",
             )
         }
 
@@ -118,11 +118,11 @@ private fun Throwable.toConnectionFailure(): CalibreConnectionCheckResult.Failur
     )
     is ConnectTimeoutException, is HttpRequestTimeoutException -> CalibreConnectionCheckResult.Failure(
         message = "连接 Calibre 超时",
-        nextStep = "确认手机和 Calibre 在同一局域网，并检查 IP 与端口",
+        nextStep = "确认本设备能通过同一 Wi-Fi 或 Tailscale 访问服务器，并检查地址与端口",
     )
     is ConnectException, is UnknownHostException -> CalibreConnectionCheckResult.Failure(
         message = "无法连接到服务器",
-        nextStep = "确认手机和 Calibre 在同一局域网，并检查端口是否为 8080",
+        nextStep = "确认本设备与服务器位于同一 Wi-Fi 或 Tailscale 网络，并检查端口",
     )
     is JsonConvertException, is SerializationException, is IllegalStateException -> CalibreConnectionCheckResult.Failure(
         message = "服务器响应不像 Calibre Content Server",
@@ -134,7 +134,7 @@ private fun Throwable.toConnectionFailure(): CalibreConnectionCheckResult.Failur
     )
     else -> CalibreConnectionCheckResult.Failure(
         message = message?.takeIf { it.isNotBlank() } ?: "无法连接到服务器",
-        nextStep = "确认手机和 Calibre 在同一局域网，并检查端口是否为 8080",
+        nextStep = "确认本设备与服务器位于同一 Wi-Fi 或 Tailscale 网络，并检查端口",
     )
 }
 
@@ -159,9 +159,9 @@ internal fun Throwable.toCalibreReadflowError(): ReadflowError = when (this) {
         "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
     )
     is ConnectTimeoutException, is HttpRequestTimeoutException ->
-        ReadflowError.network(null, "连接 Calibre 超时，请确认服务器在线且位于同一局域网")
+        ReadflowError.network(null, "连接 Calibre 超时，请确认服务器在线且可通过同一 Wi-Fi 或 Tailscale 访问")
     is ConnectException, is UnknownHostException ->
-        ReadflowError.network(null, "无法连接到 Calibre，请检查地址、端口和局域网")
+        ReadflowError.network(null, "无法连接到 Calibre，请检查地址、端口、Wi-Fi 或 Tailscale 状态")
     is JsonConvertException, is SerializationException ->
         ReadflowError.parse("Calibre 返回了无法识别的数据")
     is ResponseException -> ReadflowError.network(

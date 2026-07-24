@@ -136,6 +136,12 @@ class LibraryScreenVisualContractTest {
                 .substringBefore(")")
                 .contains("contentDescription = null"),
         )
+        assertTrue(
+            "the keyboard search action must submit through the same guarded callback",
+            sheet.contains("KeyboardOptions(imeAction = ImeAction.Search)") &&
+                sheet.contains("KeyboardActions(onSearch =") &&
+                sheet.contains("if (!state.isSearching) onSearch()"),
+        )
 
         // --- Collapsible secondary filters ---
         assertTrue(
@@ -146,7 +152,8 @@ class LibraryScreenVisualContractTest {
         )
         assertTrue(
             "filter fields only render when expanded",
-            sheet.contains("if (filtersExpanded)"),
+            sheet.contains("if (filtersExpanded)") &&
+                sheet.contains("stateDescription = if (filtersExpanded) \"已展开\" else \"已收起\""),
         )
 
         // --- Checkbox selection + row overflow menu ---
@@ -228,6 +235,16 @@ class LibraryScreenVisualContractTest {
             "online-library errors must expose a stable accessible semantic label",
             source.contains("在线书库错误：\$statusError"),
         )
+        assertTrue(
+            "batch download must expose and honor one stable in-progress state",
+            sheet.contains("enabled = !state.isDownloadingBatch") &&
+                sheet.contains("if (state.isDownloadingBatch) \"下载中\" else \"下载所选\""),
+        )
+        assertTrue(
+            "single-download actions must remain visible but disabled during a batch",
+            sheet.contains("downloadEnabled = !state.isDownloadingBatch") &&
+                resultRow.contains("enabled = downloadEnabled && !isDownloading"),
+        )
     }
 
     @Test
@@ -258,6 +275,16 @@ class LibraryScreenVisualContractTest {
                 htmlFields.contains("默认：") &&
                 htmlFields.contains("网站结构不同") &&
                 htmlFields.contains("仅局域网 HTTP 书源需要开启"),
+        )
+        assertTrue(
+            "Calibre setup must cover same-Wi-Fi and Tailscale without requiring Serve",
+            editor.contains("同一 Wi-Fi") && editor.contains("Tailscale") && editor.contains("无需 Serve"),
+        )
+        assertTrue(
+            "credential read failure must offer retry separately from destructive reset",
+            editor.contains("onRetryCredentials") &&
+                editor.contains("重试读取") &&
+                editor.contains("重置凭据"),
         )
     }
 

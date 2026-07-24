@@ -1,5 +1,8 @@
 package dev.readflow.core.calibre
 
+import java.net.Inet6Address
+import java.net.InetAddress
+
 data class CalibreProbeAttempt(
     val baseUrl: String,
     val message: String,
@@ -30,7 +33,7 @@ class GuidedCalibreEndpointProbe(
         if (candidates.isEmpty()) {
             return CalibreProbeResult.Failure(
                 message = "请先填写 Calibre 服务器 IP 或地址",
-                nextStep = "示例：192.168.1.5 或 http://192.168.1.5:8080",
+                nextStep = "同一 Wi-Fi 可填 192.168.x.x；Tailscale 可填 100.x.x.x",
                 attempts = emptyList(),
             )
         }
@@ -41,7 +44,7 @@ class GuidedCalibreEndpointProbe(
             if (!validation.isValid) {
                 return CalibreProbeResult.Failure(
                     message = validation.errorMessage.orEmpty(),
-                    nextStep = "请填写 Calibre 所在电脑的局域网 IP，例如 192.168.1.5",
+                    nextStep = "请填写 Calibre 所在电脑的局域网或 Tailscale 地址",
                     attempts = emptyList(),
                 )
             }
@@ -65,7 +68,7 @@ class GuidedCalibreEndpointProbe(
 
         return CalibreProbeResult.Failure(
             message = "没有在常用 Calibre 地址发现服务",
-            nextStep = "确认电脑端 Calibre Content Server 已启动，并检查 IP 是否正确；如果改过端口，请直接填写完整地址",
+            nextStep = "确认 Calibre Content Server 已启动，并检查 Wi-Fi 或 Tailscale 地址；如果改过端口，请填写完整地址",
             attempts = attempts,
         )
     }
@@ -74,9 +77,30 @@ class GuidedCalibreEndpointProbe(
         val trimmed = hint.trim().trimEnd('/')
         if (trimmed.isBlank()) return emptyList()
         if (trimmed.contains("://")) return listOf(trimmed)
+        if (trimmed.startsWith('[')) {
+            val closingBracket = trimmed.indexOf(']')
+            if (closingBracket > 1) {
+                val host = trimmed.substring(1, closingBracket)
+                if (host.isIpv6Literal()) {
+                    val suffix = trimmed.substring(closingBracket + 1)
+                    if (suffix.isBlank()) {
+                        return COMMON_PORTS.map { port -> "http://[$host]:$port" }
+                    }
+                    if (suffix.startsWith(':') && suffix.drop(1).toIntOrNull() in 1..65535) {
+                        return listOf("http://$trimmed")
+                    }
+                }
+            }
+        }
+        if (trimmed.isIpv6Literal()) {
+            return COMMON_PORTS.map { port -> "http://[$trimmed]:$port" }
+        }
         if (trimmed.hasPort()) return listOf("http://$trimmed")
         return COMMON_PORTS.map { port -> "http://$trimmed:$port" }
     }
+
+    private fun String.isIpv6Literal(): Boolean =
+        ':' in this && runCatching { InetAddress.getByName(this) }.getOrNull() is Inet6Address
 
     private fun String.hasPort(): Boolean {
         val lastColon = lastIndexOf(':')

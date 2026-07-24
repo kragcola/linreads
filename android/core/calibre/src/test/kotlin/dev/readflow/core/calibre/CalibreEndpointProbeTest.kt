@@ -57,6 +57,25 @@ class CalibreEndpointProbeTest {
     }
 
     @Test
+    fun bracketsBareTailscaleIpv6BeforeTryingCommonPorts() = runTest {
+        val address = "fd7a:115c:a1e0::1234"
+        val tester = RecordingConnectionTester(
+            results = mapOf(
+                "http://[$address]:8080" to CalibreConnectionCheckResult.Success(bookCount = 3),
+            ),
+        )
+        val probe = GuidedCalibreEndpointProbe(tester)
+
+        val result = probe.probe(address)
+
+        assertEquals(listOf("http://[$address]:8080"), tester.checkedUrls)
+        assertEquals(
+            CalibreProbeResult.Success(baseUrl = "http://[$address]:8080", bookCount = 3),
+            result,
+        )
+    }
+
+    @Test
     fun rejectsPublicHttpProbeCandidateBeforeNetwork() = runTest {
         val tester = RecordingConnectionTester()
         val probe = GuidedCalibreEndpointProbe(tester)
@@ -66,7 +85,7 @@ class CalibreEndpointProbeTest {
         assertEquals(emptyList<String>(), tester.checkedUrls)
         assertTrue(result is CalibreProbeResult.Failure)
         assertEquals(
-            "HTTP 只允许局域网私有地址：10.x、172.16-31.x、192.168.x，公网地址请使用 HTTPS",
+            "HTTP 仅允许本机、局域网或 Tailscale 地址；其他地址请使用 HTTPS",
             (result as CalibreProbeResult.Failure).message,
         )
     }
