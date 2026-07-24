@@ -4,6 +4,8 @@ import androidx.room.Room
 import androidx.room.withTransaction
 import dev.readflow.core.calibre.CalibreEndpointProbe
 import dev.readflow.core.calibre.CalibreConnectionTester
+import dev.readflow.core.calibre.CalibreServiceDiscovery
+import dev.readflow.core.calibre.AndroidCalibreServiceDiscovery
 import dev.readflow.core.calibre.DefaultSourceRegistry
 import dev.readflow.core.calibre.defaultSourceAdapterRegistry
 import dev.readflow.core.calibre.GuidedCalibreEndpointProbe
@@ -187,6 +189,7 @@ val renderModule = module {
 val settingsModule = module {
     single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
     single<CalibreConnectionTester> { createCalibreConnectionTester() }
+    single<CalibreServiceDiscovery> { AndroidCalibreServiceDiscovery(androidContext(), get()) }
     single<CalibreEndpointProbe> { GuidedCalibreEndpointProbe(get()) }
     single<SourceAdapterRegistry> {
         defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"))
@@ -196,6 +199,7 @@ val settingsModule = module {
             settings = get(),
             sourceConfigStore = get(),
             booksDir = File(androidContext().filesDir, "books"),
+            calibreServiceDiscovery = get(),
             sourceAdapters = get(),
         )
     }

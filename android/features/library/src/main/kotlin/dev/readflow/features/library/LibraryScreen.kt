@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Settings
@@ -66,6 +67,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -888,6 +890,9 @@ private fun SourceEditorWindow(
     onSave: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    var advancedSourceOptionsExpanded by rememberSaveable(state.addSourceAdapterId) {
+        mutableStateOf(false)
+    }
     // HTML_RULES first; Calibre optional at the end of the type list.
     val adapterOptions = listOf(
         SourceEditorOption(
@@ -984,17 +989,26 @@ private fun SourceEditorWindow(
                             }
                         }
                     }
-                    OutlinedTextField(
-                        value = state.addSourceName,
-                        onValueChange = { onFormChange(it, null, null) },
-                        label = { Text("书源名称") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
+                    Text(
+                        text = if (
+                            state.addSourceAdapterId ==
+                            dev.readflow.extensions.api.SourceAdapterIds.HTML_RULES_V1
+                        ) {
+                            "只需填写地址；常用解析规则已有通用默认值，网站结构不同再到高级设置调整。"
+                        } else {
+                            "只需填写地址；名称会自动生成，已有自定义配置仍可通过 JSON 导入。"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     if (state.addSourceAdapterId == dev.readflow.extensions.api.SourceAdapterIds.HTML_RULES_V1) {
-                        HtmlSourceRuleFields(
-                            draft = state.htmlSourceDraft,
-                            onChange = onHtmlDraftChange,
+                        SourceRuleField(
+                            value = state.htmlSourceDraft.searchUrlTemplate,
+                            label = "搜索地址模板",
+                            supportingText = "必填，使用 {query} 代表关键词；分页站点可加 {page}",
+                            onValueChange = {
+                                onHtmlDraftChange(state.htmlSourceDraft.copy(searchUrlTemplate = it))
+                            },
                         )
                     } else {
                         val addressLabel = when (state.addSourceAdapterId) {
@@ -1006,9 +1020,66 @@ private fun SourceEditorWindow(
                             value = state.addSourceUrl,
                             onValueChange = { onFormChange(null, it, null) },
                             label = { Text(addressLabel) },
+                            supportingText = {
+                                Text(
+                                    when (state.addSourceAdapterId) {
+                                        dev.readflow.extensions.api.SourceAdapterIds.CALIBRE ->
+                                            "局域网通常使用 http://电脑IP:8080"
+                                        dev.readflow.extensions.api.SourceAdapterIds.OPDS ->
+                                            "填写服务提供的 OPDS / Atom 目录地址"
+                                        else -> "填写兼容 LinReads 目录协议的 JSON 地址"
+                                    },
+                                )
+                            },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
                         )
+                    }
+                    OutlinedTextField(
+                        value = state.addSourceName,
+                        onValueChange = { onFormChange(it, null, null) },
+                        label = { Text("显示名称（可选）") },
+                        supportingText = {
+                            Text("未填写时自动使用“${defaultSourceName(state.addSourceAdapterId)}”")
+                        },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (
+                        state.addSourceAdapterId ==
+                        dev.readflow.extensions.api.SourceAdapterIds.HTML_RULES_V1
+                    ) {
+                        TextButton(
+                            onClick = {
+                                advancedSourceOptionsExpanded = !advancedSourceOptionsExpanded
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .semantics {
+                                    stateDescription = if (advancedSourceOptionsExpanded) {
+                                        "已展开"
+                                    } else {
+                                        "已收起"
+                                    }
+                                },
+                        ) {
+                            Text(if (advancedSourceOptionsExpanded) "收起高级设置" else "高级设置")
+                            Icon(
+                                imageVector = if (advancedSourceOptionsExpanded) {
+                                    Icons.Default.KeyboardArrowUp
+                                } else {
+                                    Icons.Default.KeyboardArrowDown
+                                },
+                                contentDescription = null,
+                            )
+                        }
+                        if (advancedSourceOptionsExpanded) {
+                            HtmlSourceRuleFields(
+                                draft = state.htmlSourceDraft,
+                                onChange = onHtmlDraftChange,
+                            )
+                        }
                     }
                     state.error?.let { message ->
                         Text(
@@ -1037,69 +1108,76 @@ private fun HtmlSourceRuleFields(
 ) {
     Text("搜索页规则", style = MaterialTheme.typography.labelLarge)
     SourceRuleField(
-        value = draft.searchUrlTemplate,
-        label = "搜索地址模板",
-        onValueChange = { onChange(draft.copy(searchUrlTemplate = it)) },
-    )
-    SourceRuleField(
         value = draft.itemSelector,
         label = "结果条目选择器",
+        supportingText = "默认：.bookbox, .book-item, li；网站结构不同再调整",
         onValueChange = { onChange(draft.copy(itemSelector = it)) },
     )
     SourceRuleField(
         value = draft.titleSelector,
         label = "书名选择器",
+        supportingText = "默认匹配常见标题链接；预览无书名时调整",
         onValueChange = { onChange(draft.copy(titleSelector = it)) },
     )
     SourceRuleField(
         value = draft.authorSelector,
         label = "作者选择器",
+        supportingText = "默认：.author, .writer；作者缺失时调整",
         onValueChange = { onChange(draft.copy(authorSelector = it)) },
     )
     SourceRuleField(
         value = draft.detailLinkSelector,
         label = "详情链接选择器",
+        supportingText = "默认优先标题链接；无法打开目录时调整",
         onValueChange = { onChange(draft.copy(detailLinkSelector = it)) },
     )
     SourceRuleField(
         value = draft.seriesSelector,
         label = "系列选择器（可选）",
+        supportingText = "默认留空；网站提供系列信息时填写",
         onValueChange = { onChange(draft.copy(seriesSelector = it)) },
     )
     Text("目录与正文规则", style = MaterialTheme.typography.labelLarge)
     SourceRuleField(
         value = draft.chapterItemSelector,
         label = "章节条目选择器",
+        supportingText = "默认匹配常见章节列表；目录为空时调整",
         onValueChange = { onChange(draft.copy(chapterItemSelector = it)) },
     )
     SourceRuleField(
         value = draft.chapterLinkSelector,
         label = "章节链接选择器",
+        supportingText = "默认：a；章节条目不是链接时调整",
         onValueChange = { onChange(draft.copy(chapterLinkSelector = it)) },
     )
     SourceRuleField(
         value = draft.chapterTitleSelector,
         label = "章节标题选择器（可选）",
+        supportingText = "默认留空并使用目录标题；需要正文页标题时填写",
         onValueChange = { onChange(draft.copy(chapterTitleSelector = it)) },
     )
     SourceRuleField(
         value = draft.bodySelector,
         label = "正文选择器",
+        supportingText = "默认匹配常见正文容器；正文为空或夹杂导航时调整",
         onValueChange = { onChange(draft.copy(bodySelector = it)) },
     )
     SourceRuleField(
         value = draft.nextPageSelector,
         label = "章节下一页选择器（可选）",
+        supportingText = "默认留空；单章被拆成多页时填写",
         onValueChange = { onChange(draft.copy(nextPageSelector = it)) },
     )
     SourceRuleField(
         value = draft.additionalAllowedHosts,
         label = "额外允许域名（可选）",
+        supportingText = "默认只允许搜索地址域名；章节或下载跨域时添加",
         onValueChange = { onChange(draft.copy(additionalAllowedHosts = it)) },
     )
     SourceRuleField(
         value = draft.charset,
         label = "字符编码",
+        supportingText = "默认：UTF-8；页面出现乱码时改为站点实际编码",
         onValueChange = { onChange(draft.copy(charset = it)) },
     )
     Row(
@@ -1107,7 +1185,14 @@ private fun HtmlSourceRuleFields(
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text("允许局域网 HTTP", style = MaterialTheme.typography.bodyLarge)
+        Column(modifier = Modifier.weight(1f)) {
+            Text("允许局域网 HTTP", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                "默认关闭；仅局域网 HTTP 书源需要开启",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Switch(
             checked = draft.allowLanHttp,
             onCheckedChange = { onChange(draft.copy(allowLanHttp = it)) },
@@ -1120,12 +1205,14 @@ private fun HtmlSourceRuleFields(
 private fun SourceRuleField(
     value: String,
     label: String,
+    supportingText: String,
     onValueChange: (String) -> Unit,
 ) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
         label = { Text(label) },
+        supportingText = { Text(supportingText) },
         singleLine = true,
         modifier = Modifier.fillMaxWidth(),
     )

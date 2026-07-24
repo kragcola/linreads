@@ -20,7 +20,7 @@ class CalibreRepositoryImpl(
             ReadflowResult.Success(ids.map { id -> client.bookMeta(id).toBookMeta() })
         }.getOrElse { error ->
             if (error is CancellationException) throw error
-            ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "Calibre error"))
+            ReadflowResult.Failure(error.toCalibreReadflowError())
         }
 
     override suspend fun metadata(bookId: String): ReadflowResult<BookMeta> =
@@ -28,7 +28,7 @@ class CalibreRepositoryImpl(
             ReadflowResult.Success(client.bookMeta(bookId.toInt()).toBookMeta())
         }.getOrElse { error ->
             if (error is CancellationException) throw error
-            ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "Calibre error"))
+            ReadflowResult.Failure(error.toCalibreReadflowError())
         }
 
     override suspend fun download(bookId: String): ReadflowResult<BookMeta> =
@@ -42,7 +42,7 @@ class CalibreRepositoryImpl(
             }
         }.getOrElse { error ->
             if (error is CancellationException) throw error
-            ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "Calibre error"))
+            ReadflowResult.Failure(error.toCalibreReadflowError())
         }
 
     override fun close() {

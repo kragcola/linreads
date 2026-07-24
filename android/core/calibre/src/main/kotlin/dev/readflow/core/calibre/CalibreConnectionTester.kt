@@ -1,5 +1,6 @@
 package dev.readflow.core.calibre
 
+import dev.readflow.core.model.ReadflowError
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.HttpClientEngine
@@ -128,4 +129,37 @@ private fun Throwable.toConnectionFailure(): CalibreConnectionCheckResult.Failur
         message = message?.takeIf { it.isNotBlank() } ?: "无法连接到服务器",
         nextStep = "确认手机和 Calibre 在同一局域网，并检查端口是否为 8080",
     )
+}
+
+internal fun Throwable.toCalibreReadflowError(): ReadflowError = when (this) {
+    is ClientRequestException -> when (response.status) {
+        HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden -> ReadflowError(
+            kind = ReadflowError.Kind.AUTH,
+            message = "Calibre 服务器需要认证；当前版本尚未支持登录凭据",
+            code = response.status.value,
+        )
+        HttpStatusCode.NotFound -> ReadflowError.network(
+            response.status.value,
+            "没有找到 Calibre API，请确认服务器地址不带路径",
+        )
+        else -> ReadflowError.network(
+            response.status.value,
+            "Calibre 服务器拒绝了请求（HTTP ${response.status.value}）",
+        )
+    }
+    is ServerResponseException -> ReadflowError.network(
+        response.status.value,
+        "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
+    )
+    is ConnectTimeoutException, is HttpRequestTimeoutException ->
+        ReadflowError.network(null, "连接 Calibre 超时，请确认服务器在线且位于同一局域网")
+    is ConnectException, is UnknownHostException ->
+        ReadflowError.network(null, "无法连接到 Calibre，请检查地址、端口和局域网")
+    is JsonConvertException, is SerializationException ->
+        ReadflowError.parse("Calibre 返回了无法识别的数据")
+    is ResponseException -> ReadflowError.network(
+        response.status.value,
+        "Calibre 请求失败（HTTP ${response.status.value}）",
+    )
+    else -> ReadflowError.network(null, "Calibre 操作失败，请检查服务器状态后重试")
 }

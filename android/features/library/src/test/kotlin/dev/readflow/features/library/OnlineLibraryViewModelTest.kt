@@ -307,6 +307,32 @@ class OnlineLibraryViewModelTest {
     }
 
     @Test
+    fun blankSourceNameUsesTheSelectedTypeDefault() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        var persistedName = ""
+        val added = enabledSource("source-added", SourceAdapterIds.CALIBRE, name = "Calibre")
+        val registry = FakeSourceRegistry(
+            sources = emptyList(),
+            catalogs = emptyMap(),
+            addHandler = { _, name, _, _ ->
+                persistedName = name
+                ReadflowResult.Success(added)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        viewModel.updateAddSourceForm(
+            name = "",
+            url = "http://192.168.1.5:8080",
+            adapterId = SourceAdapterIds.CALIBRE,
+        )
+
+        viewModel.addOnlineSource()
+        advanceUntilIdle()
+
+        assertEquals("Calibre", persistedName)
+    }
+
+    @Test
     fun sourceEditorStaysOpenWhenRegistryRejectsTheSource() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val registry = FakeSourceRegistry(
@@ -402,6 +428,22 @@ class OnlineLibraryViewModelTest {
         assertEquals(".series", config.search.seriesSelector)
         assertEquals(".content", config.chapter.bodySelector)
         assertEquals(".next", config.chapter.nextPageSelector)
+    }
+
+    @Test
+    fun htmlSourceDraftProvidesUsableGeneralRuleDefaults() {
+        val config = HtmlSourceDraft(
+            searchUrlTemplate = "https://books.example/search?q={query}&page={page}",
+        ).toConfig()
+
+        assertEquals("UTF-8", config.charset)
+        assertEquals(".bookbox, .book-item, li", config.search.itemSelector)
+        assertEquals("h3 a, .bookname a, .title", config.search.titleSelector)
+        assertEquals(".author, .writer", config.search.authorSelector)
+        assertEquals("h3 a, .bookname a, a", config.search.detailLinkSelector)
+        assertEquals(".listmain dd, .chapter-list li, dd", config.detail.chapterItemSelector)
+        assertEquals("a", config.detail.chapterLinkSelector)
+        assertEquals("#chaptercontent, #content, .content", config.chapter.bodySelector)
     }
 
     @Test

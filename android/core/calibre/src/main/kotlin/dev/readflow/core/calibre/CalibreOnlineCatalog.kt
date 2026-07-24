@@ -79,7 +79,7 @@ class CalibreOnlineCatalog(
             ReadflowResult.Success(entries.applyCatalogFilter(filter))
         }.getOrElse { error ->
             if (error is CancellationException) throw error
-            ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "Calibre error"))
+            ReadflowResult.Failure(error.toCalibreReadflowError())
         }
 
     override suspend fun download(entry: OnlineCatalogEntry): ReadflowResult<BookMeta> =
@@ -105,7 +105,7 @@ class CalibreOnlineCatalog(
             }
         }.getOrElse { error ->
             if (error is CancellationException) throw error
-            ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "Calibre error"))
+            ReadflowResult.Failure(error.toCalibreReadflowError())
         }
 
     override suspend fun preview(entry: OnlineCatalogEntry): ReadflowResult<OnlineBookPreview> =

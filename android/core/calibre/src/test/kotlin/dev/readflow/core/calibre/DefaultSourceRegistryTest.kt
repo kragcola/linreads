@@ -21,9 +21,16 @@ import dev.readflow.extensions.api.SourceCapabilities
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.SourceKind
 import java.io.File
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -31,6 +38,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class DefaultSourceRegistryTest {
 
     @get:Rule
@@ -180,6 +188,288 @@ class DefaultSourceRegistryTest {
     }
 
     @Test
+    fun firstRunDiscoversAndPersistsBuiltinCalibre() = runTest {
+        val settings = FakeSettingsRepository(calibreUrl = null)
+        val store = InMemorySourceConfigStore()
+        var discoveryCalls = 0
+        val registry = DefaultSourceRegistry(
+            settings = settings,
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryCalls += 1
+                CalibreDiscoveryResult.Found(
+                    baseUrl = "http://192.168.2.1:8080",
+                    serviceName = "Books in calibre",
+                )
+            },
+        )
+
+        val sources = registry.observeSources().first()
+
+        assertEquals(1, discoveryCalls)
+        assertEquals("http://192.168.2.1:8080", settings.calibreBaseUrl.value)
+        assertEquals(BUILTIN_CALIBRE_SOURCE_ID, sources.single().id)
+        assertEquals("http://192.168.2.1:8080", sources.single().baseUrl)
+    }
+
+    @Test
+    fun deletedBuiltinCalibreNeverRunsDiscoveryAgain() = runTest {
+        val settings = FakeSettingsRepository(calibreUrl = "")
+        var discoveryCalls = 0
+        val registry = DefaultSourceRegistry(
+            settings = settings,
+            sourceConfigStore = InMemorySourceConfigStore(),
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryCalls += 1
+                CalibreDiscoveryResult.Found(
+                    baseUrl = "http://192.168.2.1:8080",
+                    serviceName = "Books in calibre",
+                )
+            },
+        )
+
+        assertTrue(registry.observeSources().first().isEmpty())
+        assertEquals(0, discoveryCalls)
+        assertEquals("", settings.calibreBaseUrl.value)
+    }
+
+    @Test
+    fun existingCalibreSourceSuppressesAutomaticDiscovery() = runTest {
+        var discoveryCalls = 0
+        val existing = calibreSource("source-calibre-user", "http://192.168.1.5:8080")
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = InMemorySourceConfigStore(listOf(existing)),
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryCalls += 1
+                CalibreDiscoveryResult.Found(
+                    baseUrl = "http://192.168.2.1:8080",
+                    serviceName = "Books in calibre",
+                )
+            },
+        )
+
+        val sources = registry.observeSources().first()
+
+        assertEquals(0, discoveryCalls)
+        assertEquals(listOf("source-calibre-user"), sources.map(SourceDescriptor::id))
+    }
+
+    @Test
+    fun nullLegacySettingPreservesExistingBuiltinCalibreSource() = runTest {
+        var discoveryCalls = 0
+        val builtin = calibreSource(BUILTIN_CALIBRE_SOURCE_ID, "http://192.168.1.5:8080")
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = InMemorySourceConfigStore(listOf(builtin)),
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryCalls += 1
+                CalibreDiscoveryResult.NotFound
+            },
+        )
+
+        val sources = registry.observeSources().first()
+
+        assertEquals(0, discoveryCalls)
+        assertEquals(listOf(BUILTIN_CALIBRE_SOURCE_ID), sources.map(SourceDescriptor::id))
+    }
+
+    @Test
+    fun cancelledDiscoveryIsRetriedByTheNextCollector() = runTest {
+        var discoveryCalls = 0
+        val firstDiscoveryStarted = CompletableDeferred<Unit>()
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = InMemorySourceConfigStore(),
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryCalls += 1
+                if (discoveryCalls == 1) {
+                    firstDiscoveryStarted.complete(Unit)
+                    CompletableDeferred<Unit>().await()
+                    CalibreDiscoveryResult.NotFound
+                } else {
+                    CalibreDiscoveryResult.Found(
+                        baseUrl = "http://192.168.2.1:8080",
+                        serviceName = "Books in calibre",
+                    )
+                }
+            },
+        )
+
+        registry.observeSources().first()
+        firstDiscoveryStarted.await()
+        val retry = async {
+            registry.observeSources().first { sources -> sources.isNotEmpty() }
+        }
+        runCurrent()
+        val retriedAfterCancellation = discoveryCalls == 2
+        retry.cancel()
+
+        assertTrue("cancelled discovery must not consume the one allowed attempt", retriedAfterCancellation)
+    }
+
+    @Test
+    fun discoveryCancelledWhileWaitingForSourceWriteLockIsRetried() = runTest {
+        var discoveryCalls = 0
+        val sourceWriteStarted = CompletableDeferred<Unit>()
+        val sourceWriteGate = CompletableDeferred<Unit>()
+        val store = InMemorySourceConfigStore(
+            beforeNextSortOrder = {
+                sourceWriteStarted.complete(Unit)
+                sourceWriteGate.await()
+            },
+        )
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryCalls += 1
+                CalibreDiscoveryResult.Found(
+                    baseUrl = "http://192.168.2.1:8080",
+                    serviceName = "Books in calibre",
+                )
+            },
+        )
+        val manualAdd = async {
+            registry.addUserSource(
+                SourceKind.OPDS,
+                "OPDS",
+                "http://192.168.1.20:8080/opds",
+            )
+        }
+        sourceWriteStarted.await()
+
+        registry.observeSources().first()
+        sourceWriteGate.complete(Unit)
+        manualAdd.await()
+        val retry = async {
+            registry.observeSources().first { sources ->
+                sources.any { it.id == BUILTIN_CALIBRE_SOURCE_ID }
+            }
+        }
+        runCurrent()
+        val retriedAfterLockCancellation = discoveryCalls == 2
+        retry.cancel()
+
+        assertTrue(
+            "cancellation while waiting for the source lock must leave discovery retryable",
+            retriedAfterLockCancellation,
+        )
+    }
+
+    @Test
+    fun manualCalibreAddDuringDiscoverySuppressesBuiltinPersistence() = runTest {
+        val settings = FakeSettingsRepository(calibreUrl = null)
+        val store = InMemorySourceConfigStore()
+        val discoveryStarted = CompletableDeferred<Unit>()
+        val discoveryGate = CompletableDeferred<Unit>()
+        val registry = DefaultSourceRegistry(
+            settings = settings,
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryStarted.complete(Unit)
+                discoveryGate.await()
+                CalibreDiscoveryResult.Found(
+                    baseUrl = "http://192.168.2.1:8080",
+                    serviceName = "Books in calibre",
+                )
+            },
+        )
+        val observation = launch { registry.observeSources().collect() }
+        discoveryStarted.await()
+
+        val manual = registry.addUserSource(
+            SourceKind.CALIBRE,
+            "My Calibre",
+            "http://192.168.1.5:8080",
+        )
+        discoveryGate.complete(Unit)
+        runCurrent()
+        observation.cancelAndJoin()
+
+        assertTrue(manual is ReadflowResult.Success)
+        assertEquals(null, settings.calibreBaseUrl.value)
+        assertEquals(1, store.observeUserSources().first().count { it.adapterId == SourceAdapterIds.CALIBRE })
+    }
+
+    @Test
+    fun pendingDiscoveryDoesNotDelayExistingSources() = runTest {
+        val discoveryGate = CompletableDeferred<Unit>()
+        val store = InMemorySourceConfigStore(
+            listOf(
+                PersistedBookSource(
+                    id = "source-opds",
+                    kind = SourceKind.OPDS.name,
+                    name = "OPDS",
+                    baseUrl = "http://192.168.1.20:8080/opds",
+                    enabled = true,
+                    adapterId = SourceAdapterIds.OPDS,
+                    configVersion = 1,
+                    configJson = httpCatalogSourceConfigJson("http://192.168.1.20:8080/opds"),
+                ),
+            ),
+        )
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryGate.await()
+                CalibreDiscoveryResult.NotFound
+            },
+        )
+
+        val observation = async { registry.observeSources().first() }
+        runCurrent()
+        val emittedBeforeDiscoveryFinished = observation.isCompleted
+        discoveryGate.complete(Unit)
+        runCurrent()
+
+        assertTrue("existing sources must render while Bonjour is pending", emittedBeforeDiscoveryFinished)
+        assertEquals(listOf("source-opds"), observation.await().map(SourceDescriptor::id))
+    }
+
+    @Test
+    fun openingExistingSourceDoesNotWaitForDiscovery() = runTest {
+        val discoveryGate = CompletableDeferred<Unit>()
+        val source = PersistedBookSource(
+            id = "source-opds",
+            kind = SourceKind.OPDS.name,
+            name = "OPDS",
+            baseUrl = "http://192.168.1.20:8080/opds",
+            enabled = true,
+            adapterId = SourceAdapterIds.OPDS,
+            configVersion = 1,
+            configJson = httpCatalogSourceConfigJson("http://192.168.1.20:8080/opds"),
+        )
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = InMemorySourceConfigStore(listOf(source)),
+            booksDir = tempFolder.root,
+            calibreServiceDiscovery = CalibreServiceDiscovery {
+                discoveryGate.await()
+                CalibreDiscoveryResult.NotFound
+            },
+        )
+
+        val opening = async { registry.openCatalog(source.id) }
+        runCurrent()
+        val openedBeforeDiscoveryFinished = opening.isCompleted
+        discoveryGate.complete(Unit)
+        runCurrent()
+
+        assertTrue("opening a configured source must not wait for Bonjour", openedBeforeDiscoveryFinished)
+        assertTrue(opening.await() is ReadflowResult.Success)
+    }
+
+    @Test
     fun twoCalibreSourcesOpenWithTheirOwnDescriptors() = runTest {
         val store = InMemorySourceConfigStore(
             listOf(
@@ -319,6 +609,7 @@ class DefaultSourceRegistryTest {
 
     private class InMemorySourceConfigStore(
         initial: List<PersistedBookSource> = emptyList(),
+        private val beforeNextSortOrder: (suspend () -> Unit)? = null,
     ) : SourceConfigStore {
         private val sources = MutableStateFlow(initial)
         var upsertCalls = 0
@@ -338,8 +629,10 @@ class DefaultSourceRegistryTest {
             sources.value = sources.value.filterNot { it.id == id }
         }
 
-        override suspend fun nextSortOrder(): Int =
-            (sources.value.maxOfOrNull { it.sortOrder } ?: -1) + 1
+        override suspend fun nextSortOrder(): Int {
+            beforeNextSortOrder?.invoke()
+            return (sources.value.maxOfOrNull { it.sortOrder } ?: -1) + 1
+        }
     }
 
     private fun calibreSource(id: String, baseUrl: String) = PersistedBookSource(

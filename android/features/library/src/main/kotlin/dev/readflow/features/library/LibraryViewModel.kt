@@ -93,15 +93,15 @@ data class HtmlSourceDraft(
     val additionalAllowedHosts: String = "",
     val allowLanHttp: Boolean = false,
     val charset: String = "UTF-8",
-    val itemSelector: String = "",
-    val titleSelector: String = "",
-    val authorSelector: String = "",
-    val detailLinkSelector: String = "",
+    val itemSelector: String = ".bookbox, .book-item, li",
+    val titleSelector: String = "h3 a, .bookname a, .title",
+    val authorSelector: String = ".author, .writer",
+    val detailLinkSelector: String = "h3 a, .bookname a, a",
     val seriesSelector: String = "",
-    val chapterItemSelector: String = "",
+    val chapterItemSelector: String = ".listmain dd, .chapter-list li, dd",
     val chapterLinkSelector: String = "a",
     val chapterTitleSelector: String = "",
-    val bodySelector: String = "",
+    val bodySelector: String = "#chaptercontent, #content, .content",
     val nextPageSelector: String = "",
 ) {
     internal fun toConfig(): HtmlRulesV1Config {
@@ -937,7 +937,9 @@ class LibraryViewModel(
             val result = try {
                 registry.addUserSource(
                     adapterId = state.addSourceAdapterId,
-                    name = state.addSourceName,
+                    name = state.addSourceName.trim().ifBlank {
+                        defaultSourceName(state.addSourceAdapterId)
+                    },
                     configVersion = 1,
                     configJson = configJson,
                 )
@@ -1193,6 +1195,14 @@ class LibraryViewModel(
             offlineCount = allShelfItems.offlineReadableCount(),
         )
     }
+}
+
+internal fun defaultSourceName(adapterId: String): String = when (adapterId) {
+    SourceAdapterIds.HTML_RULES_V1 -> "网页小说站"
+    SourceAdapterIds.OPDS -> "OPDS 书库"
+    SourceAdapterIds.JSON_HTTP -> "JSON 目录"
+    SourceAdapterIds.CALIBRE -> "Calibre"
+    else -> "在线书源"
 }
 
 fun OnlineCatalogEntry.selectionKey(): String =

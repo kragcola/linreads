@@ -18,13 +18,16 @@ import dev.readflow.extensions.api.SourceKind
 import dev.readflow.extensions.api.SourceRegistry
 import java.io.File
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -33,6 +36,7 @@ class DefaultSourceRegistry(
     private val settings: SettingsRepository,
     private val sourceConfigStore: SourceConfigStore,
     private val booksDir: File,
+    private val calibreServiceDiscovery: CalibreServiceDiscovery? = null,
     private val calibreCatalogFactory: (SourceDescriptor) -> OnlineBookCatalog = { descriptor ->
         val config = descriptor.calibreConfig()
         CalibreOnlineCatalog(
@@ -52,6 +56,8 @@ class DefaultSourceRegistry(
     sourceAdapters: SourceAdapterRegistry? = null,
 ) : SourceRegistry {
     private val importMutex = Mutex()
+    private val discoveryMutex = Mutex()
+    private var discoveryAttempted = false
     private val adapters = sourceAdapters ?: compatibilityAdapterRegistry()
 
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -59,11 +65,20 @@ class DefaultSourceRegistry(
         settings.calibreBaseUrl.flatMapLatest { legacyUrl ->
             flow {
                 ensureLegacyCalibreImported(legacyUrl)
-                emitAll(
-                    sourceConfigStore.observeUserSources().map { rows ->
-                        rows.map { adapters.describe(it.toDescriptor()) }
-                    },
-                )
+                coroutineScope {
+                    if (legacyUrl == null) {
+                        launch(start = CoroutineStart.UNDISPATCHED) {
+                            discoverLocalCalibreOnFirstRun(null)?.let {
+                                ensureLegacyCalibreImported(it)
+                            }
+                        }
+                    }
+                    emitAll(
+                        sourceConfigStore.observeUserSources().map { rows ->
+                            rows.map { adapters.describe(it.toDescriptor()) }
+                        },
+                    )
+                }
             }
         }
 
@@ -78,6 +93,15 @@ class DefaultSourceRegistry(
     }
 
     override suspend fun addUserSource(
+        adapterId: String,
+        name: String,
+        configVersion: Int,
+        configJson: String,
+    ): ReadflowResult<SourceDescriptor> = importMutex.withLock {
+        addUserSourceLocked(adapterId, name, configVersion, configJson)
+    }
+
+    private suspend fun addUserSourceLocked(
         adapterId: String,
         name: String,
         configVersion: Int,
@@ -187,7 +211,7 @@ class DefaultSourceRegistry(
                 }
                 return@withLock ReadflowResult.Success(adapters.describe(reusable.toDescriptor()))
             }
-            addUserSource(
+            addUserSourceLocked(
                 adapterId = parsed.adapterId,
                 name = parsed.name,
                 configVersion = parsed.configVersion,
@@ -205,7 +229,8 @@ class DefaultSourceRegistry(
     }
 
     private suspend fun ensureLegacyCalibreImported(rawUrl: String?) {
-        if (rawUrl.isNullOrBlank()) {
+        if (rawUrl == null) return
+        if (rawUrl.isBlank()) {
             importMutex.withLock {
                 sourceConfigStore.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)?.let {
                     sourceConfigStore.deleteUserSource(BUILTIN_CALIBRE_SOURCE_ID)
@@ -246,6 +271,44 @@ class DefaultSourceRegistry(
                     updatedAt = now,
                 ),
             )
+        }
+    }
+
+    private suspend fun discoverLocalCalibreOnFirstRun(configuredUrl: String?): String? {
+        if (configuredUrl != null) return configuredUrl
+        val discovery = calibreServiceDiscovery ?: return null
+        return discoveryMutex.withLock {
+            if (discoveryAttempted) return@withLock settings.calibreBaseUrl.first()
+            val alreadyHasCalibre = sourceConfigStore.observeUserSources().first().any { source ->
+                source.adapterId == SourceAdapterIds.CALIBRE
+            }
+            if (alreadyHasCalibre) {
+                discoveryAttempted = true
+                return@withLock null
+            }
+            val discoveryResult = discovery.discover()
+            val found = discoveryResult as? CalibreDiscoveryResult.Found
+            if (found == null) {
+                discoveryAttempted = true
+                return@withLock null
+            }
+            val normalized = runCatching { requireValidCalibreBaseUrl(found.baseUrl) }.getOrNull()
+            if (normalized == null) {
+                discoveryAttempted = true
+                return@withLock null
+            }
+            val persistedUrl = importMutex.withLock persist@{
+                val current = settings.calibreBaseUrl.first()
+                if (current != null) return@persist current
+                val calibreWasAdded = sourceConfigStore.observeUserSources().first().any { source ->
+                    source.adapterId == SourceAdapterIds.CALIBRE
+                }
+                if (calibreWasAdded) return@persist null
+                settings.setCalibreBaseUrl(normalized)
+                normalized
+            }
+            discoveryAttempted = true
+            persistedUrl
         }
     }
 

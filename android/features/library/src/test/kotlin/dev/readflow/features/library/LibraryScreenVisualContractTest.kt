@@ -231,6 +231,37 @@ class LibraryScreenVisualContractTest {
     }
 
     @Test
+    fun `source editor keeps defaults documented behind advanced settings`() {
+        val source = libraryScreenSource()
+        val editor = source.substringAfter("private fun SourceEditorWindow(")
+            .substringBefore("private data class SourceEditorOption(")
+        val htmlFields = source.substringAfter("private fun HtmlSourceRuleFields(")
+            .substringBefore("private fun SourceRuleField(")
+
+        assertTrue(
+            "the common path must explain that only the address is required",
+            editor.contains("只需填写地址") && editor.contains("通用默认值"),
+        )
+        assertTrue(
+            "source name must be optional because the selected type supplies a default",
+            editor.contains("显示名称（可选）") && editor.contains("未填写时自动使用"),
+        )
+        assertTrue(
+            "HTML selectors and transport details must stay collapsed initially",
+            editor.contains("advancedSourceOptionsExpanded") &&
+                editor.contains("高级设置") &&
+                editor.contains("if (advancedSourceOptionsExpanded)"),
+        )
+        assertTrue(
+            "every adjustable HTML rule must carry supporting guidance",
+            htmlFields.contains("supportingText =") &&
+                htmlFields.contains("默认：") &&
+                htmlFields.contains("网站结构不同") &&
+                htmlFields.contains("仅局域网 HTTP 书源需要开启"),
+        )
+    }
+
+    @Test
     fun `online library empty states stay compact and immediately dismissible`() {
         val sheet = libraryScreenSource()
             .substringAfter("private fun OnlineLibrarySheet(")
