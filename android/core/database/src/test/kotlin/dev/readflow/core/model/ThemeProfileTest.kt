@@ -64,7 +64,7 @@ class ThemeProfileTest {
     fun `validated clamps line spacing to reader typography range`() {
         assertEquals(
             ReaderTypographyRange.MIN_LINE_SPACING,
-            ThemeProfile.validated(ThemeProfile(lineSpacing = 0.5f)).lineSpacing,
+            ThemeProfile.validated(ThemeProfile(lineSpacing = 0f)).lineSpacing,
         )
         assertEquals(
             ReaderTypographyRange.MAX_LINE_SPACING,

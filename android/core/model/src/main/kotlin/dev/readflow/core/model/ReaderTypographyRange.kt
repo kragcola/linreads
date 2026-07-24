@@ -10,7 +10,7 @@ object ReaderTypographyRange {
     const val MAX_FONT_SP = 32f
     const val DEFAULT_FONT_SIZE = 18
 
-    const val MIN_LINE_SPACING = 0.8f
+    const val MIN_LINE_SPACING = 0.1f
     const val MAX_LINE_SPACING = 3.0f
     const val DEFAULT_LINE_SPACING = 1.6f
 }

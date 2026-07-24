@@ -5247,6 +5247,13 @@ internal class EpubFlowView(
         return layout.getLineStart(line.coerceAtMost(layout.lineCount - 1))
     }
 
+    /**
+     * Stable viewport-start anchor for typography reflow. While a previous rebuild is still settling,
+     * keep its requested anchor instead of sampling the temporarily invalidated TextView layout.
+     */
+    fun typographyReflowAnchorOffset(): Int =
+        pendingRestoreOffset?.takeIf { awaitingStableChapter } ?: topLayoutOffset()
+
     /** Publishes and warms a chapter that was fully laid out while owned by a hidden boundary slot. */
     fun activatePreparedChapter() {
         if (disposed) return

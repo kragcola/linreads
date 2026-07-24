@@ -46,6 +46,8 @@ internal data class EpubFlowStyle(
     val columnWidthPx: Int,
     val imageMaxHeightPx: Int,
     val density: Float,
+    /** Natural row height needed before TextView applies negative additive leading. */
+    val minimumNaturalLineHeightPx: Int = 1,
     /** First-line indent for body paragraphs (Moon+ 首行缩进, ~2 CJK char widths). 0 disables. */
     val firstLineIndentPx: Int = 0,
     /**
@@ -115,6 +117,14 @@ internal fun epubBuildFlowSpannable(
                 Unit
             }
         }
+    }
+    if (style.minimumNaturalLineHeightPx > 1 && sb.isNotEmpty()) {
+        sb.setSpan(
+            EpubMinimumLineHeightSpan(style.minimumNaturalLineHeightPx),
+            0,
+            sb.length,
+            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
     }
 
     highlightRanges.forEach { range ->
@@ -525,6 +535,29 @@ private class EpubCssLineHeightSpan(
     ) {
         val current = fm.descent - fm.ascent
         val target = (current * multiplier).toInt().coerceAtLeast(current)
+        val extra = target - current
+        fm.ascent -= extra / 2
+        fm.top -= extra / 2
+        fm.descent += extra - extra / 2
+        fm.bottom += extra - extra / 2
+    }
+}
+
+/** Keeps replacement/image rows positive after TextView applies a shared negative spacingAdd. */
+internal class EpubMinimumLineHeightSpan(
+    private val minimumHeightPx: Int,
+) : LineHeightSpan {
+    override fun chooseHeight(
+        text: CharSequence,
+        start: Int,
+        end: Int,
+        spanstartv: Int,
+        lineHeight: Int,
+        fm: Paint.FontMetricsInt,
+    ) {
+        val current = fm.descent - fm.ascent
+        val target = minimumHeightPx.coerceAtLeast(1)
+        if (current >= target) return
         val extra = target - current
         fm.ascent -= extra / 2
         fm.top -= extra / 2

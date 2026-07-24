@@ -18,7 +18,8 @@ class ReaderTypographyPanelTest {
     fun `line spacing stepper moves one tenth without float drift`() {
         assertEquals(1.4f, steppedReaderLineSpacing(current = 1.3f, direction = 1), 0.001f)
         assertEquals(1.2f, steppedReaderLineSpacing(current = 1.3f, direction = -1), 0.001f)
-        assertEquals(0.8f, steppedReaderLineSpacing(current = 0.8f, direction = -1), 0.001f)
+        assertEquals(0.1f, steppedReaderLineSpacing(current = 0.2f, direction = -1), 0.001f)
+        assertEquals(0.1f, steppedReaderLineSpacing(current = 0.1f, direction = -1), 0.001f)
         assertEquals(3.0f, steppedReaderLineSpacing(current = 3.0f, direction = 1), 0.001f)
     }
 

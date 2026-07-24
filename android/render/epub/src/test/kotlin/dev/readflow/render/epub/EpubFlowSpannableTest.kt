@@ -69,9 +69,128 @@ class EpubFlowSpannableTest {
 
     @Test
     fun `flow line spacing preserves compact multipliers below one`() {
+        assertEquals(-18f, epubFlowLineSpacingAdd(fontHeightPx = 20, multiplier = 0.1f), 0.001f)
         assertEquals(-4f, epubFlowLineSpacingAdd(fontHeightPx = 20, multiplier = 0.8f), 0.001f)
         assertEquals(-2f, epubFlowLineSpacingAdd(fontHeightPx = 20, multiplier = 0.9f), 0.001f)
         assertEquals(12f, epubFlowLineSpacingAdd(fontHeightPx = 20, multiplier = 1.6f), 0.001f)
+    }
+
+    @Test
+    fun `minimum line spacing keeps positive layout rows and finite pagination`() {
+        val text = (1..24).joinToString(separator = "\n") { "compact line $it" }
+        val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 20f }
+        val fontHeight = (paint.fontMetricsInt.descent - paint.fontMetricsInt.ascent).coerceAtLeast(1)
+        val layout = android.text.StaticLayout.Builder.obtain(text, 0, text.length, paint, 400)
+            .setIncludePad(false)
+            .setLineSpacing(epubFlowLineSpacingAdd(fontHeight, 0.1f), 1f)
+            .build()
+
+        assertEquals(24, layout.lineCount)
+        repeat(layout.lineCount) { line ->
+            assertTrue(
+                "0.1x line spacing must not collapse row $line",
+                layout.getLineBottom(line) > layout.getLineTop(line),
+            )
+        }
+        val pages = epubPaginateFlow(EpubLayoutLineGeometry(layout), pageHeightPx = 12)
+        assertTrue("compact layout must still produce pages", pages.isNotEmpty())
+        assertEquals(layout.lineCount, pages.last().endLineExclusive)
+    }
+
+    @Test
+    fun `minimum line spacing keeps a small replacement row monotonic`() {
+        val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 20f }
+        val fontHeight = (paint.fontMetricsInt.descent - paint.fontMetricsInt.ascent).coerceAtLeast(1)
+        val spacingAdd = epubFlowLineSpacingAdd(fontHeight, 0.1f)
+        val flow = epubBuildChapterFlow(
+            spineIndex = 0,
+            blocks = listOf(
+                EpubDisplayBlock.Break(paragraphIndex = 0, kind = EpubBreakKind.HorizontalRule),
+                text(1, "body"),
+            ),
+        )
+        val context = RuntimeEnvironment.getApplication()
+        val text = epubBuildFlowSpannable(
+            context = context,
+            flow = flow,
+            style = style().copy(
+                density = 0.1f,
+                lineSpacingMultiplier = 0.1f,
+                minimumNaturalLineHeightPx = epubFlowMinimumNaturalLineHeightPx(spacingAdd),
+            ),
+            markwonTheme = io.noties.markwon.core.MarkwonTheme.create(context),
+            imageLoader = AsyncDrawableLoader.noOp(),
+            imageSizeResolver = EpubFlowImageSizeResolver(
+                columnWidthPx = 400,
+                pageHeightProvider = { 400 },
+                inlineMaxHeightPx = 400,
+                fullPageHrefs = emptySet(),
+            ),
+            onLinkClick = {},
+        )
+        val layout = android.text.StaticLayout.Builder.obtain(text, 0, text.length, paint, 400)
+            .setIncludePad(false)
+            .setLineSpacing(spacingAdd, 1f)
+            .build()
+
+        assertTrue("small replacement row must advance to the following row", layout.getLineTop(1) > 0)
+        repeat(layout.lineCount) { line ->
+            assertTrue(
+                "small replacement row must keep positive geometry at line $line",
+                layout.getLineBottom(line) > layout.getLineTop(line),
+            )
+        }
+        val pages = epubPaginateFlow(EpubLayoutLineGeometry(layout), pageHeightPx = 4)
+        assertEquals(layout.lineCount, pages.last().endLineExclusive)
+    }
+
+    @Test
+    fun `minimum line-height protection mirrors Android negative half rounding`() {
+        val spacingAdd = -10.5f
+        assertEquals(-11, epubFlowRoundedLineSpacingAddPx(spacingAdd))
+        assertEquals(12, epubFlowMinimumNaturalLineHeightPx(spacingAdd))
+        val text = android.text.SpannableStringBuilder("x\nbody")
+        text.setSpan(
+            object : android.text.style.LineHeightSpan {
+                override fun chooseHeight(
+                    text: CharSequence,
+                    start: Int,
+                    end: Int,
+                    spanstartv: Int,
+                    lineHeight: Int,
+                    fm: Paint.FontMetricsInt,
+                ) {
+                    fm.top = -8
+                    fm.ascent = -8
+                    fm.descent = 2
+                    fm.bottom = 2
+                }
+            },
+            0,
+            1,
+            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        val paint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 20f }
+        val naturalLayout = android.text.StaticLayout.Builder.obtain(text, 0, text.length, paint, 400)
+            .setIncludePad(false)
+            .setLineSpacing(0f, 1f)
+            .build()
+        assertEquals("fixture replacement row must have exact 10px natural height", 10, naturalLayout.getLineTop(1))
+        text.setSpan(
+            EpubMinimumLineHeightSpan(epubFlowMinimumNaturalLineHeightPx(spacingAdd)),
+            0,
+            text.length,
+            android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+        )
+        val layout = android.text.StaticLayout.Builder.obtain(text, 0, text.length, paint, 400)
+            .setIncludePad(false)
+            .setLineSpacing(spacingAdd, 1f)
+            .build()
+
+        assertTrue(
+            "the protected replacement row must advance even when spacingAdd is a negative half",
+            layout.getLineTop(1) > 0,
+        )
     }
 
     @Test

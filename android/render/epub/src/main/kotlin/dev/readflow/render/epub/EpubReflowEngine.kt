@@ -113,6 +113,8 @@ import java.io.File
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.zip.ZipFile
+import kotlin.math.ceil
+import kotlin.math.roundToInt
 
 internal enum class EpubImagePlacement {
     FullPage,
@@ -135,6 +137,13 @@ internal fun epubHeadingBoost(headingLevel: Int?): Float =
 
 internal fun epubFlowLineSpacingAdd(fontHeightPx: Int, multiplier: Float): Float =
     (multiplier - 1f) * fontHeightPx.coerceAtLeast(1)
+
+/** Mirrors StaticLayout's half-away-from-zero rounding for negative line-spacing extras. */
+internal fun epubFlowRoundedLineSpacingAddPx(spacingAddPx: Float): Int =
+    if (spacingAddPx < 0f) ceil((spacingAddPx - 0.5f).toDouble()).toInt() else spacingAddPx.roundToInt()
+
+internal fun epubFlowMinimumNaturalLineHeightPx(spacingAddPx: Float): Int =
+    (1 - epubFlowRoundedLineSpacingAddPx(spacingAddPx)).coerceAtLeast(1)
 
 /**
  * EPUB native reflow engine (v4 §12.3 ADR-EPUB-Engine).
@@ -1308,6 +1317,13 @@ class EpubReflowEngine private constructor(
             columnWidthPx = initialColumnWidthPx,
             imageMaxHeightPx = view.usablePageImageHeightPx().takeIf { it > 0 } ?: flowPageHeightPx(),
             density = density,
+            minimumNaturalLineHeightPx = epubFlowMinimumNaturalLineHeightPx(
+                epubFlowLineSpacingAdd(
+                    fontHeightPx = (view.textView.paint.fontMetricsInt.descent -
+                        view.textView.paint.fontMetricsInt.ascent).coerceAtLeast(1),
+                    multiplier = lineSpacingMultiplier,
+                ),
+            ),
             firstLineIndentPx = flowFirstLineIndentPx(density),
             bookFontResolver = if (
                 epubFontReplacementIds.isEmpty() &&
@@ -1991,6 +2007,15 @@ class EpubReflowEngine private constructor(
             else -> 0
         }
         return paragraphIndex to paragraphOffset
+    }
+
+    private fun flowTypographyAnchor(view: EpubFlowView): Pair<Int, Int> {
+        val flow = flowCurrentFlow
+        if (flow != null && flow.spineIndex == flowSpineIndex) {
+            val layoutOffset = view.typographyReflowAnchorOffset().coerceIn(0, flow.text.length)
+            flow.paragraphAtOffset(layoutOffset)?.let { return it }
+        }
+        return flowAnchorFromLocator(_currentLocator.value)
     }
 
     private fun flowHighlightRanges(flow: EpubChapterFlow): List<ReaderTextHighlightRange> {
@@ -3355,7 +3380,7 @@ class EpubReflowEngine private constructor(
         withContext(Dispatchers.Main) {
             invalidateBoundaryPreviewState(clearViewSlots = true)
             val view = flowView ?: return@withContext
-            val (anchorParagraph, anchorOffset) = flowAnchorFromLocator(_currentLocator.value)
+            val (anchorParagraph, anchorOffset) = flowTypographyAnchor(view)
             view.textView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
             view.textView.typeface = dev.readflow.core.ui.FontProvider.typefaceFor(context, currentFontId)
             applyFlowLineSpacing(view.textView)

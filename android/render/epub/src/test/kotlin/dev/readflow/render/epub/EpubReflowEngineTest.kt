@@ -2317,6 +2317,66 @@ class EpubReflowEngineTest {
     }
 
     @Test
+    fun `flow typography rebuild keeps the live page-start anchor when locator lags`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val paragraphs = List(24) { paragraphIndex ->
+            (1..36).joinToString(separator = " ") { token -> "anchor${paragraphIndex}_$token" }
+        }
+        val epub = tempDir.newFile("flow-typography-live-anchor.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to paragraphs.joinToString(
+                separator = "",
+                prefix = "<html><body>",
+                postfix = "</body></html>",
+            ) { paragraph -> "<p>$paragraph</p>" },
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setFontSize(24f)
+        engine.setLineSpacing(1.4f)
+        val host = engine.createView() as FrameLayout
+        val flowView = host.getChildAt(0) as EpubFlowView
+        activity.addContentView(host, ViewGroup.LayoutParams(360, 180))
+        host.measure(exactly(360), exactly(180))
+        host.layout(0, 0, 360, 180)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        engine.setMode(ReadingMode.PAGED)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+        assertTrue("fixture must have enough pages to expose chapter-level fallback", flowView.pageCount() > 6)
+
+        val livePageTop = flowView.pageTopPxAt(5) ?: error("missing live page top")
+        flowView.scrollTo(0, livePageTop)
+        val originalFlow = engine.privateField("flowCurrentFlow") as EpubChapterFlow
+        val liveOffset = flowView.topLayoutOffset()
+        val liveAnchor = originalFlow.paragraphAtOffset(liveOffset) ?: error("missing live anchor")
+        assertTrue("fixture must move the viewport well past the chapter start", liveOffset > 300)
+        assertTrue(
+            "manual viewport movement must leave the persisted locator stale for this regression",
+            (engine.currentLocator.value.totalProgression ?: 0f) < 0.05f,
+        )
+
+        engine.setFontSize(30f)
+        engine.setLineSpacing(1.2f)
+        shadowOf(Looper.getMainLooper()).idleFor(250L, TimeUnit.MILLISECONDS)
+
+        val rebuiltFlow = engine.privateField("flowCurrentFlow") as EpubChapterFlow
+        val rebuiltAnchorOffset = rebuiltFlow.offsetForParagraph(liveAnchor.first, liveAnchor.second)
+        @Suppress("UNCHECKED_CAST")
+        val rebuiltPages = flowView.privateField("paged") as List<EpubFlowPage>
+        val visiblePage = rebuiltPages[flowView.currentPageIndex()]
+        assertTrue(
+            "typography changes must keep the old viewport start on-screen instead of restoring the stale chapter locator: " +
+                "anchor=$rebuiltAnchorOffset page=$visiblePage",
+            rebuiltAnchorOffset in visiblePage.startOffset until visiblePage.endOffset,
+        )
+        assertTrue("the rebuilt view must remain beyond the chapter start", visiblePage.startOffset > 0)
+    }
+
+    @Test
     fun `flow same mode update does not re-anchor visible paged scroll`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val paragraphs = List(4) { paragraphIndex ->
