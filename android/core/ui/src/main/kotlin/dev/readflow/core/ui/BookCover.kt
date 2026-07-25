@@ -33,8 +33,8 @@ import dev.readflow.core.model.BookMeta
 import kotlin.math.roundToInt
 
 /**
- * 封面朝外（设计文档 §2.1）。有 coverUrl → 加载图 + 磨损暗角；无封面 → 素封面
- * （旧布/纸底色 + 居中烫印书名 + 边缘暗角，§2.1.1）。阅读进度使用封面右下角
+ * 封面朝外（设计文档 §2.1）。素封面始终作为底层；有 coverUrl 时在其上加载图片，
+ * 加载中或离线失败时仍保留可识别的书名。阅读进度使用封面右下角
  * 的紧凑圆形百分比，避免在卡片文字区重复显示。直角书脊、页边与底边阴影提供纸书质感。
  */
 @Composable
@@ -101,6 +101,7 @@ fun BookCover(
             },
         contentAlignment = Alignment.Center,
     ) {
+        PlainStampedCover(book, clothColor)
         if (book.coverUrl != null) {
             AsyncImage(
                 model = book.coverUrl,
@@ -108,8 +109,6 @@ fun BookCover(
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
             )
-        } else {
-            PlainStampedCover(book, clothColor)
         }
 
         if (showProgress && book.progress > 0f) {

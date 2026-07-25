@@ -47,8 +47,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.BookRemovalMode
-import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
+import dev.readflow.core.model.hasDownloadedRemoteAsset
+import dev.readflow.core.model.isOfflineReadable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlin.math.abs
@@ -72,15 +73,6 @@ internal fun retainContextMenuAnchor(
     anchorKey: String?,
     currentItemKeys: Collection<String>,
 ): String? = anchorKey?.takeIf(currentItemKeys::contains)
-
-private val BookMeta.canRemoveDownload: Boolean
-    get() = id.startsWith("calibre-") &&
-        downloadStatus == DownloadStatus.DOWNLOADED &&
-        localUri != null
-
-private val BookMeta.isOfflineReadable: Boolean
-    get() = localUri != null &&
-        (!id.startsWith("calibre-") || downloadStatus == DownloadStatus.DOWNLOADED)
 
 internal data class LibraryGridLayout(
     val effectiveWidthDp: Float,
@@ -138,7 +130,7 @@ internal fun libraryGridLayout(widthDp: Float): LibraryGridLayout {
     )
 }
 
-internal fun libraryGridColumns(widthDp: Float): Int = libraryGridLayout(widthDp).columns
+fun libraryGridColumns(widthDp: Float): Int = libraryGridLayout(widthDp).columns
 
 /**
  * 书架网格，支持点击、拖拽重排和封面重合建组预览。
@@ -802,7 +794,7 @@ fun BookGrid(
                                                 },
                                                 leadingIcon = { Icon(Icons.Default.Add, null) },
                                             )
-                                            if (item.book.canRemoveDownload) {
+                                            if (item.book.hasDownloadedRemoteAsset) {
                                                 DropdownMenuItem(
                                                     text = { Text("移除下载") },
                                                     onClick = {

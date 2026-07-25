@@ -279,6 +279,26 @@ class LibraryViewModelTest {
     }
 
     @Test
+    fun offlineFilterRejectsSourceScopedRemoteBookWithoutDownloadedState() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val incompleteRemote = remoteBook(
+            "remote-source-json-book-42-dddddddd",
+            "Incomplete remote",
+        ).copy(localUri = "file:///books/incomplete.epub")
+        val store = FakeLibraryStore(
+            initialItems = listOf(LibraryItem.Single(incompleteRemote)),
+        )
+        val viewModel = viewModel(store = store)
+        advanceUntilIdle()
+
+        viewModel.setLibraryFilter(LibraryFilter.OFFLINE)
+        advanceUntilIdle()
+
+        assertEquals(0, viewModel.uiState.value.offlineCount)
+        assertTrue(viewModel.uiState.value.items.isEmpty())
+    }
+
+    @Test
     fun offlineFilterKeepsBundlesWithOfflineMembersOnly() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val localBook = localBook("local-1", "Local TXT")

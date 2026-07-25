@@ -2213,7 +2213,8 @@ class ReaderSavedStateHandleTest {
         }
         override suspend fun setLastReadAt(id: String, ts: Long) = Unit
         override suspend fun downloadedRemoteCacheBooks(
-            remotePrefix: String,
+            legacyRemotePrefix: String,
+            sourceScopedRemotePrefix: String,
             downloadedStatus: String,
         ): List<DownloadedCacheBook> = emptyList()
         override suspend fun clearDownloadedAsset(id: String, downloadStatus: String) = Unit

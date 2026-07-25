@@ -116,6 +116,19 @@ data class OnlineCatalogFilter(
         get() = author.isBlank() && series.isBlank() && format.isBlank() && tag.isBlank()
 }
 
+/** One source page plus explicit continuation data for complete, adapter-independent browsing. */
+data class OnlineCatalogPage(
+    val entries: List<OnlineCatalogEntry>,
+    val nextOffset: Int,
+    val hasMore: Boolean,
+    /** Raw source entries consumed by this page, including entries removed by client-side filters. */
+    val scannedEntryKeys: Set<String> = entries.mapTo(linkedSetOf(), OnlineCatalogEntry::sourceEntryKey),
+)
+
+fun OnlineCatalogEntry.sourceEntryKey(): String = remoteKey?.let { key ->
+    "${key.sourceId}|${key.remoteId}"
+} ?: "${meta.id}|${series.orEmpty()}|${meta.title}"
+
 /** Application-owned, plain-text preview. No script, HTML, iframe, or external navigation. */
 data class OnlineBookPreview(
     val title: String,
@@ -136,12 +149,54 @@ interface OnlineBookCatalog : AutoCloseable {
         limit: Int = 100,
     ): ReadflowResult<List<OnlineCatalogEntry>>
 
+    /**
+     * Paged search with an explicit continuation signal. The fallback deliberately probes one
+     * empty page at the end so legacy adapters with a source page smaller than [limit] are not cut
+     * off after their first page.
+     */
+    suspend fun searchPage(
+        query: String,
+        filter: OnlineCatalogFilter = OnlineCatalogFilter(),
+        offset: Int = 0,
+        limit: Int = 100,
+    ): ReadflowResult<OnlineCatalogPage> = search(query, filter, offset, limit).toCatalogPage(offset, limit)
+
+    /**
+     * Browse the source without requiring user input. Sources with a native catalog endpoint can
+     * override this; the default keeps legacy adapters compatible by using an empty search query.
+     */
+    suspend fun browse(
+        filter: OnlineCatalogFilter = OnlineCatalogFilter(),
+        offset: Int = 0,
+        limit: Int = 100,
+    ): ReadflowResult<List<OnlineCatalogEntry>> = search("", filter, offset, limit)
+
+    suspend fun browsePage(
+        filter: OnlineCatalogFilter = OnlineCatalogFilter(),
+        offset: Int = 0,
+        limit: Int = 100,
+    ): ReadflowResult<OnlineCatalogPage> = browse(filter, offset, limit).toCatalogPage(offset, limit)
+
     suspend fun download(entry: OnlineCatalogEntry): ReadflowResult<BookMeta>
 
     suspend fun preview(entry: OnlineCatalogEntry): ReadflowResult<OnlineBookPreview> =
         ReadflowResult.Failure(ReadflowError.unsupported("该书源不支持应用内正文预览"))
 
     override fun close() = Unit
+}
+
+private fun ReadflowResult<List<OnlineCatalogEntry>>.toCatalogPage(
+    offset: Int,
+    limit: Int,
+): ReadflowResult<OnlineCatalogPage> = when (this) {
+    is ReadflowResult.Success -> ReadflowResult.Success(
+        OnlineCatalogPage(
+            entries = value,
+            nextOffset = offset.coerceAtLeast(0) + limit.coerceAtLeast(1),
+            hasMore = value.isNotEmpty(),
+        ),
+    )
+    is ReadflowResult.Failure -> this
 }
 
 /** One compile-time adapter implementation. Dispatch is by open [adapterId], never by enum switch. */

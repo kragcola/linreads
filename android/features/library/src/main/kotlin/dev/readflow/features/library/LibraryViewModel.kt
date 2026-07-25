@@ -8,6 +8,7 @@ import dev.readflow.core.calibre.calibreSourceConfigJson
 import dev.readflow.core.calibre.htmlRulesV1ConfigJson
 import dev.readflow.core.calibre.httpCatalogSourceConfigJson
 import dev.readflow.core.calibre.readBoundedSourceConfigBytes
+import dev.readflow.core.calibre.validateCalibreBaseUrl
 import dev.readflow.core.calibre.HtmlChapterRules
 import dev.readflow.core.calibre.HtmlDetailRules
 import dev.readflow.core.calibre.HtmlRulesV1Config
@@ -17,16 +18,18 @@ import dev.readflow.core.model.BookBundle
 import dev.readflow.core.model.BookAssetOperationCoordinator
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.BookRemovalMode
-import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
+import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.model.UncoordinatedBookAssetOperations
+import dev.readflow.core.model.isOfflineReadable
 import dev.readflow.extensions.api.FolderScanner
 import dev.readflow.extensions.api.LocalBookImporter
 import dev.readflow.extensions.api.OnlineBookCatalog
 import dev.readflow.extensions.api.OnlineBookPreview
 import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.OnlineCatalogPage
 import dev.readflow.extensions.api.ScannedBook
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.SourceCredentials
@@ -74,10 +77,15 @@ data class OnlineLibraryUiState(
     val query: String = "",
     val filter: OnlineCatalogFilter = OnlineCatalogFilter(),
     val isSearching: Boolean = false,
+    val isLoadingMore: Boolean = false,
+    val hasMore: Boolean = false,
+    val nextOffset: Int = 0,
+    val catalogRevision: Long = 0,
     val isSelectingBatch: Boolean = false,
     val isDownloadingBatch: Boolean = false,
     val isAddingSource: Boolean = false,
     val results: List<OnlineCatalogEntry> = emptyList(),
+    val scannedEntryKeys: Set<String> = emptySet(),
     val selectedEntryKeys: Set<String> = emptySet(),
     val downloadingKeys: Set<String> = emptySet(),
     val preview: OnlineBookPreview? = null,
@@ -85,6 +93,7 @@ data class OnlineLibraryUiState(
     val error: String? = null,
     val addSourceName: String = "",
     val addSourceUrl: String = "",
+    val sourceUrlError: String? = null,
     val addSourceAdapterId: String = SourceAdapterIds.HTML_RULES_V1,
     val htmlSourceDraft: HtmlSourceDraft = HtmlSourceDraft(),
     val metadataFacets: OnlineMetadataFacets = OnlineMetadataFacets(),
@@ -314,8 +323,12 @@ class LibraryViewModel(
                         state.copy(
                             sources = sources,
                             selectedSourceId = resolvedSelection,
+                            query = if (sourceChanged) "" else state.query,
                             filter = if (sourceChanged) OnlineCatalogFilter() else state.filter,
                             isSearching = if (sourceChanged) false else state.isSearching,
+                            isLoadingMore = if (sourceChanged) false else state.isLoadingMore,
+                            hasMore = if (sourceChanged) false else state.hasMore,
+                            nextOffset = if (sourceChanged) 0 else state.nextOffset,
                             isSelectingBatch = if (sourceChanged) false else state.isSelectingBatch,
                             isDownloadingBatch = if (sourceChanged) false else state.isDownloadingBatch,
                             results = if (sourceChanged) emptyList() else state.results,
@@ -576,11 +589,17 @@ class LibraryViewModel(
         _onlineLibraryState.update {
             it.copy(
                 selectedSourceId = sourceId,
+                query = "",
                 filter = OnlineCatalogFilter(),
                 isSearching = false,
+                isLoadingMore = false,
+                hasMore = false,
+                nextOffset = 0,
+                catalogRevision = it.catalogRevision + 1L,
                 isSelectingBatch = false,
                 isDownloadingBatch = false,
                 results = emptyList(),
+                scannedEntryKeys = emptySet(),
                 metadataFacets = OnlineMetadataFacets(),
                 selectedEntryKeys = emptySet(),
                 downloadingKeys = activeDownloadKeysForSource(sourceId),
@@ -593,7 +612,7 @@ class LibraryViewModel(
 
     fun updateOnlineQuery(query: String) {
         val current = _onlineLibraryState.value
-        if (query != current.query && current.isSearching) {
+        if (query != current.query && (current.isSearching || current.isLoadingMore)) {
             onlineSearchJob?.cancel()
             onlineSearchJob = null
             onlineSearchGeneration += 1L
@@ -602,6 +621,9 @@ class LibraryViewModel(
             it.copy(
                 query = query,
                 isSearching = if (query != current.query) false else it.isSearching,
+                isLoadingMore = if (query != current.query) false else it.isLoadingMore,
+                hasMore = if (query != current.query) false else it.hasMore,
+                nextOffset = if (query != current.query) 0 else it.nextOffset,
                 error = null,
                 message = null,
             )
@@ -622,7 +644,15 @@ class LibraryViewModel(
         onlineBatchSelectionJob?.cancel()
         onlineBatchSelectionJob = null
         onlineBatchSelectionGeneration += 1L
-        _onlineLibraryState.update { it.copy(isSelectingBatch = false) }
+        _onlineLibraryState.update {
+            it.copy(
+                isSelectingBatch = false,
+                isLoadingMore = false,
+                hasMore = false,
+                nextOffset = 0,
+                scannedEntryKeys = emptySet(),
+            )
+        }
         val generation = ++onlineSearchGeneration
         onlineSearchJob = viewModelScope.launch {
             val state = _onlineLibraryState.value
@@ -636,7 +666,13 @@ class LibraryViewModel(
             val query = state.query
             val filter = state.filter
             _onlineLibraryState.update {
-                it.copy(isSearching = true, error = null, message = null, selectedEntryKeys = emptySet())
+                it.copy(
+                    isSearching = true,
+                    isLoadingMore = false,
+                    error = null,
+                    message = null,
+                    selectedEntryKeys = emptySet(),
+                )
             }
             try {
                 when (val opened = registry.openCatalog(sourceId)) {
@@ -646,7 +682,12 @@ class LibraryViewModel(
                     is ReadflowResult.Success -> {
                         val catalog = opened.value
                         try {
-                            when (val result = catalog.search(query, filter)) {
+                            val result = if (query.isBlank()) {
+                                catalog.browsePage(filter, offset = 0, limit = ONLINE_BATCH_PAGE_SIZE)
+                            } else {
+                                catalog.searchPage(query, filter, offset = 0, limit = ONLINE_BATCH_PAGE_SIZE)
+                            }
+                            when (result) {
                                 is ReadflowResult.Success ->
                                     publishSearchSuccess(sourceId, query, result.value, generation)
                                 is ReadflowResult.Failure ->
@@ -660,9 +701,68 @@ class LibraryViewModel(
             } catch (e: CancellationException) {
                 // Source switch / newer search cancelled us; do not leave spinner stuck if we are still current.
                 if (generation == onlineSearchGeneration) {
-                    _onlineLibraryState.update { it.copy(isSearching = false) }
+                    _onlineLibraryState.update { it.copy(isSearching = false, isLoadingMore = false) }
                 }
                 throw e
+            }
+        }
+    }
+
+    fun loadMoreOnlineLibrary() {
+        val registry = sourceRegistry ?: return
+        val snapshot = _onlineLibraryState.value
+        val sourceId = snapshot.selectedSourceId ?: return
+        if (
+            snapshot.isSearching ||
+            snapshot.isLoadingMore ||
+            !snapshot.hasMore
+        ) {
+            return
+        }
+        val query = snapshot.query
+        val filter = snapshot.filter
+        val offset = snapshot.nextOffset
+        val generation = ++onlineSearchGeneration
+        _onlineLibraryState.update { it.copy(isLoadingMore = true, error = null, message = null) }
+        onlineSearchJob = viewModelScope.launch {
+            try {
+                when (val opened = registry.openCatalog(sourceId)) {
+                    is ReadflowResult.Failure -> {
+                        publishLoadMoreFailure(sourceId, query, opened.error.message, generation)
+                    }
+                    is ReadflowResult.Success -> {
+                        val catalog = opened.value
+                        try {
+                            val result = if (query.isBlank()) {
+                                catalog.browsePage(filter, offset = offset, limit = ONLINE_BATCH_PAGE_SIZE)
+                            } else {
+                                catalog.searchPage(query, filter, offset = offset, limit = ONLINE_BATCH_PAGE_SIZE)
+                            }
+                            when (result) {
+                                is ReadflowResult.Success -> publishLoadMoreSuccess(
+                                    sourceId = sourceId,
+                                    query = query,
+                                    offset = offset,
+                                    page = result.value,
+                                    generation = generation,
+                                )
+                                is ReadflowResult.Failure -> publishLoadMoreFailure(
+                                    sourceId,
+                                    query,
+                                    result.error.message,
+                                    generation,
+                                )
+                            }
+                        } finally {
+                            catalog.close()
+                        }
+                    }
+                }
+            } catch (error: CancellationException) {
+                if (generation == onlineSearchGeneration) {
+                    _onlineLibraryState.update { it.copy(isLoadingMore = false) }
+                }
+                throw error
             }
         }
     }
@@ -1136,6 +1236,7 @@ class LibraryViewModel(
                 addSourceName = name ?: state.addSourceName,
                 addSourceUrl = url ?: state.addSourceUrl,
                 addSourceAdapterId = adapterId ?: state.addSourceAdapterId,
+                sourceUrlError = if (url != null || adapterId != null) null else state.sourceUrlError,
             )
         }
     }
@@ -1154,6 +1255,7 @@ class LibraryViewModel(
                     editingSourceId = null,
                     addSourceName = "",
                     addSourceUrl = "",
+                    sourceUrlError = null,
                     addSourceAdapterId = SourceAdapterIds.HTML_RULES_V1,
                     htmlSourceDraft = HtmlSourceDraft(),
                     sourceUsername = "",
@@ -1172,6 +1274,7 @@ class LibraryViewModel(
                 editingSourceId = source.id,
                 addSourceName = source.name,
                 addSourceUrl = source.baseUrl,
+                sourceUrlError = null,
                 addSourceAdapterId = source.adapterId,
                 sourceUsername = "",
                 sourcePassword = "",
@@ -1266,6 +1369,7 @@ class LibraryViewModel(
                 editingSourceId = null,
                 addSourceName = "",
                 addSourceUrl = "",
+                sourceUrlError = null,
                 addSourceAdapterId = SourceAdapterIds.HTML_RULES_V1,
                 htmlSourceDraft = HtmlSourceDraft(),
                 sourceUsername = "",
@@ -1318,7 +1422,16 @@ class LibraryViewModel(
                 _onlineLibraryState.update {
                     it.copy(
                         isAddingSource = false,
-                        error = error.message ?: "书源配置无效",
+                        sourceUrlError = if (state.addSourceAdapterId == SourceAdapterIds.HTML_RULES_V1) {
+                            null
+                        } else {
+                            error.message ?: "书源地址无效"
+                        },
+                        error = if (state.addSourceAdapterId == SourceAdapterIds.HTML_RULES_V1) {
+                            error.message ?: "书源配置无效"
+                        } else {
+                            null
+                        },
                         message = null,
                     )
                 }
@@ -1364,6 +1477,7 @@ class LibraryViewModel(
             when (result) {
                 is ReadflowResult.Success -> {
                     val wasEditing = state.editingSourceId != null
+                    invalidateOnlineSearchForCatalogChange()
                     _onlineLibraryState.update {
                         it.copy(
                             message = if (wasEditing) {
@@ -1375,6 +1489,7 @@ class LibraryViewModel(
                             isAddingSource = false,
                             addSourceName = "",
                             addSourceUrl = "",
+                            sourceUrlError = null,
                             htmlSourceDraft = HtmlSourceDraft(),
                             editingSourceId = null,
                             sourceUsername = "",
@@ -1382,8 +1497,15 @@ class LibraryViewModel(
                             isLoadingSourceCredentials = false,
                             sourceCredentialsLoadFailed = false,
                             selectedSourceId = result.value.id,
+                            query = "",
                             filter = OnlineCatalogFilter(),
+                            isSearching = false,
+                            isLoadingMore = false,
+                            hasMore = false,
+                            nextOffset = 0,
+                            catalogRevision = it.catalogRevision + 1L,
                             results = emptyList(),
+                            scannedEntryKeys = emptySet(),
                             metadataFacets = OnlineMetadataFacets(),
                             selectedEntryKeys = emptySet(),
                         )
@@ -1391,7 +1513,22 @@ class LibraryViewModel(
                     onSuccess()
                 }
                 is ReadflowResult.Failure -> _onlineLibraryState.update {
-                    it.copy(isAddingSource = false, error = result.error.message, message = null)
+                    val addressValidationError = if (
+                        state.addSourceAdapterId == SourceAdapterIds.HTML_RULES_V1
+                    ) {
+                        null
+                    } else {
+                        validateCalibreBaseUrl(state.addSourceUrl).errorMessage
+                    }
+                    val isAddressValidationError =
+                        addressValidationError != null &&
+                            result.error.kind == ReadflowError.Kind.PARSE
+                    it.copy(
+                        isAddingSource = false,
+                        sourceUrlError = addressValidationError.takeIf { isAddressValidationError },
+                        error = result.error.message.takeUnless { isAddressValidationError },
+                        message = null,
+                    )
                 }
             }
         }
@@ -1488,17 +1625,27 @@ class LibraryViewModel(
 
     private fun applySourceConfigImportResult(result: ReadflowResult<SourceDescriptor>) {
         when (result) {
-            is ReadflowResult.Success -> _onlineLibraryState.update {
-                it.copy(
-                    isAddingSource = false,
-                    message = "已导入书源「${result.value.name}」",
-                    error = null,
-                    selectedSourceId = result.value.id,
-                    filter = OnlineCatalogFilter(),
-                    results = emptyList(),
-                    metadataFacets = OnlineMetadataFacets(),
-                    selectedEntryKeys = emptySet(),
-                )
+            is ReadflowResult.Success -> {
+                invalidateOnlineSearchForCatalogChange()
+                _onlineLibraryState.update {
+                    it.copy(
+                        isAddingSource = false,
+                        message = "已导入书源「${result.value.name}」",
+                        error = null,
+                        selectedSourceId = result.value.id,
+                        query = "",
+                        filter = OnlineCatalogFilter(),
+                        isSearching = false,
+                        isLoadingMore = false,
+                        hasMore = false,
+                        nextOffset = 0,
+                        catalogRevision = it.catalogRevision + 1L,
+                        scannedEntryKeys = emptySet(),
+                        results = emptyList(),
+                        metadataFacets = OnlineMetadataFacets(),
+                        selectedEntryKeys = emptySet(),
+                    )
+                }
             }
             is ReadflowResult.Failure -> _onlineLibraryState.update {
                 it.copy(isAddingSource = false, error = result.error.message, message = null)
@@ -1511,21 +1658,30 @@ class LibraryViewModel(
     private fun publishSearchSuccess(
         sourceId: String,
         query: String,
-        entries: List<OnlineCatalogEntry>,
+        page: OnlineCatalogPage,
         generation: Long,
     ) {
         if (generation != onlineSearchGeneration) return
         if (_onlineLibraryState.value.query != query) return
         if (_onlineLibraryState.value.selectedSourceId != sourceId) return
         _onlineLibraryState.update {
+            val entries = page.entries
+            val uniqueEntries = entries.distinctBy(OnlineCatalogEntry::selectionKey)
             it.copy(
                 isSearching = false,
-                results = entries,
-                metadataFacets = buildOnlineMetadataFacets(entries),
-                message = if (entries.isEmpty()) "没有找到匹配的书籍" else null,
+                isLoadingMore = false,
+                hasMore = page.hasMore &&
+                    page.nextOffset > 0 &&
+                    page.scannedEntryKeys.isNotEmpty(),
+                nextOffset = page.nextOffset,
+                results = uniqueEntries,
+                scannedEntryKeys = page.scannedEntryKeys,
+                metadataFacets = buildOnlineMetadataFacets(uniqueEntries),
+                message = if (entries.isEmpty() && query.isNotBlank()) "没有找到匹配的书籍" else null,
                 error = null,
             )
         }
+        continueEmptyFilteredPageIfNeeded()
     }
 
     private fun publishSearchFailure(
@@ -1539,7 +1695,74 @@ class LibraryViewModel(
         if (_onlineLibraryState.value.selectedSourceId != sourceId) return
         if (_onlineLibraryState.value.query != query) return
         _onlineLibraryState.update {
-            it.copy(isSearching = false, error = message, message = null)
+            it.copy(
+                isSearching = false,
+                isLoadingMore = false,
+                hasMore = false,
+                nextOffset = 0,
+                error = message,
+                message = null,
+            )
+        }
+    }
+
+    private fun publishLoadMoreSuccess(
+        sourceId: String,
+        query: String,
+        offset: Int,
+        page: OnlineCatalogPage,
+        generation: Long,
+    ) {
+        if (generation != onlineSearchGeneration) return
+        if (_onlineLibraryState.value.selectedSourceId != sourceId) return
+        if (_onlineLibraryState.value.query != query) return
+        _onlineLibraryState.update { state ->
+            val entries = page.entries
+            val merged = (state.results + entries).distinctBy(OnlineCatalogEntry::selectionKey)
+            val scannedEntryKeys = state.scannedEntryKeys + page.scannedEntryKeys
+            val madeProgress = merged.size > state.results.size ||
+                scannedEntryKeys.size > state.scannedEntryKeys.size
+            state.copy(
+                isLoadingMore = false,
+                hasMore = madeProgress && page.hasMore && page.nextOffset > offset,
+                nextOffset = page.nextOffset,
+                results = merged,
+                scannedEntryKeys = scannedEntryKeys,
+                metadataFacets = buildOnlineMetadataFacets(merged),
+                error = null,
+                message = null,
+            )
+        }
+        continueEmptyFilteredPageIfNeeded()
+    }
+
+    private fun continueEmptyFilteredPageIfNeeded() {
+        val state = _onlineLibraryState.value
+        if (state.results.isEmpty() && state.hasMore && !state.isLoadingMore && !state.isSearching) {
+            loadMoreOnlineLibrary()
+        }
+    }
+
+    private fun invalidateOnlineSearchForCatalogChange() {
+        onlineSearchJob?.cancel()
+        onlineSearchJob = null
+        onlineSearchGeneration += 1L
+        onlineBatchSelectionJob?.cancel()
+        onlineBatchSelectionJob = null
+        onlineBatchSelectionGeneration += 1L
+    }
+
+    private fun publishLoadMoreFailure(
+        sourceId: String,
+        query: String,
+        message: String,
+        generation: Long,
+    ) {
+        if (generation != onlineSearchGeneration) return
+        if (_onlineLibraryState.value.selectedSourceId != sourceId) return
+        if (_onlineLibraryState.value.query != query) return
+        _onlineLibraryState.update {
+            it.copy(isLoadingMore = false, error = message, message = null)
         }
     }
 
@@ -1679,7 +1902,3 @@ private fun List<LibraryItem>.offlineReadableCount(): Int =
             is LibraryItem.Bundle -> item.bundle.books.count { it.isOfflineReadable }
         }
     }
-
-private val BookMeta.isOfflineReadable: Boolean
-    get() = localUri != null &&
-        (!id.startsWith("calibre-") || downloadStatus == DownloadStatus.DOWNLOADED)

@@ -28,6 +28,5 @@ class DownloadedBookCachePlanner(
 
     companion object {
         const val DEFAULT_CACHE_LIMIT = 5
-        const val REMOTE_CACHE_ID_PREFIX = "calibre-"
     }
 }

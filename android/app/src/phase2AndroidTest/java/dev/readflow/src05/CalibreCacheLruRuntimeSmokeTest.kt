@@ -57,7 +57,7 @@ class CalibreCacheLruRuntimeSmokeTest {
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             dismissBlockingDialogs()
             waitForLibraryLoaded()
-            connectCalibreThroughProbe()
+            configureCalibreSource()
 
             openCalibreSearchSheet()
             val downloaded101 = downloadRemoteBook("cache-01", "LRU Remote 01", "calibre-101")
@@ -67,7 +67,7 @@ class CalibreCacheLruRuntimeSmokeTest {
             val downloaded105 = downloadRemoteBook("cache-05", "LRU Remote 05", "calibre-105")
             val evictedFile = checkNotNull(downloaded105.localUri).let(::fileFromUri)
             assertTrue("expected LRU candidate file to exist before trim", evictedFile.isFile)
-            waitForObject(By.text("关闭")).click()
+            waitForObject(By.text("本地书架")).click()
 
             val read101 = openBookAndCaptureLastReadAt(
                 title = "LRU Remote 01",
@@ -95,7 +95,7 @@ class CalibreCacheLruRuntimeSmokeTest {
             val downloaded106 = downloadRemoteBook("cache-06", "LRU Remote 06", "calibre-106")
             assertNotNull(downloaded106.localUri)
             takeScreenshot("after-download-06.png")
-            waitForObject(By.text("关闭")).click()
+            waitForObject(By.text("本地书架")).click()
 
             val evictedBook = waitForBookRow("calibre-105") { book ->
                 book.downloadStatus == NOT_DOWNLOADED && book.localUri == null
@@ -134,7 +134,7 @@ class CalibreCacheLruRuntimeSmokeTest {
             waitForObject(By.text("LRU runtime paragraph 06 proves cached remote reading after download."))
             takeScreenshot("offline-open-protected.png")
             device.pressBack()
-            waitForObject(By.text("书架"))
+            waitForObject(By.text("书库"))
 
             writeTextEvidence(
                 "lru-summary.txt",
@@ -157,20 +157,27 @@ class CalibreCacheLruRuntimeSmokeTest {
         }
     }
 
-    private fun connectCalibreThroughProbe() {
-        waitForObject(By.desc("设置")).click()
+    private fun configureCalibreSource() {
+        waitForObject(By.text("在线书库")).click()
+        waitForObject(By.desc("管理书源")).click()
+        val editCurrent = device.wait(Until.findObject(By.text("编辑当前书源")), 1_000)
+        if (editCurrent != null) {
+            editCurrent.click()
+        } else {
+            waitForObject(By.text("添加书源")).click()
+            waitForObject(By.text("Calibre")).click()
+        }
         waitForObject(By.text("Calibre 服务器地址"))
-        replaceSingleLineText(HOST_ONLY_HINT)
-        waitForObject(By.text("探测常用端口")).click()
-        waitForObject(By.text("已发现 Calibre：10.0.2.2:8081，发现 1 本书"))
-        device.pressBack()
-        waitForLibraryLoaded()
+        replaceSingleLineText(SERVER_BASE_URL)
+        waitForObject(By.text("保存").enabled(true)).click()
+        waitForObject(By.desc("书源选择器"))
+        waitForObject(By.text("LRU Remote 01"))
     }
 
     private fun openCalibreSearchSheet() {
-        waitForObject(By.desc("导入书籍")).click()
         waitForObject(By.text("在线书库")).click()
-        waitForObject(By.text("书源"))
+        waitForObject(By.desc("书源选择器"))
+        waitForObject(By.desc("搜索在线书库")).click()
     }
 
     private fun downloadRemoteBook(
@@ -179,9 +186,9 @@ class CalibreCacheLruRuntimeSmokeTest {
         bookId: String,
     ): BookEntity {
         replaceSingleLineText(query)
-        waitForObject(By.text("搜索")).click()
+        waitForObject(By.desc("执行搜索")).click()
         waitForObject(By.text(title))
-        waitForObject(By.text("下载")).click()
+        waitForObject(By.desc("下载《$title》")).click()
         waitForObject(By.text("已下载《$title》"))
         return waitForBookRow(bookId) { book ->
             book.downloadStatus == DOWNLOADED && !book.localUri.isNullOrBlank()
@@ -253,7 +260,7 @@ class CalibreCacheLruRuntimeSmokeTest {
     }
 
     private fun waitForLibraryLoaded() {
-        waitForObject(By.text("书架"))
+        waitForObject(By.text("书库"))
     }
 
     private fun dismissBlockingDialogs() {
@@ -393,7 +400,6 @@ class CalibreCacheLruRuntimeSmokeTest {
 
     private companion object {
         const val DB_NAME = "readflow.db"
-        const val HOST_ONLY_HINT = "10.0.2.2"
         const val SERVER_BASE_URL = "http://10.0.2.2:8081"
         const val DOWNLOADED = "DOWNLOADED"
         const val NOT_DOWNLOADED = "NOT_DOWNLOADED"

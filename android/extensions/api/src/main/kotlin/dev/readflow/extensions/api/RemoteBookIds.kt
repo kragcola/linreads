@@ -1,5 +1,6 @@
 package dev.readflow.extensions.api
 
+import dev.readflow.core.model.SOURCE_SCOPED_REMOTE_BOOK_ID_PREFIX
 import java.security.MessageDigest
 
 /**
@@ -13,7 +14,7 @@ fun stableRemoteBookId(sourceId: String, remoteId: String): String {
     val safeSource = sanitizeIdSegment(sourceId, maxLen = 24)
     val safeRemote = sanitizeIdSegment(remoteId, maxLen = 40)
     val hash8 = sha256Prefix8("$sourceId\u0000$remoteId")
-    return "remote-$safeSource-$safeRemote-$hash8"
+    return "$SOURCE_SCOPED_REMOTE_BOOK_ID_PREFIX$safeSource-$safeRemote-$hash8"
 }
 
 private fun sanitizeIdSegment(value: String, maxLen: Int): String =

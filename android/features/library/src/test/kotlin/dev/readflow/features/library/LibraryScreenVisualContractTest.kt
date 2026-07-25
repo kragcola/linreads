@@ -40,71 +40,85 @@ class LibraryScreenVisualContractTest {
     }
 
     @Test
-    fun `online library uses dedicated preview and structured source editor`() {
+    fun `online library is a peer full page bookshelf instead of a search sheet`() {
         val source = libraryScreenSource()
-        val sheet = source.substringAfter("private fun OnlineLibrarySheet(")
-            .substringBefore("private fun OnlineBookPreviewWindow(")
-        val resultRow = source.substringAfter("private fun OnlineCatalogResultRow(")
+        val page = onlineLibraryPageSource()
+        val card = page.substringAfter("private fun OnlineCatalogBookCard(")
 
-        // --- Reject obsolete chrome ---
-        assertFalse(
-            "online library must not keep a horizontal source chip strip",
-            sheet.contains("horizontalScroll(rememberScrollState())"),
+        assertTrue(
+            "local and online libraries must be peer destinations in the library screen",
+            source.contains("enum class LibraryPage") &&
+                source.contains("PrimaryTabRow(") &&
+                source.contains("Text(\"本地书架\"") &&
+                source.contains("Text(\"在线书库\""),
         )
         assertFalse(
-            "catalog result actions must not use a FlowRow action strip",
-            resultRow.contains("FlowRow("),
+            "the online destination itself must not be presented as a modal bottom sheet",
+            source.contains("private fun OnlineLibrarySheet("),
         )
         assertFalse(
-            "online preview must stay inside LinReads instead of launching an external browser",
-            source.contains("Intent.ACTION_VIEW"),
+            "online catalog must not be constrained to the old 280dp search-result viewport",
+            page.contains("heightIn(max = 280.dp)"),
+        )
+        assertTrue(
+            "the online destination must own the remaining page and render an adaptive shelf grid",
+            page.contains("Modifier.fillMaxSize()") &&
+                page.contains("LazyVerticalGrid(") &&
+                page.contains("OnlineCatalogBookCard("),
+        )
+        assertTrue(
+            "entering the online page must load its catalog without a search submission",
+            source.contains("selectedPage == LibraryPage.ONLINE") &&
+                source.contains("onlineLibraryState.results.isEmpty()") &&
+                source.contains("onlineLibraryState.catalogRevision") &&
+                source.contains("viewModel.searchOnlineLibrary()"),
+        )
+        assertTrue(
+            "online books must reuse the established shelf cover presentation",
+            card.contains("BookCover(") &&
+                card.contains("aspectRatio(Dimens.coverAspectRatio)") &&
+                card.contains("book.title") &&
+                card.contains("book.author"),
+        )
+        assertTrue(
+            "search and filtering must remain auxiliary collapsed tools",
+            page.contains("searchExpanded") &&
+                page.contains("filtersExpanded") &&
+                page.contains("contentDescription = \"搜索在线书库\"") &&
+                page.contains("contentDescription = \"筛选在线书库\""),
         )
         assertFalse(
-            "users must never edit raw HTML-rule JSON in the UI",
-            source.contains("HTML 规则 JSON"),
+            "the default online page must not instruct users to search before books appear",
+            page.contains("输入书名或作者开始搜索") || page.contains("选择书源后即可搜索"),
         )
-        assertFalse(
-            "the empty shelf must not keep Calibre as the primary online-library action",
-            source.contains("onConnectCalibre = onSettings"),
-        )
-        assertFalse(
-            "saving must not hide validation errors by closing the editor immediately",
-            source.contains("viewModel.addOnlineSource()\n                    showSourceEditor = false"),
-        )
+    }
 
-        // --- Single source selector ---
+    @Test
+    fun `online library keeps source management downloads and accessible selection`() {
+        val source = libraryScreenSource()
+        val page = onlineLibraryPageSource()
+        val card = page.substringAfter("private fun OnlineCatalogBookCard(")
+
         assertTrue(
             "online library must expose exactly one ExposedDropdownMenuBox source selector",
-            sheet.contains("ExposedDropdownMenuBox(") &&
-                sheet.split("ExposedDropdownMenuBox(").size - 1 == 1,
+            page.contains("ExposedDropdownMenuBox(") &&
+                page.split("ExposedDropdownMenuBox(").size - 1 == 1,
         )
         assertTrue(
             "source selector must be labeled for assistive tech",
-            sheet.contains("contentDescription = \"书源选择器\""),
-        )
-        assertFalse(
-            "selected source name must not be repeated above the labeled selector",
-            sheet.contains("selected?.let { Text(it.name, style = MaterialTheme.typography.titleSmall) }"),
+            page.contains("contentDescription = \"书源选择器\""),
         )
 
-        // --- Compact source management ---
         assertTrue(
             "add, import, and delete must live in one 48dp source-management menu",
-            sheet.contains("sourceActionsExpanded") &&
-                sheet.contains("contentDescription = \"管理书源\"") &&
-                sheet.contains("text = { Text(\"添加书源\") }") &&
-                sheet.contains("text = { Text(\"导入 JSON\") }") &&
-                sheet.contains("text = { Text(\"删除当前书源\") }") &&
-                sheet.contains(".size(48.dp)"),
-        )
-        assertFalse(
-            "source management must not consume the sheet footer with parallel action buttons",
-            sheet.contains("modifier = Modifier.weight(1f)") &&
-                sheet.contains("Text(\"添加书源\")") &&
-                sheet.contains("Text(\"导入 JSON\")"),
+            page.contains("sourceActionsExpanded") &&
+                page.contains("contentDescription = \"管理书源\"") &&
+                page.contains("text = { Text(\"添加书源\") }") &&
+                page.contains("text = { Text(\"导入 JSON\") }") &&
+                page.contains("text = { Text(\"删除当前书源\") }") &&
+                page.contains(".size(Dimens.touchTarget)"),
         )
 
-        // --- JSON document import ---
         assertTrue(
             "document picker must accept JSON source-config MIME types",
             source.contains("SOURCE_CONFIG_MIMES") &&
@@ -112,90 +126,63 @@ class LibraryScreenVisualContractTest {
                 source.contains("ActivityResultContracts.OpenDocument()"),
         )
         assertTrue(
-            "online sheet must offer a JSON import action wired to the document launcher",
-            sheet.contains("onImportSourceConfig") &&
-                sheet.contains("导入 JSON") &&
-                sheet.contains("contentDescription = \"导入书源配置\""),
+            "online page must offer a JSON import action wired to the document launcher",
+            page.contains("onImportSourceConfig") && page.contains("导入 JSON"),
         )
         assertTrue(
             "picked config files must go through ViewModel import, never raw open",
             source.contains("viewModel.importSourceConfigFromUri(context, it)"),
         )
 
-        // --- 48dp accessible trailing search icon ---
         assertTrue(
-            "search field must host a trailing IconButton with 48dp touch target",
-            sheet.contains("trailingIcon = {") &&
-                sheet.contains(".size(48.dp)") &&
-                sheet.contains("Icons.Default.Search") &&
-                sheet.contains("contentDescription = \"搜索\""),
+            "multi-select must be an explicit secondary mode with an accessible state",
+            page.contains("selectionMode") &&
+                page.contains("contentDescription = \"多选书籍\"") &&
+                page.contains("stateDescription = if (selectionMode) \"已开启\" else \"已关闭\""),
         )
         assertTrue(
-            "the inner search icon must not duplicate the IconButton announcement",
-            sheet.substringAfter("imageVector = Icons.Default.Search")
-                .substringBefore(")")
-                .contains("contentDescription = null"),
+            "selection controls must remain 48dp and expose the selected state",
+            card.contains("Checkbox(") &&
+                card.contains(".size(Dimens.touchTarget)") &&
+                card.contains(".toggleable(") &&
+                card.contains("stateDescription = if (selected) \"已选择\" else \"未选择\"") &&
+                card.contains("onCheckedChange = null"),
         )
         assertTrue(
-            "the keyboard search action must submit through the same guarded callback",
-            sheet.contains("KeyboardOptions(imeAction = ImeAction.Search)") &&
-                sheet.contains("KeyboardActions(onSearch =") &&
-                sheet.contains("if (!state.isSearching) onSearch()"),
+            "metadata filters must scroll in a separate sheet instead of shrinking the bookshelf",
+            page.contains("ModalBottomSheet(") &&
+                page.contains("LazyColumn(") &&
+                page.contains("Text(\"筛选书目\"") &&
+                !page.substringBefore("OnlineLibraryStatus(state)").contains("OnlineMetadataFacetRow("),
+        )
+        assertTrue(
+            "author and series batch actions must reveal the selection state immediately",
+            page.contains("onAuthorBatch = { author ->") &&
+                page.contains("onSeriesBatch = {") &&
+                page.split("selectionMode = true").size - 1 >= 2,
+        )
+        assertTrue(
+            "book metadata must reflow instead of clipping title and author in a fixed height",
+            card.contains("heightIn(min = 64.dp)") && !card.contains("height(58.dp)"),
+        )
+        assertTrue(
+            "download remains available from every downloadable book card",
+            card.contains("contentDescription = downloadLabel") &&
+                card.contains("enabled = downloadEnabled && !isDownloading"),
+        )
+        assertTrue(
+            "batch download must remain available without replacing the bookshelf",
+            page.contains("onDownloadSelected") &&
+                page.contains("已选 ${'$'}{state.selectedEntryKeys.size} 本") &&
+                page.contains("下载所选"),
         )
 
-        // --- Collapsible secondary filters ---
-        assertTrue(
-            "secondary filters must be collapsible behind an expand control",
-            sheet.contains("filtersExpanded") &&
-                sheet.contains("筛选条件") &&
-                sheet.contains("收起筛选"),
-        )
-        assertTrue(
-            "filter fields only render when expanded",
-            sheet.contains("if (filtersExpanded)") &&
-                sheet.contains("stateDescription = if (filtersExpanded) \"已展开\" else \"已收起\""),
-        )
-
-        // --- Checkbox selection + row overflow menu ---
-        assertTrue(
-            "catalog multi-select must use Checkbox",
-            resultRow.contains("Checkbox("),
-        )
-        assertFalse(
-            "catalog selection must not consume row width with a text toggle button",
-            resultRow.contains("OutlinedButton(onClick = onToggleSelect)"),
-        )
-        assertTrue(
-            "each result row must expose a 48dp overflow menu for secondary actions",
-            resultRow.contains("overflowExpanded") &&
-                resultRow.contains("Icons.Default.MoreVert") &&
-                resultRow.contains("DropdownMenu(") &&
-                resultRow.contains(".size(48.dp)"),
-        )
-        assertTrue(
-            "single-book download must use a fixed 48dp icon control on narrow screens",
-            resultRow.contains("Icons.Default.KeyboardArrowDown") &&
-                resultRow.contains("contentDescription = downloadLabel") &&
-                resultRow.contains(".size(48.dp)"),
-        )
-        assertFalse(
-            "single-book download must not reserve row width for a text button",
-            resultRow.contains("Text(if (isDownloading) \"下载中\" else \"下载\")"),
-        )
-
-        // --- Delete confirmation ---
         assertTrue(
             "source deletion must require AlertDialog confirmation",
-            sheet.contains("AlertDialog(") &&
-                sheet.contains("pendingDeleteSourceId") &&
-                sheet.contains("删除书源") &&
-                sheet.contains("此操作不可撤销"),
-        )
-
-        // --- Preview / editor / scroll / capability gates (kept from prior contract) ---
-        assertTrue(
-            "the tall online-library sheet must scroll vertically",
-            sheet.contains(".verticalScroll(rememberScrollState())"),
+            page.contains("AlertDialog(") &&
+                page.contains("pendingDeleteSourceId") &&
+                page.contains("删除书源") &&
+                page.contains("此操作不可撤销"),
         )
         assertTrue(
             "application-owned text preview must use a separate dismissible full-window surface",
@@ -205,7 +192,7 @@ class LibraryScreenVisualContractTest {
         )
         assertTrue(
             "download actions must remain gated by adapter capability",
-            sheet.contains("canDownload = selected?.capabilities?.canDownload == true"),
+            page.contains("canDownload = selectedSource?.capabilities?.canDownload == true"),
         )
         assertTrue(
             "source configuration must use a separate structured editor",
@@ -224,26 +211,22 @@ class LibraryScreenVisualContractTest {
                     .contains("horizontalScroll(rememberScrollState())"),
         )
         assertTrue(
-            "the empty shelf must open the generic online library directly",
-            source.contains("onOpenOnlineLibrary = { showOnlineLibrary = true }"),
-        )
-        assertTrue(
             "the source editor must close only after the registry accepts the source",
             source.contains("viewModel.saveOnlineSource { showSourceEditor = false }"),
         )
         assertTrue(
             "online-library errors must expose a stable accessible semantic label",
-            source.contains("在线书库错误：\$statusError"),
+            page.contains("在线书库错误："),
         )
         assertTrue(
             "batch download must expose and honor one stable in-progress state",
-            sheet.contains("enabled = !state.isDownloadingBatch") &&
-                sheet.contains("if (state.isDownloadingBatch) \"下载中\" else \"下载所选\""),
+            page.contains("enabled = !state.isDownloadingBatch") &&
+                page.contains("if (state.isDownloadingBatch) \"下载中\" else \"下载所选\""),
         )
         assertTrue(
             "single-download actions must remain visible but disabled during a batch",
-            sheet.contains("downloadEnabled = !state.isDownloadingBatch") &&
-                resultRow.contains("enabled = downloadEnabled && !isDownloading"),
+            page.contains("downloadEnabled = !state.isDownloadingBatch") &&
+                card.contains("enabled = downloadEnabled && !isDownloading"),
         )
     }
 
@@ -288,38 +271,6 @@ class LibraryScreenVisualContractTest {
         )
     }
 
-    @Test
-    fun `online library empty states stay compact and immediately dismissible`() {
-        val sheet = libraryScreenSource()
-            .substringAfter("private fun OnlineLibrarySheet(")
-            .substringBefore("private fun OnlineBookPreviewWindow(")
-
-        assertFalse(
-            "an empty catalog must not reserve a fixed 280dp result viewport",
-            sheet.contains(".height(280.dp)"),
-        )
-        assertTrue(
-            "the sheet title bar must expose an always-visible 48dp close action",
-            sheet.contains("contentDescription = \"关闭在线书库\"") &&
-                sheet.substringBefore("Text(\"书源\"")
-                    .contains(".size(48.dp)"),
-        )
-        assertTrue(
-            "a source-less catalog must show a compact primary action",
-            sheet.contains("if (state.sources.isEmpty())") &&
-                sheet.contains("Text(\"添加第一个书源\")"),
-        )
-        assertTrue(
-            "the bounded result list must only exist when results are available",
-            sheet.contains("if (state.results.isNotEmpty())") &&
-                sheet.contains(".heightIn(max = 280.dp)"),
-        )
-        assertFalse(
-            "dismiss must not be pushed below the catalog as a footer text button",
-            sheet.contains("TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End))"),
-        )
-    }
-
     private fun libraryScreenSource(): String {
         val workingDir = File(System.getProperty("user.dir") ?: ".")
         val candidates = listOf(
@@ -329,5 +280,16 @@ class LibraryScreenVisualContractTest {
         )
         return candidates.firstOrNull(File::isFile)?.readText()
             ?: error("LibraryScreen.kt not found from ${workingDir.absolutePath}")
+    }
+
+    private fun onlineLibraryPageSource(): String {
+        val workingDir = File(System.getProperty("user.dir") ?: ".")
+        val candidates = listOf(
+            File(workingDir, "src/main/kotlin/dev/readflow/features/library/OnlineLibraryPage.kt"),
+            File(workingDir, "features/library/src/main/kotlin/dev/readflow/features/library/OnlineLibraryPage.kt"),
+            File(workingDir, "android/features/library/src/main/kotlin/dev/readflow/features/library/OnlineLibraryPage.kt"),
+        )
+        return candidates.firstOrNull(File::isFile)?.readText()
+            ?: error("OnlineLibraryPage.kt not found from ${workingDir.absolutePath}")
     }
 }

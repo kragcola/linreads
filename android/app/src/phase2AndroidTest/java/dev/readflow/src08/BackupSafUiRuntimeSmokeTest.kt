@@ -300,7 +300,7 @@ class BackupSafUiRuntimeSmokeTest {
     }
 
     private fun openSettings() {
-        waitForObject(By.text("书架"))
+        waitForObject(By.text("书库"))
         clickObject(By.desc("设置"))
         waitForObject(By.text("设置"))
     }

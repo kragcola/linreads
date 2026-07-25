@@ -9,12 +9,14 @@ import dev.readflow.extensions.api.OnlineBookCatalog
 import dev.readflow.extensions.api.OnlineBookPreview
 import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.OnlineCatalogPage
 import dev.readflow.extensions.api.RemoteBookKey
 import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.BUILTIN_CALIBRE_SOURCE_ID
 import dev.readflow.extensions.api.applyCatalogFilter
 import dev.readflow.extensions.api.stableRemoteBookId
+import dev.readflow.extensions.api.sourceEntryKey
 import java.io.File
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -70,9 +72,22 @@ class CalibreOnlineCatalog(
         filter: OnlineCatalogFilter,
         offset: Int,
         limit: Int,
-    ): ReadflowResult<List<OnlineCatalogEntry>> =
+    ): ReadflowResult<List<OnlineCatalogEntry>> = when (
+        val result = searchPage(query, filter, offset, limit)
+    ) {
+        is ReadflowResult.Success -> ReadflowResult.Success(result.value.entries)
+        is ReadflowResult.Failure -> result
+    }
+
+    override suspend fun searchPage(
+        query: String,
+        filter: OnlineCatalogFilter,
+        offset: Int,
+        limit: Int,
+    ): ReadflowResult<OnlineCatalogPage> =
         runCatching {
-            val ids = client.search(query, limit, offset).book_ids
+            val searchResult = client.search(query, limit, offset)
+            val ids = searchResult.book_ids
             val metadataPermits = Semaphore(METADATA_REQUEST_CONCURRENCY)
             val entries = coroutineScope {
                 ids.map { id ->
@@ -98,11 +113,24 @@ class CalibreOnlineCatalog(
                     }
                 }.awaitAll()
             }
-            ReadflowResult.Success(entries.applyCatalogFilter(filter))
+            ReadflowResult.Success(
+                OnlineCatalogPage(
+                    entries = entries.applyCatalogFilter(filter),
+                    nextOffset = offset.coerceAtLeast(0) + ids.size,
+                    hasMore = ids.isNotEmpty() && offset.coerceAtLeast(0) + ids.size < searchResult.total_num,
+                    scannedEntryKeys = entries.mapTo(linkedSetOf(), OnlineCatalogEntry::sourceEntryKey),
+                ),
+            )
         }.getOrElse { error ->
             if (error is CancellationException) throw error
             ReadflowResult.Failure(error.toCalibreReadflowError())
         }
+
+    override suspend fun browsePage(
+        filter: OnlineCatalogFilter,
+        offset: Int,
+        limit: Int,
+    ): ReadflowResult<OnlineCatalogPage> = searchPage("", filter, offset, limit)
 
     override suspend fun download(entry: OnlineCatalogEntry): ReadflowResult<BookMeta> =
         runCatching {

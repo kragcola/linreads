@@ -65,6 +65,47 @@ class DownloadedBookCacheTest {
     }
 
     @Test
+    fun removeDownloadedAssetDeletesSourceScopedRemoteFileAndKeepsBookRow() = runTest {
+        val dao = FakeBookDao()
+        val file = temp.newFile("source-remote.epub")
+        val bookId = "remote-source-json-book-42-aaaaaaaa"
+        dao.upsert(cachedEntity(bookId, file.toURI().toString(), lastReadAt = 100))
+        val cache = DownloadedBookCache(bookDao = dao)
+
+        val eviction = cache.removeDownloadedAsset(bookId)
+
+        assertEquals(bookId, eviction?.bookId)
+        assertEquals(file.toURI().toString(), eviction?.localUri)
+        assertFalse(file.exists())
+        assertEquals(DownloadStatus.NOT_DOWNLOADED.name, dao.book(bookId)?.downloadStatus)
+        assertNull(dao.book(bookId)?.localUri)
+        assertEquals(bookId, dao.book(bookId)?.id)
+    }
+
+    @Test
+    fun trimManagesLegacyAndSourceScopedRemoteBooksButLeavesLocalImportsAlone() = runTest {
+        val dao = FakeBookDao()
+        val legacyFile = temp.newFile("legacy-kept.epub")
+        val sourceRemoteFile = temp.newFile("source-remote-old.epub")
+        val localFile = temp.newFile("local-import.epub")
+        val sourceRemoteId = "remote-source-opds-book-7-bbbbbbbb"
+        dao.upsert(cachedEntity("calibre-kept", legacyFile.toURI().toString(), lastReadAt = 200))
+        dao.upsert(cachedEntity(sourceRemoteId, sourceRemoteFile.toURI().toString(), lastReadAt = 100))
+        dao.upsert(cachedEntity("local-import", localFile.toURI().toString(), lastReadAt = 50))
+        val cache = DownloadedBookCache(bookDao = dao, cacheLimit = 1)
+
+        val evictions = cache.trim(protectedBookId = "calibre-kept")
+
+        assertEquals(listOf(sourceRemoteId), evictions.map { it.bookId })
+        assertTrue(legacyFile.exists())
+        assertFalse(sourceRemoteFile.exists())
+        assertTrue(localFile.exists())
+        assertEquals(DownloadStatus.NOT_DOWNLOADED.name, dao.book(sourceRemoteId)?.downloadStatus)
+        assertEquals(DownloadStatus.DOWNLOADED.name, dao.book("local-import")?.downloadStatus)
+        assertEquals(localFile.toURI().toString(), dao.book("local-import")?.localUri)
+    }
+
+    @Test
     fun removeDownloadedAssetIgnoresLocalImports() = runTest {
         val dao = FakeBookDao()
         val file = temp.newFile("local.epub")
@@ -96,6 +137,71 @@ class DownloadedBookCacheTest {
         repository.upsertBook(book)
 
         assertEquals(listOf("calibre-42"), cache.protectedBookIds)
+    }
+
+    @Test
+    fun repositoryTrimsCacheAfterSourceScopedRemoteUpsert() = runTest {
+        val dao = FakeBookDao()
+        val cache = RecordingCache()
+        val repository = LibraryRepository(dao, cache)
+        val bookId = "remote-source-html-book-9-cccccccc"
+        val book = BookMeta(
+            id = bookId,
+            title = "Remote",
+            author = "Author",
+            format = BookFormat.EPUB,
+            downloadStatus = DownloadStatus.DOWNLOADED,
+            localUri = "file:///books/$bookId.epub",
+        )
+
+        repository.upsertBook(book)
+
+        assertEquals(listOf(bookId), cache.protectedBookIds)
+    }
+
+    @Test
+    fun repositorySerializesDownloadedRemoteUpsertWithItsCacheTrim() = runTest {
+        val dao = FakeBookDao()
+        val firstTrimStarted = CompletableDeferred<Unit>()
+        val allowFirstTrimToFinish = CompletableDeferred<Unit>()
+        val trimCalls = mutableListOf<String?>()
+        val cache = object : DownloadedBookCacheStore {
+            override suspend fun trim(protectedBookId: String?): List<DownloadedCacheEviction> {
+                trimCalls += protectedBookId
+                if (protectedBookId == "remote-source-a-book-1-aaaaaaaa") {
+                    firstTrimStarted.complete(Unit)
+                    allowFirstTrimToFinish.await()
+                }
+                return emptyList()
+            }
+
+            override suspend fun removeDownloadedAsset(bookId: String): DownloadedCacheEviction? = null
+        }
+        val repository = LibraryRepository(dao, cache)
+        val first = launch {
+            repository.upsertBook(downloadedRemoteBook("remote-source-a-book-1-aaaaaaaa"))
+        }
+        firstTrimStarted.await()
+
+        val second = launch {
+            repository.upsertBook(downloadedRemoteBook("remote-source-a-book-2-bbbbbbbb"))
+        }
+        yield()
+
+        assertEquals(
+            listOf("remote-source-a-book-1-aaaaaaaa"),
+            trimCalls,
+        )
+        allowFirstTrimToFinish.complete(Unit)
+        first.join()
+        second.join()
+        assertEquals(
+            listOf(
+                "remote-source-a-book-1-aaaaaaaa",
+                "remote-source-a-book-2-bbbbbbbb",
+            ),
+            trimCalls,
+        )
     }
 
     @Test
@@ -417,6 +523,15 @@ class DownloadedBookCacheTest {
         lastReadAt = lastReadAt,
     )
 
+    private fun downloadedRemoteBook(id: String) = BookMeta(
+        id = id,
+        title = id,
+        author = "Author",
+        format = BookFormat.EPUB,
+        downloadStatus = DownloadStatus.DOWNLOADED,
+        localUri = "file:///books/$id.epub",
+    )
+
     private class RecordingCache : DownloadedBookCacheStore {
         val protectedBookIds = mutableListOf<String?>()
         val removedBookIds = mutableListOf<String>()
@@ -470,10 +585,15 @@ class DownloadedBookCacheTest {
             books[id]?.let { books[id] = it.copy(lastReadAt = ts) }
         }
         override suspend fun downloadedRemoteCacheBooks(
-            remotePrefix: String,
+            legacyRemotePrefix: String,
+            sourceScopedRemotePrefix: String,
             downloadedStatus: String,
         ): List<DownloadedCacheBook> = books.values
-            .filter { it.id.startsWith(remotePrefix) && it.downloadStatus == downloadedStatus && it.localUri != null }
+            .filter {
+                (it.id.startsWith(legacyRemotePrefix) || it.id.startsWith(sourceScopedRemotePrefix)) &&
+                    it.downloadStatus == downloadedStatus &&
+                    it.localUri != null
+            }
             .map { DownloadedCacheBook(it.id, it.localUri, it.lastReadAt) }
         override suspend fun clearDownloadedAsset(id: String, downloadStatus: String) {
             books[id]?.let { books[id] = it.copy(downloadStatus = downloadStatus, localUri = null) }

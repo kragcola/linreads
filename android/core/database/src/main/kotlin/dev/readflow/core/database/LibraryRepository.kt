@@ -5,6 +5,7 @@ import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.LibraryItem
+import dev.readflow.core.model.hasDownloadedRemoteAsset
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
@@ -37,6 +38,7 @@ class LibraryRepository(
 ) : LibraryStore {
 
     private val shelfWriteMutex = Mutex()
+    private val remoteCacheWriteMutex = Mutex()
 
     override fun observeShelf(): Flow<List<LibraryItem>> = flow {
         shelfWriteMutex.withLock { bookDao.normalizeShelfOrderIfNeeded() }
@@ -49,6 +51,17 @@ class LibraryRepository(
 
     override suspend fun count(): Int = bookDao.count()
     override suspend fun upsertBook(book: BookMeta) {
+        if (book.hasDownloadedRemoteAsset) {
+            remoteCacheWriteMutex.withLock {
+                upsertBookOnShelf(book)
+                downloadedBookCache.trim(protectedBookId = book.id)
+            }
+        } else {
+            upsertBookOnShelf(book)
+        }
+    }
+
+    private suspend fun upsertBookOnShelf(book: BookMeta) {
         shelfWriteMutex.withLock {
             bookDao.normalizeShelfOrderIfNeeded()
             val existing = bookDao.getById(book.id)
@@ -60,10 +73,21 @@ class LibraryRepository(
             }
             bookDao.upsert(ordered)
         }
-        trimCacheIfDownloadedRemote(book)
     }
 
     override suspend fun upsertAll(books: List<BookMeta>) {
+        val protectedBookId = books.lastOrNull { it.hasDownloadedRemoteAsset }?.id
+        if (protectedBookId != null) {
+            remoteCacheWriteMutex.withLock {
+                upsertAllOnShelf(books)
+                downloadedBookCache.trim(protectedBookId)
+            }
+        } else {
+            upsertAllOnShelf(books)
+        }
+    }
+
+    private suspend fun upsertAllOnShelf(books: List<BookMeta>) {
         shelfWriteMutex.withLock {
             bookDao.normalizeShelfOrderIfNeeded()
             var nextSortOrder = (bookDao.maxSortOrder() ?: -1) + 1
@@ -74,7 +98,6 @@ class LibraryRepository(
             }
             bookDao.upsertAll(entities)
         }
-        books.lastOrNull { it.isDownloadedRemoteCacheBook() }?.let { downloadedBookCache.trim(it.id) }
     }
     override suspend fun deleteBook(id: String) {
         shelfWriteMutex.withLock { bookDao.deleteById(id) }
@@ -155,17 +178,7 @@ class LibraryRepository(
         return items
     }
 
-    private suspend fun trimCacheIfDownloadedRemote(book: BookMeta) {
-        if (book.isDownloadedRemoteCacheBook()) {
-            downloadedBookCache.trim(protectedBookId = book.id)
-        }
-    }
 }
-
-private fun BookMeta.isDownloadedRemoteCacheBook(): Boolean =
-    id.startsWith(DownloadedBookCachePlanner.REMOTE_CACHE_ID_PREFIX) &&
-        downloadStatus == DownloadStatus.DOWNLOADED &&
-        localUri != null
 
 private fun BookWithProgress.toMeta() = BookMeta(
     id = book.id, title = book.title, author = book.author,

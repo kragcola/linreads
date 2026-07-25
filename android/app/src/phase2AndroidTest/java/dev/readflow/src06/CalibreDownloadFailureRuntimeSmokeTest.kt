@@ -60,24 +60,24 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             waitForLibraryLoaded()
             connectCalibreThroughExplicitUrl()
 
-            waitForObject(By.desc("导入书籍")).click()
             waitForObject(By.text("在线书库")).click()
-            waitForObject(By.text("书源"))
+            waitForObject(By.desc("书源选择器"))
+            waitForObject(By.desc("搜索在线书库")).click()
 
             replaceSingleLineText("smoke")
-            waitForObject(By.text("搜索")).click()
+            waitForObject(By.desc("执行搜索")).click()
             waitForObject(By.text("Remote EPUB Smoke"))
             takeScreenshot("search-result-before-server-loss.png")
 
             shutdownFakeCalibreServer()
             waitForCalibreServerUnavailable()
-            waitForObject(By.text("下载")).click()
+            waitForObject(By.desc("下载《Remote EPUB Smoke》")).click()
             val errorText = waitForObject(By.descContains("在线书库错误："))
                 .contentDescription
                 .orEmpty()
                 .removePrefix("在线书库错误：")
             assertTrue("download failure must expose a useful error", errorText.isNotBlank())
-            waitForObject(By.text("下载"))
+            waitForObject(By.desc("下载《Remote EPUB Smoke》"))
             takeScreenshot("download-failure-message.png")
 
             val failedBook = latestBook("calibre-42")
@@ -88,7 +88,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             assertNull("failed download must not create a shelf row", failedBook)
             assertTrue("failed download must not leave a partial calibre-42 file", orphanFiles.isEmpty())
 
-            device.pressBack()
+            waitForObject(By.text("本地书架")).click()
             waitForLibraryLoaded()
             waitForObject(By.text("还没有书"))
             waitForObject(By.text("从在线书库下载，或导入本地文件"))
@@ -118,13 +118,15 @@ class CalibreDownloadFailureRuntimeSmokeTest {
         }
 
     private fun connectCalibreThroughExplicitUrl() {
-        waitForObject(By.desc("设置")).click()
+        waitForObject(By.text("在线书库")).click()
+        waitForObject(By.desc("管理书源")).click()
+        waitForObject(By.text("添加书源")).click()
+        waitForObject(By.text("Calibre")).click()
         waitForObject(By.text("Calibre 服务器地址"))
         replaceSingleLineText(calibreBaseUrl)
-        waitForObject(By.text("测试连接")).click()
-        waitForObject(By.text("已连接到 Calibre，发现 1 本书"))
-        device.pressBack()
-        waitForLibraryLoaded()
+        waitForObject(By.text("保存").enabled(true)).click()
+        waitForObject(By.desc("书源选择器"))
+        waitForObject(By.text("Remote EPUB Smoke"))
     }
 
     private fun resetTargetAppState() {
@@ -157,7 +159,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
     }
 
     private fun waitForLibraryLoaded() {
-        waitForObject(By.text("书架"))
+        waitForObject(By.text("书库"))
     }
 
     private fun dismissBlockingDialogs() {

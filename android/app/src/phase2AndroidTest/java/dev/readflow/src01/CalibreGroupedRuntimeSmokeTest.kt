@@ -23,6 +23,7 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.After
@@ -46,13 +47,6 @@ class CalibreGroupedRuntimeSmokeTest {
     private val device = UiDevice.getInstance(instrumentation)
     private val calibreBaseUrl: String =
         arguments.getString(ARG_CALIBRE_BASE_URL) ?: DEFAULT_SERVER_BASE_URL
-    private val calibreHostHint: String =
-        arguments.getString(ARG_CALIBRE_HOST_HINT) ?: DEFAULT_HOST_ONLY_HINT
-    private val calibreUsesDefaultProbe: Boolean =
-        calibreBaseUrl == DEFAULT_SERVER_BASE_URL && calibreHostHint == DEFAULT_HOST_ONLY_HINT
-    private val calibreDisplayAddress: String =
-        calibreBaseUrl.removePrefix("http://").removePrefix("https://")
-
     @Before
     fun setUp() {
         if (!hasInitializedProcessState) {
@@ -70,32 +64,30 @@ class CalibreGroupedRuntimeSmokeTest {
     }
 
     @Test
-    fun step01_settingsShowsFailureGuidanceThenProbeFindsHostCalibre() {
+    fun step01_onlineLibraryConfiguresCalibreAndLoadsCatalogWithoutSearch() {
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             dismissBlockingDialogs()
             waitForLibraryLoaded()
 
-            waitForObject(By.desc("设置")).click()
-            waitForObject(By.text("Calibre 服务器地址"))
+            resetFakeCalibreEvents()
+            openCalibreSourceEditor()
+            replaceSingleLineText(editableField("书源地址输入"), "10.0.2.2:8090")
+            waitForObject(By.text("保存").enabled(true)).click()
+            waitForObject(By.text("地址缺少协议，请以 http:// 或 https:// 开头"))
 
-            replaceSingleLineText("http://10.0.2.2:8090")
-            waitForObject(By.text("测试连接")).click()
-            waitForObject(By.text("无法连接到服务器"))
-            waitForObject(By.text("确认手机和 Calibre 在同一局域网，并检查端口是否为 8080"))
-            takeScreenshot("settings-failure.png")
-
-            connectCalibre()
-            takeScreenshot("settings-probe-success.png")
+            replaceSingleLineText(editableField("书源地址输入"), calibreBaseUrl)
+            saveCalibreSourceAndWaitForCatalog()
+            val automaticCoverEvent = waitForFakeCalibreEvent(kind = "cover", bookId = 42)
+            takeScreenshot("online-library-auto-catalog.png")
             writeTextEvidence(
-                "settings-probe-summary.txt",
+                "online-library-setup-summary.txt",
                 buildString {
                     appendLine("serverBaseUrl=$calibreBaseUrl")
-                    appendLine("failureUrl=http://10.0.2.2:8090")
-                    appendLine("failureMessage=无法连接到服务器")
-                    appendLine("failureNextStep=确认手机和 Calibre 在同一局域网，并检查端口是否为 8080")
-                    appendLine("probeHint=$calibreHostHint")
-                    appendLine("connectionMode=${if (calibreUsesDefaultProbe) "probe" else "explicit-url"}")
-                    appendLine("connectionSuccess=${expectedConnectionSuccessText()}")
+                    appendLine("invalidAddress=10.0.2.2:8090")
+                    appendLine("validationMessage=地址缺少协议，请以 http:// 或 https:// 开头")
+                    appendLine("catalogLoadedWithoutSearch=true")
+                    appendLine("catalogTitle=Remote EPUB Smoke")
+                    appendLine("automaticCoverEvent=$automaticCoverEvent")
                 },
             )
         }
@@ -107,32 +99,30 @@ class CalibreGroupedRuntimeSmokeTest {
             dismissBlockingDialogs()
             waitForLibraryLoaded()
 
-            waitForObject(By.desc("设置")).click()
-            waitForObject(By.text("Calibre 服务器地址"))
-            connectCalibre()
-            device.pressBack()
-            waitForLibraryLoaded()
+            openCalibreSourceEditor()
+            replaceSingleLineText(editableField("书源地址输入"), calibreBaseUrl)
+            saveCalibreSourceAndWaitForCatalog()
 
             resetFakeCalibreEvents()
-            waitForObject(By.desc("导入书籍")).click()
-            waitForObject(By.text("在线书库")).click()
-            waitForObject(By.text("书源"))
+            waitForObject(By.desc("搜索在线书库")).click()
 
-            replaceSingleLineText("smoke")
-            waitForObject(By.text("搜索")).click()
+            replaceSingleLineText(editableField("在线书库搜索词"), "smoke")
+            waitForObject(By.desc("执行搜索")).click()
             waitForObject(By.text("Remote EPUB Smoke"))
-            val searchCoverDescription = waitForObject(By.desc("Remote EPUB Smoke 封面")).contentDescription
-            val coverEvent = waitForFakeCalibreEvent(kind = "cover", bookId = 42)
+            val searchCoverDescription = waitForObject(By.descContains("Remote EPUB Smoke")).contentDescription
             dumpHierarchy("search-results.xml")
             takeScreenshot("search-results.png")
-            waitForObject(By.text("下载")).click()
+            waitForObject(By.desc("下载《Remote EPUB Smoke》")).click()
             val downloadEvent = waitForFakeCalibreEvent(kind = "download", bookId = 42)
             waitForObject(By.text("已下载《Remote EPUB Smoke》"))
 
-            val downloadedBook = waitForBookRow("calibre-42") { book ->
+            val downloadedBook = waitForBookRowByTitle("Remote EPUB Smoke") { book ->
                 book.downloadStatus == "DOWNLOADED" && !book.localUri.isNullOrBlank()
             }
-            assertEquals("$calibreBaseUrl/get/cover/42/calibre-library", downloadedBook.coverUrl)
+            assertTrue(
+                downloadedBook.coverUrl?.startsWith("$calibreBaseUrl/get/cover/42/calibre-library") == true,
+            )
+            assertTrue(downloadedBook.coverUrl?.contains("__readflow_calibre_source=") == true)
             val downloadedFile = checkNotNull(downloadedBook.localUri).let(::fileFromUri)
             assertTrue("expected downloaded file to exist", downloadedFile.isFile)
             val downloadedFileExistsBeforeRemove = downloadedFile.isFile
@@ -141,31 +131,35 @@ class CalibreGroupedRuntimeSmokeTest {
             dumpHierarchy("search-downloaded.xml")
             takeScreenshot("search-downloaded.png")
 
-            waitForObject(By.text("关闭")).click()
-            waitForObject(By.text("Remote EPUB Smoke"))
-            val shelfCardDescription =
-                waitForObject(By.desc("打开 Remote EPUB Smoke")).contentDescription
+            waitForObject(By.text("本地书架")).click()
+            val shelfCard = waitForObject(By.desc("打开 Remote EPUB Smoke"))
+            val shelfCardDescription = shelfCard.contentDescription
             dumpHierarchy("shelf-after-download.xml")
 
             shutdownFakeCalibreServer()
 
-            waitForObject(By.text("离线")).click()
-            waitForObject(By.text("Remote EPUB Smoke"))
+            waitForObject(By.desc("书架筛选，当前全部书籍")).click()
+            waitForObject(By.text("离线可读")).click()
+            waitForObject(By.desc("打开 Remote EPUB Smoke"))
             takeScreenshot("offline-filter.png")
 
-            clickObjectCenter(waitForObject(By.text("Remote EPUB Smoke")))
-            waitForObject(By.desc("阅读内容，捏合调整字号"))
-            waitForObject(By.text("Calibre smoke paragraph proves offline reader opening after download."))
+            clickObjectCenter(waitForObject(By.desc("打开 Remote EPUB Smoke")))
+            device.wait(
+                Until.findObject(By.desc("阅读手势引导，点击开始阅读")),
+                2_000,
+            )?.click()
+            waitForObject(By.descStartsWith("阅读内容"))
+            waitForObject(By.textContains("Calibre smoke paragraph proves offline reader opening after download."))
             takeScreenshot("offline-reader-open.png")
             device.pressBack()
-            waitForObject(By.text("Remote EPUB Smoke"))
+            waitForObject(By.desc("打开 Remote EPUB Smoke"))
 
             clickObjectCenter(waitForObject(By.desc("Remote EPUB Smoke 的菜单")))
             waitForObject(By.text("移除下载")).click()
             waitForObject(By.text("没有离线可读的书"))
             takeScreenshot("after-remove-download.png")
 
-            val removedBook = waitForBookRow("calibre-42") { book ->
+            val removedBook = waitForBookRow(downloadedBook.id) { book ->
                 book.downloadStatus == "NOT_DOWNLOADED" && book.localUri == null
             }
             assertNotNull(removedBook)
@@ -176,7 +170,6 @@ class CalibreGroupedRuntimeSmokeTest {
                 buildString {
                     appendLine("serverBaseUrl=$calibreBaseUrl")
                     appendLine("searchCoverDescription=$searchCoverDescription")
-                    appendLine("searchCoverEvent=$coverEvent")
                     appendLine("downloadEvent=$downloadEvent")
                     appendLine("downloadedCoverUrlBeforeRemove=${downloadedBook.coverUrl}")
                     appendLine("downloadedBookId=${downloadedBook.id}")
@@ -224,16 +217,19 @@ class CalibreGroupedRuntimeSmokeTest {
             .commit()
     }
 
-    private fun replaceSingleLineText(value: String) {
-        val editText = waitForObject(By.clazz("android.widget.EditText"))
+    private fun replaceSingleLineText(selector: BySelector, value: String) {
+        val editText = waitForObject(selector)
         editText.text = value
         waitForCondition("expected edit text to update to $value") {
-            waitForObject(By.clazz("android.widget.EditText")).text == value
+            waitForObject(selector).text == value
         }
     }
 
+    private fun editableField(description: String): BySelector =
+        By.clazz("android.widget.EditText").hasDescendant(By.desc(description))
+
     private fun waitForLibraryLoaded() {
-        waitForObject(By.text("书架"))
+        waitForObject(By.text("书库"))
     }
 
     private fun dismissBlockingDialogs() {
@@ -244,31 +240,24 @@ class CalibreGroupedRuntimeSmokeTest {
         }
     }
 
-    private fun connectCalibre() {
-        if (calibreUsesDefaultProbe) {
-            replaceSingleLineText(calibreHostHint)
-            waitForObject(By.text("探测常用端口")).click()
+    private fun openCalibreSourceEditor() {
+        waitForObject(By.text("在线书库")).click()
+        waitForObject(By.desc("管理书源")).click()
+        val editCurrent = device.wait(Until.findObject(By.text("编辑当前书源")), 1_000)
+        if (editCurrent != null) {
+            editCurrent.click()
         } else {
-            replaceSingleLineText(calibreBaseUrl)
-            waitForObject(By.text("测试连接")).click()
+            waitForObject(By.text("添加书源")).click()
+            waitForObject(By.text("Calibre")).click()
         }
-        waitForObject(By.text(expectedConnectionSuccessText()))
-        waitForObject(By.text(expectedConnectionNextStepText()))
+        waitForObject(By.text("Calibre 服务器地址"))
     }
 
-    private fun expectedConnectionSuccessText(): String =
-        if (calibreUsesDefaultProbe) {
-            "已发现 Calibre：$calibreDisplayAddress，发现 1 本书"
-        } else {
-            "已连接到 Calibre，发现 1 本书"
-        }
-
-    private fun expectedConnectionNextStepText(): String =
-        if (calibreUsesDefaultProbe) {
-            "已保存该地址，返回书架后可以搜索并下载书籍"
-        } else {
-            "返回书架后可以搜索并下载书籍"
-        }
+    private fun saveCalibreSourceAndWaitForCatalog() {
+        waitForObject(By.text("保存").enabled(true)).click()
+        waitForObject(By.desc("书源选择器"))
+        waitForObject(By.text("Remote EPUB Smoke"))
+    }
 
     private fun waitForBookRow(
         bookId: String,
@@ -282,12 +271,35 @@ class CalibreGroupedRuntimeSmokeTest {
         return checkNotNull(latestBook(bookId)) { "Timed out waiting for book row $bookId" }
     }
 
+    private fun waitForBookRowByTitle(
+        title: String,
+        predicate: (BookEntity) -> Boolean,
+    ): BookEntity {
+        val deadline = System.currentTimeMillis() + DB_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            latestBookByTitle(title)?.takeIf(predicate)?.let { return it }
+            Thread.sleep(250)
+        }
+        return checkNotNull(latestBookByTitle(title)) { "Timed out waiting for book titled $title" }
+    }
+
     private fun latestBook(bookId: String): BookEntity? {
         val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
             .allowMainThreadQueries()
             .build()
         return try {
             runBlocking { db.bookDao().getById(bookId) }
+        } finally {
+            db.close()
+        }
+    }
+
+    private fun latestBookByTitle(title: String): BookEntity? {
+        val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
+            .allowMainThreadQueries()
+            .build()
+        return try {
+            runBlocking { db.bookDao().observeAll().first().firstOrNull { it.title == title } }
         } finally {
             db.close()
         }
@@ -417,8 +429,6 @@ class CalibreGroupedRuntimeSmokeTest {
     private companion object {
         const val DB_NAME = "readflow.db"
         const val ARG_CALIBRE_BASE_URL = "calibreBaseUrl"
-        const val ARG_CALIBRE_HOST_HINT = "calibreHostHint"
-        const val DEFAULT_HOST_ONLY_HINT = "10.0.2.2"
         const val DEFAULT_SERVER_BASE_URL = "http://10.0.2.2:8081"
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
         private val DB_TIMEOUT_MS = 8.seconds.inWholeMilliseconds

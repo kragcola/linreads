@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -32,7 +31,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.MoreVert
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.Add
@@ -40,18 +38,13 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExposedDropdownMenuBox
-import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -64,6 +57,8 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.PrimaryTabRow
+import androidx.compose.material3.Tab
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -94,9 +89,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.BookBundle
-import dev.readflow.core.ui.BookCover
 import dev.readflow.core.ui.BookGrid
 import dev.readflow.core.ui.EmptyState
 import dev.readflow.core.ui.PaperSurface
@@ -106,6 +99,8 @@ import org.koin.androidx.compose.koinViewModel
 
 private val SUPPORTED_MIMES = arrayOf("text/plain", "application/epub+zip", "application/pdf")
 private val SOURCE_CONFIG_MIMES = arrayOf("application/json", "text/json", "application/octet-stream", "text/*")
+
+private enum class LibraryPage { LOCAL, ONLINE }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -127,7 +122,7 @@ fun LibraryScreen(
     val context = LocalContext.current
 
     var openedBundle by remember { mutableStateOf<BookBundle?>(null) }
-    var showOnlineLibrary by remember { mutableStateOf(false) }
+    var selectedPage by rememberSaveable { mutableStateOf(LibraryPage.LOCAL) }
     var showSourceEditor by remember { mutableStateOf(false) }
     val onlineLibraryState by viewModel.onlineLibraryState.collectAsStateWithLifecycle()
 
@@ -136,6 +131,23 @@ fun LibraryScreen(
     }
     LaunchedEffect(Unit) {
         viewModel.openBundle.collect { bundle -> openedBundle = bundle }
+    }
+    LaunchedEffect(
+        selectedPage,
+        onlineLibraryState.selectedSourceId,
+        onlineLibraryState.catalogRevision,
+    ) {
+        if (
+            selectedPage == LibraryPage.ONLINE &&
+            onlineLibraryState.selectedSourceId != null &&
+            onlineLibraryState.results.isEmpty() &&
+            !onlineLibraryState.isSearching
+        ) {
+            viewModel.searchOnlineLibrary()
+        }
+    }
+    BackHandler(enabled = selectedPage == LibraryPage.ONLINE) {
+        selectedPage = LibraryPage.LOCAL
     }
 
     val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -165,6 +177,24 @@ fun LibraryScreen(
     val activeFilterLabel = when (state.filter) {
         LibraryFilter.ALL -> "全部书籍"
         LibraryFilter.OFFLINE -> "离线可读"
+    }
+    val selectedOnlineSource = onlineLibraryState.sources.firstOrNull {
+        it.id == onlineLibraryState.selectedSourceId
+    }
+    val pageSummary = when (selectedPage) {
+        LibraryPage.LOCAL -> shelfSummary
+        LibraryPage.ONLINE -> when {
+            onlineLibraryState.sources.isEmpty() -> "尚未添加书源"
+            onlineLibraryState.isSearching && onlineLibraryState.results.isEmpty() -> "正在加载书目"
+            else -> {
+                val count = if (onlineLibraryState.hasMore) {
+                    "${onlineLibraryState.results.size}+ 本"
+                } else {
+                    "${onlineLibraryState.results.size} 本"
+                }
+                "${selectedOnlineSource?.name ?: "在线书库"} · $count"
+            }
+        }
     }
 
     PaperSurface {
@@ -210,12 +240,12 @@ fun LibraryScreen(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "书架",
+                                    text = "书库",
                                     style = ReadflowType.title,
                                     color = MaterialTheme.colorScheme.onBackground,
                                 )
                                 Text(
-                                    text = shelfSummary,
+                                    text = pageSummary,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
@@ -223,77 +253,84 @@ fun LibraryScreen(
                                 )
                             }
                             Row(horizontalArrangement = Arrangement.spacedBy(Dimens.spaceSm)) {
-                                Box {
-                                    IconButton(
-                                        onClick = { showAddMenu = true },
-                                        modifier = Modifier.size(Dimens.touchTarget),
-                                    ) {
-                                        Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
+                                if (selectedPage == LibraryPage.LOCAL) {
+                                    Box {
+                                        IconButton(
+                                            onClick = { showAddMenu = true },
+                                            modifier = Modifier.size(Dimens.touchTarget),
+                                        ) {
+                                            Icon(Icons.Outlined.Add, contentDescription = "导入书籍")
+                                        }
+                                        DropdownMenu(
+                                            expanded = showAddMenu,
+                                            onDismissRequest = { showAddMenu = false },
+                                        ) {
+                                            DropdownMenuItem(
+                                                text = { Text("选择文件") },
+                                                onClick = {
+                                                    showAddMenu = false
+                                                    fileLauncher.launch(SUPPORTED_MIMES)
+                                                },
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("扫描文件夹") },
+                                                onClick = {
+                                                    showAddMenu = false
+                                                    folderLauncher.launch(null)
+                                                },
+                                            )
+                                        }
                                     }
-                                    DropdownMenu(expanded = showAddMenu, onDismissRequest = { showAddMenu = false }) {
-                                        DropdownMenuItem(
-                                            text = { Text("选择文件") },
-                                            onClick = { showAddMenu = false; fileLauncher.launch(SUPPORTED_MIMES) },
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("扫描文件夹") },
-                                            onClick = { showAddMenu = false; folderLauncher.launch(null) },
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("在线书库") },
-                                            onClick = { showAddMenu = false; showOnlineLibrary = true },
-                                        )
-                                    }
-                                }
-                                Box {
-                                    IconButton(
-                                        onClick = { showShelfMenu = true },
-                                        modifier = Modifier
-                                            .size(Dimens.touchTarget)
-                                            .semantics {
-                                                contentDescription = "书架筛选，当前$activeFilterLabel"
-                                            },
-                                    ) {
-                                        Icon(Icons.Default.MoreVert, contentDescription = null)
-                                    }
-                                    DropdownMenu(
-                                        expanded = showShelfMenu,
-                                        onDismissRequest = { showShelfMenu = false },
-                                    ) {
-                                        DropdownMenuItem(
-                                            text = { Text("全部书籍") },
-                                            onClick = {
-                                                showShelfMenu = false
-                                                viewModel.setLibraryFilter(LibraryFilter.ALL)
-                                            },
-                                            modifier = Modifier.semantics {
-                                                if (state.filter == LibraryFilter.ALL) {
-                                                    stateDescription = "当前筛选"
-                                                }
-                                            },
-                                            trailingIcon = {
-                                                if (state.filter == LibraryFilter.ALL) {
-                                                    Text("✓", color = MaterialTheme.colorScheme.primary)
-                                                }
-                                            },
-                                        )
-                                        DropdownMenuItem(
-                                            text = { Text("离线可读") },
-                                            onClick = {
-                                                showShelfMenu = false
-                                                viewModel.setLibraryFilter(LibraryFilter.OFFLINE)
-                                            },
-                                            modifier = Modifier.semantics {
-                                                if (state.filter == LibraryFilter.OFFLINE) {
-                                                    stateDescription = "当前筛选"
-                                                }
-                                            },
-                                            trailingIcon = {
-                                                if (state.filter == LibraryFilter.OFFLINE) {
-                                                    Text("✓", color = MaterialTheme.colorScheme.primary)
-                                                }
-                                            },
-                                        )
+                                    Box {
+                                        IconButton(
+                                            onClick = { showShelfMenu = true },
+                                            modifier = Modifier
+                                                .size(Dimens.touchTarget)
+                                                .semantics {
+                                                    contentDescription = "书架筛选，当前$activeFilterLabel"
+                                                },
+                                        ) {
+                                            Icon(Icons.Default.MoreVert, contentDescription = null)
+                                        }
+                                        DropdownMenu(
+                                            expanded = showShelfMenu,
+                                            onDismissRequest = { showShelfMenu = false },
+                                        ) {
+                                            DropdownMenuItem(
+                                                text = { Text("全部书籍") },
+                                                onClick = {
+                                                    showShelfMenu = false
+                                                    viewModel.setLibraryFilter(LibraryFilter.ALL)
+                                                },
+                                                modifier = Modifier.semantics {
+                                                    if (state.filter == LibraryFilter.ALL) {
+                                                        stateDescription = "当前筛选"
+                                                    }
+                                                },
+                                                trailingIcon = {
+                                                    if (state.filter == LibraryFilter.ALL) {
+                                                        Text("✓", color = MaterialTheme.colorScheme.primary)
+                                                    }
+                                                },
+                                            )
+                                            DropdownMenuItem(
+                                                text = { Text("离线可读") },
+                                                onClick = {
+                                                    showShelfMenu = false
+                                                    viewModel.setLibraryFilter(LibraryFilter.OFFLINE)
+                                                },
+                                                modifier = Modifier.semantics {
+                                                    if (state.filter == LibraryFilter.OFFLINE) {
+                                                        stateDescription = "当前筛选"
+                                                    }
+                                                },
+                                                trailingIcon = {
+                                                    if (state.filter == LibraryFilter.OFFLINE) {
+                                                        Text("✓", color = MaterialTheme.colorScheme.primary)
+                                                    }
+                                                },
+                                            )
+                                        }
                                     }
                                 }
                                 IconButton(
@@ -304,6 +341,20 @@ fun LibraryScreen(
                                 }
                             }
                         }
+                        PrimaryTabRow(selectedTabIndex = selectedPage.ordinal) {
+                            Tab(
+                                selected = selectedPage == LibraryPage.LOCAL,
+                                onClick = { selectedPage = LibraryPage.LOCAL },
+                                text = { Text("本地书架") },
+                                modifier = Modifier.heightIn(min = Dimens.touchTarget),
+                            )
+                            Tab(
+                                selected = selectedPage == LibraryPage.ONLINE,
+                                onClick = { selectedPage = LibraryPage.ONLINE },
+                                text = { Text("在线书库") },
+                                modifier = Modifier.heightIn(min = Dimens.touchTarget),
+                            )
+                        }
                     }
                 }
             },
@@ -313,45 +364,68 @@ fun LibraryScreen(
                     .fillMaxSize()
                     .padding(padding),
             ) {
-                when {
-                    state.isLoading && state.items.isEmpty() -> {
-                        CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+                when (selectedPage) {
+                    LibraryPage.LOCAL -> when {
+                        state.isLoading && state.items.isEmpty() -> {
+                            CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+                        }
+                        state.error != null && state.items.isEmpty() -> {
+                            Text(
+                                text = "加载失败：${state.error}",
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .padding(24.dp)
+                                    .semantics { liveRegion = LiveRegionMode.Polite },
+                            )
+                        }
+                        state.items.isEmpty() && state.filter == LibraryFilter.OFFLINE -> {
+                            OfflineEmptyState(onShowAll = { viewModel.setLibraryFilter(LibraryFilter.ALL) })
+                        }
+                        state.items.isEmpty() -> {
+                            EmptyState(
+                                onOpenOnlineLibrary = { selectedPage = LibraryPage.ONLINE },
+                                onImportLocal = { fileLauncher.launch(SUPPORTED_MIMES) },
+                            )
+                        }
+                        else -> {
+                            BookGrid(
+                                items = state.items,
+                                onItemClick = viewModel::onItemClick,
+                                onDelete = viewModel::deleteBook,
+                                onDeleteBundle = viewModel::deleteBundle,
+                                onRename = viewModel::renameBook,
+                                onMoveToGroup = viewModel::moveToGroup,
+                                onCreateGroup = viewModel::createGroup,
+                                onReorder = viewModel::reorder,
+                                onUngroup = viewModel::ungroupBundle,
+                                onRenameBundle = viewModel::renameBundle,
+                                onRemoveDownload = viewModel::removeDownloadedAsset,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        }
                     }
-                    state.error != null && state.items.isEmpty() -> {
-                        Text(
-                            text = "加载失败：${state.error}",
-                            color = MaterialTheme.colorScheme.error,
-                            modifier = Modifier
-                                .align(Alignment.Center)
-                                .padding(24.dp)
-                                .semantics { liveRegion = LiveRegionMode.Polite },
-                        )
-                    }
-                    state.items.isEmpty() && state.filter == LibraryFilter.OFFLINE -> {
-                        OfflineEmptyState(onShowAll = { viewModel.setLibraryFilter(LibraryFilter.ALL) })
-                    }
-                    state.items.isEmpty() -> {
-                        EmptyState(
-                            onOpenOnlineLibrary = { showOnlineLibrary = true },
-                            onImportLocal = { fileLauncher.launch(SUPPORTED_MIMES) },
-                        )
-                    }
-                    else -> {
-                        BookGrid(
-                            items = state.items,
-                            onItemClick = viewModel::onItemClick,
-                            onDelete = viewModel::deleteBook,
-                            onDeleteBundle = viewModel::deleteBundle,
-                            onRename = viewModel::renameBook,
-                            onMoveToGroup = viewModel::moveToGroup,
-                            onCreateGroup = viewModel::createGroup,
-                            onReorder = viewModel::reorder,
-                            onUngroup = viewModel::ungroupBundle,
-                            onRenameBundle = viewModel::renameBundle,
-                            onRemoveDownload = viewModel::removeDownloadedAsset,
-                            modifier = Modifier.fillMaxSize(),
-                        )
-                    }
+                    LibraryPage.ONLINE -> OnlineLibraryPage(
+                        state = onlineLibraryState,
+                        onSelectSource = viewModel::selectOnlineSource,
+                        onQueryChange = viewModel::updateOnlineQuery,
+                        onSearch = viewModel::searchOnlineLibrary,
+                        onLoadMore = viewModel::loadMoreOnlineLibrary,
+                        onToggleSelect = viewModel::toggleOnlineSelection,
+                        onToggleAllCurrent = viewModel::toggleAllCurrentOnlineResults,
+                        onApplyFacet = viewModel::applyOnlineFacet,
+                        onSelectAuthor = viewModel::selectOnlineByAuthor,
+                        onSelectSeries = viewModel::selectOnlineBySeries,
+                        onDownloadEntry = viewModel::downloadOnlineEntry,
+                        onDownloadSelected = viewModel::downloadSelectedOnlineBooks,
+                        onPreview = viewModel::previewOnlineEntry,
+                        onOpenSourceEditor = { sourceId ->
+                            viewModel.prepareSourceEditor(sourceId)
+                            showSourceEditor = true
+                        },
+                        onImportSourceConfig = { sourceConfigLauncher.launch(SOURCE_CONFIG_MIMES) },
+                        onRemoveSource = viewModel::removeOnlineSource,
+                    )
                 }
             }
         }
@@ -381,34 +455,6 @@ fun LibraryScreen(
             )
         }
 
-        if (showOnlineLibrary) {
-            OnlineLibrarySheet(
-                state = onlineLibraryState,
-                onSelectSource = viewModel::selectOnlineSource,
-                onQueryChange = viewModel::updateOnlineQuery,
-                onSearch = viewModel::searchOnlineLibrary,
-                onToggleSelect = viewModel::toggleOnlineSelection,
-                onToggleAllCurrent = viewModel::toggleAllCurrentOnlineResults,
-                onApplyFacet = viewModel::applyOnlineFacet,
-                onSelectAuthor = viewModel::selectOnlineByAuthor,
-                onSelectSeries = viewModel::selectOnlineBySeries,
-                onDownloadEntry = viewModel::downloadOnlineEntry,
-                onDownloadSelected = viewModel::downloadSelectedOnlineBooks,
-                onPreview = viewModel::previewOnlineEntry,
-                onOpenSourceEditor = { sourceId ->
-                    viewModel.prepareSourceEditor(sourceId)
-                    showSourceEditor = true
-                },
-                onImportSourceConfig = { sourceConfigLauncher.launch(SOURCE_CONFIG_MIMES) },
-                onRemoveSource = viewModel::removeOnlineSource,
-                onDismiss = {
-                    showOnlineLibrary = false
-                    showSourceEditor = false
-                    viewModel.clearSourceEditor()
-                    viewModel.clearOnlinePreview()
-                },
-            )
-        }
         onlineLibraryState.preview?.let { preview ->
             OnlineBookPreviewWindow(
                 preview = preview,
@@ -463,516 +509,6 @@ private fun OfflineEmptyState(
         }
     }
 }
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun OnlineLibrarySheet(
-    state: OnlineLibraryUiState,
-    onSelectSource: (String) -> Unit,
-    onQueryChange: (String) -> Unit,
-    onSearch: () -> Unit,
-    onToggleSelect: (dev.readflow.extensions.api.OnlineCatalogEntry) -> Unit,
-    onToggleAllCurrent: () -> Unit,
-    onApplyFacet: (dev.readflow.extensions.api.OnlineCatalogFilter) -> Unit,
-    onSelectAuthor: (String) -> Unit,
-    onSelectSeries: (String) -> Unit,
-    onDownloadEntry: (dev.readflow.extensions.api.OnlineCatalogEntry) -> Unit,
-    onDownloadSelected: () -> Unit,
-    onPreview: (dev.readflow.extensions.api.OnlineCatalogEntry) -> Unit,
-    onOpenSourceEditor: (String?) -> Unit,
-    onImportSourceConfig: () -> Unit,
-    onRemoveSource: (String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val selected = state.sources.firstOrNull { it.id == state.selectedSourceId }
-    var sourceMenuExpanded by remember { mutableStateOf(false) }
-    var sourceActionsExpanded by remember { mutableStateOf(false) }
-    var filtersExpanded by remember { mutableStateOf(false) }
-    var pendingDeleteSourceId by remember { mutableStateOf<String?>(null) }
-    val canFilterAuthor = selected?.capabilities?.canFilterByAuthor == true
-    val canFilterSeries = selected?.capabilities?.canFilterBySeries == true
-    val canFilterFormat = selected?.capabilities?.canFilterByFormat == true
-    val canFilterTag = selected?.capabilities?.canFilterByTag == true
-    val hasSecondaryFilters = canFilterAuthor || canFilterSeries || canFilterFormat || canFilterTag
-    val activeFilterCount = listOf(
-        state.filter.author,
-        state.filter.series,
-        state.filter.format,
-        state.filter.tag,
-    ).count { it.isNotBlank() }
-
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 12.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("在线书库", style = MaterialTheme.typography.titleMedium)
-                IconButton(
-                    onClick = onDismiss,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .semantics { contentDescription = "关闭在线书库" },
-                ) {
-                    Icon(Icons.Default.Close, contentDescription = null)
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("书源", style = MaterialTheme.typography.labelLarge)
-                Box {
-                    IconButton(
-                        onClick = { sourceActionsExpanded = true },
-                        modifier = Modifier
-                            .size(48.dp)
-                            .semantics { contentDescription = "管理书源" },
-                    ) {
-                        Icon(Icons.Default.MoreVert, contentDescription = null)
-                    }
-                    DropdownMenu(
-                        expanded = sourceActionsExpanded,
-                        onDismissRequest = { sourceActionsExpanded = false },
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("添加书源") },
-                            onClick = {
-                                sourceActionsExpanded = false
-                                onOpenSourceEditor(null)
-                            },
-                            leadingIcon = { Icon(Icons.Outlined.Add, contentDescription = null) },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("导入 JSON") },
-                            onClick = {
-                                sourceActionsExpanded = false
-                                onImportSourceConfig()
-                            },
-                            enabled = !state.isAddingSource,
-                            modifier = Modifier.semantics { contentDescription = "导入书源配置" },
-                            leadingIcon = { Icon(Icons.Default.KeyboardArrowDown, contentDescription = null) },
-                        )
-                        selected?.let { userSource ->
-                            if (userSource.adapterId == dev.readflow.extensions.api.SourceAdapterIds.CALIBRE) {
-                                DropdownMenuItem(
-                                    text = { Text("编辑 Calibre 连接") },
-                                    onClick = {
-                                        sourceActionsExpanded = false
-                                        onOpenSourceEditor(userSource.id)
-                                    },
-                                    leadingIcon = { Icon(Icons.Outlined.Settings, contentDescription = null) },
-                                )
-                            }
-                            DropdownMenuItem(
-                                text = { Text("删除当前书源") },
-                                onClick = {
-                                    sourceActionsExpanded = false
-                                    pendingDeleteSourceId = userSource.id
-                                },
-                                leadingIcon = { Icon(Icons.Outlined.Delete, contentDescription = null) },
-                            )
-                        }
-                    }
-                }
-            }
-            if (state.sources.isEmpty()) {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    Text("还没有书源", style = MaterialTheme.typography.titleSmall)
-                    Text(
-                        text = "添加网页书源、OPDS、JSON 或 Calibre 后即可搜索和预览。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Button(onClick = { onOpenSourceEditor(null) }) {
-                        Icon(Icons.Outlined.Add, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("添加第一个书源")
-                    }
-                }
-            } else {
-                ExposedDropdownMenuBox(
-                    expanded = sourceMenuExpanded,
-                    onExpandedChange = { sourceMenuExpanded = it },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .semantics { contentDescription = "书源选择器" },
-                ) {
-                    OutlinedTextField(
-                        value = selected?.name ?: "选择书源",
-                        onValueChange = {},
-                        readOnly = true,
-                        singleLine = true,
-                        label = { Text("当前书源") },
-                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = sourceMenuExpanded) },
-                        modifier = Modifier
-                            .menuAnchor()
-                            .fillMaxWidth()
-                            .semantics {
-                                contentDescription = "当前书源：${selected?.name ?: "未选择"}"
-                                role = Role.DropdownList
-                            },
-                    )
-                    ExposedDropdownMenu(
-                        expanded = sourceMenuExpanded,
-                        onDismissRequest = { sourceMenuExpanded = false },
-                    ) {
-                        state.sources.forEach { source ->
-                            DropdownMenuItem(
-                                text = { Text(source.name) },
-                                onClick = {
-                                    sourceMenuExpanded = false
-                                    if (source.enabled) onSelectSource(source.id)
-                                },
-                                enabled = source.enabled,
-                                trailingIcon = {
-                                    if (source.id == state.selectedSourceId) {
-                                        Text("✓", color = MaterialTheme.colorScheme.primary)
-                                    }
-                                },
-                            )
-                        }
-                    }
-                }
-
-                OutlinedTextField(
-                    value = state.query,
-                    onValueChange = onQueryChange,
-                    label = { Text("搜索书名或作者") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                    keyboardActions = KeyboardActions(onSearch = {
-                        if (!state.isSearching) onSearch()
-                    }),
-                    modifier = Modifier.fillMaxWidth(),
-                    trailingIcon = {
-                        IconButton(
-                            onClick = onSearch,
-                            enabled = !state.isSearching,
-                            modifier = Modifier
-                                .size(48.dp)
-                                .semantics { contentDescription = "搜索" },
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Search,
-                                contentDescription = null,
-                            )
-                        }
-                    },
-                )
-
-                if (hasSecondaryFilters) {
-                    OutlinedButton(
-                        onClick = { filtersExpanded = !filtersExpanded },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .semantics {
-                                contentDescription = if (activeFilterCount > 0) {
-                                    "筛选条件，已启用 $activeFilterCount 项"
-                                } else {
-                                    "筛选条件"
-                                }
-                                stateDescription = if (filtersExpanded) "已展开" else "已收起"
-                            },
-                    ) {
-                        Text(
-                            if (filtersExpanded) {
-                                "收起筛选"
-                            } else if (activeFilterCount > 0) {
-                                "筛选条件（$activeFilterCount）"
-                            } else {
-                                "筛选条件"
-                            },
-                        )
-                    }
-                    if (filtersExpanded) {
-                        if (canFilterAuthor) {
-                            MetadataFacetRow(
-                                title = "作者",
-                                facets = state.metadataFacets.authors,
-                                selectedValue = state.filter.author,
-                                onSelect = { value ->
-                                    onApplyFacet(
-                                        state.filter.copy(
-                                            author = value.takeUnless {
-                                                it.equals(state.filter.author, ignoreCase = true)
-                                            }.orEmpty(),
-                                        ),
-                                    )
-                                },
-                            )
-                        }
-                        if (canFilterSeries) {
-                            MetadataFacetRow(
-                                title = "系列",
-                                facets = state.metadataFacets.series,
-                                selectedValue = state.filter.series,
-                                onSelect = { value ->
-                                    onApplyFacet(
-                                        state.filter.copy(
-                                            series = value.takeUnless {
-                                                it.equals(state.filter.series, ignoreCase = true)
-                                            }.orEmpty(),
-                                        ),
-                                    )
-                                },
-                            )
-                        }
-                        if (canFilterFormat) {
-                            MetadataFacetRow(
-                                title = "格式",
-                                facets = state.metadataFacets.formats,
-                                selectedValue = state.filter.format,
-                                onSelect = { value ->
-                                    onApplyFacet(
-                                        state.filter.copy(
-                                            format = value.takeUnless {
-                                                it.equals(state.filter.format, ignoreCase = true)
-                                            }.orEmpty(),
-                                        ),
-                                    )
-                                },
-                            )
-                        }
-                        if (canFilterTag) {
-                            MetadataFacetRow(
-                                title = "标签",
-                                facets = state.metadataFacets.tags,
-                                selectedValue = state.filter.tag,
-                                onSelect = { value ->
-                                    onApplyFacet(
-                                        state.filter.copy(
-                                            tag = value.takeUnless {
-                                                it.equals(state.filter.tag, ignoreCase = true)
-                                            }.orEmpty(),
-                                        ),
-                                    )
-                                },
-                            )
-                        }
-                        if (
-                            state.filter.author.isNotBlank() &&
-                            selected?.capabilities?.canDownload == true
-                        ) {
-                            OutlinedButton(
-                                onClick = { onSelectAuthor(state.filter.author) },
-                                enabled = !state.isSelectingBatch,
-                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                            ) {
-                                Text("选择该作者全部书籍")
-                            }
-                        }
-                        if (
-                            state.filter.series.isNotBlank() &&
-                            selected?.capabilities?.canDownload == true
-                        ) {
-                            OutlinedButton(
-                                onClick = { onSelectSeries(state.filter.series) },
-                                enabled = !state.isSelectingBatch,
-                                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                            ) {
-                                Text("选择该系列全部书籍")
-                            }
-                        }
-                    }
-                }
-            }
-
-            val statusError = state.error
-            val statusMessage = state.message
-            when {
-                state.isSearching || state.isSelectingBatch || state.isDownloadingBatch -> Row(
-                    modifier = Modifier.semantics {
-                        liveRegion = LiveRegionMode.Polite
-                    },
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Text(
-                        when {
-                            state.isDownloadingBatch -> "正在批量下载"
-                            state.isSelectingBatch -> "正在汇总匹配书籍"
-                            else -> "正在搜索${selected?.name?.let { "「$it」" }.orEmpty()}"
-                        },
-                    )
-                }
-                statusError != null -> Text(
-                    text = statusError,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.semantics {
-                        contentDescription = "在线书库错误：$statusError"
-                        liveRegion = LiveRegionMode.Polite
-                    },
-                )
-                statusMessage != null -> Text(
-                    text = statusMessage,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
-                )
-            }
-
-            if (state.results.isNotEmpty() && selected?.capabilities?.canDownload == true) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 48.dp)
-                        .toggleable(
-                            value = state.allCurrentResultsSelected,
-                            role = Role.Checkbox,
-                            onValueChange = { onToggleAllCurrent() },
-                        )
-                        .semantics(mergeDescendants = true) {
-                            contentDescription = if (state.allCurrentResultsSelected) {
-                                "取消全选当前结果"
-                            } else {
-                                "全选当前结果"
-                            }
-                            stateDescription = if (state.allCurrentResultsSelected) "已全选" else "未全选"
-                        },
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Checkbox(
-                        checked = state.allCurrentResultsSelected,
-                        onCheckedChange = null,
-                    )
-                    Text("全选当前结果（${state.results.size}）")
-                }
-            }
-
-            if (state.selectedEntryKeys.isNotEmpty() && selected?.capabilities?.canDownload == true) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("已选 ${state.selectedEntryKeys.size} 本")
-                    Button(
-                        onClick = onDownloadSelected,
-                        enabled = !state.isDownloadingBatch,
-                        modifier = Modifier.widthIn(min = 96.dp).heightIn(min = 48.dp),
-                    ) {
-                        Text(if (state.isDownloadingBatch) "下载中" else "下载所选")
-                    }
-                }
-            }
-
-            if (state.results.isNotEmpty()) {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 280.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    items(state.results, key = { it.selectionKey() }) { entry ->
-                        OnlineCatalogResultRow(
-                            entry = entry,
-                            selected = entry.selectionKey() in state.selectedEntryKeys,
-                            isDownloading = entry.selectionKey() in state.downloadingKeys,
-                            canDownload = selected?.capabilities?.canDownload == true,
-                            downloadEnabled = !state.isDownloadingBatch,
-                            canPreview = selected?.capabilities?.canPreviewText == true,
-                            canBatchAcrossSource = selected?.capabilities?.canBatchAcrossSource == true,
-                            onToggleSelect = { onToggleSelect(entry) },
-                            onDownload = { onDownloadEntry(entry) },
-                            onPreview = { onPreview(entry) },
-                            onAuthorBatch = onSelectAuthor,
-                            onSeriesBatch = { entry.series?.let(onSelectSeries) },
-                        )
-                    }
-                }
-            } else if (
-                state.sources.isNotEmpty() &&
-                !state.isSearching &&
-                statusError == null &&
-                statusMessage == null
-            ) {
-                Text(
-                    text = if (selected == null) {
-                        "选择书源后即可搜索"
-                    } else {
-                        "输入书名或作者开始搜索"
-                    },
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        }
-    }
-
-    pendingDeleteSourceId?.let { sourceId ->
-        val sourceName = state.sources.firstOrNull { it.id == sourceId }?.name ?: "该书源"
-        AlertDialog(
-            onDismissRequest = { pendingDeleteSourceId = null },
-            title = { Text("删除书源") },
-            text = { Text("确定删除「$sourceName」？此操作不可撤销。") },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        pendingDeleteSourceId = null
-                        onRemoveSource(sourceId)
-                    },
-                ) {
-                    Text("删除")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingDeleteSourceId = null }) {
-                    Text("取消")
-                }
-            },
-        )
-    }
-}
-
-@Composable
-private fun MetadataFacetRow(
-    title: String,
-    facets: List<MetadataFacet>,
-    selectedValue: String,
-    onSelect: (String) -> Unit,
-) {
-    val visibleFacets = if (
-        selectedValue.isNotBlank() && facets.none { it.value.equals(selectedValue, ignoreCase = true) }
-    ) {
-        listOf(MetadataFacet(selectedValue, 0)) + facets
-    } else {
-        facets
-    }
-    if (visibleFacets.isEmpty()) return
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(title, style = MaterialTheme.typography.labelLarge)
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(visibleFacets, key = { "${title}:${it.value.lowercase()}" }) { facet ->
-                val selected = facet.value.equals(selectedValue, ignoreCase = true)
-                FilterChip(
-                    selected = selected,
-                    onClick = { onSelect(facet.value) },
-                    label = { Text("${facet.value} · ${facet.count}") },
-                    modifier = Modifier
-                        .heightIn(min = 48.dp)
-                        .semantics {
-                            contentDescription = "$title${facet.value}，${facet.count} 本"
-                            stateDescription = if (selected) "已选择" else "未选择"
-                        },
-                )
-            }
-        }
-    }
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun OnlineBookPreviewWindow(
@@ -1100,7 +636,7 @@ private fun SourceEditorWindow(
             Scaffold(
                 topBar = {
                     TopAppBar(
-                        title = { Text(if (state.editingSourceId == null) "添加书源" else "编辑 Calibre 连接") },
+                        title = { Text(if (state.editingSourceId == null) "添加书源" else "编辑书源") },
                         navigationIcon = {
                             IconButton(onClick = onDismiss) {
                                 Icon(
@@ -1201,7 +737,7 @@ private fun SourceEditorWindow(
                             label = { Text(addressLabel) },
                             supportingText = {
                                 Text(
-                                    when (state.addSourceAdapterId) {
+                                    state.sourceUrlError ?: when (state.addSourceAdapterId) {
                                         dev.readflow.extensions.api.SourceAdapterIds.CALIBRE ->
                                             "同一 Wi-Fi：http://192.168.x.x:8080；Tailscale：http://100.x.x.x:8080（无需 Serve）"
                                         dev.readflow.extensions.api.SourceAdapterIds.OPDS ->
@@ -1210,8 +746,11 @@ private fun SourceEditorWindow(
                                     },
                                 )
                             },
+                            isError = state.sourceUrlError != null,
                             singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .semantics { contentDescription = "书源地址输入" },
                         )
                     }
                     OutlinedTextField(
@@ -1457,158 +996,4 @@ private fun SourceRuleField(
         singleLine = true,
         modifier = Modifier.fillMaxWidth(),
     )
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun OnlineCatalogResultRow(
-    entry: dev.readflow.extensions.api.OnlineCatalogEntry,
-    selected: Boolean,
-    isDownloading: Boolean,
-    canDownload: Boolean,
-    downloadEnabled: Boolean,
-    canPreview: Boolean,
-    canBatchAcrossSource: Boolean,
-    onToggleSelect: () -> Unit,
-    onDownload: () -> Unit,
-    onPreview: () -> Unit,
-    onAuthorBatch: (String) -> Unit,
-    onSeriesBatch: () -> Unit,
-) {
-    val book = entry.meta
-    val batchAuthors = entry.individualAuthors()
-    var overflowExpanded by remember { mutableStateOf(false) }
-    val hasOverflowActions = canDownload || canPreview
-    val downloadLabel = if (isDownloading) "正在下载《${book.title}》" else "下载《${book.title}》"
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (canDownload) {
-                Checkbox(
-                    checked = selected,
-                    onCheckedChange = { onToggleSelect() },
-                    modifier = Modifier.semantics {
-                        contentDescription = if (selected) {
-                            "取消选择《${book.title}》"
-                        } else {
-                            "选择《${book.title}》"
-                        }
-                    },
-                )
-            }
-            BookCover(
-                book = book,
-                showProgress = false,
-                modifier = Modifier
-                    .width(44.dp)
-                    .height(64.dp),
-            )
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = book.title,
-                    style = MaterialTheme.typography.titleSmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = buildString {
-                        append(book.author)
-                        append(" · ")
-                        append(book.format.name)
-                        entry.series?.takeIf { it.isNotBlank() }?.let {
-                            append(" · ")
-                            append(it)
-                        }
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            if (canDownload) {
-                IconButton(
-                    onClick = onDownload,
-                    enabled = downloadEnabled && !isDownloading,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .semantics { contentDescription = downloadLabel },
-                ) {
-                    if (isDownloading) {
-                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    } else {
-                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = null)
-                    }
-                }
-            }
-            if (hasOverflowActions) {
-                Box {
-                    IconButton(
-                        onClick = { overflowExpanded = true },
-                        modifier = Modifier
-                            .size(48.dp)
-                            .semantics { contentDescription = "更多操作，${book.title}" },
-                    ) {
-                        Icon(Icons.Default.MoreVert, contentDescription = null)
-                    }
-                    DropdownMenu(
-                        expanded = overflowExpanded,
-                        onDismissRequest = { overflowExpanded = false },
-                    ) {
-                        if (canDownload) {
-                            batchAuthors.forEach { author ->
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            if (batchAuthors.size == 1) {
-                                                if (canBatchAcrossSource) "同作者全选" else "当前结果同作者"
-                                            } else if (canBatchAcrossSource) {
-                                                "全选作者：$author"
-                                            } else {
-                                                "当前结果：$author"
-                                            },
-                                        )
-                                    },
-                                    onClick = {
-                                        overflowExpanded = false
-                                        onAuthorBatch(author)
-                                    },
-                                )
-                            }
-                            if (!entry.series.isNullOrBlank()) {
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            if (canBatchAcrossSource) "同系列全选" else "当前结果同系列",
-                                        )
-                                    },
-                                    onClick = {
-                                        overflowExpanded = false
-                                        onSeriesBatch()
-                                    },
-                                )
-                            }
-                        }
-                        if (canPreview) {
-                            DropdownMenuItem(
-                                text = { Text("正文预览") },
-                                onClick = {
-                                    overflowExpanded = false
-                                    onPreview()
-                                },
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
 }

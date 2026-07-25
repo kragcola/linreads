@@ -53,13 +53,17 @@ interface BookDao {
         """
         SELECT id, localUri, lastReadAt
         FROM books
-        WHERE id LIKE :remotePrefix || '%'
+        WHERE (
+                id LIKE :legacyRemotePrefix || '%'
+                OR id LIKE :sourceScopedRemotePrefix || '%'
+            )
             AND downloadStatus = :downloadedStatus
             AND localUri IS NOT NULL
         """,
     )
     suspend fun downloadedRemoteCacheBooks(
-        remotePrefix: String,
+        legacyRemotePrefix: String,
+        sourceScopedRemotePrefix: String,
         downloadedStatus: String,
     ): List<DownloadedCacheBook>
 

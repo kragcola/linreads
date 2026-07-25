@@ -1,6 +1,9 @@
 package dev.readflow.core.database
 
 import dev.readflow.core.model.DownloadStatus
+import dev.readflow.core.model.LEGACY_REMOTE_BOOK_ID_PREFIX
+import dev.readflow.core.model.SOURCE_SCOPED_REMOTE_BOOK_ID_PREFIX
+import dev.readflow.core.model.isRemoteBookId
 import java.io.File
 import java.net.URI
 
@@ -25,7 +28,8 @@ class DownloadedBookCache(
     override suspend fun trim(protectedBookId: String?): List<DownloadedCacheEviction> {
         val evictions = planner.evictions(
             candidates = bookDao.downloadedRemoteCacheBooks(
-                remotePrefix = DownloadedBookCachePlanner.REMOTE_CACHE_ID_PREFIX,
+                legacyRemotePrefix = LEGACY_REMOTE_BOOK_ID_PREFIX,
+                sourceScopedRemotePrefix = SOURCE_SCOPED_REMOTE_BOOK_ID_PREFIX,
                 downloadedStatus = DownloadStatus.DOWNLOADED.name,
             ),
             protectedBookId = protectedBookId,
@@ -42,7 +46,7 @@ class DownloadedBookCache(
     }
 
     override suspend fun removeDownloadedAsset(bookId: String): DownloadedCacheEviction? {
-        if (!bookId.startsWith(DownloadedBookCachePlanner.REMOTE_CACHE_ID_PREFIX)) return null
+        if (!bookId.isRemoteBookId()) return null
         val book = bookDao.getById(bookId) ?: return null
         if (book.downloadStatus != DownloadStatus.DOWNLOADED.name) return null
         val localUri = book.localUri ?: return null

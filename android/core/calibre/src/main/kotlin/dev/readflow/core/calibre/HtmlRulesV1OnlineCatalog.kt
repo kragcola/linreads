@@ -9,6 +9,7 @@ import dev.readflow.extensions.api.OnlineBookCatalog
 import dev.readflow.extensions.api.OnlineBookPreview
 import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.OnlineCatalogPage
 import dev.readflow.extensions.api.RemoteBookKey
 import dev.readflow.extensions.api.SourceAdapterFactory
 import dev.readflow.extensions.api.SourceAdapterIds
@@ -16,6 +17,7 @@ import dev.readflow.extensions.api.SourceCapabilities
 import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.applyCatalogFilter
 import dev.readflow.extensions.api.stableRemoteBookId
+import dev.readflow.extensions.api.sourceEntryKey
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
@@ -107,7 +109,19 @@ class HtmlRulesV1OnlineCatalog(
         filter: OnlineCatalogFilter,
         offset: Int,
         limit: Int,
-    ): ReadflowResult<List<OnlineCatalogEntry>> =
+    ): ReadflowResult<List<OnlineCatalogEntry>> = when (
+        val result = searchPage(query, filter, offset, limit)
+    ) {
+        is ReadflowResult.Success -> ReadflowResult.Success(result.value.entries)
+        is ReadflowResult.Failure -> result
+    }
+
+    override suspend fun searchPage(
+        query: String,
+        filter: OnlineCatalogFilter,
+        offset: Int,
+        limit: Int,
+    ): ReadflowResult<OnlineCatalogPage> =
         withContext(Dispatchers.IO) {
             runCatching {
                 val url = renderSearchUrl(
@@ -116,15 +130,32 @@ class HtmlRulesV1OnlineCatalog(
                     page = offset / limit.coerceAtLeast(1) + 1,
                 )
                 val page = fetchHtml(url)
-                val entries = parseSearchResults(page.document, page.url)
+                val sourceEntries = parseSearchResults(page.document, page.url)
+                val entries = sourceEntries
                     .applyCatalogFilter(filter)
                     .take(limit.coerceIn(1, MAX_SEARCH_RESULTS))
-                ReadflowResult.Success(entries)
+                ReadflowResult.Success(
+                    OnlineCatalogPage(
+                        entries = entries,
+                        nextOffset = offset.coerceAtLeast(0) + limit.coerceAtLeast(1),
+                        hasMore = sourceEntries.isNotEmpty(),
+                        scannedEntryKeys = sourceEntries.mapTo(
+                            linkedSetOf(),
+                            OnlineCatalogEntry::sourceEntryKey,
+                        ),
+                    ),
+                )
             }.getOrElse { error ->
                 if (error is CancellationException) throw error
                 ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "HTML 书源搜索失败"))
             }
         }
+
+    override suspend fun browsePage(
+        filter: OnlineCatalogFilter,
+        offset: Int,
+        limit: Int,
+    ): ReadflowResult<OnlineCatalogPage> = searchPage("", filter, offset, limit)
 
     override suspend fun download(entry: OnlineCatalogEntry): ReadflowResult<BookMeta> =
         download(entry, HtmlBookDownloadLimits())

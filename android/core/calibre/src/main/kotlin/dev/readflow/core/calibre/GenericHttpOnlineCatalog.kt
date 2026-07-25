@@ -9,6 +9,7 @@ import dev.readflow.extensions.api.OnlineBookCatalog
 import dev.readflow.extensions.api.OnlineBookPreview
 import dev.readflow.extensions.api.OnlineCatalogEntry
 import dev.readflow.extensions.api.OnlineCatalogFilter
+import dev.readflow.extensions.api.OnlineCatalogPage
 import dev.readflow.extensions.api.RemoteBookKey
 import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceDescriptor
@@ -70,7 +71,19 @@ class GenericHttpOnlineCatalog(
         filter: OnlineCatalogFilter,
         offset: Int,
         limit: Int,
-    ): ReadflowResult<List<OnlineCatalogEntry>> =
+    ): ReadflowResult<List<OnlineCatalogEntry>> = when (
+        val result = searchPage(query, filter, offset, limit)
+    ) {
+        is ReadflowResult.Success -> ReadflowResult.Success(result.value.entries)
+        is ReadflowResult.Failure -> result
+    }
+
+    override suspend fun searchPage(
+        query: String,
+        filter: OnlineCatalogFilter,
+        offset: Int,
+        limit: Int,
+    ): ReadflowResult<OnlineCatalogPage> =
         withContext(Dispatchers.IO) {
             runCatching {
                 val q = query.trim()
@@ -83,14 +96,28 @@ class GenericHttpOnlineCatalog(
                             entry.tags.any { it.contains(q, ignoreCase = true) }
                     }
                     .applyCatalogFilter(filter)
-                    .drop(offset.coerceAtLeast(0))
+                val safeOffset = offset.coerceAtLeast(0)
+                val pageEntries = filtered
+                    .drop(safeOffset)
                     .take(limit.coerceAtLeast(1))
-                ReadflowResult.Success(filtered)
+                ReadflowResult.Success(
+                    OnlineCatalogPage(
+                        entries = pageEntries,
+                        nextOffset = safeOffset + pageEntries.size,
+                        hasMore = safeOffset + pageEntries.size < filtered.size,
+                    ),
+                )
             }.getOrElse { error ->
                 if (error is CancellationException) throw error
                 ReadflowResult.Failure(ReadflowError.network(null, error.message ?: "书源请求失败"))
             }
         }
+
+    override suspend fun browsePage(
+        filter: OnlineCatalogFilter,
+        offset: Int,
+        limit: Int,
+    ): ReadflowResult<OnlineCatalogPage> = searchPage("", filter, offset, limit)
 
     private suspend fun loadEntries(): List<OnlineCatalogEntry> {
         entriesMutex.lock()
