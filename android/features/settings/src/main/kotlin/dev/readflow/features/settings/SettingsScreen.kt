@@ -870,8 +870,8 @@ fun SettingsScreen(
                 }
 
                 UpdateState.ReadyToInstall -> ConnectionResultText(
-                    title = "下载完成，正在准备安装",
-                    detail = "系统安装确认将在准备完成后自动打开。",
+                    title = "已准备好安装",
+                    detail = "请下拉通知栏，点击「LinReads 更新已准备好」确认安装。",
                     isError = false,
                 )
 
