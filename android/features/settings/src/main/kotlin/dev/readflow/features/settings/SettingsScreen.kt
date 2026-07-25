@@ -110,8 +110,14 @@ fun SettingsScreen(
     }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
-    ) {
-        pendingUpdateDownload?.let(::startUpdateDownload)
+    ) { granted ->
+        pendingUpdateDownload?.let { update ->
+            if (granted) {
+                startUpdateDownload(update)
+            } else {
+                updateState = UpdateState.Error("需要通知权限才能可靠显示更新下载和安装状态")
+            }
+        }
         pendingUpdateDownload = null
     }
     val isBackupBusy = backupExportState is BackupExportUiState.Exporting ||
@@ -204,8 +210,8 @@ fun SettingsScreen(
                 when (status) {
                     DownloadManager.STATUS_SUCCESSFUL -> {
                         val uri = dm.getUriForDownloadedFile(dlId)
-                        if (uri != null && context.launchUpdateInstaller(uri)) {
-                            updateState = UpdateState.ReadyToInstall(uri)
+                        if (uri != null) {
+                            updateState = UpdateState.ReadyToInstall
                         }
                         else updateState = UpdateState.Error("安装包丢失")
                         break
@@ -863,14 +869,11 @@ fun SettingsScreen(
                     ) { Text("取消下载") }
                 }
 
-                is UpdateState.ReadyToInstall -> Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("下载完成", style = MaterialTheme.typography.bodyMedium)
-                    Button(onClick = {
-                        if (!context.launchUpdateInstaller(s.uri)) {
-                            updateState = UpdateState.Error("无法打开系统安装器，请重新下载")
-                        }
-                    }, modifier = Modifier.heightIn(min = 48.dp)) { Text("安装") }
-                }
+                UpdateState.ReadyToInstall -> ConnectionResultText(
+                    title = "下载完成，正在准备安装",
+                    detail = "系统安装确认将在准备完成后自动打开。",
+                    isError = false,
+                )
 
                 is UpdateState.Error -> Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1292,12 +1295,6 @@ private fun Context.applyUpdateArtifactEvent(event: UpdateArtifactEvent) {
     }
 }
 
-private fun Context.launchUpdateInstaller(uri: Uri): Boolean =
-    runCatching {
-        startActivity(createUpdateInstallIntent(uri, launchInNewTask = false))
-        applyUpdateArtifactEvent(UpdateArtifactEvent.InstallerLaunched)
-    }.isSuccess
-
 private fun Context.openUnknownAppSourcesSettings() {
     startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
         data = Uri.parse("package:$packageName")
@@ -1327,7 +1324,7 @@ private sealed interface UpdateState {
         val notes: String get() = packageInfo.notes
     }
     data class Downloading(val progress: Float, val dlId: Long) : UpdateState
-    data class ReadyToInstall(val uri: Uri) : UpdateState
+    data object ReadyToInstall : UpdateState
     data class Error(val msg: String) : UpdateState
 }
 

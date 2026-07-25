@@ -11,6 +11,11 @@ import io.ktor.client.plugins.HttpSend
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.ServerResponseException
+import io.ktor.client.plugins.auth.Auth
+import io.ktor.client.plugins.auth.providers.BasicAuthCredentials
+import io.ktor.client.plugins.auth.providers.DigestAuthCredentials
+import io.ktor.client.plugins.auth.providers.basic
+import io.ktor.client.plugins.auth.providers.digest
 import io.ktor.client.plugins.plugin
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.request.get
@@ -74,6 +79,8 @@ internal class KtorCalibreConnectionTester(
 internal fun defaultCalibreHttpClient(
     engine: HttpClientEngine? = null,
     allowedBaseUrl: String? = null,
+    username: String = "",
+    password: String = "",
 ): HttpClient {
     val config: HttpClientConfigBlock = {
         expectSuccess = true
@@ -81,6 +88,17 @@ internal fun defaultCalibreHttpClient(
         install(HttpTimeout) {
             connectTimeoutMillis = 5_000
             requestTimeoutMillis = 8_000
+        }
+        if (username.isNotBlank()) {
+            install(Auth) {
+                digest {
+                    credentials { DigestAuthCredentials(username, password) }
+                }
+                basic {
+                    credentials { BasicAuthCredentials(username, password) }
+                    sendWithoutRequest { false }
+                }
+            }
         }
     }
     val client = if (engine == null) HttpClient(config) else HttpClient(engine, config)

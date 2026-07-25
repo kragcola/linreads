@@ -4,7 +4,6 @@ import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.plugins.HttpTimeoutConfig
 import io.ktor.client.plugins.timeout
-import io.ktor.client.request.basicAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.parameter
 import io.ktor.client.request.prepareGet
@@ -50,7 +49,11 @@ class CalibreClient internal constructor(
         username = username,
         password = password,
         libraryId = libraryId,
-        http = defaultCalibreHttpClient(allowedBaseUrl = baseUrl),
+        http = defaultCalibreHttpClient(
+            allowedBaseUrl = baseUrl,
+            username = username,
+            password = password,
+        ),
     )
 
     private val baseUrl = requireValidCalibreBaseUrl(baseUrl)
@@ -60,13 +63,10 @@ class CalibreClient internal constructor(
             parameter("query", query)
             parameter("num", num)
             parameter("offset", offset)
-            if (username.isNotBlank()) basicAuth(username, password)
         }.body()
 
     suspend fun bookMeta(id: Int): CalibreBookMeta =
-        http.get("$baseUrl/ajax/book/$id/$libraryId") {
-            if (username.isNotBlank()) basicAuth(username, password)
-        }.body()
+        http.get("$baseUrl/ajax/book/$id/$libraryId").body()
 
     fun downloadUrl(id: Int, format: String) =
         "$baseUrl/get/$format/$id/$libraryId"
@@ -75,7 +75,6 @@ class CalibreClient internal constructor(
 
     suspend fun downloadTo(id: Int, format: String, output: WritableByteChannel): Long =
         http.prepareGet(downloadUrl(id, format)) {
-            if (username.isNotBlank()) basicAuth(username, password)
             timeout {
                 connectTimeoutMillis = DOWNLOAD_CONNECT_TIMEOUT_MS
                 socketTimeoutMillis = DOWNLOAD_SOCKET_TIMEOUT_MS

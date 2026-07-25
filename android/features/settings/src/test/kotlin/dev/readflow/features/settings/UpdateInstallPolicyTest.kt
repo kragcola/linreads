@@ -21,14 +21,6 @@ class UpdateInstallPolicyTest {
     }
 
     @Test
-    fun installerLaunchKeepsTheDownloadedApkAvailableForRetry() {
-        val action = updateArtifactAction(UpdateArtifactEvent.InstallerLaunched)
-
-        assertFalse(action.removeDownload)
-        assertFalse(action.clearMetadata)
-    }
-
-    @Test
     fun cancellationRemovesTheActiveDownload() {
         val action = updateArtifactAction(UpdateArtifactEvent.DownloadCancelled)
 
@@ -49,13 +41,4 @@ class UpdateInstallPolicyTest {
         assertEquals("update-release-210.apk", createUpdateDownloadFileName("release-210"))
     }
 
-    @Test
-    fun installRequestUsesTheDedicatedPackageInstallerAction() {
-        val spec = updateInstallRequestSpec(launchInNewTask = true)
-
-        assertEquals("android.intent.action.INSTALL_PACKAGE", spec.action)
-        assertEquals("application/vnd.android.package-archive", spec.mimeType)
-        assertTrue(spec.grantReadPermission)
-        assertTrue(spec.launchInNewTask)
-    }
 }

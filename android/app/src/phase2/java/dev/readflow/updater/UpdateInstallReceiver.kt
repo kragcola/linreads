@@ -1,17 +1,12 @@
 package dev.readflow.updater
 
 import android.app.DownloadManager
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
-import androidx.core.app.NotificationCompat
 import dev.readflow.features.settings.createUpdateDownloadFileName
-import dev.readflow.features.settings.createUpdateInstallIntent
 
 /** Handles "install update" tap and DownloadManager completion. */
 class UpdateInstallReceiver : BroadcastReceiver() {
@@ -55,7 +50,12 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                             // Old completed download exists - verify it's still valid
                             val uri = dm.getUriForDownloadedFile(prevId)
                             if (uri != null) {
-                                launchInstaller(context, uri)
+                                UpdatePackageInstaller.requestInstall(
+                                    context = context,
+                                    downloadId = prevId,
+                                    apkUri = uri,
+                                    retryRequested = true,
+                                )
                                 return
                             }
                             // File missing, clean up and re-download
@@ -106,10 +106,6 @@ class UpdateInstallReceiver : BroadcastReceiver() {
             .apply()
     }
 
-    private fun launchInstaller(context: Context, uri: Uri) {
-        context.startActivity(createUpdateInstallIntent(uri, launchInNewTask = true))
-    }
-
     private fun onDownloadComplete(context: Context, intent: Intent) {
         val dlId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
         val savedId = context.getSharedPreferences("update", Context.MODE_PRIVATE)
@@ -119,28 +115,6 @@ class UpdateInstallReceiver : BroadcastReceiver() {
         val dm = context.getSystemService(DownloadManager::class.java)
         val apkUri = dm.getUriForDownloadedFile(dlId) ?: return
 
-        // Automatically launch installer after download completes
-        launchInstaller(context, apkUri)
-
-        // Also post a notification as a fallback if auto-install doesn't trigger
-        val installIntent = PendingIntent.getActivity(
-            context, 0,
-            createUpdateInstallIntent(apkUri, launchInNewTask = true),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val nm = context.getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(
-            NotificationChannel("linreads_update", "应用更新", NotificationManager.IMPORTANCE_HIGH)
-        )
-        nm.notify(
-            9002,
-            androidx.core.app.NotificationCompat.Builder(context, "linreads_update")
-                .setSmallIcon(android.R.drawable.stat_sys_download_done)
-                .setContentTitle("LinReads 下载完成")
-                .setContentText("点击安装新版本")
-                .setAutoCancel(true)
-                .setContentIntent(installIntent)
-                .build()
-        )
+        UpdatePackageInstaller.requestInstall(context, dlId, apkUri)
     }
 }

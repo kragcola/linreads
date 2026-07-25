@@ -132,6 +132,7 @@ dependencies {
     implementation(libs.activity.compose)
     implementation(libs.coil)
     implementation(libs.coil.network.okhttp)
+    implementation(libs.work.runtime)
     implementation(libs.bundles.koin)
     implementation(libs.bundles.room)
     // Other render engines (epub/pdf/md) + settings: shells only, wired when implemented
