@@ -198,6 +198,59 @@ class CalibreOnlineCatalogIdentityTest {
     }
 
     @Test
+    fun batchMetadataUsesMapKeyWhenCalibreOmitsEmbeddedId() = runTest {
+        val engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/ajax/search" -> respond(
+                    content = """{"total_num":1,"book_ids":[42],"library_id":"books"}""",
+                    headers = JSON_HEADERS,
+                )
+                "/ajax/books" -> respond(
+                    content = """{"42":{"application_id":999,"title":"Shared","authors":["Author"],"formats":["EPUB"]}}""",
+                    headers = JSON_HEADERS,
+                )
+                else -> error("unexpected request: ${request.url}")
+            }
+        }
+        val catalog = catalog("source-a", engine = engine)
+
+        val result = catalog.search("")
+
+        assertTrue("real Calibre metadata failed: $result", result is ReadflowResult.Success)
+        val entry = (result as ReadflowResult.Success).value.single()
+        assertEquals("Shared", entry.meta.title)
+        assertEquals("42", entry.remoteKey?.remoteId)
+        catalog.close()
+    }
+
+    @Test
+    fun singleMetadataUsesRequestIdWhenCalibreOmitsEmbeddedId() = runTest {
+        val baseUrl = "http://192.168.1.5:8080"
+        val client = CalibreClient(
+            baseUrl = baseUrl,
+            username = "",
+            password = "",
+            libraryId = "books",
+            http = defaultCalibreHttpClient(
+                engine = MockEngine { request ->
+                    assertEquals("/ajax/book/42/books", request.url.encodedPath)
+                    respond(
+                        content = """{"application_id":999,"title":"Shared","formats":["EPUB"]}""",
+                        headers = JSON_HEADERS,
+                    )
+                },
+                allowedBaseUrl = baseUrl,
+            ),
+        )
+
+        val metadata = client.bookMeta(42)
+
+        assertEquals(42, metadata.id)
+        assertEquals("Shared", metadata.title)
+        client.close()
+    }
+
+    @Test
     fun reopenedCatalogRediscoversLibraryIdBeforeDownload() = runTest {
         val searchCatalog = catalog("source-a", engine = MockEngine { request ->
             when (request.url.encodedPath) {
@@ -227,7 +280,7 @@ class CalibreOnlineCatalogIdentityTest {
                         headers = JSON_HEADERS,
                     )
                     "/ajax/book/42/books" -> respond(
-                        content = """{"id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}""",
+                        content = """{"application_id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}""",
                         headers = JSON_HEADERS,
                     )
                     "/get/EPUB/42/books" -> respond(

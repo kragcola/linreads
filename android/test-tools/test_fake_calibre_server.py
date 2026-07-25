@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 class FakeCalibreServerTest(unittest.TestCase):
-    def test_search_and_batch_metadata_match_real_calibre_contract(self):
+    def test_search_and_metadata_routes_match_real_calibre_contract(self):
         port = self._free_port()
         server = subprocess.Popen(
             [
@@ -38,11 +38,20 @@ class FakeCalibreServerTest(unittest.TestCase):
                 timeout=2,
             ) as response:
                 metadata = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/ajax/book/42/calibre-library",
+                timeout=2,
+            ) as response:
+                single_metadata = json.loads(response.read().decode("utf-8"))
 
             self.assertEqual("calibre-library", search["library_id"])
             self.assertEqual([42], search["book_ids"])
-            self.assertEqual(42, metadata["42"]["id"])
+            self.assertNotIn("id", metadata["42"])
+            self.assertEqual(42, metadata["42"]["application_id"])
             self.assertEqual("Remote EPUB Smoke", metadata["42"]["title"])
+            self.assertNotIn("id", single_metadata)
+            self.assertEqual(42, single_metadata["application_id"])
+            self.assertEqual("Remote EPUB Smoke", single_metadata["title"])
         finally:
             self._shutdown_server(port)
             server.wait(timeout=5)

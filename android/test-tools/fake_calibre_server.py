@@ -222,7 +222,7 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _book_metadata(book: FakeBook) -> dict[str, object]:
         return {
-            "id": book.id,
+            "application_id": book.id,
             "title": book.title,
             "authors": [book.author],
             "formats": ["EPUB"],

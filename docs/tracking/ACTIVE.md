@@ -1,6 +1,6 @@
 # Active Work
 
-_最后更新：2026-07-25_
+_最后更新：2026-07-26_
 
 Mode: `task-feature`
 Objective: Android Reader 全量体验打磨：继续排版字体、书架、书签搜索、菜单架构与跨格式能力对齐
@@ -16,6 +16,8 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 > ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
 ## 当前状态
+
+- 2026-07-26 **Calibre 9.5 真实 metadata 身份契约已修复，尚未 OTA 发布**：上一轮修复服务端 `library_id` 后，真实服务的 `/ajax/books?ids=` 仍会失败，根因不是 HTTP 502、Tailscale 或认证，而是 batch 外层 map key 才是书籍 ID，metadata 对象没有 `id`（仅有不可信的 `application_id`）；旧 `CalibreBookMeta.id` 直接反序列化使目录显示“Calibre 返回了无法识别的数据”。现在单书 metadata 始终归一化为请求 ID，批量 metadata 始终归一化为外层数值 key，忽略 `application_id`，非法/溢出 key 仅跳过对应条目。回归故意传入错误 `application_id=999`，确认目录和单书下载身份仍为 42；fake server 的批量与单书 metadata 都锁定为同一 Calibre 9.5 形状。真实 Tailscale 服务在模拟器端验证搜索、批量 metadata、单书 metadata、封面及下载均为 HTTP 200；目录 XML 为 `Calibre · 94 本`、9 个下载动作、错误节点 0，并已完成一册下载后在本地书架显示“1 本可离线”。本地 `CalibreOnlineCatalogIdentityTest` 重新编译通过、fake server 2/2 通过、`git diff --check` 通过。独立协议复审无 Critical/Important；本轮尚待提交、云端全量回归与 OTA。
 
 - 2026-07-25 **Calibre HTTP 502 根因修复完成，随本轮 OTA 发布**：真实 Calibre 9.5 的 `/ajax/search` 返回 `library_id=books`，旧客户端后续却固定请求 `calibre-library`，导致 `/ajax/book/<id>/calibre-library` 为 403，而同一本书使用 `/ajax/book/<id>/books` 为 200；仅有 `ServerResponseException` 文案映射不能修复协议路径。客户端现缓存服务端库标识并对路径段编码，新 catalog 下载前会重新发现库标识；在线书架改用 `/ajax/books?ids=` 单次批量元数据并按搜索顺序组装，服务端遗漏个别 ID 时只跳过对应书目；连接测试探测同一批量接口且不会再把探测阶段 HTTP 502 报成成功；下载失败保留 `NETWORK + HTTP 502` 并清理暂存文件。fake Calibre server 同步实现 `library_id` 与批量元数据契约，并移除测试服务启动时无意义的反向 DNS 阻塞。真实服务经 Tailscale 直连验证搜索、批量元数据、单本元数据和封面均为 HTTP 200；本地 `:core:calibre:testDebugUnitTest`、Python fake server 2 项测试与 `git diff --check` 通过。边界：未在物理平板执行本轮端到端书架浏览/下载验收。
 

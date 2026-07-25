@@ -34,6 +34,25 @@ data class CalibreBookMeta(
     val series: String? = null,
 )
 
+/** Calibre omits `id` from metadata objects; identity comes from the request or response map key. */
+@Serializable
+private data class CalibreBookMetaWire(
+    val title: String,
+    val authors: List<String> = emptyList(),
+    val formats: List<String> = emptyList(),
+    val tags: List<String> = emptyList(),
+    val series: String? = null,
+) {
+    fun normalized(id: Int) = CalibreBookMeta(
+        id = id,
+        title = title,
+        authors = authors,
+        formats = formats,
+        tags = tags,
+        series = series,
+    )
+}
+
 /**
  * Thin HTTP client over the Calibre Content Server REST API.
  * baseUrl/credentials are injected (never hardcoded, C2). Phase 1 scaffold:
@@ -93,7 +112,9 @@ class CalibreClient internal constructor(
 
     suspend fun bookMeta(id: Int): CalibreBookMeta {
         ensureLibraryDiscovered()
-        return http.get("$baseUrl/ajax/book/$id/${libraryPathSegment()}").body()
+        return http.get("$baseUrl/ajax/book/$id/${libraryPathSegment()}")
+            .body<CalibreBookMetaWire>()
+            .normalized(id)
     }
 
     suspend fun bookMetas(ids: List<Int>): Map<Int, CalibreBookMeta> {
@@ -101,10 +122,12 @@ class CalibreClient internal constructor(
         ensureLibraryDiscovered()
         return http.get(booksUrl()) {
             parameter("ids", ids.joinToString(","))
-        }.body<Map<String, CalibreBookMeta?>>()
-            .values
-            .filterNotNull()
-            .associateBy(CalibreBookMeta::id)
+        }.body<Map<String, CalibreBookMetaWire?>>()
+            .mapNotNull { (rawId, wire) ->
+                val id = rawId.toIntOrNull() ?: return@mapNotNull null
+                wire?.normalized(id)?.let { id to it }
+            }
+            .toMap()
     }
 
     fun downloadUrl(id: Int, format: String) =
