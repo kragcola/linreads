@@ -18,12 +18,7 @@ import dev.readflow.extensions.api.applyCatalogFilter
 import dev.readflow.extensions.api.stableRemoteBookId
 import dev.readflow.extensions.api.sourceEntryKey
 import java.io.File
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 
 /**
  * Calibre Content Server as a generic [OnlineBookCatalog] adapter.
@@ -88,30 +83,24 @@ class CalibreOnlineCatalog(
         runCatching {
             val searchResult = client.search(query, limit, offset)
             val ids = searchResult.book_ids
-            val metadataPermits = Semaphore(METADATA_REQUEST_CONCURRENCY)
-            val entries = coroutineScope {
-                ids.map { id ->
-                    async {
-                        metadataPermits.withPermit {
-                            val wire = client.bookMeta(id)
-                            OnlineCatalogEntry(
-                                meta = wire.toCatalogMeta(client, descriptor),
-                                remoteKey = RemoteBookKey(descriptor.id, id.toString()),
-                                authors = wire.authors,
-                                series = wire.series,
-                                tags = wire.tags,
-                                availableFormats = wire.formats,
-                                downloadUrl = wire.bestDownloadFormat()?.let {
-                                    client.downloadUrl(id, it.remoteFormat)
-                                },
-                                previewUrl = authenticatedCalibreCoverUrl(
-                                    client.coverUrl(id),
-                                    descriptor.id,
-                                ),
-                            )
-                        }
-                    }
-                }.awaitAll()
+            val metadata = client.bookMetas(ids)
+            val entries = ids.mapNotNull { id ->
+                val wire = metadata[id] ?: return@mapNotNull null
+                OnlineCatalogEntry(
+                    meta = wire.toCatalogMeta(client, descriptor),
+                    remoteKey = RemoteBookKey(descriptor.id, id.toString()),
+                    authors = wire.authors,
+                    series = wire.series,
+                    tags = wire.tags,
+                    availableFormats = wire.formats,
+                    downloadUrl = wire.bestDownloadFormat()?.let {
+                        client.downloadUrl(id, it.remoteFormat)
+                    },
+                    previewUrl = authenticatedCalibreCoverUrl(
+                        client.coverUrl(id),
+                        descriptor.id,
+                    ),
+                )
             }
             ReadflowResult.Success(
                 OnlineCatalogPage(
@@ -165,9 +154,6 @@ class CalibreOnlineCatalog(
         client.close()
     }
 
-    internal companion object {
-        const val METADATA_REQUEST_CONCURRENCY = 6
-    }
 }
 
 /**

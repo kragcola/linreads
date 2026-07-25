@@ -12,6 +12,7 @@ import zipfile
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import parse_qs, urlparse
 
 
@@ -130,6 +131,12 @@ EVENTS: list[dict[str, object]] = []
 EVENTS_LOCK = threading.Lock()
 
 
+class FakeCalibreServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 class FakeCalibreHandler(BaseHTTPRequestHandler):
     server_version = "FakeCalibre/1.0"
 
@@ -148,6 +155,9 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/ajax/search":
             self._handle_search(parsed)
+            return
+        if parsed.path == "/ajax/books":
+            self._handle_books(parsed)
             return
         if self._handle_book_meta(parsed):
             return
@@ -171,6 +181,7 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         payload = {
             "total_num": len(matches),
             "book_ids": [book.id for book in matches[offset : offset + num]],
+            "library_id": LIBRARY_ID,
         }
         self._write_json(payload)
 
@@ -183,6 +194,19 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
             if any(token in query for token in book.query_tokens)
         ]
 
+    def _handle_books(self, parsed) -> None:
+        params = parse_qs(parsed.query)
+        raw_ids = params.get("ids", [""])[0].split(",")
+        books = [self._book_from_parts(raw_id) for raw_id in raw_ids if raw_id]
+        self._record_event("books", parsed.path)
+        self._write_json(
+            {
+                str(book.id): self._book_metadata(book)
+                for book in books
+                if book is not None
+            }
+        )
+
     def _handle_book_meta(self, parsed) -> bool:
         parts = parsed.path.strip("/").split("/")
         if len(parts) != 4 or parts[:2] != ["ajax", "book"] or parts[3] != LIBRARY_ID:
@@ -192,17 +216,19 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "unknown book")
             return True
         self._record_event("book_meta", parsed.path, book.id)
-        self._write_json(
-            {
-                "id": book.id,
-                "title": book.title,
-                "authors": [book.author],
-                "formats": ["EPUB"],
-                "tags": ["readflow", "runtime"],
-                "series": None,
-            }
-        )
+        self._write_json(self._book_metadata(book))
         return True
+
+    @staticmethod
+    def _book_metadata(book: FakeBook) -> dict[str, object]:
+        return {
+            "id": book.id,
+            "title": book.title,
+            "authors": [book.author],
+            "formats": ["EPUB"],
+            "tags": ["readflow", "runtime"],
+            "series": None,
+        }
 
     def _handle_download(self, parsed) -> bool:
         parts = parsed.path.strip("/").split("/")
@@ -274,7 +300,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8081)
     args = parser.parse_args()
 
-    httpd = ThreadingHTTPServer((args.host, args.port), FakeCalibreHandler)
+    httpd = FakeCalibreServer((args.host, args.port), FakeCalibreHandler)
     print(f"[fake-calibre] listening on http://{args.host}:{args.port}", flush=True)
     try:
         httpd.serve_forever()

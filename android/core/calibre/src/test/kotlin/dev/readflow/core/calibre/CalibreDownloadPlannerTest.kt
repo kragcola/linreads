@@ -1,11 +1,14 @@
 package dev.readflow.core.calibre
 
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.MockEngineConfig
 import io.ktor.client.engine.mock.respond
+import io.ktor.client.engine.mock.respondError
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -138,6 +141,36 @@ class CalibreDownloadPlannerTest {
             "formal download must not inherit the 8 second probe timeout",
             result is ReadflowResult.Success<*>,
         )
+    }
+
+    @Test
+    fun downloadPreservesHttp502AndCleansTheStagingFile() = runTest {
+        val booksDir = temp.newFolder("failed-download")
+        val client = CalibreClient(
+            baseUrl = "http://192.168.1.5:8080",
+            username = "",
+            password = "",
+            libraryId = "calibre-library",
+            http = defaultCalibreHttpClient(
+                MockEngine { respondError(HttpStatusCode.BadGateway) },
+            ),
+        )
+        val downloader = CalibreBookDownloader(client = client, booksDir = booksDir)
+
+        val result = downloader.download(
+            CalibreBookMeta(
+                id = 42,
+                title = "Gateway failure",
+                formats = listOf("EPUB"),
+            ),
+        )
+
+        assertTrue(result is ReadflowResult.Failure)
+        val error = (result as ReadflowResult.Failure).error
+        assertEquals(ReadflowError.Kind.NETWORK, error.kind)
+        assertEquals(502, error.code)
+        assertTrue(error.message.contains("HTTP 502"))
+        assertTrue(booksDir.listFiles().orEmpty().isEmpty())
     }
 
     @Test(expected = CancellationException::class)

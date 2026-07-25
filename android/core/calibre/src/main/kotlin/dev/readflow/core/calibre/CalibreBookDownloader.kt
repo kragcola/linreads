@@ -4,6 +4,7 @@ import dev.readflow.core.model.BookMeta
 import dev.readflow.core.model.DownloadStatus
 import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadflowResult
+import io.ktor.client.plugins.ResponseException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -74,7 +75,13 @@ class CalibreBookDownloader(
                 )
             }.getOrElse { error ->
                 if (error is CancellationException) throw error
-                ReadflowResult.Failure(ReadflowError.io(error.message ?: "Calibre 下载失败"))
+                ReadflowResult.Failure(
+                    if (error is ResponseException) {
+                        error.toCalibreReadflowError()
+                    } else {
+                        ReadflowError.io(error.message ?: "Calibre 下载失败")
+                    },
+                )
             }
         }
 }

@@ -18,8 +18,6 @@ import io.ktor.client.plugins.auth.providers.basic
 import io.ktor.client.plugins.auth.providers.digest
 import io.ktor.client.plugins.plugin
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.request.get
-import io.ktor.client.request.parameter
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.JsonConvertException
 import io.ktor.serialization.kotlinx.json.json
@@ -63,28 +61,21 @@ internal class KtorCalibreConnectionTester(
 
         return runCatching {
             httpClientFactory(validation.normalizedUrl).use { http ->
-                val search = http.get("${validation.normalizedUrl}/ajax/search") {
-                    parameter("query", "")
-                    parameter("num", 1)
-                    parameter("offset", 0)
-                }.body<CalibreSearchResult>()
+                val client = CalibreClient(
+                    baseUrl = validation.normalizedUrl,
+                    username = "",
+                    password = "",
+                    libraryId = "calibre-library",
+                    http = http,
+                )
+                val search = client.search(query = "", num = 1, offset = 0)
 
-                // Probe one book-meta to verify the full deserialization pipeline.
+                // Probe the same batch metadata route used by library browsing.
                 // A parse failure here would otherwise only surface when the user opens
                 // their library, not at connection-test time.
                 val firstId = search.book_ids.firstOrNull()
                 if (firstId != null) {
-                    runCatching {
-                        http.get("${validation.normalizedUrl}/ajax/book/$firstId/calibre-library")
-                            .body<CalibreBookMeta>()
-                    }.onFailure { probeError ->
-                        if (probeError is CancellationException) throw probeError
-                        // Only surface deserialization failures — HTTP errors (wrong library ID,
-                        // 404, etc.) are benign for a connectivity probe.
-                        if (probeError is JsonConvertException || probeError is SerializationException) {
-                            throw probeError
-                        }
-                    }
+                    client.bookMetas(listOf(firstId))
                 }
 
                 CalibreConnectionCheckResult.Success(bookCount = search.total_num)

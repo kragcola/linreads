@@ -26,7 +26,8 @@ class CalibreConnectionTesterTest {
           "offset": 0,
           "num": 1,
           "book_ids": [42],
-          "base_url": "/ajax/book"
+          "base_url": "/ajax/search/books",
+          "library_id": "books"
         }
     """.trimIndent()
 
@@ -88,8 +89,8 @@ class CalibreConnectionTesterTest {
             when {
                 request.url.encodedPath == "/ajax/search" ->
                     respond(realSearchResponse, headers = jsonHeaders)
-                request.url.encodedPath.startsWith("/ajax/book/") ->
-                    respond(realBookMetaResponse, headers = jsonHeaders)
+                request.url.encodedPath == "/ajax/books" ->
+                    respond("""{"42":$realBookMetaResponse}""", headers = jsonHeaders)
                 else -> respondError(HttpStatusCode.NotFound)
             }
         }
@@ -99,7 +100,7 @@ class CalibreConnectionTesterTest {
         assertTrue(result is CalibreConnectionCheckResult.Success)
         assertTrue(
             "Expected book meta probe; got paths: $probedPaths",
-            probedPaths.any { it.startsWith("/ajax/book/") },
+            probedPaths.contains("/ajax/books"),
         )
     }
 
@@ -113,7 +114,7 @@ class CalibreConnectionTesterTest {
                     respond("""{"total_num":1,"book_ids":[1]}""", headers = jsonHeaders)
                 // Return a malformed book meta (title is an int instead of a string) to simulate
                 // a wire-format mismatch the app cannot handle.
-                else -> respond("""{"id":1,"title":9999}""", headers = jsonHeaders)
+                else -> respond("""{"1":{"id":1,"title":9999}}""", headers = jsonHeaders)
             }
         }
 
@@ -126,20 +127,27 @@ class CalibreConnectionTesterTest {
     }
 
     @Test
-    fun bookMetaProbeHttpFailureDoesNotFailConnectionTest() = runTest {
-        // A 404 on the probe (wrong library ID, missing book) should not fail the connection
-        // test — only deserialization errors should propagate.
+    fun bookMetaProbeServerFailureDoesNotReportAWorkingConnection() = runTest {
         val tester = testerWithEngine { request ->
             when {
                 request.url.encodedPath == "/ajax/search" ->
-                    respond("""{"total_num":1,"book_ids":[99]}""", headers = jsonHeaders)
-                else -> respondError(HttpStatusCode.NotFound)
+                    respond(
+                        """{"total_num":1,"book_ids":[99],"library_id":"books"}""",
+                        headers = jsonHeaders,
+                    )
+                else -> respondError(HttpStatusCode.BadGateway)
             }
         }
 
         val result = tester.check("http://192.168.1.5:8080")
 
-        assertEquals(CalibreConnectionCheckResult.Success(bookCount = 1), result)
+        assertEquals(
+            CalibreConnectionCheckResult.Failure(
+                message = "Calibre 服务器暂时不可用（HTTP 502）",
+                nextStep = "确认电脑端 Calibre Content Server 正在运行后再重试",
+            ),
+            result,
+        )
     }
 
     @Test
@@ -226,9 +234,9 @@ class CalibreConnectionTesterTest {
         when {
             request.url.encodedPath == "/ajax/search" ->
                 respond(searchJson, headers = jsonHeaders)
-            request.url.encodedPath.startsWith("/ajax/book/") && bookMetaJson != null ->
-                respond(bookMetaJson, headers = jsonHeaders)
-            request.url.encodedPath.startsWith("/ajax/book/") ->
+            request.url.encodedPath == "/ajax/books" && bookMetaJson != null ->
+                respond("""{"42":$bookMetaJson}""", headers = jsonHeaders)
+            request.url.encodedPath == "/ajax/books" ->
                 respondError(HttpStatusCode.NotFound)
             else -> respondError(HttpStatusCode.NotFound)
         }

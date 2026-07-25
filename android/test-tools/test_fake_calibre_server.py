@@ -10,6 +10,45 @@ from pathlib import Path
 
 
 class FakeCalibreServerTest(unittest.TestCase):
+    def test_search_and_batch_metadata_match_real_calibre_contract(self):
+        port = self._free_port()
+        server = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("fake_calibre_server.py")),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            self._wait_for_server(port)
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/ajax/search?query=smoke&num=1&offset=0",
+                timeout=2,
+            ) as response:
+                search = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/ajax/books?ids=42",
+                timeout=2,
+            ) as response:
+                metadata = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual("calibre-library", search["library_id"])
+            self.assertEqual([42], search["book_ids"])
+            self.assertEqual(42, metadata["42"]["id"])
+            self.assertEqual("Remote EPUB Smoke", metadata["42"]["title"])
+        finally:
+            self._shutdown_server(port)
+            server.wait(timeout=5)
+            if server.stdout is not None:
+                server.stdout.close()
+
     def test_cover_route_returns_png_and_records_cover_event(self):
         port = self._free_port()
         server = subprocess.Popen(

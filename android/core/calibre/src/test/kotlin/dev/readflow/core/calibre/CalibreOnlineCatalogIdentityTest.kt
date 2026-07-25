@@ -7,11 +7,11 @@ import dev.readflow.extensions.api.SourceDescriptor
 import dev.readflow.extensions.api.stableRemoteBookId
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
+import io.ktor.client.engine.mock.respondError
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
-import java.util.concurrent.atomic.AtomicInteger
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -66,42 +66,188 @@ class CalibreOnlineCatalogIdentityTest {
     }
 
     @Test
-    fun metadataRequestsAreBoundedAndResultsKeepCalibreSearchOrder() = runTest {
-        val activeRequests = AtomicInteger(0)
-        val peakRequests = AtomicInteger(0)
+    fun metadataRequestsAreBatchedAndResultsKeepCalibreSearchOrder() = runTest {
+        val requestedPaths = mutableListOf<String>()
+        var requestedIds: String? = null
         val ids = (1..12).toList()
         val engine = MockEngine { request ->
-            if (request.url.encodedPath == "/ajax/search") {
-                respond(
+            requestedPaths += request.url.encodedPath
+            when (request.url.encodedPath) {
+                "/ajax/search" -> respond(
                     content = """{"total_num":12,"book_ids":${ids.joinToString(prefix = "[", postfix = "]")}}""",
                     headers = JSON_HEADERS,
                 )
-            } else {
-                val id = request.url.encodedPath.substringAfter("/ajax/book/").substringBefore('/').toInt()
-                val active = activeRequests.incrementAndGet()
-                peakRequests.accumulateAndGet(active, ::maxOf)
-                try {
-                    delay((13 - id) * 5L)
+                "/ajax/books" -> {
+                    requestedIds = request.url.parameters["ids"]
                     respond(
-                        content = """{"id":$id,"title":"Book $id","authors":["Author"],"formats":["EPUB"]}""",
+                        content = ids.reversed().joinToString(prefix = "{", postfix = "}") { id ->
+                            """"$id":{"id":$id,"title":"Book $id","authors":["Author"],"formats":["EPUB"]}"""
+                        },
                         headers = JSON_HEADERS,
                     )
-                } finally {
-                    activeRequests.decrementAndGet()
                 }
+                else -> error("metadata must use the Calibre batch endpoint: ${request.url}")
             }
         }
         val catalog = catalog("source-a", engine = engine)
 
         val entries = catalog.search("").successValue()
 
-        assertTrue("metadata requests should overlap", peakRequests.get() > 1)
-        assertTrue(
-            "metadata concurrency must stay bounded",
-            peakRequests.get() <= CalibreOnlineCatalog.METADATA_REQUEST_CONCURRENCY,
-        )
+        assertEquals(listOf("/ajax/search", "/ajax/books"), requestedPaths)
+        assertEquals(ids.joinToString(","), requestedIds)
         assertEquals(ids.map { "Book $it" }, entries.map { it.meta.title })
         catalog.close()
+    }
+
+    @Test
+    fun missingBatchMetadataSkipsOnlyTheMissingBook() = runTest {
+        val engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/ajax/search" -> respond(
+                    content = """{"total_num":2,"book_ids":[1,2],"library_id":"books"}""",
+                    headers = JSON_HEADERS,
+                )
+                "/ajax/books" -> respond(
+                    content = """{"1":{"id":1,"title":"Available","formats":["EPUB"]},"2":null}""",
+                    headers = JSON_HEADERS,
+                )
+                else -> error("unexpected request: ${request.url}")
+            }
+        }
+        val catalog = catalog("source-a", engine = engine)
+
+        val result = catalog.search("")
+
+        assertTrue(result is ReadflowResult.Success)
+        assertEquals(listOf("Available"), (result as ReadflowResult.Success).value.map { it.meta.title })
+        catalog.close()
+    }
+
+    @Test
+    fun explicitLibraryIdUsesEncodedQualifiedRoutesAndIsNotOverriddenBySearch() = runTest {
+        val requestedPaths = mutableListOf<String>()
+        val libraryId = "Sci Fi/中文"
+        val encodedLibraryId = "Sci%20Fi%2F%E4%B8%AD%E6%96%87"
+        val engine = MockEngine { request ->
+            requestedPaths += request.url.encodedPath
+            when (request.url.encodedPath) {
+                "/ajax/search/$encodedLibraryId" -> respond(
+                    content = """{"total_num":1,"book_ids":[42],"library_id":"books"}""",
+                    headers = JSON_HEADERS,
+                )
+                "/ajax/books/$encodedLibraryId" -> respond(
+                    content = """{"42":{"id":42,"title":"Custom Library","formats":["EPUB"]}}""",
+                    headers = JSON_HEADERS,
+                )
+                else -> error("unexpected request: ${request.url}")
+            }
+        }
+        val baseUrl = "http://192.168.1.5:8080"
+        val client = CalibreClient(
+            baseUrl = baseUrl,
+            username = "",
+            password = "",
+            libraryId = libraryId,
+            http = defaultCalibreHttpClient(engine, allowedBaseUrl = baseUrl),
+        )
+
+        val search = client.search("")
+        val metadata = client.bookMetas(search.book_ids)
+
+        assertEquals(
+            listOf(
+                "/ajax/search/$encodedLibraryId",
+                "/ajax/books/$encodedLibraryId",
+            ),
+            requestedPaths,
+        )
+        assertEquals("Custom Library", metadata.getValue(42).title)
+        assertEquals("$baseUrl/get/EPUB/42/$encodedLibraryId", client.downloadUrl(42, "EPUB"))
+        assertEquals("$baseUrl/get/cover/42/$encodedLibraryId", client.coverUrl(42))
+        client.close()
+    }
+
+    @Test
+    fun serverReportedLibraryIdRoutesMetadataCoverAndDownload() = runTest {
+        val requestedPaths = mutableListOf<String>()
+        val engine = MockEngine { request ->
+            requestedPaths += request.url.encodedPath
+            when (request.url.encodedPath) {
+                "/ajax/search" -> respond(
+                    content = """{"total_num":1,"book_ids":[42],"library_id":"books"}""",
+                    headers = JSON_HEADERS,
+                )
+                "/ajax/books" -> respond(
+                    content = """{"42":{"id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}}""",
+                    headers = JSON_HEADERS,
+                )
+                else -> error("unexpected request: ${request.url}")
+            }
+        }
+        val catalog = catalog("source-a", engine = engine)
+
+        val entry = catalog.search("").successValue().single()
+
+        assertEquals(listOf("/ajax/search", "/ajax/books"), requestedPaths)
+        assertEquals(
+            "http://192.168.1.5:8080/get/EPUB/42/books",
+            entry.downloadUrl,
+        )
+        assertTrue(entry.previewUrl?.contains("/get/cover/42/books") == true)
+        catalog.close()
+    }
+
+    @Test
+    fun reopenedCatalogRediscoversLibraryIdBeforeDownload() = runTest {
+        val searchCatalog = catalog("source-a", engine = MockEngine { request ->
+            when (request.url.encodedPath) {
+                "/ajax/search" -> respond(
+                    content = """{"total_num":1,"book_ids":[42],"library_id":"books"}""",
+                    headers = JSON_HEADERS,
+                )
+                "/ajax/books" -> respond(
+                    content = """{"42":{"id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}}""",
+                    headers = JSON_HEADERS,
+                )
+                else -> error("unexpected search request: ${request.url}")
+            }
+        })
+        val entry = searchCatalog.search("").successValue().single()
+        searchCatalog.close()
+
+        val requestedPaths = mutableListOf<String>()
+        val downloadCatalog = catalog(
+            sourceId = "source-a",
+            booksDir = tempFolder.newFolder("rediscovered-library-download"),
+            engine = MockEngine { request ->
+                requestedPaths += request.url.encodedPath
+                when (request.url.encodedPath) {
+                    "/ajax/search" -> respond(
+                        content = """{"total_num":1,"book_ids":[42],"library_id":"books"}""",
+                        headers = JSON_HEADERS,
+                    )
+                    "/ajax/book/42/books" -> respond(
+                        content = """{"id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}""",
+                        headers = JSON_HEADERS,
+                    )
+                    "/get/EPUB/42/books" -> respond(
+                        content = "epub bytes",
+                        headers = headersOf(HttpHeaders.ContentLength, "10"),
+                    )
+                    "/ajax/book/42/calibre-library" -> respondError(HttpStatusCode.BadGateway)
+                    else -> error("unexpected download request: ${request.url}")
+                }
+            },
+        )
+
+        val result = downloadCatalog.download(entry)
+
+        assertTrue("reopened catalog download failed: $result", result is ReadflowResult.Success)
+        assertEquals(
+            listOf("/ajax/search", "/ajax/book/42/books", "/get/EPUB/42/books"),
+            requestedPaths,
+        )
+        downloadCatalog.close()
     }
 
     private fun catalog(
@@ -136,7 +282,7 @@ class CalibreOnlineCatalogIdentityTest {
         val body = if (request.url.encodedPath == "/ajax/search") {
             """{"total_num":1,"book_ids":[42]}"""
         } else {
-            """{"id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}"""
+            """{"42":{"id":42,"title":"Shared","authors":["Author"],"formats":["EPUB"]}}"""
         }
         respond(
             content = body,
