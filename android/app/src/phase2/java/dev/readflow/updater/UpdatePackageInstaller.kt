@@ -1,6 +1,7 @@
 package dev.readflow.updater
 
 import android.Manifest
+import android.app.DownloadManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -275,28 +276,61 @@ class UpdateInstallStatusReceiver : android.content.BroadcastReceiver() {
         if (sessionId == NO_SESSION) return
         when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
-                val confirmation = intent.installConfirmationIntent() ?: run {
-                    UpdatePackageInstaller.markFailed(context, sessionId, "系统未返回安装确认页面")
-                    postInstallFailureNotification(context, "系统未返回安装确认页面")
-                    return
-                }
                 UpdatePackageInstaller.markAwaitingUser(context, sessionId)
-                // Always post a notification rather than auto-starting the confirmation activity.
-                // Calling startActivity() from a BroadcastReceiver with FLAG_ACTIVITY_NEW_TASK
-                // unconditionally brings the OEM installer (or app store on some tablets) to the
-                // foreground, causing the unwanted app-store redirect after each OTA install.
-                // A user-initiated tap on the notification opens the confirmation gracefully.
-                if (canPostInstallNotification(context)) {
-                    postInstallConfirmationNotification(context, sessionId, confirmation)
+                // On Huawei EMUI devices, the PackageInstaller session's STATUS_PENDING_USER_ACTION
+                // confirmation intent is a market://search?q=<app-name> AppGallery URI rather than
+                // the system installer UI. Launching it — whether directly or via a notification
+                // PendingIntent — opens AppGallery search instead of the install dialog.
+                //
+                // Workaround: bypass the confirmation intent and use ACTION_INSTALL_PACKAGE with
+                // the original APK content URI from DownloadManager. AOSP and OEM installers
+                // (including Huawei's local one) resolve this correctly without AppGallery.
+                val dlId = context.getSharedPreferences("update", Context.MODE_PRIVATE)
+                    .getLong("dl_id", -1L)
+                val apkUri = if (dlId != -1L)
+                    context.getSystemService(DownloadManager::class.java)
+                        .getUriForDownloadedFile(dlId)
+                else null
+
+                if (apkUri != null) {
+                    val installIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+                        data = apkUri
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+                        putExtra(Intent.EXTRA_RETURN_RESULT, false)
+                    }
+                    runCatching {
+                        context.startActivity(installIntent)
+                    }.onFailure {
+                        // Direct launch failed — fall back to the system confirmation intent.
+                        val confirmation = intent.installConfirmationIntent()
+                        if (confirmation != null) {
+                            runCatching {
+                                context.startActivity(
+                                    confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            }.onFailure { fallback ->
+                                UpdatePackageInstaller.markFailed(context, sessionId, "无法打开安装页面，请重试")
+                                postInstallFailureNotification(context, "无法打开安装页面，请重试")
+                            }
+                        } else {
+                            UpdatePackageInstaller.markFailed(context, sessionId, "无法打开安装页面，请重试")
+                            postInstallFailureNotification(context, "无法打开安装页面，请重试")
+                        }
+                    }
                 } else {
-                    // No notification permission — try direct launch as a last resort.
+                    // APK URI not found in DownloadManager — fall back to the confirmation intent.
+                    val confirmation = intent.installConfirmationIntent() ?: run {
+                        UpdatePackageInstaller.markFailed(context, sessionId, "系统未返回安装确认页面")
+                        postInstallFailureNotification(context, "系统未返回安装确认页面")
+                        return
+                    }
                     runCatching {
                         context.startActivity(confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     }.onFailure {
                         UpdatePackageInstaller.markFailed(
-                            context,
-                            sessionId,
-                            "无法打开系统安装确认页面，请返回 LinReads 重试",
+                            context, sessionId, "无法打开系统安装确认页面，请返回 LinReads 重试",
                         )
                     }
                 }
