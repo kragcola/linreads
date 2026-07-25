@@ -27,6 +27,7 @@ import java.net.ConnectException
 import java.net.UnknownHostException
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
 
 sealed interface CalibreConnectionCheckResult {
     data class Success(val bookCount: Int) : CalibreConnectionCheckResult
@@ -62,12 +63,31 @@ internal class KtorCalibreConnectionTester(
 
         return runCatching {
             httpClientFactory(validation.normalizedUrl).use { http ->
-                val result = http.get("${validation.normalizedUrl}/ajax/search") {
+                val search = http.get("${validation.normalizedUrl}/ajax/search") {
                     parameter("query", "")
                     parameter("num", 1)
                     parameter("offset", 0)
                 }.body<CalibreSearchResult>()
-                CalibreConnectionCheckResult.Success(bookCount = result.total_num)
+
+                // Probe one book-meta to verify the full deserialization pipeline.
+                // A parse failure here would otherwise only surface when the user opens
+                // their library, not at connection-test time.
+                val firstId = search.book_ids.firstOrNull()
+                if (firstId != null) {
+                    runCatching {
+                        http.get("${validation.normalizedUrl}/ajax/book/$firstId/calibre-library")
+                            .body<CalibreBookMeta>()
+                    }.onFailure { probeError ->
+                        if (probeError is CancellationException) throw probeError
+                        // Only surface deserialization failures — HTTP errors (wrong library ID,
+                        // 404, etc.) are benign for a connectivity probe.
+                        if (probeError is JsonConvertException || probeError is SerializationException) {
+                            throw probeError
+                        }
+                    }
+                }
+
+                CalibreConnectionCheckResult.Success(bookCount = search.total_num)
             }
         }.getOrElse { error ->
             if (error is CancellationException) throw error
@@ -84,7 +104,10 @@ internal fun defaultCalibreHttpClient(
 ): HttpClient {
     val config: HttpClientConfigBlock = {
         expectSuccess = true
-        install(ContentNegotiation) { json() }
+        // ignoreUnknownKeys: Calibre returns 10+ extra fields (sort_order, offset, num,
+        // base_url, cover, last_modified, …) beyond what our data classes declare.
+        // Default Json rejects any unknown key with SerializationException.
+        install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
         install(HttpTimeout) {
             connectTimeoutMillis = 5_000
             requestTimeoutMillis = 8_000

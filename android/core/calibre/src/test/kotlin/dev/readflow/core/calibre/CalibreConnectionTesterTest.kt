@@ -1,6 +1,5 @@
 package dev.readflow.core.calibre
 
-import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.MockRequestHandleScope
 import io.ktor.client.engine.mock.respond
@@ -18,13 +17,129 @@ import org.junit.Test
 
 class CalibreConnectionTesterTest {
 
+    // Real Calibre /ajax/search response — includes sort_order, offset, num, base_url that the
+    // contract does not declare.  Used to verify ignoreUnknownKeys = true.
+    private val realSearchResponse = """
+        {
+          "total_num": 12,
+          "sort_order": "asc",
+          "offset": 0,
+          "num": 1,
+          "book_ids": [42],
+          "base_url": "/ajax/book"
+        }
+    """.trimIndent()
+
+    // Real Calibre /ajax/book/<id>/<library> response — includes 20+ extra fields.
+    private val realBookMetaResponse = """
+        {
+          "id": 42,
+          "title": "Flatland: A Romance of Many Dimensions",
+          "authors": ["Edwin A. Abbott"],
+          "author_sort": "Abbott, Edwin A.",
+          "formats": ["EPUB", "PDF"],
+          "tags": ["fiction", "mathematics"],
+          "series": null,
+          "series_index": 1.0,
+          "cover": "/get/cover/42/calibre-library",
+          "has_cover": true,
+          "last_modified": "2024-01-15T10:30:00+00:00",
+          "timestamp": "2023-06-01T08:00:00+00:00",
+          "pubdate": "1884-01-01T00:00:00+00:00",
+          "publisher": null,
+          "comments": "A satirical novella by the English schoolmaster Edwin Abbott.",
+          "identifiers": {"isbn": "9780486272634"},
+          "languages": ["eng"],
+          "rating": null,
+          "size": 204800,
+          "uuid": "550e8400-e29b-41d4-a716-446655440000"
+        }
+    """.trimIndent()
+
     @Test
     fun succeedsWhenCalibreSearchEndpointReturnsJson() = runTest {
-        val tester = testerWithResponse("""{"total_num": 12, "book_ids": [1]}""")
+        val tester = testerWithRoutes(
+            searchJson = """{"total_num": 12, "book_ids": []}""",
+        )
 
         val result = tester.check("http://192.168.1.5:8080")
 
         assertEquals(CalibreConnectionCheckResult.Success(bookCount = 12), result)
+    }
+
+    @Test
+    fun succeedsWithRealCalibreWirePayloadIncludingExtraFields() = runTest {
+        // Regression: default Json rejects unknown keys; ignoreUnknownKeys = true is required.
+        val tester = testerWithRoutes(
+            searchJson = realSearchResponse,
+            bookMetaJson = realBookMetaResponse,
+        )
+
+        val result = tester.check("http://192.168.1.5:8080")
+
+        assertEquals(CalibreConnectionCheckResult.Success(bookCount = 12), result)
+    }
+
+    @Test
+    fun probesBookMetaWhenSearchReturnsIds() = runTest {
+        val probedPaths = mutableListOf<String>()
+        val tester = testerWithEngine { request ->
+            probedPaths += request.url.encodedPath
+            when {
+                request.url.encodedPath == "/ajax/search" ->
+                    respond(realSearchResponse, headers = jsonHeaders)
+                request.url.encodedPath.startsWith("/ajax/book/") ->
+                    respond(realBookMetaResponse, headers = jsonHeaders)
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val result = tester.check("http://192.168.1.5:8080")
+
+        assertTrue(result is CalibreConnectionCheckResult.Success)
+        assertTrue(
+            "Expected book meta probe; got paths: $probedPaths",
+            probedPaths.any { it.startsWith("/ajax/book/") },
+        )
+    }
+
+    @Test
+    fun reportsParseFailureWhenBookMetaHasUnexpectedShape() = runTest {
+        // If Calibre changes its wire format, the probe should surface it during connection test
+        // rather than silently breaking in the library view.
+        val tester = testerWithEngine { request ->
+            when {
+                request.url.encodedPath == "/ajax/search" ->
+                    respond("""{"total_num":1,"book_ids":[1]}""", headers = jsonHeaders)
+                // Return a malformed book meta (title is an int instead of a string) to simulate
+                // a wire-format mismatch the app cannot handle.
+                else -> respond("""{"id":1,"title":9999}""", headers = jsonHeaders)
+            }
+        }
+
+        val result = tester.check("http://192.168.1.5:8080")
+
+        assertTrue(
+            "Expected parse failure but got: $result",
+            result is CalibreConnectionCheckResult.Failure,
+        )
+    }
+
+    @Test
+    fun bookMetaProbeHttpFailureDoesNotFailConnectionTest() = runTest {
+        // A 404 on the probe (wrong library ID, missing book) should not fail the connection
+        // test — only deserialization errors should propagate.
+        val tester = testerWithEngine { request ->
+            when {
+                request.url.encodedPath == "/ajax/search" ->
+                    respond("""{"total_num":1,"book_ids":[99]}""", headers = jsonHeaders)
+                else -> respondError(HttpStatusCode.NotFound)
+            }
+        }
+
+        val result = tester.check("http://192.168.1.5:8080")
+
+        assertEquals(CalibreConnectionCheckResult.Success(bookCount = 1), result)
     }
 
     @Test
@@ -47,7 +162,7 @@ class CalibreConnectionTesterTest {
 
     @Test
     fun reportsNonCalibreJsonWithAddressGuidance() = runTest {
-        val tester = testerWithResponse("""{"ok": true}""")
+        val tester = testerWithRoutes(searchJson = """{"ok": true}""")
 
         val result = tester.check("http://192.168.1.5:8080")
 
@@ -99,10 +214,25 @@ class CalibreConnectionTesterTest {
         assertEquals(1, requestCount)
     }
 
-    private fun testerWithResponse(json: String): CalibreConnectionTester =
-        testerWithEngine {
-            respond(content = json, headers = jsonHeaders)
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+
+    /** Routes search and optional book-meta to pre-canned JSON strings. */
+    private fun testerWithRoutes(
+        searchJson: String,
+        bookMetaJson: String? = null,
+    ): CalibreConnectionTester = testerWithEngine { request ->
+        when {
+            request.url.encodedPath == "/ajax/search" ->
+                respond(searchJson, headers = jsonHeaders)
+            request.url.encodedPath.startsWith("/ajax/book/") && bookMetaJson != null ->
+                respond(bookMetaJson, headers = jsonHeaders)
+            request.url.encodedPath.startsWith("/ajax/book/") ->
+                respondError(HttpStatusCode.NotFound)
+            else -> respondError(HttpStatusCode.NotFound)
         }
+    }
 
     private fun testerWithEngine(
         handler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
