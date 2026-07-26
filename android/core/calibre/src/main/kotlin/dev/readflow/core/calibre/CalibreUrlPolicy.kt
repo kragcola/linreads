@@ -41,7 +41,7 @@ fun validateCalibreBaseUrl(rawUrl: String): CalibreUrlValidation {
 
     val normalized = normalizeBaseUrl(trimmed)
     return CalibreUrlValidation(
-        normalizedUrl = canonicalizeValidatedTailscaleServeCalibreUrl(normalized),
+        normalizedUrl = normalized,
         errorMessage = null,
     )
 }
@@ -52,20 +52,20 @@ fun requireValidCalibreBaseUrl(rawUrl: String): String {
     return validation.normalizedUrl
 }
 
-/**
- * A bare HTTPS MagicDNS address is a Tailscale Serve endpoint, not a direct connection to the
- * Calibre Content Server. Calibre itself normally listens on port 8080 inside the tailnet.
- *
- * Keep explicit non-standard HTTPS ports and reverse-proxy prefixes untouched: those can be a
- * real user-managed proxy rather than the default direct Content Server endpoint.
- */
+/** Kept for callers migrating from older releases; validation no longer changes transport. */
 internal fun canonicalizeTailscaleServeCalibreUrl(rawUrl: String): String {
     return requireValidCalibreBaseUrl(rawUrl)
 }
 
-private fun canonicalizeValidatedTailscaleServeCalibreUrl(normalized: String): String {
+/**
+ * Returns the direct Content Server candidate for a bare HTTPS MagicDNS endpoint.
+ *
+ * The configured URL remains authoritative. Callers must try it first and may only persist this
+ * candidate after a successful Calibre probe.
+ */
+internal fun directTailscaleContentServerFallback(normalized: String): String? {
     val uri = URI(normalized)
-    val host = uri.host?.withoutIpv6Brackets() ?: return normalized
+    val host = uri.host?.withoutIpv6Brackets() ?: return null
     val isDefaultHttpsPort = uri.port == -1 || uri.port == 443
     val isDirectCalibrePath = uri.rawPath.orEmpty().trimEnd('/').let {
         it.isEmpty() || it.equals(CALIBRE_OPDS_TERMINAL_PATH, ignoreCase = true)
@@ -79,7 +79,84 @@ private fun canonicalizeValidatedTailscaleServeCalibreUrl(normalized: String): S
         val path = uri.rawPath.orEmpty()
         return "http://${host.lowercase()}:8080$path".trimEnd('/')
     }
-    return normalized
+    return null
+}
+
+/**
+ * A generated direct HTTP endpoint is safe to probe with stored credentials only when it is the
+ * exact fallback for the configured HTTPS MagicDNS address and Android has positively established
+ * that this app is routed through a VPN.  An unknown network state is deliberately not enough:
+ * otherwise a hostile DNS or LAN responder could solicit Basic credentials over cleartext HTTP.
+ */
+internal fun isVpnProtectedDirectTailscaleFallback(
+    configuredUrl: String,
+    candidateUrl: String,
+    network: CalibreNetworkSnapshot,
+): Boolean {
+    if (!network.hasActiveVpnForCalibre()) return false
+    val configured = runCatching { requireValidCalibreBaseUrl(configuredUrl) }.getOrNull()
+        ?: return false
+    val candidate = runCatching { requireValidCalibreBaseUrl(candidateUrl) }.getOrNull()
+        ?: return false
+    return directTailscaleContentServerFallback(configured) == candidate
+}
+
+/**
+ * A persisted HTTP tailnet endpoint must not be opened outside the VPN either.  Otherwise a
+ * previously verified fallback would become a credential leak on a later hostile network after
+ * the VPN disconnects.
+ */
+fun requiresActiveVpnForCalibreHttp(baseUrl: String): Boolean {
+    val uri = runCatching { URI(baseUrl) }.getOrNull() ?: return false
+    if (!uri.scheme.equals("http", ignoreCase = true)) return false
+    val host = uri.host?.withoutIpv6Brackets().orEmpty()
+    return host.isTailscaleMagicDnsHostname() || host.isTailscaleIpv4() || host.isTailscaleIpv6()
+}
+
+/**
+ * Stored credentials may be used normally over HTTPS and private LAN HTTP. Tailnet HTTP is the
+ * exception: an unknown network state is deliberately treated as unsafe so a stale route or
+ * hostile DNS responder cannot solicit credentials after Tailscale disconnects.
+ */
+fun canUseStoredCalibreCredentials(
+    requestUrl: String,
+    network: CalibreNetworkSnapshot,
+): Boolean {
+    val uri = runCatching { URI(requestUrl) }.getOrNull() ?: return false
+    val scheme = uri.scheme?.lowercase() ?: return false
+    if (uri.host.isNullOrBlank() || uri.userInfo != null || (scheme != "http" && scheme != "https")) {
+        return false
+    }
+    return !requiresActiveVpnForCalibreHttp(requestUrl) || network.hasActiveVpnForCalibre()
+}
+
+internal fun CalibreNetworkSnapshot.hasActiveVpnForCalibre(): Boolean =
+    this is CalibreNetworkSnapshot.Active && vpnAppliesToApp
+
+/**
+ * A credential may follow an endpoint change only for the tightly constrained, VPN-protected
+ * MagicDNS HTTPS -> direct HTTP:8080 transition.  Equal scopes include harmless spelling changes
+ * such as equivalent IPv6 literals and need no credential write at all.
+ */
+internal fun calibreCredentialTransition(
+    currentUrl: String,
+    verifiedUrl: String,
+    network: CalibreNetworkSnapshot,
+): CalibreCredentialTransition {
+    val currentScope = calibreCredentialScopeForRequestUrl(currentUrl)
+    val verifiedScope = calibreCredentialScopeForRequestUrl(verifiedUrl)
+    if (currentScope == verifiedScope) return CalibreCredentialTransition.UNCHANGED
+    return if (isVpnProtectedDirectTailscaleFallback(currentUrl, verifiedUrl, network)) {
+        CalibreCredentialTransition.MIGRATE_TRUSTED_FALLBACK
+    } else {
+        CalibreCredentialTransition.CLEAR
+    }
+}
+
+internal enum class CalibreCredentialTransition {
+    UNCHANGED,
+    MIGRATE_TRUSTED_FALLBACK,
+    CLEAR,
 }
 
 /**
@@ -88,7 +165,7 @@ private fun canonicalizeValidatedTailscaleServeCalibreUrl(normalized: String): S
  * a URL ending in `/opds`; retain any reverse-proxy prefix but use its parent for this adapter.
  */
 internal fun requireCalibreAjaxBaseUrl(rawUrl: String): String {
-    val normalized = canonicalizeTailscaleServeCalibreUrl(rawUrl)
+    val normalized = requireValidCalibreBaseUrl(rawUrl)
     return if (normalized.endsWith(CALIBRE_OPDS_TERMINAL_PATH, ignoreCase = true)) {
         normalized.dropLast(CALIBRE_OPDS_TERMINAL_PATH.length)
     } else {
@@ -205,7 +282,7 @@ private fun String.isLocalhost(): Boolean =
         this == "127.0.0.1" ||
         this == "::1"
 
-private fun String.withoutIpv6Brackets(): String = removePrefix("[").removeSuffix("]")
+internal fun String.withoutIpv6Brackets(): String = removePrefix("[").removeSuffix("]")
 
 private fun String.canonicalCalibreHost(): String {
     val host = withoutIpv6Brackets().lowercase()
@@ -257,7 +334,7 @@ private fun String.isRfc1918Ipv4(): Boolean {
         (first == 192 && second == 168)
 }
 
-private fun String.isTailscaleIpv4(): Boolean {
+internal fun String.isTailscaleIpv4(): Boolean {
     val values = ipv4Octets() ?: return false
     return values[0] == 100 && values[1] in 64..127
 }
@@ -279,7 +356,7 @@ private fun String.ipv4Octets(): List<Int>? {
     }
 }
 
-private fun String.isTailscaleIpv6(): Boolean {
+internal fun String.isTailscaleIpv6(): Boolean {
     if (':' !in this) return false
     val address = runCatching { InetAddress.getByName(this) }.getOrNull() as? Inet6Address
         ?: return false

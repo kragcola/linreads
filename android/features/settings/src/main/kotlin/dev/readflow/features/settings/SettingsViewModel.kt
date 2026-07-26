@@ -2,10 +2,9 @@ package dev.readflow.features.settings
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import dev.readflow.core.calibre.CalibreConnectionCheckResult
-import dev.readflow.core.calibre.CalibreConnectionTester
 import dev.readflow.core.calibre.CalibreEndpointProbe
 import dev.readflow.core.calibre.CalibreProbeResult
+import dev.readflow.core.calibre.VerifiedCalibreEndpointSink
 import dev.readflow.core.calibre.validateCalibreBaseUrl
 import dev.readflow.core.database.LinReadsBackupExportStore
 import dev.readflow.core.database.LinReadsBackupRestoreStore
@@ -17,6 +16,7 @@ import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
 import dev.readflow.core.model.ReaderCommandId
 import dev.readflow.core.model.ReaderMenuConfig
+import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.prefs.SettingsRepository
 import dev.readflow.core.prefs.ReaderTypography
 import dev.readflow.core.sync.SyncBackend
@@ -25,6 +25,7 @@ import java.io.OutputStream
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -65,8 +66,8 @@ sealed interface BackupRestoreUiState {
 
 class SettingsViewModel(
     private val settings: SettingsRepository,
-    private val connectionTester: CalibreConnectionTester,
     private val endpointProbe: CalibreEndpointProbe,
+    private val verifiedEndpointSink: VerifiedCalibreEndpointSink,
     syncBackend: SyncBackend,
     private val backupExporter: LinReadsBackupExportStore,
     private val backupRestorer: LinReadsBackupRestoreStore,
@@ -107,6 +108,8 @@ class SettingsViewModel(
     /** Serializes read-modify-write of [readerMenuConfig] so rapid toggles cannot drop updates. */
     private val readerMenuConfigMutex = Mutex()
     private val epubFontReplacementMutex = Mutex()
+    private var calibreProbeJob: Job? = null
+    private var calibreProbeGeneration = 0L
 
     private val _calibreUrlError = MutableStateFlow<String?>(null)
     val calibreUrlError: StateFlow<String?> = _calibreUrlError.asStateFlow()
@@ -134,6 +137,7 @@ class SettingsViewModel(
     val themeImportState: StateFlow<BackupRestoreUiState> = _themeImportState.asStateFlow()
 
     fun setCalibreUrl(url: String) {
+        cancelCalibreProbe()
         val validation = validateCalibreBaseUrl(url)
         if (!validation.isValid) {
             _calibreUrlError.value = validation.errorMessage
@@ -142,12 +146,12 @@ class SettingsViewModel(
         }
         _calibreUrlError.value = null
         _calibreConnectionState.value = CalibreConnectionUiState.Idle
-        viewModelScope.launch { settings.setCalibreBaseUrl(validation.normalizedUrl) }
     }
 
     fun testCalibreConnection(url: String) {
         val validation = validateCalibreBaseUrl(url)
         if (!validation.isValid || validation.normalizedUrl.isBlank()) {
+            cancelCalibreProbe()
             _calibreUrlError.value = validation.errorMessage ?: "请先填写 Calibre 服务器地址"
             _calibreConnectionState.value = CalibreConnectionUiState.Idle
             return
@@ -155,38 +159,27 @@ class SettingsViewModel(
 
         _calibreUrlError.value = null
         _calibreConnectionState.value = CalibreConnectionUiState.Checking
-        viewModelScope.launch {
-            when (val result = connectionTester.check(validation.normalizedUrl)) {
-                is CalibreConnectionCheckResult.Success -> {
-                    settings.setCalibreBaseUrl(validation.normalizedUrl)
-                    _calibreConnectionState.value = CalibreConnectionUiState.Success(
+        val generation = beginCalibreProbe()
+        calibreProbeJob = viewModelScope.launch {
+            when (val result = endpointProbe.probe(validation.normalizedUrl)) {
+                is CalibreProbeResult.Success -> {
+                    if (generation != calibreProbeGeneration) return@launch
+                    persistVerifiedCalibreEndpoint(
+                        generation = generation,
+                        result = result,
                         message = "已连接到 Calibre，发现 ${result.bookCount} 本书",
                         nextStep = "返回书架后可以搜索并下载书籍",
                     )
                 }
-                is CalibreConnectionCheckResult.Failure -> {
+                is CalibreProbeResult.AuthenticationRequired -> {
+                    if (generation != calibreProbeGeneration) return@launch
                     _calibreConnectionState.value = CalibreConnectionUiState.Failure(
-                        message = result.message,
-                        nextStep = result.nextStep,
-                    )
-                }
-            }
-        }
-    }
-
-    fun probeCalibreConnection(hint: String) {
-        _calibreUrlError.value = null
-        _calibreConnectionState.value = CalibreConnectionUiState.Checking
-        viewModelScope.launch {
-            when (val result = endpointProbe.probe(hint)) {
-                is CalibreProbeResult.Success -> {
-                    settings.setCalibreBaseUrl(result.baseUrl)
-                    _calibreConnectionState.value = CalibreConnectionUiState.Success(
-                        message = "已发现 Calibre：${result.baseUrl.removeProtocol()}，发现 ${result.bookCount} 本书",
-                        nextStep = "已保存该地址，返回书架后可以搜索并下载书籍",
+                        message = "Calibre 服务器需要认证",
+                        nextStep = "请在书源设置中填写 Calibre 用户名和密码",
                     )
                 }
                 is CalibreProbeResult.Failure -> {
+                    if (generation != calibreProbeGeneration) return@launch
                     _calibreConnectionState.value = CalibreConnectionUiState.Failure(
                         message = result.message,
                         nextStep = result.nextStep.withAttempts(result),
@@ -196,8 +189,75 @@ class SettingsViewModel(
         }
     }
 
+    fun probeCalibreConnection(hint: String) {
+        _calibreUrlError.value = null
+        _calibreConnectionState.value = CalibreConnectionUiState.Checking
+        val generation = beginCalibreProbe()
+        calibreProbeJob = viewModelScope.launch {
+            when (val result = endpointProbe.probe(hint)) {
+                is CalibreProbeResult.Success -> {
+                    if (generation != calibreProbeGeneration) return@launch
+                    persistVerifiedCalibreEndpoint(
+                        generation = generation,
+                        result = result,
+                        message = "已发现 Calibre：${result.baseUrl.removeProtocol()}，发现 ${result.bookCount} 本书",
+                        nextStep = "已保存该地址，返回书架后可以搜索并下载书籍",
+                    )
+                }
+                is CalibreProbeResult.Failure -> {
+                    if (generation != calibreProbeGeneration) return@launch
+                    _calibreConnectionState.value = CalibreConnectionUiState.Failure(
+                        message = result.message,
+                        nextStep = result.nextStep.withAttempts(result),
+                    )
+                }
+                is CalibreProbeResult.AuthenticationRequired -> {
+                    if (generation != calibreProbeGeneration) return@launch
+                    _calibreConnectionState.value = CalibreConnectionUiState.Failure(
+                        message = "Calibre 服务器需要认证",
+                        nextStep = "请在书源设置中填写 Calibre 用户名和密码",
+                    )
+                }
+            }
+        }
+    }
+
     fun clearCalibreConnectionState() {
+        cancelCalibreProbe()
         _calibreConnectionState.value = CalibreConnectionUiState.Idle
+    }
+
+    private fun beginCalibreProbe(): Long {
+        cancelCalibreProbe()
+        return calibreProbeGeneration
+    }
+
+    private fun cancelCalibreProbe() {
+        calibreProbeGeneration += 1
+        calibreProbeJob?.cancel()
+        calibreProbeJob = null
+    }
+
+    private suspend fun persistVerifiedCalibreEndpoint(
+        generation: Long,
+        result: CalibreProbeResult.Success,
+        message: String,
+        nextStep: String,
+    ) {
+        if (generation != calibreProbeGeneration) return
+        when (val persisted = verifiedEndpointSink.persistVerifiedCalibreEndpoint(result.baseUrl)) {
+            is ReadflowResult.Success -> {
+                if (generation != calibreProbeGeneration) return
+                _calibreConnectionState.value = CalibreConnectionUiState.Success(message, nextStep)
+            }
+            is ReadflowResult.Failure -> {
+                if (generation != calibreProbeGeneration) return
+                _calibreConnectionState.value = CalibreConnectionUiState.Failure(
+                    message = "已连接到 Calibre，但保存地址失败",
+                    nextStep = persisted.error.message,
+                )
+            }
+        }
     }
 
     fun exportBackup(output: OutputStream) {

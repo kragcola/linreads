@@ -3,9 +3,15 @@ package dev.readflow.di
 import android.app.Application
 import androidx.room.Room
 import androidx.room.withTransaction
+import dev.readflow.core.calibre.CalibreConnectionTester
+import dev.readflow.core.calibre.CalibreEndpointProbe
 import dev.readflow.core.calibre.DefaultSourceRegistry
+import dev.readflow.core.calibre.AndroidCalibreNetworkSnapshotProvider
 import dev.readflow.core.calibre.AndroidSourceCredentialStore
+import dev.readflow.core.calibre.CalibreNetworkSnapshotProvider
+import dev.readflow.core.calibre.GuidedCalibreEndpointProbe
 import dev.readflow.core.calibre.SourceCredentialStore
+import dev.readflow.core.calibre.createCalibreConnectionTester
 import dev.readflow.core.calibre.defaultSourceAdapterRegistry
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.database.LibraryStore
@@ -96,8 +102,11 @@ val extensionsModule = module {
 val settingsModule = module {
     single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
     single<SourceCredentialStore> { AndroidSourceCredentialStore(androidContext()) }
+    single<CalibreNetworkSnapshotProvider> { AndroidCalibreNetworkSnapshotProvider(androidContext()) }
+    single<CalibreConnectionTester> { createCalibreConnectionTester(get()) }
+    single<CalibreEndpointProbe> { GuidedCalibreEndpointProbe(get(), get()) }
     single<SourceAdapterRegistry> {
-        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"), get())
+        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"), get(), get())
     }
     single<SourceRegistry> {
         DefaultSourceRegistry(
@@ -105,6 +114,8 @@ val settingsModule = module {
             sourceConfigStore = get(),
             booksDir = File(androidContext().filesDir, "books"),
             credentialStore = get(),
+            calibreEndpointProbe = get(),
+            networkSnapshotProvider = get(),
             sourceAdapters = get(),
         )
     }

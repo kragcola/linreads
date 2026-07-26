@@ -1,5 +1,6 @@
 package dev.readflow.core.calibre
 
+import dev.readflow.extensions.api.SourceCredentials
 import java.net.Inet6Address
 import java.net.InetAddress
 
@@ -19,17 +20,29 @@ sealed interface CalibreProbeResult {
         val nextStep: String,
         val attempts: List<CalibreProbeAttempt>,
     ) : CalibreProbeResult
+
+    /** The endpoint answered, but the caller must provide credentials before it can be verified. */
+    data class AuthenticationRequired(
+        val baseUrl: String,
+        val attempts: List<CalibreProbeAttempt>,
+    ) : CalibreProbeResult
 }
 
 fun interface CalibreEndpointProbe {
     suspend fun probe(hint: String): CalibreProbeResult
+
+    suspend fun probe(hint: String, credentials: SourceCredentials?): CalibreProbeResult = probe(hint)
 }
 
 class GuidedCalibreEndpointProbe(
     private val connectionTester: CalibreConnectionTester,
+    private val networkSnapshotProvider: CalibreNetworkSnapshotProvider =
+        UnknownCalibreNetworkSnapshotProvider,
 ) : CalibreEndpointProbe {
-    override suspend fun probe(hint: String): CalibreProbeResult {
-        val candidates = buildCandidates(hint)
+    override suspend fun probe(hint: String): CalibreProbeResult = probe(hint, null)
+
+    override suspend fun probe(hint: String, credentials: SourceCredentials?): CalibreProbeResult {
+        val candidates = calibreEndpointCandidates(hint)
         if (candidates.isEmpty()) {
             return CalibreProbeResult.Failure(
                 message = "请先填写 Calibre 服务器 IP 或地址",
@@ -51,9 +64,28 @@ class GuidedCalibreEndpointProbe(
             normalizedCandidates += validation.normalizedUrl
         }
 
+        val configuredUrl = normalizedCandidates.first()
         val attempts = mutableListOf<CalibreProbeAttempt>()
+        var reachedServerFailure: CalibreConnectionCheckResult.Failure? = null
         for (baseUrl in normalizedCandidates.distinct()) {
-            when (val result = connectionTester.check(baseUrl)) {
+            // Re-snapshot immediately before every candidate. HTTPS may take long enough for the
+            // VPN to disconnect before a generated cleartext fallback is reached.
+            val network = networkSnapshotProvider.snapshot()
+            val isGeneratedDirectFallback = baseUrl != configuredUrl &&
+                directTailscaleContentServerFallback(configuredUrl) == baseUrl
+            if (
+                isGeneratedDirectFallback &&
+                !isVpnProtectedDirectTailscaleFallback(configuredUrl, baseUrl, network)
+            ) {
+                continue
+            }
+            val candidateCredentials = when {
+                baseUrl == configuredUrl &&
+                    canUseStoredCalibreCredentials(baseUrl, network) -> credentials
+                isVpnProtectedDirectTailscaleFallback(configuredUrl, baseUrl, network) -> credentials
+                else -> null
+            }
+            when (val result = connectionTester.check(baseUrl, candidateCredentials)) {
                 is CalibreConnectionCheckResult.Success -> {
                     return CalibreProbeResult.Success(
                         baseUrl = baseUrl,
@@ -62,10 +94,26 @@ class GuidedCalibreEndpointProbe(
                 }
                 is CalibreConnectionCheckResult.Failure -> {
                     attempts += CalibreProbeAttempt(baseUrl, result.message)
+                    if (
+                        result.kind == CalibreConnectionCheckResult.Failure.Kind.SERVER_RESPONSE &&
+                        reachedServerFailure == null
+                    ) {
+                        reachedServerFailure = result
+                    }
+                    if (result.kind == CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED) {
+                        return CalibreProbeResult.AuthenticationRequired(baseUrl, attempts)
+                    }
                 }
             }
         }
 
+        reachedServerFailure?.let { failure ->
+            return CalibreProbeResult.Failure(
+                message = failure.message,
+                nextStep = failure.nextStep,
+                attempts = attempts,
+            )
+        }
         return CalibreProbeResult.Failure(
             message = "没有在常用 Calibre 地址发现服务",
             nextStep = "确认 Calibre Content Server 已启动，并检查 Wi-Fi 或 Tailscale 地址；如果改过端口，请填写完整地址",
@@ -73,43 +121,47 @@ class GuidedCalibreEndpointProbe(
         )
     }
 
-    private fun buildCandidates(hint: String): List<String> {
-        val trimmed = hint.trim().trimEnd('/')
-        if (trimmed.isBlank()) return emptyList()
-        if (trimmed.contains("://")) return listOf(trimmed)
-        if (trimmed.startsWith('[')) {
-            val closingBracket = trimmed.indexOf(']')
-            if (closingBracket > 1) {
-                val host = trimmed.substring(1, closingBracket)
-                if (host.isIpv6Literal()) {
-                    val suffix = trimmed.substring(closingBracket + 1)
-                    if (suffix.isBlank()) {
-                        return COMMON_PORTS.map { port -> "http://[$host]:$port" }
-                    }
-                    if (suffix.startsWith(':') && suffix.drop(1).toIntOrNull() in 1..65535) {
-                        return listOf("http://$trimmed")
-                    }
+}
+
+internal fun calibreEndpointCandidates(hint: String): List<String> {
+    val trimmed = hint.trim().trimEnd('/')
+    if (trimmed.isBlank()) return emptyList()
+    if (trimmed.contains("://")) {
+        val validation = validateCalibreBaseUrl(trimmed)
+        if (!validation.isValid || validation.normalizedUrl.isBlank()) return listOf(trimmed)
+        val original = validation.normalizedUrl
+        return listOfNotNull(original, directTailscaleContentServerFallback(original)).distinct()
+    }
+    if (trimmed.startsWith('[')) {
+        val closingBracket = trimmed.indexOf(']')
+        if (closingBracket > 1) {
+            val host = trimmed.substring(1, closingBracket)
+            if (host.isIpv6Literal()) {
+                val suffix = trimmed.substring(closingBracket + 1)
+                if (suffix.isBlank()) {
+                    return COMMON_PORTS.map { port -> "http://[$host]:$port" }
+                }
+                if (suffix.startsWith(':') && suffix.drop(1).toIntOrNull() in 1..65535) {
+                    return listOf("http://$trimmed")
                 }
             }
         }
-        if (trimmed.isIpv6Literal()) {
-            return COMMON_PORTS.map { port -> "http://[$trimmed]:$port" }
-        }
-        if (trimmed.hasPort()) return listOf("http://$trimmed")
-        return COMMON_PORTS.map { port -> "http://$trimmed:$port" }
     }
-
-    private fun String.isIpv6Literal(): Boolean =
-        ':' in this && runCatching { InetAddress.getByName(this) }.getOrNull() is Inet6Address
-
-    private fun String.hasPort(): Boolean {
-        val lastColon = lastIndexOf(':')
-        return lastColon > 0 &&
-            substring(lastColon + 1).toIntOrNull() in 1..65535 &&
-            count { it == ':' } == 1
+    if (trimmed.isIpv6Literal()) {
+        return COMMON_PORTS.map { port -> "http://[$trimmed]:$port" }
     }
-
-    private companion object {
-        val COMMON_PORTS = listOf(8080, 8081)
-    }
+    if (trimmed.hasPort()) return listOf("http://$trimmed")
+    return COMMON_PORTS.map { port -> "http://$trimmed:$port" }
 }
+
+private fun String.isIpv6Literal(): Boolean =
+    ':' in this && runCatching { InetAddress.getByName(this) }.getOrNull() is Inet6Address
+
+private fun String.hasPort(): Boolean {
+    val lastColon = lastIndexOf(':')
+    return lastColon > 0 &&
+        substring(lastColon + 1).toIntOrNull() in 1..65535 &&
+        count { it == ':' } == 1
+}
+
+private val COMMON_PORTS = listOf(8080, 8081)

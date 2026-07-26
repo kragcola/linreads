@@ -17,6 +17,8 @@ import androidx.test.uiautomator.Until
 import dev.readflow.MainActivity
 import dev.readflow.core.database.BookEntity
 import dev.readflow.core.database.ReadflowDatabase
+import dev.readflow.core.model.BookAssetOperationCoordinator
+import dev.readflow.core.prefs.DataStoreSettingsRepository
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -35,6 +37,7 @@ import org.junit.FixMethodOrder
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.MethodSorters
+import org.koin.core.context.GlobalContext
 
 @LargeTest
 @RunWith(AndroidJUnit4::class)
@@ -196,17 +199,25 @@ class CalibreGroupedRuntimeSmokeTest {
         }
 
     private fun resetTargetAppState() {
-        appContext.deleteDatabase(DB_NAME)
-        deleteIfExists(appContext.getDatabasePath(DB_NAME))
-        deleteIfExists(File(appContext.getDatabasePath(DB_NAME).path + "-wal"))
-        deleteIfExists(File(appContext.getDatabasePath(DB_NAME).path + "-shm"))
-        deleteRecursively(File(appContext.filesDir, "books"))
-        deleteRecursively(File(appContext.filesDir, "covers"))
-        deleteChildrenRecursively(appContext.cacheDir)
-        deleteIfExists(File(appContext.filesDir, "datastore/readflow_settings.preferences_pb"))
+        markSeedBooksAsAlreadyImported()
+        runBlocking {
+            val koin = GlobalContext.get()
+            koin.get<BookAssetOperationCoordinator>().delete(TEST_RESET_OPERATION_ID) {
+                koin.get<ReadflowDatabase>().clearAllTables()
+                deleteRecursively(File(appContext.filesDir, "books"))
+                deleteRecursively(File(appContext.filesDir, "covers"))
+                deleteChildrenRecursively(appContext.cacheDir)
+            }
+            DataStoreSettingsRepository(appContext).clearCalibreBaseUrl()
+        }
+        check(
+            appContext.getSharedPreferences(SOURCE_CREDENTIAL_PREFERENCES, Context.MODE_PRIVATE)
+                .edit()
+                .clear()
+                .commit(),
+        ) { "Failed to clear source credentials" }
         evidenceDir().deleteRecursively()
         evidenceDir().mkdirs()
-        markSeedBooksAsAlreadyImported()
     }
 
     private fun markSeedBooksAsAlreadyImported() {
@@ -430,6 +441,8 @@ class CalibreGroupedRuntimeSmokeTest {
         const val DB_NAME = "readflow.db"
         const val ARG_CALIBRE_BASE_URL = "calibreBaseUrl"
         const val DEFAULT_SERVER_BASE_URL = "http://10.0.2.2:8081"
+        const val SOURCE_CREDENTIAL_PREFERENCES = "source_credentials_v1"
+        const val TEST_RESET_OPERATION_ID = "calibre-runtime-smoke-reset"
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
         private val DB_TIMEOUT_MS = 8.seconds.inWholeMilliseconds
         @Volatile private var hasInitializedProcessState = false

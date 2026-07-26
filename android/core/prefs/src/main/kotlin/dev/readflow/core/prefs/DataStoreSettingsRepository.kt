@@ -123,6 +123,10 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         context.dataStore.edit { it[KEY_CALIBRE_URL] = url }
     }
 
+    override suspend fun clearCalibreBaseUrl() {
+        context.dataStore.edit { it.remove(KEY_CALIBRE_URL) }
+    }
+
     override suspend fun setFontSize(size: Int) {
         context.dataStore.edit { it[KEY_FONT_SIZE] = size }
     }

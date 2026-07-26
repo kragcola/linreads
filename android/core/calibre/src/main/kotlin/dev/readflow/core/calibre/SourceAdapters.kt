@@ -15,6 +15,8 @@ import java.io.File
 class CalibreSourceAdapterFactory(
     private val booksDir: File,
     private val credentialProvider: (String, String) -> SourceCredentials? = { _, _ -> null },
+    private val networkSnapshotProvider: CalibreNetworkSnapshotProvider =
+        UnknownCalibreNetworkSnapshotProvider,
 ) : SourceAdapterFactory {
     override val adapterId = SourceAdapterIds.CALIBRE
     override val latestConfigVersion = 1
@@ -42,6 +44,17 @@ class CalibreSourceAdapterFactory(
     override fun open(descriptor: SourceDescriptor): ReadflowResult<OnlineBookCatalog> = runCatching {
         val config = descriptor.calibreConfig()
         val baseUrl = requireValidCalibreBaseUrl(config.baseUrl)
+        if (
+            requiresActiveVpnForCalibreHttp(baseUrl) &&
+            !networkSnapshotProvider.snapshot().hasActiveVpnForCalibre()
+        ) {
+            return@runCatching ReadflowResult.Failure(
+                ReadflowError.network(
+                    code = null,
+                    message = "未检测到对本应用生效的 Tailscale VPN，已停止访问 HTTP Calibre 书源以保护凭据",
+                ),
+            )
+        }
         val credentials = credentialProvider(
             descriptor.id,
             calibreCredentialScopeForRequestUrl(baseUrl),
@@ -53,6 +66,7 @@ class CalibreSourceAdapterFactory(
                     username = credentials?.username.orEmpty(),
                     password = credentials?.password.orEmpty(),
                     libraryId = config.libraryId,
+                    networkSnapshotProvider = networkSnapshotProvider,
                 ),
                 booksDir = booksDir,
                 descriptor = descriptor.copy(baseUrl = baseUrl),
@@ -128,10 +142,11 @@ class JsonHttpSourceAdapterFactory(
 fun defaultSourceAdapterRegistry(
     booksDir: File,
     credentialStore: SourceCredentialStore = NoOpSourceCredentialStore,
+    networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
 ): SourceAdapterRegistry =
     DefaultSourceAdapterRegistry(
         setOf(
-            CalibreSourceAdapterFactory(booksDir, credentialStore::get),
+            CalibreSourceAdapterFactory(booksDir, credentialStore::get, networkSnapshotProvider),
             OpdsSourceAdapterFactory(booksDir),
             JsonHttpSourceAdapterFactory(booksDir),
             HtmlRulesV1SourceAdapterFactory(booksDir),

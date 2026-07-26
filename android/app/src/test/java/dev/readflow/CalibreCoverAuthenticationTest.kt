@@ -1,6 +1,8 @@
 package dev.readflow
 
 import dev.readflow.core.calibre.CALIBRE_COVER_SOURCE_QUERY_PARAMETER
+import dev.readflow.core.calibre.CalibreNetworkSnapshot
+import dev.readflow.core.calibre.CalibreNetworkSnapshotProvider
 import dev.readflow.core.calibre.SourceCredentialStore
 import dev.readflow.core.calibre.authenticatedCalibreCoverUrl
 import dev.readflow.core.calibre.calibreCredentialScopeForRequestUrl
@@ -13,6 +15,9 @@ import java.nio.charset.Charset
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.Arguments
+import org.junit.jupiter.params.provider.MethodSource
 
 class CalibreCoverAuthenticationTest {
 
@@ -31,6 +36,9 @@ class CalibreCoverAuthenticationTest {
         val authenticated = authenticatedCalibreCoverRequest(
             Request.Builder().url(markedUrl).build(),
             store,
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                CalibreNetworkSnapshot.Unknown
+            },
         )
 
         assertNull(authenticated.url.queryParameter(CALIBRE_COVER_SOURCE_QUERY_PARAMETER))
@@ -41,6 +49,125 @@ class CalibreCoverAuthenticationTest {
         assertNull(authenticated.header("Authorization"))
         assertEquals(credentials, authenticated.tag(SourceCredentials::class.java))
         assertEquals("source-calibre", store.requestedSourceId)
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("blockedHttpTailnetCoverCases")
+    fun httpTailnetCoverDoesNotReadCredentialsWithoutPositiveVpnEvidence(
+        caseName: String,
+        baseUrl: String,
+        network: CalibreNetworkSnapshot,
+    ) {
+        val credentials = SourceCredentials("reader", "secret")
+        val store = RecordingCredentialStore(
+            expectedScope = calibreCredentialScopeForRequestUrl(baseUrl),
+            credentials = credentials,
+        )
+        val markedUrl = authenticatedCalibreCoverUrl(
+            "$baseUrl/get/cover/42/calibre-library",
+            "source-calibre",
+        )
+
+        val authenticated = authenticatedCalibreCoverRequest(
+            Request.Builder().url(markedUrl).build(),
+            store,
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider { network },
+        )
+
+        assertEquals(0, store.requestCount, "$caseName must not query stored credentials")
+        assertNull(
+            authenticated.tag(SourceCredentials::class.java),
+            "$caseName must not attach stored credentials",
+        )
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("markerlessTailnetRetryCases")
+    fun markerlessTailnetAuthenticationRetryRechecksVpnBeforeSendingCredentials(
+        caseName: String,
+        network: CalibreNetworkSnapshot,
+        shouldRetainCredentials: Boolean,
+    ) {
+        val baseUrl = "http://100.101.102.103:8080"
+        val credentials = SourceCredentials("reader", "secret")
+        val authorization = okhttp3.Credentials.basic(credentials.username, credentials.password)
+        val store = RecordingCredentialStore(
+            expectedScope = baseUrl,
+            credentials = credentials,
+        )
+        val retry = Request.Builder()
+            .url("$baseUrl/get/cover/42/calibre-library")
+            .tag(SourceCredentials::class.java, credentials)
+            .header("Authorization", authorization)
+            .build()
+
+        val gated = authenticatedCalibreCoverRequest(
+            request = retry,
+            credentialStore = store,
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider { network },
+        )
+
+        if (shouldRetainCredentials) {
+            assertEquals(authorization, gated.header("Authorization"), caseName)
+            assertEquals(credentials, gated.tag(SourceCredentials::class.java), caseName)
+        } else {
+            assertNull(gated.header("Authorization"), caseName)
+            assertNull(gated.tag(SourceCredentials::class.java), caseName)
+        }
+        assertEquals(0, store.requestCount, "$caseName must not query stored credentials")
+    }
+
+    @Test
+    fun magicDnsHttpCoverRetainsCredentialsWhenVpnAppliesToApp() {
+        val baseUrl = "http://reader.tailnet.ts.net:8080"
+        val credentials = SourceCredentials("reader", "secret")
+        val store = RecordingCredentialStore(
+            expectedScope = calibreCredentialScopeForRequestUrl(baseUrl),
+            credentials = credentials,
+        )
+        val markedUrl = authenticatedCalibreCoverUrl(
+            "$baseUrl/get/cover/42/calibre-library",
+            "source-calibre",
+        )
+
+        val authenticated = authenticatedCalibreCoverRequest(
+            Request.Builder().url(markedUrl).build(),
+            store,
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                CalibreNetworkSnapshot.Active(
+                    vpnAppliesToApp = true,
+                    internetValidated = true,
+                )
+            },
+        )
+
+        assertEquals(1, store.requestCount)
+        assertEquals(credentials, authenticated.tag(SourceCredentials::class.java))
+    }
+
+    @Test
+    fun httpsCoverRetainsCredentialsWhenNetworkStateIsUnknown() {
+        val baseUrl = "https://books.example"
+        val credentials = SourceCredentials("reader", "secret")
+        val store = RecordingCredentialStore(
+            expectedScope = baseUrl,
+            credentials = credentials,
+        )
+        val markedUrl = authenticatedCalibreCoverUrl(
+            "$baseUrl/get/cover/42/calibre-library",
+            "source-calibre",
+        )
+
+        val authenticated = authenticatedCalibreCoverRequest(
+            Request.Builder().url(markedUrl).build(),
+            store,
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                CalibreNetworkSnapshot.Unknown
+            },
+        )
+
+        assertEquals(1, store.requestCount)
+        assertEquals(credentials, authenticated.tag(SourceCredentials::class.java))
     }
 
     @Test
@@ -92,6 +219,12 @@ class CalibreCoverAuthenticationTest {
         val authenticated = authenticatedCalibreCoverRequest(
             Request.Builder().url(markedUrl).build(),
             store,
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                CalibreNetworkSnapshot.Active(
+                    vpnAppliesToApp = true,
+                    internetValidated = true,
+                )
+            },
         )
 
         assertNull(authenticated.header("Authorization"))
@@ -209,8 +342,10 @@ class CalibreCoverAuthenticationTest {
     ) : SourceCredentialStore {
         var requestedSourceId: String? = null
         var requestedScope: String? = null
+        var requestCount: Int = 0
 
         override fun get(sourceId: String, scope: String): SourceCredentials? {
+            requestCount += 1
             requestedSourceId = sourceId
             requestedScope = scope
             return credentials.takeIf { scope == expectedScope }
@@ -221,6 +356,61 @@ class CalibreCoverAuthenticationTest {
     }
 
     private companion object {
+        @JvmStatic
+        fun blockedHttpTailnetCoverCases(): List<Arguments> = listOf(
+            Arguments.of(
+                "Tailscale IPv4 with unknown network state",
+                "http://100.101.102.103:8080",
+                CalibreNetworkSnapshot.Unknown,
+            ),
+            Arguments.of(
+                "MagicDNS with unknown network state",
+                "http://reader.tailnet.ts.net:8080",
+                CalibreNetworkSnapshot.Unknown,
+            ),
+            Arguments.of(
+                "Tailscale IPv4 without app-scoped VPN",
+                "http://100.101.102.103:8080",
+                CalibreNetworkSnapshot.Active(
+                    vpnAppliesToApp = false,
+                    internetValidated = true,
+                ),
+            ),
+            Arguments.of(
+                "MagicDNS without app-scoped VPN",
+                "http://reader.tailnet.ts.net:8080",
+                CalibreNetworkSnapshot.Active(
+                    vpnAppliesToApp = false,
+                    internetValidated = true,
+                ),
+            ),
+        )
+
+        @JvmStatic
+        fun markerlessTailnetRetryCases(): List<Arguments> = listOf(
+            Arguments.of(
+                "markerless retry with unknown network state",
+                CalibreNetworkSnapshot.Unknown,
+                false,
+            ),
+            Arguments.of(
+                "markerless retry without app-scoped VPN",
+                CalibreNetworkSnapshot.Active(
+                    vpnAppliesToApp = false,
+                    internetValidated = true,
+                ),
+                false,
+            ),
+            Arguments.of(
+                "markerless retry with app-scoped VPN",
+                CalibreNetworkSnapshot.Active(
+                    vpnAppliesToApp = true,
+                    internetValidated = true,
+                ),
+                true,
+            ),
+        )
+
         val DIGEST_DIRECTIVE = Regex("""([A-Za-z]+)=(?:"([^"]*)"|([^,\s]+))""")
     }
 }

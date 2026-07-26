@@ -1,9 +1,11 @@
 package dev.readflow.core.calibre
 
 import dev.readflow.core.model.ReadflowError
+import dev.readflow.extensions.api.SourceCredentials
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.HttpClientEngine
+import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.network.sockets.ConnectTimeoutException
 import io.ktor.client.plugins.ClientRequestException
 import io.ktor.client.plugins.HttpRequestTimeoutException
@@ -34,23 +36,63 @@ sealed interface CalibreConnectionCheckResult {
         val nextStep: String,
         val kind: Kind = Kind.OTHER,
     ) : CalibreConnectionCheckResult {
-        enum class Kind { AUTHENTICATION_REQUIRED, OTHER }
+        enum class Kind {
+            AUTHENTICATION_REQUIRED,
+            DNS_FAILURE,
+            TAILNET_UNREACHABLE,
+            CONNECT_TIMEOUT,
+            RESPONSE_TIMEOUT,
+            TLS_FAILURE,
+            CONNECTION_REFUSED,
+            SERVER_RESPONSE,
+            OTHER,
+        }
     }
 }
 
 fun interface CalibreConnectionTester {
     suspend fun check(baseUrl: String): CalibreConnectionCheckResult
+
+    suspend fun check(
+        baseUrl: String,
+        credentials: SourceCredentials?,
+    ): CalibreConnectionCheckResult = check(baseUrl)
 }
 
-fun createCalibreConnectionTester(): CalibreConnectionTester = KtorCalibreConnectionTester()
+fun createCalibreConnectionTester(
+    networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
+): CalibreConnectionTester = KtorCalibreConnectionTester(networkSnapshotProvider)
 
-internal class KtorCalibreConnectionTester(
-    private val httpClientFactory: (String) -> HttpClient = { baseUrl ->
-        defaultCalibreHttpClient(allowedBaseUrl = baseUrl)
-    },
+internal class KtorCalibreConnectionTester internal constructor(
+    private val httpClientFactory: (String, String, String) -> HttpClient,
+    private val networkSnapshotProvider: CalibreNetworkSnapshotProvider,
 ) : CalibreConnectionTester {
 
-    override suspend fun check(baseUrl: String): CalibreConnectionCheckResult {
+    constructor() : this(UnknownCalibreNetworkSnapshotProvider)
+
+    constructor(networkSnapshotProvider: CalibreNetworkSnapshotProvider) : this(
+        httpClientFactory = { baseUrl, username, password ->
+            defaultCalibreHttpClient(
+                allowedBaseUrl = baseUrl,
+                username = username,
+                password = password,
+                networkSnapshotProvider = networkSnapshotProvider,
+            )
+        },
+        networkSnapshotProvider = networkSnapshotProvider,
+    )
+
+    constructor(httpClientFactory: (String) -> HttpClient) : this(
+        httpClientFactory = { baseUrl, _, _ -> httpClientFactory(baseUrl) },
+        networkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
+    )
+
+    override suspend fun check(baseUrl: String): CalibreConnectionCheckResult = check(baseUrl, null)
+
+    override suspend fun check(
+        baseUrl: String,
+        credentials: SourceCredentials?,
+    ): CalibreConnectionCheckResult {
         val validation = validateCalibreBaseUrl(baseUrl)
         if (!validation.isValid || validation.normalizedUrl.isBlank()) {
             return CalibreConnectionCheckResult.Failure(
@@ -58,10 +100,14 @@ internal class KtorCalibreConnectionTester(
                 nextStep = "同一 Wi-Fi 可填电脑局域网地址；远程连接可填 Tailscale 100.x 地址",
             )
         }
-        val effectiveBaseUrl = canonicalizeTailscaleServeCalibreUrl(validation.normalizedUrl)
+        val effectiveBaseUrl = validation.normalizedUrl
 
         return runCatching {
-            httpClientFactory(effectiveBaseUrl).use { http ->
+            httpClientFactory(
+                effectiveBaseUrl,
+                credentials?.username.orEmpty(),
+                credentials?.password.orEmpty(),
+            ).use { http ->
                 val client = CalibreClient(
                     baseUrl = effectiveBaseUrl,
                     username = "",
@@ -83,7 +129,10 @@ internal class KtorCalibreConnectionTester(
             }
         }.getOrElse { error ->
             if (error is CancellationException) throw error
-            error.toConnectionFailure()
+            error.toConnectionFailure(
+                endpointKind = calibreEndpointKind(effectiveBaseUrl),
+                network = networkSnapshotProvider.snapshot(),
+            )
         }
     }
 }
@@ -93,6 +142,7 @@ internal fun defaultCalibreHttpClient(
     allowedBaseUrl: String? = null,
     username: String = "",
     password: String = "",
+    networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
 ): HttpClient {
     val config: HttpClientConfigBlock = {
         expectSuccess = true
@@ -101,8 +151,9 @@ internal fun defaultCalibreHttpClient(
         // Default Json rejects any unknown key with SerializationException.
         install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true }) }
         install(HttpTimeout) {
-            connectTimeoutMillis = 5_000
-            requestTimeoutMillis = 8_000
+            connectTimeoutMillis = 4_000
+            requestTimeoutMillis = 15_000
+            socketTimeoutMillis = 15_000
         }
         if (username.isNotBlank()) {
             install(Auth) {
@@ -116,11 +167,21 @@ internal fun defaultCalibreHttpClient(
             }
         }
     }
-    val client = if (engine == null) HttpClient(config) else HttpClient(engine, config)
+    val client = if (engine == null) HttpClient(OkHttp, config) else HttpClient(engine, config)
     client.plugin(HttpSend).intercept { request ->
         requireAllowedCalibreRequestUrl(request.url.buildString())
         if (allowedBaseUrl != null) {
             requireSameCalibreOrigin(request.url.buildString(), allowedBaseUrl)
+        }
+        if (
+            username.isNotBlank() &&
+            requiresActiveVpnForCalibreHttp(request.url.buildString()) &&
+            !canUseStoredCalibreCredentials(
+                requestUrl = request.url.buildString(),
+                network = networkSnapshotProvider.snapshot(),
+            )
+        ) {
+            throw CalibreVpnRequiredException()
         }
         execute(request)
     }
@@ -129,7 +190,10 @@ internal fun defaultCalibreHttpClient(
 
 private typealias HttpClientConfigBlock = io.ktor.client.HttpClientConfig<*>.() -> Unit
 
-private fun Throwable.toConnectionFailure(): CalibreConnectionCheckResult.Failure = when (this) {
+internal fun Throwable.toConnectionFailure(
+    endpointKind: CalibreEndpointKind = CalibreEndpointKind.OTHER,
+    network: CalibreNetworkSnapshot = CalibreNetworkSnapshot.Unknown,
+): CalibreConnectionCheckResult.Failure = when (this) {
     is ClientRequestException -> when (response.status) {
         HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden -> CalibreConnectionCheckResult.Failure(
             message = "Calibre 服务器需要认证",
@@ -148,17 +212,10 @@ private fun Throwable.toConnectionFailure(): CalibreConnectionCheckResult.Failur
     is ServerResponseException -> {
         CalibreConnectionCheckResult.Failure(
             message = "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
-            nextStep = "确认电脑端 Calibre Content Server 正在运行后再重试",
+            nextStep = "已到达服务器地址；请检查 Calibre Content Server 或前置反向代理后重试",
+            kind = CalibreConnectionCheckResult.Failure.Kind.SERVER_RESPONSE,
         )
     }
-    is ConnectTimeoutException, is HttpRequestTimeoutException -> CalibreConnectionCheckResult.Failure(
-        message = "连接 Calibre 超时",
-        nextStep = "确认本设备能通过同一 Wi-Fi 或 Tailscale 访问服务器，并检查地址与端口",
-    )
-    is ConnectException, is UnknownHostException -> CalibreConnectionCheckResult.Failure(
-        message = "无法连接到服务器",
-        nextStep = "确认本设备与服务器位于同一 Wi-Fi 或 Tailscale 网络，并检查端口",
-    )
     is JsonConvertException, is SerializationException, is IllegalStateException -> CalibreConnectionCheckResult.Failure(
         message = "服务器响应不像 Calibre Content Server",
         nextStep = "确认地址直接指向 Calibre Content Server，例如 http://192.168.1.5:8080",
@@ -167,13 +224,13 @@ private fun Throwable.toConnectionFailure(): CalibreConnectionCheckResult.Failur
         message = "Calibre 连接测试失败（HTTP ${response.status.value}）",
         nextStep = "检查服务器状态后再重试",
     )
-    else -> CalibreConnectionCheckResult.Failure(
-        message = message?.takeIf { it.isNotBlank() } ?: "无法连接到服务器",
-        nextStep = "确认本设备与服务器位于同一 Wi-Fi 或 Tailscale 网络，并检查端口",
-    )
+    else -> classifyCalibreConnectionFailure(this, endpointKind, network)
 }
 
-internal fun Throwable.toCalibreReadflowError(): ReadflowError = when (this) {
+internal fun Throwable.toCalibreReadflowError(
+    baseUrl: String? = null,
+    network: CalibreNetworkSnapshot = CalibreNetworkSnapshot.Unknown,
+): ReadflowError = when (this) {
     is ClientRequestException -> when (response.status) {
         HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden -> ReadflowError(
             kind = ReadflowError.Kind.AUTH,
@@ -192,18 +249,21 @@ internal fun Throwable.toCalibreReadflowError(): ReadflowError = when (this) {
     is ServerResponseException -> {
         ReadflowError.network(
             response.status.value,
-            "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
+            "Calibre 服务器暂时不可用（HTTP ${response.status.value}）：" +
+                "已到达服务器地址，请检查 Content Server 或前置反向代理",
         )
     }
-    is ConnectTimeoutException, is HttpRequestTimeoutException ->
-        ReadflowError.network(null, "连接 Calibre 超时，请确认服务器在线且可通过同一 Wi-Fi 或 Tailscale 访问")
-    is ConnectException, is UnknownHostException ->
-        ReadflowError.network(null, "无法连接到 Calibre，请检查地址、端口、Wi-Fi 或 Tailscale 状态")
     is JsonConvertException, is SerializationException ->
         ReadflowError.parse("Calibre 返回了无法识别的数据")
     is ResponseException -> ReadflowError.network(
         response.status.value,
         "Calibre 请求失败（HTTP ${response.status.value}）",
     )
-    else -> ReadflowError.network(null, "Calibre 操作失败，请检查服务器状态后重试")
+    else -> classifyCalibreConnectionFailure(
+        error = this,
+        endpointKind = baseUrl?.let(::calibreEndpointKind) ?: CalibreEndpointKind.OTHER,
+        network = network,
+    ).let { failure ->
+        ReadflowError.network(null, "${failure.message}。${failure.nextStep}")
+    }
 }

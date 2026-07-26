@@ -50,11 +50,14 @@ class SourceAdapterCapabilitiesTest {
     fun calibreAdapterRequestsCredentialsForTheOpenedSource() {
         var requestedSourceId: String? = null
         var requestedScope: String? = null
-        val factory = CalibreSourceAdapterFactory(tempFolder.root) { sourceId, scope ->
-            requestedSourceId = sourceId
-            requestedScope = scope
-            dev.readflow.extensions.api.SourceCredentials("reader", "secret")
-        }
+        val factory = CalibreSourceAdapterFactory(
+            booksDir = tempFolder.root,
+            credentialProvider = { sourceId, scope ->
+                requestedSourceId = sourceId
+                requestedScope = scope
+                dev.readflow.extensions.api.SourceCredentials("reader", "secret")
+            },
+        )
         val descriptor = dev.readflow.extensions.api.SourceDescriptor(
             id = "protected-calibre",
             adapterId = dev.readflow.extensions.api.SourceAdapterIds.CALIBRE,

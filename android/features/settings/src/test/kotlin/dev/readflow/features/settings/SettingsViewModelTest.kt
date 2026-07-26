@@ -3,11 +3,10 @@ package dev.readflow.features.settings
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.prefs.SettingsRepository
-import dev.readflow.core.calibre.CalibreConnectionCheckResult
-import dev.readflow.core.calibre.CalibreConnectionTester
 import dev.readflow.core.calibre.CalibreEndpointProbe
 import dev.readflow.core.calibre.CalibreProbeAttempt
 import dev.readflow.core.calibre.CalibreProbeResult
+import dev.readflow.core.calibre.VerifiedCalibreEndpointSink
 import dev.readflow.core.database.LinReadsBackupExportResult
 import dev.readflow.core.database.LinReadsBackupExportStore
 import dev.readflow.core.database.LinReadsBackupRestoreResult
@@ -20,6 +19,7 @@ import dev.readflow.core.model.ReaderMenuEntry
 import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.TxtEncoding
 import dev.readflow.core.model.FontChoice
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,6 +29,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import dev.readflow.core.model.ReadflowResult
+import dev.readflow.core.model.ReadflowError
 import dev.readflow.core.model.ReadingProgress
 import dev.readflow.core.sync.SyncBackend
 import org.junit.After
@@ -67,7 +68,7 @@ class SettingsViewModelTest {
     }
 
     @Test
-    fun savesNormalizedPrivateHttpCalibreUrl() = runTest(dispatcher) {
+    fun setCalibreUrlKeepsNormalizedPrivateHttpEndpointUnverified() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val settings = FakeSettingsRepository()
         val viewModel = createViewModel(settings)
@@ -76,11 +77,11 @@ class SettingsViewModelTest {
         advanceUntilIdle()
 
         assertNull(viewModel.calibreUrlError.value)
-        assertEquals("http://172.31.0.7:8080", settings.savedCalibreUrl)
+        assertNull(settings.savedCalibreUrl)
     }
 
     @Test
-    fun savesDirectCalibreEndpointInsteadOfBareHttpsMagicDnsServeAddress() = runTest(dispatcher) {
+    fun setCalibreUrlDoesNotPersistAnUnverifiedEndpoint() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val settings = FakeSettingsRepository()
         val viewModel = createViewModel(settings)
@@ -89,23 +90,32 @@ class SettingsViewModelTest {
         advanceUntilIdle()
 
         assertNull(viewModel.calibreUrlError.value)
-        assertEquals("http://reader.tailnet.ts.net:8080/opds", settings.savedCalibreUrl)
+        assertNull(settings.savedCalibreUrl)
     }
 
     @Test
-    fun testConnectionSavesNormalizedUrlAndShowsSuccessGuidance() = runTest(dispatcher) {
+    fun testConnectionPersistsEndpointReturnedBySharedProbe() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val settings = FakeSettingsRepository()
-        val tester = FakeCalibreConnectionTester(
-            result = CalibreConnectionCheckResult.Success(bookCount = 12),
+        val probe = FakeCalibreEndpointProbe(
+            result = CalibreProbeResult.Success(
+                baseUrl = "http://reader.tailnet.ts.net:8080",
+                bookCount = 12,
+            ),
         )
-        val viewModel = createViewModel(settings, connectionTester = tester)
+        val sink = FakeVerifiedCalibreEndpointSink(settings)
+        val viewModel = createViewModel(
+            settings,
+            endpointProbe = probe,
+            verifiedEndpointSink = sink,
+        )
 
-        viewModel.testCalibreConnection(" http://192.168.1.5:8080/ ")
+        viewModel.testCalibreConnection("https://reader.tailnet.ts.net")
         advanceUntilIdle()
 
-        assertEquals("http://192.168.1.5:8080", settings.savedCalibreUrl)
-        assertEquals("http://192.168.1.5:8080", tester.checkedUrl)
+        assertEquals("http://reader.tailnet.ts.net:8080", settings.savedCalibreUrl)
+        assertEquals("http://reader.tailnet.ts.net:8080", sink.savedUrl)
+        assertEquals("https://reader.tailnet.ts.net", probe.probedHint)
         assertNull(viewModel.calibreUrlError.value)
         assertEquals(
             CalibreConnectionUiState.Success(
@@ -117,16 +127,51 @@ class SettingsViewModelTest {
     }
 
     @Test
+    fun verifiedConnectionIsNotReportedAsSavedWhenTransactionalPersistenceFails() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val settings = FakeSettingsRepository()
+            val probe = FakeCalibreEndpointProbe(
+                result = CalibreProbeResult.Success(
+                    baseUrl = "http://192.168.1.5:8080",
+                    bookCount = 12,
+                ),
+            )
+            val sink = FakeVerifiedCalibreEndpointSink(
+                settings = settings,
+                result = ReadflowResult.Failure(ReadflowError.io("数据库写入失败")),
+            )
+            val viewModel = createViewModel(
+                settings,
+                endpointProbe = probe,
+                verifiedEndpointSink = sink,
+            )
+
+            viewModel.testCalibreConnection("http://192.168.1.5:8080")
+            advanceUntilIdle()
+
+            assertNull(settings.savedCalibreUrl)
+            assertEquals(
+                CalibreConnectionUiState.Failure(
+                    message = "已连接到 Calibre，但保存地址失败",
+                    nextStep = "数据库写入失败",
+                ),
+                viewModel.calibreConnectionState.value,
+            )
+        }
+
+    @Test
     fun testConnectionFailureShowsActionableGuidanceWithoutSaving() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val settings = FakeSettingsRepository()
-        val tester = FakeCalibreConnectionTester(
-            result = CalibreConnectionCheckResult.Failure(
+        val probe = FakeCalibreEndpointProbe(
+            result = CalibreProbeResult.Failure(
                 message = "无法连接到服务器",
                 nextStep = "确认手机和 Calibre 在同一局域网，并检查端口是否为 8080",
+                attempts = emptyList(),
             ),
         )
-        val viewModel = createViewModel(settings, connectionTester = tester)
+        val viewModel = createViewModel(settings, endpointProbe = probe)
 
         viewModel.testCalibreConnection("http://192.168.1.5:8080")
         advanceUntilIdle()
@@ -142,13 +187,71 @@ class SettingsViewModelTest {
     }
 
     @Test
+    fun newerConnectionTestCannotBeOverwrittenByAnOlderSlowProbe() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val firstProbeStarted = CompletableDeferred<Unit>()
+        val finishFirstProbe = CompletableDeferred<Unit>()
+        val probe = object : CalibreEndpointProbe {
+            override suspend fun probe(hint: String): CalibreProbeResult =
+                if (hint == "https://old.tailnet.ts.net") {
+                    firstProbeStarted.complete(Unit)
+                    finishFirstProbe.await()
+                    CalibreProbeResult.Success(hint, bookCount = 1)
+                } else {
+                    CalibreProbeResult.Success(hint, bookCount = 9)
+                }
+        }
+        val viewModel = createViewModel(settings, endpointProbe = probe)
+
+        viewModel.testCalibreConnection("https://old.tailnet.ts.net")
+        firstProbeStarted.await()
+        viewModel.testCalibreConnection("https://new.tailnet.ts.net")
+        advanceUntilIdle()
+        finishFirstProbe.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals("https://new.tailnet.ts.net", settings.savedCalibreUrl)
+        assertEquals(
+            CalibreConnectionUiState.Success(
+                message = "已连接到 Calibre，发现 9 本书",
+                nextStep = "返回书架后可以搜索并下载书籍",
+            ),
+            viewModel.calibreConnectionState.value,
+        )
+    }
+
+    @Test
+    fun invalidConnectionTestCancelsAnOlderSlowProbe() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val firstProbeStarted = CompletableDeferred<Unit>()
+        val finishFirstProbe = CompletableDeferred<Unit>()
+        val probe = object : CalibreEndpointProbe {
+            override suspend fun probe(hint: String): CalibreProbeResult {
+                firstProbeStarted.complete(Unit)
+                finishFirstProbe.await()
+                return CalibreProbeResult.Success(hint, bookCount = 1)
+            }
+        }
+        val viewModel = createViewModel(settings, endpointProbe = probe)
+
+        viewModel.testCalibreConnection("https://old.tailnet.ts.net")
+        firstProbeStarted.await()
+        viewModel.testCalibreConnection("")
+        finishFirstProbe.complete(Unit)
+        advanceUntilIdle()
+
+        assertNull(settings.savedCalibreUrl)
+        assertEquals("请先填写 Calibre 服务器地址", viewModel.calibreUrlError.value)
+        assertEquals(CalibreConnectionUiState.Idle, viewModel.calibreConnectionState.value)
+    }
+
+    @Test
     fun clearsConnectionStateWhenDraftChanges() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val settings = FakeSettingsRepository()
-        val viewModel = createViewModel(
-            settings,
-            connectionTester = FakeCalibreConnectionTester(CalibreConnectionCheckResult.Success(bookCount = 1)),
-        )
+        val viewModel = createViewModel(settings)
 
         viewModel.testCalibreConnection("http://192.168.1.5:8080")
         advanceUntilIdle()
@@ -609,8 +712,9 @@ class SettingsViewModelTest {
 
     private fun createViewModel(
         settings: SettingsRepository,
-        connectionTester: CalibreConnectionTester = FakeCalibreConnectionTester(),
         endpointProbe: CalibreEndpointProbe = FakeCalibreEndpointProbe(),
+        verifiedEndpointSink: VerifiedCalibreEndpointSink =
+            FakeVerifiedCalibreEndpointSink(settings),
         syncBackend: SyncBackend = FakeSyncBackend(),
         backupExporter: LinReadsBackupExportStore = FakeBackupExporter(),
         backupRestorer: LinReadsBackupRestoreStore = FakeBackupRestorer(),
@@ -618,14 +722,27 @@ class SettingsViewModelTest {
     ): SettingsViewModel =
         SettingsViewModel(
             settings,
-            connectionTester,
             endpointProbe,
+            verifiedEndpointSink,
             syncBackend,
             backupExporter,
             backupRestorer,
             notesExporter,
             dispatcher,
         )
+
+    private class FakeVerifiedCalibreEndpointSink(
+        private val settings: SettingsRepository,
+        private val result: ReadflowResult<Unit> = ReadflowResult.Success(Unit),
+    ) : VerifiedCalibreEndpointSink {
+        var savedUrl: String? = null
+
+        override suspend fun persistVerifiedCalibreEndpoint(baseUrl: String): ReadflowResult<Unit> {
+            savedUrl = baseUrl
+            if (result is ReadflowResult.Success) settings.setCalibreBaseUrl(baseUrl)
+            return result
+        }
+    }
 
     private class FakeSettingsRepository : SettingsRepository {
         override val calibreBaseUrl = MutableStateFlow<String?>(null)
@@ -703,17 +820,6 @@ class SettingsViewModelTest {
         override suspend fun setReaderMenuConfig(config: ReaderMenuConfig) {
             setReaderMenuConfigCalls += 1
             readerMenuConfig.value = ReaderMenuConfig.resolve(config)
-        }
-    }
-
-    private class FakeCalibreConnectionTester(
-        private val result: CalibreConnectionCheckResult = CalibreConnectionCheckResult.Success(bookCount = 0),
-    ) : CalibreConnectionTester {
-        var checkedUrl: String? = null
-
-        override suspend fun check(baseUrl: String): CalibreConnectionCheckResult {
-            checkedUrl = baseUrl
-            return result
         }
     }
 

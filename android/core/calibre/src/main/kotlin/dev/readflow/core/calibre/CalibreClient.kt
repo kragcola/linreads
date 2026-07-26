@@ -64,12 +64,15 @@ class CalibreClient internal constructor(
     private val password: String,
     libraryId: String,
     private val http: HttpClient,
+    private val networkSnapshotProvider: CalibreNetworkSnapshotProvider =
+        UnknownCalibreNetworkSnapshotProvider,
 ) : AutoCloseable {
     constructor(
         baseUrl: String,
         username: String = "",
         password: String = "",
         libraryId: String = "calibre-library",
+        networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
     ) : this(
         baseUrl = baseUrl,
         username = username,
@@ -79,7 +82,9 @@ class CalibreClient internal constructor(
             allowedBaseUrl = requireCalibreAjaxBaseUrl(baseUrl),
             username = username,
             password = password,
+            networkSnapshotProvider = networkSnapshotProvider,
         ),
+        networkSnapshotProvider = networkSnapshotProvider,
     )
 
     private val baseUrl = requireCalibreAjaxBaseUrl(baseUrl)
@@ -149,6 +154,11 @@ class CalibreClient internal constructor(
     override fun close() {
         http.close()
     }
+
+    internal fun toReadflowError(error: Throwable) = error.toCalibreReadflowError(
+        baseUrl = baseUrl,
+        network = networkSnapshotProvider.snapshot(),
+    )
 
     private fun libraryPathSegment(): String =
         (discoveredLibraryId ?: configuredLibraryId).encodeURLPathPart()

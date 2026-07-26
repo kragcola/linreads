@@ -1,4 +1,5 @@
 import json
+import http.client
 import socket
 import subprocess
 import sys
@@ -100,6 +101,55 @@ class FakeCalibreServerTest(unittest.TestCase):
                         "book_id": 42,
                     }
                 ],
+                events,
+            )
+        finally:
+            self._shutdown_server(port)
+            server.wait(timeout=5)
+            if server.stdout is not None:
+                server.stdout.close()
+
+    def test_partial_download_mode_closes_stream_after_writing_bytes(self):
+        port = self._free_port()
+        server = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("fake_calibre_server.py")),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            self._wait_for_server(port)
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/__download_mode__?mode=partial",
+                timeout=2,
+            ) as response:
+                self.assertEqual({"mode": "partial"}, json.loads(response.read().decode("utf-8")))
+
+            with self.assertRaises(http.client.IncompleteRead):
+                urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/get/EPUB/42/calibre-library",
+                    timeout=2,
+                ).read()
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/__events__",
+                timeout=2,
+            ) as response:
+                events = json.loads(response.read().decode("utf-8"))["events"]
+            self.assertIn(
+                {
+                    "index": 1,
+                    "kind": "partial_download",
+                    "path": "/get/EPUB/42/calibre-library",
+                    "book_id": 42,
+                },
                 events,
             )
         finally:

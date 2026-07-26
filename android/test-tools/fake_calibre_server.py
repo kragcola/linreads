@@ -129,6 +129,8 @@ BOOKS_BY_ID = {book.id: book for book in BOOKS}
 EPUB_BYTES_BY_ID = {book.id: build_epub_bytes(book) for book in BOOKS}
 EVENTS: list[dict[str, object]] = []
 EVENTS_LOCK = threading.Lock()
+DOWNLOAD_MODE = "normal"
+DOWNLOAD_MODE_LOCK = threading.Lock()
 
 
 class FakeCalibreServer(ThreadingHTTPServer):
@@ -151,7 +153,11 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/__reset_events__":
             self._reset_events()
+            self._set_download_mode("normal")
             self._write_json({"ok": True})
+            return
+        if parsed.path == "/__download_mode__":
+            self._handle_download_mode(parsed)
             return
         if parsed.path == "/ajax/search":
             self._handle_search(parsed)
@@ -184,6 +190,14 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
             "library_id": LIBRARY_ID,
         }
         self._write_json(payload)
+
+    def _handle_download_mode(self, parsed) -> None:
+        mode = parse_qs(parsed.query).get("mode", [""])[0]
+        if mode not in {"normal", "partial"}:
+            self.send_error(HTTPStatus.BAD_REQUEST, "unsupported download mode")
+            return
+        self._set_download_mode(mode)
+        self._write_json({"mode": mode})
 
     def _matching_books(self, query: str) -> list[FakeBook]:
         if not query:
@@ -241,8 +255,13 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         if book is None:
             self.send_error(HTTPStatus.NOT_FOUND, "unknown book")
             return True
-        self._record_event("download", parsed.path, book.id)
-        self._write_bytes("application/epub+zip", EPUB_BYTES_BY_ID[book.id])
+        payload = EPUB_BYTES_BY_ID[book.id]
+        if self._download_mode() == "partial":
+            self._record_event("partial_download", parsed.path, book.id)
+            self._write_partial_bytes("application/epub+zip", payload)
+        else:
+            self._record_event("download", parsed.path, book.id)
+            self._write_bytes("application/epub+zip", payload)
         return True
 
     def _handle_cover(self, parsed) -> bool:
@@ -274,6 +293,16 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _write_partial_bytes(self, content_type: str, payload: bytes) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload[: max(1, len(payload) // 2)])
+        self.wfile.flush()
+        self.close_connection = True
+
     def _record_event(self, kind: str, path: str, book_id: int | None = None) -> None:
         with EVENTS_LOCK:
             EVENTS.append(
@@ -292,6 +321,17 @@ class FakeCalibreHandler(BaseHTTPRequestHandler):
     def _reset_events(self) -> None:
         with EVENTS_LOCK:
             EVENTS.clear()
+
+    @staticmethod
+    def _download_mode() -> str:
+        with DOWNLOAD_MODE_LOCK:
+            return DOWNLOAD_MODE
+
+    @staticmethod
+    def _set_download_mode(mode: str) -> None:
+        global DOWNLOAD_MODE
+        with DOWNLOAD_MODE_LOCK:
+            DOWNLOAD_MODE = mode
 
 
 def main() -> int:

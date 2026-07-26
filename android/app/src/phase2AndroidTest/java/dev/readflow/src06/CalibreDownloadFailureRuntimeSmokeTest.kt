@@ -16,18 +16,23 @@ import androidx.test.uiautomator.Until
 import dev.readflow.MainActivity
 import dev.readflow.core.database.BookEntity
 import dev.readflow.core.database.ReadflowDatabase
+import dev.readflow.core.model.BookAssetOperationCoordinator
+import dev.readflow.core.prefs.DataStoreSettingsRepository
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.first
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.koin.core.context.GlobalContext
 
 @LargeTest
 @RunWith(AndroidJUnit4::class)
@@ -54,7 +59,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
     }
 
     @Test
-    fun downloadFailureAfterSearchDoesNotCreateBrokenOfflineBook() {
+    fun partialDownloadFailureAfterSearchDoesNotCreateBrokenOfflineBook() {
         ActivityScenario.launch<MainActivity>(mainIntent()).use {
             dismissBlockingDialogs()
             waitForLibraryLoaded()
@@ -64,14 +69,14 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             waitForObject(By.desc("书源选择器"))
             waitForObject(By.desc("搜索在线书库")).click()
 
-            replaceSingleLineText("smoke")
+            replaceSingleLineText(editableField("在线书库搜索词"), "smoke")
             waitForObject(By.desc("执行搜索")).click()
             waitForObject(By.text("Remote EPUB Smoke"))
             takeScreenshot("search-result-before-server-loss.png")
 
-            shutdownFakeCalibreServer()
-            waitForCalibreServerUnavailable()
+            enablePartialFakeCalibreDownload()
             waitForObject(By.desc("下载《Remote EPUB Smoke》")).click()
+            val partialDownloadEvent = waitForFakeCalibreEvent(kind = "partial_download", bookId = 42)
             val errorText = waitForObject(By.descContains("在线书库错误："))
                 .contentDescription
                 .orEmpty()
@@ -80,13 +85,13 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             waitForObject(By.desc("下载《Remote EPUB Smoke》"))
             takeScreenshot("download-failure-message.png")
 
-            val failedBook = latestBook("calibre-42")
+            val failedBook = latestBookByTitle("Remote EPUB Smoke")
             val booksDir = File(appContext.filesDir, "books")
             val orphanFiles = booksDir.listFiles()
-                ?.filter { it.name.startsWith("calibre-42.") }
+                ?.filter(File::isFile)
                 .orEmpty()
             assertNull("failed download must not create a shelf row", failedBook)
-            assertTrue("failed download must not leave a partial calibre-42 file", orphanFiles.isEmpty())
+            assertTrue("failed download must not leave a final or staging asset", orphanFiles.isEmpty())
 
             waitForObject(By.text("本地书架")).click()
             waitForLibraryLoaded()
@@ -99,7 +104,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
                 buildString {
                     appendLine("serverBaseUrl=$calibreBaseUrl")
                     appendLine("searchedTitle=Remote EPUB Smoke")
-                    appendLine("serverUnavailableBeforeDownload=true")
+                    appendLine("partialDownloadEvent=$partialDownloadEvent")
                     appendLine("downloadError=$errorText")
                     appendLine("bookRowAfterFailure=${failedBook?.id}")
                     appendLine("orphanFilesAfterFailure=${orphanFiles.joinToString(",") { file -> file.name }}")
@@ -108,6 +113,7 @@ class CalibreDownloadFailureRuntimeSmokeTest {
                 },
             )
             copyDatabaseSnapshot("after-download-failure")
+            shutdownFakeCalibreServer()
         }
     }
 
@@ -123,23 +129,31 @@ class CalibreDownloadFailureRuntimeSmokeTest {
         waitForObject(By.text("添加书源")).click()
         waitForObject(By.text("Calibre")).click()
         waitForObject(By.text("Calibre 服务器地址"))
-        replaceSingleLineText(calibreBaseUrl)
+        replaceSingleLineText(editableField("书源地址输入"), calibreBaseUrl)
         waitForObject(By.text("保存").enabled(true)).click()
         waitForObject(By.desc("书源选择器"))
         waitForObject(By.text("Remote EPUB Smoke"))
     }
 
     private fun resetTargetAppState() {
-        appContext.deleteDatabase(DB_NAME)
-        deleteIfExists(appContext.getDatabasePath(DB_NAME))
-        deleteIfExists(File(appContext.getDatabasePath(DB_NAME).path + "-wal"))
-        deleteIfExists(File(appContext.getDatabasePath(DB_NAME).path + "-shm"))
-        deleteRecursively(File(appContext.filesDir, "books"))
-        deleteRecursively(File(appContext.filesDir, "covers"))
-        deleteIfExists(File(appContext.filesDir, "datastore/readflow_settings.preferences_pb"))
+        markSeedBooksAsAlreadyImported()
+        runBlocking {
+            val koin = GlobalContext.get()
+            koin.get<BookAssetOperationCoordinator>().delete(TEST_RESET_OPERATION_ID) {
+                koin.get<ReadflowDatabase>().clearAllTables()
+                deleteRecursively(File(appContext.filesDir, "books"))
+                deleteRecursively(File(appContext.filesDir, "covers"))
+            }
+            DataStoreSettingsRepository(appContext).clearCalibreBaseUrl()
+        }
+        check(
+            appContext.getSharedPreferences(SOURCE_CREDENTIAL_PREFERENCES, Context.MODE_PRIVATE)
+                .edit()
+                .clear()
+                .commit(),
+        ) { "Failed to clear source credentials" }
         evidenceDir().deleteRecursively()
         evidenceDir().mkdirs()
-        markSeedBooksAsAlreadyImported()
     }
 
     private fun markSeedBooksAsAlreadyImported() {
@@ -150,13 +164,16 @@ class CalibreDownloadFailureRuntimeSmokeTest {
             .commit()
     }
 
-    private fun replaceSingleLineText(value: String) {
-        val editText = waitForObject(By.clazz("android.widget.EditText"))
+    private fun replaceSingleLineText(selector: BySelector, value: String) {
+        val editText = waitForObject(selector)
         editText.text = value
         waitForCondition("expected edit text to update to $value") {
-            waitForObject(By.clazz("android.widget.EditText")).text == value
+            waitForObject(selector).text == value
         }
     }
+
+    private fun editableField(description: String): BySelector =
+        By.clazz("android.widget.EditText").hasDescendant(By.desc(description))
 
     private fun waitForLibraryLoaded() {
         waitForObject(By.text("书库"))
@@ -180,24 +197,52 @@ class CalibreDownloadFailureRuntimeSmokeTest {
         }
     }
 
-    private fun waitForCalibreServerUnavailable() {
-        waitForCondition("expected fake Calibre server to be unavailable") {
-            runCatching {
-                val connection = URL("$calibreBaseUrl/ajax/search?query=&num=1").openConnection() as HttpURLConnection
-                connection.connectTimeout = 250
-                connection.readTimeout = 250
-                connection.inputStream.use { it.readBytes() }
-                connection.disconnect()
-            }.isFailure
+    private fun enablePartialFakeCalibreDownload() {
+        val connection = URL("$calibreBaseUrl/__download_mode__?mode=partial").openConnection() as HttpURLConnection
+        connection.connectTimeout = 2_000
+        connection.readTimeout = 2_000
+        try {
+            check(connection.responseCode == HttpURLConnection.HTTP_OK) {
+                "failed to enable fake partial-download mode: HTTP ${connection.responseCode}"
+            }
+            connection.inputStream.use { it.readBytes() }
+        } finally {
+            connection.disconnect()
         }
     }
 
-    private fun latestBook(bookId: String): BookEntity? {
+    private fun waitForFakeCalibreEvent(kind: String, bookId: Int): String {
+        val deadline = System.currentTimeMillis() + UI_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            val events = JSONObject(fakeCalibreEventsJson()).getJSONArray("events")
+            for (index in 0 until events.length()) {
+                val event = events.getJSONObject(index)
+                if (event.optString("kind") == kind && event.optInt("book_id", -1) == bookId) {
+                    return event.toString()
+                }
+            }
+            Thread.sleep(100)
+        }
+        error("Timed out waiting for fake Calibre event $kind/$bookId")
+    }
+
+    private fun fakeCalibreEventsJson(): String {
+        val connection = URL("$calibreBaseUrl/__events__").openConnection() as HttpURLConnection
+        connection.connectTimeout = 2_000
+        connection.readTimeout = 2_000
+        return try {
+            connection.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun latestBookByTitle(title: String): BookEntity? {
         val db = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
             .allowMainThreadQueries()
             .build()
         return try {
-            runBlocking { db.bookDao().getById(bookId) }
+            runBlocking { db.bookDao().observeAll().first().firstOrNull { it.title == title } }
         } finally {
             db.close()
         }
@@ -264,6 +309,8 @@ class CalibreDownloadFailureRuntimeSmokeTest {
         const val DB_NAME = "readflow.db"
         const val ARG_CALIBRE_BASE_URL = "calibreBaseUrl"
         const val DEFAULT_SERVER_BASE_URL = "http://10.0.2.2:18081"
+        const val SOURCE_CREDENTIAL_PREFERENCES = "source_credentials_v1"
+        const val TEST_RESET_OPERATION_ID = "calibre-download-failure-smoke-reset"
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
     }
 }

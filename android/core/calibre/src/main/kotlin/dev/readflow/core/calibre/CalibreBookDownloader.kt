@@ -76,8 +76,8 @@ class CalibreBookDownloader(
             }.getOrElse { error ->
                 if (error is CancellationException) throw error
                 ReadflowResult.Failure(
-                    if (error is ResponseException) {
-                        error.toCalibreReadflowError()
+                    if (error is ResponseException || error.isCalibreTransportFailure()) {
+                        client.toReadflowError(error)
                     } else {
                         ReadflowError.io(error.message ?: "Calibre 下载失败")
                     },

@@ -55,6 +55,8 @@ interface SettingsRepository {
     suspend fun ensureCurrentTypographyBaseline(): Boolean = false
 
     suspend fun setCalibreBaseUrl(url: String)
+    /** Removes the legacy Calibre preference so rollback can restore an originally absent value. */
+    suspend fun clearCalibreBaseUrl() = setCalibreBaseUrl("")
     suspend fun setFontSize(size: Int)
     suspend fun setLineSpacing(multiplier: Float)
     suspend fun setReadingMode(mode: ReaderReadingMode)

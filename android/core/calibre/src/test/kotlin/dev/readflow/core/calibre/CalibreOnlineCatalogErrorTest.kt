@@ -7,6 +7,7 @@ import dev.readflow.extensions.api.SourceDescriptor
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respondError
 import io.ktor.http.HttpStatusCode
+import java.net.ConnectException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -86,7 +87,50 @@ class CalibreOnlineCatalogErrorTest {
         assertEquals(ReadflowError.Kind.NETWORK, error.kind)
         assertEquals(502, error.code)
         assertTrue(error.message.contains("Calibre 服务器暂时不可用"))
+        assertTrue(error.message.contains("已到达服务器地址"))
         assertFalse(error.message.contains("Tailscale Serve"))
+        assertFalse(error.message.contains("VPN"))
+        catalog.close()
+    }
+
+    @Test
+    fun tailscaleIpConnectionFailureWithoutVpnKeepsNetworkEvidenceInTheRealCatalogPath() = runTest {
+        val baseUrl = "http://100.64.0.42:8080"
+        val client = CalibreClient(
+            baseUrl = baseUrl,
+            username = "",
+            password = "",
+            libraryId = "calibre-library",
+            http = defaultCalibreHttpClient(
+                engine = MockEngine { throw ConnectException("failed to connect") },
+                allowedBaseUrl = baseUrl,
+            ),
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                CalibreNetworkSnapshot.Active(
+                    vpnAppliesToApp = false,
+                    internetValidated = true,
+                )
+            },
+        )
+        val catalog = CalibreOnlineCatalog(
+            client = client,
+            booksDir = null,
+            descriptor = SourceDescriptor(
+                id = "source-calibre",
+                adapterId = SourceAdapterIds.CALIBRE,
+                name = "Calibre",
+                configVersion = 1,
+                configJson = calibreSourceConfigJson(baseUrl),
+                baseUrl = baseUrl,
+            ),
+        )
+
+        val result = catalog.search("")
+
+        assertTrue(result is ReadflowResult.Failure)
+        val error = (result as ReadflowResult.Failure).error
+        assertEquals(ReadflowError.Kind.NETWORK, error.kind)
+        assertTrue(error.message.contains("未检测到可用于本应用的 VPN"))
         catalog.close()
     }
 }

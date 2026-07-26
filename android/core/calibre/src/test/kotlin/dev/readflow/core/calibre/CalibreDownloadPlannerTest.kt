@@ -10,11 +10,13 @@ import io.ktor.client.engine.mock.respondError
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
+import java.net.ConnectException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -171,6 +173,91 @@ class CalibreDownloadPlannerTest {
         assertEquals(502, error.code)
         assertTrue(error.message.contains("HTTP 502"))
         assertTrue(booksDir.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun downloadConnectionFailureKeepsTailscaleDiagnosticsAndCleansTheStagingFile() = runTest {
+        val booksDir = temp.newFolder("failed-tailscale-download")
+        val baseUrl = "http://100.64.0.42:8080"
+        val client = CalibreClient(
+            baseUrl = baseUrl,
+            username = "",
+            password = "",
+            libraryId = "calibre-library",
+            http = defaultCalibreHttpClient(
+                MockEngine { throw ConnectException("failed to connect") },
+            ),
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                CalibreNetworkSnapshot.Active(
+                    vpnAppliesToApp = false,
+                    internetValidated = true,
+                )
+            },
+        )
+        val downloader = CalibreBookDownloader(client = client, booksDir = booksDir)
+
+        val result = downloader.download(
+            CalibreBookMeta(
+                id = 42,
+                title = "Tailnet failure",
+                formats = listOf("EPUB"),
+            ),
+        )
+
+        assertTrue(result is ReadflowResult.Failure)
+        val error = (result as ReadflowResult.Failure).error
+        assertEquals(ReadflowError.Kind.NETWORK, error.kind)
+        assertTrue(error.message.contains("未检测到可用于本应用的 VPN"))
+        assertTrue(booksDir.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun authenticatedTailnetHttpDownloadWithoutVpnFailsBeforeNetworkWithActionableError() = runTest {
+        val baseUrl = "http://100.64.0.42:8080"
+        val networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+            CalibreNetworkSnapshot.Active(
+                vpnAppliesToApp = false,
+                internetValidated = true,
+            )
+        }
+        var mockEngineRequests = 0
+        val client = CalibreClient(
+            baseUrl = baseUrl,
+            username = "reader",
+            password = "secret",
+            libraryId = "calibre-library",
+            http = defaultCalibreHttpClient(
+                engine = MockEngine {
+                    mockEngineRequests += 1
+                    respond("must not be reached")
+                },
+                allowedBaseUrl = baseUrl,
+                username = "reader",
+                password = "secret",
+                networkSnapshotProvider = networkSnapshotProvider,
+            ),
+            networkSnapshotProvider = networkSnapshotProvider,
+        )
+        val downloader = CalibreBookDownloader(
+            client = client,
+            booksDir = temp.newFolder("vpn-gated-download"),
+        )
+
+        val result = downloader.download(
+            CalibreBookMeta(
+                id = 42,
+                title = "VPN gated download",
+                formats = listOf("EPUB"),
+            ),
+        )
+
+        assertEquals("VPN gate must run before the HTTP engine", 0, mockEngineRequests)
+        assertTrue(result is ReadflowResult.Failure)
+        val error = (result as ReadflowResult.Failure).error
+        assertEquals(ReadflowError.Kind.NETWORK, error.kind)
+        assertTrue(error.message.contains("打开 Tailscale"))
+        assertTrue(error.message.contains("VPN"))
+        assertFalse(error.message.contains("authenticated Calibre HTTP traffic"))
     }
 
     @Test(expected = CancellationException::class)

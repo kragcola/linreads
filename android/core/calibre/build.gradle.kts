@@ -22,6 +22,8 @@ dependencies {
     testImplementation(libs.junit4)
     testImplementation(libs.ktor.client.mock)
     testImplementation(libs.coroutines.test)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
     // Real XmlPullParser for JVM unit tests (Android framework API is stubbed otherwise).
     testImplementation(libs.kxml2)
 }

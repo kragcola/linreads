@@ -4,13 +4,16 @@ import androidx.room.Room
 import androidx.room.withTransaction
 import dev.readflow.core.calibre.CalibreEndpointProbe
 import dev.readflow.core.calibre.CalibreConnectionTester
+import dev.readflow.core.calibre.CalibreNetworkSnapshotProvider
 import dev.readflow.core.calibre.CalibreServiceDiscovery
 import dev.readflow.core.calibre.AndroidCalibreServiceDiscovery
+import dev.readflow.core.calibre.AndroidCalibreNetworkSnapshotProvider
 import dev.readflow.core.calibre.DefaultSourceRegistry
 import dev.readflow.core.calibre.AndroidSourceCredentialStore
 import dev.readflow.core.calibre.SourceCredentialStore
 import dev.readflow.core.calibre.defaultSourceAdapterRegistry
 import dev.readflow.core.calibre.GuidedCalibreEndpointProbe
+import dev.readflow.core.calibre.VerifiedCalibreEndpointSink
 import dev.readflow.core.calibre.createCalibreConnectionTester
 import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.database.LibraryStore
@@ -191,22 +194,27 @@ val renderModule = module {
 val settingsModule = module {
     single<SettingsRepository> { DataStoreSettingsRepository(androidContext()) }
     single<SourceCredentialStore> { AndroidSourceCredentialStore(androidContext()) }
-    single<CalibreConnectionTester> { createCalibreConnectionTester() }
+    single<CalibreNetworkSnapshotProvider> { AndroidCalibreNetworkSnapshotProvider(androidContext()) }
+    single<CalibreConnectionTester> { createCalibreConnectionTester(get()) }
     single<CalibreServiceDiscovery> { AndroidCalibreServiceDiscovery(androidContext(), get()) }
-    single<CalibreEndpointProbe> { GuidedCalibreEndpointProbe(get()) }
+    single<CalibreEndpointProbe> { GuidedCalibreEndpointProbe(get(), get()) }
     single<SourceAdapterRegistry> {
-        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"), get())
+        defaultSourceAdapterRegistry(File(androidContext().filesDir, "books"), get(), get())
     }
-    single<SourceRegistry> {
+    single {
         DefaultSourceRegistry(
             settings = get(),
             sourceConfigStore = get(),
             booksDir = File(androidContext().filesDir, "books"),
             credentialStore = get(),
             calibreServiceDiscovery = get(),
+            calibreEndpointProbe = get(),
+            networkSnapshotProvider = get(),
             sourceAdapters = get(),
         )
     }
+    single<SourceRegistry> { get<DefaultSourceRegistry>() }
+    single<VerifiedCalibreEndpointSink> { get<DefaultSourceRegistry>() }
 }
 
 val featureModule = module {

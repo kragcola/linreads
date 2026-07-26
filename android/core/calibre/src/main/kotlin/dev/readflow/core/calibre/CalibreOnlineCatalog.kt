@@ -112,7 +112,7 @@ class CalibreOnlineCatalog(
             )
         }.getOrElse { error ->
             if (error is CancellationException) throw error
-            ReadflowResult.Failure(error.toCalibreReadflowError())
+            ReadflowResult.Failure(client.toReadflowError(error))
         }
 
     override suspend fun browsePage(
@@ -144,7 +144,7 @@ class CalibreOnlineCatalog(
             }
         }.getOrElse { error ->
             if (error is CancellationException) throw error
-            ReadflowResult.Failure(error.toCalibreReadflowError())
+            ReadflowResult.Failure(client.toReadflowError(error))
         }
 
     override suspend fun preview(entry: OnlineCatalogEntry): ReadflowResult<OnlineBookPreview> =

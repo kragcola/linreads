@@ -1,5 +1,6 @@
 package dev.readflow.core.calibre
 
+import dev.readflow.extensions.api.SourceCredentials
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.MockRequestHandleScope
 import io.ktor.client.engine.mock.respond
@@ -144,14 +145,15 @@ class CalibreConnectionTesterTest {
         assertEquals(
             CalibreConnectionCheckResult.Failure(
                 message = "Calibre 服务器暂时不可用（HTTP 502）",
-                nextStep = "确认电脑端 Calibre Content Server 正在运行后再重试",
+                nextStep = "已到达服务器地址；请检查 Calibre Content Server 或前置反向代理后重试",
+                kind = CalibreConnectionCheckResult.Failure.Kind.SERVER_RESPONSE,
             ),
             result,
         )
     }
 
     @Test
-    fun automaticallyUsesDirectTailscaleContentServerInsteadOfServeHttps() = runTest {
+    fun usesConfiguredHttpsMagicDnsEndpointWithoutImplicitFallback() = runTest {
         var requestedUrl = ""
         val tester = testerWithEngine { request ->
             requestedUrl = request.url.toString()
@@ -165,7 +167,7 @@ class CalibreConnectionTesterTest {
 
         assertTrue(result is CalibreConnectionCheckResult.Success)
         assertEquals(
-            "http://reader.tailnet.ts.net:8080/ajax/search?query=&num=1&offset=0",
+            "https://reader.tailnet.ts.net/ajax/search?query=&num=1&offset=0",
             requestedUrl,
         )
     }
@@ -270,6 +272,90 @@ class CalibreConnectionTesterTest {
         assertEquals(1, requestCount)
     }
 
+    @Test
+    fun tailscaleIpv4CredentialsDoNotReachEngineWhenVpnStateIsUnknown() = runTest {
+        assertTailnetCredentialsDoNotReachEngine(
+            baseUrl = "http://100.101.102.103:8080",
+            network = CalibreNetworkSnapshot.Unknown,
+        )
+    }
+
+    @Test
+    fun magicDnsCredentialsDoNotReachEngineWhenVpnStateIsUnknown() = runTest {
+        assertTailnetCredentialsDoNotReachEngine(
+            baseUrl = "http://reader.tailnet.ts.net:8080",
+            network = CalibreNetworkSnapshot.Unknown,
+        )
+    }
+
+    @Test
+    fun tailscaleIpv4CredentialsDoNotReachEngineWithoutAppScopedVpn() = runTest {
+        assertTailnetCredentialsDoNotReachEngine(
+            baseUrl = "http://100.101.102.103:8080",
+            network = inactiveVpnNetwork,
+        )
+    }
+
+    @Test
+    fun magicDnsCredentialsDoNotReachEngineWithoutAppScopedVpn() = runTest {
+        assertTailnetCredentialsDoNotReachEngine(
+            baseUrl = "http://reader.tailnet.ts.net:8080",
+            network = inactiveVpnNetwork,
+        )
+    }
+
+    @Test
+    fun credentialsStillReachLanHttpAndHttpsWhenVpnStateIsUnknown() = runTest {
+        listOf(
+            "http://192.168.1.5:8080",
+            "https://books.example",
+        ).forEach { baseUrl ->
+            var requestCount = 0
+            val tester = testerWithEngine(
+                networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                    CalibreNetworkSnapshot.Unknown
+                },
+            ) {
+                requestCount += 1
+                respond("""{"total_num":0,"book_ids":[]}""", headers = jsonHeaders)
+            }
+
+            val result = tester.check(baseUrl, storedCredentials)
+
+            assertEquals("$baseUrl must still reach the engine", 1, requestCount)
+            assertTrue(
+                "$baseUrl should remain usable: $result",
+                result is CalibreConnectionCheckResult.Success,
+            )
+        }
+    }
+
+    @Test
+    fun authenticationRetryDoesNotReachEngineAfterVpnDisconnects() = runTest {
+        var snapshotCount = 0
+        val network = CalibreNetworkSnapshotProvider {
+            if (snapshotCount++ == 0) activeVpnNetwork else inactiveVpnNetwork
+        }
+        val authorizations = mutableListOf<String?>()
+        val tester = testerWithEngine(networkSnapshotProvider = network) { request ->
+            authorizations += request.headers[HttpHeaders.Authorization]
+            respond(
+                content = "",
+                status = HttpStatusCode.Unauthorized,
+                headers = headersOf(HttpHeaders.WWWAuthenticate, "Basic realm=\"calibre\""),
+            )
+        }
+
+        tester.check("http://100.101.102.103:8080", storedCredentials)
+
+        assertEquals(
+            "only the unauthenticated challenge request may reach the engine",
+            listOf<String?>(null),
+            authorizations,
+        )
+        assertTrue("VPN state must be sampled again before authentication", snapshotCount >= 2)
+    }
+
     // ---------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------
@@ -291,13 +377,50 @@ class CalibreConnectionTesterTest {
     }
 
     private fun testerWithEngine(
+        networkSnapshotProvider: CalibreNetworkSnapshotProvider =
+            UnknownCalibreNetworkSnapshotProvider,
         handler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
     ): CalibreConnectionTester =
-        KtorCalibreConnectionTester { baseUrl ->
-            defaultCalibreHttpClient(MockEngine(handler), allowedBaseUrl = baseUrl)
+        KtorCalibreConnectionTester(
+            httpClientFactory = { baseUrl, username, password ->
+                defaultCalibreHttpClient(
+                    engine = MockEngine(handler),
+                    allowedBaseUrl = baseUrl,
+                    username = username,
+                    password = password,
+                    networkSnapshotProvider = networkSnapshotProvider,
+                )
+            },
+            networkSnapshotProvider = networkSnapshotProvider,
+        )
+
+    private suspend fun assertTailnetCredentialsDoNotReachEngine(
+        baseUrl: String,
+        network: CalibreNetworkSnapshot,
+    ) {
+        var requestCount = 0
+        val tester = testerWithEngine(
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider { network },
+        ) {
+            requestCount += 1
+            respond("""{"total_num":0,"book_ids":[]}""", headers = jsonHeaders)
         }
 
+        tester.check(baseUrl, storedCredentials)
+
+        assertEquals("$baseUrl must not reach the engine with $network", 0, requestCount)
+    }
+
     private companion object {
+        val storedCredentials = SourceCredentials(username = "reader", password = "secret")
+        val activeVpnNetwork = CalibreNetworkSnapshot.Active(
+            vpnAppliesToApp = true,
+            internetValidated = true,
+        )
+        val inactiveVpnNetwork = CalibreNetworkSnapshot.Active(
+            vpnAppliesToApp = false,
+            internetValidated = true,
+        )
         val jsonHeaders = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
     }
 }

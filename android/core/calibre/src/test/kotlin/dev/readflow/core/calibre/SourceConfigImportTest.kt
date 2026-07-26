@@ -229,14 +229,15 @@ class SourceConfigImportTest {
     }
 
     @Test
-    fun calibreTailscaleServeAddressCanonicalizesToItsDirectContentServer() {
+    fun calibreBareHttpsMagicDnsConfigKeepsItsOriginalEndpoint() {
+        val configuredUrl = "https://reader.tailnet.ts.net/opds"
         val canonical = canonicalizeImportedConfigJson(
             SourceAdapterIds.CALIBRE,
-            calibreSourceConfigJson("https://reader.tailnet.ts.net/opds"),
+            calibreSourceConfigJson(configuredUrl),
         )
 
         assertEquals(
-            calibreSourceConfigJson("http://reader.tailnet.ts.net:8080/opds"),
+            calibreSourceConfigJson(configuredUrl),
             canonical,
         )
     }

@@ -8,8 +8,12 @@ import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import dev.readflow.core.calibre.requireAllowedCalibreRequestUrl
 import dev.readflow.core.calibre.CALIBRE_COVER_SOURCE_QUERY_PARAMETER
+import dev.readflow.core.calibre.CalibreNetworkSnapshotProvider
 import dev.readflow.core.calibre.SourceCredentialStore
+import dev.readflow.core.calibre.UnknownCalibreNetworkSnapshotProvider
+import dev.readflow.core.calibre.canUseStoredCalibreCredentials
 import dev.readflow.core.calibre.calibreCredentialScopeForRequestUrl
+import dev.readflow.core.calibre.requiresActiveVpnForCalibreHttp
 import dev.readflow.core.database.BookDeletionRecoveryFailure
 import dev.readflow.core.database.CompleteBookDeletionStore
 import dev.readflow.core.model.FontChoice
@@ -77,6 +81,7 @@ class ReadflowApplication : Application(), SingletonImageLoader.Factory {
 
     override fun newImageLoader(context: Context): ImageLoader {
         val credentialStore: SourceCredentialStore by inject()
+        val networkSnapshotProvider: CalibreNetworkSnapshotProvider by inject()
         return ImageLoader.Builder(context)
             .components {
                 add(
@@ -88,7 +93,11 @@ class ReadflowApplication : Application(), SingletonImageLoader.Factory {
                                 .authenticator { _, response -> authenticateCalibreCover(response) }
                                 .addNetworkInterceptor { chain ->
                                     chain.proceed(
-                                        authenticatedCalibreCoverRequest(chain.request(), credentialStore),
+                                        authenticatedCalibreCoverRequest(
+                                            request = chain.request(),
+                                            credentialStore = credentialStore,
+                                            networkSnapshotProvider = networkSnapshotProvider,
+                                        ),
                                     )
                                 }
                                 .build()
@@ -103,19 +112,44 @@ class ReadflowApplication : Application(), SingletonImageLoader.Factory {
 internal fun authenticatedCalibreCoverRequest(
     request: Request,
     credentialStore: SourceCredentialStore,
+    networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
 ): Request {
-    val sourceId = request.url.queryParameter(CALIBRE_COVER_SOURCE_QUERY_PARAMETER)
-        ?.takeIf(String::isNotBlank)
-        ?: return request.also { requireAllowedCalibreRequestUrl(it.url.toString()) }
-    val sanitizedUrl = request.url.newBuilder()
-        .removeAllQueryParameters(CALIBRE_COVER_SOURCE_QUERY_PARAMETER)
-        .build()
+    val markedSourceId = request.url.queryParameter(CALIBRE_COVER_SOURCE_QUERY_PARAMETER)
+    val sanitizedUrl = if (markedSourceId != null) {
+        request.url.newBuilder()
+            .removeAllQueryParameters(CALIBRE_COVER_SOURCE_QUERY_PARAMETER)
+            .build()
+    } else {
+        request.url
+    }
     requireAllowedCalibreRequestUrl(sanitizedUrl.toString())
+
+    if (
+        requiresActiveVpnForCalibreHttp(sanitizedUrl.toString()) &&
+        !canUseStoredCalibreCredentials(
+            requestUrl = sanitizedUrl.toString(),
+            network = networkSnapshotProvider.snapshot(),
+        )
+    ) {
+        return request.newBuilder()
+            .url(sanitizedUrl)
+            .removeHeader("Authorization")
+            .tag(SourceCredentials::class.java, null)
+            .build()
+    }
+
+    if (markedSourceId == null) return request
+    val sourceId = markedSourceId.takeIf(String::isNotBlank) ?: return request.newBuilder()
+        .url(sanitizedUrl)
+        .removeHeader("Authorization")
+        .tag(SourceCredentials::class.java, null)
+        .build()
     val scope = calibreCredentialScopeForRequestUrl(sanitizedUrl.toString())
     val credentials = credentialStore.get(sourceId, scope)
     return request.newBuilder()
         .url(sanitizedUrl)
         .removeHeader("Authorization")
+        .tag(SourceCredentials::class.java, null)
         .apply {
             if (credentials != null) tag(SourceCredentials::class.java, credentials)
         }
