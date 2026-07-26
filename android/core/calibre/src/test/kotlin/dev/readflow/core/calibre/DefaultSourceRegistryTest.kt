@@ -183,6 +183,90 @@ class DefaultSourceRegistryTest {
     }
 
     @Test
+    fun openingLegacyTailscaleServeSourceMigratesItAndItsCredentialsToDirectCalibre() = runTest {
+        val servedUrl = "https://reader.tailnet.ts.net/opds"
+        val directUrl = "http://reader.tailnet.ts.net:8080/opds"
+        val sourceId = "source-tailscale"
+        val expectedCredentials = SourceCredentials("reader", "secret")
+        val credentials = InMemorySourceCredentialStore().apply {
+            // Older releases persisted credentials under the original HTTPS origin before
+            // MagicDNS URLs were canonicalized to the direct HTTP :8080 endpoint.
+            put(sourceId, "https://reader.tailnet.ts.net", expectedCredentials)
+        }
+        val store = InMemorySourceConfigStore(listOf(calibreSource(sourceId, servedUrl)))
+        val opened = mutableListOf<SourceDescriptor>()
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            credentialStore = credentials,
+            calibreCatalogFactory = { descriptor ->
+                opened += descriptor
+                FakeCatalog(descriptor)
+            },
+        )
+
+        val result = registry.openCatalog(sourceId)
+
+        assertTrue(result is ReadflowResult.Success)
+        assertEquals(directUrl, opened.single().baseUrl)
+        assertEquals(directUrl, store.getUserSource(sourceId)?.baseUrl)
+        assertEquals(calibreSourceConfigJson(directUrl), store.getUserSource(sourceId)?.configJson)
+        assertEquals(expectedCredentials, registry.sourceCredentials(sourceId))
+    }
+
+    @Test
+    fun addingTailscaleServeSourceStoresTheDirectCalibreEndpointImmediately() = runTest {
+        val store = InMemorySourceConfigStore()
+        val registry = DefaultSourceRegistry(
+            settings = FakeSettingsRepository(calibreUrl = null),
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+        )
+
+        val added = registry.addUserSource(
+            adapterId = SourceAdapterIds.CALIBRE,
+            name = "Tailscale Calibre",
+            configVersion = 1,
+            configJson = calibreSourceConfigJson("https://reader.tailnet.ts.net/opds"),
+        ) as ReadflowResult.Success
+
+        assertEquals("http://reader.tailnet.ts.net:8080/opds", added.value.baseUrl)
+        assertEquals(
+            calibreSourceConfigJson("http://reader.tailnet.ts.net:8080/opds"),
+            store.getUserSource(added.value.id)?.configJson,
+        )
+    }
+
+    @Test
+    fun legacyBareHttpsMagicDnsSettingPersistsTheDirectEndpointAndMigratesCredentials() = runTest {
+        val servedUrl = "https://reader.tailnet.ts.net/opds"
+        val directUrl = "http://reader.tailnet.ts.net:8080/opds"
+        val expectedCredentials = SourceCredentials("reader", "secret")
+        val settings = FakeSettingsRepository(calibreUrl = servedUrl)
+        val credentials = InMemorySourceCredentialStore().apply {
+            put(
+                BUILTIN_CALIBRE_SOURCE_ID,
+                "https://reader.tailnet.ts.net",
+                expectedCredentials,
+            )
+        }
+        val store = InMemorySourceConfigStore()
+        val registry = DefaultSourceRegistry(
+            settings = settings,
+            sourceConfigStore = store,
+            booksDir = tempFolder.root,
+            credentialStore = credentials,
+        )
+
+        registry.observeSources().first()
+
+        assertEquals(directUrl, settings.calibreBaseUrl.value)
+        assertEquals(directUrl, store.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)?.baseUrl)
+        assertEquals(expectedCredentials, registry.sourceCredentials(BUILTIN_CALIBRE_SOURCE_ID))
+    }
+
+    @Test
     fun editingBuiltinCalibreAlsoUpdatesLegacyUrlSoItIsNotReverted() = runTest {
         val settings = FakeSettingsRepository(calibreUrl = "http://192.168.1.5:8080")
         val store = InMemorySourceConfigStore()

@@ -58,11 +58,12 @@ internal class KtorCalibreConnectionTester(
                 nextStep = "同一 Wi-Fi 可填电脑局域网地址；远程连接可填 Tailscale 100.x 地址",
             )
         }
+        val effectiveBaseUrl = canonicalizeTailscaleServeCalibreUrl(validation.normalizedUrl)
 
         return runCatching {
-            httpClientFactory(validation.normalizedUrl).use { http ->
+            httpClientFactory(effectiveBaseUrl).use { http ->
                 val client = CalibreClient(
-                    baseUrl = validation.normalizedUrl,
+                    baseUrl = effectiveBaseUrl,
                     username = "",
                     password = "",
                     libraryId = "calibre-library",
@@ -144,10 +145,12 @@ private fun Throwable.toConnectionFailure(): CalibreConnectionCheckResult.Failur
             nextStep = "检查 Calibre Content Server 是否允许当前设备访问",
         )
     }
-    is ServerResponseException -> CalibreConnectionCheckResult.Failure(
-        message = "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
-        nextStep = "确认电脑端 Calibre Content Server 正在运行后再重试",
-    )
+    is ServerResponseException -> {
+        CalibreConnectionCheckResult.Failure(
+            message = "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
+            nextStep = "确认电脑端 Calibre Content Server 正在运行后再重试",
+        )
+    }
     is ConnectTimeoutException, is HttpRequestTimeoutException -> CalibreConnectionCheckResult.Failure(
         message = "连接 Calibre 超时",
         nextStep = "确认本设备能通过同一 Wi-Fi 或 Tailscale 访问服务器，并检查地址与端口",
@@ -186,10 +189,12 @@ internal fun Throwable.toCalibreReadflowError(): ReadflowError = when (this) {
             "Calibre 服务器拒绝了请求（HTTP ${response.status.value}）",
         )
     }
-    is ServerResponseException -> ReadflowError.network(
-        response.status.value,
-        "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
-    )
+    is ServerResponseException -> {
+        ReadflowError.network(
+            response.status.value,
+            "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
+        )
+    }
     is ConnectTimeoutException, is HttpRequestTimeoutException ->
         ReadflowError.network(null, "连接 Calibre 超时，请确认服务器在线且可通过同一 Wi-Fi 或 Tailscale 访问")
     is ConnectException, is UnknownHostException ->

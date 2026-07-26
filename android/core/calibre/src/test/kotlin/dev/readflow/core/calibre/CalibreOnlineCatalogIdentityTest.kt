@@ -168,6 +168,46 @@ class CalibreOnlineCatalogIdentityTest {
     }
 
     @Test
+    fun moonReaderStyleOpdsUrlKeepsItsPrefixButNeverPrefixesCalibreEndpoints() = runTest {
+        val configuredUrl = "http://192.168.1.5:8080/calibre/opds"
+        val requestedPaths = mutableListOf<String>()
+        val client = CalibreClient(
+            baseUrl = configuredUrl,
+            username = "",
+            password = "",
+            libraryId = "books",
+            http = defaultCalibreHttpClient(
+                engine = MockEngine { request ->
+                    requestedPaths += request.url.encodedPath
+                    when (request.url.encodedPath) {
+                        "/calibre/ajax/search/books" -> respond(
+                            content = """{"total_num":1,"book_ids":[42]}""",
+                            headers = JSON_HEADERS,
+                        )
+                        "/calibre/ajax/books/books" -> respond(
+                            content = """{"42":{"title":"Shared","formats":["EPUB"]}}""",
+                            headers = JSON_HEADERS,
+                        )
+                        else -> error("unexpected request: ${request.url}")
+                    }
+                },
+                allowedBaseUrl = configuredUrl,
+            ),
+        )
+
+        val search = client.search("")
+        client.bookMetas(search.book_ids)
+
+        assertEquals(
+            listOf("/calibre/ajax/search/books", "/calibre/ajax/books/books"),
+            requestedPaths,
+        )
+        assertEquals("http://192.168.1.5:8080/calibre/get/EPUB/42/books", client.downloadUrl(42, "EPUB"))
+        assertEquals("http://192.168.1.5:8080/calibre/get/cover/42/books", client.coverUrl(42))
+        client.close()
+    }
+
+    @Test
     fun serverReportedLibraryIdRoutesMetadataCoverAndDownload() = runTest {
         val requestedPaths = mutableListOf<String>()
         val engine = MockEngine { request ->

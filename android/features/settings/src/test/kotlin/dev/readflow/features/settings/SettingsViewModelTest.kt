@@ -80,6 +80,19 @@ class SettingsViewModelTest {
     }
 
     @Test
+    fun savesDirectCalibreEndpointInsteadOfBareHttpsMagicDnsServeAddress() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val settings = FakeSettingsRepository()
+        val viewModel = createViewModel(settings)
+
+        viewModel.setCalibreUrl("https://reader.tailnet.ts.net/opds")
+        advanceUntilIdle()
+
+        assertNull(viewModel.calibreUrlError.value)
+        assertEquals("http://reader.tailnet.ts.net:8080/opds", settings.savedCalibreUrl)
+    }
+
+    @Test
     fun testConnectionSavesNormalizedUrlAndShowsSuccessGuidance() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val settings = FakeSettingsRepository()

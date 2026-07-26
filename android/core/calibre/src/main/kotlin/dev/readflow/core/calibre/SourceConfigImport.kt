@@ -106,7 +106,7 @@ fun canonicalizeImportedConfigJson(adapterId: String, configJson: String): Strin
             dev.readflow.extensions.api.SourceAdapterIds.CALIBRE -> {
                 val config = sourceConfigJson.decodeFromString(CalibreSourceConfig.serializer(), configJson)
                 calibreSourceConfigJson(
-                    baseUrl = canonicalizeImportedBaseUrl(config.baseUrl),
+                    baseUrl = canonicalizeImportedCalibreBaseUrl(config.baseUrl),
                     libraryId = config.libraryId.trim().ifBlank { "calibre-library" },
                 )
             }
@@ -146,6 +146,9 @@ private fun canonicalizeImportedBaseUrl(rawUrl: String): String {
     val authority = if (port >= 0) "$authorityHost:$port" else authorityHost
     return "$scheme://$authority${uri.rawPath.orEmpty()}".trimEnd('/')
 }
+
+private fun canonicalizeImportedCalibreBaseUrl(rawUrl: String): String =
+    canonicalizeImportedBaseUrl(canonicalizeTailscaleServeCalibreUrl(rawUrl))
 
 private fun stableJsonOrTrim(rawJson: String): String = runCatching {
     val element = importEnvelopeJson.parseToJsonElement(rawJson)

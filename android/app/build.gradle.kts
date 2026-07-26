@@ -13,16 +13,21 @@ android {
     compileSdk = 36
 
     val buildTag = System.getenv("BUILD_TAG") ?: "dev-local"
+    val buildVersionCode = System.getenv("BUILD_VERSION_CODE")?.let { rawValue ->
+        rawValue.toIntOrNull()?.takeIf { it > 0 }
+            ?: error("BUILD_VERSION_CODE must be a positive 32-bit integer")
+    } ?: 1
 
     defaultConfig {
         applicationId = "dev.readflow"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
+        versionCode = buildVersionCode
         versionName = "0.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "GITHUB_REPO", "\"kragcola/linreads\"")
         buildConfigField("String", "BUILD_TAG", "\"$buildTag\"")
+        buildConfigField("int", "OTA_VERSION_CODE", buildVersionCode.toString())
         buildConfigField("String", "GITHUB_OTA_TOKEN", "\"${System.getenv("GITHUB_OTA_TOKEN") ?: ""}\"" )
         manifestPlaceholders["updateReceiverEnabled"] = readflowPhase >= 2
     }

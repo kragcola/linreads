@@ -39,13 +39,61 @@ fun validateCalibreBaseUrl(rawUrl: String): CalibreUrlValidation {
         return invalid(CALIBRE_HTTP_HOST_ERROR)
     }
 
-    return CalibreUrlValidation(normalizeBaseUrl(trimmed), errorMessage = null)
+    val normalized = normalizeBaseUrl(trimmed)
+    return CalibreUrlValidation(
+        normalizedUrl = canonicalizeValidatedTailscaleServeCalibreUrl(normalized),
+        errorMessage = null,
+    )
 }
 
 fun requireValidCalibreBaseUrl(rawUrl: String): String {
     val validation = validateCalibreBaseUrl(rawUrl)
     require(validation.isValid) { validation.errorMessage.orEmpty() }
     return validation.normalizedUrl
+}
+
+/**
+ * A bare HTTPS MagicDNS address is a Tailscale Serve endpoint, not a direct connection to the
+ * Calibre Content Server. Calibre itself normally listens on port 8080 inside the tailnet.
+ *
+ * Keep explicit non-standard HTTPS ports and reverse-proxy prefixes untouched: those can be a
+ * real user-managed proxy rather than the default direct Content Server endpoint.
+ */
+internal fun canonicalizeTailscaleServeCalibreUrl(rawUrl: String): String {
+    return requireValidCalibreBaseUrl(rawUrl)
+}
+
+private fun canonicalizeValidatedTailscaleServeCalibreUrl(normalized: String): String {
+    val uri = URI(normalized)
+    val host = uri.host?.withoutIpv6Brackets() ?: return normalized
+    val isDefaultHttpsPort = uri.port == -1 || uri.port == 443
+    val isDirectCalibrePath = uri.rawPath.orEmpty().trimEnd('/').let {
+        it.isEmpty() || it.equals(CALIBRE_OPDS_TERMINAL_PATH, ignoreCase = true)
+    }
+    if (
+        uri.scheme.equals("https", ignoreCase = true) &&
+        isDefaultHttpsPort &&
+        isDirectCalibrePath &&
+        host.isTailscaleMagicDnsHostname()
+    ) {
+        val path = uri.rawPath.orEmpty()
+        return "http://${host.lowercase()}:8080$path".trimEnd('/')
+    }
+    return normalized
+}
+
+/**
+ * Calibre exposes its OPDS catalog at a terminal `/opds` path while its AJAX and content
+ * endpoints are siblings of that path. Moon+ Reader's Calibre setup therefore commonly stores
+ * a URL ending in `/opds`; retain any reverse-proxy prefix but use its parent for this adapter.
+ */
+internal fun requireCalibreAjaxBaseUrl(rawUrl: String): String {
+    val normalized = canonicalizeTailscaleServeCalibreUrl(rawUrl)
+    return if (normalized.endsWith(CALIBRE_OPDS_TERMINAL_PATH, ignoreCase = true)) {
+        normalized.dropLast(CALIBRE_OPDS_TERMINAL_PATH.length)
+    } else {
+        normalized
+    }
 }
 
 fun requireAllowedCalibreRequestUrl(url: String) {
@@ -84,7 +132,35 @@ fun authenticatedCalibreCoverUrl(coverUrl: String, sourceId: String): String {
 }
 
 fun calibreCredentialScopeForRequestUrl(requestUrl: String): String {
-    val uri = URI(requestUrl)
+    val canonicalUrl = requireValidCalibreBaseUrl(requestUrl)
+    return credentialScopeForUri(URI(canonicalUrl))
+}
+
+/**
+ * Returns the origin key used by releases before bare HTTPS MagicDNS URLs were normalized.
+ *
+ * This exists only to recover a credential already stored under that legacy origin. Do not use
+ * it for new requests: new Calibre sources must use [calibreCredentialScopeForRequestUrl] so
+ * their credential follows the normalized direct endpoint.
+ */
+internal fun legacyCalibreCredentialScopeForStoredBaseUrl(storedBaseUrl: String): String {
+    val trimmed = storedBaseUrl.trim()
+    val uri = runCatching { URI(trimmed) }.getOrNull()
+        ?: error("Invalid legacy Calibre URL")
+    val scheme = uri.scheme?.lowercase().orEmpty()
+    val host = uri.host?.canonicalCalibreHost().orEmpty()
+    require(scheme == "http" || scheme == "https") { "Invalid legacy Calibre URL scheme" }
+    require(host.isNotBlank()) { "Invalid legacy Calibre URL host" }
+    require(uri.userInfo == null && uri.rawQuery == null && uri.rawFragment == null) {
+        "Invalid legacy Calibre URL"
+    }
+    require(scheme != "http" || host.isAllowedCalibreHttpHost()) {
+        CALIBRE_HTTP_HOST_ERROR
+    }
+    return credentialScopeForUri(uri)
+}
+
+private fun credentialScopeForUri(uri: URI): String {
     val scheme = uri.scheme?.lowercase().orEmpty()
     val host = uri.host?.canonicalCalibreHost().orEmpty()
     require(scheme.isNotBlank() && host.isNotBlank()) { "Invalid Calibre request URL" }
@@ -95,7 +171,7 @@ fun calibreCredentialScopeForRequestUrl(requestUrl: String): String {
         scheme == "https" && uri.port == 443 -> ""
         else -> ":${uri.port}"
     }
-    return requireValidCalibreBaseUrl("$scheme://$canonicalHost$port")
+    return "$scheme://$canonicalHost$port"
 }
 
 private fun URI.effectivePort(): Int = when {
@@ -111,11 +187,17 @@ private fun invalid(message: String): CalibreUrlValidation =
 private fun normalizeBaseUrl(url: String): String =
     url.trim().trimEnd('/')
 
+private const val CALIBRE_OPDS_TERMINAL_PATH = "/opds"
+
 private const val CALIBRE_HTTP_HOST_ERROR =
     "HTTP 仅允许本机、局域网或 Tailscale 地址；其他地址请使用 HTTPS"
 
 private fun String.isAllowedCalibreHttpHost(): Boolean =
-    isLocalhost() || isRfc1918Ipv4() || isTailscaleIpv4() || isTailscaleIpv6()
+    isLocalhost() ||
+        isRfc1918Ipv4() ||
+        isTailscaleIpv4() ||
+        isTailscaleIpv6() ||
+        isTailscaleMagicDnsHostname()
 
 private fun String.isLocalhost(): Boolean =
     equals("localhost", ignoreCase = true) ||
@@ -180,6 +262,14 @@ private fun String.isTailscaleIpv4(): Boolean {
     return values[0] == 100 && values[1] in 64..127
 }
 
+/** MagicDNS FQDNs use the tailnet-scoped `<machine>.<tailnet>.ts.net` form. */
+internal fun String.isTailscaleMagicDnsHostname(): Boolean {
+    val hostname = lowercase().removeSuffix(".")
+    if (!hostname.endsWith(TAILSCALE_MAGIC_DNS_SUFFIX)) return false
+    val labels = hostname.removeSuffix(TAILSCALE_MAGIC_DNS_SUFFIX).split('.')
+    return labels.size == 2 && labels.all(String::isNotBlank)
+}
+
 private fun String.ipv4Octets(): List<Int>? {
     val octets = split('.')
     if (octets.size != 4) return null
@@ -197,3 +287,5 @@ private fun String.isTailscaleIpv6(): Boolean {
     val prefix = intArrayOf(0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0)
     return prefix.indices.all { index -> bytes[index].toInt() and 0xff == prefix[index] }
 }
+
+private const val TAILSCALE_MAGIC_DNS_SUFFIX = ".ts.net"

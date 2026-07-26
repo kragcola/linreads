@@ -76,13 +76,13 @@ class CalibreClient internal constructor(
         password = password,
         libraryId = libraryId,
         http = defaultCalibreHttpClient(
-            allowedBaseUrl = baseUrl,
+            allowedBaseUrl = requireCalibreAjaxBaseUrl(baseUrl),
             username = username,
             password = password,
         ),
     )
 
-    private val baseUrl = requireValidCalibreBaseUrl(baseUrl)
+    private val baseUrl = requireCalibreAjaxBaseUrl(baseUrl)
     private val configuredLibraryId = libraryId.trim().ifBlank { DEFAULT_LIBRARY_ID }
     private val usesDefaultLibraryDiscovery = configuredLibraryId == DEFAULT_LIBRARY_ID
 

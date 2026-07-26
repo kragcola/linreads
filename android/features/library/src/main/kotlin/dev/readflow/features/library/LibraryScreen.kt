@@ -739,7 +739,7 @@ private fun SourceEditorWindow(
                                 Text(
                                     state.sourceUrlError ?: when (state.addSourceAdapterId) {
                                         dev.readflow.extensions.api.SourceAdapterIds.CALIBRE ->
-                                            "同一 Wi-Fi：http://192.168.x.x:8080；Tailscale：http://100.x.x.x:8080（无需 Serve）"
+                                            "同一 Wi-Fi：http://192.168.x.x:8080；Tailscale：http://100.x.x.x:8080 或 http://<主机>.<tailnet>.ts.net:8080（无需 Serve；末尾 /opds 也可）"
                                         dev.readflow.extensions.api.SourceAdapterIds.OPDS ->
                                             "填写服务提供的 OPDS / Atom 目录地址"
                                         else -> "填写兼容 LinReads 目录协议的 JSON 地址"

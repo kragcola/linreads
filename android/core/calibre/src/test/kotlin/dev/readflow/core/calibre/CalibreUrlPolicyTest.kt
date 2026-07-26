@@ -50,6 +50,24 @@ class CalibreUrlPolicyTest {
     }
 
     @Test
+    fun acceptsTailscaleMagicDnsOverItsDirectHttpPort() {
+        val baseUrl = "http://reader.tailnet.ts.net:8080"
+
+        assertValid(baseUrl)
+        requireAllowedCalibreRequestUrl("$baseUrl/ajax/search")
+        requireSameCalibreOrigin("$baseUrl/get/EPUB/1/books", baseUrl)
+        assertEquals(baseUrl, calibreCredentialScopeForRequestUrl(baseUrl))
+    }
+
+    @Test
+    fun bareHttpsMagicDnsIsNormalizedToTheDirectCalibreEndpointAtValidationBoundary() {
+        val validation = validateCalibreBaseUrl("https://reader.tailnet.ts.net/opds")
+
+        assertTrue(validation.isValid)
+        assertEquals("http://reader.tailnet.ts.net:8080/opds", validation.normalizedUrl)
+    }
+
+    @Test
     fun acceptsTailscaleIpv6HttpAcrossConfigurationRequestRedirectAndCoverPolicies() {
         val baseUrl = "http://[fd7a:115c:a1e0::1234]:8080"
         assertValid(baseUrl)
@@ -84,6 +102,9 @@ class CalibreUrlPolicyTest {
             "http://[fd7a:115c:a1df:ffff::1]:8080",
             "http://[fd7a:115c:a1e1::1]:8080",
             "http://example.com:8080",
+            "http://ts.net:8080",
+            "http://reader-tailnet.ts.net:8080",
+            "http://tailnet.ts.net.example.com:8080",
         ).forEach { url ->
             val validation = validateCalibreBaseUrl(url)
             assertEquals(false, validation.isValid)

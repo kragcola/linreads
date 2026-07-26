@@ -83,13 +83,14 @@ class DefaultSourceRegistry(
         ensureLegacyCalibreImported(settings.calibreBaseUrl.first())
         val stored = sourceConfigStore.getUserSource(sourceId)
             ?: return ReadflowResult.Failure(ReadflowError.notFound("source", sourceId))
-        if (!stored.enabled) {
+        val resolvedSource = migrateTailscaleServeCalibreSource(stored)
+        if (!resolvedSource.enabled) {
             return ReadflowResult.Failure(ReadflowError.unsupported("书源已禁用或适配器不可用"))
         }
-        return if (stored.adapterId == SourceAdapterIds.CALIBRE) {
-            withContext(Dispatchers.IO) { adapters.open(stored.toDescriptor()) }
+        return if (resolvedSource.adapterId == SourceAdapterIds.CALIBRE) {
+            withContext(Dispatchers.IO) { adapters.open(resolvedSource.toDescriptor()) }
         } else {
-            adapters.open(stored.toDescriptor())
+            adapters.open(resolvedSource.toDescriptor())
         }
     }
 
@@ -114,16 +115,17 @@ class DefaultSourceRegistry(
         if (trimmedName.isBlank()) {
             return ReadflowResult.Failure(ReadflowError.parse("请填写书源名称"))
         }
+        val canonicalConfig = canonicalizeImportedConfigJson(adapterId, configJson)
         val factory = adapters.factory(adapterId)
             ?: return ReadflowResult.Failure(ReadflowError.unsupported("未安装书源适配器：$adapterId"))
-        when (val validation = factory.validate(configVersion, configJson)) {
+        when (val validation = factory.validate(configVersion, canonicalConfig)) {
             is ReadflowResult.Failure -> return validation
             is ReadflowResult.Success -> Unit
         }
         val id = newUserSourceId()
         val sortOrder = sourceConfigStore.nextSortOrder()
         val now = System.currentTimeMillis()
-        val baseUrl = displayBaseUrl(adapterId, configJson)
+        val baseUrl = displayBaseUrl(adapterId, canonicalConfig)
         val persisted = PersistedBookSource(
             id = id,
             kind = legacyKind(adapterId),
@@ -134,7 +136,7 @@ class DefaultSourceRegistry(
             createdAt = now,
             adapterId = adapterId,
             configVersion = configVersion,
-            configJson = configJson,
+            configJson = canonicalConfig,
             updatedAt = now,
         )
         try {
@@ -167,19 +169,20 @@ class DefaultSourceRegistry(
         if (trimmedName.isBlank()) {
             return@withLock ReadflowResult.Failure(ReadflowError.parse("请填写书源名称"))
         }
+        val canonicalConfig = canonicalizeImportedConfigJson(existing.adapterId, configJson)
         val factory = adapters.factory(existing.adapterId)
             ?: return@withLock ReadflowResult.Failure(
                 ReadflowError.unsupported("未安装书源适配器：${existing.adapterId}"),
             )
-        when (val validation = factory.validate(configVersion, configJson)) {
+        when (val validation = factory.validate(configVersion, canonicalConfig)) {
             is ReadflowResult.Failure -> return@withLock validation
             is ReadflowResult.Success -> Unit
         }
         val updated = existing.copy(
             name = trimmedName,
-            baseUrl = displayBaseUrl(existing.adapterId, configJson),
+            baseUrl = displayBaseUrl(existing.adapterId, canonicalConfig),
             configVersion = configVersion,
-            configJson = configJson,
+            configJson = canonicalConfig,
             updatedAt = System.currentTimeMillis(),
         )
         try {
@@ -336,10 +339,15 @@ class DefaultSourceRegistry(
             return
         }
         importMutex.withLock {
-            val normalized = runCatching { requireValidCalibreBaseUrl(rawUrl) }.getOrNull() ?: return
+            val normalized = runCatching { canonicalizeTailscaleServeCalibreUrl(rawUrl) }.getOrNull() ?: return
             val existing = sourceConfigStore.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)
             if (existing != null) {
                 if (existing.adapterId == SourceAdapterIds.CALIBRE && existing.baseUrl != normalized) {
+                    migrateCalibreCredentials(
+                        sourceId = existing.id,
+                        oldBaseUrl = existing.baseUrl,
+                        newBaseUrl = normalized,
+                    )
                     sourceConfigStore.upsertUserSource(
                         existing.copy(
                             baseUrl = normalized,
@@ -349,6 +357,7 @@ class DefaultSourceRegistry(
                         ),
                     )
                 }
+                persistCanonicalLegacyCalibreSetting(rawUrl, normalized)
                 return
             }
             val now = System.currentTimeMillis()
@@ -368,6 +377,66 @@ class DefaultSourceRegistry(
                     updatedAt = now,
                 ),
             )
+            persistCanonicalLegacyCalibreSetting(rawUrl, normalized)
+        }
+    }
+
+    private suspend fun persistCanonicalLegacyCalibreSetting(
+        rawUrl: String,
+        normalizedUrl: String,
+    ) {
+        if (rawUrl == normalizedUrl) return
+        migrateCalibreCredentials(
+            sourceId = BUILTIN_CALIBRE_SOURCE_ID,
+            oldBaseUrl = rawUrl,
+            newBaseUrl = normalizedUrl,
+        )
+        settings.setCalibreBaseUrl(normalizedUrl)
+    }
+
+    /**
+     * Old releases accepted a bare HTTPS MagicDNS address and then tried Tailscale Serve.
+     * A direct Calibre server is normally reachable as HTTP on port 8080 inside the tailnet.
+     * Persist the corrected endpoint so the user never has to repair the source manually.
+     */
+    private suspend fun migrateTailscaleServeCalibreSource(
+        source: PersistedBookSource,
+    ): PersistedBookSource {
+        if (source.adapterId != SourceAdapterIds.CALIBRE) return source
+        val migrated = canonicalizedCalibreSource(source) ?: return source
+        return runCatching {
+            importMutex.withLock {
+                val current = sourceConfigStore.getUserSource(source.id) ?: return@withLock source
+                val currentMigrated = canonicalizedCalibreSource(current) ?: return@withLock current
+                migrateCalibreCredentials(
+                    sourceId = current.id,
+                    oldBaseUrl = current.baseUrl,
+                    newBaseUrl = currentMigrated.baseUrl,
+                )
+                sourceConfigStore.upsertUserSource(currentMigrated)
+                if (currentMigrated.id == BUILTIN_CALIBRE_SOURCE_ID) {
+                    settings.setCalibreBaseUrl(currentMigrated.baseUrl)
+                }
+                currentMigrated
+            }
+        }.getOrDefault(migrated)
+    }
+
+    private suspend fun migrateCalibreCredentials(
+        sourceId: String,
+        oldBaseUrl: String,
+        newBaseUrl: String,
+    ) {
+        // Existing releases stored exactly one credential per source. Before MagicDNS URLs were
+        // normalized, that value was keyed by the raw HTTPS origin, so it must be recovered
+        // without passing through the new direct-endpoint canonicalizer.
+        val oldScope = legacyCalibreCredentialScopeForStoredBaseUrl(oldBaseUrl)
+        val newScope = calibreCredentialScopeForRequestUrl(newBaseUrl)
+        if (oldScope == newScope) return
+        withContext(Dispatchers.IO) {
+            credentialStore.get(sourceId, oldScope)?.let { credentials ->
+                credentialStore.put(sourceId, newScope, credentials)
+            }
         }
     }
 
@@ -431,6 +500,18 @@ class DefaultSourceRegistry(
             ) { descriptor -> ReadflowResult.Success(genericCatalogFactory(descriptor)) },
             HtmlRulesV1SourceAdapterFactory(booksDir),
         ),
+    )
+}
+
+private fun canonicalizedCalibreSource(source: PersistedBookSource): PersistedBookSource? {
+    if (source.adapterId != SourceAdapterIds.CALIBRE) return null
+    val canonicalConfig = canonicalizeImportedConfigJson(source.adapterId, source.configJson)
+    val canonicalBaseUrl = displayBaseUrl(source.adapterId, canonicalConfig)
+    if (source.configJson == canonicalConfig && source.baseUrl == canonicalBaseUrl) return null
+    return source.copy(
+        baseUrl = canonicalBaseUrl,
+        configJson = canonicalConfig,
+        updatedAt = System.currentTimeMillis(),
     )
 }
 

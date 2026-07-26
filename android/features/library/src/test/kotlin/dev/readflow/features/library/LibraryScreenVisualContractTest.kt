@@ -261,7 +261,11 @@ class LibraryScreenVisualContractTest {
         )
         assertTrue(
             "Calibre setup must cover same-Wi-Fi and Tailscale without requiring Serve",
-            editor.contains("同一 Wi-Fi") && editor.contains("Tailscale") && editor.contains("无需 Serve"),
+                editor.contains("同一 Wi-Fi") &&
+                editor.contains("Tailscale") &&
+                editor.contains("<主机>.<tailnet>.ts.net:8080") &&
+                editor.contains("/opds") &&
+                editor.contains("无需 Serve"),
         )
         assertTrue(
             "credential read failure must offer retry separately from destructive reset",

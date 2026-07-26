@@ -21,25 +21,29 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlin.coroutines.coroutineContext
 
+internal const val UPDATE_DETECTION_NOTIFICATION_ID = 9001
+
 /**
  * Checks for a newer GitHub release on every app foreground.
- * If found, posts a system notification; tapping it downloads and launches the installer.
+ * If found, starts the updater immediately; the system notification is informational only.
  * Does not touch any feature module — lives entirely in :app.
  */
 object AppUpdateManager {
 
     private const val CHANNEL_ID = "linreads_update"
-    private const val NOTIF_ID = 9001
     private const val PREFS_NAME = "update"
     private const val KEY_CACHED_NOTES = "cached_notes"
 
     private val checker = GitHubUpdateChecker(
         repoSlug = BuildConfig.GITHUB_REPO,
         currentTag = BuildConfig.BUILD_TAG,
+        currentVersionCode = BuildConfig.OTA_VERSION_CODE.toLong(),
     )
     private val foregroundCheckGuard = LatestUpdateCheckGuard()
 
     fun checkOnForeground(context: Context, scope: CoroutineScope): Job {
+        val appContext = context.applicationContext
+        resumePendingUpdateOnForeground(appContext)
         val request = foregroundCheckGuard.newRequest()
         return scope.launch(Dispatchers.IO) {
             val info = try {
@@ -50,24 +54,28 @@ object AppUpdateManager {
                 null
             } ?: return@launch
             coroutineContext.ensureActive()
-            val appContext = context.applicationContext
             try {
-                val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-                    ContextCompat.checkSelfPermission(
-                        appContext,
-                        Manifest.permission.POST_NOTIFICATIONS,
-                    ) == PackageManager.PERMISSION_GRANTED
-                if (
+                val notificationsAllowed = runCatching {
+                    val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                        ContextCompat.checkSelfPermission(
+                            appContext,
+                            Manifest.permission.POST_NOTIFICATIONS,
+                        ) == PackageManager.PERMISSION_GRANTED
                     shouldPostUpdateNotification(
                         sdkInt = Build.VERSION.SDK_INT,
                         permissionGranted = permissionGranted,
                         notificationsEnabled = NotificationManagerCompat.from(appContext).areNotificationsEnabled(),
                     )
-                ) {
-                    foregroundCheckGuard.runIfLatest(request) {
-                        coroutineContext.ensureActive()
-                        postNotification(appContext, info)
-                    }
+                }.getOrDefault(false)
+                foregroundCheckGuard.runIfLatest(request) {
+                    coroutineContext.ensureActive()
+                    publishDetectedUpdate(
+                        info = info,
+                        currentVersionCode = BuildConfig.OTA_VERSION_CODE.toLong(),
+                        notificationsAllowed = notificationsAllowed,
+                        startDownload = { startAutomaticDownload(appContext, it) },
+                        postNotification = { postNotification(appContext, it) },
+                    )
                 }
             } catch (error: CancellationException) {
                 throw error
@@ -88,6 +96,7 @@ object AppUpdateManager {
             apkUrl = info.apkUrl,
             notes = notes,
             buildTag = info.buildTag,
+            versionCode = info.versionCode,
         )
     }
 
@@ -112,28 +121,57 @@ object AppUpdateManager {
         return body
     }
 
+    private fun startAutomaticDownload(ctx: Context, info: UpdateInfo) {
+        val request = automaticUpdateDownloadRequest(info, BuildConfig.GITHUB_OTA_TOKEN)
+        ctx.sendBroadcast(
+            Intent(ctx, UpdateInstallReceiver::class.java).apply {
+                putExtra(UPDATE_EXTRA_APK_URL, request.apkUrl)
+                putExtra(UPDATE_EXTRA_BUILD_TAG, request.buildTag)
+                request.versionCode?.let { putExtra(UPDATE_EXTRA_VERSION_CODE, it) }
+                putExtra(UPDATE_EXTRA_AUTH_TOKEN, request.authToken)
+                putExtra(UPDATE_EXTRA_AUTOMATIC, request.automatic)
+            },
+        )
+    }
+
     private fun postNotification(ctx: Context, info: UpdateInfo) {
         val nm = ctx.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "应用更新", NotificationManager.IMPORTANCE_HIGH),
         )
 
-        // Tapping the notification triggers download + install via a BroadcastReceiver
+        val automaticDownloadStarted = isAutomaticUpdateEligible(
+            buildTag = info.buildTag,
+            versionCode = info.versionCode,
+            currentVersionCode = BuildConfig.OTA_VERSION_CODE.toLong(),
+        )
+        // A verified newer build is already downloading. A tap only retries/resumes it.
         val installIntent = PendingIntent.getBroadcast(
             ctx, 0,
             Intent(ctx, UpdateInstallReceiver::class.java).apply {
-                putExtra("apk_url", info.apkUrl)
-                putExtra("build_tag", info.buildTag)
+                putExtra(UPDATE_EXTRA_APK_URL, info.apkUrl)
+                putExtra(UPDATE_EXTRA_BUILD_TAG, info.buildTag)
+                info.versionCode?.let { putExtra(UPDATE_EXTRA_VERSION_CODE, it) }
+                putExtra(UPDATE_EXTRA_AUTH_TOKEN, BuildConfig.GITHUB_OTA_TOKEN)
+                putExtra(UPDATE_EXTRA_AUTOMATIC, automaticDownloadStarted)
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
         nm.notify(
-            NOTIF_ID,
+            UPDATE_DETECTION_NOTIFICATION_ID,
             NotificationCompat.Builder(ctx, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
-                .setContentTitle("LinReads 新版本可用")
-                .setContentText("${info.tagName}  —  点击下载安装")
+                .setContentTitle(
+                    if (automaticDownloadStarted) "LinReads 新版本下载中" else "LinReads 新版本可用",
+                )
+                .setContentText(
+                    if (automaticDownloadStarted) {
+                        "${info.tagName}  —  下载完成后将自动安装；系统要求确认时会提示"
+                    } else {
+                        "${info.tagName}  —  点击下载安装"
+                    },
+                )
                 .setAutoCancel(true)
                 .setContentIntent(installIntent)
                 .build(),
@@ -165,3 +203,43 @@ internal fun shouldPostUpdateNotification(
     permissionGranted: Boolean,
     notificationsEnabled: Boolean,
 ): Boolean = notificationsEnabled && (sdkInt < 33 || permissionGranted)
+
+internal fun publishDetectedUpdate(
+    info: UpdateInfo,
+    currentVersionCode: Long,
+    notificationsAllowed: Boolean,
+    startDownload: (UpdateInfo) -> Unit,
+    postNotification: (UpdateInfo) -> Unit,
+) {
+    if (isAutomaticUpdateEligible(info.buildTag, info.versionCode, currentVersionCode)) {
+        startDownload(info)
+    }
+    if (notificationsAllowed) postNotification(info)
+}
+
+internal data class UpdateDownloadRequest(
+    val apkUrl: String,
+    val buildTag: String?,
+    val authToken: String,
+    val automatic: Boolean,
+    val versionCode: Long? = null,
+)
+
+internal fun automaticUpdateDownloadRequest(
+    info: UpdateInfo,
+    authToken: String,
+): UpdateDownloadRequest = UpdateDownloadRequest(
+    apkUrl = info.apkUrl,
+    buildTag = info.buildTag,
+    authToken = authToken,
+    automatic = true,
+    versionCode = info.versionCode,
+)
+
+internal fun isAutomaticUpdateEligible(
+    buildTag: String?,
+    versionCode: Long?,
+    currentVersionCode: Long,
+): Boolean =
+    isVerifiedCiBuildIdentity(buildTag, versionCode) &&
+        requireNotNull(versionCode) > currentVersionCode

@@ -13,11 +13,13 @@ class UpdateInstallPolicyTest {
                 apkUrl = "https://example.test/linreads.apk",
                 notes = "Release notes",
                 buildTag = "dev-210-release",
+                versionCode = 210L,
             ),
         )
 
         assertEquals("https://example.test/linreads.apk", metadata.apkUrl)
         assertEquals("dev-210-release", metadata.buildTag)
+        assertEquals(210L, metadata.versionCode)
     }
 
     @Test

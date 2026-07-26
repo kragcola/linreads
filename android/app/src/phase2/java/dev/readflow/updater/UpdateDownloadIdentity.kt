@@ -5,4 +5,11 @@ internal fun canReuseUpdateDownload(
     savedTag: String?,
     requestedUrl: String,
     requestedTag: String?,
-): Boolean = requestedTag != null && savedUrl == requestedUrl && savedTag == requestedTag
+    savedVersionCode: Long? = null,
+    requestedVersionCode: Long? = null,
+): Boolean =
+    !requestedTag.isNullOrBlank() &&
+        requestedVersionCode != null &&
+        savedUrl == requestedUrl &&
+        savedTag == requestedTag &&
+        savedVersionCode == requestedVersionCode

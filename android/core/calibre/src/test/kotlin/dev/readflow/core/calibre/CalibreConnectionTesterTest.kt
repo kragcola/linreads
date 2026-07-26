@@ -151,6 +151,26 @@ class CalibreConnectionTesterTest {
     }
 
     @Test
+    fun automaticallyUsesDirectTailscaleContentServerInsteadOfServeHttps() = runTest {
+        var requestedUrl = ""
+        val tester = testerWithEngine { request ->
+            requestedUrl = request.url.toString()
+            respond(
+                content = """{"total_num": 0, "book_ids": []}""",
+                headers = jsonHeaders,
+            )
+        }
+
+        val result = tester.check("https://reader.tailnet.ts.net")
+
+        assertTrue(result is CalibreConnectionCheckResult.Success)
+        assertEquals(
+            "http://reader.tailnet.ts.net:8080/ajax/search?query=&num=1&offset=0",
+            requestedUrl,
+        )
+    }
+
+    @Test
     fun reportsAuthenticationFailureWithNextStep() = runTest {
         val tester = testerWithEngine {
             respondError(HttpStatusCode.Unauthorized)
@@ -198,6 +218,34 @@ class CalibreConnectionTesterTest {
 
         assertTrue(result is CalibreConnectionCheckResult.Success)
         assertEquals("http://192.168.1.5:8080/ajax/search?query=&num=1&offset=0", requestedUrl)
+    }
+
+    @Test
+    fun moonReaderStyleOpdsUrlsUseTheirSiblingAjaxEndpoint() = runTest {
+        val cases = listOf(
+            "http://192.168.1.5:8080/opds/" to
+                "http://192.168.1.5:8080/ajax/search?query=&num=1&offset=0",
+            "http://192.168.1.5:8080/calibre/opds" to
+                "http://192.168.1.5:8080/calibre/ajax/search?query=&num=1&offset=0",
+            "http://192.168.1.5:8080/calibre" to
+                "http://192.168.1.5:8080/calibre/ajax/search?query=&num=1&offset=0",
+        )
+
+        cases.forEach { (configuredUrl, expectedRequestUrl) ->
+            var requestedUrl = ""
+            val tester = testerWithEngine {
+                requestedUrl = it.url.toString()
+                respond(
+                    content = """{"total_num": 0, "book_ids": []}""",
+                    headers = jsonHeaders,
+                )
+            }
+
+            val result = tester.check(configuredUrl)
+
+            assertTrue("Expected Calibre connection to succeed for $configuredUrl", result is CalibreConnectionCheckResult.Success)
+            assertEquals(expectedRequestUrl, requestedUrl)
+        }
     }
 
     @Test

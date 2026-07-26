@@ -52,4 +52,41 @@ class CalibreOnlineCatalogErrorTest {
         assertFalse(error.message.contains("Client request"))
         catalog.close()
     }
+
+    @Test
+    fun reverseProxyGatewaySearchKeepsItsActualGatewayFailure() = runTest {
+        val baseUrl = "https://reader.tailnet.ts.net/calibre/opds"
+        val client = CalibreClient(
+            baseUrl = baseUrl,
+            username = "",
+            password = "",
+            libraryId = "calibre-library",
+            http = defaultCalibreHttpClient(
+                engine = MockEngine { respondError(HttpStatusCode.BadGateway) },
+                allowedBaseUrl = baseUrl,
+            ),
+        )
+        val catalog = CalibreOnlineCatalog(
+            client = client,
+            booksDir = null,
+            descriptor = SourceDescriptor(
+                id = "source-calibre",
+                adapterId = SourceAdapterIds.CALIBRE,
+                name = "Calibre",
+                configVersion = 1,
+                configJson = calibreSourceConfigJson(baseUrl),
+                baseUrl = baseUrl,
+            ),
+        )
+
+        val result = catalog.search("")
+
+        assertTrue(result is ReadflowResult.Failure)
+        val error = (result as ReadflowResult.Failure).error
+        assertEquals(ReadflowError.Kind.NETWORK, error.kind)
+        assertEquals(502, error.code)
+        assertTrue(error.message.contains("Calibre 服务器暂时不可用"))
+        assertFalse(error.message.contains("Tailscale Serve"))
+        catalog.close()
+    }
 }

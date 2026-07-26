@@ -1270,11 +1270,16 @@ private fun Context.startFreshDownload(update: UpdatePackageInfo, authToken: Str
             )
         }
     )
-    prefs.edit()
+    val editor = prefs.edit()
         .putLong("dl_id", dlId)
         .putString("dl_url", metadata.apkUrl)
         .putString("dl_tag", metadata.buildTag)
-        .apply()
+    if (metadata.versionCode == null) {
+        editor.remove("dl_version_code")
+    } else {
+        editor.putLong("dl_version_code", metadata.versionCode)
+    }
+    editor.apply()
     return dlId
 }
 
@@ -1291,6 +1296,7 @@ private fun Context.applyUpdateArtifactEvent(event: UpdateArtifactEvent) {
             .remove("dl_id")
             .remove("dl_url")
             .remove("dl_tag")
+            .remove("dl_version_code")
             .apply()
     }
 }

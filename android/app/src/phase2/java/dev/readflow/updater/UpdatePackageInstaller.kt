@@ -31,6 +31,31 @@ internal enum class InstallStage {
 
 internal enum class InstallEnqueueAction { START, KEEP_EXISTING }
 
+internal enum class PendingUserActionLaunch { DIRECT_APK_INSTALL, SYSTEM_CONFIRMATION, FAILURE }
+
+/** Requests the Android self-update path that can complete without a confirmation sheet. */
+internal fun selfUpdateUserActionRequirement(sdkInt: Int): Int? =
+    if (sdkInt >= Build.VERSION_CODES.S) {
+        PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED
+    } else {
+        null
+    }
+
+internal fun pendingUserActionLaunch(
+    isHuaweiOrHonor: Boolean = false,
+    hasDownloadedApk: Boolean,
+    hasSystemConfirmation: Boolean,
+): PendingUserActionLaunch = when {
+    isHuaweiOrHonor && hasDownloadedApk -> PendingUserActionLaunch.DIRECT_APK_INSTALL
+    hasSystemConfirmation -> PendingUserActionLaunch.SYSTEM_CONFIRMATION
+    else -> PendingUserActionLaunch.FAILURE
+}
+
+internal fun isHuaweiOrHonorDevice(manufacturer: String?, brand: String?): Boolean {
+    val names = listOfNotNull(manufacturer, brand).map { it.trim().lowercase() }
+    return names.any { it == "huawei" || it == "honor" }
+}
+
 internal fun installEnqueueAction(
     currentDownloadId: Long,
     currentStage: InstallStage?,
@@ -117,6 +142,17 @@ internal object UpdatePackageInstaller {
         updateStageForSession(context, sessionId, InstallStage.AWAITING_USER)
     }
 
+    fun isCurrentSession(context: Context, sessionId: Int): Boolean = synchronized(lock) {
+        context.installPreferences().getInt(KEY_INSTALL_SESSION_ID, NO_SESSION) == sessionId
+    }
+
+    fun downloadIdForSession(context: Context, sessionId: Int): Long? = synchronized(lock) {
+        val prefs = context.installPreferences()
+        prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD).takeIf {
+            it != NO_DOWNLOAD && prefs.getInt(KEY_INSTALL_SESSION_ID, NO_SESSION) == sessionId
+        }
+    }
+
     fun markFailed(context: Context, sessionId: Int, message: String) {
         val prefs = context.installPreferences()
         synchronized(lock) {
@@ -138,6 +174,27 @@ internal object UpdatePackageInstaller {
                 .remove(KEY_INSTALL_STAGE)
                 .remove(KEY_INSTALL_ERROR)
                 .apply()
+        }
+    }
+
+    fun clearRecordedInstall(context: Context) {
+        val appContext = context.applicationContext
+        val sessionId = synchronized(lock) {
+            val prefs = appContext.installPreferences()
+            val recorded = prefs.getInt(KEY_INSTALL_SESSION_ID, NO_SESSION)
+            prefs.edit()
+                .remove(KEY_INSTALL_DOWNLOAD_ID)
+                .remove(KEY_INSTALL_SESSION_ID)
+                .remove(KEY_INSTALL_STAGE)
+                .remove(KEY_INSTALL_ERROR)
+                .apply()
+            recorded
+        }
+        if (sessionId != NO_SESSION) {
+            runCatching { appContext.packageManager.packageInstaller.abandonSession(sessionId) }
+        }
+        runCatching {
+            appContext.getSystemService(NotificationManager::class.java).cancel(INSTALL_NOTIFICATION_ID)
         }
     }
 
@@ -187,6 +244,21 @@ internal object UpdatePackageInstaller {
             prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) == downloadId
         }
     }
+
+    fun resumeAwaitingInstallerOnForeground(
+        context: Context,
+        downloadId: Long,
+        apkUri: Uri,
+    ): Boolean {
+        if (stageForDownload(context, downloadId) != InstallStage.AWAITING_USER) return false
+        // Only EMUI/Honor uses the APK fallback. On standard Android the active
+        // PackageInstaller session owns the confirmation intent and must not be replaced.
+        if (isHuaweiOrHonorDevice(Build.MANUFACTURER, Build.BRAND)) {
+            val launched = launchApkInstaller(context, apkUri)
+            if (!launched) postApkInstallNotification(context, downloadId.hashCode(), apkUri)
+        }
+        return true
+    }
 }
 
 class UpdateInstallWorker(
@@ -217,9 +289,7 @@ class UpdateInstallWorker(
                 setAppPackageName(applicationContext.packageName)
                 setInstallReason(PackageManager.INSTALL_REASON_USER)
                 if (size > 0) setSize(size)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED)
-                }
+                selfUpdateUserActionRequirement(Build.VERSION.SDK_INT)?.let(::setRequireUserAction)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     setPackageSource(PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE)
                 }
@@ -274,6 +344,7 @@ class UpdateInstallStatusReceiver : android.content.BroadcastReceiver() {
             intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, NO_SESSION),
         )
         if (sessionId == NO_SESSION) return
+        if (!UpdatePackageInstaller.isCurrentSession(context, sessionId)) return
         when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
                 UpdatePackageInstaller.markAwaitingUser(context, sessionId)
@@ -282,56 +353,42 @@ class UpdateInstallStatusReceiver : android.content.BroadcastReceiver() {
                 // the system installer UI. Launching it — whether directly or via a notification
                 // PendingIntent — opens AppGallery search instead of the install dialog.
                 //
-                // Workaround: bypass the confirmation intent and use ACTION_INSTALL_PACKAGE with
-                // the original APK content URI from DownloadManager. AOSP and OEM installers
-                // (including Huawei's local one) resolve this correctly without AppGallery.
-                val dlId = context.getSharedPreferences("update", Context.MODE_PRIVATE)
-                    .getLong("dl_id", -1L)
-                val apkUri = if (dlId != -1L)
+                // Work around only the EMUI/Honor AppGallery confirmation misroute. Standard
+                // Android must retain the original session confirmation intent.
+                val dlId = UpdatePackageInstaller.downloadIdForSession(context, sessionId)
+                val apkUri = if (dlId != null)
                     context.getSystemService(DownloadManager::class.java)
                         .getUriForDownloadedFile(dlId)
                 else null
 
-                if (apkUri != null) {
-                    val installIntent = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
-                        data = apkUri
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
-                        putExtra(Intent.EXTRA_RETURN_RESULT, false)
+                val confirmation = intent.installConfirmationIntent()
+                when (
+                    pendingUserActionLaunch(
+                        isHuaweiOrHonor = isHuaweiOrHonorDevice(
+                            manufacturer = Build.MANUFACTURER,
+                            brand = Build.BRAND,
+                        ),
+                        hasDownloadedApk = apkUri != null,
+                        hasSystemConfirmation = confirmation != null,
+                    )
+                ) {
+                    PendingUserActionLaunch.DIRECT_APK_INSTALL -> {
+                        val uri = requireNotNull(apkUri)
+                        // Always leave an EMUI-safe, user-tapped fallback. Android can suppress a
+                        // receiver-initiated activity launch after background download completion.
+                        // Do not use the confirmation intent here: EMUI may resolve it to an
+                        // AppGallery search instead of the local package installer. If both the
+                        // launch and notification are unavailable, keep AWAITING_USER so the next
+                        // known foreground can retry this same direct APK intent.
+                        postApkInstallNotification(context, sessionId, uri)
+                        launchApkInstaller(context, uri)
                     }
-                    runCatching {
-                        context.startActivity(installIntent)
-                    }.onFailure {
-                        // Direct launch failed — fall back to the system confirmation intent.
-                        val confirmation = intent.installConfirmationIntent()
-                        if (confirmation != null) {
-                            runCatching {
-                                context.startActivity(
-                                    confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                                )
-                            }.onFailure { fallback ->
-                                UpdatePackageInstaller.markFailed(context, sessionId, "无法打开安装页面，请重试")
-                                postInstallFailureNotification(context, "无法打开安装页面，请重试")
-                            }
-                        } else {
-                            UpdatePackageInstaller.markFailed(context, sessionId, "无法打开安装页面，请重试")
-                            postInstallFailureNotification(context, "无法打开安装页面，请重试")
-                        }
+                    PendingUserActionLaunch.SYSTEM_CONFIRMATION -> {
+                        launchSystemConfirmation(context, sessionId, confirmation)
                     }
-                } else {
-                    // APK URI not found in DownloadManager — fall back to the confirmation intent.
-                    val confirmation = intent.installConfirmationIntent() ?: run {
+                    PendingUserActionLaunch.FAILURE -> {
                         UpdatePackageInstaller.markFailed(context, sessionId, "系统未返回安装确认页面")
                         postInstallFailureNotification(context, "系统未返回安装确认页面")
-                        return
-                    }
-                    runCatching {
-                        context.startActivity(confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    }.onFailure {
-                        UpdatePackageInstaller.markFailed(
-                            context, sessionId, "无法打开系统安装确认页面，请返回 LinReads 重试",
-                        )
                     }
                 }
             }
@@ -378,47 +435,81 @@ private fun canPostInstallNotification(context: Context): Boolean {
     )
 }
 
-private fun postInstallConfirmationNotification(context: Context, sessionId: Int, confirmation: Intent) {
-    createInstallNotificationChannel(context)
-    val pendingConfirmation = PendingIntent.getActivity(
-        context,
-        sessionId,
-        confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,
-    )
-    context.getSystemService(NotificationManager::class.java).notify(
-        INSTALL_NOTIFICATION_ID,
-        NotificationCompat.Builder(context, INSTALL_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_download_done)
-            .setContentTitle("LinReads 更新已准备好")
-            .setContentText("点击确认安装")
-            .setAutoCancel(true)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setContentIntent(pendingConfirmation)
-            .build(),
-    )
+private fun launchApkInstaller(context: Context, apkUri: Uri): Boolean = runCatching {
+    context.startActivity(apkInstallIntent(apkUri))
+}.isSuccess
+
+private fun apkInstallIntent(apkUri: Uri) = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+    data = apkUri
+    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
+    putExtra(Intent.EXTRA_RETURN_RESULT, false)
 }
 
+private fun launchSystemConfirmation(context: Context, sessionId: Int, confirmation: Intent?) {
+    if (confirmation == null) {
+        UpdatePackageInstaller.markFailed(context, sessionId, "无法打开安装页面，请重试")
+        postInstallFailureNotification(context, "无法打开安装页面，请重试")
+        return
+    }
+    runCatching {
+        context.startActivity(confirmation.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }.onFailure {
+        UpdatePackageInstaller.markFailed(context, sessionId, "无法打开系统安装确认页面，请返回 LinReads 重试")
+        postInstallFailureNotification(context, "无法打开系统安装确认页面，请返回 LinReads 重试")
+    }
+}
+
+private fun postApkInstallNotification(context: Context, sessionId: Int, apkUri: Uri): Boolean =
+    runCatching {
+        if (!canPostInstallNotification(context)) {
+            false
+        } else {
+            createInstallNotificationChannel(context)
+            val pendingInstaller = PendingIntent.getActivity(
+                context,
+                sessionId,
+                apkInstallIntent(apkUri),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            context.getSystemService(NotificationManager::class.java).notify(
+                INSTALL_NOTIFICATION_ID,
+                NotificationCompat.Builder(context, INSTALL_CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                    .setContentTitle("LinReads 更新已准备好")
+                    .setContentText("点击确认安装")
+                    .setAutoCancel(true)
+                    .setPriority(NotificationCompat.PRIORITY_HIGH)
+                    .setContentIntent(pendingInstaller)
+                    .build(),
+            )
+            true
+        }
+    }.getOrDefault(false)
+
 private fun postInstallFailureNotification(context: Context, message: String) {
-    if (!canPostInstallNotification(context)) return
-    createInstallNotificationChannel(context)
-    val openApp = PendingIntent.getActivity(
-        context,
-        INSTALL_NOTIFICATION_ID,
-        Intent(context, MainActivity::class.java),
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-    )
-    context.getSystemService(NotificationManager::class.java).notify(
-        INSTALL_NOTIFICATION_ID,
-        NotificationCompat.Builder(context, INSTALL_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_error)
-            .setContentTitle("LinReads 更新安装失败")
-            .setContentText(message.take(120))
-            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
-            .setAutoCancel(true)
-            .setContentIntent(openApp)
-            .build(),
-    )
+    runCatching {
+        if (!canPostInstallNotification(context)) return@runCatching
+        createInstallNotificationChannel(context)
+        val openApp = PendingIntent.getActivity(
+            context,
+            INSTALL_NOTIFICATION_ID,
+            Intent(context, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        context.getSystemService(NotificationManager::class.java).notify(
+            INSTALL_NOTIFICATION_ID,
+            NotificationCompat.Builder(context, INSTALL_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentTitle("LinReads 更新安装失败")
+                .setContentText(message.take(120))
+                .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+                .setAutoCancel(true)
+                .setContentIntent(openApp)
+                .build(),
+        )
+    }
 }
 
 private fun createInstallNotificationChannel(context: Context) {

@@ -6,17 +6,20 @@ data class UpdatePackageInfo(
     val apkUrl: String,
     val notes: String,
     val buildTag: String?,
+    val versionCode: Long? = null,
 )
 
 internal data class UpdateDownloadMetadata(
     val apkUrl: String,
     val buildTag: String?,
+    val versionCode: Long? = null,
 )
 
 internal fun updateDownloadMetadata(update: UpdatePackageInfo): UpdateDownloadMetadata =
     UpdateDownloadMetadata(
         apkUrl = update.apkUrl,
         buildTag = update.buildTag,
+        versionCode = update.versionCode,
     )
 
 internal enum class UpdateArtifactEvent {

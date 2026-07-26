@@ -229,6 +229,32 @@ class SourceConfigImportTest {
     }
 
     @Test
+    fun calibreTailscaleServeAddressCanonicalizesToItsDirectContentServer() {
+        val canonical = canonicalizeImportedConfigJson(
+            SourceAdapterIds.CALIBRE,
+            calibreSourceConfigJson("https://reader.tailnet.ts.net/opds"),
+        )
+
+        assertEquals(
+            calibreSourceConfigJson("http://reader.tailnet.ts.net:8080/opds"),
+            canonical,
+        )
+    }
+
+    @Test
+    fun calibreTailscaleProxyPrefixIsNotRewrittenToTheDefaultDirectPort() {
+        val proxied = "https://reader.tailnet.ts.net/calibre/opds"
+
+        assertEquals(
+            calibreSourceConfigJson(proxied),
+            canonicalizeImportedConfigJson(
+                SourceAdapterIds.CALIBRE,
+                calibreSourceConfigJson(proxied),
+            ),
+        )
+    }
+
+    @Test
     fun htmlCanonicalizationDedupsHostSetsAndCharsetAliases() {
         val rules = HtmlRulesV1Config(
             searchUrlTemplate = "https://books.example/search?q={query}",

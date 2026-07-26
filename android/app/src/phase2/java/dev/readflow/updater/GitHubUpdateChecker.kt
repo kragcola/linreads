@@ -13,17 +13,19 @@ data class UpdateInfo(
     val buildTag: String?,
     val apkUrl: String,
     val notes: String,
+    val versionCode: Long? = null,
 )
 
 /**
  * Checks the `dev-latest` GitHub release for a newer build.
- * Version identity: CI embeds `BUILD_TAG: <tag>` in the release body; we compare
- * that against BuildConfig.BUILD_TAG.  If absent (old release) we always show the
- * notification so the user is never stuck on a stale install.
+ * CI embeds both a build tag and a monotonically increasing version code in the release body.
+ * A release without a version code remains available for an explicit manual update, but never
+ * enters the unattended update path.
  */
 class GitHubUpdateChecker(
     private val repoSlug: String,
     private val currentTag: String,
+    private val currentVersionCode: Long,
 ) {
     suspend fun check(): UpdateInfo? = withContext(Dispatchers.IO) {
         val conn = (URL("https://api.github.com/repos/$repoSlug/releases/tags/dev-latest")
@@ -44,14 +46,23 @@ class GitHubUpdateChecker(
             val body = root.optString("body", "")
 
             val releaseBuildTag = releaseBuildTagFromBody(body)
+            val releaseVersionCode = releaseVersionCodeFromBody(body)
 
-            if (releaseBuildTag != null && releaseBuildTag == currentTag) return@withContext null
+            if (!shouldOfferRelease(
+                    releaseBuildTag = releaseBuildTag,
+                    releaseVersionCode = releaseVersionCode,
+                    currentTag = currentTag,
+                    currentVersionCode = currentVersionCode,
+                )
+            ) {
+                return@withContext null
+            }
 
             val assets = root.getJSONArray("assets")
             var apkUrl: String? = null
             for (i in 0 until assets.length()) {
                 val a = assets.getJSONObject(i)
-                if (a.getString("name").endsWith(".apk")) {
+                if (a.optString("name") == OTA_APK_ASSET_NAME) {
                     apkUrl = a.getString("browser_download_url"); break
                 }
             }
@@ -61,9 +72,10 @@ class GitHubUpdateChecker(
                     buildTag = releaseBuildTag,
                     apkUrl = it,
                     notes = body,
+                    versionCode = releaseVersionCode,
                 )
             }
-                ?: throw IOException("release has no APK asset")
+                ?: throw IOException("release has no $OTA_APK_ASSET_NAME asset")
         } catch (error: CancellationException) {
             throw error
         } catch (e: IOException) {
@@ -77,13 +89,42 @@ class GitHubUpdateChecker(
 
 }
 
-internal fun releaseBuildTagFromBody(body: String): String? {
+internal fun releaseBuildTagFromBody(body: String): String? =
+    releaseMetadataValue(body, "BUILD_TAG")
+
+internal fun releaseVersionCodeFromBody(body: String): Long? =
+    releaseMetadataValue(body, "VERSION_CODE")
+        ?.toLongOrNull()
+        ?.takeIf { it > 0 }
+
+internal fun shouldOfferRelease(
+    releaseBuildTag: String?,
+    releaseVersionCode: Long?,
+    currentTag: String,
+    currentVersionCode: Long,
+): Boolean = when {
+    releaseVersionCode != null ->
+        releaseVersionCode > currentVersionCode &&
+            isVerifiedCiBuildIdentity(releaseBuildTag, releaseVersionCode)
+    else -> releaseBuildTag != currentTag
+}
+
+internal fun isVerifiedCiBuildIdentity(buildTag: String?, versionCode: Long?): Boolean {
+    if (buildTag == null || versionCode == null || versionCode <= 0L) return false
+    val match = CI_BUILD_TAG.matchEntire(buildTag) ?: return false
+    return match.groupValues[1].toLongOrNull() == versionCode
+}
+
+private fun releaseMetadataValue(body: String, key: String): String? {
     val lines = body.lineSequence().toList()
     val metadataStart = lines.indexOfLast { it.trim() == "---" } + 1
     if (metadataStart <= 0) return null
     return lines.drop(metadataStart)
-        .firstOrNull { it.trimStart().startsWith("BUILD_TAG:") }
-        ?.substringAfter("BUILD_TAG:")
+        .firstOrNull { it.trimStart().startsWith("$key:") }
+        ?.substringAfter("$key:")
         ?.trim()
         ?.takeIf { it.isNotEmpty() }
 }
+
+private const val OTA_APK_ASSET_NAME = "app-ota.apk"
+private val CI_BUILD_TAG = Regex("^dev-([1-9]\\d*)-([0-9a-fA-F]{40})$")

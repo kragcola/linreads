@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Cleartext HTTP is needed for user-configured LAN and Tailscale Calibre servers on Android 9+.
-  Network Security Config cannot express RFC1918 CIDR ranges or runtime user hosts,
-  so Calibre HTTP is constrained in code by CalibreUrlPolicy:
-  only localhost, RFC1918 IPv4, and Tailscale IPv4/IPv6 ranges are accepted.
+  Network Security Config cannot express private CIDR ranges or runtime MagicDNS hosts,
+  so runtime URL/origin policies must guard every source client before it sends a request.
   Do NOT hardcode a real baseUrl (C2).
 -->
 <network-security-config>

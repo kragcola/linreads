@@ -15,6 +15,7 @@ jobs:
       contents: write
     env:
       BUILD_TAG: dev-${{ github.run_number }}-${{ github.sha }}
+      BUILD_VERSION_CODE: ${{ github.run_number }}
       KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
       STORE_PASSWORD: android
       KEY_ALIAS: androiddebugkey
@@ -59,6 +60,7 @@ jobs:
             
             ---
             BUILD_TAG: ${{ env.BUILD_TAG }}
+            VERSION_CODE: ${{ env.BUILD_VERSION_CODE }}
             Commit: ${{ github.sha }}
             Branch: ${{ github.ref_name }}
           files: android/app/build/outputs/apk/ota/app-ota.apk
