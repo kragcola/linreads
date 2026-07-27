@@ -497,6 +497,8 @@ internal class EpubFlowView(
     var onBoundaryPreviewEvicted: ((BoundaryPagePreview) -> Unit)? = null
     var onBoundaryPreviewRequestCancelled: ((forward: Boolean) -> Unit)? = null
     var onPageShotForeground: (() -> Unit)? = null
+    /** Restores async image callbacks after Markwon unschedules them on a window detach. */
+    var onImageDrawableHostAttached: (() -> Unit)? = null
     /** Called before an eligible animated turn reads or captures page-shot pixels. */
     var onPageTurnCapturePreparing: (() -> Unit)? = null
     /** Called after a new visual turn has acquired both page shots and accepted ownership. */
@@ -2653,6 +2655,7 @@ internal class EpubFlowView(
         onBoundaryPreviewEvicted = null
         onBoundaryPreviewRequestCancelled = null
         onPageShotForeground = null
+        onImageDrawableHostAttached = null
         onPageTurnCapturePreparing = null
         onPageTurnStarted = null
         onPageTurnTargetParked = null
@@ -5259,6 +5262,9 @@ internal class EpubFlowView(
         if (disposed) return
         animateChapterReveal = true
         pageTexturePrecacheEnabled = true
+        // Prepared chapters admit only their landing-page images. Expand to the active current-and-
+        // adjacent window before a transferred rapid turn can capture a transparent target page.
+        onPageTurnTargetParked?.invoke()
         reportTopOffset(force = true)
         continueQueuedTurnsOrPrecache()
         onPageSettled?.invoke()
@@ -5449,6 +5455,11 @@ internal class EpubFlowView(
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
         if (!disposed && visibility == View.VISIBLE) onPageShotForeground?.invoke()
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (!disposed) onImageDrawableHostAttached?.invoke()
     }
 
     private fun textInteractiveTapWasConsumed(): Boolean =

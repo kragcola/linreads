@@ -204,20 +204,23 @@ class EpubCorpusSmokeTest {
                             page.endOffset in page.startOffset..paragraphText.length,
                             "${file.name} text page $pageIndex has invalid end offset ${page.endOffset}.",
                         )
-                        page.links.forEachIndexed { linkIndex, link ->
-                            assertTrue(
-                                link.start >= 0 && link.end <= (page.endOffset - page.startOffset),
-                                "${file.name} text page $pageIndex link $linkIndex escaped page-local bounds.",
-                            )
-                            assertTrue(
-                                paragraphText.substring(
-                                    page.startOffset + link.start,
-                                    page.startOffset + link.end,
-                                ).isNotBlank(),
-                                "${file.name} text page $pageIndex link $linkIndex lost linked text.",
-                            )
-                            if (!link.isExternal && epubInternalLinkTargetKey(link.href) in targetIndexes) {
-                                targetedInternalLinkPages += 1
+                        page.textLinkSegments().forEach { segment ->
+                            val segmentText = book.paras[segment.paragraphIndex].text
+                            segment.links.forEachIndexed { linkIndex, link ->
+                                assertTrue(
+                                    link.start >= 0 && link.end <= (segment.endOffset - segment.startOffset),
+                                    "${file.name} text page $pageIndex link $linkIndex escaped segment-local bounds.",
+                                )
+                                assertTrue(
+                                    segmentText.substring(
+                                        segment.startOffset + link.start,
+                                        segment.startOffset + link.end,
+                                    ).isNotBlank(),
+                                    "${file.name} text page $pageIndex link $linkIndex lost linked text.",
+                                )
+                                if (!link.isExternal && epubInternalLinkTargetKey(link.href) in targetIndexes) {
+                                    targetedInternalLinkPages += 1
+                                }
                             }
                         }
                     }
@@ -242,11 +245,7 @@ class EpubCorpusSmokeTest {
 
             linkedTextBlocks.forEachIndexed { blockIndex, block ->
                 assertTrue(
-                    pages.any { page ->
-                        page.kind == EpubPageSliceKind.Text &&
-                            page.paragraphIndex == block.paragraphIndex &&
-                            page.links.isNotEmpty()
-                    },
+                    pages.any { page -> page.preservesLinkedParagraph(block.paragraphIndex) },
                     "${file.name} linked text block $blockIndex lost page-local link metadata.",
                 )
             }
@@ -276,7 +275,7 @@ class EpubCorpusSmokeTest {
                 "EPUB_PAGED_CORPUS|${file.name}" +
                     "|pages=${pages.size}" +
                     "|imagePages=${pages.count { it.kind is EpubPageSliceKind.Image }}" +
-                    "|linkPages=${pages.count { it.links.isNotEmpty() }}" +
+                    "|linkPages=${pages.count { it.hasPageLinks() }}" +
                     "|styledPages=${pages.count { page -> pageHasNonDefaultStyle(page) }}" +
                     "|targetedInternalLinkPages=$targetedInternalLinkPages",
             )
@@ -628,6 +627,27 @@ class EpubCorpusSmokeTest {
         }
         return page.paragraphIndex == paragraphIndex && page.textStyle == expectedStyle
     }
+
+    private fun EpubPageSlice.textLinkSegments(): List<EpubPageTextSegment> =
+        textSegments.takeIf { it.isNotEmpty() }
+            ?: listOf(
+                EpubPageTextSegment(
+                    paragraphIndex = paragraphIndex,
+                    startOffset = startOffset,
+                    endOffset = endOffset,
+                    text = "",
+                    links = links,
+                ),
+            )
+
+    private fun EpubPageSlice.preservesLinkedParagraph(paragraphIndex: Int): Boolean =
+        kind == EpubPageSliceKind.Text &&
+            textLinkSegments().any { segment ->
+                segment.paragraphIndex == paragraphIndex && segment.links.isNotEmpty()
+            }
+
+    private fun EpubPageSlice.hasPageLinks(): Boolean =
+        kind == EpubPageSliceKind.Text && textLinkSegments().any { it.links.isNotEmpty() }
 
     private fun pageHasNonDefaultStyle(page: EpubPageSlice): Boolean {
         if (page.kind != EpubPageSliceKind.Text) return false

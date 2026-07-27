@@ -1429,6 +1429,14 @@ class EpubReflowEngine private constructor(
             imageSchedulingPending ||
                 loader.hasRelevantPendingDecodes(pendingDecodeRangesProvider())
         }
+        lateinit var scheduleVisibleImages: () -> Unit
+        scheduleVisibleImages = schedule@{
+            if (view.onImageDrawableHostAttached !== scheduleVisibleImages) return@schedule
+            val ranges = runCatching { pendingDecodeRangesProvider() }.getOrDefault(emptyList())
+            loader.updateDecodeWindow(ranges)
+            AsyncDrawableScheduler.schedule(view.textView)
+        }
+        view.onImageDrawableHostAttached = scheduleVisibleImages
         view.setChapter(
             flow,
             spannable,
@@ -1439,10 +1447,10 @@ class EpubReflowEngine private constructor(
         )
         // Schedule async images after the layout pass; positioning is now done inside setChapter's own
         // post (single pre-paint placement — no chapter-top→resume jump on entry).
-        view.textView.post {
+        view.textView.post postedSchedule@{
+            if (view.onImageDrawableHostAttached !== scheduleVisibleImages) return@postedSchedule
             try {
-                loader.updateDecodeWindow(pendingDecodeRangesProvider())
-                AsyncDrawableScheduler.schedule(view.textView)
+                scheduleVisibleImages()
             } finally {
                 imageSchedulingPending = false
                 view.tryRevealWhenStable()
@@ -2997,7 +3005,7 @@ class EpubReflowEngine private constructor(
             epubComposeAnnotatedText(
                 text = pageText,
                 highlightRanges = composePaintRangesForPageSlice(slice),
-                links = slice.links,
+                links = pageLinksFor(slice),
                 selectionHighlightRange = composeSelectionHighlight,
                 linkClickHandler = composeLinkClickHandler(composeView, slice),
             ),
@@ -3935,7 +3943,7 @@ class EpubReflowEngine private constructor(
                 epubComposeAnnotatedText(
                     text = pageText,
                     highlightRanges = composePaintRangesForPageSlice(pageState.slice),
-                    links = pageState.slice.links,
+                    links = pageLinksFor(pageState.slice),
                     linkClickHandler = composeLinkClickHandler(composeView, pageState.slice),
                 ),
             )

@@ -19,6 +19,9 @@ android {
             providers.systemProperty("readflow.realMultiFontEpub").orNull?.let { epubPath ->
                 it.systemProperty("readflow.realMultiFontEpub", epubPath)
             }
+            providers.systemProperty("readflow.realImageEpub").orNull?.let { epubPath ->
+                it.systemProperty("readflow.realImageEpub", epubPath)
+            }
         }
     }
 }

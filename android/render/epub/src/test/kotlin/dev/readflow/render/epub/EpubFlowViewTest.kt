@@ -5942,6 +5942,24 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `prepared promotion expands the image window before starting a transferred turn`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val decodeWindowPages = mutableListOf<Int>()
+        view.onPageTurnTargetParked = { decodeWindowPages += view.currentPageIndex() }
+        view.acceptPromotedPageTurns(delta = 1, rapidSequence = true)
+
+        view.activatePreparedChapter()
+
+        assertTrue("promotion must publish an active decode window", decodeWindowPages.isNotEmpty())
+        assertEquals(
+            "the active current-and-adjacent image window must be admitted before the queued target is captured",
+            0,
+            decodeWindowPages.first(),
+        )
+    }
+
+    @Test
     fun `opposite rapid requests cancel before another renderer starts`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)

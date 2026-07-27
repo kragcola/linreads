@@ -50,8 +50,10 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import io.noties.markwon.image.AsyncDrawable
+import io.noties.markwon.image.AsyncDrawableScheduler
 import io.noties.markwon.image.AsyncDrawableSpan
 import org.junit.After
+import org.junit.Assume.assumeTrue
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -316,6 +318,163 @@ class EpubReflowEngineTest {
                 "otherwise settle can reveal before AsyncDrawableScheduler runs",
             flowView.pendingDecodesProvider?.invoke() == true,
         )
+    }
+
+    @Test
+    fun `reattaching an open flow view resumes current and adjacent image decodes`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-image-reattach.epub")
+        writeBoundaryTwoPageImageEpub(epub, imagesFirst = true)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+        val releaseWorkers = CountDownLatch(1)
+        val workersStarted = CountDownLatch(2)
+        val bulkExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val priorityExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        listOf(bulkExecutor, priorityExecutor).forEach { executor ->
+            executor.submit {
+                workersStarted.countDown()
+                releaseWorkers.await()
+            }
+        }
+        assertTrue("fixture must occupy both image decode lanes", workersStarted.await(2, TimeUnit.SECONDS))
+        engine.setPrivateField("flowExecutorInstance", bulkExecutor)
+        engine.setPrivateField("flowCriticalImageExecutorInstance", priorityExecutor)
+
+        try {
+            engine.openBook(Uri.fromFile(epub))
+            engine.setMode(ReadingMode.PAGED)
+            val host = engine.createView() as FrameLayout
+            val flowView = host.getChildAt(0) as EpubFlowView
+            activity.addContentView(host, ViewGroup.LayoutParams(360, 240))
+            host.measure(exactly(360), exactly(240))
+            host.layout(0, 0, 360, 240)
+            idleMainLooper()
+
+            val text = flowView.textView.text as Spanned
+            val images = text.getSpans(0, text.length, AsyncDrawableSpan::class.java).map { it.drawable }
+            val loader = engine.privateField("liveFlowImageLoader") as EpubFlowImageLoader
+            assertEquals("fixture must place one image on the current page and one on the adjacent page", 2, images.size)
+            assertTrue("current and adjacent images must be attached before detach", images.all(AsyncDrawable::isAttached))
+            assertTrue("the blocked current and adjacent decodes must be pending before detach", loader.hasPendingDecodes())
+
+            val parent = host.parent as ViewGroup
+            parent.removeView(host)
+            idleMainLooper()
+            assertTrue("Markwon clears every image callback when its TextView detaches", images.none(AsyncDrawable::isAttached))
+            assertFalse("the detached decode must leave the active pending set", loader.hasPendingDecodes())
+
+            parent.addView(host, ViewGroup.LayoutParams(360, 240))
+            host.measure(exactly(360), exactly(240))
+            host.layout(0, 0, 360, 240)
+            idleMainLooper()
+
+            assertTrue("reattach must restore current and adjacent image callbacks", images.all(AsyncDrawable::isAttached))
+            assertTrue("reattach must resubmit current and adjacent image decodes", loader.hasPendingDecodes())
+            releaseWorkers.countDown()
+            awaitCondition("reattached current and adjacent images must receive decoded pixels") {
+                images.all { it.hasDecodedPixelsForTest() }
+            }
+        } finally {
+            releaseWorkers.countDown()
+            engine.close()
+            bulkExecutor.shutdownNow()
+            priorityExecutor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `real image epub keeps decoded opening images across host reattach`() = runTest(dispatcher) {
+        val epubPath = System.getProperty("readflow.realImageEpub")
+        assumeTrue(
+            "Set -Dreadflow.realImageEpub=/path/to/book.epub to run the real image lifecycle smoke.",
+            !epubPath.isNullOrBlank(),
+        )
+        Dispatchers.setMain(dispatcher)
+        val epub = File(requireNotNull(epubPath))
+        assertTrue("real EPUB fixture must exist", epub.isFile)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        try {
+            engine.openBook(Uri.fromFile(epub))
+            engine.setMode(ReadingMode.PAGED)
+            val host = engine.createView() as FrameLayout
+            val flowView = host.getChildAt(0) as EpubFlowView
+            activity.addContentView(host, ViewGroup.LayoutParams(720, 1080))
+            host.measure(exactly(720), exactly(1080))
+            host.layout(0, 0, 720, 1080)
+            idleMainLooper()
+
+            awaitCondition("real EPUB opening spine must expose at least one image drawable") {
+                val text = flowView.textView.text as? Spanned ?: return@awaitCondition false
+                text.getSpans(0, text.length, AsyncDrawableSpan::class.java).isNotEmpty()
+            }
+            val text = flowView.textView.text as Spanned
+            val admittedRanges = flowView.relevantPendingDecodeLayoutRanges()
+            val images = text.getSpans(0, text.length, AsyncDrawableSpan::class.java)
+                .filter { span -> text.getSpanStart(span).let { start -> admittedRanges.any { start in it } } }
+                .map { it.drawable }
+            assertTrue("real EPUB current-and-adjacent pages must contain an admitted image", images.isNotEmpty())
+            awaitCondition("real EPUB opening images must decode into pixels") {
+                images.all { it.hasDecodedPixelsForTest() }
+            }
+
+            val parent = host.parent as ViewGroup
+            parent.removeView(host)
+            idleMainLooper()
+            assertTrue("Markwon must detach real EPUB image callbacks with the host", images.none(AsyncDrawable::isAttached))
+
+            parent.addView(host, ViewGroup.LayoutParams(720, 1080))
+            host.measure(exactly(720), exactly(1080))
+            host.layout(0, 0, 720, 1080)
+            idleMainLooper()
+
+            assertTrue("reattach must restore every real EPUB image callback", images.all(AsyncDrawable::isAttached))
+            assertTrue("reattach must preserve decoded real EPUB pixels", images.all { it.hasDecodedPixelsForTest() })
+        } finally {
+            engine.close()
+        }
+    }
+
+    @Test
+    fun `a replaced image resume callback cannot reschedule an obsolete chapter generation`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("flow-image-stale-resume.epub")
+        writeBoundaryTwoPageImageEpub(epub, imagesFirst = true)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
+        val engine = EpubReflowEngine(context, flowEngineEnabled = true)
+
+        try {
+            engine.openBook(Uri.fromFile(epub))
+            engine.setMode(ReadingMode.PAGED)
+            val host = engine.createView() as FrameLayout
+            val flowView = host.getChildAt(0) as EpubFlowView
+            activity.addContentView(host, ViewGroup.LayoutParams(360, 240))
+            host.measure(exactly(360), exactly(240))
+            host.layout(0, 0, 360, 240)
+            idleMainLooper()
+
+            val text = flowView.textView.text as Spanned
+            val images = text.getSpans(0, text.length, AsyncDrawableSpan::class.java).map { it.drawable }
+            val obsoleteResume = requireNotNull(flowView.onImageDrawableHostAttached)
+            assertTrue("fixture images must initially be scheduled", images.all(AsyncDrawable::isAttached))
+            AsyncDrawableScheduler.unschedule(flowView.textView)
+            assertTrue("explicit unschedule must detach the obsolete generation", images.none(AsyncDrawable::isAttached))
+
+            flowView.onImageDrawableHostAttached = { }
+            obsoleteResume()
+
+            assertTrue(
+                "an obsolete posted or attach callback must not mutate the replacement generation",
+                images.none(AsyncDrawable::isAttached),
+            )
+        } finally {
+            engine.close()
+        }
     }
 
     @Test
@@ -1293,14 +1452,14 @@ class EpubReflowEngineTest {
     }
 
     @Test
-    fun `prepared boundary landing ignores a pending next page image but waits for landing image`() = runTest(dispatcher) {
+    fun `prepared promotion waits for a queued next-page image before capturing the turn`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("prepared-boundary-page-decode-gate.epub")
         writeBoundaryTwoPageImageEpub(epub)
         val context = RuntimeEnvironment.getApplication() as Application
         val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().get()
         val engine = EpubReflowEngine(context, flowEngineEnabled = true)
-        engine.setPageFlipStyle(PageFlipStyle.NONE)
+        engine.setPageFlipStyle(PageFlipStyle.SIMULATION)
         engine.setMode(ReadingMode.PAGED)
         engine.openBook(Uri.fromFile(epub))
         val blockedBulkExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
@@ -1373,6 +1532,14 @@ class EpubReflowEngineTest {
             }
 
             engine.goToAdjacentPage(1)
+            val boundaryAnimator = checkNotNull(outgoingView.privateField("flipAnimator") as? android.animation.ValueAnimator)
+            engine.goToAdjacentPage(1)
+            assertEquals(
+                "the second rapid request must queue on the outgoing chapter",
+                1,
+                outgoingView.privateField("queuedPageTurnDelta") as Int,
+            )
+            boundaryAnimator.end()
 
             assertSame(
                 "the prepared chapter must commit while its next-page decode remains pending",
@@ -1382,11 +1549,28 @@ class EpubReflowEngineTest {
             awaitCondition("promotion must admit the newly adjacent page image") {
                 loader.hasPendingDecodes()
             }
+            assertEquals(
+                "the transferred turn must stay on the landing page until its target image is decoded",
+                0,
+                preparedView.currentPageIndex(),
+            )
+            assertNull(
+                "the target page must not be captured with a transparent image placeholder",
+                preparedView.privateField("flipAnimator"),
+            )
             assertTrue("commit must not cancel the promoted chapter's next-page decode", loader.hasPendingDecodes())
             assertTrue(
                 "after promotion the active decode gate must include its adjacent page",
                 preparedView.pendingDecodesProvider?.invoke() == true,
             )
+
+            releaseWorkers.countDown()
+            awaitCondition("the transferred target image must receive decoded pixels before the turn resumes") {
+                nextPageImage.hasDecodedPixelsForTest()
+            }
+            awaitCondition("the queued turn must resume after its target image is ready") {
+                preparedView.currentPageIndex() == 1
+            }
         } finally {
             loader.cancelAll()
             releaseWorkers.countDown()
@@ -2933,6 +3117,60 @@ class EpubReflowEngineTest {
         assertTrue(links.orEmpty().isNotEmpty())
         assertEquals(0, links!!.first().start)
         assertEquals("Tap note".length, links.first().end)
+    }
+
+    @Test
+    fun `packed non-anchor links survive selection annotation rebuilds`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("packed-non-anchor-link-selection.epub")
+        writeEpub(
+            epub,
+            "OEBPS/ch1.xhtml" to """
+                <html><body>
+                  <p>Plain lead.</p>
+                  <p><a href="https://example.com/note">Tap note</a></p>
+                  <p>Plain tail.</p>
+                </body></html>
+            """.trimIndent(),
+        )
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = EpubReflowEngine(
+            context = context,
+            pageLineMeasurer = EpubPageLineMeasurer.ComposeTextLayoutResult { text: String, _: Int, _: EpubPageTextStyle ->
+                listOf(EpubTextLayoutLineRange(0, text.length))
+            },
+        )
+
+        engine.openBook(Uri.fromFile(epub))
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0)
+        @Suppress("UNCHECKED_CAST")
+        val selectionCallback = page.getTag(R.id.epub_compose_text_selection_callback) as? (Int, Int) -> Unit
+        fun annotatedUrls(): List<String> {
+            val annotated = page.getTag(R.id.epub_compose_text_annotated_string) as? AnnotatedString
+                ?: return emptyList()
+            return annotated.getLinkAnnotations(0, annotated.length).mapNotNull { annotation ->
+                (annotation.item as? LinkAnnotation.Url)?.url
+            }
+        }
+
+        assertEquals(1, engine.pageCount.value)
+        assertEquals(listOf("https://example.com/note"), annotatedUrls())
+        assertNotNull(selectionCallback)
+
+        selectionCallback?.invoke(0, "Plain lead.".length)
+        assertEquals(
+            "selection highlight rebuild must preserve links from non-anchor packed segments",
+            listOf("https://example.com/note"),
+            annotatedUrls(),
+        )
+
+        engine.clearTextSelection()
+        assertEquals(
+            "clearing selection must preserve links from non-anchor packed segments",
+            listOf("https://example.com/note"),
+            annotatedUrls(),
+        )
     }
 
     @Test
