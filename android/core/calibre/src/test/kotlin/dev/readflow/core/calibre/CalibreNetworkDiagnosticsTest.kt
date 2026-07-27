@@ -24,15 +24,16 @@ class CalibreNetworkDiagnosticsTest {
     }
 
     @Test
-    fun tailnetConnectFailureWithoutVpnExplainsTheMissingVpnEvidence() {
+    fun tailnetConnectFailureWithoutVpnPreservesTheObservedConnectionRefusal() {
         val result = ConnectException("failed to connect").toConnectionFailure(
             endpointKind = CalibreEndpointKind.TAILSCALE_IP,
             network = CalibreNetworkSnapshot.Active(vpnAppliesToApp = false, internetValidated = true),
         )
 
-        assertEquals(CalibreConnectionCheckResult.Failure.Kind.TAILNET_UNREACHABLE, result.kind)
-        assertEquals("无法通过 Tailscale 连接服务器", result.message)
-        assertTrue(result.nextStep.contains("未检测到"))
+        assertEquals(CalibreConnectionCheckResult.Failure.Kind.CONNECTION_REFUSED, result.kind)
+        assertEquals("服务器拒绝或无法接受连接", result.message)
+        assertTrue(result.nextStep.contains("Tailscale"))
+        assertTrue(result.nextStep.contains("ACL"))
     }
 
     @Test

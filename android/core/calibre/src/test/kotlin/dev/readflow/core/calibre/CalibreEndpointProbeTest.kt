@@ -58,7 +58,7 @@ class CalibreEndpointProbeTest {
     }
 
     @Test
-    fun doesNotForwardCredentialsToExplicitTailnetHttpWhenVpnStateIsUnknown() = runTest {
+    fun forwardsCredentialsToExplicitTailnetHttpWhenVpnStateIsUnknown() = runTest {
         val configured = "http://100.101.102.103:8080"
         val credentials = SourceCredentials(username = "reader", password = "secret")
         val tester = RecordingConnectionTester(
@@ -74,12 +74,12 @@ class CalibreEndpointProbeTest {
         val result = probe.probe(configured, credentials)
 
         assertEquals(listOf(configured), tester.checkedUrls)
-        assertEquals(listOf<SourceCredentials?>(null), tester.checkedCredentials)
+        assertEquals(listOf<SourceCredentials?>(credentials), tester.checkedCredentials)
         assertEquals(CalibreProbeResult.Success(baseUrl = configured, bookCount = 2), result)
     }
 
     @Test
-    fun doesNotForwardCredentialsToExplicitTailnetHttpWhenVpnDoesNotApplyToApp() = runTest {
+    fun forwardsCredentialsToExplicitTailnetHttpWhenActiveNetworkIsNotVpn() = runTest {
         val configured = "http://100.101.102.103:8080"
         val credentials = SourceCredentials(username = "reader", password = "secret")
         val tester = RecordingConnectionTester(
@@ -98,12 +98,12 @@ class CalibreEndpointProbeTest {
         val result = probe.probe(configured, credentials)
 
         assertEquals(listOf(configured), tester.checkedUrls)
-        assertEquals(listOf<SourceCredentials?>(null), tester.checkedCredentials)
+        assertEquals(listOf<SourceCredentials?>(credentials), tester.checkedCredentials)
         assertEquals(CalibreProbeResult.Success(baseUrl = configured, bookCount = 2), result)
     }
 
     @Test
-    fun triesOriginalHttpsMagicDnsBeforeDirectHttpFallback() = runTest {
+    fun explicitHttpsMagicDnsNeverGeneratesDirectHttpFallback() = runTest {
         val original = "https://reader.tailnet.ts.net"
         val fallback = "http://reader.tailnet.ts.net:8080"
         val tester = RecordingConnectionTester(
@@ -119,92 +119,8 @@ class CalibreEndpointProbeTest {
 
         val result = probe.probe(original)
 
-        assertEquals(listOf(original, fallback), tester.checkedUrls)
-        assertEquals(CalibreProbeResult.Success(baseUrl = fallback, bookCount = 7), result)
-    }
-
-    @Test
-    fun resnapshotsVpnBeforeForwardingCredentialsToDirectHttpFallback() = runTest {
-        val original = "https://reader.tailnet.ts.net"
-        val fallback = "http://reader.tailnet.ts.net:8080"
-        val credentials = SourceCredentials(username = "reader", password = "secret")
-        var snapshotCount = 0
-        val changingNetwork = CalibreNetworkSnapshotProvider {
-            snapshotCount += 1
-            CalibreNetworkSnapshot.Active(
-                vpnAppliesToApp = snapshotCount == 1,
-                internetValidated = true,
-            )
-        }
-        val tester = RecordingConnectionTester(
-            results = mapOf(
-                original to CalibreConnectionCheckResult.Failure(
-                    message = "HTTPS 端点连接超时",
-                    nextStep = "检查 HTTPS 服务",
-                    kind = CalibreConnectionCheckResult.Failure.Kind.CONNECT_TIMEOUT,
-                ),
-                fallback to CalibreConnectionCheckResult.Success(bookCount = 7),
-            ),
-        )
-        val probe = GuidedCalibreEndpointProbe(tester, changingNetwork)
-
-        val result = probe.probe(original, credentials)
-
-        assertEquals(listOf(original), tester.checkedUrls)
-        assertEquals(listOf<SourceCredentials?>(credentials), tester.checkedCredentials)
-        assertTrue("VPN state must be sampled again before HTTP fallback", snapshotCount >= 2)
-        assertTrue(result is CalibreProbeResult.Failure)
-    }
-
-    @Test
-    fun doesNotProbeDirectHttpFallbackWithoutPositiveVpnEvidence() = runTest {
-        val original = "https://reader.tailnet.ts.net"
-        val fallback = "http://reader.tailnet.ts.net:8080"
-        val tester = RecordingConnectionTester(
-            results = mapOf(
-                original to CalibreConnectionCheckResult.Failure(
-                    message = "HTTPS 端点不可用",
-                    nextStep = "检查 HTTPS 服务",
-                ),
-                fallback to CalibreConnectionCheckResult.Success(bookCount = 7),
-            ),
-        )
-        val probe = GuidedCalibreEndpointProbe(tester)
-
-        val result = probe.probe(original)
-
         assertEquals(listOf(original), tester.checkedUrls)
         assertTrue(result is CalibreProbeResult.Failure)
-        assertTrue((result as CalibreProbeResult.Failure).nextStep.contains("Tailscale"))
-    }
-
-    @Test
-    fun preservesReachedServerFailureWhenDirectFallbackAlsoFails() = runTest {
-        val original = "https://reader.tailnet.ts.net"
-        val fallback = "http://reader.tailnet.ts.net:8080"
-        val tester = RecordingConnectionTester(
-            results = mapOf(
-                original to CalibreConnectionCheckResult.Failure(
-                    message = "Calibre 服务器暂时不可用（HTTP 502）",
-                    nextStep = "已到达服务器地址；请检查 Calibre Content Server 或前置反向代理后重试",
-                    kind = CalibreConnectionCheckResult.Failure.Kind.SERVER_RESPONSE,
-                ),
-                fallback to CalibreConnectionCheckResult.Failure(
-                    message = "无法通过 Tailscale 连接服务器",
-                    nextStep = "请打开 Tailscale 后重试",
-                    kind = CalibreConnectionCheckResult.Failure.Kind.TAILNET_UNREACHABLE,
-                ),
-            ),
-        )
-        val probe = GuidedCalibreEndpointProbe(tester, vpnConnectedNetwork)
-
-        val result = probe.probe(original)
-
-        assertTrue(result is CalibreProbeResult.Failure)
-        result as CalibreProbeResult.Failure
-        assertEquals("Calibre 服务器暂时不可用（HTTP 502）", result.message)
-        assertTrue(result.nextStep.contains("已到达服务器地址"))
-        assertEquals(listOf(original, fallback), tester.checkedUrls)
     }
 
     @Test

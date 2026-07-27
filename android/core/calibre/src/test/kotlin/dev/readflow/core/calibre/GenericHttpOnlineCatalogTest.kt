@@ -316,6 +316,18 @@ class GenericHttpOnlineCatalogTest {
         )
         assertEquals(epub, selectPreferredOpdsAcquisition(listOf(pdf, octet, epub)))
         assertEquals(pdf, selectPreferredOpdsAcquisition(listOf(octet, pdf)))
+        listOf("txt", "md", "docx", "cbz").forEach { extension ->
+            val supported = OpdsAcquisitionCandidate(
+                url = "http://192.168.1.1/a.$extension",
+                type = "application/$extension",
+                formatHint = extension,
+            )
+            assertEquals(
+                "$extension must rank above an unknown octet-stream acquisition",
+                supported,
+                selectPreferredOpdsAcquisition(listOf(octet, supported)),
+            )
+        }
     }
 
     @Test

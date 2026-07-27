@@ -1,7 +1,9 @@
 package dev.readflow.core.calibre
 
 import dev.readflow.core.model.ReadflowError
+import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceCredentials
+import dev.readflow.extensions.api.SourceDescriptor
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.HttpClientEngine
@@ -20,6 +22,7 @@ import io.ktor.client.plugins.auth.providers.basic
 import io.ktor.client.plugins.auth.providers.digest
 import io.ktor.client.plugins.plugin
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.get
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.JsonConvertException
 import io.ktor.serialization.kotlinx.json.json
@@ -30,7 +33,7 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 
 sealed interface CalibreConnectionCheckResult {
-    data class Success(val bookCount: Int) : CalibreConnectionCheckResult
+    data class Success(val bookCount: Int?) : CalibreConnectionCheckResult
     data class Failure(
         val message: String,
         val nextStep: String,
@@ -101,6 +104,7 @@ internal class KtorCalibreConnectionTester internal constructor(
             )
         }
         val effectiveBaseUrl = validation.normalizedUrl
+        val opdsUrl = requireCalibreOpdsUrl(effectiveBaseUrl)
 
         return runCatching {
             httpClientFactory(
@@ -108,24 +112,25 @@ internal class KtorCalibreConnectionTester internal constructor(
                 credentials?.username.orEmpty(),
                 credentials?.password.orEmpty(),
             ).use { http ->
-                val client = CalibreClient(
-                    baseUrl = effectiveBaseUrl,
-                    username = "",
-                    password = "",
-                    libraryId = "calibre-library",
-                    http = http,
-                )
-                val search = client.search(query = "", num = 1, offset = 0)
-
-                // Probe the same batch metadata route used by library browsing.
-                // A parse failure here would otherwise only surface when the user opens
-                // their library, not at connection-test time.
-                val firstId = search.book_ids.firstOrNull()
-                if (firstId != null) {
-                    client.bookMetas(listOf(firstId))
+                val body = withCalibreRequestContext(
+                    phase = CalibreRequestPhase.OPDS_ROOT,
+                    requestUrl = opdsUrl,
+                ) {
+                    http.get(opdsUrl).body<String>()
                 }
-
-                CalibreConnectionCheckResult.Success(bookCount = search.total_num)
+                parseCalibreOpdsFeed(
+                    body = body,
+                    descriptor = SourceDescriptor(
+                        id = "calibre-connection-probe",
+                        adapterId = SourceAdapterIds.CALIBRE,
+                        name = "Calibre",
+                        configVersion = 1,
+                        configJson = calibreSourceConfigJson(effectiveBaseUrl),
+                        baseUrl = effectiveBaseUrl,
+                    ),
+                    feedUrl = opdsUrl,
+                )
+                CalibreConnectionCheckResult.Success(bookCount = null)
             }
         }.getOrElse { error ->
             if (error is CancellationException) throw error
@@ -193,77 +198,97 @@ private typealias HttpClientConfigBlock = io.ktor.client.HttpClientConfig<*>.() 
 internal fun Throwable.toConnectionFailure(
     endpointKind: CalibreEndpointKind = CalibreEndpointKind.OTHER,
     network: CalibreNetworkSnapshot = CalibreNetworkSnapshot.Unknown,
-): CalibreConnectionCheckResult.Failure = when (this) {
-    is ClientRequestException -> when (response.status) {
+): CalibreConnectionCheckResult.Failure {
+    val diagnostic = calibreRequestDiagnostic()
+    val clientFailure = findCalibreCause<ClientRequestException>()
+    val serverFailure = findCalibreCause<ServerResponseException>()
+    val responseFailure = findCalibreCause<ResponseException>()
+    return when {
+    clientFailure != null -> when (clientFailure.response.status) {
         HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden -> CalibreConnectionCheckResult.Failure(
-            message = "Calibre 服务器需要认证",
+            message = "Calibre 服务器需要认证${diagnostic.suffix()}",
             nextStep = "请在书源设置中填写 Calibre 用户名和密码",
             kind = CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED,
         )
         HttpStatusCode.NotFound -> CalibreConnectionCheckResult.Failure(
-            message = "没有找到 Calibre API",
-            nextStep = "确认地址不要带路径，直接填写 Content Server 根地址",
+            message = "没有找到 Calibre OPDS 目录${diagnostic.suffix()}",
+            nextStep = "确认地址指向 Calibre Content Server 根地址或其 /opds 地址",
         )
         else -> CalibreConnectionCheckResult.Failure(
-            message = "服务器拒绝了连接测试（HTTP ${response.status.value}）",
+            message = "服务器拒绝了连接测试（HTTP ${clientFailure.response.status.value}）${diagnostic.suffix()}",
             nextStep = "检查 Calibre Content Server 是否允许当前设备访问",
         )
     }
-    is ServerResponseException -> {
+    serverFailure != null -> {
         CalibreConnectionCheckResult.Failure(
-            message = "Calibre 服务器暂时不可用（HTTP ${response.status.value}）",
-            nextStep = "已到达服务器地址；请检查 Calibre Content Server 或前置反向代理后重试",
+            message = "Calibre 请求收到 HTTP ${serverFailure.response.status.value}${diagnostic.suffix()}",
+            nextStep = "该响应可能来自当前端点或中间代理；按 phase 检查 OPDS、Content Server 和网络路径",
             kind = CalibreConnectionCheckResult.Failure.Kind.SERVER_RESPONSE,
         )
     }
-    is JsonConvertException, is SerializationException, is IllegalStateException -> CalibreConnectionCheckResult.Failure(
-        message = "服务器响应不像 Calibre Content Server",
+    findCalibreCause<JsonConvertException>() != null ||
+        findCalibreCause<SerializationException>() != null ||
+        findCalibreCause<IllegalStateException>() != null ||
+        findCalibreCause<IllegalArgumentException>() != null -> CalibreConnectionCheckResult.Failure(
+        message = "服务器响应不是可识别的 Calibre OPDS 目录${diagnostic.suffix()}",
         nextStep = "确认地址直接指向 Calibre Content Server，例如 http://192.168.1.5:8080",
     )
-    is ResponseException -> CalibreConnectionCheckResult.Failure(
-        message = "Calibre 连接测试失败（HTTP ${response.status.value}）",
+    responseFailure != null -> CalibreConnectionCheckResult.Failure(
+        message = "Calibre 连接测试失败（HTTP ${responseFailure.response.status.value}）${diagnostic.suffix()}",
         nextStep = "检查服务器状态后再重试",
     )
-    else -> classifyCalibreConnectionFailure(this, endpointKind, network)
+    else -> classifyCalibreConnectionFailure(this, endpointKind, network).let { failure ->
+        failure.copy(message = failure.message + diagnostic.suffix())
+    }
+    }
 }
 
 internal fun Throwable.toCalibreReadflowError(
     baseUrl: String? = null,
     network: CalibreNetworkSnapshot = CalibreNetworkSnapshot.Unknown,
-): ReadflowError = when (this) {
-    is ClientRequestException -> when (response.status) {
+): ReadflowError {
+    val diagnostic = calibreRequestDiagnostic(baseUrl)
+    val clientFailure = findCalibreCause<ClientRequestException>()
+    val serverFailure = findCalibreCause<ServerResponseException>()
+    val responseFailure = findCalibreCause<ResponseException>()
+    return when {
+    clientFailure != null -> when (clientFailure.response.status) {
         HttpStatusCode.Unauthorized, HttpStatusCode.Forbidden -> ReadflowError(
             kind = ReadflowError.Kind.AUTH,
-            message = "Calibre 认证失败，请在当前书源设置中填写或检查用户名和密码",
-            code = response.status.value,
+            message = "Calibre 认证失败，请在当前书源设置中填写或检查用户名和密码${diagnostic.suffix()}",
+            code = clientFailure.response.status.value,
         )
         HttpStatusCode.NotFound -> ReadflowError.network(
-            response.status.value,
-            "没有找到 Calibre API，请确认服务器地址不带路径",
+            clientFailure.response.status.value,
+            "没有找到 Calibre OPDS 目录${diagnostic.suffix()}",
         )
         else -> ReadflowError.network(
-            response.status.value,
-            "Calibre 服务器拒绝了请求（HTTP ${response.status.value}）",
+            clientFailure.response.status.value,
+            "Calibre 服务器拒绝了请求（HTTP ${clientFailure.response.status.value}）${diagnostic.suffix()}",
         )
     }
-    is ServerResponseException -> {
+    serverFailure != null -> {
         ReadflowError.network(
-            response.status.value,
-            "Calibre 服务器暂时不可用（HTTP ${response.status.value}）：" +
-                "已到达服务器地址，请检查 Content Server 或前置反向代理",
+            serverFailure.response.status.value,
+            "Calibre 请求收到 HTTP ${serverFailure.response.status.value}${diagnostic.suffix()}。" +
+                "该响应可能来自当前端点或中间代理",
         )
     }
-    is JsonConvertException, is SerializationException ->
-        ReadflowError.parse("Calibre 返回了无法识别的数据")
-    is ResponseException -> ReadflowError.network(
-        response.status.value,
-        "Calibre 请求失败（HTTP ${response.status.value}）",
+    findCalibreCause<JsonConvertException>() != null ||
+        findCalibreCause<SerializationException>() != null ||
+        findCalibreCause<IllegalStateException>() != null ||
+        findCalibreCause<IllegalArgumentException>() != null ->
+        ReadflowError.parse("Calibre 返回了无法识别的数据${diagnostic.suffix()}")
+    responseFailure != null -> ReadflowError.network(
+        responseFailure.response.status.value,
+        "Calibre 请求失败（HTTP ${responseFailure.response.status.value}）${diagnostic.suffix()}",
     )
     else -> classifyCalibreConnectionFailure(
         error = this,
         endpointKind = baseUrl?.let(::calibreEndpointKind) ?: CalibreEndpointKind.OTHER,
         network = network,
     ).let { failure ->
-        ReadflowError.network(null, "${failure.message}。${failure.nextStep}")
+        ReadflowError.network(null, "${failure.message}${diagnostic.suffix()}。${failure.nextStep}")
+    }
     }
 }

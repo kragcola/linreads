@@ -889,38 +889,7 @@ class DefaultSourceRegistry(
             is ReadflowResult.Failure -> return@withLock recovery
             is ReadflowResult.Success -> Unit
         }
-        if (calibreEndpointCandidates(current.baseUrl).size <= 1) {
-            return@withLock ReadflowResult.Success(current)
-        }
-        val probe = calibreEndpointProbe ?: return@withLock ReadflowResult.Success(current)
-
-        // Credential reads, endpoint verification, and the resulting migration are one transaction.
-        // Otherwise a credential cleared while the probe is suspended could be restored from a
-        // stale snapshot when the fallback endpoint is persisted.
-        val credentials = withContext(Dispatchers.IO) {
-            credentialStore.get(current.id, calibreCredentialScopeForRequestUrl(current.baseUrl))
-        }
-        when (val result = probe.probe(current.baseUrl, credentials)) {
-            is CalibreProbeResult.Success -> {
-                if (result.baseUrl == current.baseUrl) {
-                    ReadflowResult.Success(current)
-                } else {
-                    persistVerifiedCalibreEndpointLocked(current, result.baseUrl, credentials)
-                }
-            }
-            is CalibreProbeResult.AuthenticationRequired -> ReadflowResult.Failure(
-                ReadflowError(
-                    kind = ReadflowError.Kind.AUTH,
-                    message = "Calibre 服务器需要认证，请在当前书源设置中填写用户名和密码",
-                ),
-            )
-            is CalibreProbeResult.Failure -> ReadflowResult.Failure(
-                ReadflowError.network(
-                    code = null,
-                    message = "${result.message}。${result.nextStep}",
-                ),
-            )
-        }
+        ReadflowResult.Success(current)
     }
 
     private suspend fun persistVerifiedCalibreEndpointLocked(
@@ -950,15 +919,9 @@ class DefaultSourceRegistry(
         val credentialTransition = calibreCredentialTransition(
             currentUrl = current.baseUrl,
             verifiedUrl = updated.baseUrl,
-            network = networkSnapshotProvider.snapshot(),
         )
         val pending = when {
             !hasCredentials || credentialTransition == CalibreCredentialTransition.UNCHANGED -> null
-            credentialTransition == CalibreCredentialTransition.MIGRATE_TRUSTED_FALLBACK -> {
-                PendingCredentialMutation.Activate(
-                    CredentialGrant(setOf(newScope), checkNotNull(credentials)),
-                )
-            }
             else -> PendingCredentialMutation.Clear(newScope)
         }
         if (pending != null) {

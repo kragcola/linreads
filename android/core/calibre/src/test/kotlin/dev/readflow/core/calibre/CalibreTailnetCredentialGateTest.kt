@@ -15,7 +15,7 @@ class CalibreTailnetCredentialGateTest {
     val tempFolder = TemporaryFolder()
 
     @Test
-    fun persistedTailnetHttpSourceFailsClosedWhenVpnStateIsUnknown() {
+    fun persistedTailnetHttpSourceOpensWithoutReadingCredentialsWhenVpnStateIsUnknown() {
         val credentials = RecordingCredentialProvider()
 
         val opened = openPersistedTailnetSource(
@@ -23,12 +23,13 @@ class CalibreTailnetCredentialGateTest {
             credentialProvider = credentials,
         )
 
-        assertTrue("unknown VPN state must fail closed", opened is ReadflowResult.Failure)
+        assertTrue("unauthenticated OPDS probing should remain available", opened is ReadflowResult.Success)
         assertTrue("unknown VPN state must not request stored credentials", credentials.requests.isEmpty())
+        (opened as ReadflowResult.Success).value.close()
     }
 
     @Test
-    fun persistedTailnetHttpSourceFailsClosedWhenVpnDoesNotApplyToApp() {
+    fun persistedTailnetHttpSourceOpensWithoutReadingCredentialsWhenVpnDoesNotApplyToApp() {
         val credentials = RecordingCredentialProvider()
 
         val opened = openPersistedTailnetSource(
@@ -39,8 +40,9 @@ class CalibreTailnetCredentialGateTest {
             credentialProvider = credentials,
         )
 
-        assertTrue("inactive VPN must fail closed", opened is ReadflowResult.Failure)
+        assertTrue("unauthenticated OPDS probing should remain available", opened is ReadflowResult.Success)
         assertTrue("inactive VPN must not request stored credentials", credentials.requests.isEmpty())
+        (opened as ReadflowResult.Success).value.close()
     }
 
     @Test

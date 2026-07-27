@@ -7,420 +7,245 @@ import io.ktor.client.engine.mock.respond
 import io.ktor.client.engine.mock.respondError
 import io.ktor.client.request.HttpRequestData
 import io.ktor.client.request.HttpResponseData
-import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CalibreConnectionTesterTest {
 
-    // Real Calibre /ajax/search response — includes sort_order, offset, num, base_url that the
-    // contract does not declare.  Used to verify ignoreUnknownKeys = true.
-    private val realSearchResponse = """
-        {
-          "total_num": 12,
-          "sort_order": "asc",
-          "offset": 0,
-          "num": 1,
-          "book_ids": [42],
-          "base_url": "/ajax/search/books",
-          "library_id": "books"
-        }
-    """.trimIndent()
-
-    // Real Calibre /ajax/book/<id>/<library> response — includes 20+ extra fields.
-    private val realBookMetaResponse = """
-        {
-          "id": 42,
-          "title": "Flatland: A Romance of Many Dimensions",
-          "authors": ["Edwin A. Abbott"],
-          "author_sort": "Abbott, Edwin A.",
-          "formats": ["EPUB", "PDF"],
-          "tags": ["fiction", "mathematics"],
-          "series": null,
-          "series_index": 1.0,
-          "cover": "/get/cover/42/calibre-library",
-          "has_cover": true,
-          "last_modified": "2024-01-15T10:30:00+00:00",
-          "timestamp": "2023-06-01T08:00:00+00:00",
-          "pubdate": "1884-01-01T00:00:00+00:00",
-          "publisher": null,
-          "comments": "A satirical novella by the English schoolmaster Edwin Abbott.",
-          "identifiers": {"isbn": "9780486272634"},
-          "languages": ["eng"],
-          "rating": null,
-          "size": 204800,
-          "uuid": "550e8400-e29b-41d4-a716-446655440000"
-        }
-    """.trimIndent()
-
     @Test
-    fun succeedsWhenCalibreSearchEndpointReturnsJson() = runTest {
-        val tester = testerWithRoutes(
-            searchJson = """{"total_num": 12, "book_ids": []}""",
-        )
-
-        val result = tester.check("http://192.168.1.5:8080")
-
-        assertEquals(CalibreConnectionCheckResult.Success(bookCount = 12), result)
-    }
-
-    @Test
-    fun succeedsWithRealCalibreWirePayloadIncludingExtraFields() = runTest {
-        // Regression: default Json rejects unknown keys; ignoreUnknownKeys = true is required.
-        val tester = testerWithRoutes(
-            searchJson = realSearchResponse,
-            bookMetaJson = realBookMetaResponse,
-        )
-
-        val result = tester.check("http://192.168.1.5:8080")
-
-        assertEquals(CalibreConnectionCheckResult.Success(bookCount = 12), result)
-    }
-
-    @Test
-    fun probesBookMetaWhenSearchReturnsIds() = runTest {
-        val probedPaths = mutableListOf<String>()
+    fun connectionBaselineUsesOpdsAndNeverRequiresAjax() = runTest {
+        val requestedPaths = mutableListOf<String>()
         val tester = testerWithEngine { request ->
-            probedPaths += request.url.encodedPath
-            when {
-                request.url.encodedPath == "/ajax/search" ->
-                    respond(realSearchResponse, headers = jsonHeaders)
-                request.url.encodedPath == "/ajax/books" ->
-                    respond("""{"42":$realBookMetaResponse}""", headers = jsonHeaders)
-                else -> respondError(HttpStatusCode.NotFound)
-            }
-        }
-
-        val result = tester.check("http://192.168.1.5:8080")
-
-        assertTrue(result is CalibreConnectionCheckResult.Success)
-        assertTrue(
-            "Expected book meta probe; got paths: $probedPaths",
-            probedPaths.contains("/ajax/books"),
-        )
-    }
-
-    @Test
-    fun reportsParseFailureWhenBookMetaHasUnexpectedShape() = runTest {
-        // If Calibre changes its wire format, the probe should surface it during connection test
-        // rather than silently breaking in the library view.
-        val tester = testerWithEngine { request ->
-            when {
-                request.url.encodedPath == "/ajax/search" ->
-                    respond("""{"total_num":1,"book_ids":[1]}""", headers = jsonHeaders)
-                // Return a malformed book meta (title is an int instead of a string) to simulate
-                // a wire-format mismatch the app cannot handle.
-                else -> respond("""{"1":{"id":1,"title":9999}}""", headers = jsonHeaders)
-            }
-        }
-
-        val result = tester.check("http://192.168.1.5:8080")
-
-        assertTrue(
-            "Expected parse failure but got: $result",
-            result is CalibreConnectionCheckResult.Failure,
-        )
-    }
-
-    @Test
-    fun bookMetaProbeServerFailureDoesNotReportAWorkingConnection() = runTest {
-        val tester = testerWithEngine { request ->
-            when {
-                request.url.encodedPath == "/ajax/search" ->
-                    respond(
-                        """{"total_num":1,"book_ids":[99],"library_id":"books"}""",
-                        headers = jsonHeaders,
-                    )
+            requestedPaths += request.url.encodedPath
+            when (request.url.encodedPath) {
+                "/opds" -> respond(OPDS_ROOT, headers = atomHeaders)
                 else -> respondError(HttpStatusCode.BadGateway)
             }
         }
 
         val result = tester.check("http://192.168.1.5:8080")
 
-        assertEquals(
-            CalibreConnectionCheckResult.Failure(
-                message = "Calibre 服务器暂时不可用（HTTP 502）",
-                nextStep = "已到达服务器地址；请检查 Calibre Content Server 或前置反向代理后重试",
-                kind = CalibreConnectionCheckResult.Failure.Kind.SERVER_RESPONSE,
-            ),
-            result,
-        )
+        assertEquals(CalibreConnectionCheckResult.Success(bookCount = null), result)
+        assertEquals(listOf("/opds"), requestedPaths)
     }
 
     @Test
-    fun usesConfiguredHttpsMagicDnsEndpointWithoutImplicitFallback() = runTest {
-        var requestedUrl = ""
-        val tester = testerWithEngine { request ->
-            requestedUrl = request.url.toString()
-            respond(
-                content = """{"total_num": 0, "book_ids": []}""",
-                headers = jsonHeaders,
-            )
-        }
-
-        val result = tester.check("https://reader.tailnet.ts.net")
-
-        assertTrue(result is CalibreConnectionCheckResult.Success)
-        assertEquals(
-            "https://reader.tailnet.ts.net/ajax/search?query=&num=1&offset=0",
-            requestedUrl,
-        )
-    }
-
-    @Test
-    fun reportsAuthenticationFailureWithNextStep() = runTest {
-        val tester = testerWithEngine {
-            respondError(HttpStatusCode.Unauthorized)
-        }
-
-        val result = tester.check("http://192.168.1.5:8080")
-
-        assertEquals(
-            CalibreConnectionCheckResult.Failure(
-                message = "Calibre 服务器需要认证",
-                nextStep = "请在书源设置中填写 Calibre 用户名和密码",
-                kind = CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED,
-            ),
-            result,
-        )
-    }
-
-    @Test
-    fun reportsNonCalibreJsonWithAddressGuidance() = runTest {
-        val tester = testerWithRoutes(searchJson = """{"ok": true}""")
-
-        val result = tester.check("http://192.168.1.5:8080")
-
-        assertEquals(
-            CalibreConnectionCheckResult.Failure(
-                message = "服务器响应不像 Calibre Content Server",
-                nextStep = "确认地址直接指向 Calibre Content Server，例如 http://192.168.1.5:8080",
-            ),
-            result,
-        )
-    }
-
-    @Test
-    fun normalizesAndUsesSearchEndpoint() = runTest {
-        var requestedUrl = ""
-        val tester = testerWithEngine {
-            requestedUrl = it.url.toString()
-            respond(
-                content = """{"total_num": 0, "book_ids": []}""",
-                headers = jsonHeaders,
-            )
-        }
-
-        val result = tester.check(" http://192.168.1.5:8080/ ")
-
-        assertTrue(result is CalibreConnectionCheckResult.Success)
-        assertEquals("http://192.168.1.5:8080/ajax/search?query=&num=1&offset=0", requestedUrl)
-    }
-
-    @Test
-    fun moonReaderStyleOpdsUrlsUseTheirSiblingAjaxEndpoint() = runTest {
+    fun derivesOpdsPathWithoutChangingConfiguredOriginOrProxyPrefix() = runTest {
         val cases = listOf(
-            "http://192.168.1.5:8080/opds/" to
-                "http://192.168.1.5:8080/ajax/search?query=&num=1&offset=0",
-            "http://192.168.1.5:8080/calibre/opds" to
-                "http://192.168.1.5:8080/calibre/ajax/search?query=&num=1&offset=0",
-            "http://192.168.1.5:8080/calibre" to
-                "http://192.168.1.5:8080/calibre/ajax/search?query=&num=1&offset=0",
+            "http://192.168.1.5:8080" to "/opds",
+            "http://192.168.1.5:8080/opds" to "/opds",
+            "http://192.168.1.5:8080/calibre" to "/calibre/opds",
+            "http://192.168.1.5:8080/calibre/opds" to "/calibre/opds",
         )
 
-        cases.forEach { (configuredUrl, expectedRequestUrl) ->
+        cases.forEach { (configured, expectedPath) ->
             var requestedUrl = ""
-            val tester = testerWithEngine {
-                requestedUrl = it.url.toString()
-                respond(
-                    content = """{"total_num": 0, "book_ids": []}""",
-                    headers = jsonHeaders,
+            val result = testerWithEngine { request ->
+                requestedUrl = request.url.toString()
+                respond(OPDS_ROOT, headers = atomHeaders)
+            }.check(configured)
+
+            assertTrue("connection failed for $configured: $result", result is CalibreConnectionCheckResult.Success)
+            assertEquals(expectedPath, java.net.URI(requestedUrl).path)
+            assertEquals(java.net.URI(configured).scheme, java.net.URI(requestedUrl).scheme)
+            assertEquals(java.net.URI(configured).host, java.net.URI(requestedUrl).host)
+            assertEquals(java.net.URI(configured).port, java.net.URI(requestedUrl).port)
+        }
+    }
+
+    @Test
+    fun explicitHttpsMagicDnsUsesOnlyItsConfiguredOrigin() = runTest {
+        val requested = mutableListOf<String>()
+        val result = testerWithEngine { request ->
+            requested += request.url.toString()
+            respond(OPDS_ROOT, headers = atomHeaders)
+        }.check("https://reader.tailnet.ts.net")
+
+        assertTrue(result is CalibreConnectionCheckResult.Success)
+        assertEquals(listOf("https://reader.tailnet.ts.net/opds"), requested)
+    }
+
+    @Test
+    fun explicitTailnetHttpCredentialsFailClosedWithoutPositiveVpnEvidence() = runTest {
+        val networks = listOf(
+            CalibreNetworkSnapshot.Unknown,
+            CalibreNetworkSnapshot.Active(vpnAppliesToApp = false, internetValidated = true),
+        )
+        val endpoints = listOf(
+            "http://100.101.102.103:8080",
+            "http://reader.tailnet.ts.net:8080",
+        )
+
+        networks.forEach { network ->
+            endpoints.forEach { endpoint ->
+                var requests = 0
+                val result = testerWithEngine(
+                    networkSnapshotProvider = CalibreNetworkSnapshotProvider { network },
+                ) {
+                    requests += 1
+                    respond(OPDS_ROOT, headers = atomHeaders)
+                }.check(endpoint, credentials)
+
+                assertEquals("$endpoint with $network", 0, requests)
+                assertTrue("$endpoint with $network should fail closed: $result", result is CalibreConnectionCheckResult.Failure)
+                assertEquals(
+                    CalibreConnectionCheckResult.Failure.Kind.TAILNET_UNREACHABLE,
+                    (result as CalibreConnectionCheckResult.Failure).kind,
                 )
             }
-
-            val result = tester.check(configuredUrl)
-
-            assertTrue("Expected Calibre connection to succeed for $configuredUrl", result is CalibreConnectionCheckResult.Success)
-            assertEquals(expectedRequestUrl, requestedUrl)
         }
+    }
+
+    @Test
+    fun explicitTailnetHttpWithoutCredentialsStillRunsAnUnauthenticatedProbe() = runTest {
+        val networks = listOf(
+            CalibreNetworkSnapshot.Unknown,
+            CalibreNetworkSnapshot.Active(vpnAppliesToApp = false, internetValidated = true),
+        )
+
+        networks.forEach { network ->
+            var requests = 0
+            val result = testerWithEngine(
+                networkSnapshotProvider = CalibreNetworkSnapshotProvider { network },
+            ) {
+                requests += 1
+                respond(OPDS_ROOT, headers = atomHeaders)
+            }.check("http://100.101.102.103:8080")
+
+            assertEquals("unauthenticated probe with $network", 1, requests)
+            assertTrue("unauthenticated probe failed with $network: $result", result is CalibreConnectionCheckResult.Success)
+        }
+    }
+
+    @Test
+    fun digestCredentialsWaitForChallengeThenRetryOpds() = runTest {
+        val authorizations = mutableListOf<String?>()
+        val tester = testerWithEngine(
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                CalibreNetworkSnapshot.Active(vpnAppliesToApp = true, internetValidated = true)
+            },
+        ) { request ->
+            val authorization = request.headers[HttpHeaders.Authorization]
+            authorizations += authorization
+            if (authorization == null) {
+                respond(
+                    content = "",
+                    status = HttpStatusCode.Unauthorized,
+                    headers = headersOf(
+                        HttpHeaders.WWWAuthenticate,
+                        "Digest realm=\"calibre\", nonce=\"test-nonce\", algorithm=MD5, qop=\"auth\"",
+                    ),
+                )
+            } else {
+                respond(OPDS_ROOT, headers = atomHeaders)
+            }
+        }
+
+        val result = tester.check("http://100.101.102.103:8080", credentials)
+
+        assertTrue("Digest OPDS connection failed: $result", result is CalibreConnectionCheckResult.Success)
+        assertNull(authorizations.first())
+        assertEquals(2, authorizations.size)
+        assertTrue(authorizations.last().orEmpty().startsWith("Digest "))
+    }
+
+    @Test
+    fun reportsAuthenticationRequiredWithSafeRequestContext() = runTest {
+        val result = testerWithEngine {
+            respondError(HttpStatusCode.Unauthorized)
+        }.check("http://192.168.1.5:8080")
+
+        assertTrue(result is CalibreConnectionCheckResult.Failure)
+        val failure = result as CalibreConnectionCheckResult.Failure
+        assertEquals(CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED, failure.kind)
+        assertTrue(failure.message.contains("phase=opds_root"))
+        assertTrue(failure.message.contains("origin=http://192.168.1.5:8080"))
+    }
+
+    @Test
+    fun gatewayFailureDoesNotClaimItReachedCalibreAndDoesNotExposePath() = runTest {
+        val result = testerWithEngine {
+            respondError(HttpStatusCode.BadGateway)
+        }.check("https://reader.tailnet.ts.net/private-proxy")
+
+        assertTrue(result is CalibreConnectionCheckResult.Failure)
+        val failure = result as CalibreConnectionCheckResult.Failure
+        assertEquals(CalibreConnectionCheckResult.Failure.Kind.SERVER_RESPONSE, failure.kind)
+        assertTrue(failure.message.contains("phase=opds_root"))
+        assertTrue(failure.message.contains("origin=https://reader.tailnet.ts.net"))
+        assertTrue(failure.message.contains("status=502"))
+        assertFalse(failure.message.contains("private-proxy"))
+        assertFalse(failure.nextStep.contains("已到达服务器"))
+    }
+
+    @Test
+    fun rejectsNonAtomResponseAsNotCalibre() = runTest {
+        val result = testerWithEngine {
+            respond("<html><body>not calibre</body></html>")
+        }.check("http://192.168.1.5:8080")
+
+        assertTrue(result is CalibreConnectionCheckResult.Failure)
+        val failure = result as CalibreConnectionCheckResult.Failure
+        assertTrue(failure.message.contains("不是可识别的 Calibre OPDS"))
+        assertFalse(failure.message.contains("html"))
     }
 
     @Test
     fun refusesRedirectFromPrivateCalibreToPublicHttp() = runTest {
         var requestCount = 0
-        val tester = testerWithEngine { request ->
-            requestCount++
+        val result = testerWithEngine { request ->
+            requestCount += 1
             if (requestCount == 1) {
                 respond(
                     content = "",
                     status = HttpStatusCode.Found,
-                    headers = headersOf(HttpHeaders.Location, "http://example.com/books"),
+                    headers = headersOf(HttpHeaders.Location, "http://example.com/opds"),
                 )
             } else {
                 error("public redirect must not be requested: ${request.url}")
             }
-        }
-
-        val result = tester.check("http://192.168.1.5:8080")
+        }.check("http://192.168.1.5:8080")
 
         assertTrue(result is CalibreConnectionCheckResult.Failure)
         assertEquals(1, requestCount)
     }
 
-    @Test
-    fun tailscaleIpv4CredentialsDoNotReachEngineWhenVpnStateIsUnknown() = runTest {
-        assertTailnetCredentialsDoNotReachEngine(
-            baseUrl = "http://100.101.102.103:8080",
-            network = CalibreNetworkSnapshot.Unknown,
-        )
-    }
-
-    @Test
-    fun magicDnsCredentialsDoNotReachEngineWhenVpnStateIsUnknown() = runTest {
-        assertTailnetCredentialsDoNotReachEngine(
-            baseUrl = "http://reader.tailnet.ts.net:8080",
-            network = CalibreNetworkSnapshot.Unknown,
-        )
-    }
-
-    @Test
-    fun tailscaleIpv4CredentialsDoNotReachEngineWithoutAppScopedVpn() = runTest {
-        assertTailnetCredentialsDoNotReachEngine(
-            baseUrl = "http://100.101.102.103:8080",
-            network = inactiveVpnNetwork,
-        )
-    }
-
-    @Test
-    fun magicDnsCredentialsDoNotReachEngineWithoutAppScopedVpn() = runTest {
-        assertTailnetCredentialsDoNotReachEngine(
-            baseUrl = "http://reader.tailnet.ts.net:8080",
-            network = inactiveVpnNetwork,
-        )
-    }
-
-    @Test
-    fun credentialsStillReachLanHttpAndHttpsWhenVpnStateIsUnknown() = runTest {
-        listOf(
-            "http://192.168.1.5:8080",
-            "https://books.example",
-        ).forEach { baseUrl ->
-            var requestCount = 0
-            val tester = testerWithEngine(
-                networkSnapshotProvider = CalibreNetworkSnapshotProvider {
-                    CalibreNetworkSnapshot.Unknown
-                },
-            ) {
-                requestCount += 1
-                respond("""{"total_num":0,"book_ids":[]}""", headers = jsonHeaders)
-            }
-
-            val result = tester.check(baseUrl, storedCredentials)
-
-            assertEquals("$baseUrl must still reach the engine", 1, requestCount)
-            assertTrue(
-                "$baseUrl should remain usable: $result",
-                result is CalibreConnectionCheckResult.Success,
-            )
-        }
-    }
-
-    @Test
-    fun authenticationRetryDoesNotReachEngineAfterVpnDisconnects() = runTest {
-        var snapshotCount = 0
-        val network = CalibreNetworkSnapshotProvider {
-            if (snapshotCount++ == 0) activeVpnNetwork else inactiveVpnNetwork
-        }
-        val authorizations = mutableListOf<String?>()
-        val tester = testerWithEngine(networkSnapshotProvider = network) { request ->
-            authorizations += request.headers[HttpHeaders.Authorization]
-            respond(
-                content = "",
-                status = HttpStatusCode.Unauthorized,
-                headers = headersOf(HttpHeaders.WWWAuthenticate, "Basic realm=\"calibre\""),
-            )
-        }
-
-        tester.check("http://100.101.102.103:8080", storedCredentials)
-
-        assertEquals(
-            "only the unauthenticated challenge request may reach the engine",
-            listOf<String?>(null),
-            authorizations,
-        )
-        assertTrue("VPN state must be sampled again before authentication", snapshotCount >= 2)
-    }
-
-    // ---------------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------------
-
-    /** Routes search and optional book-meta to pre-canned JSON strings. */
-    private fun testerWithRoutes(
-        searchJson: String,
-        bookMetaJson: String? = null,
-    ): CalibreConnectionTester = testerWithEngine { request ->
-        when {
-            request.url.encodedPath == "/ajax/search" ->
-                respond(searchJson, headers = jsonHeaders)
-            request.url.encodedPath == "/ajax/books" && bookMetaJson != null ->
-                respond("""{"42":$bookMetaJson}""", headers = jsonHeaders)
-            request.url.encodedPath == "/ajax/books" ->
-                respondError(HttpStatusCode.NotFound)
-            else -> respondError(HttpStatusCode.NotFound)
-        }
-    }
-
     private fun testerWithEngine(
-        networkSnapshotProvider: CalibreNetworkSnapshotProvider =
-            UnknownCalibreNetworkSnapshotProvider,
+        networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
         handler: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
-    ): CalibreConnectionTester =
-        KtorCalibreConnectionTester(
-            httpClientFactory = { baseUrl, username, password ->
-                defaultCalibreHttpClient(
-                    engine = MockEngine(handler),
-                    allowedBaseUrl = baseUrl,
-                    username = username,
-                    password = password,
-                    networkSnapshotProvider = networkSnapshotProvider,
-                )
-            },
-            networkSnapshotProvider = networkSnapshotProvider,
-        )
-
-    private suspend fun assertTailnetCredentialsDoNotReachEngine(
-        baseUrl: String,
-        network: CalibreNetworkSnapshot,
-    ) {
-        var requestCount = 0
-        val tester = testerWithEngine(
-            networkSnapshotProvider = CalibreNetworkSnapshotProvider { network },
-        ) {
-            requestCount += 1
-            respond("""{"total_num":0,"book_ids":[]}""", headers = jsonHeaders)
-        }
-
-        tester.check(baseUrl, storedCredentials)
-
-        assertEquals("$baseUrl must not reach the engine with $network", 0, requestCount)
-    }
+    ): CalibreConnectionTester = KtorCalibreConnectionTester(
+        httpClientFactory = { baseUrl, username, password ->
+            defaultCalibreHttpClient(
+                engine = MockEngine(handler),
+                allowedBaseUrl = baseUrl,
+                username = username,
+                password = password,
+                networkSnapshotProvider = networkSnapshotProvider,
+            )
+        },
+        networkSnapshotProvider = networkSnapshotProvider,
+    )
 
     private companion object {
-        val storedCredentials = SourceCredentials(username = "reader", password = "secret")
-        val activeVpnNetwork = CalibreNetworkSnapshot.Active(
-            vpnAppliesToApp = true,
-            internetValidated = true,
-        )
-        val inactiveVpnNetwork = CalibreNetworkSnapshot.Active(
-            vpnAppliesToApp = false,
-            internetValidated = true,
-        )
-        val jsonHeaders = headersOf(HttpHeaders.ContentType, ContentType.Application.Json.toString())
+        val credentials = SourceCredentials(username = "reader", password = "secret")
+        val atomHeaders = headersOf(HttpHeaders.ContentType, "application/atom+xml")
+        const val OPDS_ROOT = """<?xml version="1.0" encoding="UTF-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <id>urn:calibre:main</id>
+              <title>calibre library</title>
+              <link rel="search" href="/opds/search/{searchTerms}" type="application/atom+xml"/>
+              <entry>
+                <id>calibre-nav:newest</id>
+                <title>Newest</title>
+                <link href="/opds/navcatalog/newest" type="application/atom+xml;profile=opds-catalog"/>
+              </entry>
+            </feed>"""
     }
 }

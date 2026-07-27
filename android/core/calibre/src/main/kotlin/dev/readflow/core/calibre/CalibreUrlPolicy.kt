@@ -1,5 +1,6 @@
 package dev.readflow.core.calibre
 
+import io.ktor.http.URLBuilder
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.URI
@@ -58,53 +59,10 @@ internal fun canonicalizeTailscaleServeCalibreUrl(rawUrl: String): String {
 }
 
 /**
- * Returns the direct Content Server candidate for a bare HTTPS MagicDNS endpoint.
- *
- * The configured URL remains authoritative. Callers must try it first and may only persist this
- * candidate after a successful Calibre probe.
- */
-internal fun directTailscaleContentServerFallback(normalized: String): String? {
-    val uri = URI(normalized)
-    val host = uri.host?.withoutIpv6Brackets() ?: return null
-    val isDefaultHttpsPort = uri.port == -1 || uri.port == 443
-    val isDirectCalibrePath = uri.rawPath.orEmpty().trimEnd('/').let {
-        it.isEmpty() || it.equals(CALIBRE_OPDS_TERMINAL_PATH, ignoreCase = true)
-    }
-    if (
-        uri.scheme.equals("https", ignoreCase = true) &&
-        isDefaultHttpsPort &&
-        isDirectCalibrePath &&
-        host.isTailscaleMagicDnsHostname()
-    ) {
-        val path = uri.rawPath.orEmpty()
-        return "http://${host.lowercase()}:8080$path".trimEnd('/')
-    }
-    return null
-}
-
-/**
- * A generated direct HTTP endpoint is safe to probe with stored credentials only when it is the
- * exact fallback for the configured HTTPS MagicDNS address and Android has positively established
- * that this app is routed through a VPN.  An unknown network state is deliberately not enough:
- * otherwise a hostile DNS or LAN responder could solicit Basic credentials over cleartext HTTP.
- */
-internal fun isVpnProtectedDirectTailscaleFallback(
-    configuredUrl: String,
-    candidateUrl: String,
-    network: CalibreNetworkSnapshot,
-): Boolean {
-    if (!network.hasActiveVpnForCalibre()) return false
-    val configured = runCatching { requireValidCalibreBaseUrl(configuredUrl) }.getOrNull()
-        ?: return false
-    val candidate = runCatching { requireValidCalibreBaseUrl(candidateUrl) }.getOrNull()
-        ?: return false
-    return directTailscaleContentServerFallback(configured) == candidate
-}
-
-/**
- * A persisted HTTP tailnet endpoint must not be opened outside the VPN either.  Otherwise a
- * previously verified fallback would become a credential leak on a later hostile network after
- * the VPN disconnects.
+ * Cleartext Calibre endpoints on a Tailscale address may only use persisted credentials while
+ * Android positively reports that the app is routed through a VPN.  We still allow an
+ * unauthenticated probe so the caller can distinguish reachability from authentication, but never
+ * read or attach a stored username/password while the route is unknown or inactive.
  */
 fun requiresActiveVpnForCalibreHttp(baseUrl: String): Boolean {
     val uri = runCatching { URI(baseUrl) }.getOrNull() ?: return false
@@ -113,11 +71,6 @@ fun requiresActiveVpnForCalibreHttp(baseUrl: String): Boolean {
     return host.isTailscaleMagicDnsHostname() || host.isTailscaleIpv4() || host.isTailscaleIpv6()
 }
 
-/**
- * Stored credentials may be used normally over HTTPS and private LAN HTTP. Tailnet HTTP is the
- * exception: an unknown network state is deliberately treated as unsafe so a stale route or
- * hostile DNS responder cannot solicit credentials after Tailscale disconnects.
- */
 fun canUseStoredCalibreCredentials(
     requestUrl: String,
     network: CalibreNetworkSnapshot,
@@ -133,29 +86,19 @@ fun canUseStoredCalibreCredentials(
 internal fun CalibreNetworkSnapshot.hasActiveVpnForCalibre(): Boolean =
     this is CalibreNetworkSnapshot.Active && vpnAppliesToApp
 
-/**
- * A credential may follow an endpoint change only for the tightly constrained, VPN-protected
- * MagicDNS HTTPS -> direct HTTP:8080 transition.  Equal scopes include harmless spelling changes
- * such as equivalent IPv6 literals and need no credential write at all.
- */
+/** Equal origins retain credentials; any scheme, host, or port change clears them. */
 internal fun calibreCredentialTransition(
     currentUrl: String,
     verifiedUrl: String,
-    network: CalibreNetworkSnapshot,
 ): CalibreCredentialTransition {
     val currentScope = calibreCredentialScopeForRequestUrl(currentUrl)
     val verifiedScope = calibreCredentialScopeForRequestUrl(verifiedUrl)
     if (currentScope == verifiedScope) return CalibreCredentialTransition.UNCHANGED
-    return if (isVpnProtectedDirectTailscaleFallback(currentUrl, verifiedUrl, network)) {
-        CalibreCredentialTransition.MIGRATE_TRUSTED_FALLBACK
-    } else {
-        CalibreCredentialTransition.CLEAR
-    }
+    return CalibreCredentialTransition.CLEAR
 }
 
 internal enum class CalibreCredentialTransition {
     UNCHANGED,
-    MIGRATE_TRUSTED_FALLBACK,
     CLEAR,
 }
 
@@ -171,6 +114,25 @@ internal fun requireCalibreAjaxBaseUrl(rawUrl: String): String {
     } else {
         normalized
     }
+}
+
+/** Resolves the configured Calibre endpoint to its OPDS catalog without changing its origin. */
+internal fun requireCalibreOpdsUrl(
+    rawUrl: String,
+    libraryId: String = DEFAULT_CALIBRE_LIBRARY_ID,
+): String {
+    val normalized = requireValidCalibreBaseUrl(rawUrl)
+    val opdsUrl = if (normalized.endsWith(CALIBRE_OPDS_TERMINAL_PATH, ignoreCase = true)) {
+        normalized
+    } else {
+        "$normalized$CALIBRE_OPDS_TERMINAL_PATH"
+    }
+    val selectedLibrary = libraryId.trim().ifBlank { DEFAULT_CALIBRE_LIBRARY_ID }
+    if (selectedLibrary == DEFAULT_CALIBRE_LIBRARY_ID) return opdsUrl
+
+    return URLBuilder(opdsUrl).apply {
+        parameters.append("library_id", selectedLibrary)
+    }.buildString()
 }
 
 fun requireAllowedCalibreRequestUrl(url: String) {

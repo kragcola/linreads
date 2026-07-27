@@ -7,19 +7,49 @@ import dev.readflow.core.calibre.SourceCredentialStore
 import dev.readflow.core.calibre.authenticatedCalibreCoverUrl
 import dev.readflow.core.calibre.calibreCredentialScopeForRequestUrl
 import dev.readflow.extensions.api.SourceCredentials
+import okhttp3.Dns
 import okhttp3.Request
 import okhttp3.Protocol
 import okhttp3.Response
+import java.net.InetAddress
+import java.net.Proxy
+import java.net.ServerSocket
+import java.net.SocketTimeoutException
+import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.nio.charset.Charset
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.MethodSource
 
 class CalibreCoverAuthenticationTest {
+
+    @Test
+    fun coverHttpClientDoesNotUseTheSystemProxy() {
+        val client = calibreCoverHttpClient(
+            credentialStore = RecordingCredentialStore(
+                expectedScope = "http://127.0.0.1",
+                credentials = SourceCredentials("reader", "secret"),
+            ),
+        )
+
+        try {
+            assertEquals(Proxy.NO_PROXY, client.proxy)
+        } finally {
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+        }
+    }
 
     @Test
     fun authenticatedCoverRequestStripsMarkerAndRetainsScopedCredentialsWithoutPreemptiveAuth() {
@@ -271,6 +301,308 @@ class CalibreCoverAuthenticationTest {
         assertEquals(uri, directives["uri"])
         assertEquals("opaque-token", directives["opaque"])
         assertEquals(expected, directives["response"])
+    }
+
+    @Test
+    fun coverHttpClientPreservesCredentialsAcrossARealDigestChallenge() {
+        val credentials = SourceCredentials("reader", "secret")
+        val requests = mutableListOf<Pair<String, String?>>()
+        val executor = Executors.newSingleThreadExecutor()
+        val server = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        val serverTask = executor.submit {
+            repeat(2) {
+                server.accept().use { socket ->
+                    val reader = socket.getInputStream().bufferedReader(StandardCharsets.ISO_8859_1)
+                    val requestLine = requireNotNull(reader.readLine())
+                    val headers = buildList {
+                        while (true) {
+                            val line = reader.readLine()
+                            if (line.isNullOrEmpty()) break
+                            add(line)
+                        }
+                    }
+                    val authorization = headers.firstOrNull {
+                        it.startsWith("Authorization:", ignoreCase = true)
+                    }?.substringAfter(':')?.trim()
+                    requests += requestLine.split(' ')[1] to authorization
+                    val response = if (authorization == null) {
+                        "HTTP/1.1 401 Unauthorized\r\n" +
+                            "WWW-Authenticate: Digest realm=\"calibre\", nonce=\"test-nonce\", " +
+                            "algorithm=\"MD5\", qop=\"auth\"\r\n" +
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ncover"
+                    }
+                    socket.getOutputStream().apply {
+                        write(response.toByteArray(StandardCharsets.ISO_8859_1))
+                        flush()
+                    }
+                }
+            }
+        }
+        val baseUrl = "http://127.0.0.1:${server.localPort}"
+        val store = RecordingCredentialStore(
+            expectedScope = baseUrl,
+            credentials = credentials,
+        )
+        val client = calibreCoverHttpClient(store)
+
+        try {
+            val markedUrl = authenticatedCalibreCoverUrl(
+                "$baseUrl/get/cover/42/calibre-library",
+                "source-calibre",
+            )
+            client.newCall(Request.Builder().url(markedUrl).build()).execute().use { response ->
+                assertEquals(200, response.code)
+            }
+
+            serverTask.get(5, TimeUnit.SECONDS)
+            assertEquals(2, requests.size)
+            assertTrue(requests.all { (url, _) -> CALIBRE_COVER_SOURCE_QUERY_PARAMETER !in url })
+            assertNull(requests.first().second)
+            assertNotNull(requests.last().second)
+            assertFalse(requests.last().second.orEmpty().contains(credentials.password))
+        } finally {
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+            server.close()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun coverHttpClientDoesNotSendDigestAuthorizationAfterVpnBecomesInactive() {
+        val credentials = SourceCredentials("reader", "secret")
+        val network = AtomicReference<CalibreNetworkSnapshot>(
+            CalibreNetworkSnapshot.Active(
+                vpnAppliesToApp = true,
+                internetValidated = true,
+            ),
+        )
+        val requests = mutableListOf<String?>()
+        val executor = Executors.newSingleThreadExecutor()
+        val server = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1")).apply {
+            soTimeout = 5_000
+        }
+        val serverTask = executor.submit {
+            try {
+                repeat(2) { requestIndex ->
+                    server.accept().use { socket ->
+                        val reader = socket.getInputStream()
+                            .bufferedReader(StandardCharsets.ISO_8859_1)
+                        requireNotNull(reader.readLine())
+                        val headers = buildList {
+                            while (true) {
+                                val line = reader.readLine()
+                                if (line.isNullOrEmpty()) break
+                                add(line)
+                            }
+                        }
+                        requests += headers.firstOrNull {
+                            it.startsWith("Authorization:", ignoreCase = true)
+                        }?.substringAfter(':')?.trim()
+
+                        val response = if (requestIndex == 0) {
+                            server.soTimeout = 1_000
+                            network.set(
+                                CalibreNetworkSnapshot.Active(
+                                    vpnAppliesToApp = false,
+                                    internetValidated = true,
+                                ),
+                            )
+                            "HTTP/1.1 401 Unauthorized\r\n" +
+                                "WWW-Authenticate: Digest realm=\"calibre\", nonce=\"test-nonce\", " +
+                                "algorithm=\"MD5\", qop=\"auth\"\r\n" +
+                                "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ncover"
+                        }
+                        socket.getOutputStream().apply {
+                            write(response.toByteArray(StandardCharsets.ISO_8859_1))
+                            flush()
+                        }
+                    }
+                }
+            } catch (_: SocketTimeoutException) {
+                // A secure client may stop after the challenge instead of retrying.
+            }
+        }
+        val baseUrl = "http://reader.tailnet.ts.net:${server.localPort}"
+        val store = RecordingCredentialStore(
+            expectedScope = baseUrl,
+            credentials = credentials,
+        )
+        val client = calibreCoverHttpClient(
+            credentialStore = store,
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider { network.get() },
+        ).newBuilder()
+            .proxy(Proxy.NO_PROXY)
+            .dns(
+                object : Dns {
+                    override fun lookup(hostname: String): List<InetAddress> {
+                        assertEquals("reader.tailnet.ts.net", hostname)
+                        return listOf(InetAddress.getByName("127.0.0.1"))
+                    }
+                },
+            )
+            .build()
+
+        try {
+            val markedUrl = authenticatedCalibreCoverUrl(
+                "$baseUrl/get/cover/42/calibre-library",
+                "source-calibre",
+            )
+            client.newCall(Request.Builder().url(markedUrl).build()).execute().close()
+
+            serverTask.get(5, TimeUnit.SECONDS)
+            assertTrue(requests.isNotEmpty(), "the server must receive the initial cover request")
+            assertNull(requests.first(), "the initial cover request must not send Authorization")
+            assertTrue(
+                requests.drop(1).none { authorization -> authorization != null },
+                "authentication follow-up must not send Authorization after VPN becomes inactive",
+            )
+        } finally {
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+            server.close()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun coverHttpClientStripsBasicAuthorizationWhenVpnFailsAfterAuthenticator() {
+        val credentials = SourceCredentials("reader", "secret")
+        val snapshotReads = AtomicInteger()
+        val active = CalibreNetworkSnapshot.Active(
+            vpnAppliesToApp = true,
+            internetValidated = true,
+        )
+        val inactive = CalibreNetworkSnapshot.Active(
+            vpnAppliesToApp = false,
+            internetValidated = true,
+        )
+        val requests = mutableListOf<String?>()
+        val executor = Executors.newSingleThreadExecutor()
+        val server = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1")).apply {
+            soTimeout = 5_000
+        }
+        val serverTask = executor.submit {
+            repeat(2) { requestIndex ->
+                server.accept().use { socket ->
+                    val reader = socket.getInputStream()
+                        .bufferedReader(StandardCharsets.ISO_8859_1)
+                    requireNotNull(reader.readLine())
+                    val headers = buildList {
+                        while (true) {
+                            val line = reader.readLine()
+                            if (line.isNullOrEmpty()) break
+                            add(line)
+                        }
+                    }
+                    val authorization = headers.firstOrNull {
+                        it.startsWith("Authorization:", ignoreCase = true)
+                    }?.substringAfter(':')?.trim()
+                    requests += authorization
+                    val response = when {
+                        requestIndex == 0 ->
+                            "HTTP/1.1 401 Unauthorized\r\n" +
+                                "WWW-Authenticate: Basic realm=\"calibre\"\r\n" +
+                                "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        authorization == null ->
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        else ->
+                            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ncover"
+                    }
+                    socket.getOutputStream().apply {
+                        write(response.toByteArray(StandardCharsets.ISO_8859_1))
+                        flush()
+                    }
+                }
+            }
+        }
+        val baseUrl = "http://reader.tailnet.ts.net:${server.localPort}"
+        val client = calibreCoverHttpClient(
+            credentialStore = RecordingCredentialStore(
+                expectedScope = baseUrl,
+                credentials = credentials,
+            ),
+            networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+                if (snapshotReads.incrementAndGet() <= 3) active else inactive
+            },
+        ).newBuilder()
+            .dns(
+                object : Dns {
+                    override fun lookup(hostname: String): List<InetAddress> {
+                        assertEquals("reader.tailnet.ts.net", hostname)
+                        return listOf(InetAddress.getByName("127.0.0.1"))
+                    }
+                },
+            )
+            .build()
+
+        try {
+            val markedUrl = authenticatedCalibreCoverUrl(
+                "$baseUrl/get/cover/42/calibre-library",
+                "source-calibre",
+            )
+            client.newCall(Request.Builder().url(markedUrl).build()).execute().use { response ->
+                assertEquals(401, response.code)
+            }
+
+            serverTask.get(5, TimeUnit.SECONDS)
+            assertEquals(listOf(null, null), requests)
+            assertTrue(snapshotReads.get() >= 4, "the authentication follow-up must reach the final VPN gate")
+        } finally {
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+            server.close()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun coverHttpClientRechecksVpnAtTheFinalNetworkBoundary() {
+        val credentials = SourceCredentials("reader", "secret")
+        // The initial application interceptor already consumed one active snapshot.
+        val snapshotReads = AtomicInteger(1)
+        val active = CalibreNetworkSnapshot.Active(
+            vpnAppliesToApp = true,
+            internetValidated = true,
+        )
+        val inactive = CalibreNetworkSnapshot.Active(
+            vpnAppliesToApp = false,
+            internetValidated = true,
+        )
+        val networkSnapshotProvider = CalibreNetworkSnapshotProvider {
+            if (snapshotReads.incrementAndGet() <= 2) active else inactive
+        }
+        val initial = Request.Builder()
+            .url("http://reader.tailnet.ts.net:8080/get/cover/42/calibre-library")
+            .tag(SourceCredentials::class.java, credentials)
+            .build()
+        val challenge = Response.Builder()
+            .request(initial)
+            .protocol(Protocol.HTTP_1_1)
+            .code(401)
+            .message("Unauthorized")
+            .header("WWW-Authenticate", "Basic realm=\"calibre\"")
+            .build()
+        val retry = requireNotNull(
+            authenticateCalibreCover(
+                response = challenge,
+                networkSnapshotProvider = networkSnapshotProvider,
+            ),
+        )
+
+        assertNotNull(retry.header("Authorization"), "the Authenticator should observe the second active snapshot")
+        val gated = finalCalibreCoverNetworkRequest(
+            request = retry,
+            networkSnapshotProvider = networkSnapshotProvider,
+        )
+
+        assertNull(gated.header("Authorization"))
+        assertNull(gated.tag(SourceCredentials::class.java))
+        assertEquals(3, snapshotReads.get())
     }
 
     @Test

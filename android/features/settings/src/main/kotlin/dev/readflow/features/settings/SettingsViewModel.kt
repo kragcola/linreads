@@ -167,7 +167,8 @@ class SettingsViewModel(
                     persistVerifiedCalibreEndpoint(
                         generation = generation,
                         result = result,
-                        message = "已连接到 Calibre，发现 ${result.bookCount} 本书",
+                        message = result.bookCount?.let { "已连接到 Calibre，发现 $it 本书" }
+                            ?: "已连接到 Calibre OPDS 目录",
                         nextStep = "返回书架后可以搜索并下载书籍",
                     )
                 }
@@ -200,7 +201,9 @@ class SettingsViewModel(
                     persistVerifiedCalibreEndpoint(
                         generation = generation,
                         result = result,
-                        message = "已发现 Calibre：${result.baseUrl.removeProtocol()}，发现 ${result.bookCount} 本书",
+                        message = result.bookCount?.let {
+                            "已发现 Calibre：${result.baseUrl.removeProtocol()}，发现 $it 本书"
+                        } ?: "已发现 Calibre：${result.baseUrl.removeProtocol()}，OPDS 目录可用",
                         nextStep = "已保存该地址，返回书架后可以搜索并下载书籍",
                     )
                 }

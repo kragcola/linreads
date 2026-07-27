@@ -212,7 +212,7 @@ class GenericHttpOnlineCatalog(
 
 private const val MAX_CATALOG_RESPONSE_BYTES = 8 * 1024 * 1024
 
-private suspend fun readCatalogBody(channel: ByteReadChannel): String {
+internal suspend fun readCatalogBody(channel: ByteReadChannel): String {
     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
     return ByteArrayOutputStream().use { output ->
         while (true) {
@@ -410,10 +410,7 @@ private fun parseOpdsFeed(body: String, descriptor: SourceDescriptor): List<Onli
     return entries
 }
 
-/**
- * Prefer EPUB, then PDF, then other supported acquisition types (octet-stream / known formats).
- * Deterministic: first best-ranked candidate wins when ranks tie.
- */
+/** Prefer formats the published reader can open, then other recognized formats, then unknowns. */
 internal fun selectPreferredOpdsAcquisition(
     candidates: List<OpdsAcquisitionCandidate>,
 ): OpdsAcquisitionCandidate? =
@@ -422,12 +419,15 @@ internal fun selectPreferredOpdsAcquisition(
 private fun acquisitionPreferenceRank(candidate: OpdsAcquisitionCandidate): Int {
     val type = candidate.type
     val hint = candidate.formatHint.orEmpty()
+    val hintedFormat = BookFormat.fromExtension(hint)
     return when {
         type.contains("epub", ignoreCase = true) || hint.equals("epub", ignoreCase = true) -> 0
         type.contains("pdf", ignoreCase = true) || hint.equals("pdf", ignoreCase = true) -> 1
-        type.contains("octet-stream", ignoreCase = true) -> 2
-        hint.isNotBlank() && BookFormat.fromExtension(hint) != BookFormat.UNKNOWN -> 3
-        else -> 4
+        hintedFormat == BookFormat.TXT -> 2
+        hintedFormat == BookFormat.MD -> 3
+        hintedFormat != BookFormat.UNKNOWN -> 10 + hintedFormat.ordinal
+        type.contains("octet-stream", ignoreCase = true) -> 100
+        else -> 101
     }
 }
 

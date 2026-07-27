@@ -13,10 +13,12 @@ internal val sourceConfigJson = Json {
     encodeDefaults = true
 }
 
+internal const val DEFAULT_CALIBRE_LIBRARY_ID = "calibre-library"
+
 @Serializable
 data class CalibreSourceConfig(
     val baseUrl: String,
-    val libraryId: String = "calibre-library",
+    val libraryId: String = DEFAULT_CALIBRE_LIBRARY_ID,
 )
 
 @Serializable
@@ -57,7 +59,7 @@ data class HtmlChapterRules(
     val nextPageSelector: String? = null,
 )
 
-fun calibreSourceConfigJson(baseUrl: String, libraryId: String = "calibre-library"): String =
+fun calibreSourceConfigJson(baseUrl: String, libraryId: String = DEFAULT_CALIBRE_LIBRARY_ID): String =
     sourceConfigJson.encodeToString(CalibreSourceConfig(baseUrl, libraryId))
 
 fun httpCatalogSourceConfigJson(baseUrl: String): String =

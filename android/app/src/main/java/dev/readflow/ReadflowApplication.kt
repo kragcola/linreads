@@ -30,6 +30,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Credentials
 import okhttp3.Request
 import okhttp3.Response
+import java.net.Proxy
 import java.security.MessageDigest
 import java.security.SecureRandom
 import kotlinx.coroutines.CancellationException
@@ -87,20 +88,10 @@ class ReadflowApplication : Application(), SingletonImageLoader.Factory {
                 add(
                     OkHttpNetworkFetcherFactory(
                         callFactory = {
-                            OkHttpClient.Builder()
-                                .followRedirects(false)
-                                .followSslRedirects(false)
-                                .authenticator { _, response -> authenticateCalibreCover(response) }
-                                .addNetworkInterceptor { chain ->
-                                    chain.proceed(
-                                        authenticatedCalibreCoverRequest(
-                                            request = chain.request(),
-                                            credentialStore = credentialStore,
-                                            networkSnapshotProvider = networkSnapshotProvider,
-                                        ),
-                                    )
-                                }
-                                .build()
+                            calibreCoverHttpClient(
+                                credentialStore = credentialStore,
+                                networkSnapshotProvider = networkSnapshotProvider,
+                            )
                         },
                     ),
                 )
@@ -108,6 +99,38 @@ class ReadflowApplication : Application(), SingletonImageLoader.Factory {
             .build()
     }
 }
+
+internal fun calibreCoverHttpClient(
+    credentialStore: SourceCredentialStore,
+    networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
+): OkHttpClient = OkHttpClient.Builder()
+    .proxy(Proxy.NO_PROXY)
+    .followRedirects(false)
+    .followSslRedirects(false)
+    .authenticator { _, response ->
+        authenticateCalibreCover(
+            response = response,
+            networkSnapshotProvider = networkSnapshotProvider,
+        )
+    }
+    .addInterceptor { chain ->
+        chain.proceed(
+            authenticatedCalibreCoverRequest(
+                request = chain.request(),
+                credentialStore = credentialStore,
+                networkSnapshotProvider = networkSnapshotProvider,
+            ),
+        )
+    }
+    .addNetworkInterceptor { chain ->
+        chain.proceed(
+            finalCalibreCoverNetworkRequest(
+                request = chain.request(),
+                networkSnapshotProvider = networkSnapshotProvider,
+            ),
+        )
+    }
+    .build()
 
 internal fun authenticatedCalibreCoverRequest(
     request: Request,
@@ -156,11 +179,41 @@ internal fun authenticatedCalibreCoverRequest(
         .build()
 }
 
+internal fun finalCalibreCoverNetworkRequest(
+    request: Request,
+    networkSnapshotProvider: CalibreNetworkSnapshotProvider,
+): Request {
+    val requestUrl = request.url.toString()
+    if (
+        requiresActiveVpnForCalibreHttp(requestUrl) &&
+        !canUseStoredCalibreCredentials(
+            requestUrl = requestUrl,
+            network = networkSnapshotProvider.snapshot(),
+        )
+    ) {
+        return request.newBuilder()
+            .removeHeader("Authorization")
+            .tag(SourceCredentials::class.java, null)
+            .build()
+    }
+    return request
+}
+
 internal fun authenticateCalibreCover(
     response: Response,
+    networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
     cnonceFactory: () -> String = ::newDigestCnonce,
 ): Request? {
     val request = response.request
+    if (
+        requiresActiveVpnForCalibreHttp(request.url.toString()) &&
+        !canUseStoredCalibreCredentials(
+            requestUrl = request.url.toString(),
+            network = networkSnapshotProvider.snapshot(),
+        )
+    ) {
+        return null
+    }
     val credentials = request.tag(SourceCredentials::class.java) ?: return null
     if (request.header("Authorization") != null) return null
 

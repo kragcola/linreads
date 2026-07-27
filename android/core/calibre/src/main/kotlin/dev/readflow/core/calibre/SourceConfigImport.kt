@@ -107,7 +107,7 @@ fun canonicalizeImportedConfigJson(adapterId: String, configJson: String): Strin
                 val config = sourceConfigJson.decodeFromString(CalibreSourceConfig.serializer(), configJson)
                 calibreSourceConfigJson(
                     baseUrl = canonicalizeImportedCalibreBaseUrl(config.baseUrl),
-                    libraryId = config.libraryId.trim().ifBlank { "calibre-library" },
+                    libraryId = config.libraryId.trim().ifBlank { DEFAULT_CALIBRE_LIBRARY_ID },
                 )
             }
             dev.readflow.extensions.api.SourceAdapterIds.OPDS,

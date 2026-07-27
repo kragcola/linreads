@@ -242,6 +242,19 @@ class LibraryViewModel(
         val ownerId: Long,
     )
 
+    private data class OnlineCatalogSessionKey(
+        val sourceId: String,
+        val query: String,
+        val filter: OnlineCatalogFilter,
+        val catalogRevision: Long,
+    )
+
+    private data class OnlineCatalogSession(
+        val ownerId: Long,
+        val key: OnlineCatalogSessionKey,
+        val catalog: OnlineBookCatalog,
+    )
+
     private val _uiState = MutableStateFlow(LibraryUiState(isLoading = true))
     val uiState: StateFlow<LibraryUiState> = _uiState.asStateFlow()
 
@@ -259,6 +272,8 @@ class LibraryViewModel(
 
     private var scanJob: Job? = null
     private var onlineSearchJob: Job? = null
+    private var onlineCatalogSession: OnlineCatalogSession? = null
+    private var nextOnlineCatalogSessionOwnerId = 0L
     private var onlinePreviewJob: Job? = null
     private var onlineBatchSelectionJob: Job? = null
     private var onlineBatchDownloadJob: Job? = null
@@ -295,7 +310,8 @@ class LibraryViewModel(
         sourceRegistry?.let { registry ->
             viewModelScope.launch {
                 registry.observeSources().collect { sources ->
-                    val currentSelection = _onlineLibraryState.value.selectedSourceId
+                    val currentState = _onlineLibraryState.value
+                    val currentSelection = currentState.selectedSourceId
                     val resolvedSelection = currentSelection
                         ?.takeIf { id -> sources.any { it.id == id } }
                         ?: sources.firstOrNull {
@@ -304,10 +320,17 @@ class LibraryViewModel(
                         ?: sources.firstOrNull { it.enabled && it.baseUrl.isNotBlank() }?.id
                         ?: sources.firstOrNull()?.id
                     val sourceChanged = resolvedSelection != currentSelection
+                    val selectedSourceConfigurationChanged = currentSelection != null &&
+                        resolvedSelection == currentSelection &&
+                        currentState.sources.firstOrNull { it.id == currentSelection }
+                            ?.hasSameCatalogConfiguration(
+                                sources.firstOrNull { it.id == currentSelection },
+                            ) == false
                     if (sourceChanged) {
                         onlineSearchJob?.cancel()
                         onlineSearchJob = null
                         onlineSearchGeneration += 1L
+                        closeOnlineCatalogSession()
                         onlinePreviewJob?.cancel()
                         onlinePreviewJob = null
                         onlinePreviewGeneration += 1L
@@ -318,6 +341,8 @@ class LibraryViewModel(
                         onlineBatchDownloadJob = null
                         onlineBatchDownloadGeneration += 1L
                         cancelSingleDownloadsForSource(currentSelection)
+                    } else if (selectedSourceConfigurationChanged) {
+                        invalidateOnlineSearchForCatalogChange()
                     }
                     _onlineLibraryState.update { state ->
                         state.copy(
@@ -576,6 +601,7 @@ class LibraryViewModel(
         onlineSearchJob?.cancel()
         onlineSearchJob = null
         onlineSearchGeneration += 1L
+        closeOnlineCatalogSession()
         onlinePreviewJob?.cancel()
         onlinePreviewJob = null
         onlinePreviewGeneration += 1L
@@ -612,10 +638,11 @@ class LibraryViewModel(
 
     fun updateOnlineQuery(query: String) {
         val current = _onlineLibraryState.value
-        if (query != current.query && (current.isSearching || current.isLoadingMore)) {
+        if (query != current.query) {
             onlineSearchJob?.cancel()
             onlineSearchJob = null
             onlineSearchGeneration += 1L
+            closeOnlineCatalogSession()
         }
         _onlineLibraryState.update {
             it.copy(
@@ -631,7 +658,24 @@ class LibraryViewModel(
     }
 
     fun updateOnlineFilter(filter: OnlineCatalogFilter) {
-        _onlineLibraryState.update { it.copy(filter = filter, error = null, message = null) }
+        val current = _onlineLibraryState.value
+        if (filter != current.filter) {
+            onlineSearchJob?.cancel()
+            onlineSearchJob = null
+            onlineSearchGeneration += 1L
+            closeOnlineCatalogSession()
+        }
+        _onlineLibraryState.update {
+            it.copy(
+                filter = filter,
+                isSearching = if (filter != current.filter) false else it.isSearching,
+                isLoadingMore = if (filter != current.filter) false else it.isLoadingMore,
+                hasMore = if (filter != current.filter) false else it.hasMore,
+                nextOffset = if (filter != current.filter) 0 else it.nextOffset,
+                error = null,
+                message = null,
+            )
+        }
     }
 
     fun searchOnlineLibrary() {
@@ -641,6 +685,7 @@ class LibraryViewModel(
             return
         }
         onlineSearchJob?.cancel()
+        closeOnlineCatalogSession()
         onlineBatchSelectionJob?.cancel()
         onlineBatchSelectionJob = null
         onlineBatchSelectionGeneration += 1L
@@ -665,6 +710,12 @@ class LibraryViewModel(
             }
             val query = state.query
             val filter = state.filter
+            val sessionKey = OnlineCatalogSessionKey(
+                sourceId = sourceId,
+                query = query,
+                filter = filter,
+                catalogRevision = state.catalogRevision,
+            )
             _onlineLibraryState.update {
                 it.copy(
                     isSearching = true,
@@ -674,6 +725,7 @@ class LibraryViewModel(
                     selectedEntryKeys = emptySet(),
                 )
             }
+            var ownedSession: OnlineCatalogSession? = null
             try {
                 when (val opened = registry.openCatalog(sourceId)) {
                     is ReadflowResult.Failure -> {
@@ -681,6 +733,12 @@ class LibraryViewModel(
                     }
                     is ReadflowResult.Success -> {
                         val catalog = opened.value
+                        val session = adoptOnlineCatalogSession(
+                            key = sessionKey,
+                            catalog = catalog,
+                            generation = generation,
+                        ) ?: return@launch
+                        ownedSession = session
                         try {
                             val result = if (query.isBlank()) {
                                 catalog.browsePage(filter, offset = 0, limit = ONLINE_BATCH_PAGE_SIZE)
@@ -694,7 +752,9 @@ class LibraryViewModel(
                                     publishSearchFailure(sourceId, query, result.error.message, generation)
                             }
                         } finally {
-                            catalog.close()
+                            if (!shouldRetainOnlineCatalogSession(session)) {
+                                closeOnlineCatalogSession(session)
+                            }
                         }
                     }
                 }
@@ -704,12 +764,19 @@ class LibraryViewModel(
                     _onlineLibraryState.update { it.copy(isSearching = false, isLoadingMore = false) }
                 }
                 throw e
+            } catch (error: Throwable) {
+                ownedSession?.let(::closeOnlineCatalogSession)
+                publishSearchFailure(
+                    sourceId = sourceId,
+                    query = query,
+                    message = error.message ?: "加载在线书库失败",
+                    generation = generation,
+                )
             }
         }
     }
 
     fun loadMoreOnlineLibrary() {
-        val registry = sourceRegistry ?: return
         val snapshot = _onlineLibraryState.value
         val sourceId = snapshot.selectedSourceId ?: return
         if (
@@ -722,47 +789,69 @@ class LibraryViewModel(
         val query = snapshot.query
         val filter = snapshot.filter
         val offset = snapshot.nextOffset
+        val expectedKey = OnlineCatalogSessionKey(
+            sourceId = sourceId,
+            query = query,
+            filter = filter,
+            catalogRevision = snapshot.catalogRevision,
+        )
+        val session = onlineCatalogSession?.takeIf { it.key == expectedKey }
+        if (session == null) {
+            _onlineLibraryState.update {
+                if (it.selectedSourceId != sourceId || it.query != query || it.filter != filter) it else {
+                    it.copy(
+                        isLoadingMore = false,
+                        hasMore = false,
+                        error = "分页会话已失效，请重新加载在线书库",
+                        message = null,
+                    )
+                }
+            }
+            return
+        }
         val generation = ++onlineSearchGeneration
         _onlineLibraryState.update { it.copy(isLoadingMore = true, error = null, message = null) }
         onlineSearchJob = viewModelScope.launch {
             try {
-                when (val opened = registry.openCatalog(sourceId)) {
-                    is ReadflowResult.Failure -> {
-                        publishLoadMoreFailure(sourceId, query, opened.error.message, generation)
-                    }
+                val result = if (query.isBlank()) {
+                    session.catalog.browsePage(filter, offset = offset, limit = ONLINE_BATCH_PAGE_SIZE)
+                } else {
+                    session.catalog.searchPage(query, filter, offset = offset, limit = ONLINE_BATCH_PAGE_SIZE)
+                }
+                when (result) {
                     is ReadflowResult.Success -> {
-                        val catalog = opened.value
-                        try {
-                            val result = if (query.isBlank()) {
-                                catalog.browsePage(filter, offset = offset, limit = ONLINE_BATCH_PAGE_SIZE)
-                            } else {
-                                catalog.searchPage(query, filter, offset = offset, limit = ONLINE_BATCH_PAGE_SIZE)
-                            }
-                            when (result) {
-                                is ReadflowResult.Success -> publishLoadMoreSuccess(
-                                    sourceId = sourceId,
-                                    query = query,
-                                    offset = offset,
-                                    page = result.value,
-                                    generation = generation,
-                                )
-                                is ReadflowResult.Failure -> publishLoadMoreFailure(
-                                    sourceId,
-                                    query,
-                                    result.error.message,
-                                    generation,
-                                )
-                            }
-                        } finally {
-                            catalog.close()
+                        publishLoadMoreSuccess(
+                            sourceId = sourceId,
+                            query = query,
+                            offset = offset,
+                            page = result.value,
+                            generation = generation,
+                        )
+                        if (!shouldRetainOnlineCatalogSession(session)) {
+                            closeOnlineCatalogSession(session)
                         }
                     }
+                    is ReadflowResult.Failure -> publishLoadMoreFailure(
+                        sourceId,
+                        query,
+                        result.error.message,
+                        generation,
+                    )
                 }
             } catch (error: CancellationException) {
                 if (generation == onlineSearchGeneration) {
                     _onlineLibraryState.update { it.copy(isLoadingMore = false) }
                 }
                 throw error
+            } catch (error: Throwable) {
+                closeOnlineCatalogSession(session)
+                publishLoadMoreFailure(
+                    sourceId = sourceId,
+                    query = query,
+                    message = error.message ?: "加载更多失败",
+                    generation = generation,
+                    retainPagination = false,
+                )
             }
         }
     }
@@ -1307,6 +1396,9 @@ class LibraryViewModel(
     private fun loadSourceCredentials(sourceId: String, announceSuccess: Boolean) {
         val registry = sourceRegistry ?: return
         viewModelScope.launch {
+            val hadActiveCatalog = _onlineLibraryState.value.selectedSourceId == sourceId &&
+                (onlineCatalogSession != null || onlineSearchJob?.isActive == true)
+            var cancelled = false
             try {
                 val credentials = registry.sourceCredentials(sourceId)
                 _onlineLibraryState.update { state ->
@@ -1322,6 +1414,7 @@ class LibraryViewModel(
                     }
                 }
             } catch (error: CancellationException) {
+                cancelled = true
                 throw error
             } catch (_: Throwable) {
                 _onlineLibraryState.update { state ->
@@ -1334,6 +1427,18 @@ class LibraryViewModel(
                         )
                     }
                 }
+            } finally {
+                if (
+                    !cancelled &&
+                    _onlineLibraryState.value.selectedSourceId == sourceId &&
+                    (
+                        hadActiveCatalog ||
+                            onlineCatalogSession != null ||
+                            onlineSearchJob?.isActive == true
+                    )
+                ) {
+                    invalidateOnlineSearchForCatalogChange()
+                }
             }
         }
     }
@@ -1343,15 +1448,20 @@ class LibraryViewModel(
         val sourceId = _onlineLibraryState.value.editingSourceId ?: return
         viewModelScope.launch {
             when (val result = registry.clearSourceCredentials(sourceId)) {
-                is ReadflowResult.Success -> _onlineLibraryState.update { state ->
-                    if (state.editingSourceId != sourceId) state else {
-                        state.copy(
-                            sourceUsername = "",
-                            sourcePassword = "",
-                            sourceCredentialsLoadFailed = false,
-                            error = null,
-                            message = "已重置登录凭据",
-                        )
+                is ReadflowResult.Success -> {
+                    if (_onlineLibraryState.value.selectedSourceId == sourceId) {
+                        invalidateOnlineSearchForCatalogChange()
+                    }
+                    _onlineLibraryState.update { state ->
+                        if (state.editingSourceId != sourceId) state else {
+                            state.copy(
+                                sourceUsername = "",
+                                sourcePassword = "",
+                                sourceCredentialsLoadFailed = false,
+                                error = null,
+                                message = "已重置登录凭据",
+                            )
+                        }
                     }
                 }
                 is ReadflowResult.Failure -> _onlineLibraryState.update { state ->
@@ -1411,6 +1521,7 @@ class LibraryViewModel(
         _onlineLibraryState.update { it.copy(isAddingSource = true, error = null, message = null) }
         viewModelScope.launch {
             val state = _onlineLibraryState.value
+            val onlineSearchGenerationBeforeMutation = onlineSearchGeneration
             val configJson = runCatching {
                 when (state.addSourceAdapterId) {
                     SourceAdapterIds.CALIBRE -> calibreSourceConfigJson(state.addSourceUrl)
@@ -1477,9 +1588,23 @@ class LibraryViewModel(
             when (result) {
                 is ReadflowResult.Success -> {
                     val wasEditing = state.editingSourceId != null
-                    invalidateOnlineSearchForCatalogChange()
+                    invalidateOnlineSearchAfterSourceMutation(
+                        sourceBeforeMutation = state.editingSourceId?.let { sourceId ->
+                            state.sources.firstOrNull { it.id == sourceId }
+                        },
+                        sourceAfterMutation = result.value,
+                        catalogRevisionBeforeMutation = state.catalogRevision,
+                        onlineSearchGenerationBeforeMutation = onlineSearchGenerationBeforeMutation,
+                    )
                     _onlineLibraryState.update {
                         it.copy(
+                            sources = if (wasEditing) {
+                                it.sources.map { source ->
+                                    if (source.id == state.editingSourceId) result.value else source
+                                }
+                            } else {
+                                it.sources
+                            },
                             message = if (wasEditing) {
                                 "已更新书源「${result.value.name}」"
                             } else {
@@ -1499,15 +1624,6 @@ class LibraryViewModel(
                             selectedSourceId = result.value.id,
                             query = "",
                             filter = OnlineCatalogFilter(),
-                            isSearching = false,
-                            isLoadingMore = false,
-                            hasMore = false,
-                            nextOffset = 0,
-                            catalogRevision = it.catalogRevision + 1L,
-                            results = emptyList(),
-                            scannedEntryKeys = emptySet(),
-                            metadataFacets = OnlineMetadataFacets(),
-                            selectedEntryKeys = emptySet(),
                         )
                     }
                     onSuccess()
@@ -1538,8 +1654,13 @@ class LibraryViewModel(
         val registry = sourceRegistry ?: return
         viewModelScope.launch {
             when (val result = registry.removeUserSource(sourceId)) {
-                is ReadflowResult.Success -> _onlineLibraryState.update {
-                    it.copy(message = "已删除书源", error = null)
+                is ReadflowResult.Success -> {
+                    if (_onlineLibraryState.value.selectedSourceId == sourceId) {
+                        invalidateOnlineSearchForCatalogChange()
+                    }
+                    _onlineLibraryState.update {
+                        it.copy(message = "已删除书源", error = null)
+                    }
                 }
                 is ReadflowResult.Failure -> _onlineLibraryState.update {
                     it.copy(error = result.error.message, message = null)
@@ -1559,6 +1680,9 @@ class LibraryViewModel(
             return
         }
         if (_onlineLibraryState.value.isAddingSource) return
+        val sourcesBeforeImport = _onlineLibraryState.value.sources
+        val catalogRevisionBeforeImport = _onlineLibraryState.value.catalogRevision
+        val onlineSearchGenerationBeforeImport = onlineSearchGeneration
         _onlineLibraryState.update { it.copy(isAddingSource = true, error = null, message = null) }
         viewModelScope.launch {
             val result = try {
@@ -1588,7 +1712,12 @@ class LibraryViewModel(
                 }
                 return@launch
             }
-            applySourceConfigImportResult(result)
+            applySourceConfigImportResult(
+                result = result,
+                sourcesBeforeImport = sourcesBeforeImport,
+                catalogRevisionBeforeImport = catalogRevisionBeforeImport,
+                onlineSearchGenerationBeforeImport = onlineSearchGenerationBeforeImport,
+            )
         }
     }
 
@@ -1599,6 +1728,9 @@ class LibraryViewModel(
             return
         }
         if (_onlineLibraryState.value.isAddingSource) return
+        val sourcesBeforeImport = _onlineLibraryState.value.sources
+        val catalogRevisionBeforeImport = _onlineLibraryState.value.catalogRevision
+        val onlineSearchGenerationBeforeImport = onlineSearchGeneration
         _onlineLibraryState.update { it.copy(isAddingSource = true, error = null, message = null) }
         viewModelScope.launch {
             // Already-read JSON string: stay on viewModelScope (Main under tests) so
@@ -1619,31 +1751,42 @@ class LibraryViewModel(
                 }
                 return@launch
             }
-            applySourceConfigImportResult(result)
+            applySourceConfigImportResult(
+                result = result,
+                sourcesBeforeImport = sourcesBeforeImport,
+                catalogRevisionBeforeImport = catalogRevisionBeforeImport,
+                onlineSearchGenerationBeforeImport = onlineSearchGenerationBeforeImport,
+            )
         }
     }
 
-    private fun applySourceConfigImportResult(result: ReadflowResult<SourceDescriptor>) {
+    private fun applySourceConfigImportResult(
+        result: ReadflowResult<SourceDescriptor>,
+        sourcesBeforeImport: List<SourceDescriptor>,
+        catalogRevisionBeforeImport: Long,
+        onlineSearchGenerationBeforeImport: Long,
+    ) {
         when (result) {
             is ReadflowResult.Success -> {
-                invalidateOnlineSearchForCatalogChange()
+                invalidateOnlineSearchAfterSourceMutation(
+                    sourceBeforeMutation = sourcesBeforeImport.firstOrNull {
+                        it.id == result.value.id
+                    },
+                    sourceAfterMutation = result.value,
+                    catalogRevisionBeforeMutation = catalogRevisionBeforeImport,
+                    onlineSearchGenerationBeforeMutation = onlineSearchGenerationBeforeImport,
+                )
                 _onlineLibraryState.update {
                     it.copy(
+                        sources = it.sources.map { source ->
+                            if (source.id == result.value.id) result.value else source
+                        },
                         isAddingSource = false,
                         message = "已导入书源「${result.value.name}」",
                         error = null,
                         selectedSourceId = result.value.id,
                         query = "",
                         filter = OnlineCatalogFilter(),
-                        isSearching = false,
-                        isLoadingMore = false,
-                        hasMore = false,
-                        nextOffset = 0,
-                        catalogRevision = it.catalogRevision + 1L,
-                        scannedEntryKeys = emptySet(),
-                        results = emptyList(),
-                        metadataFacets = OnlineMetadataFacets(),
-                        selectedEntryKeys = emptySet(),
                     )
                 }
             }
@@ -1743,13 +1886,109 @@ class LibraryViewModel(
         }
     }
 
+    private fun adoptOnlineCatalogSession(
+        key: OnlineCatalogSessionKey,
+        catalog: OnlineBookCatalog,
+        generation: Long,
+    ): OnlineCatalogSession? {
+        if (
+            generation != onlineSearchGeneration ||
+            _onlineLibraryState.value.onlineCatalogSessionKey() != key
+        ) {
+            closeOnlineCatalog(catalog)
+            return null
+        }
+        closeOnlineCatalogSession()
+        return OnlineCatalogSession(
+            ownerId = ++nextOnlineCatalogSessionOwnerId,
+            key = key,
+            catalog = catalog,
+        ).also { onlineCatalogSession = it }
+    }
+
+    private fun shouldRetainOnlineCatalogSession(session: OnlineCatalogSession): Boolean =
+        onlineCatalogSession?.ownerId == session.ownerId &&
+            _onlineLibraryState.value.onlineCatalogSessionKey() == session.key &&
+            _onlineLibraryState.value.hasMore
+
+    private fun closeOnlineCatalogSession(expected: OnlineCatalogSession? = null) {
+        val current = onlineCatalogSession ?: return
+        if (expected != null && current.ownerId != expected.ownerId) return
+        onlineCatalogSession = null
+        closeOnlineCatalog(current.catalog)
+    }
+
+    private fun closeOnlineCatalog(catalog: OnlineBookCatalog) {
+        runCatching(catalog::close)
+    }
+
+    private fun OnlineLibraryUiState.onlineCatalogSessionKey(): OnlineCatalogSessionKey? =
+        selectedSourceId?.let { sourceId ->
+            OnlineCatalogSessionKey(
+                sourceId = sourceId,
+                query = query,
+                filter = filter,
+                catalogRevision = catalogRevision,
+            )
+        }
+
+    private fun SourceDescriptor.hasSameCatalogConfiguration(other: SourceDescriptor?): Boolean =
+        other != null &&
+            adapterId == other.adapterId &&
+            configVersion == other.configVersion &&
+            configJson == other.configJson &&
+            baseUrl == other.baseUrl &&
+            enabled == other.enabled &&
+            capabilities == other.capabilities
+
+    private fun invalidateOnlineSearchAfterSourceMutation(
+        sourceBeforeMutation: SourceDescriptor?,
+        sourceAfterMutation: SourceDescriptor,
+        catalogRevisionBeforeMutation: Long,
+        onlineSearchGenerationBeforeMutation: Long,
+    ) {
+        val currentState = _onlineLibraryState.value
+        // Descriptor Flow and the explicit result may report the same config change. Suppress
+        // only that one invalidation; a later search may have opened with pre-mutation credentials.
+        val configurationChangeAlreadyApplied =
+            sourceBeforeMutation?.hasSameCatalogConfiguration(sourceAfterMutation) == false &&
+                currentState.catalogRevision == catalogRevisionBeforeMutation + 1L &&
+                onlineSearchGeneration == onlineSearchGenerationBeforeMutation + 1L &&
+                currentState.selectedSourceId == sourceAfterMutation.id &&
+                currentState.sources.firstOrNull { it.id == sourceAfterMutation.id }
+                    ?.hasSameCatalogConfiguration(sourceAfterMutation) == true
+        if (!configurationChangeAlreadyApplied) {
+            invalidateOnlineSearchForCatalogChange()
+        }
+    }
+
     private fun invalidateOnlineSearchForCatalogChange() {
         onlineSearchJob?.cancel()
         onlineSearchJob = null
         onlineSearchGeneration += 1L
+        closeOnlineCatalogSession()
         onlineBatchSelectionJob?.cancel()
         onlineBatchSelectionJob = null
         onlineBatchSelectionGeneration += 1L
+        _onlineLibraryState.update {
+            it.copy(
+                isSearching = false,
+                isLoadingMore = false,
+                hasMore = false,
+                nextOffset = 0,
+                catalogRevision = it.catalogRevision + 1L,
+                isSelectingBatch = false,
+                results = emptyList(),
+                scannedEntryKeys = emptySet(),
+                metadataFacets = OnlineMetadataFacets(),
+                selectedEntryKeys = emptySet(),
+            )
+        }
+    }
+
+    override fun onCleared() {
+        closeOnlineCatalogSession()
+        super.onCleared()
     }
 
     private fun publishLoadMoreFailure(
@@ -1757,12 +1996,18 @@ class LibraryViewModel(
         query: String,
         message: String,
         generation: Long,
+        retainPagination: Boolean = true,
     ) {
         if (generation != onlineSearchGeneration) return
         if (_onlineLibraryState.value.selectedSourceId != sourceId) return
         if (_onlineLibraryState.value.query != query) return
         _onlineLibraryState.update {
-            it.copy(isLoadingMore = false, error = message, message = null)
+            it.copy(
+                isLoadingMore = false,
+                hasMore = it.hasMore && retainPagination,
+                error = message,
+                message = null,
+            )
         }
     }
 

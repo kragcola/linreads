@@ -12,7 +12,7 @@ data class CalibreProbeAttempt(
 sealed interface CalibreProbeResult {
     data class Success(
         val baseUrl: String,
-        val bookCount: Int,
+        val bookCount: Int?,
     ) : CalibreProbeResult
 
     data class Failure(
@@ -36,6 +36,7 @@ fun interface CalibreEndpointProbe {
 
 class GuidedCalibreEndpointProbe(
     private val connectionTester: CalibreConnectionTester,
+    @Suppress("unused")
     private val networkSnapshotProvider: CalibreNetworkSnapshotProvider =
         UnknownCalibreNetworkSnapshotProvider,
 ) : CalibreEndpointProbe {
@@ -64,27 +65,9 @@ class GuidedCalibreEndpointProbe(
             normalizedCandidates += validation.normalizedUrl
         }
 
-        val configuredUrl = normalizedCandidates.first()
         val attempts = mutableListOf<CalibreProbeAttempt>()
-        var reachedServerFailure: CalibreConnectionCheckResult.Failure? = null
         for (baseUrl in normalizedCandidates.distinct()) {
-            // Re-snapshot immediately before every candidate. HTTPS may take long enough for the
-            // VPN to disconnect before a generated cleartext fallback is reached.
-            val network = networkSnapshotProvider.snapshot()
-            val isGeneratedDirectFallback = baseUrl != configuredUrl &&
-                directTailscaleContentServerFallback(configuredUrl) == baseUrl
-            if (
-                isGeneratedDirectFallback &&
-                !isVpnProtectedDirectTailscaleFallback(configuredUrl, baseUrl, network)
-            ) {
-                continue
-            }
-            val candidateCredentials = when {
-                baseUrl == configuredUrl &&
-                    canUseStoredCalibreCredentials(baseUrl, network) -> credentials
-                isVpnProtectedDirectTailscaleFallback(configuredUrl, baseUrl, network) -> credentials
-                else -> null
-            }
+            val candidateCredentials = credentials.takeIf { normalizedCandidates.size == 1 }
             when (val result = connectionTester.check(baseUrl, candidateCredentials)) {
                 is CalibreConnectionCheckResult.Success -> {
                     return CalibreProbeResult.Success(
@@ -94,26 +77,20 @@ class GuidedCalibreEndpointProbe(
                 }
                 is CalibreConnectionCheckResult.Failure -> {
                     attempts += CalibreProbeAttempt(baseUrl, result.message)
-                    if (
-                        result.kind == CalibreConnectionCheckResult.Failure.Kind.SERVER_RESPONSE &&
-                        reachedServerFailure == null
-                    ) {
-                        reachedServerFailure = result
-                    }
                     if (result.kind == CalibreConnectionCheckResult.Failure.Kind.AUTHENTICATION_REQUIRED) {
                         return CalibreProbeResult.AuthenticationRequired(baseUrl, attempts)
+                    }
+                    if (normalizedCandidates.size == 1) {
+                        return CalibreProbeResult.Failure(
+                            message = result.message,
+                            nextStep = result.nextStep,
+                            attempts = attempts,
+                        )
                     }
                 }
             }
         }
 
-        reachedServerFailure?.let { failure ->
-            return CalibreProbeResult.Failure(
-                message = failure.message,
-                nextStep = failure.nextStep,
-                attempts = attempts,
-            )
-        }
         return CalibreProbeResult.Failure(
             message = "没有在常用 Calibre 地址发现服务",
             nextStep = "确认 Calibre Content Server 已启动，并检查 Wi-Fi 或 Tailscale 地址；如果改过端口，请填写完整地址",
@@ -129,8 +106,7 @@ internal fun calibreEndpointCandidates(hint: String): List<String> {
     if (trimmed.contains("://")) {
         val validation = validateCalibreBaseUrl(trimmed)
         if (!validation.isValid || validation.normalizedUrl.isBlank()) return listOf(trimmed)
-        val original = validation.normalizedUrl
-        return listOfNotNull(original, directTailscaleContentServerFallback(original)).distinct()
+        return listOf(validation.normalizedUrl)
     }
     if (trimmed.startsWith('[')) {
         val closingBracket = trimmed.indexOf(']')

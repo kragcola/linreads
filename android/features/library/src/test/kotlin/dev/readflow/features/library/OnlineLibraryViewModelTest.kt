@@ -1,6 +1,9 @@
 package dev.readflow.features.library
 
 import android.net.Uri
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelStore
 import dev.readflow.core.database.CoroutineBookAssetOperationCoordinator
 import dev.readflow.core.database.LibraryStore
 import dev.readflow.core.model.BookAssetOperationCoordinator
@@ -243,6 +246,720 @@ class OnlineLibraryViewModelTest {
         assertTrue(firstPage.first().selectionKey() in viewModel.onlineLibraryState.value.selectedEntryKeys)
         assertFalse(viewModel.onlineLibraryState.value.hasMore)
         assertEquals(200, viewModel.onlineLibraryState.value.nextOffset)
+    }
+
+    @Test
+    fun pagedBrowseReusesOneCatalogSessionUntilTerminalPage() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val requestedOffsets = mutableListOf<Int>()
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = emptyMap(),
+            catalogFactory = {
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        requestedOffsets += offset
+                        val entries = when (offset) {
+                            0 -> (1..100).map { entry("page-1-$it", "Page 1 Book $it") }
+                            100 -> (1..100).map { entry("page-2-$it", "Page 2 Book $it") }
+                            200 -> listOf(entry("page-3-1", "Page 3 Book"))
+                            else -> emptyList()
+                        }
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = entries,
+                                nextOffset = offset + 100,
+                                hasMore = offset < 200,
+                            ),
+                        )
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+
+        assertEquals(listOf(0, 100, 200), requestedOffsets)
+        assertEquals(1, createdCatalogs.size)
+        assertEquals(1, createdCatalogs.single().closeCalls)
+        assertFalse(viewModel.onlineLibraryState.value.hasMore)
+    }
+
+    @Test
+    fun initialBrowseExceptionClosesCatalogSessionAndClearsSearchingState() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val catalog = FakeOnlineCatalog(
+            browsePageHandler = { _, _, _ ->
+                throw IllegalStateException("initial browse exploded")
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = mapOf("source-json" to catalog),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+
+        assertFalse(viewModel.onlineLibraryState.value.isSearching)
+        assertFalse(viewModel.onlineLibraryState.value.hasMore)
+        assertTrue(viewModel.onlineLibraryState.value.error?.contains("initial browse exploded") == true)
+        assertEquals(1, catalog.closeCalls)
+    }
+
+    @Test
+    fun staleInitialBrowseExceptionDoesNotCloseReplacementPaginationSession() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val oldBrowseStarted = CompletableDeferred<Unit>()
+        val releaseOldBrowse = CompletableDeferred<Unit>()
+        val requests = mutableListOf<Pair<Int, Int>>()
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = emptyMap(),
+            catalogFactory = {
+                val sessionNumber = createdCatalogs.size + 1
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        requests += sessionNumber to offset
+                        if (sessionNumber == 1) {
+                            withContext(NonCancellable) {
+                                oldBrowseStarted.complete(Unit)
+                                releaseOldBrowse.await()
+                                throw IllegalStateException("stale browse exploded")
+                            }
+                        }
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = listOf(entry("$sessionNumber-$offset", "Book $sessionNumber-$offset")),
+                                nextOffset = offset + 100,
+                                hasMore = offset == 0,
+                            ),
+                        )
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        runCurrent()
+        oldBrowseStarted.await()
+        viewModel.searchOnlineLibrary()
+        runCurrent()
+
+        assertEquals(2, createdCatalogs.size)
+        assertTrue(viewModel.onlineLibraryState.value.hasMore)
+        assertEquals(0, createdCatalogs[1].closeCalls)
+
+        releaseOldBrowse.complete(Unit)
+        advanceUntilIdle()
+
+        assertNull(viewModel.onlineLibraryState.value.error)
+        assertTrue(viewModel.onlineLibraryState.value.hasMore)
+        assertEquals(0, createdCatalogs[1].closeCalls)
+
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+
+        assertEquals(listOf(1 to 0, 2 to 0, 2 to 100), requests)
+        assertFalse(viewModel.onlineLibraryState.value.hasMore)
+        assertEquals(1, createdCatalogs[0].closeCalls)
+        assertEquals(1, createdCatalogs[1].closeCalls)
+    }
+
+    @Test
+    fun loadMoreExceptionClosesCatalogSessionAndClearsLoadingState() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val catalog = FakeOnlineCatalog(
+            browsePageHandler = { _, offset, _ ->
+                if (offset == 0) {
+                    ReadflowResult.Success(
+                        OnlineCatalogPage(
+                            entries = listOf(entry("first", "First Page")),
+                            nextOffset = 100,
+                            hasMore = true,
+                        ),
+                    )
+                } else {
+                    throw IllegalStateException("network exploded")
+                }
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = mapOf("source-json" to catalog),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        assertEquals(0, catalog.closeCalls)
+
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+
+        assertFalse(viewModel.onlineLibraryState.value.isLoadingMore)
+        assertFalse(viewModel.onlineLibraryState.value.hasMore)
+        assertTrue(viewModel.onlineLibraryState.value.error?.contains("network exploded") == true)
+        assertEquals(1, catalog.closeCalls)
+    }
+
+    @Test
+    fun explicitSearchReplacesActiveCatalogSessionWithoutPublishingItsLatePage() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val oldLoadMoreStarted = CompletableDeferred<Unit>()
+        val releaseOldLoadMore = CompletableDeferred<Unit>()
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = emptyMap(),
+            catalogFactory = {
+                val sessionNumber = createdCatalogs.size + 1
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        when (offset) {
+                            0 -> ReadflowResult.Success(
+                                OnlineCatalogPage(
+                                    entries = listOf(
+                                        if (sessionNumber == 1) {
+                                            entry("old-first", "Old First Page")
+                                        } else {
+                                            entry("new-first", "New First Page")
+                                        },
+                                    ),
+                                    nextOffset = 100,
+                                    hasMore = true,
+                                ),
+                            )
+                            100 -> {
+                                oldLoadMoreStarted.complete(Unit)
+                                withContext(NonCancellable) { releaseOldLoadMore.await() }
+                                ReadflowResult.Success(
+                                    OnlineCatalogPage(
+                                        entries = listOf(entry("old-late", "Old Late Page")),
+                                        nextOffset = 200,
+                                        hasMore = false,
+                                    ),
+                                )
+                            }
+                            else -> error("Unexpected offset: $offset")
+                        }
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.loadMoreOnlineLibrary()
+        runCurrent()
+        oldLoadMoreStarted.await()
+
+        viewModel.searchOnlineLibrary()
+        runCurrent()
+        releaseOldLoadMore.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(listOf("new-first"), viewModel.onlineLibraryState.value.results.map { it.meta.id })
+        assertEquals(2, createdCatalogs.size)
+        assertEquals(1, createdCatalogs[0].closeCalls)
+        assertEquals(0, createdCatalogs[1].closeCalls)
+    }
+
+    @Test
+    fun clearingViewModelStoreClosesActiveCatalogSession() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = emptyMap(),
+            catalogFactory = {
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, _, _ ->
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = listOf(entry("first", "First Page")),
+                                nextOffset = 100,
+                                hasMore = true,
+                            ),
+                        )
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        val store = ViewModelStore()
+        val storedViewModel = ViewModelProvider(
+            store,
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T = viewModel as T
+            },
+        )[LibraryViewModel::class.java]
+        advanceUntilIdle()
+
+        storedViewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        assertEquals(1, createdCatalogs.size)
+        assertEquals(0, createdCatalogs.single().closeCalls)
+
+        store.clear()
+        advanceUntilIdle()
+
+        assertEquals(1, createdCatalogs.single().closeCalls)
+    }
+
+    @Test
+    fun editingSourceConfigClosesPagedCatalogSessionBeforeLoadMoreUsesReplacement() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-json", SourceAdapterIds.JSON_HTTP)
+        val requests = mutableListOf<Pair<Int, Int>>()
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = emptyMap(),
+            emitSuccessfulUpdates = true,
+            updateHandler = { _, _, _, _, _ ->
+                ReadflowResult.Success(
+                    source.copy(
+                        configJson = "{\"baseUrl\":\"https://books.example/catalog.json\"}",
+                        baseUrl = "https://books.example/catalog.json",
+                    ),
+                )
+            },
+            catalogFactory = {
+                val catalogNumber = createdCatalogs.size + 1
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        requests += catalogNumber to offset
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = listOf(entry("$catalogNumber-$offset", "Book $catalogNumber-$offset")),
+                                nextOffset = offset + 100,
+                                hasMore = offset == 0,
+                            ),
+                        )
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        val revisionBeforeEdit = viewModel.onlineLibraryState.value.catalogRevision
+        viewModel.prepareSourceEditor(source.id)
+        viewModel.updateAddSourceForm(url = "https://books.example/catalog.json")
+        viewModel.saveOnlineSource()
+        advanceUntilIdle()
+
+        assertEquals(1, createdCatalogs.single().closeCalls)
+        assertEquals(revisionBeforeEdit + 1L, viewModel.onlineLibraryState.value.catalogRevision)
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+
+        assertEquals(listOf(1 to 0, 2 to 0, 2 to 100), requests)
+        assertEquals(2, createdCatalogs.size)
+        assertEquals(1, createdCatalogs[1].closeCalls)
+    }
+
+    @Test
+    fun mutationResultInvalidatesSessionOpenedAfterItsConfigFlowEmission() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-json", SourceAdapterIds.JSON_HTTP)
+        val updatedSource = source.copy(
+            configJson = "{\"baseUrl\":\"https://books.example/catalog.json\"}",
+            baseUrl = "https://books.example/catalog.json",
+        )
+        val descriptorEmitted = CompletableDeferred<Unit>()
+        val releaseUpdate = CompletableDeferred<Unit>()
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = emptyMap(),
+            emitSuccessfulUpdates = true,
+            afterSuccessfulUpdateEmission = {
+                descriptorEmitted.complete(Unit)
+                releaseUpdate.await()
+            },
+            updateHandler = { _, _, _, _, _ -> ReadflowResult.Success(updatedSource) },
+            catalogFactory = {
+                val catalogNumber = createdCatalogs.size + 1
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = listOf(entry("$catalogNumber-$offset", "Book $catalogNumber-$offset")),
+                                nextOffset = offset + 100,
+                                hasMore = true,
+                            ),
+                        )
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        val revisionBeforeUpdate = viewModel.onlineLibraryState.value.catalogRevision
+        viewModel.prepareSourceEditor(source.id)
+        viewModel.updateAddSourceForm(url = updatedSource.baseUrl)
+        viewModel.saveOnlineSource()
+        runCurrent()
+        descriptorEmitted.await()
+        runCurrent()
+
+        assertEquals(1, createdCatalogs.single().closeCalls)
+        assertEquals(revisionBeforeUpdate + 1L, viewModel.onlineLibraryState.value.catalogRevision)
+
+        viewModel.searchOnlineLibrary()
+        runCurrent()
+        assertEquals(2, createdCatalogs.size)
+        assertEquals(0, createdCatalogs[1].closeCalls)
+
+        releaseUpdate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(1, createdCatalogs[1].closeCalls)
+        assertEquals(revisionBeforeUpdate + 2L, viewModel.onlineLibraryState.value.catalogRevision)
+        assertTrue(viewModel.onlineLibraryState.value.results.isEmpty())
+    }
+
+    @Test
+    fun sourceUpdateAfterUnrelatedSwitchStillClosesCurrentCatalogSession() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val sourceA = enabledSource("source-a", SourceAdapterIds.JSON_HTTP)
+        val sourceB = enabledSource("source-b", SourceAdapterIds.JSON_HTTP)
+        val updatedSourceA = sourceA.copy(
+            configJson = "{\"baseUrl\":\"https://books.example/catalog.json\"}",
+            baseUrl = "https://books.example/catalog.json",
+        )
+        val updateStarted = CompletableDeferred<Unit>()
+        val releaseUpdate = CompletableDeferred<Unit>()
+        val requests = mutableListOf<Pair<String, Int>>()
+        val createdCatalogs = mutableListOf<Pair<String, FakeOnlineCatalog>>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(sourceA, sourceB),
+            catalogs = emptyMap(),
+            emitSuccessfulUpdates = true,
+            updateHandler = { _, _, _, _, _ ->
+                updateStarted.complete(Unit)
+                releaseUpdate.await()
+                ReadflowResult.Success(updatedSourceA)
+            },
+            catalogFactory = { sourceId ->
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        requests += sourceId to offset
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = listOf(entry("$sourceId-$offset", "Book $sourceId-$offset")),
+                                nextOffset = offset + 100,
+                                hasMore = offset == 0,
+                            ),
+                        )
+                    },
+                ).also { createdCatalogs += sourceId to it }
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.selectOnlineSource(sourceA.id)
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.prepareSourceEditor(sourceA.id)
+        viewModel.updateAddSourceForm(url = updatedSourceA.baseUrl)
+        viewModel.saveOnlineSource()
+        runCurrent()
+        updateStarted.await()
+
+        viewModel.selectOnlineSource(sourceB.id)
+        viewModel.searchOnlineLibrary()
+        runCurrent()
+        assertEquals(listOf(sourceA.id, sourceB.id), createdCatalogs.map { it.first })
+
+        releaseUpdate.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(1, createdCatalogs[0].second.closeCalls)
+        assertEquals(1, createdCatalogs[1].second.closeCalls)
+        assertEquals(sourceA.id, viewModel.onlineLibraryState.value.selectedSourceId)
+        assertTrue(viewModel.onlineLibraryState.value.results.isEmpty())
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf(sourceA.id to 0, sourceB.id to 0, sourceA.id to 0, sourceA.id to 100),
+            requests,
+        )
+        assertEquals(listOf(sourceA.id, sourceB.id, sourceA.id), createdCatalogs.map { it.first })
+    }
+
+    @Test
+    fun resettingCredentialsClosesPagedCatalogSessionBeforeLoadMoreUsesReplacement() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-calibre", SourceAdapterIds.CALIBRE)
+        val requests = mutableListOf<Pair<Int, Int>>()
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = emptyMap(),
+            credentials = mutableMapOf(source.id to SourceCredentials("reader", "secret")),
+            catalogFactory = {
+                val catalogNumber = createdCatalogs.size + 1
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        requests += catalogNumber to offset
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = listOf(entry("$catalogNumber-$offset", "Book $catalogNumber-$offset")),
+                                nextOffset = offset + 100,
+                                hasMore = offset == 0,
+                            ),
+                        )
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.prepareSourceEditor(source.id)
+        advanceUntilIdle()
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.resetSourceCredentials()
+        advanceUntilIdle()
+
+        assertEquals(1, createdCatalogs.single().closeCalls)
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+
+        assertEquals(listOf(1 to 0, 2 to 0, 2 to 100), requests)
+        assertEquals(2, createdCatalogs.size)
+        assertEquals(1, createdCatalogs[1].closeCalls)
+    }
+
+    @Test
+    fun savingCredentialsWithUnchangedConfigClosesPagedCatalogSessionBeforeReplacementLoads() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val source = enabledSource("source-calibre", SourceAdapterIds.CALIBRE)
+            var updatedCredentials: SourceCredentials? = null
+            val requests = mutableListOf<Pair<Int, Int>>()
+            val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+            val registry = FakeSourceRegistry(
+                sources = listOf(source),
+                catalogs = emptyMap(),
+                credentials = mutableMapOf(source.id to SourceCredentials("reader", "old-secret")),
+                emitSuccessfulUpdates = true,
+                updateHandler = { _, _, _, _, supplied ->
+                    updatedCredentials = supplied
+                    ReadflowResult.Success(source)
+                },
+                catalogFactory = {
+                    val catalogNumber = createdCatalogs.size + 1
+                    FakeOnlineCatalog(
+                        browsePageHandler = { _, offset, _ ->
+                            requests += catalogNumber to offset
+                            ReadflowResult.Success(
+                                OnlineCatalogPage(
+                                    entries = listOf(
+                                        entry("$catalogNumber-$offset", "Book $catalogNumber-$offset"),
+                                    ),
+                                    nextOffset = offset + 100,
+                                    hasMore = offset == 0,
+                                ),
+                            )
+                        },
+                    ).also(createdCatalogs::add)
+                },
+            )
+            val viewModel = viewModel(registry = registry)
+            advanceUntilIdle()
+
+            viewModel.prepareSourceEditor(source.id)
+            advanceUntilIdle()
+            viewModel.searchOnlineLibrary()
+            advanceUntilIdle()
+            val revisionBeforeSave = viewModel.onlineLibraryState.value.catalogRevision
+            viewModel.updateSourceCredentials("reader", "new-secret")
+            viewModel.saveOnlineSource()
+            advanceUntilIdle()
+
+            assertEquals(SourceCredentials("reader", "new-secret"), updatedCredentials)
+            assertEquals(1, createdCatalogs.single().closeCalls)
+            assertEquals(revisionBeforeSave + 1L, viewModel.onlineLibraryState.value.catalogRevision)
+
+            viewModel.searchOnlineLibrary()
+            advanceUntilIdle()
+            viewModel.loadMoreOnlineLibrary()
+            advanceUntilIdle()
+
+            assertEquals(listOf(1 to 0, 2 to 0, 2 to 100), requests)
+            assertEquals(2, createdCatalogs.size)
+            assertEquals(1, createdCatalogs[1].closeCalls)
+        }
+
+    @Test
+    fun sameIdSourceConfigEmissionClosesPagedCatalogSessionBeforeReplacementLoads() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-json", SourceAdapterIds.JSON_HTTP)
+        val requests = mutableListOf<Pair<Int, Int>>()
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = emptyMap(),
+            catalogFactory = {
+                val catalogNumber = createdCatalogs.size + 1
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        requests += catalogNumber to offset
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = listOf(entry("$catalogNumber-$offset", "Book $catalogNumber-$offset")),
+                                nextOffset = offset + 100,
+                                hasMore = offset == 0,
+                            ),
+                        )
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        registry.emitSources(
+            listOf(
+                source.copy(
+                    configJson = "{\"baseUrl\":\"https://books.example/catalog.json\"}",
+                    baseUrl = "https://books.example/catalog.json",
+                ),
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(1, createdCatalogs.single().closeCalls)
+        assertTrue(viewModel.onlineLibraryState.value.results.isEmpty())
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+
+        assertEquals(listOf(1 to 0, 2 to 0, 2 to 100), requests)
+        assertEquals(2, createdCatalogs.size)
+    }
+
+    @Test
+    fun credentialReconcileReadClosesPagedCatalogSessionBeforeReplacementLoads() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-calibre", SourceAdapterIds.CALIBRE)
+        val requests = mutableListOf<Pair<Int, Int>>()
+        val createdCatalogs = mutableListOf<FakeOnlineCatalog>()
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = emptyMap(),
+            credentialReadHandler = { SourceCredentials("reader", "secret") },
+            catalogFactory = {
+                val catalogNumber = createdCatalogs.size + 1
+                FakeOnlineCatalog(
+                    browsePageHandler = { _, offset, _ ->
+                        requests += catalogNumber to offset
+                        ReadflowResult.Success(
+                            OnlineCatalogPage(
+                                entries = listOf(entry("$catalogNumber-$offset", "Book $catalogNumber-$offset")),
+                                nextOffset = offset + 100,
+                                hasMore = offset == 0,
+                            ),
+                        )
+                    },
+                ).also(createdCatalogs::add)
+            },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.prepareSourceEditor(source.id)
+        advanceUntilIdle()
+
+        assertEquals(1, createdCatalogs.single().closeCalls)
+        assertTrue(viewModel.onlineLibraryState.value.results.isEmpty())
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.loadMoreOnlineLibrary()
+        advanceUntilIdle()
+
+        assertEquals(listOf(1 to 0, 2 to 0, 2 to 100), requests)
+        assertEquals(2, createdCatalogs.size)
+    }
+
+    @Test
+    fun credentialReadFailureClosesPagedCatalogSession() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-calibre", SourceAdapterIds.CALIBRE)
+        val catalog = FakeOnlineCatalog(
+            browsePageHandler = { _, _, _ ->
+                ReadflowResult.Success(
+                    OnlineCatalogPage(
+                        entries = listOf(entry("first", "First Page")),
+                        nextOffset = 100,
+                        hasMore = true,
+                    ),
+                )
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = mapOf(source.id to catalog),
+            credentialReadHandler = { throw IllegalStateException("keystore unavailable") },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        val revisionBeforeRead = viewModel.onlineLibraryState.value.catalogRevision
+        viewModel.prepareSourceEditor(source.id)
+        advanceUntilIdle()
+
+        assertEquals(1, catalog.closeCalls)
+        assertEquals(revisionBeforeRead + 1L, viewModel.onlineLibraryState.value.catalogRevision)
+        assertTrue(viewModel.onlineLibraryState.value.results.isEmpty())
+        assertTrue(viewModel.onlineLibraryState.value.sourceCredentialsLoadFailed)
     }
 
     @Test
@@ -710,6 +1427,43 @@ class OnlineLibraryViewModelTest {
     }
 
     @Test
+    fun importingUpdatedSourceClosesItsPagedCatalogSession() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val source = enabledSource("source-json", SourceAdapterIds.JSON_HTTP)
+        val imported = source.copy(
+            configJson = "{\"baseUrl\":\"https://books.example/catalog.json\"}",
+            baseUrl = "https://books.example/catalog.json",
+        )
+        val catalog = FakeOnlineCatalog(
+            browsePageHandler = { _, _, _ ->
+                ReadflowResult.Success(
+                    OnlineCatalogPage(
+                        entries = listOf(entry("first", "First Page")),
+                        nextOffset = 100,
+                        hasMore = true,
+                    ),
+                )
+            },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = mapOf(source.id to catalog),
+            importHandler = { ReadflowResult.Success(imported) },
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+
+        viewModel.searchOnlineLibrary()
+        advanceUntilIdle()
+        viewModel.importSourceConfigText("{\"schemaVersion\":1}")
+        advanceUntilIdle()
+
+        assertEquals(1, catalog.closeCalls)
+        assertTrue(viewModel.onlineLibraryState.value.results.isEmpty())
+        assertEquals(source.id, viewModel.onlineLibraryState.value.selectedSourceId)
+    }
+
+    @Test
     fun importSourceConfigFailureSurfacesRegistryError() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val registry = FakeSourceRegistry(
@@ -1112,15 +1866,24 @@ class OnlineLibraryViewModelTest {
     fun removingSelectedSourceClearsItsResultsAndSelection() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val resultEntry = entry("old", "Old Source Book")
+        val catalog = FakeOnlineCatalog(
+            browsePageHandler = { _, _, _ ->
+                ReadflowResult.Success(
+                    OnlineCatalogPage(
+                        entries = listOf(resultEntry),
+                        nextOffset = 100,
+                        hasMore = true,
+                    ),
+                )
+            },
+        )
         val registry = FakeSourceRegistry(
             sources = listOf(
                 enabledSource(BUILTIN_CALIBRE_SOURCE_ID, SourceAdapterIds.CALIBRE),
                 enabledSource("source-json", SourceAdapterIds.JSON_HTTP),
             ),
             catalogs = mapOf(
-                "source-json" to FakeOnlineCatalog(
-                    searchHandler = { _, _ -> ReadflowResult.Success(listOf(resultEntry)) },
-                ),
+                "source-json" to catalog,
             ),
         )
         val viewModel = viewModel(registry = registry)
@@ -1129,6 +1892,7 @@ class OnlineLibraryViewModelTest {
         viewModel.searchOnlineLibrary()
         advanceUntilIdle()
         assertEquals(listOf("old"), viewModel.onlineLibraryState.value.results.map { it.meta.id })
+        assertEquals(0, catalog.closeCalls)
 
         viewModel.removeOnlineSource("source-json")
         advanceUntilIdle()
@@ -1136,6 +1900,7 @@ class OnlineLibraryViewModelTest {
         assertEquals(BUILTIN_CALIBRE_SOURCE_ID, viewModel.onlineLibraryState.value.selectedSourceId)
         assertTrue(viewModel.onlineLibraryState.value.results.isEmpty())
         assertTrue(viewModel.onlineLibraryState.value.selectedEntryKeys.isEmpty())
+        assertEquals(1, catalog.closeCalls)
     }
 
     @Test
@@ -1601,6 +2366,9 @@ class OnlineLibraryViewModelTest {
         private val importHandler: suspend (String) -> ReadflowResult<SourceDescriptor> = {
             ReadflowResult.Failure(ReadflowError.unsupported("not used"))
         },
+        private val catalogFactory: ((String) -> OnlineBookCatalog)? = null,
+        private val emitSuccessfulUpdates: Boolean = false,
+        private val afterSuccessfulUpdateEmission: suspend (SourceDescriptor) -> Unit = {},
     ) : SourceRegistry {
         private val sourceFlow = MutableStateFlow(sources)
         val openedSourceIds = mutableListOf<String>()
@@ -1611,11 +2379,15 @@ class OnlineLibraryViewModelTest {
         var credentialsCleared = false
             private set
 
+        fun emitSources(sources: List<SourceDescriptor>) {
+            sourceFlow.value = sources
+        }
+
         override fun observeSources(): Flow<List<SourceDescriptor>> = sourceFlow
 
         override suspend fun openCatalog(sourceId: String): ReadflowResult<OnlineBookCatalog> {
             openedSourceIds += sourceId
-            val catalog = catalogs[sourceId]
+            val catalog = catalogFactory?.invoke(sourceId) ?: catalogs[sourceId]
                 ?: return ReadflowResult.Failure(ReadflowError.notFound("source", sourceId))
             return ReadflowResult.Success(catalog)
         }
@@ -1636,7 +2408,14 @@ class OnlineLibraryViewModelTest {
             credentials: SourceCredentials?,
         ): ReadflowResult<SourceDescriptor> {
             updateCalls += 1
-            return updateHandler(sourceId, name, configVersion, configJson, credentials)
+            val result = updateHandler(sourceId, name, configVersion, configJson, credentials)
+            if (emitSuccessfulUpdates && result is ReadflowResult.Success) {
+                sourceFlow.value = sourceFlow.value.map { source ->
+                    if (source.id == sourceId) result.value else source
+                }
+                afterSuccessfulUpdateEmission(result.value)
+            }
+            return result
         }
 
         override suspend fun sourceCredentials(sourceId: String): SourceCredentials? =
@@ -1685,6 +2464,9 @@ class OnlineLibraryViewModelTest {
             ReadflowResult.Success(OnlineBookPreview(it.meta.title, it.meta.author, null, "preview"))
         },
     ) : OnlineBookCatalog {
+        var closeCalls = 0
+            private set
+
         override val descriptor = SourceDescriptor(
             id = "fake",
             adapterId = SourceAdapterIds.JSON_HTTP,
@@ -1718,6 +2500,10 @@ class OnlineLibraryViewModelTest {
         override suspend fun download(entry: OnlineCatalogEntry) = downloadHandler(entry)
 
         override suspend fun preview(entry: OnlineCatalogEntry) = previewHandler(entry)
+
+        override fun close() {
+            closeCalls += 1
+        }
     }
 
     private class FakeLibraryStore : LibraryStore {

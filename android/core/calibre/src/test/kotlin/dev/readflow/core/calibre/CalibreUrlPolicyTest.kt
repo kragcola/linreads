@@ -70,6 +70,20 @@ class CalibreUrlPolicyTest {
     }
 
     @Test
+    fun endpointChangeNeverMigratesCredentialsBasedOnVpnClassification() {
+        val servedUrl = "https://reader.tailnet.ts.net/opds"
+        val directUrl = "http://reader.tailnet.ts.net:8080/opds"
+
+        assertEquals(
+            CalibreCredentialTransition.CLEAR,
+            calibreCredentialTransition(
+                currentUrl = servedUrl,
+                verifiedUrl = directUrl,
+            ),
+        )
+    }
+
+    @Test
     fun acceptsTailscaleIpv6HttpAcrossConfigurationRequestRedirectAndCoverPolicies() {
         val baseUrl = "http://[fd7a:115c:a1e0::1234]:8080"
         assertValid(baseUrl)

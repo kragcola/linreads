@@ -176,7 +176,7 @@ class CalibreDownloadPlannerTest {
     }
 
     @Test
-    fun downloadConnectionFailureKeepsTailscaleDiagnosticsAndCleansTheStagingFile() = runTest {
+    fun downloadConnectionFailureDoesNotInventMissingVpnEvidenceAndCleansTheStagingFile() = runTest {
         val booksDir = temp.newFolder("failed-tailscale-download")
         val baseUrl = "http://100.64.0.42:8080"
         val client = CalibreClient(
@@ -207,7 +207,8 @@ class CalibreDownloadPlannerTest {
         assertTrue(result is ReadflowResult.Failure)
         val error = (result as ReadflowResult.Failure).error
         assertEquals(ReadflowError.Kind.NETWORK, error.kind)
-        assertTrue(error.message.contains("未检测到可用于本应用的 VPN"))
+        assertTrue(error.message.contains("服务器拒绝或无法接受连接"))
+        assertFalse(error.message.contains("未检测到"))
         assertTrue(booksDir.listFiles().orEmpty().isEmpty())
     }
 

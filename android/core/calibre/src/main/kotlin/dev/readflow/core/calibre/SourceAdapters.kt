@@ -44,32 +44,28 @@ class CalibreSourceAdapterFactory(
     override fun open(descriptor: SourceDescriptor): ReadflowResult<OnlineBookCatalog> = runCatching {
         val config = descriptor.calibreConfig()
         val baseUrl = requireValidCalibreBaseUrl(config.baseUrl)
-        if (
-            requiresActiveVpnForCalibreHttp(baseUrl) &&
-            !networkSnapshotProvider.snapshot().hasActiveVpnForCalibre()
-        ) {
-            return@runCatching ReadflowResult.Failure(
-                ReadflowError.network(
-                    code = null,
-                    message = "未检测到对本应用生效的 Tailscale VPN，已停止访问 HTTP Calibre 书源以保护凭据",
-                ),
+        val mayReadCredentials = !requiresActiveVpnForCalibreHttp(baseUrl) ||
+            canUseStoredCalibreCredentials(
+                requestUrl = baseUrl,
+                network = networkSnapshotProvider.snapshot(),
             )
+        val credentials = if (mayReadCredentials) {
+            credentialProvider(
+                descriptor.id,
+                calibreCredentialScopeForRequestUrl(baseUrl),
+            )
+        } else {
+            // The catalog may still probe OPDS without credentials. This preserves useful
+            // reachability diagnostics while keeping the stored secret out of memory and off the
+            // wire until Android positively reports that this app is routed through Tailscale.
+            null
         }
-        val credentials = credentialProvider(
-            descriptor.id,
-            calibreCredentialScopeForRequestUrl(baseUrl),
-        )
         ReadflowResult.Success(
-            CalibreOnlineCatalog(
-                client = CalibreClient(
-                    baseUrl = baseUrl,
-                    username = credentials?.username.orEmpty(),
-                    password = credentials?.password.orEmpty(),
-                    libraryId = config.libraryId,
-                    networkSnapshotProvider = networkSnapshotProvider,
-                ),
-                booksDir = booksDir,
+            CalibreOpdsOnlineCatalog(
                 descriptor = descriptor.copy(baseUrl = baseUrl),
+                booksDir = booksDir,
+                credentials = credentials,
+                networkSnapshotProvider = networkSnapshotProvider,
             ),
         )
     }.getOrElse(::sourceOpenFailure)

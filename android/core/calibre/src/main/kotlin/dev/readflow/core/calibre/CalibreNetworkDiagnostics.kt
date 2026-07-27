@@ -31,6 +31,7 @@ object UnknownCalibreNetworkSnapshotProvider : CalibreNetworkSnapshotProvider {
     override fun snapshot(): CalibreNetworkSnapshot = CalibreNetworkSnapshot.Unknown
 }
 
+/** Raised before a request would expose stored credentials over unverified tailnet HTTP. */
 internal class CalibreVpnRequiredException : IOException(
     "Tailscale VPN is not active for authenticated Calibre HTTP traffic",
 )
@@ -127,7 +128,7 @@ internal fun classifyCalibreConnectionFailure(
         )
     }
     return CalibreConnectionCheckResult.Failure(
-        message = error.message?.takeIf(String::isNotBlank) ?: "无法连接到服务器",
+        message = "无法连接到 Calibre",
         nextStep = "检查服务器状态、地址、端口和网络连接",
     )
 }
@@ -149,35 +150,15 @@ private fun tailnetFailureOr(
     fallback: CalibreConnectionCheckResult.Failure,
 ): CalibreConnectionCheckResult.Failure {
     if (endpointKind == CalibreEndpointKind.OTHER) return fallback
-    return when (network) {
-        is CalibreNetworkSnapshot.Active -> if (network.vpnAppliesToApp) {
-            // The VPN is already the app's active transport. Preserve the observed TCP
-            // failure instead of incorrectly telling the user that Tailnet is unavailable.
-            fallback.copy(
-                nextStep = when (fallback.kind) {
-                    CalibreConnectionCheckResult.Failure.Kind.CONNECT_TIMEOUT ->
-                        "Tailscale 已连接；目标 TCP 建连超时，请检查 Calibre、端口、Tailscale ACL 和电脑防火墙"
-                    CalibreConnectionCheckResult.Failure.Kind.CONNECTION_REFUSED ->
-                        "Tailscale 已连接；确认 Calibre Content Server 正在运行，并检查端口、Tailscale ACL 和电脑防火墙"
-                    else -> fallback.nextStep
-                },
-            )
-        } else {
-            CalibreConnectionCheckResult.Failure(
-                message = "无法通过 Tailscale 连接服务器",
-                nextStep = "当前未检测到可用于本应用的 VPN 连接；请打开 Tailscale 后重试",
-                kind = CalibreConnectionCheckResult.Failure.Kind.TAILNET_UNREACHABLE,
-            )
-        }
-        CalibreNetworkSnapshot.NoActiveNetwork -> CalibreConnectionCheckResult.Failure(
-            message = "无法通过 Tailscale 连接服务器",
-            nextStep = "当前没有活动网络；连接网络并打开 Tailscale 后重试",
-            kind = CalibreConnectionCheckResult.Failure.Kind.TAILNET_UNREACHABLE,
-        )
-        CalibreNetworkSnapshot.Unknown -> fallback.copy(
-            nextStep = "未能读取本机 Tailscale 状态；${fallback.nextStep}",
-        )
-    }
+    return fallback.copy(
+        nextStep = when (fallback.kind) {
+            CalibreConnectionCheckResult.Failure.Kind.CONNECT_TIMEOUT ->
+                "目标 TCP 建连超时；检查 Calibre、端口、Tailscale 路由/ACL 和电脑防火墙"
+            CalibreConnectionCheckResult.Failure.Kind.CONNECTION_REFUSED ->
+                "确认 Calibre Content Server 正在运行，并检查端口、Tailscale 路由/ACL 和电脑防火墙"
+            else -> fallback.nextStep
+        },
+    )
 }
 
 private inline fun <reified T : Throwable> Throwable.findCause(): T? {

@@ -71,7 +71,7 @@ class CalibreClient internal constructor(
         baseUrl: String,
         username: String = "",
         password: String = "",
-        libraryId: String = "calibre-library",
+        libraryId: String = DEFAULT_CALIBRE_LIBRARY_ID,
         networkSnapshotProvider: CalibreNetworkSnapshotProvider = UnknownCalibreNetworkSnapshotProvider,
     ) : this(
         baseUrl = baseUrl,
@@ -88,8 +88,8 @@ class CalibreClient internal constructor(
     )
 
     private val baseUrl = requireCalibreAjaxBaseUrl(baseUrl)
-    private val configuredLibraryId = libraryId.trim().ifBlank { DEFAULT_LIBRARY_ID }
-    private val usesDefaultLibraryDiscovery = configuredLibraryId == DEFAULT_LIBRARY_ID
+    private val configuredLibraryId = libraryId.trim().ifBlank { DEFAULT_CALIBRE_LIBRARY_ID }
+    private val usesDefaultLibraryDiscovery = configuredLibraryId == DEFAULT_CALIBRE_LIBRARY_ID
 
     @Volatile
     private var discoveredLibraryId: String? = null
@@ -100,11 +100,14 @@ class CalibreClient internal constructor(
     private val libraryDiscoveryMutex = Mutex()
 
     suspend fun search(query: String = "", num: Int = 100, offset: Int = 0): CalibreSearchResult {
-        val result = http.get(searchUrl()) {
-            parameter("query", query)
-            parameter("num", num)
-            parameter("offset", offset)
-        }.body<CalibreSearchResult>()
+        val url = searchUrl()
+        val result = withCalibreRequestContext(CalibreRequestPhase.AJAX_SEARCH, url) {
+            http.get(url) {
+                parameter("query", query)
+                parameter("num", num)
+                parameter("offset", offset)
+            }.body<CalibreSearchResult>()
+        }
         if (usesDefaultLibraryDiscovery) {
             result.library_id
                 ?.trim()
@@ -117,17 +120,21 @@ class CalibreClient internal constructor(
 
     suspend fun bookMeta(id: Int): CalibreBookMeta {
         ensureLibraryDiscovered()
-        return http.get("$baseUrl/ajax/book/$id/${libraryPathSegment()}")
-            .body<CalibreBookMetaWire>()
-            .normalized(id)
+        val url = "$baseUrl/ajax/book/$id/${libraryPathSegment()}"
+        return withCalibreRequestContext(CalibreRequestPhase.AJAX_BOOK, url) {
+            http.get(url).body<CalibreBookMetaWire>().normalized(id)
+        }
     }
 
     suspend fun bookMetas(ids: List<Int>): Map<Int, CalibreBookMeta> {
         if (ids.isEmpty()) return emptyMap()
         ensureLibraryDiscovered()
-        return http.get(booksUrl()) {
-            parameter("ids", ids.joinToString(","))
-        }.body<Map<String, CalibreBookMetaWire?>>()
+        val url = booksUrl()
+        return withCalibreRequestContext(CalibreRequestPhase.AJAX_METADATA, url) {
+            http.get(url) {
+                parameter("ids", ids.joinToString(","))
+            }.body<Map<String, CalibreBookMetaWire?>>()
+        }
             .mapNotNull { (rawId, wire) ->
                 val id = rawId.toIntOrNull() ?: return@mapNotNull null
                 wire?.normalized(id)?.let { id to it }
@@ -141,14 +148,18 @@ class CalibreClient internal constructor(
     fun coverUrl(id: Int) = "$baseUrl/get/cover/$id/${libraryPathSegment()}"
 
     suspend fun downloadTo(id: Int, format: String, output: WritableByteChannel): Long =
-        http.prepareGet(downloadUrl(id, format)) {
-            timeout {
-                connectTimeoutMillis = DOWNLOAD_CONNECT_TIMEOUT_MS
-                socketTimeoutMillis = DOWNLOAD_SOCKET_TIMEOUT_MS
-                requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
+        downloadUrl(id, format).let { url ->
+            withCalibreRequestContext(CalibreRequestPhase.AJAX_DOWNLOAD, url) {
+                http.prepareGet(url) {
+                    timeout {
+                        connectTimeoutMillis = DOWNLOAD_CONNECT_TIMEOUT_MS
+                        socketTimeoutMillis = DOWNLOAD_SOCKET_TIMEOUT_MS
+                        requestTimeoutMillis = HttpTimeoutConfig.INFINITE_TIMEOUT_MS
+                    }
+                }.execute { response ->
+                    response.bodyAsChannel().copyTo(output)
+                }
             }
-        }.execute { response ->
-            response.bodyAsChannel().copyTo(output)
         }
 
     override fun close() {
@@ -185,7 +196,6 @@ class CalibreClient internal constructor(
     }
 
     private companion object {
-        const val DEFAULT_LIBRARY_ID = "calibre-library"
         const val DOWNLOAD_CONNECT_TIMEOUT_MS = 5_000L
         const val DOWNLOAD_SOCKET_TIMEOUT_MS = 60_000L
     }

@@ -36,6 +36,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -600,7 +601,7 @@ class DefaultSourceRegistryTest {
     }
 
     @Test
-    fun openingBareHttpsMagicDnsSourcePersistsOnlyVerifiedFallback() = runTest {
+    fun openingExplicitEndpointDoesNotProbeOrRewriteIt() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
         val directUrl = "http://reader.tailnet.ts.net:8080/opds"
         val sourceId = "source-tailscale"
@@ -612,6 +613,7 @@ class DefaultSourceRegistryTest {
         }
         val store = InMemorySourceConfigStore(listOf(calibreSource(sourceId, servedUrl)))
         val opened = mutableListOf<SourceDescriptor>()
+        var probeCalls = 0
         val registry = DefaultSourceRegistry(
             settings = FakeSettingsRepository(calibreUrl = null),
             sourceConfigStore = store,
@@ -621,7 +623,7 @@ class DefaultSourceRegistryTest {
                 CalibreNetworkSnapshot.Active(vpnAppliesToApp = true, internetValidated = true)
             },
             calibreEndpointProbe = CalibreEndpointProbe { hint ->
-                assertEquals(servedUrl, hint)
+                probeCalls += 1
                 CalibreProbeResult.Success(baseUrl = directUrl, bookCount = 1)
             },
             calibreCatalogFactory = { descriptor ->
@@ -633,12 +635,14 @@ class DefaultSourceRegistryTest {
         val result = registry.openCatalog(sourceId)
 
         assertTrue(result is ReadflowResult.Success)
-        assertEquals(directUrl, opened.single().baseUrl)
-        assertEquals(directUrl, store.getUserSource(sourceId)?.baseUrl)
-        assertEquals(calibreSourceConfigJson(directUrl), store.getUserSource(sourceId)?.configJson)
+        assertEquals(0, probeCalls)
+        assertEquals(servedUrl, opened.single().baseUrl)
+        assertEquals(servedUrl, store.getUserSource(sourceId)?.baseUrl)
+        assertEquals(calibreSourceConfigJson(servedUrl), store.getUserSource(sourceId)?.configJson)
         assertEquals(expectedCredentials, registry.sourceCredentials(sourceId))
     }
 
+    @Ignore("Runtime endpoint migration was removed; explicit addresses are opened unchanged")
     @Test
     fun automaticEndpointMigrationDoesNotStageCredentialsForAnUntrustedOrigin() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
@@ -669,6 +673,7 @@ class DefaultSourceRegistryTest {
         assertEquals(null, registry.sourceCredentials(sourceId))
     }
 
+    @Ignore("Runtime endpoint probes were removed")
     @Test
     fun clearingCredentialsDuringEndpointProbeCannotRestoreAStaleCredentialSnapshot() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
@@ -766,6 +771,7 @@ class DefaultSourceRegistryTest {
         assertEquals(expectedCredentials, registry.sourceCredentials(BUILTIN_CALIBRE_SOURCE_ID))
     }
 
+    @Ignore("Runtime endpoint probes were removed")
     @Test
     fun failedMagicDnsNegotiationLeavesStoredEndpointAndCredentialsUntouched() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
@@ -797,6 +803,7 @@ class DefaultSourceRegistryTest {
         assertEquals(expectedCredentials, registry.sourceCredentials(sourceId))
     }
 
+    @Ignore("Runtime endpoint probes were removed")
     @Test
     fun sourcePersistenceFailureAfterMutationKeepsTheCommittedVerifiedFallback() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
@@ -837,6 +844,7 @@ class DefaultSourceRegistryTest {
         assertEquals(expectedCredentials, registry.sourceCredentials(sourceId))
     }
 
+    @Ignore("Runtime endpoint probes were removed")
     @Test
     fun credentialPersistenceFailureAfterMutationRestoresTheOriginalScope() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
@@ -885,6 +893,7 @@ class DefaultSourceRegistryTest {
         assertEquals(expectedCredentials, registry.sourceCredentials(sourceId))
     }
 
+    @Ignore("Runtime endpoint probes were removed")
     @Test
     fun committedSourceWriteDoesNotAttemptCredentialRollbackAfterThrowing() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
@@ -943,6 +952,7 @@ class DefaultSourceRegistryTest {
         assertEquals(expectedCredentials, registry.sourceCredentials(sourceId))
     }
 
+    @Ignore("Runtime endpoint probes were removed")
     @Test
     fun cancellationAfterCommittedSourceWriteKeepsDescriptorAndCredentialsAligned() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
@@ -1002,6 +1012,7 @@ class DefaultSourceRegistryTest {
         assertEquals(expectedCredentials, registry.sourceCredentials(sourceId))
     }
 
+    @Ignore("Runtime endpoint probes were removed")
     @Test
     fun builtinSettingFailureAfterMutationKeepsRoomAuthoritativeEndpoint() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
@@ -1797,7 +1808,7 @@ class DefaultSourceRegistryTest {
     }
 
     @Test
-    fun verifiedBuiltinEndpointUpdatePreservesLibraryAndSameHostCredentials() = runTest {
+    fun verifiedBuiltinEndpointUpdatePreservesLibraryAndClearsCrossOriginCredentials() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
         val directUrl = "http://reader.tailnet.ts.net:8080/opds"
         val libraryId = "main-library"
@@ -1834,7 +1845,7 @@ class DefaultSourceRegistryTest {
         assertEquals(directUrl, updated?.baseUrl)
         assertEquals(calibreSourceConfigJson(directUrl, libraryId), updated?.configJson)
         assertEquals(directUrl, settings.calibreBaseUrl.value)
-        assertEquals(expectedCredentials, registry.sourceCredentials(BUILTIN_CALIBRE_SOURCE_ID))
+        assertEquals(null, registry.sourceCredentials(BUILTIN_CALIBRE_SOURCE_ID))
     }
 
     @Test
@@ -1888,8 +1899,8 @@ class DefaultSourceRegistryTest {
             store.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)?.baseUrl,
         )
         assertTrue(
-            "failed final reconcile must retain the activation intent",
-            credentials.snapshot(BUILTIN_CALIBRE_SOURCE_ID)?.pending is PendingCredentialMutation.Activate,
+            "failed final reconcile must retain the clear intent",
+            credentials.snapshot(BUILTIN_CALIBRE_SOURCE_ID)?.pending is PendingCredentialMutation.Clear,
         )
         assertEquals(expectedCredentials, credentials.get(BUILTIN_CALIBRE_SOURCE_ID, oldScope))
         assertEquals(null, credentials.get(BUILTIN_CALIBRE_SOURCE_ID, newScope))
@@ -1899,12 +1910,12 @@ class DefaultSourceRegistryTest {
         assertTrue("retry at the already-persisted endpoint must succeed", retried is ReadflowResult.Success)
         assertEquals(null, credentials.snapshot(BUILTIN_CALIBRE_SOURCE_ID)?.pending)
         assertEquals(
-            "retry must activate only the descriptor's current origin",
-            setOf(newScope),
-            credentials.snapshot(BUILTIN_CALIBRE_SOURCE_ID)?.active?.scopes,
+            "retry must clear credentials after the origin change",
+            null,
+            credentials.snapshot(BUILTIN_CALIBRE_SOURCE_ID)?.active,
         )
         assertEquals(null, credentials.get(BUILTIN_CALIBRE_SOURCE_ID, oldScope))
-        assertEquals(expectedCredentials, credentials.get(BUILTIN_CALIBRE_SOURCE_ID, newScope))
+        assertEquals(null, credentials.get(BUILTIN_CALIBRE_SOURCE_ID, newScope))
         assertTrue(
             "the already-matching retry must still reconcile the pending activation",
             credentials.reconcileBindings.count { it == DescriptorBinding.Calibre(newScope) } >= 2,
@@ -1962,7 +1973,7 @@ class DefaultSourceRegistryTest {
             store.getUserSource(BUILTIN_CALIBRE_SOURCE_ID)?.baseUrl,
         )
         assertEquals(directUrl, settings.calibreBaseUrl.value)
-        assertEquals(expectedCredentials, registry.sourceCredentials(BUILTIN_CALIBRE_SOURCE_ID))
+        assertEquals(null, registry.sourceCredentials(BUILTIN_CALIBRE_SOURCE_ID))
     }
 
     @Test
@@ -2017,7 +2028,7 @@ class DefaultSourceRegistryTest {
     }
 
     @Test
-    fun verifiedBuiltinFallbackClearsCredentialsWithoutPositiveVpnEvidence() = runTest {
+    fun verifiedBuiltinEndpointChangeClearsCredentialsWithoutNetworkClassification() = runTest {
         val servedUrl = "https://reader.tailnet.ts.net/opds"
         val directUrl = "http://reader.tailnet.ts.net:8080/opds"
         val expectedCredentials = SourceCredentials("reader", "secret")
@@ -2162,18 +2173,13 @@ class DefaultSourceRegistryTest {
             Triple(label, credentials, runCatching { registry.sourceCredentials(sourceId) })
         }
 
-        assertEquals(
-            "tailnet HTTP credential reads without app VPN evidence must not query credential storage",
-            List(observations.size) { 0 },
-            observations.map { it.second.getCalls },
-        )
-        assertTrue(
-            "tailnet HTTP credentials without app VPN evidence must be unavailable: " +
-                observations
-                    .filterNot { it.third.isFailure || it.third.getOrNull() == null }
-                    .joinToString { it.first },
-            observations.all { it.third.isFailure || it.third.getOrNull() == null },
-        )
+        observations.forEach { (label, credentialStore, read) ->
+            assertTrue(
+                "$label credentials must be unavailable without positive VPN evidence",
+                read.isFailure || read.getOrNull() == null,
+            )
+            assertEquals("$label credential store reads", 0, credentialStore.getCalls)
+        }
     }
 
     @Test

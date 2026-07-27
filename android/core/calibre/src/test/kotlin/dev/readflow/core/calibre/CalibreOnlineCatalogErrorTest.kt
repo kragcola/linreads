@@ -80,21 +80,23 @@ class CalibreOnlineCatalogErrorTest {
             ),
         )
 
-        val result = catalog.search("")
+        val secretQuery = "private search phrase"
+        val result = catalog.search(secretQuery)
 
         assertTrue(result is ReadflowResult.Failure)
         val error = (result as ReadflowResult.Failure).error
         assertEquals(ReadflowError.Kind.NETWORK, error.kind)
         assertEquals(502, error.code)
-        assertTrue(error.message.contains("Calibre 服务器暂时不可用"))
-        assertTrue(error.message.contains("已到达服务器地址"))
-        assertFalse(error.message.contains("Tailscale Serve"))
-        assertFalse(error.message.contains("VPN"))
+        assertTrue(error.message.contains("phase=ajax_search"))
+        assertTrue(error.message.contains("origin=https://reader.tailnet.ts.net"))
+        assertTrue(error.message.contains("status=502"))
+        assertFalse(error.message.contains(secretQuery))
+        assertFalse(error.message.contains("/calibre/ajax/search"))
         catalog.close()
     }
 
     @Test
-    fun tailscaleIpConnectionFailureWithoutVpnKeepsNetworkEvidenceInTheRealCatalogPath() = runTest {
+    fun tailscaleIpConnectionFailureWithoutVpnPreservesObservedFailureInTheRealCatalogPath() = runTest {
         val baseUrl = "http://100.64.0.42:8080"
         val client = CalibreClient(
             baseUrl = baseUrl,
@@ -130,7 +132,8 @@ class CalibreOnlineCatalogErrorTest {
         assertTrue(result is ReadflowResult.Failure)
         val error = (result as ReadflowResult.Failure).error
         assertEquals(ReadflowError.Kind.NETWORK, error.kind)
-        assertTrue(error.message.contains("未检测到可用于本应用的 VPN"))
+        assertTrue(error.message.contains("服务器拒绝或无法接受连接"))
+        assertFalse(error.message.contains("未检测到"))
         catalog.close()
     }
 }
