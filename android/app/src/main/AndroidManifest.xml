@@ -65,6 +65,14 @@
             android:name=".updater.UpdateInstallStatusReceiver"
             android:enabled="${updateReceiverEnabled}"
             android:exported="false" />
+        <activity
+            android:name=".updater.UpdateInstallStatusActivity"
+            android:enabled="${updateReceiverEnabled}"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay" />
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

@@ -38,6 +38,9 @@ internal fun retryRequestedForUpdateRequest(automatic: Boolean): Boolean = !auto
 
 internal enum class ReusableDownloadAction { STAGE_EXISTING, KEEP_EXISTING, ENQUEUE_NEW }
 
+internal fun automaticDownloadNotificationVisibility(): Int =
+    DownloadManager.Request.VISIBILITY_VISIBLE
+
 internal fun reusableDownloadAction(
     downloadStatus: Int?,
     hasDownloadedApk: Boolean,
@@ -193,7 +196,10 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                 setTitle("LinReads 更新下载中")
                 setDescription("正在下载新版本…")
                 setMimeType("application/vnd.android.package-archive")
-                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                // The updater owns the post-download transition. Keep download progress visible,
+                // then remove DownloadManager's completed-file notification so it cannot become a
+                // second, manual installation entry point.
+                setNotificationVisibility(automaticDownloadNotificationVisibility())
                 setDestinationInExternalFilesDir(
                     context,
                     null,

@@ -9,6 +9,14 @@ import org.junit.jupiter.api.Test
 class UpdateInstallReceiverPolicyTest {
 
     @Test
+    fun `automatic download notification disappears when the APK is complete`() {
+        assertEquals(
+            DownloadManager.Request.VISIBILITY_VISIBLE,
+            automaticDownloadNotificationVisibility(),
+        )
+    }
+
+    @Test
     fun `automatic requests do not retry replace while explicit taps do`() {
         assertFalse(retryRequestedForUpdateRequest(automatic = true))
         assertTrue(retryRequestedForUpdateRequest(automatic = false))
