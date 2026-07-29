@@ -14,8 +14,7 @@ jobs:
     permissions:
       contents: write
     env:
-      BUILD_TAG: dev-${{ github.run_number }}-${{ github.sha }}
-      BUILD_VERSION_CODE: ${{ github.run_number }}
+      BUILD_VERSION_BASE: 100000
       KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
       STORE_PASSWORD: android
       KEY_ALIAS: androiddebugkey
@@ -24,6 +23,40 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve monotonic Android build identity
+        id: build_identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          version_code=$((BUILD_VERSION_BASE + GITHUB_RUN_NUMBER))
+          previous_body="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/dev-latest" \
+              --jq '.body // ""' 2>/dev/null || true
+          )"
+          previous_code="$(
+            printf '%s\n' "$previous_body" \
+              | sed -nE 's/^VERSION_CODE:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' \
+              | tail -n 1
+          )"
+          if [[ -n "$previous_code" ]] && (( previous_code >= version_code )); then
+            version_code=$((previous_code + 1))
+          fi
+          if (( version_code <= 0 || version_code > 2100000000 )); then
+            echo "Resolved Android versionCode is outside the supported range: $version_code" >&2
+            exit 1
+          fi
+
+          build_tag="dev-${version_code}-${GITHUB_SHA}"
+          echo "BUILD_VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+          echo "BUILD_TAG=$build_tag" >> "$GITHUB_ENV"
+          echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
+          echo "build_tag=$build_tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved BUILD_VERSION_CODE=$version_code"
+          echo "Resolved BUILD_TAG=$build_tag"
 
       - uses: actions/setup-java@v4
         with:
@@ -54,15 +87,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dev-latest
-          name: "Dev build #${{ github.run_number }}"
+          name: "Dev build #${{ steps.build_identity.outputs.version_code }}"
           body: |
             ${{ github.event.head_commit.message }}
             
             ---
-            BUILD_TAG: ${{ env.BUILD_TAG }}
-            VERSION_CODE: ${{ env.BUILD_VERSION_CODE }}
+            BUILD_TAG: ${{ steps.build_identity.outputs.build_tag }}
+            VERSION_CODE: ${{ steps.build_identity.outputs.version_code }}
             Commit: ${{ github.sha }}
             Branch: ${{ github.ref_name }}
+            Workflow run: ${{ github.run_number }}
           files: android/app/build/outputs/apk/ota/app-ota.apk
           prerelease: true
           make_latest: false
