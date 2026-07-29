@@ -6121,6 +6121,8 @@ class EpubFlowViewTest {
         val epub = java.io.File.createTempFile("readflow-real-loader-terminal", ".epub")
         val executor = Executors.newSingleThreadExecutor()
         val decodeAttempts = AtomicInteger(0)
+        val firstDecodeAttempt = CountDownLatch(1)
+        val terminalDecodeAttempt = CountDownLatch(2)
         val resolver = EpubFlowImageSizeResolver(
             columnWidthPx = view.width,
             pageHeightProvider = { view.height },
@@ -6139,6 +6141,8 @@ class EpubFlowViewTest {
             imageQualityProvider = { EpubImageRenderQuality.RAPID },
             imageDecoder = { _, _, _ ->
                 decodeAttempts.incrementAndGet()
+                firstDecodeAttempt.countDown()
+                terminalDecodeAttempt.countDown()
                 null
             },
             onDecodeFinished = view::onAsyncImageDecodeFinished,
@@ -6165,7 +6169,11 @@ class EpubFlowViewTest {
             view.goToPage(fixture.imagePageIndex)
             loader.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
             loader.load(drawable)
-            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            assertTrue(
+                "the real executor must run the first image decode",
+                firstDecodeAttempt.await(5L, TimeUnit.SECONDS),
+            )
+            shadowOf(Looper.getMainLooper()).idle()
             assertTrue("the real loader must have attempted the first image decode", decodeAttempts.get() >= 1)
 
             view.flipStyle = PageFlipStyle.SIMULATION
@@ -6174,6 +6182,10 @@ class EpubFlowViewTest {
             assertTrue(view.goToAdjacentPage(1))
             val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
             firstAnimator.end()
+            assertTrue(
+                "the queued target must run the terminal image decode",
+                terminalDecodeAttempt.await(5L, TimeUnit.SECONDS),
+            )
             shadowOf(Looper.getMainLooper()).idleFor(1_000L, TimeUnit.MILLISECONDS)
 
             assertEquals(
