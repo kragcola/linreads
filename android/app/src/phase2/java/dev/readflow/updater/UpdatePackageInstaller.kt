@@ -54,9 +54,7 @@ internal fun foregroundInstallRecoveryAction(
     sessionQueryFailed: Boolean = false,
     bridgeRetrySuppressed: Boolean = false,
 ): ForegroundInstallRecoveryAction = when {
-    stage == InstallStage.AWAITING_USER && bridgeRetrySuppressed ->
-        ForegroundInstallRecoveryAction.KEEP_AWAITING
-    stage == InstallStage.AWAITING_USER -> ForegroundInstallRecoveryAction.LAUNCH_DOWNLOADED_APK
+    stage == InstallStage.AWAITING_USER -> ForegroundInstallRecoveryAction.KEEP_AWAITING
     stage == InstallStage.COMMITTED && sessionQueryFailed -> ForegroundInstallRecoveryAction.NONE
     stage == InstallStage.COMMITTED && sessionIsActive -> ForegroundInstallRecoveryAction.NONE
     stage == InstallStage.COMMITTED && hasRecoverableSession ->
@@ -83,10 +81,7 @@ internal fun pendingUserActionLaunch(
     hasDownloadedApk: Boolean,
     hasSystemConfirmation: Boolean,
 ): PendingUserActionLaunch = when {
-    isHuaweiOrHonor && hasDownloadedApk -> PendingUserActionLaunch.DIRECT_APK_INSTALL
-    isHuaweiOrHonor -> PendingUserActionLaunch.FAILURE
     hasSystemConfirmation -> PendingUserActionLaunch.SYSTEM_CONFIRMATION
-    hasDownloadedApk -> PendingUserActionLaunch.DIRECT_APK_INSTALL
     else -> PendingUserActionLaunch.FAILURE
 }
 
@@ -98,6 +93,18 @@ internal fun installStatusActivityBackgroundLaunchMode(sdkInt: Int): Int? = when
         ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED
     }
     else -> null
+}
+
+internal enum class InstallStatusAction(val opensMainActivity: Boolean) {
+    HANDLE_PENDING_USER_ACTION(opensMainActivity = false),
+    COMPLETE(opensMainActivity = true),
+    FAIL(opensMainActivity = false),
+}
+
+internal fun installStatusAction(status: Int): InstallStatusAction = when (status) {
+    PackageInstaller.STATUS_PENDING_USER_ACTION -> InstallStatusAction.HANDLE_PENDING_USER_ACTION
+    PackageInstaller.STATUS_SUCCESS -> InstallStatusAction.COMPLETE
+    else -> InstallStatusAction.FAIL
 }
 
 internal fun isHuaweiOrHonorDevice(manufacturer: String?, brand: String?): Boolean {
@@ -889,8 +896,9 @@ private fun handleInstallStatus(context: Context, intent: Intent) {
     )
     if (sessionId == NO_SESSION) return
     if (!UpdatePackageInstaller.isCurrentSession(context, sessionId)) return
-    when (val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
-        PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+    val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
+    when (installStatusAction(status)) {
+        InstallStatusAction.HANDLE_PENDING_USER_ACTION -> {
             UpdatePackageInstaller.markAwaitingUser(context, sessionId)
             val dlId = UpdatePackageInstaller.downloadIdForSession(context, sessionId)
             val apkUri = dlId?.let { downloadId ->
@@ -929,11 +937,12 @@ private fun handleInstallStatus(context: Context, intent: Intent) {
                 }
             }
         }
-        PackageInstaller.STATUS_SUCCESS -> {
+        InstallStatusAction.COMPLETE -> {
             UpdatePackageInstaller.clearCompleted(context, sessionId)
             cancelUpdateNotifications(context)
+            launchMainAfterInstall(context)
         }
-        else -> {
+        InstallStatusAction.FAIL -> {
             UpdatePackageInstaller.downloadIdForSession(context, sessionId)?.let { downloadId ->
                 disarmPostInstallTakeover(context, downloadId)
             }
@@ -944,6 +953,16 @@ private fun handleInstallStatus(context: Context, intent: Intent) {
         }
     }
 }
+
+private fun launchMainAfterInstall(context: Context): Boolean = runCatching {
+    context.startActivity(
+        Intent(context, MainActivity::class.java).addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP,
+        ),
+    )
+}.isSuccess
 
 private fun statusIntent(context: Context, sessionId: Int): PendingIntent {
     val intent = Intent(context, UpdateInstallStatusActivity::class.java).apply {

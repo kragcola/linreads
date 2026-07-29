@@ -22,9 +22,9 @@ class UpdatePackageInstallerTest {
     }
 
     @Test
-    fun `Huawei pending action uses the downloaded APK instead of AppGallery confirmation`() {
+    fun `Huawei pending action preserves the original PackageInstaller session`() {
         assertEquals(
-            PendingUserActionLaunch.DIRECT_APK_INSTALL,
+            PendingUserActionLaunch.SYSTEM_CONFIRMATION,
             pendingUserActionLaunch(
                 isHuaweiOrHonor = true,
                 hasDownloadedApk = true,
@@ -34,9 +34,9 @@ class UpdatePackageInstallerTest {
     }
 
     @Test
-    fun `Huawei pending action never falls through to AppGallery when the APK URI is unavailable`() {
+    fun `Huawei pending action still preserves the session when the APK URI is unavailable`() {
         assertEquals(
-            PendingUserActionLaunch.FAILURE,
+            PendingUserActionLaunch.SYSTEM_CONFIRMATION,
             pendingUserActionLaunch(
                 isHuaweiOrHonor = true,
                 hasDownloadedApk = false,
@@ -456,9 +456,9 @@ class UpdatePackageInstallerTest {
     }
 
     @Test
-    fun `foreground resume uses the downloaded APK when the session confirmation is unavailable`() {
+    fun `missing session confirmation never starts a second install transaction`() {
         assertEquals(
-            PendingUserActionLaunch.DIRECT_APK_INSTALL,
+            PendingUserActionLaunch.FAILURE,
             pendingUserActionLaunch(
                 isHuaweiOrHonor = false,
                 hasDownloadedApk = true,
@@ -478,6 +478,22 @@ class UpdatePackageInstallerTest {
         assertEquals(
             ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOW_ALWAYS,
             installStatusActivityBackgroundLaunchMode(sdkInt = 36),
+        )
+    }
+
+    @Test
+    fun `successful original session callback reopens LinReads`() {
+        assertEquals(
+            true,
+            installStatusAction(PackageInstaller.STATUS_SUCCESS).opensMainActivity,
+        )
+        assertEquals(
+            false,
+            installStatusAction(PackageInstaller.STATUS_PENDING_USER_ACTION).opensMainActivity,
+        )
+        assertEquals(
+            false,
+            installStatusAction(PackageInstaller.STATUS_FAILURE).opensMainActivity,
         )
     }
 
@@ -594,9 +610,9 @@ class UpdatePackageInstallerTest {
     }
 
     @Test
-    fun `foreground recovery reopens the downloaded APK while awaiting user action`() {
+    fun `foreground recovery never replaces an awaiting original session with direct install`() {
         assertEquals(
-            ForegroundInstallRecoveryAction.LAUNCH_DOWNLOADED_APK,
+            ForegroundInstallRecoveryAction.KEEP_AWAITING,
             foregroundInstallRecoveryAction(
                 stage = InstallStage.AWAITING_USER,
                 hasRecoverableSession = true,
