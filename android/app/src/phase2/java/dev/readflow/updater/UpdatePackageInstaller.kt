@@ -2,6 +2,7 @@ package dev.readflow.updater
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.ActivityOptions
 import android.app.DownloadManager
 import android.app.NotificationChannel
@@ -14,6 +15,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Process
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -38,6 +41,7 @@ internal enum class PendingUserActionLaunch { DIRECT_APK_INSTALL, SYSTEM_CONFIRM
 
 internal enum class ForegroundInstallRecoveryAction {
     NONE,
+    KEEP_AWAITING,
     LAUNCH_DOWNLOADED_APK,
     RECOMMIT_SESSION,
     RESTAGE_DOWNLOADED_APK,
@@ -48,7 +52,10 @@ internal fun foregroundInstallRecoveryAction(
     hasRecoverableSession: Boolean,
     sessionIsActive: Boolean = false,
     sessionQueryFailed: Boolean = false,
+    bridgeRetrySuppressed: Boolean = false,
 ): ForegroundInstallRecoveryAction = when {
+    stage == InstallStage.AWAITING_USER && bridgeRetrySuppressed ->
+        ForegroundInstallRecoveryAction.KEEP_AWAITING
     stage == InstallStage.AWAITING_USER -> ForegroundInstallRecoveryAction.LAUNCH_DOWNLOADED_APK
     stage == InstallStage.COMMITTED && sessionQueryFailed -> ForegroundInstallRecoveryAction.NONE
     stage == InstallStage.COMMITTED && sessionIsActive -> ForegroundInstallRecoveryAction.NONE
@@ -97,6 +104,151 @@ internal fun isHuaweiOrHonorDevice(manufacturer: String?, brand: String?): Boole
     val names = listOfNotNull(manufacturer, brand).map { it.trim().lowercase() }
     return names.any { it == "huawei" || it == "honor" }
 }
+
+internal fun directApkInstallerFlags(): Int = Intent.FLAG_GRANT_READ_URI_PERMISSION
+
+internal fun directApkInstallerReturnsResult(): Boolean = true
+
+internal enum class ApkInstallBridgeAction { LAUNCH_INSTALLER, AWAIT_RESULT, FINISH }
+
+internal fun apkInstallBridgeAction(
+    installerAlreadyLaunched: Boolean,
+    hasApkUri: Boolean,
+    persistedState: ApkInstallBridgeState = ApkInstallBridgeState.NONE,
+): ApkInstallBridgeAction = when {
+    !hasApkUri -> ApkInstallBridgeAction.FINISH
+    installerAlreadyLaunched || persistedState == ApkInstallBridgeState.ACTIVE ->
+        ApkInstallBridgeAction.AWAIT_RESULT
+    persistedState == ApkInstallBridgeState.LAUNCHING -> ApkInstallBridgeAction.LAUNCH_INSTALLER
+    else -> ApkInstallBridgeAction.FINISH
+}
+
+internal fun shouldCloseInstallBridgeOnResume(
+    installerLaunched: Boolean,
+    bridgePausedForInstaller: Boolean,
+    returningToLinReads: Boolean = false,
+    recoveredActiveWithoutSavedState: Boolean = false,
+): Boolean = installerLaunched &&
+    (bridgePausedForInstaller || recoveredActiveWithoutSavedState) &&
+    !returningToLinReads
+
+internal fun shouldRemoveInstallBridgeTask(mainActivityLaunchSucceeded: Boolean): Boolean =
+    mainActivityLaunchSucceeded
+
+internal enum class ApkInstallBridgeState {
+    NONE,
+    LAUNCHING,
+    ACTIVE,
+    DEFERRED,
+    DEFERRED_WITHOUT_NOTIFICATION,
+    FAILED,
+}
+
+internal enum class BridgeLaunchClaimAction { CLAIM, KEEP_WAITING, REJECT }
+
+internal fun bridgeLaunchClaimAction(
+    state: ApkInstallBridgeState,
+    userInitiated: Boolean,
+): BridgeLaunchClaimAction = when (state) {
+    ApkInstallBridgeState.NONE -> BridgeLaunchClaimAction.CLAIM
+    ApkInstallBridgeState.LAUNCHING,
+    ApkInstallBridgeState.ACTIVE,
+    -> BridgeLaunchClaimAction.KEEP_WAITING
+    ApkInstallBridgeState.DEFERRED,
+    ApkInstallBridgeState.DEFERRED_WITHOUT_NOTIFICATION,
+    ApkInstallBridgeState.FAILED,
+    -> if (userInitiated) BridgeLaunchClaimAction.CLAIM else BridgeLaunchClaimAction.REJECT
+}
+
+internal enum class BridgeNotificationAction { RESUME_TASK, RETRY_INSTALLER, KEEP_WAITING }
+
+internal enum class ApkInstallRetryEntryPoint { ACTIVITY }
+
+internal fun apkInstallRetryEntryPoint(): ApkInstallRetryEntryPoint =
+    ApkInstallRetryEntryPoint.ACTIVITY
+
+internal fun bridgeNotificationAction(
+    state: ApkInstallBridgeState,
+    hasBridgeTask: Boolean,
+): BridgeNotificationAction = when {
+    state == ApkInstallBridgeState.ACTIVE && hasBridgeTask -> BridgeNotificationAction.RESUME_TASK
+    state == ApkInstallBridgeState.LAUNCHING -> BridgeNotificationAction.KEEP_WAITING
+    else -> BridgeNotificationAction.RETRY_INSTALLER
+}
+
+internal fun bridgeStateForRetryRoute(notificationPosted: Boolean): ApkInstallBridgeState =
+    if (notificationPosted) {
+        ApkInstallBridgeState.DEFERRED
+    } else {
+        ApkInstallBridgeState.DEFERRED_WITHOUT_NOTIFICATION
+    }
+
+internal fun canPublishBridgeNotification(
+    currentDownloadId: Long,
+    requestedDownloadId: Long,
+    currentState: ApkInstallBridgeState,
+    requiredState: ApkInstallBridgeState?,
+): Boolean = currentDownloadId == requestedDownloadId &&
+    (requiredState == null || currentState == requiredState)
+
+internal fun shouldPublishInstallNotification(
+    appNotificationsAllowed: Boolean,
+    channelImportance: Int?,
+): Boolean = appNotificationsAllowed && channelImportance != NotificationManager.IMPORTANCE_NONE
+
+internal fun apkInstallBridgeFlags(callerIsActivity: Boolean): Int =
+    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK
+
+internal enum class ActiveBridgeForegroundAction { KEEP_NOTIFICATION_ROUTE, MOVE_TASK_TO_FRONT }
+
+internal fun activeBridgeForegroundAction(
+    notificationPosted: Boolean,
+): ActiveBridgeForegroundAction = if (notificationPosted) {
+    ActiveBridgeForegroundAction.KEEP_NOTIFICATION_ROUTE
+} else {
+    ActiveBridgeForegroundAction.MOVE_TASK_TO_FRONT
+}
+
+internal fun shouldPublishStagingFailureNotification(
+    failureBelongsToCurrentDownload: Boolean,
+): Boolean = failureBelongsToCurrentDownload
+
+internal fun isBridgeLaunchStale(
+    state: ApkInstallBridgeState,
+    hasBridgeTask: Boolean,
+    claimedProcessId: Int?,
+    currentProcessId: Int,
+    claimedAtElapsedMs: Long?,
+    nowElapsedMs: Long,
+    timeoutMs: Long = BRIDGE_LAUNCH_TIMEOUT_MS,
+): Boolean {
+    if (state != ApkInstallBridgeState.LAUNCHING || hasBridgeTask) return false
+    if (claimedProcessId == null || claimedProcessId != currentProcessId) return true
+    val claimedAt = claimedAtElapsedMs ?: return true
+    val age = nowElapsedMs - claimedAt
+    return age < 0L || age >= timeoutMs
+}
+
+internal enum class BridgeForegroundFallbackAction {
+    NONE,
+    KEEP_EXPLICIT_RETRY,
+    ARM_NEXT_FOREGROUND,
+}
+
+internal fun bridgeForegroundFallbackAction(
+    state: ApkInstallBridgeState,
+): BridgeForegroundFallbackAction = when (state) {
+    ApkInstallBridgeState.NONE -> BridgeForegroundFallbackAction.NONE
+    ApkInstallBridgeState.DEFERRED_WITHOUT_NOTIFICATION ->
+        BridgeForegroundFallbackAction.ARM_NEXT_FOREGROUND
+    else -> BridgeForegroundFallbackAction.KEEP_EXPLICIT_RETRY
+}
+
+internal fun shouldSuppressAutomaticBridgeReopen(
+    currentDownloadId: Long,
+    bridgeDownloadId: Long?,
+    bridgeState: ApkInstallBridgeState,
+): Boolean = bridgeDownloadId == currentDownloadId && bridgeState != ApkInstallBridgeState.NONE
 
 internal fun installEnqueueAction(
     currentDownloadId: Long,
@@ -147,6 +299,10 @@ internal object UpdatePackageInstaller {
                 .putString(KEY_INSTALL_STAGE, InstallStage.STAGING.name)
                 .remove(KEY_INSTALL_SESSION_ID)
                 .remove(KEY_INSTALL_ERROR)
+                .remove(KEY_INSTALL_BRIDGE_STATE)
+                .remove(KEY_INSTALL_BRIDGE_TASK_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
                 .apply()
         }
 
@@ -215,6 +371,10 @@ internal object UpdatePackageInstaller {
                 .remove(KEY_INSTALL_SESSION_ID)
                 .remove(KEY_INSTALL_STAGE)
                 .remove(KEY_INSTALL_ERROR)
+                .remove(KEY_INSTALL_BRIDGE_STATE)
+                .remove(KEY_INSTALL_BRIDGE_TASK_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
                 .apply()
         }
     }
@@ -229,6 +389,10 @@ internal object UpdatePackageInstaller {
                 .remove(KEY_INSTALL_SESSION_ID)
                 .remove(KEY_INSTALL_STAGE)
                 .remove(KEY_INSTALL_ERROR)
+                .remove(KEY_INSTALL_BRIDGE_STATE)
+                .remove(KEY_INSTALL_BRIDGE_TASK_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
                 .apply()
             recorded
         }
@@ -258,15 +422,28 @@ internal object UpdatePackageInstaller {
         }
     }
 
-    fun recordStagingFailure(context: Context, downloadId: Long, error: Throwable) {
-        synchronized(lock) {
-            val prefs = context.installPreferences()
-            if (prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) return
+    fun recordStagingFailure(
+        context: Context,
+        downloadId: Long,
+        error: Throwable,
+        publishNotification: Boolean = false,
+    ): Boolean = synchronized(lock) {
+        val prefs = context.installPreferences()
+        val belongsToCurrentDownload =
+            prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) == downloadId
+        if (belongsToCurrentDownload) {
             prefs.edit()
                 .putString(KEY_INSTALL_STAGE, InstallStage.FAILED.name)
                 .putString(KEY_INSTALL_ERROR, error.message ?: error.javaClass.simpleName)
                 .apply()
         }
+        if (
+            publishNotification &&
+            shouldPublishStagingFailureNotification(belongsToCurrentDownload)
+        ) {
+            postInstallFailureNotification(context, error.message ?: "无法准备更新安装")
+        }
+        belongsToCurrentDownload
     }
 
     fun abandonRecordedSession(context: Context) {
@@ -287,13 +464,257 @@ internal object UpdatePackageInstaller {
         }
     }
 
+    fun bridgeStateForDownload(context: Context, downloadId: Long): ApkInstallBridgeState {
+        val prefs = context.installPreferences()
+        return prefs.installBridgeState().takeIf {
+            prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) == downloadId
+        } ?: ApkInstallBridgeState.NONE
+    }
+
+    fun bridgeTaskIdForDownload(context: Context, downloadId: Long): Int? {
+        val prefs = context.installPreferences()
+        if (prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) return null
+        return prefs.getInt(KEY_INSTALL_BRIDGE_TASK_ID, NO_BRIDGE_TASK).takeIf {
+            it != NO_BRIDGE_TASK
+        }
+    }
+
+    fun bridgeAppTaskForDownload(
+        context: Context,
+        downloadId: Long,
+    ): ActivityManager.AppTask? {
+        val taskId = bridgeTaskIdForDownload(context, downloadId) ?: return null
+        return runCatching {
+            context.getSystemService(ActivityManager::class.java).appTasks.firstOrNull {
+                it.taskInfo.taskId == taskId
+            }
+        }.getOrNull()
+    }
+
+    fun claimBridgeLaunch(
+        context: Context,
+        downloadId: Long,
+        userInitiated: Boolean,
+    ): BridgeLaunchClaimAction = synchronized(lock) {
+        val prefs = context.installPreferences()
+        if (prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) {
+            return@synchronized BridgeLaunchClaimAction.REJECT
+        }
+        val action = bridgeLaunchClaimAction(prefs.installBridgeState(), userInitiated)
+        if (action == BridgeLaunchClaimAction.CLAIM) {
+            val committed = prefs.edit()
+                .putString(KEY_INSTALL_BRIDGE_STATE, ApkInstallBridgeState.LAUNCHING.name)
+                .remove(KEY_INSTALL_BRIDGE_TASK_ID)
+                .putInt(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID, Process.myPid())
+                .putLong(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS, SystemClock.elapsedRealtime())
+                .commit()
+            if (!committed) return@synchronized BridgeLaunchClaimAction.REJECT
+        }
+        action
+    }
+
+    fun activateBridgeForDownload(
+        context: Context,
+        downloadId: Long,
+        taskId: Int,
+    ): Boolean = synchronized(lock) {
+        val prefs = context.installPreferences()
+        if (
+            prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId ||
+            prefs.installBridgeState() != ApkInstallBridgeState.LAUNCHING
+        ) {
+            return@synchronized false
+        }
+        prefs.edit()
+            .putString(KEY_INSTALL_BRIDGE_STATE, ApkInstallBridgeState.ACTIVE.name)
+            .putInt(KEY_INSTALL_BRIDGE_TASK_ID, taskId)
+            .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+            .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
+            .commit()
+    }
+
+    fun updateBridgeStateForDownload(
+        context: Context,
+        downloadId: Long,
+        state: ApkInstallBridgeState,
+    ): Boolean = synchronized(lock) {
+        val prefs = context.installPreferences()
+        if (prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) {
+            return@synchronized false
+        }
+        val editor = prefs.edit()
+        if (state == ApkInstallBridgeState.NONE) {
+            editor.remove(KEY_INSTALL_BRIDGE_STATE)
+        } else {
+            editor.putString(KEY_INSTALL_BRIDGE_STATE, state.name)
+        }
+        if (state !in setOf(ApkInstallBridgeState.LAUNCHING, ApkInstallBridgeState.ACTIVE)) {
+            editor.remove(KEY_INSTALL_BRIDGE_TASK_ID)
+        }
+        if (state != ApkInstallBridgeState.LAUNCHING) {
+            editor.remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+            editor.remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
+        }
+        editor.commit()
+    }
+
+    fun recoverStaleBridgeLaunch(context: Context, downloadId: Long): Boolean = synchronized(lock) {
+        val prefs = context.installPreferences()
+        if (prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) {
+            return@synchronized false
+        }
+        if (
+            !isBridgeLaunchStale(
+                state = prefs.installBridgeState(),
+                hasBridgeTask = prefs.getInt(KEY_INSTALL_BRIDGE_TASK_ID, NO_BRIDGE_TASK) !=
+                    NO_BRIDGE_TASK,
+                claimedProcessId = prefs.getInt(
+                    KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID,
+                    NO_BRIDGE_CLAIM_PROCESS,
+                ).takeIf { it != NO_BRIDGE_CLAIM_PROCESS },
+                currentProcessId = Process.myPid(),
+                claimedAtElapsedMs = prefs.getLong(
+                    KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS,
+                    NO_BRIDGE_CLAIM_TIME,
+                ).takeIf { it != NO_BRIDGE_CLAIM_TIME },
+                nowElapsedMs = SystemClock.elapsedRealtime(),
+            )
+        ) {
+            return@synchronized false
+        }
+        prefs.edit()
+            .remove(KEY_INSTALL_BRIDGE_STATE)
+            .remove(KEY_INSTALL_BRIDGE_TASK_ID)
+            .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+            .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
+            .commit()
+    }
+
+    fun publishBridgeNotification(
+        context: Context,
+        downloadId: Long,
+        apkUri: Uri,
+        requiredState: ApkInstallBridgeState? = null,
+        deferWhenUnavailable: Boolean = false,
+    ): Boolean = synchronized(lock) {
+        val prefs = context.installPreferences()
+        if (
+            !canPublishBridgeNotification(
+                currentDownloadId = prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD),
+                requestedDownloadId = downloadId,
+                currentState = prefs.installBridgeState(),
+                requiredState = requiredState,
+            )
+        ) {
+            return@synchronized false
+        }
+        val posted = postApkInstallNotification(context, downloadId, apkUri)
+        if (!posted && deferWhenUnavailable) {
+            prefs.edit()
+                .putString(
+                    KEY_INSTALL_BRIDGE_STATE,
+                    bridgeStateForRetryRoute(notificationPosted = false).name,
+                )
+                .remove(KEY_INSTALL_BRIDGE_TASK_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
+                .commit()
+        }
+        posted
+    }
+
+    private fun armBridgeRetryForNextForeground(
+        context: Context,
+        downloadId: Long,
+    ): Boolean = synchronized(lock) {
+        val prefs = context.installPreferences()
+        if (
+            prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId ||
+            prefs.installBridgeState() != ApkInstallBridgeState.DEFERRED_WITHOUT_NOTIFICATION
+        ) {
+            return@synchronized false
+        }
+        prefs.edit()
+            .remove(KEY_INSTALL_BRIDGE_STATE)
+            .remove(KEY_INSTALL_BRIDGE_TASK_ID)
+            .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+            .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
+            .commit()
+    }
+
     fun resumeAwaitingInstallerOnForeground(
         context: Context,
         downloadId: Long,
         apkUri: Uri,
     ): Boolean {
+        recoverStaleBridgeLaunch(context, downloadId)
         val stage = stageForDownload(context, downloadId)
-        val sessionId = context.installPreferences().getInt(KEY_INSTALL_SESSION_ID, NO_SESSION)
+        val prefs = context.installPreferences()
+        val sessionId = prefs.getInt(KEY_INSTALL_SESSION_ID, NO_SESSION)
+        val bridgeDownloadId = prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD)
+            .takeIf { it != NO_DOWNLOAD }
+        val bridgeState = prefs.installBridgeState()
+        when (bridgeState) {
+            ApkInstallBridgeState.DEFERRED_WITHOUT_NOTIFICATION -> {
+                if (armBridgeRetryForNextForeground(context, downloadId)) return true
+            }
+            ApkInstallBridgeState.DEFERRED,
+            ApkInstallBridgeState.FAILED,
+            -> {
+                publishBridgeNotification(
+                    context = context,
+                    downloadId = downloadId,
+                    apkUri = apkUri,
+                    requiredState = bridgeState,
+                    deferWhenUnavailable = true,
+                )
+                return true
+            }
+            ApkInstallBridgeState.ACTIVE -> {
+                val appTask = bridgeAppTaskForDownload(context, downloadId)
+                if (appTask == null) {
+                    if (
+                        updateBridgeStateForDownload(
+                            context,
+                            downloadId,
+                            ApkInstallBridgeState.DEFERRED,
+                        )
+                    ) {
+                        publishBridgeNotification(
+                            context = context,
+                            downloadId = downloadId,
+                            apkUri = apkUri,
+                            requiredState = ApkInstallBridgeState.DEFERRED,
+                            deferWhenUnavailable = true,
+                        )
+                    }
+                } else {
+                    val notificationPosted = publishBridgeNotification(
+                        context = context,
+                        downloadId = downloadId,
+                        apkUri = apkUri,
+                        requiredState = ApkInstallBridgeState.ACTIVE,
+                    )
+                    if (
+                        activeBridgeForegroundAction(notificationPosted) ==
+                        ActiveBridgeForegroundAction.MOVE_TASK_TO_FRONT
+                    ) {
+                        runCatching { appTask.moveToFront() }
+                    }
+                }
+                return true
+            }
+            ApkInstallBridgeState.LAUNCHING -> {
+                publishBridgeNotification(
+                    context = context,
+                    downloadId = downloadId,
+                    apkUri = apkUri,
+                    requiredState = ApkInstallBridgeState.LAUNCHING,
+                )
+                return true
+            }
+            ApkInstallBridgeState.NONE -> Unit
+        }
         val sessionInfoResult = if (sessionId == NO_SESSION) {
             Result.success(null)
         } else {
@@ -306,15 +727,21 @@ internal object UpdatePackageInstaller {
                 hasRecoverableSession = sessionInfo != null,
                 sessionIsActive = sessionInfo?.isActive == true,
                 sessionQueryFailed = sessionInfoResult.isFailure,
+                bridgeRetrySuppressed = shouldSuppressAutomaticBridgeReopen(
+                    currentDownloadId = downloadId,
+                    bridgeDownloadId = bridgeDownloadId,
+                    bridgeState = bridgeState,
+                ),
             )
         ) {
             ForegroundInstallRecoveryAction.NONE -> false
+            ForegroundInstallRecoveryAction.KEEP_AWAITING -> true
             ForegroundInstallRecoveryAction.LAUNCH_DOWNLOADED_APK -> {
                 // startActivity() can be silently aborted by the system. Keep a user-triggered
                 // route alive until PackageInstaller reaches a terminal state.
-                postApkInstallNotification(context, downloadId.hashCode(), apkUri)
+                publishBridgeNotification(context, downloadId, apkUri)
                 cancelUpdateDetectionNotification(context)
-                launchApkInstaller(context, apkUri)
+                launchApkInstaller(context, downloadId, apkUri)
                 true
             }
             ForegroundInstallRecoveryAction.RECOMMIT_SESSION -> {
@@ -415,8 +842,12 @@ class UpdateInstallWorker(
             if (sessionId != NO_SESSION) {
                 runCatching { applicationContext.packageManager.packageInstaller.abandonSession(sessionId) }
             }
-            UpdatePackageInstaller.recordStagingFailure(applicationContext, downloadId, error)
-            postInstallFailureNotification(applicationContext, error.message ?: "无法准备更新安装")
+            UpdatePackageInstaller.recordStagingFailure(
+                context = applicationContext,
+                downloadId = downloadId,
+                error = error,
+                publishNotification = true,
+            )
             Result.failure()
         }
     }
@@ -436,7 +867,7 @@ class UpdateInstallStatusActivity : Activity() {
 
     private fun consumeStatusIntent(statusIntent: Intent) {
         handleInstallStatus(this, statusIntent)
-        finishAndRemoveTask()
+        finish()
     }
 }
 
@@ -474,9 +905,10 @@ private fun handleInstallStatus(context: Context, intent: Intent) {
             ) {
                 PendingUserActionLaunch.DIRECT_APK_INSTALL -> {
                     val uri = requireNotNull(apkUri)
-                    postApkInstallNotification(context, sessionId, uri)
+                    val downloadId = requireNotNull(dlId)
+                    UpdatePackageInstaller.publishBridgeNotification(context, downloadId, uri)
                     cancelUpdateDetectionNotification(context)
-                    launchApkInstaller(context, uri)
+                    launchApkInstaller(context, downloadId, uri)
                 }
                 PendingUserActionLaunch.SYSTEM_CONFIRMATION -> {
                     val systemConfirmation = requireNotNull(confirmation)
@@ -534,24 +966,76 @@ private fun canPostInstallNotification(context: Context): Boolean {
     val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
         PackageManager.PERMISSION_GRANTED
-    return shouldPostUpdateNotification(
+    val appNotificationsAllowed = shouldPostUpdateNotification(
         sdkInt = Build.VERSION.SDK_INT,
         permissionGranted = permissionGranted,
         notificationsEnabled = NotificationManagerCompat.from(context).areNotificationsEnabled(),
     )
+    val channelImportance = context.getSystemService(NotificationManager::class.java)
+        .getNotificationChannel(INSTALL_CHANNEL_ID)
+        ?.importance
+    return shouldPublishInstallNotification(appNotificationsAllowed, channelImportance)
 }
 
-private fun launchApkInstaller(context: Context, apkUri: Uri): Boolean = runCatching {
-    context.startActivity(apkInstallIntent(apkUri))
-}.isSuccess
+internal fun launchApkInstaller(
+    context: Context,
+    downloadId: Long,
+    apkUri: Uri,
+    userInitiated: Boolean = false,
+): Boolean {
+    return when (
+        UpdatePackageInstaller.claimBridgeLaunch(context, downloadId, userInitiated)
+    ) {
+        BridgeLaunchClaimAction.KEEP_WAITING -> true
+        BridgeLaunchClaimAction.REJECT -> false
+        BridgeLaunchClaimAction.CLAIM -> runCatching {
+            context.startActivity(
+                apkInstallBridgeIntent(
+                    context = context,
+                    downloadId = downloadId,
+                    apkUri = apkUri,
+                ),
+            )
+        }.fold(
+            onSuccess = { true },
+            onFailure = {
+                val stateUpdated = UpdatePackageInstaller.updateBridgeStateForDownload(
+                    context,
+                    downloadId,
+                    ApkInstallBridgeState.FAILED,
+                )
+                if (stateUpdated) {
+                    UpdatePackageInstaller.publishBridgeNotification(
+                        context = context,
+                        downloadId = downloadId,
+                        apkUri = apkUri,
+                        requiredState = ApkInstallBridgeState.FAILED,
+                        deferWhenUnavailable = true,
+                    )
+                }
+                false
+            },
+        )
+    }
+}
 
-private fun apkInstallIntent(apkUri: Uri) = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
+internal fun apkInstallIntent(apkUri: Uri) = Intent(Intent.ACTION_INSTALL_PACKAGE).apply {
     data = apkUri
-    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    addFlags(directApkInstallerFlags())
     putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true)
-    putExtra(Intent.EXTRA_RETURN_RESULT, false)
+    putExtra(Intent.EXTRA_RETURN_RESULT, directApkInstallerReturnsResult())
 }
+
+private fun apkInstallBridgeIntent(
+    context: Context,
+    downloadId: Long,
+    apkUri: Uri,
+) =
+    Intent(context, UpdateApkInstallActivity::class.java).apply {
+        data = apkUri
+        putExtra(EXTRA_BRIDGE_DOWNLOAD_ID, downloadId)
+        addFlags(apkInstallBridgeFlags(callerIsActivity = context is Activity))
+    }
 
 private fun launchSystemConfirmation(context: Context, confirmation: Intent): Boolean =
     runCatching {
@@ -588,7 +1072,7 @@ private fun postSystemConfirmationNotification(
     }
 }.getOrDefault(false)
 
-private fun postApkInstallNotification(context: Context, sessionId: Int, apkUri: Uri): Boolean =
+private fun postApkInstallNotification(context: Context, downloadId: Long, apkUri: Uri): Boolean =
     runCatching {
         if (!canPostInstallNotification(context)) {
             false
@@ -596,9 +1080,16 @@ private fun postApkInstallNotification(context: Context, sessionId: Int, apkUri:
             createInstallNotificationChannel(context)
             val pendingInstaller = PendingIntent.getActivity(
                 context,
-                sessionId,
-                apkInstallIntent(apkUri),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE,
+                downloadId.hashCode(),
+                Intent(context, UpdateApkInstallResumeActivity::class.java).apply {
+                    data = apkUri
+                    putExtra(EXTRA_BRIDGE_DOWNLOAD_ID, downloadId)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    addFlags(Intent.FLAG_ACTIVITY_NO_HISTORY)
+                    addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
             context.getSystemService(NotificationManager::class.java).notify(
                 INSTALL_NOTIFICATION_ID,
@@ -606,7 +1097,8 @@ private fun postApkInstallNotification(context: Context, sessionId: Int, apkUri:
                     .setSmallIcon(android.R.drawable.stat_sys_download_done)
                     .setContentTitle("LinReads 更新已准备好")
                     .setContentText("点击确认安装")
-                    .setAutoCancel(true)
+                    .setAutoCancel(false)
+                    .setOnlyAlertOnce(true)
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
                     .setContentIntent(pendingInstaller)
                     .build(),
@@ -665,6 +1157,11 @@ private fun android.content.SharedPreferences.installStage(): InstallStage? =
     getString(KEY_INSTALL_STAGE, null)
         ?.let { value -> runCatching { InstallStage.valueOf(value) }.getOrNull() }
 
+private fun android.content.SharedPreferences.installBridgeState(): ApkInstallBridgeState =
+    getString(KEY_INSTALL_BRIDGE_STATE, null)
+        ?.let { value -> runCatching { ApkInstallBridgeState.valueOf(value) }.getOrNull() }
+        ?: ApkInstallBridgeState.NONE
+
 private fun Context.installPreferences() = getSharedPreferences(UPDATE_PREFS_NAME, Context.MODE_PRIVATE)
 
 private fun workName(downloadId: Long) = "linreads-update-install-$downloadId"
@@ -676,11 +1173,20 @@ private const val KEY_INSTALL_DOWNLOAD_ID = "install_dl_id"
 private const val KEY_INSTALL_SESSION_ID = "install_session_id"
 private const val KEY_INSTALL_STAGE = "install_stage"
 private const val KEY_INSTALL_ERROR = "install_error"
+private const val KEY_INSTALL_BRIDGE_STATE = "install_bridge_state"
+private const val KEY_INSTALL_BRIDGE_TASK_ID = "install_bridge_task_id"
+private const val KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID = "install_bridge_claim_process_id"
+private const val KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS = "install_bridge_claim_elapsed_ms"
 private const val INPUT_DOWNLOAD_ID = "download_id"
 private const val INPUT_APK_URI = "apk_uri"
 private const val EXTRA_SESSION_ID = "linreads_install_session_id"
+internal const val EXTRA_BRIDGE_DOWNLOAD_ID = "linreads_install_download_id"
 private const val APK_SESSION_NAME = "base.apk"
 private const val INSTALL_CHANNEL_ID = "linreads_update"
 private const val INSTALL_NOTIFICATION_ID = 9002
 private const val NO_DOWNLOAD = -1L
 private const val NO_SESSION = -1
+private const val NO_BRIDGE_TASK = -1
+private const val NO_BRIDGE_CLAIM_PROCESS = -1
+private const val NO_BRIDGE_CLAIM_TIME = -1L
+private const val BRIDGE_LAUNCH_TIMEOUT_MS = 10_000L
