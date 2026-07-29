@@ -1900,7 +1900,7 @@ class EpubFlowSpannableTest {
         val executor = QueuedExecutorService()
         val decoded = mutableListOf<android.graphics.Bitmap>()
         val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().visible().get()
-        val host = android.view.View(activity)
+        val host = ControlledFrameHost(activity)
         activity.setContentView(host)
         val loader = EpubFlowImageLoader(
             epubFileProvider = { epub },
@@ -1924,13 +1924,22 @@ class EpubFlowSpannableTest {
             shadowOf(Looper.getMainLooper()).idle()
             loader.releaseAll(host)
 
-            shadowOf(Looper.getMainLooper()).idleFor(336L, TimeUnit.MILLISECONDS)
+            assertEquals("releaseAll(host) must request the first host frame", 1, host.pendingFrameCount)
+            shadowOf(Looper.getMainLooper()).idleFor(640L, TimeUnit.MILLISECONDS)
             assertFalse(
-                "the host release path must cross two frame callbacks before the safety age starts",
+                "elapsed age cannot replace either required host frame",
                 decoded.single().isRecycled,
             )
-            shadowOf(Looper.getMainLooper()).idleFor(32L, TimeUnit.MILLISECONDS)
-            assertTrue("the render barrier must still release retired native pixels", decoded.single().isRecycled)
+            host.dispatchNextFrame()
+            assertEquals("the first frame must request a distinct second frame", 1, host.pendingFrameCount)
+            shadowOf(Looper.getMainLooper()).idleFor(320L, TimeUnit.MILLISECONDS)
+            assertFalse("one host frame cannot authorize native recycle", decoded.single().isRecycled)
+            host.dispatchNextFrame()
+            assertEquals(0, host.pendingFrameCount)
+            shadowOf(Looper.getMainLooper()).idleFor(319L, TimeUnit.MILLISECONDS)
+            assertFalse("the bitmap must also survive the post-barrier safety age", decoded.single().isRecycled)
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
+            assertTrue("two host frames plus 320ms may release retired native pixels", decoded.single().isRecycled)
         } finally {
             executor.shutdownNow()
             activity.finish()
@@ -1944,7 +1953,7 @@ class EpubFlowSpannableTest {
         val executor = QueuedExecutorService()
         val decoded = mutableListOf<android.graphics.Bitmap>()
         val activity = Robolectric.buildActivity(android.app.Activity::class.java).setup().visible().get()
-        val host = android.view.View(activity)
+        val host = ControlledFrameHost(activity)
         activity.setContentView(host)
         val loader = EpubFlowImageLoader(
             epubFileProvider = { epub },
@@ -1973,18 +1982,24 @@ class EpubFlowSpannableTest {
 
             loader.updateDecodeWindow(listOf(100 until 200))
             loader.scheduleRetiredPixelFlushAfterRenderBarrier(host)
-            shadowOf(Looper.getMainLooper()).idleFor(16L, TimeUnit.MILLISECONDS)
+            host.dispatchNextFrame()
+            assertEquals(1, host.pendingFrameCount)
 
-            // A newer retirement must cancel the earlier frame callback and its pending flush.
+            // A newer retirement must invalidate the earlier frame callback and its pending flush.
             loader.updateDecodeWindow(emptyList())
-            shadowOf(Looper.getMainLooper()).idleFor(500L, TimeUnit.MILLISECONDS)
+            host.dispatchNextFrame()
+            shadowOf(Looper.getMainLooper()).idleFor(640L, TimeUnit.MILLISECONDS)
             assertTrue(
                 "a stale barrier must not recycle either generation's bitmap",
                 decoded.none { it.isRecycled },
             )
 
             loader.scheduleRetiredPixelFlushAfterRenderBarrier(host)
-            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            host.dispatchNextFrame()
+            host.dispatchNextFrame()
+            shadowOf(Looper.getMainLooper()).idleFor(319L, TimeUnit.MILLISECONDS)
+            assertTrue(decoded.none { it.isRecycled })
+            shadowOf(Looper.getMainLooper()).idleFor(1L, TimeUnit.MILLISECONDS)
             assertTrue("the replacement barrier must drain both retired generations", decoded.all { it.isRecycled })
         } finally {
             loader.releaseAll(host)
@@ -3158,6 +3173,20 @@ class EpubFlowSpannableTest {
         override fun isShutdown(): Boolean = stopped
         override fun isTerminated(): Boolean = stopped && tasks.isEmpty()
         override fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean = isTerminated
+    }
+
+    private class ControlledFrameHost(context: android.content.Context) : android.view.View(context) {
+        private val frameCallbacks = ArrayDeque<Runnable>()
+
+        val pendingFrameCount: Int get() = frameCallbacks.size
+
+        override fun postOnAnimation(action: Runnable) {
+            frameCallbacks.addLast(action)
+        }
+
+        fun dispatchNextFrame() {
+            frameCallbacks.removeFirst().run()
+        }
     }
 
     private companion object {

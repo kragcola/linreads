@@ -46,9 +46,12 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
+import java.util.ArrayDeque
+import java.util.concurrent.AbstractExecutorService
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(RobolectricTestRunner::class)
@@ -6119,10 +6122,8 @@ class EpubFlowViewTest {
         val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
         val view = fixture.view
         val epub = java.io.File.createTempFile("readflow-real-loader-terminal", ".epub")
-        val executor = Executors.newSingleThreadExecutor()
-        val decodeAttempts = AtomicInteger(0)
-        val firstDecodeAttempt = CountDownLatch(1)
-        val terminalDecodeAttempt = CountDownLatch(2)
+        val executor = QueuedImageDecodeExecutor()
+        var decodeAttempts = 0
         val resolver = EpubFlowImageSizeResolver(
             columnWidthPx = view.width,
             pageHeightProvider = { view.height },
@@ -6140,11 +6141,14 @@ class EpubFlowViewTest {
             imageBoundsProvider = { EpubImageBounds(width = view.width, height = view.height + 120) },
             imageQualityProvider = { EpubImageRenderQuality.RAPID },
             imageDecoder = { _, _, _ ->
-                decodeAttempts.incrementAndGet()
-                firstDecodeAttempt.countDown()
-                terminalDecodeAttempt.countDown()
-                null
+                decodeAttempts += 1
+                if (decodeAttempts == 1) {
+                    Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)
+                } else {
+                    null
+                }
             },
+            onImageResultChanged = { result -> view.onAsyncImagePixelsChanged(result.layoutStart) },
             onDecodeFinished = view::onAsyncImageDecodeFinished,
         )
         val drawable = AsyncDrawable("plate-pattern.png", loader, resolver, null)
@@ -6164,17 +6168,17 @@ class EpubFlowViewTest {
             loader.promoteToDisplayQuality(view.displayQualityLayoutRanges())
         }
         try {
-            // Admit the real occurrence once while its page is visible, then move back so the
-            // second miss is produced by the queued-turn promotion path.
+            // Install retained RAPID pixels first. The queued turn then owns the real DISPLAY
+            // promotion, its bounded retry, and the loader-to-view completion callback.
             view.goToPage(fixture.imagePageIndex)
             loader.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
             loader.load(drawable)
-            assertTrue(
-                "the real executor must run the first image decode",
-                firstDecodeAttempt.await(5L, TimeUnit.SECONDS),
-            )
+            assertEquals(1, executor.queuedTaskCount)
+            executor.runNext()
             shadowOf(Looper.getMainLooper()).idle()
-            assertTrue("the real loader must have attempted the first image decode", decodeAttempts.get() >= 1)
+            view.textView.viewTreeObserver.dispatchOnPreDraw()
+            assertEquals(1, decodeAttempts)
+            assertFalse(loader.hasStablePixels(listOf(fixture.imageLayoutStart)))
 
             view.flipStyle = PageFlipStyle.SIMULATION
             view.goToPage(fixture.headingPageIndex - 1)
@@ -6182,28 +6186,41 @@ class EpubFlowViewTest {
             assertTrue(view.goToAdjacentPage(1))
             val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
             firstAnimator.end()
-            assertTrue(
-                "the queued target must run the terminal image decode",
-                terminalDecodeAttempt.await(5L, TimeUnit.SECONDS),
+            assertEquals(fixture.headingPageIndex, view.currentPageIndex())
+            assertEquals(1, view.privateInt("queuedPageTurnDelta"))
+            assertEquals("the queued target must request DISPLAY promotion", 1, executor.queuedTaskCount)
+
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(2, decodeAttempts)
+            assertEquals("the first DISPLAY miss must leave exactly one bounded retry", 1, executor.queuedTaskCount)
+            assertEquals(1, view.privateInt("queuedPageTurnDelta"))
+
+            shadowOf(Looper.getMainLooper()).idleFor(320L, TimeUnit.MILLISECONDS)
+            assertEquals(
+                "the active admission tick must not duplicate an in-flight retry",
+                1,
+                executor.queuedTaskCount,
             )
-            shadowOf(Looper.getMainLooper()).idleFor(1_000L, TimeUnit.MILLISECONDS)
+            assertEquals(2, decodeAttempts)
+
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            view.textView.viewTreeObserver.dispatchOnPreDraw()
 
             assertEquals(
-                "the production loader callback must release the queued turn on terminal placeholder",
+                "the real second failure callback must release the queued turn on retained pixels",
                 fixture.imagePageIndex,
                 view.currentPageIndex(),
             )
             assertEquals(0, view.privateInt("queuedPageTurnDelta"))
-            assertTrue(
-                "the real loader may supersede one in-flight admission, but must settle within " +
-                    "two accepted misses; attempts=${decodeAttempts.get()}",
-                decodeAttempts.get() in 2..3,
-            )
-            shadowOf(Looper.getMainLooper()).idleFor(1_000L, TimeUnit.MILLISECONDS)
-            assertTrue(
-                "terminal failure must stop recurring admission",
-                decodeAttempts.get() in 2..3,
-            )
+            assertEquals(3, decodeAttempts)
+            assertTrue(loader.hasStablePixels(listOf(fixture.imageLayoutStart)))
+            assertEquals(0, executor.queuedTaskCount)
+
+            shadowOf(Looper.getMainLooper()).idleFor(960L, TimeUnit.MILLISECONDS)
+            assertEquals("terminal failure must stop later 320ms admission ticks", 3, decodeAttempts)
+            assertEquals(0, executor.queuedTaskCount)
         } finally {
             loader.releaseAll(view)
             executor.shutdownNow()
@@ -12343,6 +12360,35 @@ class EpubFlowViewTest {
 
     private fun exactly(size: Int): Int =
         android.view.View.MeasureSpec.makeMeasureSpec(size, android.view.View.MeasureSpec.EXACTLY)
+
+    private class QueuedImageDecodeExecutor : AbstractExecutorService() {
+        private val tasks = ArrayDeque<Runnable>()
+        private var stopped = false
+
+        val queuedTaskCount: Int get() = tasks.size
+
+        fun runNext() {
+            tasks.removeFirst().run()
+        }
+
+        override fun execute(command: Runnable) {
+            if (stopped) throw RejectedExecutionException("executor stopped")
+            tasks.addLast(command)
+        }
+
+        override fun shutdown() {
+            stopped = true
+        }
+
+        override fun shutdownNow(): MutableList<Runnable> {
+            stopped = true
+            return tasks.toMutableList().also { tasks.clear() }
+        }
+
+        override fun isShutdown(): Boolean = stopped
+        override fun isTerminated(): Boolean = stopped && tasks.isEmpty()
+        override fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean = isTerminated
+    }
 
     private fun motionEvent(
         downTime: Long,
