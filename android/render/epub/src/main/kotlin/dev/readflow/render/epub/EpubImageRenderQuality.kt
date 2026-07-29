@@ -40,3 +40,24 @@ internal fun epubImageRenderQualityForOccurrence(
     isCurrentChapter: Boolean,
     visualMotionActive: Boolean,
 ): EpubImageRenderQuality = EpubImageRenderQuality.DISPLAY
+
+/**
+ * Quality policy for the bounded rapid-admission runway. The runway is decoded at RAPID quality
+ * only while it is outside the current/adjacent display contract; promotion is requested before it
+ * can become a visible page-shot target.
+ */
+internal fun epubImageRenderQualityForRapidAdmission(
+    layoutStart: Int,
+    displayQualityRanges: Collection<IntRange>,
+    isCurrentChapter: Boolean,
+    visualMotionActive: Boolean,
+): EpubImageRenderQuality = if (
+    isCurrentChapter &&
+        visualMotionActive &&
+        layoutStart >= 0 &&
+        displayQualityRanges.none { layoutStart in it }
+) {
+    EpubImageRenderQuality.RAPID
+} else {
+    EpubImageRenderQuality.DISPLAY
+}

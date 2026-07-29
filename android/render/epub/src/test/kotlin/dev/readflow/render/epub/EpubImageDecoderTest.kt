@@ -51,6 +51,39 @@ class EpubImageDecoderTest {
     }
 
     @Test
+    fun `rapid runway uses lower decode quality only outside the display neighborhood`() {
+        val displayRanges = listOf(100 until 300)
+
+        assertEquals(
+            EpubImageRenderQuality.DISPLAY,
+            epubImageRenderQualityForRapidAdmission(
+                layoutStart = 150,
+                displayQualityRanges = displayRanges,
+                isCurrentChapter = true,
+                visualMotionActive = true,
+            ),
+        )
+        assertEquals(
+            EpubImageRenderQuality.RAPID,
+            epubImageRenderQualityForRapidAdmission(
+                layoutStart = 450,
+                displayQualityRanges = displayRanges,
+                isCurrentChapter = true,
+                visualMotionActive = true,
+            ),
+        )
+        assertEquals(
+            EpubImageRenderQuality.DISPLAY,
+            epubImageRenderQualityForRapidAdmission(
+                layoutStart = 450,
+                displayQualityRanges = displayRanges,
+                isCurrentChapter = true,
+                visualMotionActive = false,
+            ),
+        )
+    }
+
+    @Test
     fun `sample size keeps decoded image inside side and pixel budgets`() {
         assertEquals(
             1,

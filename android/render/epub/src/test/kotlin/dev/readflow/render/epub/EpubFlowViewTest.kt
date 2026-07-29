@@ -1831,8 +1831,22 @@ class EpubFlowViewTest {
                 activeFrame.recycle()
             }
 
+            val containerShadow = shadowOf(view)
+            val textShadow = shadowOf(view.textView)
+            // Model the overlay-owned traversal consuming the earlier dirty signals.
+            containerShadow.clearWasInvalidated()
+            textShadow.clearWasInvalidated()
             view.clearFlipOverlayForTest()
+            shadowOf(Looper.getMainLooper()).idle()
             assertNull(view.privateField("slideDrawable"))
+            assertTrue(
+                "overlay teardown must invalidate the container so the live page replaces the page shot",
+                containerShadow.wasInvalidated(),
+            )
+            assertTrue(
+                "overlay teardown must invalidate the text child so HWUI re-records live content",
+                textShadow.wasInvalidated(),
+            )
 
             val settledFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
@@ -1847,6 +1861,7 @@ class EpubFlowViewTest {
         } finally {
             if (view.privateField("slideDrawable") != null) view.clearFlipOverlayForTest()
             view.dispose()
+            shadowOf(Looper.getMainLooper()).idle()
         }
     }
 
@@ -6006,7 +6021,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `rapid follow-up prefetch is skipped when the queued target depends on an image`() {
+    fun `rapid follow-up prefetch accepts a stable image target`() {
         val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
         val view = fixture.view
         try {
@@ -6014,17 +6029,173 @@ class EpubFlowViewTest {
             assertEquals(fixture.headingPageIndex + 1, fixture.imagePageIndex)
             view.flipStyle = PageFlipStyle.SIMULATION
             view.goToPage(fixture.headingPageIndex - 1)
+            var requestedStarts = emptyList<Int>()
+            view.pendingDecodesProvider = { true }
+            view.imagePixelsStableProvider = { starts ->
+                requestedStarts = starts.toList()
+                starts.all { it == fixture.imageLayoutStart }
+            }
 
             assertTrue(view.goToAdjacentPage(1))
             assertTrue(view.goToAdjacentPage(1))
 
             assertEquals(1, view.privateInt("queuedPageTurnDelta"))
-            assertNull(
-                "an image-dependent target must stay on the existing decode/page-shot path",
+            assertEquals(listOf(fixture.imageLayoutStart), requestedStarts)
+            assertNotNull(
+                "a stable exact target must ignore unrelated global pending work",
                 view.privateField("rapidFollowUpPageShot"),
             )
-            assertNull(view.privateField("captureRapidFollowUpRunnable"))
+            assertNotNull(view.privateField("captureRapidFollowUpRunnable"))
         } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `rapid image target defers page-shot capture while pixel refresh is pending`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        var stable = false
+        try {
+            assertTrue(fixture.headingPageIndex > 0)
+            view.flipStyle = PageFlipStyle.SIMULATION
+            view.goToPage(fixture.headingPageIndex - 1)
+            view.pendingDecodesProvider = { false }
+            view.imagePixelsStableProvider = { starts -> starts.isEmpty() || stable }
+
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.goToAdjacentPage(1))
+            assertNull("an unresolved image target must not be captured", view.privateField("rapidFollowUpPageShot"))
+
+            stable = true
+            view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+
+            assertNull(
+                "a dirty image owner must not be captured into a stale rapid page shot",
+                view.privateField("rapidFollowUpPageShot"),
+            )
+            assertTrue(
+                "the pixel refresh must remain queued until the active turn settles",
+                (view.privateField("asyncImagePixelRefreshOffsets") as Set<*>).isNotEmpty(),
+            )
+        } finally {
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `terminal image failure releases a queued rapid turn on the retained placeholder`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        var terminalFailure = false
+        try {
+            view.flipStyle = PageFlipStyle.SIMULATION
+            view.goToPage(fixture.headingPageIndex - 1)
+            view.pendingDecodesProvider = { false }
+            view.imagePixelsStableProvider = { starts -> starts.isEmpty() || terminalFailure }
+
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.goToAdjacentPage(1))
+            val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+            firstAnimator.end()
+            assertEquals(fixture.headingPageIndex, view.currentPageIndex())
+            assertEquals(1, view.privateInt("queuedPageTurnDelta"))
+
+            terminalFailure = true
+            view.onAsyncImageDecodeFinished()
+            view.textView.viewTreeObserver.dispatchOnPreDraw()
+
+            assertEquals("a terminal placeholder must not deadlock navigation", fixture.imagePageIndex, view.currentPageIndex())
+            assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+        } finally {
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `real loader terminal failure drains queued navigation without recurring admission`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        val epub = java.io.File.createTempFile("readflow-real-loader-terminal", ".epub")
+        val executor = Executors.newSingleThreadExecutor()
+        val decodeAttempts = AtomicInteger(0)
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = view.width,
+            pageHeightProvider = { view.height },
+            inlineMaxHeightPx = view.height,
+            fullPageHrefs = emptySet(),
+        )
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = executor,
+            priorityLayoutRangesProvider = { view.decodeAdmissionLayoutRanges() },
+            columnWidthPx = view.width,
+            pageHeightProvider = { view.height },
+            inlineMaxHeightPx = view.height,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = view.width, height = view.height + 120) },
+            imageQualityProvider = { EpubImageRenderQuality.RAPID },
+            imageDecoder = { _, _, _ ->
+                decodeAttempts.incrementAndGet()
+                null
+            },
+            onDecodeFinished = view::onAsyncImageDecodeFinished,
+        )
+        val drawable = AsyncDrawable("plate-pattern.png", loader, resolver, null)
+        loader.registerOccurrence(drawable, fixture.imageLayoutStart)
+        drawable.setCallback2(object : Drawable.Callback {
+            override fun invalidateDrawable(who: Drawable) = Unit
+            override fun scheduleDrawable(who: Drawable, what: Runnable, `when`: Long) = Unit
+            override fun unscheduleDrawable(who: Drawable, what: Runnable) = Unit
+        })
+        loader.load(drawable)
+        view.pendingDecodesProvider = {
+            loader.hasRelevantPendingDecodes(view.relevantPendingDecodeLayoutRanges())
+        }
+        view.imagePixelsStableProvider = loader::hasStablePixels
+        view.onDecodeWindowNeeded = {
+            loader.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
+            loader.promoteToDisplayQuality(view.displayQualityLayoutRanges())
+        }
+        try {
+            // Admit the real occurrence once while its page is visible, then move back so the
+            // second miss is produced by the queued-turn promotion path.
+            view.goToPage(fixture.imagePageIndex)
+            loader.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
+            loader.load(drawable)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            assertTrue("the real loader must have attempted the first image decode", decodeAttempts.get() >= 1)
+
+            view.flipStyle = PageFlipStyle.SIMULATION
+            view.goToPage(fixture.headingPageIndex - 1)
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.goToAdjacentPage(1))
+            val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+            firstAnimator.end()
+            shadowOf(Looper.getMainLooper()).idleFor(1_000L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "the production loader callback must release the queued turn on terminal placeholder",
+                fixture.imagePageIndex,
+                view.currentPageIndex(),
+            )
+            assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+            assertTrue(
+                "the real loader may supersede one in-flight admission, but must settle within " +
+                    "two accepted misses; attempts=${decodeAttempts.get()}",
+                decodeAttempts.get() in 2..3,
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(1_000L, TimeUnit.MILLISECONDS)
+            assertTrue(
+                "terminal failure must stop recurring admission",
+                decodeAttempts.get() in 2..3,
+            )
+        } finally {
+            loader.releaseAll(view)
+            executor.shutdownNow()
+            epub.delete()
             view.dispose()
         }
     }
@@ -11265,6 +11436,47 @@ class EpubFlowViewTest {
         assertFalse(
             "far page offsets must not be included",
             ranges.any { pages[3].startOffset in it },
+        )
+        view.dispose()
+    }
+
+    @Test
+    fun `rapid decode admission adds one directional runway page within a four-page cap`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 6)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        view.goToPage(2)
+        var windowUpdates = 0
+        view.onDecodeWindowNeeded = { windowUpdates++ }
+
+        view.acceptPromotedPageTurns(delta = 8, rapidSequence = true)
+        val ranges = view.decodeAdmissionLayoutRanges()
+
+        assertEquals("queued intent must publish the expanded admission window", 1, windowUpdates)
+        listOf(1, 2, 3, 4).forEach { index ->
+            assertTrue("page $index must be admitted", ranges.any { pages[index].startOffset in it })
+        }
+        assertFalse("the opposite runway must stay bounded", ranges.any { pages[0].startOffset in it })
+        assertFalse("a second forward runway page exceeds the cap", ranges.any { pages[5].startOffset in it })
+        view.dispose()
+    }
+
+    @Test
+    fun `one queued rapid turn keeps the base neighborhood without opening a second runway`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        view.goToPage(2)
+
+        view.acceptPromotedPageTurns(delta = 1, rapidSequence = true)
+        val ranges = view.decodeAdmissionLayoutRanges()
+
+        listOf(1, 2, 3).forEach { index ->
+            assertTrue("base neighborhood page $index must be admitted", ranges.any { pages[index].startOffset in it })
+        }
+        assertFalse(
+            "a single queued turn must not decode the second directional runway page",
+            ranges.any { pages[4].startOffset in it },
         )
         view.dispose()
     }

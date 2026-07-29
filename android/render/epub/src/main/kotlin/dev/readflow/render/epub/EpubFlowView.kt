@@ -141,6 +141,7 @@ internal class EpubFlowView(
     /** Exact settled line window. Null means the viewport is an arbitrary FREE_REST pixel position. */
     private var activePageWindow: EpubFlowPage? = null
     private var flow: EpubChapterFlow? = null
+    private var chapterImageLayoutStarts = IntArray(0)
     /** Paper background painted in viewport coordinates; avoids ScrollView's scroll-translated background. */
     private var viewportBackground: Drawable? = null
 
@@ -150,6 +151,9 @@ internal class EpubFlowView(
     /** Provider queried by the stability gate to check for pending async image decodes. */
     var pendingDecodesProvider: (() -> Boolean)? = null
 
+    /** Exact image-pixel readiness used by rapid page-shot admission. */
+    var imagePixelsStableProvider: ((Collection<Int>) -> Boolean)? = null
+
     /**
      * Layout-offset ranges for the restored/visible current page plus adjacent previous and next
      * pages. Used by [pendingDecodesProvider] for relevance-aware decode gating so far-page work
@@ -157,6 +161,84 @@ internal class EpubFlowView(
      */
     fun relevantPendingDecodeLayoutRanges(): List<IntRange> =
         decodeLayoutRangesFor(relevantPageWindows())
+
+    /**
+     * Decode admission for the active gesture. Keep the current/adjacent neighborhood, then add a
+     * bounded directional runway while a burst is queued so the next image is decoded before it is
+     * needed by the next fixed-length turn.
+     */
+    fun decodeAdmissionLayoutRanges(): List<IntRange> {
+        if (paged.isEmpty()) return emptyList()
+        val index = canonicalPageIndexForWindow(activePageWindow?.takeIf { it.topPx == scrollY })
+            .takeIf { it >= 0 }
+            ?: nearestCanonicalPageIndexForScrollY(scrollY)
+        val direction = when {
+            queuedPageTurnDelta > 0 -> 1
+            queuedPageTurnDelta < 0 -> -1
+            else -> 0
+        }
+        val windows = buildList {
+            paged.getOrNull(index)?.let(::add)
+            if (direction == 0) {
+                paged.getOrNull(index - 1)?.let(::add)
+                paged.getOrNull(index + 1)?.let(::add)
+            } else {
+                paged.getOrNull(index - direction)?.let(::add)
+                paged.getOrNull(index + direction)?.let(::add)
+                // A single queued turn already has the adjacent target in the base window. Admit
+                // the second directional runway only once two turns are pending; this avoids
+                // decoding an extra full-quality image page for an isolated rapid follow-up.
+                if (abs(queuedPageTurnDelta) >= 2) {
+                    paged.getOrNull(index + direction * 2)?.let(::add)
+                }
+            }
+        }.distinct().take(RAPID_DECODE_WINDOW_MAX_PAGES)
+        return decodeLayoutRangesFor(windows)
+    }
+
+    /** Pages whose pixels must be DISPLAY quality before a page-shot turn may be revealed. */
+    fun displayQualityLayoutRanges(): List<IntRange> {
+        if (paged.isEmpty()) return emptyList()
+        val index = canonicalPageIndexForWindow(activePageWindow?.takeIf { it.topPx == scrollY })
+            .takeIf { it >= 0 }
+            ?: nearestCanonicalPageIndexForScrollY(scrollY)
+        val windows = listOfNotNull(
+            paged.getOrNull(index - 1),
+            paged.getOrNull(index),
+            paged.getOrNull(index + 1),
+        )
+        return decodeLayoutRangesFor(windows)
+    }
+
+    private fun pageWindowImageLayoutStarts(window: EpubFlowPage): List<Int> {
+        val chapter = flow ?: return emptyList()
+        if (chapterImageLayoutStarts.isEmpty()) return emptyList()
+        val ranges = decodeLayoutRangesFor(listOf(window))
+        val starts = chapterImageLayoutStarts.asSequence()
+            .filter { offset -> ranges.any { offset in it } }
+            .toMutableList()
+        val layout = textView.layout
+        if (layout != null) {
+            val previews = pageLayoutMetadataFor(layout)?.pageBoundaryImagePreviews
+                ?: pageBoundaryImagePreviews(layout, chapter)
+            previews.asSequence()
+                .filter { preview ->
+                    preview.precedingEndLineExclusive > window.startLine &&
+                        preview.precedingEndLineExclusive <= window.endLineExclusive &&
+                        preview.imageLine >= window.endLineExclusive
+                }
+                .mapTo(starts, PageBoundaryImagePreview::imageLayoutStart)
+        }
+        return starts.distinct()
+    }
+
+    private fun targetImagePixelsAreStable(window: EpubFlowPage): Boolean =
+        imagePixelsStableProvider?.invoke(pageWindowImageLayoutStarts(window))
+            ?: (pendingDecodesProvider?.invoke() != true)
+
+    /** Compatibility fallback for isolated view tests and hosts without an image loader. */
+    private fun rapidDecodeGateBlocks(): Boolean =
+        imagePixelsStableProvider == null && pendingDecodesProvider?.invoke() == true
 
     /** Decode gate for a prepared boundary surface: only the page that will be revealed must be ready. */
     fun currentPageDecodeLayoutRanges(): List<IntRange> =
@@ -430,6 +512,9 @@ internal class EpubFlowView(
     private val rapidTurnIdleRunnable = object : Runnable {
         override fun run() {
             if (queuedPageTurnDelta != 0) {
+                // Re-admit/promote a gated target before retrying the queued turn. The idle window
+                // rate-limits transient decode failures without spinning a null-decode retry loop.
+                onDecodeWindowNeeded?.invoke()
                 if (drainQueuedPageTurn()) {
                     onPageSettled?.invoke()
                 } else if (!disposed) {
@@ -505,6 +590,8 @@ internal class EpubFlowView(
     var onPageTurnStarted: (() -> Unit)? = null
     /** Called after a local target is parked so its image window can prepare the following page. */
     var onPageTurnTargetParked: (() -> Unit)? = null
+    /** Called whenever queued intent changes the directional image-decode admission window. */
+    var onDecodeWindowNeeded: (() -> Unit)? = null
     var onPageSettled: (() -> Unit)? = null
 
     // ---- Pre-cache page textures (Moon+ Reader model) ------------------------------------------
@@ -658,8 +745,7 @@ internal class EpubFlowView(
             !rapidTurnSequenceActive ||
             !turnInFlight ||
             mode != Mode.PAGED ||
-            pendingDecodesProvider?.invoke() == true ||
-            hasPendingPageArtifactRefresh() ||
+            rapidPageArtifactRefreshPending() ||
             textView.isLayoutRequested
         ) {
             clearRapidFollowUpPageShot()
@@ -670,7 +756,7 @@ internal class EpubFlowView(
             clearRapidFollowUpPageShot()
             return
         }
-        if (pageWindowHasImageDependency(targetWindow)) {
+        if (!targetImagePixelsAreStable(targetWindow)) {
             clearRapidFollowUpPageShot()
             return
         }
@@ -718,8 +804,8 @@ internal class EpubFlowView(
             activePageWindow?.takeIf { it.topPx == scrollY } == request.sourceWindow &&
             pageWindowForTurn(request.forward) == request.targetWindow &&
             pageTextureKey(request.targetWindow.topPx, request.targetWindow) == request.targetKey &&
-            pendingDecodesProvider?.invoke() != true &&
-            !hasPendingPageArtifactRefresh() &&
+            targetImagePixelsAreStable(request.targetWindow) &&
+            !rapidPageArtifactRefreshPending() &&
             !textView.isLayoutRequested
 
     private fun captureRapidFollowUpPageShot(request: RapidFollowUpPageShot) {
@@ -775,14 +861,10 @@ internal class EpubFlowView(
         return bitmap
     }
 
-    private fun pageWindowHasImageDependency(window: EpubFlowPage): Boolean {
-        val chapter = flow ?: return true
-        val ranges = decodeLayoutRangesFor(listOf(window))
-        return chapter.segments.any { segment ->
-            segment.block is EpubDisplayBlock.Image &&
-                ranges.any { range -> segment.layoutStart in range }
-        }
-    }
+    private fun rapidPageArtifactRefreshPending(): Boolean =
+        asyncImageRefreshPending ||
+            asyncImagePixelRefreshOffsets.isNotEmpty() ||
+            asyncImagePixelTextRebindPending
 
     private fun preCachePageTextures() {
         if (disposed) return
@@ -1893,9 +1975,15 @@ internal class EpubFlowView(
             } else {
                 postOnAnimation(asyncImageRefreshRunnable)
             }
+            if (turnInFlight && rapidTurnSequenceActive && queuedPageTurnDelta != 0) {
+                scheduleRapidFollowUpPageShot(forward = queuedPageTurnDelta > 0)
+            }
             return
         }
         applyAsyncImagePixelRefresh(listOf(layoutOffset))
+        if (turnInFlight && rapidTurnSequenceActive && queuedPageTurnDelta != 0) {
+            scheduleRapidFollowUpPageShot(forward = queuedPageTurnDelta > 0)
+        }
     }
 
     private fun applyAsyncImagePixelRefresh(
@@ -2270,6 +2358,11 @@ internal class EpubFlowView(
         removeCallbacks(reflowRunnable)
         recycleCachedTextures()
         this.flow = flow
+        chapterImageLayoutStarts = flow.segments.asSequence()
+            .filter { it.block is EpubDisplayBlock.Image }
+            .map { it.layoutStart }
+            .toList()
+            .toIntArray()
         this.pageHeightPx = pageHeightPx.coerceAtLeast(1)
         currentPage = 0
         activePageWindow = null
@@ -2646,6 +2739,7 @@ internal class EpubFlowView(
         recycleCachedTextures()
         recycleTracker()
         pendingDecodesProvider = null
+        imagePixelsStableProvider = null
         onChapterStable = null
         onBoundaryPreviewNeeded = null
         onBoundaryPreviewConfigurationChanged = null
@@ -2659,6 +2753,7 @@ internal class EpubFlowView(
         onPageTurnCapturePreparing = null
         onPageTurnStarted = null
         onPageTurnTargetParked = null
+        onDecodeWindowNeeded = null
         onPageSettled = null
         awaitingReveal = false
         awaitingStableChapter = false
@@ -2668,6 +2763,7 @@ internal class EpubFlowView(
         interruptedFreeFlingNeedsRebase = false
         pageLayoutMetadata = null
         flow = null
+        chapterImageLayoutStarts = IntArray(0)
         textView.text = ""
     }
 
@@ -3243,6 +3339,7 @@ internal class EpubFlowView(
             MAX_QUEUED_PAGE_TURNS,
         )
         armRapidTurnSequence()
+        onDecodeWindowNeeded?.invoke()
         if (turnInFlight) {
             if (queuedPageTurnDelta == 0) {
                 clearRapidFollowUpPageShot()
@@ -3274,6 +3371,7 @@ internal class EpubFlowView(
             MAX_QUEUED_PAGE_TURNS,
         )
         if (rapidSequence || queuedPageTurnDelta != 0) armRapidTurnSequence()
+        onDecodeWindowNeeded?.invoke()
     }
 
     private fun armRapidTurnSequence() {
@@ -3296,6 +3394,9 @@ internal class EpubFlowView(
             resumeDeferredInPlacePageShotRefresh()
             return
         }
+        if (turnInFlight && rapidTurnSequenceActive && queuedPageTurnDelta != 0) {
+            scheduleRapidFollowUpPageShot(forward = queuedPageTurnDelta > 0)
+        }
         if (drainQueuedPageTurn()) return
         if (rapidTurnSequenceActive) scheduleRapidTurnIdle() else preCachePageTextures()
     }
@@ -3315,8 +3416,9 @@ internal class EpubFlowView(
             paged.isEmpty() ||
             initialRevealActive() ||
             awaitingStableChapter ||
-            pendingDecodesProvider?.invoke() == true ||
-            hasPendingPageArtifactRefresh() ||
+            rapidDecodeGateBlocks() ||
+            rapidPageArtifactRefreshPending() ||
+            pendingInPlacePageShotRefreshSlots.isNotEmpty() ||
             textView.isLayoutRequested
         ) return false
         val delta = if (queuedPageTurnDelta > 0) 1 else -1
@@ -3325,8 +3427,10 @@ internal class EpubFlowView(
         if (availableLocalSteps > 0) {
             val targetPage = currentPage + delta
             val targetWindow = paged[targetPage]
+            if (!targetImagePixelsAreStable(targetWindow)) return false
             if (!goToPageAnimated(targetWindow, forward = delta > 0)) return false
             queuedPageTurnDelta -= delta
+            onDecodeWindowNeeded?.invoke()
             return true
         }
         queuedPageTurnDelta -= delta
@@ -4326,6 +4430,13 @@ internal class EpubFlowView(
         // Re-centre the parked live content after any previous turn path.
         container.translationX = 0f
         container.translationY = 0f
+        // The overlay draw path suppresses the live child. If HWUI records the container while that
+        // suppression is active, removing the overlay alone can keep replaying an empty RenderNode.
+        // Dirty both levels so the first settled frame records the parked page and image spans again.
+        container.skipContentDraw = false
+        textView.invalidate()
+        container.invalidate()
+        postInvalidateOnAnimation()
     }
 
     private fun showConversionSnapshot(bitmap: Bitmap?) {
@@ -5951,6 +6062,7 @@ internal class EpubFlowView(
         const val MICRO_TURN_PROJECTION_SECONDS = 0.04f
         const val MICRO_TURN_MAX_CROSS_AXIS_RATIO = 0.5f
         const val MAX_QUEUED_PAGE_TURNS = 12
+        const val RAPID_DECODE_WINDOW_MAX_PAGES = 4
         const val RAPID_TURN_IDLE_TIMEOUT_MS = 320L
         const val RAPID_FOLLOW_UP_PREFETCH_DELAY_MS = 32L
         const val FREE_FLING_MIN_SETTLE_MS = 64L

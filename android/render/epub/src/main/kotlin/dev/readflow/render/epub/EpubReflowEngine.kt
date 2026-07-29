@@ -1013,12 +1013,23 @@ class EpubReflowEngine private constructor(
         view.onPageShotForeground = ::resumePageShotsAfterForeground
         view.onPageTurnTargetParked = {
             if (flowView === view) {
-                liveFlowImageLoader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
+                liveFlowImageLoader?.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
+                liveFlowImageLoader?.promoteToDisplayQuality(view.displayQualityLayoutRanges())
+            }
+        }
+        view.onDecodeWindowNeeded = {
+            if (flowView === view) {
+                liveFlowImageLoader?.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
+                liveFlowImageLoader?.promoteToDisplayQuality(view.displayQualityLayoutRanges())
             }
         }
         view.onPageSettled = {
             if (flowView === view) {
-                liveFlowImageLoader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
+                liveFlowImageLoader?.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
+                liveFlowImageLoader?.promoteToDisplayQuality(view.displayQualityLayoutRanges())
+                if (!view.isRapidTurnPerformanceModeActive()) {
+                    liveFlowImageLoader?.scheduleRetiredPixelFlushAfterRenderBarrier(view)
+                }
             }
             prewarmBoundaryPreviews()
             tryDrainPendingFontPrewarmRebuild()
@@ -1028,8 +1039,10 @@ class EpubReflowEngine private constructor(
                 flowView === view &&
                 flowSpineIndex >= 0
             ) {
-                liveFlowImageLoader?.updateDecodeWindow(view.relevantPendingDecodeLayoutRanges())
+                liveFlowImageLoader?.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
+                liveFlowImageLoader?.promoteToDisplayQuality(view.displayQualityLayoutRanges())
                 if (!view.isRapidTurnPerformanceModeActive()) {
+                    liveFlowImageLoader?.scheduleRetiredPixelFlushAfterRenderBarrier(view)
                     prewarmBoundaryPreviews()
                 }
             }
@@ -1136,7 +1149,7 @@ class EpubReflowEngine private constructor(
             if (blocks.isEmpty()) return
             epubBuildChapterFlow(spineIndex, blocks)
         }
-        liveFlowImageLoader?.releaseAll()
+        liveFlowImageLoader?.releaseAll(view)
         liveFlowImageLoader = installFlowChapter(
             view = view,
             flow = flow,
@@ -1299,6 +1312,7 @@ class EpubReflowEngine private constructor(
         isVisible: () -> Boolean = isCurrent,
         onLinkClick: (EpubTextLink) -> Unit,
         pendingDecodeRangesProvider: () -> Collection<IntRange> = view::relevantPendingDecodeLayoutRanges,
+        decodeAdmissionRangesProvider: (() -> Collection<IntRange>)? = null,
     ): EpubFlowImageLoader? {
         val density = context.resources.displayMetrics.density
         val palette = paletteFor(themeMode, context.resources.configuration)
@@ -1361,12 +1375,13 @@ class EpubReflowEngine private constructor(
                 .takeIf { it > 0 }
                 ?: initialColumnWidthPx
         }
+        val decodeAdmissionProvider = decodeAdmissionRangesProvider ?: view::decodeAdmissionLayoutRanges
         lateinit var loader: EpubFlowImageLoader
         loader = EpubFlowImageLoader(
             epubFileProvider = { epubFile },
             executor = flowExecutor(),
             priorityExecutor = flowCriticalImageExecutor(),
-            priorityLayoutRangesProvider = pendingDecodeRangesProvider,
+            priorityLayoutRangesProvider = decodeAdmissionProvider,
             columnWidthPx = initialColumnWidthPx,
             columnWidthProvider = columnWidthProvider,
             pageHeightProvider = pageHeightProvider,
@@ -1374,9 +1389,9 @@ class EpubReflowEngine private constructor(
             fullPageHrefs = fullPageHrefs,
             imageBoundsProvider = ::epubImageBoundsFor,
             imageQualityProvider = { layoutStart ->
-                epubImageRenderQualityForOccurrence(
+                epubImageRenderQualityForRapidAdmission(
                     layoutStart = layoutStart,
-                    currentPageRanges = view.currentPageDecodeLayoutRanges(),
+                    displayQualityRanges = view.displayQualityLayoutRanges(),
                     isCurrentChapter = isVisible(),
                     visualMotionActive = view.isRapidTurnPerformanceModeActive(),
                 )
@@ -1429,11 +1444,15 @@ class EpubReflowEngine private constructor(
             imageSchedulingPending ||
                 loader.hasRelevantPendingDecodes(pendingDecodeRangesProvider())
         }
+        view.imagePixelsStableProvider = { layoutStarts ->
+            loader.hasStablePixels(layoutStarts)
+        }
         lateinit var scheduleVisibleImages: () -> Unit
         scheduleVisibleImages = schedule@{
             if (view.onImageDrawableHostAttached !== scheduleVisibleImages) return@schedule
-            val ranges = runCatching { pendingDecodeRangesProvider() }.getOrDefault(emptyList())
+            val ranges = runCatching { decodeAdmissionProvider() }.getOrDefault(emptyList())
             loader.updateDecodeWindow(ranges)
+            loader.promoteToDisplayQuality(view.displayQualityLayoutRanges())
             AsyncDrawableScheduler.schedule(view.textView)
         }
         view.onImageDrawableHostAttached = scheduleVisibleImages
@@ -1685,6 +1704,13 @@ class EpubReflowEngine private constructor(
                     previewView.currentPageDecodeLayoutRanges()
                 }
             },
+            decodeAdmissionRangesProvider = {
+                if (flowView === previewView) {
+                    previewView.decodeAdmissionLayoutRanges()
+                } else {
+                    previewView.currentPageDecodeLayoutRanges()
+                }
+            },
         ) ?: run {
             host.removeView(previewView)
             previewView.dispose()
@@ -1813,11 +1839,14 @@ class EpubReflowEngine private constructor(
 
         val canRetainOld = oldLoader != null && oldFlow != null && oldSpine >= 0
         if (canRetainOld) {
+            // The old reader may have admitted a rapid four-page runway. It is now becoming a
+            // hidden reverse preview, so cancel every non-landing decode before retaining it.
+            checkNotNull(oldLoader).updateDecodeWindow(oldView.currentPageDecodeLayoutRanges())
             oldView.prepareForBoundaryReuse()
             markFlowViewRetained(oldView)
         } else {
             preview.reverseBitmap?.let(::recycleDetachedBoundaryPageShot)
-            oldLoader?.releaseAll()
+            oldLoader?.releaseAll(host)
             runCatching { AsyncDrawableScheduler.unschedule(oldView.textView) }
             oldView.dispose()
             (oldView.parent as? ViewGroup)?.removeView(oldView)
@@ -1957,14 +1986,14 @@ class EpubReflowEngine private constructor(
         session.timeoutRunnable?.let(session.view::removeCallbacks)
         session.timeoutRunnable = null
         runCatching { AsyncDrawableScheduler.unschedule(session.view.textView) }
-        session.loader.releaseAll()
+        session.loader.releaseAll(flowHost ?: session.view)
         session.view.dispose()
         (session.view.parent as? ViewGroup)?.removeView(session.view)
     }
 
     private fun disposeBoundaryPreviewTarget(target: BoundaryPreviewTarget) {
         runCatching { AsyncDrawableScheduler.unschedule(target.view.textView) }
-        target.loader.releaseAll()
+        target.loader.releaseAll(flowHost ?: target.view)
         target.view.dispose()
         (target.view.parent as? ViewGroup)?.removeView(target.view)
     }
@@ -3069,7 +3098,7 @@ class EpubReflowEngine private constructor(
         clearFontPrewarmRebuildState()
         invalidateBoundaryPreviewState(clearViewSlots = false)
         flowMainHandler.removeCallbacksAndMessages(null)
-        liveFlowImageLoader?.releaseAll()
+        liveFlowImageLoader?.releaseAll(flowHost ?: flowView)
         liveFlowImageLoader = null
         cacheJob?.cancel()
         cacheJob = null
@@ -3131,7 +3160,7 @@ class EpubReflowEngine private constructor(
         unregisterPageShotMemoryCallbacks()
         invalidateBoundaryPreviewState(clearViewSlots = false)
         flowMainHandler.removeCallbacksAndMessages(null)
-        liveFlowImageLoader?.releaseAll()
+        liveFlowImageLoader?.releaseAll(flowHost ?: flowView)
         liveFlowImageLoader = null
         recyclerView = null
         pageRequestCallback = null

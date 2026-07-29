@@ -8,6 +8,7 @@ import android.graphics.drawable.Drawable
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.View
 import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableLoader
 import io.noties.markwon.image.ImageSizeResolver
@@ -19,6 +20,9 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 private const val EPUB_DISPLAY_PROMOTION_FADE_MS = 120L
+private const val EPUB_IMAGE_DECODE_MAX_FAILURES = 2
+private const val EPUB_RETIRED_PIXEL_BUDGET_BYTES = 64L * 1024L * 1024L
+private const val EPUB_RETIRED_PIXEL_MIN_AGE_MS = 320L
 
 /**
  * Computes the on-screen size for a flow image from its intrinsic pixels. Full-page illustrations
@@ -127,6 +131,7 @@ internal data class EpubAsyncImageResult(
     val isFullPage: Boolean,
     val quality: EpubImageRenderQuality = EpubImageRenderQuality.DISPLAY,
     val replacesPlaceholder: Boolean = true,
+    val installsFirstPixels: Boolean = false,
 ) {
     val kind: EpubAsyncImageResultKind = if (
         beforeBounds.isEmpty ||
@@ -139,8 +144,8 @@ internal data class EpubAsyncImageResult(
     }
 
     val requiresTextRebind: Boolean
-        // Unknown geometry has no retained pixel layer, so its first decoded result still replaces
-        // the span owner. Known-geometry placeholders keep one drawable identity and update in place.
+        // Known-geometry placeholders retain one drawable identity, so first pixels and later
+        // promotions only invalidate that layer. Rebind only when no retained owner existed.
         get() = replacesPlaceholder
 }
 
@@ -239,6 +244,30 @@ private class EpubImagePixelDrawable(
         transitionStartedAtMs = 0L
         invalidateSelf()
     }
+
+    /** Drops decoded pixels while retaining the final layout geometry for a later window re-entry. */
+    fun retirePixels(): List<Bitmap> {
+        val retired = ArrayList<Bitmap>(3)
+        fun retire(bitmap: Bitmap?) {
+            if (
+                bitmap != null &&
+                bitmap !== EpubImagePixelDrawableHolder.bitmap &&
+                retired.none { existing -> existing === bitmap }
+            ) {
+                retired += bitmap
+            }
+        }
+        retire(fallbackPixels)
+        retire(pixels)
+        retire(previousPixels)
+        fallbackPixels = null
+        fallbackQuality = null
+        pixels = EpubImagePixelDrawableHolder.bitmap
+        previousPixels = null
+        transitionStartedAtMs = 0L
+        invalidateSelf()
+        return retired
+    }
 }
 
 internal class EpubFlowImageLoader(
@@ -274,7 +303,25 @@ internal class EpubFlowImageLoader(
     private val inFlight = WeakHashMap<AsyncDrawable, DecodeRequest>()
     private val layoutStartByDrawable = WeakHashMap<AsyncDrawable, Int>()
     private val installedQualityByDrawable = WeakHashMap<AsyncDrawable, EpubImageRenderQuality>()
+    private val decodeFailureCountByDrawable = WeakHashMap<AsyncDrawable, Int>()
+    private val terminalFailureGenerationByDrawable = WeakHashMap<AsyncDrawable, Long>()
     private val promotionCompletionByDrawable = WeakHashMap<AsyncDrawable, Runnable>()
+    private val retiredPixelBitmaps = ArrayList<RetiredPixelBitmap>()
+    private var retiredPixelBytes = 0L
+    private var retiredPixelBarrierGeneration = 0L
+    private var retiredPixelBarrierSatisfied = false
+    private val retiredPixelMaintenanceRunnable = object : Runnable {
+        override fun run() {
+            trimRetiredPixelBudget()
+            val overBudget = synchronized(lifecycleLock) {
+                retiredPixelBytes > EPUB_RETIRED_PIXEL_BUDGET_BYTES
+            }
+            if (overBudget && !released) {
+                handler.postDelayed(this, EPUB_RETIRED_PIXEL_MIN_AGE_MS)
+            }
+        }
+    }
+    private val retiredPixelFlushRunnable = Runnable { flushRetiredPixels() }
     private var decodeWindowRanges: List<IntRange>? = null
     private var decodeWindowRestrictsAdmission = false
     private var lifecycleGeneration = 0L
@@ -301,6 +348,92 @@ internal class EpubFlowImageLoader(
             return false
         }
 
+    /**
+     * Returns true only when every image occurrence at [layoutStarts] owns attached DISPLAY pixels.
+     * Rapid page turns use this exact-page contract instead of waiting for unrelated decode work.
+     */
+    fun hasStablePixels(layoutStarts: Collection<Int>): Boolean =
+        synchronized(lifecycleLock) {
+            val starts = layoutStarts.filter { it >= 0 }.distinct()
+            if (starts.isEmpty()) return true
+            starts.all { start ->
+                layoutStartByDrawable.entries.any { (drawable, registeredStart) ->
+                    registeredStart == start &&
+                        drawable.isAttached &&
+                        inFlight[drawable] == null &&
+                        (
+                            (
+                                (drawable.result as? EpubImagePixelSource)?.hasDecodedPixels == true &&
+                                    installedQualityByDrawable[drawable] == EpubImageRenderQuality.DISPLAY &&
+                                    promotionCompletionByDrawable[drawable] == null
+                                ) || terminalFailureGenerationByDrawable[drawable] == lifecycleGeneration
+                            )
+                }
+            }
+        }
+
+    private fun markTerminalFailure(drawable: AsyncDrawable) {
+        synchronized(lifecycleLock) {
+            if (!released && drawable.isAttached) {
+                terminalFailureGenerationByDrawable[drawable] = lifecycleGeneration
+            }
+        }
+    }
+
+    /**
+     * Defers the destructive native-pixel release until the just-retired layer has crossed a
+     * conservative HWUI safety window. Callers use this after a page/chapter lifecycle transition;
+     * [flushRetiredPixels] remains the explicit force barrier for tests/teardown that already owns
+     * the render lifecycle.
+     */
+    fun scheduleRetiredPixelFlush() {
+        val hasRetired = synchronized(lifecycleLock) {
+            if (retiredPixelBitmaps.isEmpty()) {
+                false
+            } else {
+                retiredPixelBarrierSatisfied = true
+                true
+            }
+        }
+        if (!hasRetired) return
+        handler.removeCallbacks(retiredPixelFlushRunnable)
+        handler.postDelayed(retiredPixelFlushRunnable, EPUB_RETIRED_PIXEL_MIN_AGE_MS)
+    }
+
+    /**
+     * Requests two attached-host frame traversals before starting the native-pixel safety age.
+     * This gives HWUI a concrete opportunity to replace the display list that referenced the
+     * retired drawable; the ordinary delayed flush remains the detached-host fallback.
+     */
+    fun scheduleRetiredPixelFlushAfterRenderBarrier(host: View) {
+        val barrierGeneration = synchronized(lifecycleLock) {
+            if (retiredPixelBitmaps.isEmpty()) return
+            retiredPixelBarrierSatisfied = false
+            ++retiredPixelBarrierGeneration
+        }
+        handler.removeCallbacks(retiredPixelFlushRunnable)
+        if (!host.isAttachedToWindow) {
+            scheduleRetiredPixelFlush()
+            return
+        }
+        var remainingFrames = 2
+        lateinit var frameBarrier: Runnable
+        frameBarrier = Runnable {
+            val isCurrent = synchronized(lifecycleLock) {
+                retiredPixelBarrierGeneration == barrierGeneration
+            }
+            if (!isCurrent) return@Runnable
+            remainingFrames -= 1
+            host.postInvalidateOnAnimation()
+            if (remainingFrames > 0 && host.isAttachedToWindow) {
+                host.postOnAnimation(frameBarrier)
+            } else {
+                scheduleRetiredPixelFlush()
+            }
+        }
+        host.postInvalidateOnAnimation()
+        host.postOnAnimation(frameBarrier)
+    }
     fun registerOccurrence(drawable: AsyncDrawable, layoutStart: Int) {
         synchronized(lifecycleLock) {
             if (!released) layoutStartByDrawable[drawable] = layoutStart
@@ -314,11 +447,10 @@ internal class EpubFlowImageLoader(
      */
     fun updateDecodeWindow(layoutRanges: Collection<IntRange>): Int {
         val ranges = layoutRanges.toList()
-        val (cancelled, candidates, generation) = synchronized(lifecycleLock) {
+        val update = synchronized(lifecycleLock) {
             if (released) return 0
             decodeWindowRanges = ranges
             decodeWindowRestrictsAdmission = true
-            if (ranges.isEmpty()) return 0
             val staleRequests = buildList {
                 val iterator = inFlight.entries.iterator()
                 while (iterator.hasNext()) {
@@ -330,19 +462,37 @@ internal class EpubFlowImageLoader(
                     }
                 }
             }
+            val cancelledCompletions = mutableListOf<Runnable>()
+            val retiredLayers = layoutStartByDrawable.entries.mapNotNull { (drawable, layoutStart) ->
+                if (ranges.any { range -> layoutStart in range }) return@mapNotNull null
+                val layer = drawable.result as? EpubImagePixelDrawable ?: return@mapNotNull null
+                installedQualityByDrawable.remove(drawable)
+                promotionCompletionByDrawable.remove(drawable)?.let(cancelledCompletions::add)
+                layer.takeIf { it.hasDecodedPixels }
+            }
             val dormant = layoutStartByDrawable.entries.mapNotNull { (drawable, layoutStart) ->
                 drawable.takeIf {
-                    drawable.isAttached &&
+                        drawable.isAttached &&
                         ranges.any { range -> layoutStart in range } &&
                         installedQualityByDrawable[drawable] == null &&
+                        terminalFailureGenerationByDrawable[drawable] != lifecycleGeneration &&
                         inFlight[drawable] == null
                 }
             }
-            Triple(staleRequests, dormant, lifecycleGeneration)
+            DecodeWindowUpdate(
+                cancelled = staleRequests,
+                candidates = dormant,
+                retiredLayers = retiredLayers,
+                cancelledCompletions = cancelledCompletions,
+                generation = lifecycleGeneration,
+            )
         }
-        cancelled.forEach { request -> request.future?.cancel(true) }
-        if (cancelled.isNotEmpty()) notifyDecodeFinished(generation)
-        return candidates.count { requestLoad(it, forcedQuality = null) }
+        update.cancelled.forEach { request -> request.future?.cancel(true) }
+        update.cancelledCompletions.forEach(handler::removeCallbacks)
+        retirePixelLayers(update.retiredLayers)
+        trimRetiredPixelBudget()
+        if (update.cancelled.isNotEmpty()) notifyDecodeFinished(update.generation)
+        return update.candidates.count { requestLoad(it, forcedQuality = null) }
     }
 
     fun promoteToDisplayQuality(layoutRanges: Collection<IntRange>): Int {
@@ -446,8 +596,12 @@ internal class EpubFlowImageLoader(
     private fun requestLoad(
         drawable: AsyncDrawable,
         forcedQuality: EpubImageRenderQuality?,
+        retryAttempt: Int = 0,
     ): Boolean {
         if (synchronized(lifecycleLock) { released }) return false
+        if (synchronized(lifecycleLock) { terminalFailureGenerationByDrawable[drawable] == lifecycleGeneration }) {
+            return false
+        }
         val layoutStart = synchronized(lifecycleLock) { layoutStartByDrawable[drawable] ?: -1 }
         val decodeWindow = if (layoutStart >= 0) {
             currentDecodeWindow()
@@ -462,11 +616,15 @@ internal class EpubFlowImageLoader(
             epubFileProvider()
         } catch (_: RuntimeException) {
             null
-        } ?: return false
+        } ?: run {
+            markTerminalFailure(drawable)
+            return false
+        }
         val href = drawable.destination
         val pageHeightPx = try {
             pageHeightProvider().coerceAtLeast(1)
         } catch (_: RuntimeException) {
+            markTerminalFailure(drawable)
             return false
         }
         val currentColumnWidthPx = currentColumnWidthPx()
@@ -529,6 +687,7 @@ internal class EpubFlowImageLoader(
                 generation = lifecycleGeneration,
                 quality = quality,
                 isPromotion = forcedQuality != null,
+                retryAttempt = retryAttempt,
             )
             inFlight[drawable] = new
             new to old
@@ -593,8 +752,9 @@ internal class EpubFlowImageLoader(
     }
 
     /** Permanently releases this loader. Subsequent [load] calls are ignored. */
-    fun releaseAll() {
+    fun releaseAll(renderBarrierHost: View? = null) {
         cancelAll(permanently = true)
+        renderBarrierHost?.let(::scheduleRetiredPixelFlushAfterRenderBarrier)
     }
 
     // Reserve the final image box before pixel decode. Markwon treats a non-empty-bounds placeholder
@@ -638,16 +798,20 @@ internal class EpubFlowImageLoader(
             var installedResult: EpubAsyncImageResult? = null
             var promotedLayer: EpubImagePixelDrawable? = null
             var decodeFinishedNotified = false
+            var retryPromotion = false
+            var retryPromotionStarted = false
             try {
                 synchronized(lifecycleLock) {
                     if (!isCurrentRequestLocked(drawable, request)) return@synchronized
                     accepted = true
                     if (bitmap != null && drawable.isAttached) {
+                        decodeFailureCountByDrawable.remove(drawable)
                         val beforeBounds = Rect(drawable.bounds)
                         val target = reservedBounds ?: Rect(drawable.bounds)
                         val retainedLayer = drawable.result as? EpubImagePixelDrawable
                         val replacesPlaceholder = retainedLayer == null
                         val result = retainedLayer ?: EpubImagePixelDrawable(target)
+                        val installsFirstPixels = !result.hasDecodedPixels
                         if (drawable.isAttached) {
                             if (replacesPlaceholder) {
                                 result.installInitialPixels(bitmap, request.quality)
@@ -674,11 +838,36 @@ internal class EpubFlowImageLoader(
                                 isFullPage = isFullPage,
                                 quality = request.quality,
                                 replacesPlaceholder = replacesPlaceholder,
+                                installsFirstPixels = installsFirstPixels,
                             )
+                        }
+                    } else if (bitmap == null && drawable.isAttached) {
+                        val hasRetainedPixels =
+                            (drawable.result as? EpubImagePixelSource)?.hasDecodedPixels == true
+                        val failureCount = (decodeFailureCountByDrawable[drawable] ?: 0) + 1
+                        decodeFailureCountByDrawable[drawable] = failureCount
+                        retryPromotion =
+                            hasRetainedPixels &&
+                                request.isPromotion &&
+                                request.retryAttempt == 0 &&
+                                failureCount < EPUB_IMAGE_DECODE_MAX_FAILURES
+                        if (
+                            (!hasRetainedPixels && request.quality == EpubImageRenderQuality.DISPLAY) ||
+                            failureCount >= EPUB_IMAGE_DECODE_MAX_FAILURES
+                        ) {
+                            terminalFailureGenerationByDrawable[drawable] = request.generation
                         }
                     }
                     inFlight.remove(drawable)
                 }
+                if (retryPromotion) {
+                    retryPromotionStarted = requestLoad(
+                        drawable = drawable,
+                        forcedQuality = request.quality,
+                        retryAttempt = request.retryAttempt + 1,
+                    )
+                }
+                if (retryPromotionStarted) decodeFinishedNotified = true
                 if (accepted) {
                     synchronized(lifecycleLock) {
                         if (!released && request.generation == lifecycleGeneration) {
@@ -731,6 +920,13 @@ internal class EpubFlowImageLoader(
     private fun finishWithoutResult(drawable: AsyncDrawable, request: DecodeRequest) {
         val removed = synchronized(lifecycleLock) {
             if (isCurrentRequestLocked(drawable, request)) {
+                if (
+                    drawable.isAttached &&
+                    (drawable.result as? EpubImagePixelSource)?.hasDecodedPixels != true &&
+                        request.quality == EpubImageRenderQuality.DISPLAY
+                ) {
+                    terminalFailureGenerationByDrawable[drawable] = request.generation
+                }
                 inFlight.remove(drawable)
                 true
             } else {
@@ -796,24 +992,124 @@ internal class EpubFlowImageLoader(
     }
 
     private fun cancelAll(permanently: Boolean) {
-        val (pending, completions, generation) = synchronized(lifecycleLock) {
+        val cancellation = synchronized(lifecycleLock) {
             lifecycleGeneration++
             if (permanently) released = true
+            val retiredLayers = if (permanently) {
+                layoutStartByDrawable.keys.mapNotNull { drawable ->
+                    (drawable.result as? EpubImagePixelDrawable)
+                        ?.takeIf { it.hasDecodedPixels }
+                }
+            } else {
+                emptyList()
+            }
             if (permanently) {
                 layoutStartByDrawable.clear()
                 installedQualityByDrawable.clear()
+                decodeFailureCountByDrawable.clear()
+                terminalFailureGenerationByDrawable.clear()
                 decodeWindowRanges = null
                 decodeWindowRestrictsAdmission = false
             }
             val requests = inFlight.values.toList().also { inFlight.clear() }
+            if (!permanently) {
+                decodeFailureCountByDrawable.clear()
+                terminalFailureGenerationByDrawable.clear()
+            }
             val fadeCompletions = promotionCompletionByDrawable.values.toList().also {
                 promotionCompletionByDrawable.clear()
             }
-            Triple(requests, fadeCompletions, lifecycleGeneration)
+            LoaderCancellation(
+                pending = requests,
+                completions = fadeCompletions,
+                retiredLayers = retiredLayers,
+                generation = lifecycleGeneration,
+            )
         }
-        pending.forEach { it.future?.cancel(true) }
-        completions.forEach(handler::removeCallbacks)
-        if (!permanently && pending.isNotEmpty()) notifyDecodeFinished(generation)
+        cancellation.pending.forEach { it.future?.cancel(true) }
+        cancellation.completions.forEach(handler::removeCallbacks)
+        retirePixelLayers(cancellation.retiredLayers)
+        if (permanently) {
+            handler.removeCallbacks(retiredPixelMaintenanceRunnable)
+            handler.removeCallbacks(retiredPixelFlushRunnable)
+            val hasRetired = synchronized(lifecycleLock) { retiredPixelBitmaps.isNotEmpty() }
+            if (hasRetired) handler.postDelayed(retiredPixelFlushRunnable, EPUB_RETIRED_PIXEL_MIN_AGE_MS)
+        }
+        if (!permanently && cancellation.pending.isNotEmpty()) {
+            notifyDecodeFinished(cancellation.generation)
+        }
+    }
+
+    private fun retirePixelLayers(layers: Collection<EpubImagePixelDrawable>) {
+        if (layers.isEmpty()) return
+        val retired = ArrayList<Bitmap>()
+        layers.forEach { layer ->
+            layer.retirePixels().forEach { bitmap ->
+                if (retired.none { existing -> existing === bitmap }) retired += bitmap
+            }
+        }
+        if (retired.isEmpty()) return
+        val retiredAtMs = SystemClock.uptimeMillis()
+        synchronized(lifecycleLock) {
+            var addedPixels = false
+            retired.forEach { bitmap ->
+                if (retiredPixelBitmaps.none { existing -> existing.bitmap === bitmap }) {
+                    val bytes = bitmap.allocationByteCount.toLong().coerceAtLeast(0L)
+                    retiredPixelBitmaps += RetiredPixelBitmap(bitmap, retiredAtMs, bytes)
+                    retiredPixelBytes += bytes
+                    addedPixels = true
+                }
+            }
+            if (addedPixels) {
+                retiredPixelBarrierSatisfied = false
+                retiredPixelBarrierGeneration += 1L
+            }
+        }
+        handler.removeCallbacks(retiredPixelFlushRunnable)
+        handler.removeCallbacks(retiredPixelMaintenanceRunnable)
+        handler.postDelayed(retiredPixelMaintenanceRunnable, EPUB_RETIRED_PIXEL_MIN_AGE_MS)
+    }
+
+    private fun trimRetiredPixelBudget(): Int {
+        val now = SystemClock.uptimeMillis()
+        val retired = synchronized(lifecycleLock) {
+            if (!retiredPixelBarrierSatisfied) return@synchronized emptyList()
+            buildList {
+                while (retiredPixelBytes > EPUB_RETIRED_PIXEL_BUDGET_BYTES) {
+                    val oldest = retiredPixelBitmaps.firstOrNull() ?: break
+                    if (now - oldest.retiredAtMs < EPUB_RETIRED_PIXEL_MIN_AGE_MS) break
+                    retiredPixelBitmaps.removeAt(0)
+                    retiredPixelBytes = (retiredPixelBytes - oldest.bytes).coerceAtLeast(0L)
+                    add(oldest.bitmap)
+                }
+            }
+        }
+        retired.forEach { bitmap ->
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        return retired.size
+    }
+
+    /**
+     * Recycles pixel buffers only after the host has crossed an explicit HWUI lifecycle barrier.
+     * Removing pixels from the retained drawable is immediate; releasing their native storage is
+     * deferred so a render-thread display list recorded by the just-finished page turn cannot race
+     * a fixed-delay recycle.
+     */
+    fun flushRetiredPixels(): Int {
+        handler.removeCallbacks(retiredPixelFlushRunnable)
+        val retired = synchronized(lifecycleLock) {
+            retiredPixelBarrierGeneration += 1L
+            retiredPixelBarrierSatisfied = false
+            retiredPixelBitmaps.map(RetiredPixelBitmap::bitmap).also {
+                retiredPixelBitmaps.clear()
+                retiredPixelBytes = 0L
+            }
+        }
+        retired.forEach { bitmap ->
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        return retired.size
     }
 
     private fun isCurrentRequestLocked(drawable: AsyncDrawable, request: DecodeRequest): Boolean =
@@ -840,7 +1136,29 @@ internal class EpubFlowImageLoader(
         val generation: Long,
         val quality: EpubImageRenderQuality,
         val isPromotion: Boolean,
+        val retryAttempt: Int,
         var future: Future<*>? = null,
+    )
+
+    private data class DecodeWindowUpdate(
+        val cancelled: List<DecodeRequest>,
+        val candidates: List<AsyncDrawable>,
+        val retiredLayers: List<EpubImagePixelDrawable>,
+        val cancelledCompletions: List<Runnable>,
+        val generation: Long,
+    )
+
+    private data class LoaderCancellation(
+        val pending: List<DecodeRequest>,
+        val completions: List<Runnable>,
+        val retiredLayers: List<EpubImagePixelDrawable>,
+        val generation: Long,
+    )
+
+    private data class RetiredPixelBitmap(
+        val bitmap: Bitmap,
+        val retiredAtMs: Long,
+        val bytes: Long,
     )
 
     private data class DecodeWindowSnapshot(
