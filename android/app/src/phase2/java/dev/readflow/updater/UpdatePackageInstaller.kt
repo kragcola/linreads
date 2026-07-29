@@ -10,6 +10,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.IntentSender
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -350,6 +351,28 @@ internal object UpdatePackageInstaller {
     fun isCurrentSession(context: Context, sessionId: Int): Boolean = synchronized(lock) {
         context.installPreferences().getInt(KEY_INSTALL_SESSION_ID, NO_SESSION) == sessionId
     }
+
+    fun currentSessionId(context: Context): Int = synchronized(lock) {
+        context.installPreferences().getInt(KEY_INSTALL_SESSION_ID, NO_SESSION)
+    }
+
+    fun expectedVersionForCurrentSession(context: Context): Long? = synchronized(lock) {
+        val prefs = context.installPreferences()
+        if (prefs.getInt(KEY_INSTALL_SESSION_ID, NO_SESSION) == NO_SESSION) return@synchronized null
+        prefs.getLong(KEY_DOWNLOAD_VERSION_CODE, -1L).takeIf { it > 0L }
+    }
+
+    fun commitSession(context: Context, sessionId: Int, statusSender: IntentSender): Boolean {
+        if (!isCurrentSession(context, sessionId)) return false
+        return runCatching {
+            context.packageManager.packageInstaller.openSession(sessionId).use { session ->
+                session.commit(statusSender)
+            }
+        }.isSuccess
+    }
+
+    fun commitSessionWithInAppCallback(context: Context, sessionId: Int): Boolean =
+        commitSession(context, sessionId, statusIntent(context, sessionId).intentSender)
 
     fun downloadIdForSession(context: Context, sessionId: Int): Long? = synchronized(lock) {
         val prefs = context.installPreferences()
@@ -752,11 +775,13 @@ internal object UpdatePackageInstaller {
                 true
             }
             ForegroundInstallRecoveryAction.RECOMMIT_SESSION -> {
-                val recommitted = runCatching {
-                    context.packageManager.packageInstaller.openSession(sessionId).use { session ->
-                        session.commit(statusIntent(context, sessionId).intentSender)
-                    }
-                }.isSuccess
+                val expectedVersion = expectedVersionForCurrentSession(context)
+                val helperPrepared = expectedVersion != null && UpdateHelperBridge.prepareCallback(
+                    context = context,
+                    sessionId = sessionId,
+                    expectedVersion = expectedVersion,
+                )
+                val recommitted = helperPrepared || commitSessionWithInAppCallback(context, sessionId)
                 if (!recommitted) {
                     val followUpQuery = runCatching {
                         context.packageManager.packageInstaller.getSessionInfo(sessionId)
@@ -840,7 +865,18 @@ class UpdateInstallWorker(
                 if (!armPostInstallTakeover(applicationContext, downloadId)) {
                     throw InstallSupersededException()
                 }
-                session.commit(statusIntent(applicationContext, sessionId).intentSender)
+            }
+            val expectedVersion = UpdatePackageInstaller.expectedVersionForCurrentSession(applicationContext)
+            val helperPrepared = expectedVersion != null && UpdateHelperBridge.prepareCallback(
+                context = applicationContext,
+                sessionId = sessionId,
+                expectedVersion = expectedVersion,
+            )
+            if (
+                !helperPrepared &&
+                !UpdatePackageInstaller.commitSessionWithInAppCallback(applicationContext, sessionId)
+            ) {
+                error("无法提交系统安装会话")
             }
             Result.success()
         } catch (_: InstallSupersededException) {
@@ -1205,6 +1241,7 @@ private const val KEY_INSTALL_BRIDGE_STATE = "install_bridge_state"
 private const val KEY_INSTALL_BRIDGE_TASK_ID = "install_bridge_task_id"
 private const val KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID = "install_bridge_claim_process_id"
 private const val KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS = "install_bridge_claim_elapsed_ms"
+private const val KEY_DOWNLOAD_VERSION_CODE = "dl_version_code"
 private const val INPUT_DOWNLOAD_ID = "download_id"
 private const val INPUT_APK_URI = "apk_uri"
 private const val EXTRA_SESSION_ID = "linreads_install_session_id"

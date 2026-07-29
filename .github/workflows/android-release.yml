@@ -6,7 +6,7 @@ on:
 
 concurrency:
   group: android-dev-release-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -51,8 +51,16 @@ jobs:
           fi
 
           build_tag="dev-${version_code}-${GITHUB_SHA}"
+          helper_protocol_version="$(
+            sed -nE 's/^readflow\.updateHelperProtocolVersion=([0-9]+)$/\1/p' android/gradle.properties
+          )"
+          if [[ -z "$helper_protocol_version" ]] || (( helper_protocol_version <= 0 )); then
+            echo "Invalid readflow.updateHelperProtocolVersion" >&2
+            exit 1
+          fi
           echo "BUILD_VERSION_CODE=$version_code" >> "$GITHUB_ENV"
           echo "BUILD_TAG=$build_tag" >> "$GITHUB_ENV"
+          echo "HELPER_PROTOCOL_VERSION=$helper_protocol_version" >> "$GITHUB_ENV"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
           echo "build_tag=$build_tag" >> "$GITHUB_OUTPUT"
           echo "Resolved BUILD_VERSION_CODE=$version_code"
@@ -79,24 +87,98 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Build OTA APK
+      - name: Build OTA APKs
         working-directory: android
-        run: ./gradlew -Preadflow.phase=2 :app:assembleOta
+        run: ./gradlew -Preadflow.phase=2 :updater-helper:assembleOta :app:assembleOta
 
-      - name: Publish dev-latest release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: dev-latest
-          name: "Dev build #${{ steps.build_identity.outputs.version_code }}"
-          body: |
-            ${{ github.event.head_commit.message }}
-            
-            ---
-            BUILD_TAG: ${{ steps.build_identity.outputs.build_tag }}
-            VERSION_CODE: ${{ steps.build_identity.outputs.version_code }}
-            Commit: ${{ github.sha }}
-            Branch: ${{ github.ref_name }}
-            Workflow run: ${{ github.run_number }}
-          files: android/app/build/outputs/apk/ota/app-ota.apk
-          prerelease: true
-          make_latest: false
+      - name: Publish verified dev-latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          app_apk="android/app/build/outputs/apk/ota/app-ota.apk"
+          helper_apk="android/updater-helper/build/outputs/apk/ota/updater-helper-ota.apk"
+          test -s "$app_apk"
+          test -s "$helper_apk"
+
+          apksigner="$(
+            find "${ANDROID_HOME:?}/build-tools" -type f -name apksigner -perm -u+x \
+              | sort -V \
+              | tail -n 1
+          )"
+          test -x "$apksigner"
+          app_signer="$(
+            "$apksigner" verify --print-certs "$app_apk" \
+              | sed -nE 's/^.*certificate SHA-256 digest:[[:space:]]*([0-9a-fA-F]+).*$/\1/p' \
+              | head -n 1
+          )"
+          helper_signer="$(
+            "$apksigner" verify --print-certs "$helper_apk" \
+              | sed -nE 's/^.*certificate SHA-256 digest:[[:space:]]*([0-9a-fA-F]+).*$/\1/p' \
+              | head -n 1
+          )"
+          test -n "$app_signer"
+          test "$app_signer" = "$helper_signer"
+
+          version_code="${{ steps.build_identity.outputs.version_code }}"
+          stage_dir="$(mktemp -d)"
+          verify_dir="$(mktemp -d)"
+          app_versioned="$stage_dir/app-ota-${version_code}.apk"
+          helper_versioned="$stage_dir/updater-helper-ota-${version_code}.apk"
+          cp "$app_apk" "$app_versioned"
+          cp "$helper_apk" "$helper_versioned"
+
+          if ! gh release view dev-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create dev-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "LinReads development release" \
+              --notes $'Pending verified assets\n\n---\nVERSION_CODE: 0' \
+              --prerelease
+          fi
+
+          # Versioned assets are uploaded and downloaded first. The release metadata still points
+          # at the previous build until both stable assets have also been verified.
+          gh release upload dev-latest "$app_versioned" "$helper_versioned" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release download dev-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "app-ota-${version_code}.apk" \
+            --pattern "updater-helper-ota-${version_code}.apk" \
+            --dir "$verify_dir"
+          cmp "$app_apk" "$verify_dir/app-ota-${version_code}.apk"
+          cmp "$helper_apk" "$verify_dir/updater-helper-ota-${version_code}.apk"
+
+          gh release upload dev-latest "$app_apk" "$helper_apk" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          rm -rf "$verify_dir"
+          verify_dir="$(mktemp -d)"
+          gh release download dev-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "app-ota.apk" \
+            --pattern "updater-helper-ota.apk" \
+            --dir "$verify_dir"
+          cmp "$app_apk" "$verify_dir/app-ota.apk"
+          cmp "$helper_apk" "$verify_dir/updater-helper-ota.apk"
+
+          notes_file="$stage_dir/release-notes.txt"
+          {
+            git log -1 --pretty=%B
+            cat <<EOF
+
+          ---
+          BUILD_TAG: ${{ steps.build_identity.outputs.build_tag }}
+          VERSION_CODE: $version_code
+          HELPER_PROTOCOL_VERSION: $HELPER_PROTOCOL_VERSION
+          HELPER_VERSION_CODE: $version_code
+          Commit: $GITHUB_SHA
+          Branch: $GITHUB_REF_NAME
+          Workflow run: $GITHUB_RUN_NUMBER
+          EOF
+          } > "$notes_file"
+          gh release edit dev-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Dev build #${version_code}" \
+            --notes-file "$notes_file" \
+            --prerelease

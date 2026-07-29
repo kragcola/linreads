@@ -18,6 +18,7 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "LinReads"
+include(":updater-helper")
 
 // Phased include driven by the `readflow.phase` Gradle property (v4 §10.3 / P6).
 // Default phase = 1. Override with -Preadflow.phase=2 (or in gradle.properties).

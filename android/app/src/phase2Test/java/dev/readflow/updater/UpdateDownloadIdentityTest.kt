@@ -151,4 +151,10 @@ class UpdateDownloadIdentityTest {
         assertNull(releaseVersionCodeFromBody("---\nVERSION_CODE: invalid"))
         assertNull(releaseVersionCodeFromBody("---\nVERSION_CODE: 0"))
     }
+
+    @Test
+    fun `verified releases use immutable versioned apk assets`() {
+        assertEquals("app-ota-100302.apk", otaApkAssetName(100_302L))
+        assertEquals("app-ota.apk", otaApkAssetName(null))
+    }
 }

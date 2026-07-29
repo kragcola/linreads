@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
+    <uses-permission android:name="dev.readflow.permission.UPDATE_HELPER_BRIDGE" />
+
+    <queries>
+        <package android:name="dev.readflow" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <meta-data
+            android:name="dev.readflow.updaterhelper.PROTOCOL_VERSION"
+            android:value="${updateHelperProtocolVersion}" />
+        <activity
+            android:name="dev.readflow.updaterhelper.UpdaterActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:permission="dev.readflow.permission.UPDATE_HELPER_BRIDGE"
+            android:taskAffinity="dev.readflow.updaterhelper.install" />
+        <receiver
+            android:name="dev.readflow.updaterhelper.InstallStatusReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

@@ -73,9 +73,18 @@ compact 后任务判定：system-reminder 注入的 `### Skill:` 段尾若带 `A
 
 ### Build resource policy
 
-- Full Android regression suites, R8/minification, and `:app:assembleOta` run in GitHub Actions only.
+- Full Android regression suites, R8/minification, `:app:assembleOta`, and
+  `:updater-helper:assembleOta` run in GitHub Actions only.
 - Local Android verification is limited to the smallest targeted test tasks needed for the current change.
 - After pushing, monitor `.github/workflows/android-release.yml` through completion and verify the published `dev-latest` APK; do not duplicate that release build locally.
+
+### Release lanes
+
+1. **Local lane**: freeze one problem packet, review its exact diff/allowlist, then run each targeted test and static contract check once.
+2. **Cloud lane**: make one scoped commit and let GitHub Actions own full regression, R8, dual-APK signing/building, publication, and byte verification. A failed run returns to one explicit root cause; do not stack speculative fixes.
+3. **Device lane**: start only after CI and release metadata are verified. Bootstrap the production helper and helper-aware app once without clearing data, then validate the next OTA in one physical-device batch. Capture text logs, package/session state, version/signature, task stack, and library counts; the main agent does not load screenshots.
+
+Do not interleave local builds, emulator runs, ADB installs, and manual device checks between small edits. The order for an OTA packet is always local targeted checks -> CI full/R8/publication -> one final device acceptance batch.
 
 改完代码后，先检查工作树并只暂存本次文件，再推送到远端平板：
 
@@ -88,13 +97,14 @@ git push
 
 自动流程：
 1. `git push` → GitHub Actions 触发（见 [`.github/workflows/android-release.yml`](.github/workflows/android-release.yml)）
-2. Actions 运行 `phase=2` 全量回归并构建经过 R8/minification 的 OTA APK
-3. 上传到 [`dev-latest` Release](https://github.com/kragcola/linreads/releases/tag/dev-latest)
+2. Actions 运行 `phase=2` 全量回归并构建经过 R8/minification 的 app/helper OTA APK
+3. 先上传并下载校验 `app-ota-<versionCode>.apk` 与 `updater-helper-ota-<versionCode>.apk`，再刷新兼容旧客户端的固定资产，最后更新 [`dev-latest` Release](https://github.com/kragcola/linreads/releases/tag/dev-latest) 元数据
 4. 平板切到前台后约 8 秒：弹出系统通知「LinReads 新版本可用」
 5. 点通知 → 下载 → 系统安装器 → 完成
 
 **平板首次配置（一次性）：**
 - 设置 → 应用 → 特殊权限 → 安装未知来源应用 → 允许 LinReads
+- 从同一条已验真的 Release 安装一次 `updater-helper-ota-<versionCode>.apk`；helper 不下载 APK，也不申请安装未知来源权限
 - 无需 USB/ADB/开发者模式
 
 **相关文件：**

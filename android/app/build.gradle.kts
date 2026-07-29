@@ -7,6 +7,8 @@ plugins {
 }
 
 val readflowPhase = (project.findProperty("readflow.phase") as String?)?.toInt() ?: 1
+val updateHelperProtocolVersion = providers.gradleProperty("readflow.updateHelperProtocolVersion")
+    .get().toInt().also { require(it > 0) }
 
 android {
     namespace = "dev.readflow"
@@ -28,6 +30,7 @@ android {
         buildConfigField("String", "GITHUB_REPO", "\"kragcola/linreads\"")
         buildConfigField("String", "BUILD_TAG", "\"$buildTag\"")
         buildConfigField("int", "OTA_VERSION_CODE", buildVersionCode.toString())
+        buildConfigField("int", "UPDATE_HELPER_PROTOCOL_VERSION", updateHelperProtocolVersion.toString())
         buildConfigField("String", "GITHUB_OTA_TOKEN", "\"${System.getenv("GITHUB_OTA_TOKEN") ?: ""}\"" )
         manifestPlaceholders["updateReceiverEnabled"] = readflowPhase >= 2
     }

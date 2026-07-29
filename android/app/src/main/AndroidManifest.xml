@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <permission
+        android:name="dev.readflow.permission.UPDATE_HELPER_BRIDGE"
+        android:protectionLevel="signature" />
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
@@ -7,6 +11,11 @@
     <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REORDER_TASKS" />
+    <uses-permission android:name="dev.readflow.permission.UPDATE_HELPER_BRIDGE" />
+
+    <queries>
+        <package android:name="dev.readflow.updaterhelper" />
+    </queries>
     <application
         android:name=".ReadflowApplication"
         android:label="Readflow"
@@ -89,6 +98,15 @@
             android:excludeFromRecents="true"
             android:exported="false"
             android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay" />
+        <activity
+            android:name=".updater.UpdateHelperCallbackActivity"
+            android:enabled="${updateReceiverEnabled}"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:noHistory="true"
+            android:permission="dev.readflow.permission.UPDATE_HELPER_BRIDGE"
             android:taskAffinity=""
             android:theme="@android:style/Theme.NoDisplay" />
         <activity

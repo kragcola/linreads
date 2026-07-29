@@ -59,10 +59,11 @@ class GitHubUpdateChecker(
             }
 
             val assets = root.getJSONArray("assets")
+            val apkAssetName = otaApkAssetName(releaseVersionCode)
             var apkUrl: String? = null
             for (i in 0 until assets.length()) {
                 val a = assets.getJSONObject(i)
-                if (a.optString("name") == OTA_APK_ASSET_NAME) {
+                if (a.optString("name") == apkAssetName) {
                     apkUrl = a.getString("browser_download_url"); break
                 }
             }
@@ -75,7 +76,7 @@ class GitHubUpdateChecker(
                     versionCode = releaseVersionCode,
                 )
             }
-                ?: throw IOException("release has no $OTA_APK_ASSET_NAME asset")
+                ?: throw IOException("release has no $apkAssetName asset")
         } catch (error: CancellationException) {
             throw error
         } catch (e: IOException) {
@@ -96,6 +97,9 @@ internal fun releaseVersionCodeFromBody(body: String): Long? =
     releaseMetadataValue(body, "VERSION_CODE")
         ?.toLongOrNull()
         ?.takeIf { it > 0 }
+
+internal fun otaApkAssetName(versionCode: Long?): String =
+    versionCode?.takeIf { it > 0L }?.let { "app-ota-$it.apk" } ?: OTA_APK_ASSET_NAME
 
 internal fun shouldOfferRelease(
     releaseBuildTag: String?,
