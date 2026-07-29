@@ -1,6 +1,7 @@
 package dev.readflow.updater
 
 import android.Manifest
+import android.app.ActivityManager
 import android.app.DownloadManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -16,6 +17,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import dev.readflow.BuildConfig
+import dev.readflow.MainActivity
 import dev.readflow.features.settings.createUpdateDownloadFileName
 
 internal const val UPDATE_EXTRA_APK_URL = "apk_url"
@@ -63,22 +65,10 @@ internal fun isPendingUpdateInstallable(
 /** Called from the app's foreground lifecycle, never from a completion receiver. */
 internal fun resumePendingUpdateOnForeground(context: Context) {
     val appContext = context.applicationContext
+    cancelPostInstallCompletionNotification(appContext)
     val prefs = appContext.updatePreferences()
     if (isInstalledUpdateBuild(prefs.getString(KEY_DOWNLOAD_TAG, null), BuildConfig.BUILD_TAG)) {
-        UpdatePackageInstaller.clearRecordedInstall(appContext)
-        prefs.edit()
-            .remove(KEY_DOWNLOAD_ID)
-            .remove(KEY_DOWNLOAD_URL)
-            .remove(KEY_DOWNLOAD_TAG)
-            .remove(KEY_DOWNLOAD_VERSION_CODE)
-            .remove(KEY_UNKNOWN_SOURCES_PERMISSION_PENDING)
-            .apply()
-        runCatching {
-            appContext.getSystemService(NotificationManager::class.java).apply {
-                cancel(UPDATE_DETECTION_NOTIFICATION_ID)
-                cancel(UNKNOWN_SOURCES_NOTIFICATION_ID)
-            }
-        }
+        clearInstalledUpdateState(appContext)
         return
     }
     val downloadId = prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD)
@@ -156,6 +146,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                     .remove(KEY_DOWNLOAD_URL)
                     .remove(KEY_DOWNLOAD_TAG)
                     .remove(KEY_DOWNLOAD_VERSION_CODE)
+                    .remove(KEY_POST_INSTALL_ARMED_TAG)
                     .apply()
             } else {
                 val q = dm.query(DownloadManager.Query().setFilterById(prevId))
@@ -211,6 +202,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
             .putLong(KEY_DOWNLOAD_ID, dlId)
             .putString(KEY_DOWNLOAD_URL, apkUrl)
             .putString(KEY_DOWNLOAD_TAG, buildTag)
+            .remove(KEY_POST_INSTALL_ARMED_TAG)
         if (versionCode == null) {
             editor.remove(KEY_DOWNLOAD_VERSION_CODE)
         } else {
@@ -229,6 +221,68 @@ class UpdateInstallReceiver : BroadcastReceiver() {
         val apkUri = dm.getUriForDownloadedFile(dlId) ?: return
 
         stageDownloadedUpdate(context, dlId, apkUri)
+    }
+}
+
+class UpdatePostInstallReceiver : BroadcastReceiver() {
+
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Intent.ACTION_MY_PACKAGE_REPLACED) return
+
+        val appContext = context.applicationContext
+        val tasks = runCatching {
+            appContext.getSystemService(ActivityManager::class.java).appTasks
+        }.getOrDefault(emptyList())
+        val tasksByRole = tasks.groupBy { task ->
+            val taskInfo = runCatching { task.taskInfo }.getOrNull()
+            val rootComponent = taskInfo?.baseIntent?.component ?: taskInfo?.baseActivity
+            postInstallTaskRole(
+                packageName = appContext.packageName,
+                rootPackageName = rootComponent?.packageName,
+                rootClassName = rootComponent?.className,
+            )
+        }
+        val mainTask = tasksByRole[PostInstallTaskRole.MAIN]?.firstOrNull()
+        val installerTasks = tasksByRole[PostInstallTaskRole.INSTALLER].orEmpty()
+        val prefs = appContext.updatePreferences()
+        val actions = postInstallTakeoverActions(
+            savedBuildTag = prefs.getString(KEY_DOWNLOAD_TAG, null),
+            armedBuildTag = prefs.getString(KEY_POST_INSTALL_ARMED_TAG, null),
+            currentBuildTag = BuildConfig.BUILD_TAG,
+            handledBuildTag = prefs.getString(KEY_POST_INSTALL_HANDLED_TAG, null),
+            hasMainTask = mainTask != null,
+            installerTaskCount = installerTasks.size,
+        )
+        if (actions.isEmpty() || !claimPostInstallTakeover(appContext)) return
+
+        val hadMainTask = mainTask != null
+        var installerTaskIndex = 0
+        var completionNotificationPosted = false
+        actions.forEach { action ->
+            when (action) {
+                PostInstallTakeoverAction.POST_COMPLETION_NOTIFICATION -> {
+                    completionNotificationPosted = postPostInstallCompletionNotification(appContext)
+                }
+                PostInstallTakeoverAction.MOVE_MAIN_TASK_TO_FRONT -> {
+                    runCatching { requireNotNull(mainTask).moveToFront() }
+                }
+                PostInstallTakeoverAction.LAUNCH_MAIN_ACTIVITY -> {
+                    launchMainActivity(appContext)
+                }
+                PostInstallTakeoverAction.REMOVE_INSTALLER_TASK -> {
+                    val installerTask = installerTasks.getOrNull(installerTaskIndex++)
+                    if (
+                        installerTask != null &&
+                        shouldRemovePostInstallInstallerTask(
+                            hadMainTask = hadMainTask,
+                            completionNotificationPosted = completionNotificationPosted,
+                        )
+                    ) {
+                        runCatching { installerTask.finishAndRemoveTask() }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -275,12 +329,120 @@ private fun discardPersistedUpdate(context: Context, downloadId: Long) {
         .remove(KEY_DOWNLOAD_TAG)
         .remove(KEY_DOWNLOAD_VERSION_CODE)
         .remove(KEY_UNKNOWN_SOURCES_PERMISSION_PENDING)
+        .remove(KEY_POST_INSTALL_ARMED_TAG)
         .apply()
     runCatching {
         appContext.getSystemService(NotificationManager::class.java).apply {
             cancel(UPDATE_DETECTION_NOTIFICATION_ID)
             cancel(UNKNOWN_SOURCES_NOTIFICATION_ID)
         }
+    }
+}
+
+private fun claimPostInstallTakeover(context: Context): Boolean = synchronized(POST_INSTALL_LOCK) {
+    val prefs = context.updatePreferences()
+    val actions = postInstallTakeoverActions(
+        savedBuildTag = prefs.getString(KEY_DOWNLOAD_TAG, null),
+        armedBuildTag = prefs.getString(KEY_POST_INSTALL_ARMED_TAG, null),
+        currentBuildTag = BuildConfig.BUILD_TAG,
+        handledBuildTag = prefs.getString(KEY_POST_INSTALL_HANDLED_TAG, null),
+        hasMainTask = false,
+        installerTaskCount = 0,
+    )
+    if (actions.isEmpty()) return@synchronized false
+    prefs.edit().putString(KEY_POST_INSTALL_HANDLED_TAG, BuildConfig.BUILD_TAG).commit()
+}
+
+internal fun armPostInstallTakeover(context: Context, downloadId: Long): Boolean =
+    synchronized(POST_INSTALL_LOCK) {
+        val prefs = context.updatePreferences()
+        if (prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) return@synchronized false
+        val buildTag = prefs.getString(KEY_DOWNLOAD_TAG, null) ?: return@synchronized false
+        prefs.edit().putString(KEY_POST_INSTALL_ARMED_TAG, buildTag).commit()
+    }
+
+internal fun disarmPostInstallTakeover(context: Context, downloadId: Long) {
+    synchronized(POST_INSTALL_LOCK) {
+        val prefs = context.updatePreferences()
+        if (prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) return@synchronized
+        prefs.edit().remove(KEY_POST_INSTALL_ARMED_TAG).apply()
+    }
+}
+
+private fun clearInstalledUpdateState(context: Context) {
+    val appContext = context.applicationContext
+    val prefs = appContext.updatePreferences()
+    val downloadId = prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD)
+    UpdatePackageInstaller.clearRecordedInstall(appContext)
+    if (downloadId != NO_DOWNLOAD) {
+        runCatching { appContext.getSystemService(DownloadManager::class.java).remove(downloadId) }
+    }
+    prefs.edit()
+        .remove(KEY_DOWNLOAD_ID)
+        .remove(KEY_DOWNLOAD_URL)
+        .remove(KEY_DOWNLOAD_TAG)
+        .remove(KEY_DOWNLOAD_VERSION_CODE)
+        .remove(KEY_UNKNOWN_SOURCES_PERMISSION_PENDING)
+        .remove(KEY_POST_INSTALL_ARMED_TAG)
+        .apply()
+    runCatching {
+        appContext.getSystemService(NotificationManager::class.java).apply {
+            cancel(UPDATE_DETECTION_NOTIFICATION_ID)
+            cancel(UNKNOWN_SOURCES_NOTIFICATION_ID)
+        }
+    }
+}
+
+private fun launchMainActivity(context: Context) {
+    runCatching {
+        context.startActivity(
+            Intent(context, MainActivity::class.java).addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP,
+            ),
+        )
+    }
+}
+
+private fun postPostInstallCompletionNotification(context: Context): Boolean = runCatching {
+    context.getSystemService(NotificationManager::class.java).createNotificationChannel(
+        NotificationChannel(UPDATE_CHANNEL_ID, "应用更新", NotificationManager.IMPORTANCE_HIGH),
+    )
+    val appNotificationsAllowed = canPostUpdateNotification(context)
+    val channelImportance = context.getSystemService(NotificationManager::class.java)
+        .getNotificationChannel(UPDATE_CHANNEL_ID)
+        ?.importance
+    if (!shouldPublishInstallNotification(appNotificationsAllowed, channelImportance)) {
+        return@runCatching false
+    }
+    val openApp = PendingIntent.getActivity(
+        context,
+        POST_INSTALL_NOTIFICATION_ID,
+        Intent(context, MainActivity::class.java).addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP,
+        ),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+    NotificationManagerCompat.from(context).notify(
+        POST_INSTALL_NOTIFICATION_ID,
+        NotificationCompat.Builder(context, UPDATE_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_download_done)
+            .setContentTitle("LinReads 更新完成")
+            .setContentText("点按返回 LinReads")
+            .setAutoCancel(true)
+            .setContentIntent(openApp)
+            .build(),
+    )
+    true
+}.getOrDefault(false)
+
+private fun cancelPostInstallCompletionNotification(context: Context) {
+    runCatching {
+        context.getSystemService(NotificationManager::class.java)
+            .cancel(POST_INSTALL_NOTIFICATION_ID)
     }
 }
 
@@ -345,7 +507,11 @@ private const val KEY_DOWNLOAD_URL = "dl_url"
 private const val KEY_DOWNLOAD_TAG = "dl_tag"
 private const val KEY_DOWNLOAD_VERSION_CODE = "dl_version_code"
 private const val KEY_UNKNOWN_SOURCES_PERMISSION_PENDING = "unknown_sources_permission_pending"
+private const val KEY_POST_INSTALL_ARMED_TAG = "post_install_armed_tag"
+private const val KEY_POST_INSTALL_HANDLED_TAG = "post_install_handled_tag"
 private const val UPDATE_CHANNEL_ID = "linreads_update"
 private const val UNKNOWN_SOURCES_NOTIFICATION_ID = 9003
+private const val POST_INSTALL_NOTIFICATION_ID = 9004
 private const val NO_DOWNLOAD = -1L
 private const val NO_VERSION_CODE = -1L
+private val POST_INSTALL_LOCK = Any()

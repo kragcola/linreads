@@ -67,6 +67,14 @@
             android:name=".updater.UpdateInstallStatusReceiver"
             android:enabled="${updateReceiverEnabled}"
             android:exported="false" />
+        <receiver
+            android:name=".updater.UpdatePostInstallReceiver"
+            android:enabled="${updateReceiverEnabled}"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
         <activity
             android:name=".updater.UpdateApkInstallResumeActivity"
             android:enabled="${updateReceiverEnabled}"

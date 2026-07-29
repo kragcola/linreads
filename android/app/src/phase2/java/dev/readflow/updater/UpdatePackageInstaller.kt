@@ -830,15 +830,20 @@ class UpdateInstallWorker(
                     sessionId,
                     InstallStage.COMMITTED,
                 )
+                if (!armPostInstallTakeover(applicationContext, downloadId)) {
+                    throw InstallSupersededException()
+                }
                 session.commit(statusIntent(applicationContext, sessionId).intentSender)
             }
             Result.success()
         } catch (_: InstallSupersededException) {
+            disarmPostInstallTakeover(applicationContext, downloadId)
             if (sessionId != NO_SESSION) {
                 runCatching { applicationContext.packageManager.packageInstaller.abandonSession(sessionId) }
             }
             Result.success()
         } catch (error: Throwable) {
+            disarmPostInstallTakeover(applicationContext, downloadId)
             if (sessionId != NO_SESSION) {
                 runCatching { applicationContext.packageManager.packageInstaller.abandonSession(sessionId) }
             }
@@ -917,6 +922,7 @@ private fun handleInstallStatus(context: Context, intent: Intent) {
                     launchSystemConfirmation(context, systemConfirmation)
                 }
                 PendingUserActionLaunch.FAILURE -> {
+                    dlId?.let { downloadId -> disarmPostInstallTakeover(context, downloadId) }
                     UpdatePackageInstaller.markFailed(context, sessionId, "系统未返回安装确认页面")
                     cancelUpdateDetectionNotification(context)
                     postInstallFailureNotification(context, "系统未返回安装确认页面")
@@ -928,6 +934,9 @@ private fun handleInstallStatus(context: Context, intent: Intent) {
             cancelUpdateNotifications(context)
         }
         else -> {
+            UpdatePackageInstaller.downloadIdForSession(context, sessionId)?.let { downloadId ->
+                disarmPostInstallTakeover(context, downloadId)
+            }
             val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
                 ?: "系统安装失败（状态 $status）"
             UpdatePackageInstaller.markFailed(context, sessionId, message)
