@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.REORDER_TASKS" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="dev.readflow.permission.UPDATE_HELPER_BRIDGE" />
 
     <queries>
@@ -24,5 +25,9 @@
         <receiver
             android:name="dev.readflow.updaterhelper.InstallStatusReceiver"
             android:exported="false" />
+        <receiver
+            android:name="dev.readflow.updaterhelper.ReturnAckReceiver"
+            android:exported="true"
+            android:permission="dev.readflow.permission.UPDATE_HELPER_BRIDGE" />
     </application>
 </manifest>

@@ -2,6 +2,9 @@ package dev.readflow.updaterhelper
 
 import android.app.Activity
 import android.app.ActivityManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -23,7 +26,6 @@ class UpdaterActivity : Activity() {
     private lateinit var statusView: TextView
     private var returnWhenFocused = false
     private var returnScheduled = false
-    private var returnLaunchRequested = false
     private var activityResumed = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -57,12 +59,10 @@ class UpdaterActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) scheduleReturnWhenFocused()
-    }
-
-    override fun onStop() {
-        super.onStop()
-        if (returnLaunchRequested) finishAndRemoveTask()
+        if (hasFocus) {
+            resumePendingTerminalAction()
+            scheduleReturnWhenFocused()
+        }
     }
 
     private fun handleIntent(intent: Intent) {
@@ -71,11 +71,7 @@ class UpdaterActivity : Activity() {
             HelperContract.ACTION_CONFIRM_INSTALL -> confirmInstall(intent)
             HelperContract.ACTION_RETURN_TO_APP,
             HelperContract.ACTION_INSTALL_FAILED,
-            -> {
-                if (shouldConsumePendingTerminalAction(activityResumed)) {
-                    resumePendingTerminalAction()
-                }
-            }
+            -> resumePendingTerminalAction()
             else -> {
                 updateStatus("无法准备更新")
                 Log.e(HelperContract.TAG, "invalid action=${intent.action}")
@@ -84,6 +80,8 @@ class UpdaterActivity : Activity() {
     }
 
     private fun prepareCallback(intent: Intent) {
+        returnWhenFocused = false
+        returnScheduled = false
         val protocolVersion = intent.getIntExtra(HelperContract.EXTRA_PROTOCOL_VERSION, -1)
         val sessionId = intent.getIntExtra(HelperContract.EXTRA_SESSION_ID, -1)
         val expectedVersion = intent.getLongExtra(HelperContract.EXTRA_EXPECTED_VERSION, -1L)
@@ -108,6 +106,7 @@ class UpdaterActivity : Activity() {
             .putBoolean(HelperContract.KEY_TERMINAL_CONSUMED, false)
             .putBoolean(HelperContract.KEY_TERMINAL_PENDING, false)
             .putBoolean(HelperContract.KEY_CONFIRMATION_DISPATCHED, false)
+            .putInt(HelperContract.KEY_RETURN_LAUNCH_ATTEMPTS, 0)
             .remove(HelperContract.KEY_PENDING_TERMINAL_ACTION)
             .remove(HelperContract.KEY_PENDING_ERROR_MESSAGE)
             .commit()
@@ -161,58 +160,90 @@ class UpdaterActivity : Activity() {
     }
 
     private fun openLinReads() {
-        returnLaunchRequested = true
+        val targetIntent = returnIntent(helperPreferences())
+        if (targetIntent == null) {
+            updateStatus("无法验证更新返回请求")
+            return
+        }
         runCatching {
-            startActivity(
-                Intent().setClassName(
-                    HelperContract.TARGET_PACKAGE,
-                    HelperContract.TARGET_ACTIVITY,
-                ).addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                        Intent.FLAG_ACTIVITY_SINGLE_TOP,
-                ),
-            )
+            startActivity(targetIntent)
         }.onFailure {
-            returnLaunchRequested = false
             updateStatus("LinReads 已更新，请返回应用")
         }
     }
 
     private fun scheduleReturnWhenFocused() {
-        if (!returnWhenFocused || returnScheduled || !hasWindowFocus()) return
-        returnScheduled = true
-        statusView.post {
-            returnScheduled = false
-            if (!returnWhenFocused || !hasWindowFocus() || isFinishing) return@post
-            returnWhenFocused = false
-            openLinReads()
+        val preferences = helperPreferences()
+        val persistedAttempts = preferences.getInt(HelperContract.KEY_RETURN_LAUNCH_ATTEMPTS, 0)
+        if (!shouldScheduleReturnLaunch(
+                terminalPending = returnWhenFocused,
+                returnScheduled = returnScheduled,
+                activityResumed = activityResumed,
+                hasWindowFocus = hasWindowFocus(),
+                launchAttempts = persistedAttempts,
+            )
+        ) {
+            return
         }
+        returnScheduled = true
+        val delayMs = returnLaunchDelayMs(persistedAttempts)
+        statusView.postDelayed({
+            returnScheduled = false
+            if (isFinishing) {
+                return@postDelayed
+            }
+            val currentPreferences = helperPreferences()
+            val currentAttempts = currentPreferences.getInt(
+                HelperContract.KEY_RETURN_LAUNCH_ATTEMPTS,
+                0,
+            )
+            val nextAttempt = nextReturnLaunchAttempt(
+                terminalPending = currentPreferences.getBoolean(
+                    HelperContract.KEY_TERMINAL_PENDING,
+                    false,
+                ),
+                pendingAction = currentPreferences.getString(
+                    HelperContract.KEY_PENDING_TERMINAL_ACTION,
+                    null,
+                ),
+                activityResumed = activityResumed,
+                hasWindowFocus = hasWindowFocus(),
+                persistedAttempts = currentAttempts,
+            ) ?: return@postDelayed
+            currentPreferences.edit()
+                .putInt(HelperContract.KEY_RETURN_LAUNCH_ATTEMPTS, nextAttempt)
+                .commit()
+            openLinReads()
+            if (shouldScheduleReturnLaunch(
+                    terminalPending = returnWhenFocused,
+                    returnScheduled = returnScheduled,
+                    activityResumed = activityResumed,
+                    hasWindowFocus = hasWindowFocus(),
+                    launchAttempts = nextAttempt,
+                )
+            ) {
+                scheduleReturnWhenFocused()
+            } else if (returnWhenFocused && activityResumed && hasWindowFocus()) {
+                postReturnNotification(this, currentPreferences)
+                updateStatus("LinReads 已更新，请点击通知返回")
+            }
+        }, delayMs)
     }
 
     private fun resumePendingTerminalAction() {
         val preferences = helperPreferences()
         if (!preferences.getBoolean(HelperContract.KEY_TERMINAL_PENDING, false)) return
-        consumePendingTerminalAction(
-            action = preferences.getString(HelperContract.KEY_PENDING_TERMINAL_ACTION, null),
-            errorMessage = preferences.getString(HelperContract.KEY_PENDING_ERROR_MESSAGE, null),
-        )
-    }
-
-    private fun consumePendingTerminalAction(action: String?, errorMessage: String?) {
-        if (action !in setOf(HelperContract.ACTION_RETURN_TO_APP, HelperContract.ACTION_INSTALL_FAILED)) return
-        helperPreferences().edit()
-            .putBoolean(HelperContract.KEY_TERMINAL_CONSUMED, true)
-            .putBoolean(HelperContract.KEY_TERMINAL_PENDING, false)
-            .remove(HelperContract.KEY_PENDING_TERMINAL_ACTION)
-            .remove(HelperContract.KEY_PENDING_ERROR_MESSAGE)
-            .commit()
+        val action = preferences.getString(HelperContract.KEY_PENDING_TERMINAL_ACTION, null)
+        val errorMessage = preferences.getString(HelperContract.KEY_PENDING_ERROR_MESSAGE, null)
         if (action == HelperContract.ACTION_RETURN_TO_APP) {
             returnWhenFocused = true
             updateStatus("安装完成，正在返回 LinReads")
             scheduleReturnWhenFocused()
-        } else {
+        } else if (action == HelperContract.ACTION_INSTALL_FAILED) {
             updateStatus(errorMessage ?: "更新安装失败")
+            if (activityResumed && hasWindowFocus()) {
+                markPendingTerminalActionConsumed(preferences)
+            }
         }
     }
 
@@ -268,7 +299,17 @@ class InstallStatusReceiver : BroadcastReceiver() {
                     HelperContract.ACTION_RETURN_TO_APP,
                     errorMessage = null,
                 )
-                bringHelperTaskForward(context, preferences.getInt(HelperContract.KEY_TASK_ID, -1))
+                val taskId = preferences.getInt(HelperContract.KEY_TASK_ID, -1)
+                val hasRecoverableTask = hasRecoverableHelperTask(context, taskId)
+                if (shouldPostReturnNotification(
+                        terminalPending = true,
+                        pendingAction = HelperContract.ACTION_RETURN_TO_APP,
+                        hasRecoverableHelperTask = hasRecoverableTask,
+                    )
+                ) {
+                    postReturnNotification(context, preferences)
+                }
+                bringHelperTaskForward(context, taskId)
                 startHelperActivity(context, HelperContract.ACTION_RETURN_TO_APP)
             }
             CallbackAction.FAIL -> {
@@ -324,6 +365,36 @@ class InstallStatusReceiver : BroadcastReceiver() {
     }
 }
 
+class ReturnAckReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != HelperContract.ACTION_RETURN_ACK) return
+        val preferences = context.getSharedPreferences(HelperContract.PREFS_NAME, Context.MODE_PRIVATE)
+        val installedVersion = installedVersion(context, HelperContract.TARGET_PACKAGE)
+        val signerMatches = packageSignerDigests(context, context.packageName) != null &&
+            packageSignerDigests(context, context.packageName) ==
+            packageSignerDigests(context, HelperContract.TARGET_PACKAGE)
+        val consume = shouldConsumeReturnAck(
+            terminalPending = preferences.getBoolean(HelperContract.KEY_TERMINAL_PENDING, false),
+            pendingAction = preferences.getString(HelperContract.KEY_PENDING_TERMINAL_ACTION, null),
+            armedSessionId = preferences.getInt(HelperContract.KEY_SESSION_ID, -1),
+            armedExpectedVersion = preferences.getLong(HelperContract.KEY_EXPECTED_VERSION, -1L),
+            armedNonce = preferences.getString(HelperContract.KEY_NONCE, null),
+            ackSessionId = intent.getIntExtra(HelperContract.EXTRA_SESSION_ID, -1),
+            ackExpectedVersion = intent.getLongExtra(HelperContract.EXTRA_EXPECTED_VERSION, -1L),
+            ackNonce = intent.getStringExtra(HelperContract.EXTRA_NONCE),
+            targetSignerMatches = signerMatches,
+            installedVersion = installedVersion,
+        )
+        Log.i(HelperContract.TAG, "return ack consume=$consume")
+        if (!consume) return
+        val taskId = preferences.getInt(HelperContract.KEY_TASK_ID, -1)
+        markPendingTerminalActionConsumed(preferences)
+        context.getSystemService(NotificationManager::class.java)
+            .cancel(HelperContract.RETURN_NOTIFICATION_ID)
+        finishHelperTask(context, taskId)
+    }
+}
+
 internal object HelperContract {
     const val TAG = "LinReadsUpdaterHelper"
     val PROTOCOL_VERSION = BuildConfig.UPDATE_HELPER_PROTOCOL_VERSION
@@ -336,7 +407,9 @@ internal object HelperContract {
     const val ACTION_INSTALL_STATUS = "dev.readflow.updaterhelper.INSTALL_STATUS_V1"
     const val ACTION_CONFIRM_INSTALL = "dev.readflow.updaterhelper.CONFIRM_INSTALL_V1"
     const val ACTION_RETURN_TO_APP = "dev.readflow.updaterhelper.RETURN_TO_APP_V1"
+    const val ACTION_RETURN_ACK = "dev.readflow.updaterhelper.RETURN_ACK_V1"
     const val ACTION_INSTALL_FAILED = "dev.readflow.updaterhelper.INSTALL_FAILED_V1"
+    const val ACTION_TARGET_RETURN = "dev.readflow.updater.RETURN_FROM_HELPER_V1"
 
     const val EXTRA_PROTOCOL_VERSION = "protocol_version"
     const val EXTRA_SESSION_ID = "session_id"
@@ -359,7 +432,10 @@ internal object HelperContract {
     const val KEY_PENDING_TERMINAL_ACTION = "pending_terminal_action"
     const val KEY_PENDING_ERROR_MESSAGE = "pending_error_message"
     const val KEY_CONFIRMATION_DISPATCHED = "confirmation_dispatched"
+    const val KEY_RETURN_LAUNCH_ATTEMPTS = "return_launch_attempts"
     const val CALLBACK_TTL_MS = 30L * 60L * 1_000L
+    const val RETURN_NOTIFICATION_ID = 18042
+    const val RETURN_NOTIFICATION_CHANNEL_ID = "linreads_update_return"
 }
 
 private fun persistPendingTerminalAction(
@@ -370,12 +446,74 @@ private fun persistPendingTerminalAction(
     val editor = preferences.edit()
         .putBoolean(HelperContract.KEY_TERMINAL_PENDING, true)
         .putString(HelperContract.KEY_PENDING_TERMINAL_ACTION, action)
+        .putInt(HelperContract.KEY_RETURN_LAUNCH_ATTEMPTS, 0)
     if (errorMessage == null) {
         editor.remove(HelperContract.KEY_PENDING_ERROR_MESSAGE)
     } else {
         editor.putString(HelperContract.KEY_PENDING_ERROR_MESSAGE, errorMessage)
     }
     editor.commit()
+}
+
+private fun markPendingTerminalActionConsumed(
+    preferences: android.content.SharedPreferences,
+) {
+    preferences.edit()
+        .putBoolean(HelperContract.KEY_TERMINAL_CONSUMED, true)
+        .putBoolean(HelperContract.KEY_TERMINAL_PENDING, false)
+        .remove(HelperContract.KEY_PENDING_TERMINAL_ACTION)
+        .remove(HelperContract.KEY_PENDING_ERROR_MESSAGE)
+        .commit()
+}
+
+private fun returnIntent(preferences: android.content.SharedPreferences): Intent? {
+    val sessionId = preferences.getInt(HelperContract.KEY_SESSION_ID, -1)
+    val expectedVersion = preferences.getLong(HelperContract.KEY_EXPECTED_VERSION, -1L)
+    val nonce = preferences.getString(HelperContract.KEY_NONCE, null)
+    if (sessionId < 0 || expectedVersion <= 0L || nonce.isNullOrBlank()) return null
+    return Intent().setClassName(
+        HelperContract.TARGET_PACKAGE,
+        HelperContract.TARGET_ACTIVITY,
+    ).setAction(HelperContract.ACTION_TARGET_RETURN)
+        .putExtra(HelperContract.EXTRA_SESSION_ID, sessionId)
+        .putExtra(HelperContract.EXTRA_EXPECTED_VERSION, expectedVersion)
+        .putExtra(HelperContract.EXTRA_NONCE, nonce)
+        .addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP,
+        )
+}
+
+private fun postReturnNotification(
+    context: Context,
+    preferences: android.content.SharedPreferences,
+) {
+    val targetIntent = returnIntent(preferences) ?: return
+    val sessionId = preferences.getInt(HelperContract.KEY_SESSION_ID, -1)
+    val manager = context.getSystemService(NotificationManager::class.java)
+    manager.createNotificationChannel(
+        NotificationChannel(
+            HelperContract.RETURN_NOTIFICATION_CHANNEL_ID,
+            "LinReads 更新返回",
+            NotificationManager.IMPORTANCE_LOW,
+        ),
+    )
+    val contentIntent = PendingIntent.getActivity(
+        context,
+        sessionId,
+        targetIntent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+    val notification = Notification.Builder(context, HelperContract.RETURN_NOTIFICATION_CHANNEL_ID)
+        .setSmallIcon(android.R.drawable.stat_sys_download_done)
+        .setContentTitle("LinReads 已更新")
+        .setContentText("点按返回 LinReads")
+        .setContentIntent(contentIntent)
+        .setAutoCancel(true)
+        .build()
+    runCatching { manager.notify(HelperContract.RETURN_NOTIFICATION_ID, notification) }
+        .onFailure { error -> Log.w(HelperContract.TAG, "return notification unavailable", error) }
 }
 
 private fun startHelperActivity(context: Context, action: String, errorMessage: String? = null) {
@@ -401,6 +539,27 @@ private fun bringHelperTaskForward(context: Context, taskId: Int) {
     if (taskId < 0) return
     runCatching { context.getSystemService(ActivityManager::class.java).moveTaskToFront(taskId, 0) }
         .onFailure { error -> Log.e(HelperContract.TAG, "moveTaskToFront failed taskId=$taskId", error) }
+}
+
+private fun hasRecoverableHelperTask(context: Context, taskId: Int): Boolean {
+    if (taskId < 0) return false
+    return runCatching {
+        context.getSystemService(ActivityManager::class.java)
+            .appTasks
+            .any { it.taskInfo.taskId == taskId }
+    }.getOrDefault(false)
+}
+
+private fun finishHelperTask(context: Context, taskId: Int) {
+    if (taskId < 0) return
+    runCatching {
+        context.getSystemService(ActivityManager::class.java)
+            .appTasks
+            .firstOrNull { it.taskInfo.taskId == taskId }
+            ?.finishAndRemoveTask()
+    }.onFailure { error ->
+        Log.w(HelperContract.TAG, "helper task cleanup failed taskId=$taskId", error)
+    }
 }
 
 private fun installedVersion(context: Context, packageName: String): Long? = runCatching {

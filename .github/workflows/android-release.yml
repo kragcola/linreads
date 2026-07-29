@@ -3,6 +3,10 @@ name: Android Dev Release
 on:
   push:
     branches: [main]
+    paths:
+      - "android/**"
+      - ".github/workflows/android-release.yml"
+  workflow_dispatch:
 
 concurrency:
   group: android-dev-release-${{ github.ref }}
@@ -33,15 +37,31 @@ jobs:
           set -euo pipefail
 
           version_code=$((BUILD_VERSION_BASE + GITHUB_RUN_NUMBER))
-          previous_body="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/dev-latest" \
-              --jq '.body // ""' 2>/dev/null || true
-          )"
+          release_json="$(mktemp)"
+          release_error="$(mktemp)"
+          release_exists=true
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/tags/dev-latest" \
+            >"$release_json" 2>"$release_error"; then
+            if grep -q '(HTTP 404)' "$release_error"; then
+              release_exists=false
+            else
+              cat "$release_error" >&2
+              exit 1
+            fi
+          fi
+          previous_body=""
+          if [[ "$release_exists" == true ]]; then
+            previous_body="$(jq -r '.body // ""' "$release_json")"
+          fi
           previous_code="$(
             printf '%s\n' "$previous_body" \
               | sed -nE 's/^VERSION_CODE:[[:space:]]*([0-9]+)[[:space:]]*$/\1/p' \
               | tail -n 1
           )"
+          if [[ "$release_exists" == true && -z "$previous_code" ]]; then
+            echo "Existing dev-latest release has no valid VERSION_CODE" >&2
+            exit 1
+          fi
           if [[ -n "$previous_code" ]] && (( previous_code >= version_code )); then
             version_code=$((previous_code + 1))
           fi
@@ -138,10 +158,28 @@ jobs:
               --prerelease
           fi
 
-          # Versioned assets are uploaded and downloaded first. The release metadata still points
-          # at the previous build until both stable assets have also been verified.
-          gh release upload dev-latest "$app_versioned" "$helper_versioned" \
-            --repo "$GITHUB_REPOSITORY" --clobber
+          # Versioned assets are authoritative and immutable. A rerun may reuse an existing pair
+          # only when both remote files are byte-identical to this build.
+          asset_names="$(
+            gh release view dev-latest --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name'
+          )"
+          app_exists=false
+          helper_exists=false
+          if grep -Fxq "app-ota-${version_code}.apk" <<<"$asset_names"; then
+            app_exists=true
+          fi
+          if grep -Fxq "updater-helper-ota-${version_code}.apk" <<<"$asset_names"; then
+            helper_exists=true
+          fi
+          if [[ "$app_exists" != "$helper_exists" ]]; then
+            echo "Incomplete versioned OTA asset pair for version $version_code" >&2
+            exit 1
+          fi
+          if [[ "$app_exists" == false ]]; then
+            gh release upload dev-latest "$app_versioned" "$helper_versioned" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
           gh release download dev-latest \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "app-ota-${version_code}.apk" \
@@ -149,18 +187,6 @@ jobs:
             --dir "$verify_dir"
           cmp "$app_apk" "$verify_dir/app-ota-${version_code}.apk"
           cmp "$helper_apk" "$verify_dir/updater-helper-ota-${version_code}.apk"
-
-          gh release upload dev-latest "$app_apk" "$helper_apk" \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          rm -rf "$verify_dir"
-          verify_dir="$(mktemp -d)"
-          gh release download dev-latest \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "app-ota.apk" \
-            --pattern "updater-helper-ota.apk" \
-            --dir "$verify_dir"
-          cmp "$app_apk" "$verify_dir/app-ota.apk"
-          cmp "$helper_apk" "$verify_dir/updater-helper-ota.apk"
 
           notes_file="$stage_dir/release-notes.txt"
           {
@@ -182,3 +208,10 @@ jobs:
             --title "Dev build #${version_code}" \
             --notes-file "$notes_file" \
             --prerelease
+
+          # Current clients resolve the verified versioned asset from VERSION_CODE. Keep fixed
+          # names only as best-effort aliases for legacy clients; they are not release authority.
+          if ! gh release upload dev-latest "$app_apk" "$helper_apk" \
+            --repo "$GITHUB_REPOSITORY" --clobber; then
+            echo "::warning::Legacy fixed-name OTA aliases were not refreshed"
+          fi

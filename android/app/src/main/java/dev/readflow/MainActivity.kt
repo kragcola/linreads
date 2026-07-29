@@ -40,6 +40,29 @@ class MainActivity : ComponentActivity() {
         updateIncomingBook(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        acknowledgeHelperReturn(intent)
+    }
+
+    private fun acknowledgeHelperReturn(intent: Intent) {
+        val request = helperReturnRequest(
+            action = intent.action,
+            sessionId = intent.getIntExtra(EXTRA_HELPER_RETURN_SESSION_ID, -1),
+            expectedVersion = intent.getLongExtra(EXTRA_HELPER_RETURN_EXPECTED_VERSION, -1L),
+            nonce = intent.getStringExtra(EXTRA_HELPER_RETURN_NONCE),
+        ) ?: return
+        sendBroadcast(
+            Intent().setClassName(
+                UPDATE_HELPER_PACKAGE_NAME,
+                UPDATE_HELPER_ACK_RECEIVER,
+            ).setAction(ACTION_HELPER_RETURN_ACK)
+                .putExtra(EXTRA_HELPER_RETURN_SESSION_ID, request.sessionId)
+                .putExtra(EXTRA_HELPER_RETURN_EXPECTED_VERSION, request.expectedVersion)
+                .putExtra(EXTRA_HELPER_RETURN_NONCE, request.nonce),
+        )
+    }
+
     private fun updateIncomingBook(intent: Intent) {
         incomingBookUri = intent.extractIncomingBookUri()
         incomingBookMimeType = if (incomingBookUri != null) intent.type else null
