@@ -6360,6 +6360,55 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `rapid turn consumes an already cached current and target pair without recapture`() {
+        EpubPageShotCaptureProbe.reset()
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > fixture.headingPageIndex + 1)
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+
+            val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            val cachedTarget = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+            val capturesAfterWarm = EpubPageShotCaptureProbe.total()
+            val targetWindow = (view.privateField("paged") as List<EpubFlowPage>)[fixture.imagePageIndex]
+
+            view.setPrivateField("rapidTurnSequenceActive", true)
+            val started = view.javaClass.getDeclaredMethod(
+                "goToPageAnimated",
+                EpubFlowPage::class.java,
+                Boolean::class.javaPrimitiveType,
+            ).apply { isAccessible = true }
+                .invoke(view, targetWindow, true) as Boolean
+
+            assertTrue("rapid turn should start from the warm pair", started)
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            assertSame(
+                "rapid current page must transfer the cached front owner",
+                cachedFront,
+                slide.privateBitmap("frontBitmap"),
+            )
+            assertSame(
+                "rapid target page must transfer the cached revealed owner",
+                cachedTarget,
+                slide.privateBitmap("revealedBitmap"),
+            )
+            assertEquals(
+                "an already valid rapid pair must not allocate another page shot",
+                capturesAfterWarm,
+                EpubPageShotCaptureProbe.total(),
+            )
+        } finally {
+            view.dispose()
+            EpubPageShotCaptureProbe.stop()
+        }
+    }
+
+    @Test
     fun `direct page texture precache waits for the rapid idle window`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)

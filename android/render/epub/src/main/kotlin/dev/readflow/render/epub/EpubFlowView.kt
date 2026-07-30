@@ -1518,6 +1518,53 @@ internal class EpubFlowView(
         return front
     }
 
+    /**
+     * Rapid turns may consume a complete idle cache pair without allocating a replacement shot.
+     * Keep a partial pair intact so the rapid follow-up or boundary-front path can still use it.
+     */
+    private fun takeCachedTexturesForRapidTurn(
+        fromPage: Int,
+        fromTop: Int,
+        fromWindow: EpubFlowPage?,
+        targetPage: Int,
+        targetTop: Int,
+        targetWindow: EpubFlowPage,
+    ): Pair<Bitmap, Bitmap>? {
+        val fromKey = pageTextureKey(fromTop, fromWindow)
+        val targetKey = pageTextureKey(targetTop, targetWindow)
+        val front = cachedFrontBitmap?.takeUnless(Bitmap::isRecycled)
+        val revealed = when {
+            targetPage == cachedTargetPage && targetTop == cachedTargetTopPx ->
+                cachedRevealedBitmap?.takeUnless(Bitmap::isRecycled)
+            targetPage == cachedBackwardPage && targetTop == cachedBackwardTopPx ->
+                cachedBackwardBitmap?.takeUnless(Bitmap::isRecycled)
+            else -> null
+        }
+        val matches =
+            front != null &&
+                revealed != null &&
+                fromPage == cachedFromPage &&
+                fromTop == cachedFromTopPx &&
+                (cachedFromTextureKey == null || cachedFromTextureKey == fromKey) &&
+                (
+                    (targetPage == cachedTargetPage &&
+                        targetTop == cachedTargetTopPx &&
+                        (cachedTargetTextureKey == null || cachedTargetTextureKey == targetKey)) ||
+                        (targetPage == cachedBackwardPage &&
+                            targetTop == cachedBackwardTopPx &&
+                            (cachedBackwardTextureKey == null || cachedBackwardTextureKey == targetKey))
+                    )
+        if (!matches) return null
+        return takeCachedTexturesForTurn(
+            fromPage = fromPage,
+            fromTop = fromTop,
+            fromWindow = fromWindow,
+            targetPage = targetPage,
+            targetTop = targetTop,
+            targetWindow = targetWindow,
+        )
+    }
+
     // ---- Finger-tracking (跟手) software page turn ---------------------------------------------
     // Horizontal and side-column vertical drags drive software turn progress directly from finger
     // displacement. Release settles by position+axis velocity; SIMULATION uses PageCurlDrawable while
@@ -3729,7 +3776,19 @@ internal class EpubFlowView(
         val targetTop = targetWindow.topPx
         val fromTop = origin.topPx
         val rapidTurn = rapidTurnSequenceActive
-        val prefetchedTarget = if (frozenOutgoing == null && rapidTurn) {
+        val rapidCached = if (frozenOutgoing == null && rapidTurn) {
+            takeCachedTexturesForRapidTurn(
+                fromPage = origin.pageProjection,
+                fromTop = fromTop,
+                fromWindow = origin.window,
+                targetPage = targetPage,
+                targetTop = targetTop,
+                targetWindow = targetWindow,
+            )
+        } else {
+            null
+        }
+        val prefetchedTarget = if (frozenOutgoing == null && rapidTurn && rapidCached == null) {
             takeRapidFollowUpPageShot(targetPage, targetWindow, forward)
         } else {
             null
@@ -3746,21 +3805,22 @@ internal class EpubFlowView(
         } else {
             null
         }
-        val rapidOutgoing = if (frozenOutgoing == null && rapidTurn) {
+        val rapidOutgoing = if (frozenOutgoing == null && rapidTurn && rapidCached == null) {
             takeCachedFrontForBoundaryTurn(origin.pageProjection, fromTop, origin.window)
         } else {
             null
         }
         if (rapidTurn && frozenOutgoing != null) recycleCachedTextures()
-        val outgoing = frozenOutgoing ?: rapidOutgoing ?: cached?.first ?: snapshotViewport(
+        val outgoing = frozenOutgoing ?: rapidCached?.first ?: rapidOutgoing ?: cached?.first ?: snapshotViewport(
             PageShotLeaseKind.PINNED,
             "active.front",
         ) ?: run {
             prefetchedTarget?.let(::recyclePageShot)
+            rapidCached?.second?.let(::recyclePageShot)
             cached?.second?.let(::recyclePageShot)
             return false
         }
-        val revealed = prefetchedTarget ?: cached?.second ?: snapshotPageAt(
+        val revealed = rapidCached?.second ?: prefetchedTarget ?: cached?.second ?: snapshotPageAt(
             targetTop,
             targetWindow,
             PageShotLeaseKind.PINNED,
