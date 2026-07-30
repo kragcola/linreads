@@ -193,6 +193,26 @@ class InstallStatusDecisionTest {
     }
 
     @Test
+    fun `terminal callback remains valid after confirmation even when handshake ttl expired`() {
+        assertEquals(
+            CallbackAction.OPEN_LINREADS,
+            action(
+                status = PackageInstaller.STATUS_SUCCESS,
+                confirmationDispatched = true,
+                nowEpochMs = 2_001L,
+            ),
+        )
+        assertEquals(
+            CallbackAction.FAIL,
+            action(
+                status = PackageInstaller.STATUS_FAILURE_INVALID,
+                confirmationDispatched = true,
+                nowEpochMs = 2_001L,
+            ),
+        )
+    }
+
+    @Test
     fun `terminal installer failure is reported for a valid callback`() {
         assertEquals(
             CallbackAction.FAIL,

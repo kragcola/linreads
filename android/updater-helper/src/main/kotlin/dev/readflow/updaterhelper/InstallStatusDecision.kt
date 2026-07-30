@@ -103,7 +103,7 @@ internal fun callbackAction(
         armedSessionId < 0 ||
         armedNonce.isNullOrBlank() ||
         armedExpectedVersion <= 0L ||
-        armedExpiresAtEpochMs < nowEpochMs ||
+        (armedExpiresAtEpochMs < nowEpochMs && !confirmationDispatched) ||
         callbackSessionId != armedSessionId ||
         callbackNonce != armedNonce
     ) {
