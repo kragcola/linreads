@@ -902,7 +902,10 @@ class MarkdownEngine(
         pageWindows = windows
         _pageCount.value = pageWindows.size.coerceAtLeast(1)
         if (requestPageForAnchor) {
-            val pageIndex = pageIndexForLocator(_currentLocator.value)
+            val anchor = normalizeToSourceSection(_currentLocator.value)
+            publishLocator(anchor)
+            val renderedOffset = document.renderedOffsetFor(anchor, ensureCachedRendered())
+            val pageIndex = pageIndexForRenderedOffset(pageWindows, renderedOffset)
             pageRequestCallback?.invoke(pageIndex)
         }
         return true

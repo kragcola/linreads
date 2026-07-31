@@ -4941,6 +4941,28 @@ internal class EpubFlowView(
         val deferColdShots = latestX != null && latestY != null
         val targetTop = targetWindow.topPx
         val targetPage = canonicalFloorPageIndexForTopPx(targetTop)
+        val requiredWarmSlotNeedsPixelRefresh =
+            CachedPageShotSlot.FRONT in pendingInPlacePageShotRefreshSlots ||
+                when {
+                    targetPage == cachedTargetPage && targetTop == cachedTargetTopPx ->
+                        CachedPageShotSlot.REVEALED in pendingInPlacePageShotRefreshSlots
+                    targetPage == cachedBackwardPage && targetTop == cachedBackwardTopPx ->
+                        CachedPageShotSlot.BACKWARD in pendingInPlacePageShotRefreshSlots
+                    else -> false
+                }
+        if (deferColdShots && requiredWarmSlotNeedsPixelRefresh) {
+            cancelInPlacePageShotRefreshCallbacks()
+            return beginPendingLocalPageShotHandoff(
+                origin = origin,
+                targetWindow = targetWindow,
+                targetPage = targetPage,
+                forward = forward,
+                axis = axis,
+                anchor = anchor,
+                latestX = latestX,
+                latestY = latestY,
+            )
+        }
         if (deferColdShots && conversionSnapshotDrawable != null) {
             return beginPendingLocalPageShotHandoff(
                 origin = origin,
