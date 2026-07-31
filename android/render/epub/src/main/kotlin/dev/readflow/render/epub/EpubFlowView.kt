@@ -910,18 +910,6 @@ internal class EpubFlowView(
             asyncImagePixelRefreshOffsets.isNotEmpty() ||
             asyncImagePixelTextRebindPending
 
-    /**
-     * True while a rapid burst's deferred settle refresh (PIXELS_ONLY offsets, whole-TextView
-     * rebind, staged in-place page-shot redraws) has not fully drained yet. A gesture that starts
-     * inside this window is treated as part of the rapid coalescing sequence so the heavyweight
-     * refresh stays deferred instead of co-locating with the next interaction tail.
-     */
-    private fun deferredRapidSettleRefreshPending(): Boolean =
-        inPlacePageShotRefreshPosted ||
-            pendingInPlacePageShotRefreshSlots.isNotEmpty() ||
-            asyncImagePixelTextRebindPending ||
-            asyncImagePixelRefreshOffsets.isNotEmpty()
-
     private fun preCachePageTextures() {
         preCachePageTextures(allowRapidBootstrap = false)
     }
@@ -5916,11 +5904,7 @@ internal class EpubFlowView(
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             cancelPendingLocalPageShotHandoff(consumeGesture = false)
             flingStopGesture = stopFreeFlingForTouch()
-            // A DOWN inside the rapid coalescing window OR while the burst's deferred settle
-            // refresh is still draining owns the same rapid idle tail. Its release enqueues into
-            // the rapid sequence, and the heavy settle stays deferred until it resolves.
-            rapidIdlePageTurnGesture =
-                rapidTurnSequenceActive || deferredRapidSettleRefreshPending()
+            rapidIdlePageTurnGesture = rapidTurnSequenceActive
             pendingCleanTapX = null
             setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, false)
             textView.setTag(RenderApiR.id.selection_aware_interactive_tap_consumed, false)

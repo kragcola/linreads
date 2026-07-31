@@ -325,10 +325,10 @@ class TxtVirtualPagerEngine(
         val snapshot = paginationSnapshot(requestedViewportWidthPx, requestedViewportHeightPx) ?: return null
         val windows = withContext(paginationDispatcher) {
             paginationMutex.withLock {
-                if (snapshot.generation != paginationGeneration.get()) return@withLock null
+                if (snapshot.generation != paginationGeneration.get()) return@withLock emptyList()
                 buildPagedPageWindows(snapshot)
             }
-        } ?: return null
+        }
         return TxtPaginationResult(snapshot, windows)
     }
 
