@@ -2,6 +2,7 @@ package dev.readflow.render.pdf
 
 import android.content.Context
 import android.graphics.Canvas
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
@@ -49,24 +50,46 @@ internal class PdfSearchPageHost(
     /** Optional: engine-driven same-page framework selection. */
     var selectionListener: PdfPageSelectionListener? = null
 
+    /** Optional: request an adjacent fixed page after a zoom-pan crosses a horizontal edge. */
+    var boundaryPageTurnListener: ((pageDelta: Int) -> Unit)? = null
+
     private var selecting = false
     private var selectionStartPagePt: Pair<Float, Float>? = null
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
     private var downX = 0f
     private var downY = 0f
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+    private var panning = false
+    private var boundaryDragX = 0f
+    private var appliedZoomScale = 1f
+    private var pendingZoomFocus: PdfPanOffset? = null
+    private val panState = PdfPanState()
 
     private val scaleDetector = ScaleGestureDetector(
         context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                // Accept the scale stream so isInProgress becomes true; release parent
-                // intercept so RecyclerView / outer pinch-zoom can continue. Returning
-                // false left isInProgress false and could strand selection intercept.
+                // ReaderTapContainer observes the same stream and owns the zoom value. This host
+                // keeps the focal point and blocks ViewPager interception while the pinch is live.
                 selecting = false
+                panning = false
+                boundaryDragX = 0f
                 selectionStartPagePt = null
-                parent?.requestDisallowInterceptTouchEvent(false)
+                pendingZoomFocus = PdfPanOffset(detector.focusX, detector.focusY)
+                parent?.requestDisallowInterceptTouchEvent(true)
                 selectionListener?.onSelectionCancelled(tag as? Int ?: -1)
                 return true
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                pendingZoomFocus = PdfPanOffset(detector.focusX, detector.focusY)
+                return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                pendingZoomFocus = null
+                parent?.requestDisallowInterceptTouchEvent(hasPanRange())
             }
         },
     )
@@ -81,6 +104,7 @@ internal class PdfSearchPageHost(
                 val pagePt = viewToPagePoint(e.x, e.y) ?: return
                 selecting = true
                 selectionStartPagePt = pagePt
+                setTag(dev.readflow.render.api.R.id.selection_aware_interactive_tap_consumed, true)
                 parent?.requestDisallowInterceptTouchEvent(true)
                 selectionListener?.onSelectionGesture(
                     pageIndex = tag as? Int ?: return,
@@ -146,12 +170,49 @@ internal class PdfSearchPageHost(
         selectionOverlay.invalidate()
     }
 
+    fun setZoomScale(scale: Float) {
+        val nextScale = scale.takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
+        val previousScale = appliedZoomScale
+        appliedZoomScale = nextScale
+        if (nextScale <= 1f) {
+            panState.reset()
+        } else {
+            val geometry = fittedPageGeometry()
+            if (geometry != null) {
+                val bounds = geometry.panBounds(nextScale)
+                val focus = pendingZoomFocus
+                if (focus != null && previousScale != nextScale) {
+                    panState.set(
+                        pdfPanOffsetKeepingFocus(
+                            offset = panState.offset,
+                            previousZoomScale = previousScale,
+                            zoomScale = nextScale,
+                            focusX = focus.x,
+                            focusY = focus.y,
+                            contentCenterX = geometry.contentCenterX,
+                            contentCenterY = geometry.contentCenterY,
+                        ),
+                        bounds,
+                    )
+                } else {
+                    panState.reclamp(bounds)
+                }
+            }
+        }
+        applyPdfTransform()
+    }
+
+    /** Recompute fit + pan after layout changes such as device rotation. */
+    fun reapplyPdfTransform() {
+        applyPdfTransform()
+    }
+
     /** Test / engine helper: expose whether a selection drag is in progress. */
     fun isSelectionGestureActive(): Boolean = selecting
 
     override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
-        scaleDetector.onTouchEvent(ev)
-        // Idle scroll / pinch: never intercept. Selection drag only after long-press.
+        // Children are paint-only. The host receives their unhandled stream; it only takes over
+        // interception after long-press selection has started.
         return PdfSelectionGestureLifecycle.hostInterceptsForSelection(
             selecting = selecting,
             scaleInProgress = scaleDetector.isInProgress,
@@ -159,13 +220,16 @@ internal class PdfSearchPageHost(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN && event.pointerCount > 1) {
+            boundaryDragX = 0f
+            parent?.requestDisallowInterceptTouchEvent(true)
+        }
         scaleDetector.onTouchEvent(event)
         if (scaleDetector.isInProgress) {
             selecting = false
+            panning = false
             selectionStartPagePt = null
-            parent?.requestDisallowInterceptTouchEvent(false)
-            // Do not consume — parent RecyclerView / zoom pipeline owns multi-touch.
-            return false
+            return true
         }
         gestureDetector.onTouchEvent(event)
 
@@ -173,6 +237,13 @@ internal class PdfSearchPageHost(
             MotionEvent.ACTION_DOWN -> {
                 downX = event.x
                 downY = event.y
+                lastTouchX = event.x
+                lastTouchY = event.y
+                panning = false
+                boundaryDragX = 0f
+                if (hasPanRange()) {
+                    parent?.requestDisallowInterceptTouchEvent(true)
+                }
             }
             MotionEvent.ACTION_MOVE -> {
                 if (selecting) {
@@ -186,13 +257,53 @@ internal class PdfSearchPageHost(
                     )
                     return true
                 }
+                val deltaX = event.x - lastTouchX
+                val deltaY = event.y - lastTouchY
+                lastTouchX = event.x
+                lastTouchY = event.y
+                if (!panning) {
+                    val totalX = event.x - downX
+                    val totalY = event.y - downY
+                    if (totalX * totalX + totalY * totalY > touchSlop * touchSlop) {
+                        panning = canConsumePan(deltaX, deltaY)
+                        if (!panning) {
+                            recordBoundaryDrag(deltaX, deltaY, unconsumedX = deltaX)
+                            parent?.requestDisallowInterceptTouchEvent(false)
+                            return true
+                        }
+                    }
+                }
+                if (panning) {
+                    if (deltaX == 0f && deltaY == 0f) return true
+                    if (!canConsumePan(deltaX, deltaY)) {
+                        recordBoundaryDrag(deltaX, deltaY, unconsumedX = deltaX)
+                        parent?.requestDisallowInterceptTouchEvent(false)
+                        panning = false
+                        return true
+                    }
+                    // ViewGroup cannot replay this MOVE after intercept is re-enabled. Preserve only
+                    // the clamped horizontal remainder so ACTION_UP can request the adjacent page.
+                    val previousPanX = panState.offset.x
+                    panBy(deltaX, deltaY)
+                    recordBoundaryDrag(
+                        deltaX = deltaX,
+                        deltaY = deltaY,
+                        unconsumedX = deltaX - (panState.offset.x - previousPanX),
+                    )
+                    if (!canConsumePan(deltaX, deltaY)) {
+                        parent?.requestDisallowInterceptTouchEvent(false)
+                    }
+                    return true
+                }
             }
+            MotionEvent.ACTION_POINTER_UP -> resetTouchAnchorAfterPointerUp(event)
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (selecting) {
                     val start = selectionStartPagePt
                     val stop = viewToPagePoint(event.x, event.y)
                     selecting = false
                     selectionStartPagePt = null
+                    boundaryDragX = 0f
                     parent?.requestDisallowInterceptTouchEvent(false)
                     if (event.actionMasked == MotionEvent.ACTION_UP && start != null && stop != null) {
                         selectionListener?.onSelectionGesture(
@@ -209,16 +320,26 @@ internal class PdfSearchPageHost(
                 // Small movement without selection: allow click/scroll propagation
                 val dx = event.x - downX
                 val dy = event.y - downY
-                if (dx * dx + dy * dy < touchSlop * touchSlop) {
+                val pageTurnDelta = if (event.actionMasked == MotionEvent.ACTION_UP) {
+                    takeBoundaryPageTurnDelta()
+                } else {
+                    boundaryDragX = 0f
+                    0
+                }
+                if (!panning && dx * dx + dy * dy < touchSlop * touchSlop) {
                     performClick()
+                }
+                panning = false
+                pendingZoomFocus = null
+                parent?.requestDisallowInterceptTouchEvent(false)
+                if (pageTurnDelta != 0) {
+                    boundaryPageTurnListener?.invoke(pageTurnDelta)
                 }
             }
         }
-        // When not selecting, return false so parent RecyclerView receives scroll.
-        return PdfSelectionGestureLifecycle.hostInterceptsForSelection(
-            selecting = selecting,
-            scaleInProgress = false,
-        ) || super.onTouchEvent(event)
+        // Consume DOWN so long-press and a future zoom-pan keep one coherent stream. ViewPager can
+        // still intercept fit-scale swipes because the host does not disallow them.
+        return true
     }
 
     override fun performClick(): Boolean = super.performClick()
@@ -262,6 +383,136 @@ internal class PdfSearchPageHost(
         // Here we return bitmap-local coordinates; the engine converts to page points.
         return bitmapX to bitmapY
     }
+
+    private fun applyPdfTransform() {
+        if (appliedZoomScale <= 1f) {
+            panState.reset()
+            imageView.scaleType = ImageView.ScaleType.FIT_CENTER
+            imageView.imageMatrix = Matrix()
+            rebindHighlightPaint()
+            return
+        }
+        val geometry = fittedPageGeometry() ?: return
+        val pan = panState.reclamp(geometry.panBounds(appliedZoomScale))
+        val drawScale = geometry.fitScale * appliedZoomScale
+        val left = geometry.contentLeft +
+            (geometry.contentWidth - geometry.fittedPageWidth * appliedZoomScale) / 2f + pan.x
+        val top = geometry.contentTop +
+            (geometry.contentHeight - geometry.fittedPageHeight * appliedZoomScale) / 2f + pan.y
+        imageView.scaleType = ImageView.ScaleType.MATRIX
+        imageView.imageMatrix = Matrix().apply {
+            setValues(
+                floatArrayOf(
+                    drawScale, 0f, left,
+                    0f, drawScale, top,
+                    0f, 0f, 1f,
+                ),
+            )
+        }
+        // Paint and hit testing both consume imageView.imageMatrix, so pan cannot drift from text.
+        rebindHighlightPaint()
+    }
+
+    private fun panBy(deltaX: Float, deltaY: Float) {
+        val geometry = fittedPageGeometry() ?: return
+        panState.panBy(deltaX, deltaY, geometry.panBounds(appliedZoomScale))
+        applyPdfTransform()
+    }
+
+    private fun hasPanRange(): Boolean {
+        val bounds = currentPanBounds() ?: return false
+        return bounds.maxX > 0f || bounds.maxY > 0f
+    }
+
+    private fun canConsumePan(deltaX: Float, deltaY: Float): Boolean {
+        val bounds = currentPanBounds() ?: return false
+        return if (kotlin.math.abs(deltaX) >= kotlin.math.abs(deltaY)) {
+            bounds.canPanHorizontally(panState.offset, deltaX.direction())
+        } else {
+            bounds.canPanVertically(panState.offset, deltaY.direction())
+        }
+    }
+
+    private fun recordBoundaryDrag(deltaX: Float, deltaY: Float, unconsumedX: Float) {
+        if (appliedZoomScale <= 1f || !hasPanRange()) return
+        if (kotlin.math.abs(deltaX) < kotlin.math.abs(deltaY)) return
+        if (boundaryDragX != 0f && boundaryDragX * deltaX < 0f) {
+            boundaryDragX = 0f
+        }
+        if (!unconsumedX.isFinite() || unconsumedX == 0f) return
+        if (boundaryDragX != 0f && boundaryDragX * unconsumedX < 0f) {
+            boundaryDragX = 0f
+        }
+        boundaryDragX += unconsumedX
+    }
+
+    private fun takeBoundaryPageTurnDelta(): Int {
+        val dragX = boundaryDragX
+        boundaryDragX = 0f
+        if (!dragX.isFinite() || kotlin.math.abs(dragX) < touchSlop.toFloat()) return 0
+        return if (dragX > 0f) -1 else 1
+    }
+
+    private fun currentPanBounds(): PdfPanBounds? =
+        fittedPageGeometry()?.panBounds(appliedZoomScale)
+
+    private fun fittedPageGeometry(): FittedPageGeometry? {
+        val drawable = imageView.drawable ?: return null
+        val drawableWidth = drawable.intrinsicWidth
+        val drawableHeight = drawable.intrinsicHeight
+        val contentWidth = (imageView.width - imageView.paddingLeft - imageView.paddingRight).toFloat()
+        val contentHeight = (imageView.height - imageView.paddingTop - imageView.paddingBottom).toFloat()
+        if (drawableWidth <= 0 || drawableHeight <= 0 || contentWidth <= 0f || contentHeight <= 0f) {
+            return null
+        }
+        val fitScale = minOf(contentWidth / drawableWidth, contentHeight / drawableHeight)
+        return FittedPageGeometry(
+            contentLeft = imageView.paddingLeft.toFloat(),
+            contentTop = imageView.paddingTop.toFloat(),
+            contentWidth = contentWidth,
+            contentHeight = contentHeight,
+            fittedPageWidth = drawableWidth * fitScale,
+            fittedPageHeight = drawableHeight * fitScale,
+            fitScale = fitScale,
+        )
+    }
+
+    private fun resetTouchAnchorAfterPointerUp(event: MotionEvent) {
+        if (event.pointerCount <= 1) return
+        val remainingIndex = if (event.actionIndex == 0) 1 else 0
+        downX = event.getX(remainingIndex)
+        downY = event.getY(remainingIndex)
+        lastTouchX = downX
+        lastTouchY = downY
+        panning = false
+    }
+
+    private data class FittedPageGeometry(
+        val contentLeft: Float,
+        val contentTop: Float,
+        val contentWidth: Float,
+        val contentHeight: Float,
+        val fittedPageWidth: Float,
+        val fittedPageHeight: Float,
+        val fitScale: Float,
+    ) {
+        val contentCenterX: Float get() = contentLeft + contentWidth / 2f
+        val contentCenterY: Float get() = contentTop + contentHeight / 2f
+
+        fun panBounds(zoomScale: Float): PdfPanBounds = pdfPanBounds(
+            contentWidth = contentWidth,
+            contentHeight = contentHeight,
+            fittedPageWidth = fittedPageWidth,
+            fittedPageHeight = fittedPageHeight,
+            zoomScale = zoomScale,
+        )
+    }
+}
+
+private fun Float.direction(): Int = when {
+    this > 0f -> 1
+    this < 0f -> -1
+    else -> 0
 }
 
 /**

@@ -1445,7 +1445,13 @@ class EpubReflowEngine private constructor(
                 loader.hasRelevantPendingDecodes(pendingDecodeRangesProvider())
         }
         view.imagePixelsStableProvider = { layoutStarts ->
-            loader.hasStablePixels(layoutStarts)
+            // While a rapid motion window owns the frames, the exact-page gate accepts retained
+            // decoded pixels so a queued turn never hard-waits on a DISPLAY promotion crossfade.
+            // Quiet idle still requires completed DISPLAY promotion for the settled contract.
+            loader.hasStablePixels(
+                layoutStarts,
+                requireDisplayPromotion = !view.isRapidTurnPerformanceModeActive(),
+            )
         }
         lateinit var scheduleVisibleImages: () -> Unit
         scheduleVisibleImages = schedule@{

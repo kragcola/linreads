@@ -39,6 +39,9 @@
                 <data android:mimeType="text/x-markdown" />
                 <data android:mimeType="application/epub+zip" />
                 <data android:mimeType="application/pdf" />
+                <data android:mimeType="application/vnd.comicbook+zip" />
+                <data android:mimeType="application/x-cbz" />
+                <data android:mimeType="application/cbz" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
@@ -50,6 +53,9 @@
                 <data android:mimeType="text/x-markdown" />
                 <data android:mimeType="application/epub+zip" />
                 <data android:mimeType="application/pdf" />
+                <data android:mimeType="application/vnd.comicbook+zip" />
+                <data android:mimeType="application/x-cbz" />
+                <data android:mimeType="application/cbz" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
@@ -61,6 +67,9 @@
                 <data android:mimeType="text/x-markdown" />
                 <data android:mimeType="application/epub+zip" />
                 <data android:mimeType="application/pdf" />
+                <data android:mimeType="application/vnd.comicbook+zip" />
+                <data android:mimeType="application/x-cbz" />
+                <data android:mimeType="application/cbz" />
             </intent-filter>
         </activity>
         <receiver

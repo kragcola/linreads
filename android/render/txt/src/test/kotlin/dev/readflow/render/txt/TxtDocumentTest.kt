@@ -82,6 +82,21 @@ class TxtDocumentTest {
     }
 
     @Test
+    fun `batch read keeps requested cache hits while loading missing paragraphs`() {
+        val paragraphs = (0 until 192).map { index -> "paragraph-$index" }
+        val file = createTempFile(prefix = "readflow-batch-cache-", suffix = ".txt")
+        file.writeText(paragraphs.joinToString("\n\n"), charset = StandardCharsets.UTF_8)
+        val document = TxtDocument.index(file.toFile())
+        document.readParagraphs((0 until 128).toList())
+        val requested = (0 until 64).toList() + (128 until 192).toList()
+
+        val actual = document.readParagraphs(requested)
+
+        assertEquals(requested, actual.keys.toList())
+        assertEquals(requested.map(paragraphs::get), actual.values.toList())
+    }
+
+    @Test
     fun `splits long hard-wrapped txt ranges on line boundaries for scroll progress`() {
         val lines = (0 until 160).map { index ->
             "Readflow performance corpus line %06d: long hard-wrapped content".format(index)

@@ -122,6 +122,8 @@ import dev.readflow.render.api.EpubCssFontFamilyInfo
 import dev.readflow.render.api.EpubCssFontEffectiveSource
 import dev.readflow.render.api.EpubCssFontMappingStatus
 import dev.readflow.render.api.PagingKind
+import dev.readflow.render.api.DirectionalPagedReaderEngine
+import dev.readflow.render.api.PageReadingDirection
 import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.SelfPagingReaderEngine
@@ -510,6 +512,11 @@ fun ReaderScreen(
                         zoomableEngine?.zoomScale ?: MutableStateFlow(1f)
                     }
                     val zoomScale by zoomScaleFlow.collectAsState()
+                    val pageReadingDirectionFlow = remember(engine) {
+                        (engine as? DirectionalPagedReaderEngine)?.pageReadingDirection
+                            ?: MutableStateFlow(PageReadingDirection.LEFT_TO_RIGHT)
+                    }
+                    val pageReadingDirection by pageReadingDirectionFlow.collectAsState()
                     val readerFocusRequester = remember { FocusRequester() }
                     fun handleReaderAction(action: ReaderTapZone) {
                         viewModel.onIntent(ReaderIntent.DismissGuide)
@@ -521,7 +528,11 @@ fun ReaderScreen(
                     }
                     fun handleReaderKey(nativeEvent: KeyEvent): Boolean {
                         if (state.activePanel != null) return false
-                        val action = readerTapZoneForKey(nativeEvent.keyCode, nativeEvent.isShiftPressed) ?: return false
+                        val action = readerTapZoneForKey(
+                            keyCode = nativeEvent.keyCode,
+                            shiftPressed = nativeEvent.isShiftPressed,
+                            pageReadingDirection = pageReadingDirection,
+                        ) ?: return false
                         if (nativeEvent.action == KeyEvent.ACTION_UP) {
                             handleReaderAction(action)
                         }
@@ -569,7 +580,8 @@ fun ReaderScreen(
                                 view.currentZoomScale = zoomScale
                                 view.isZoomPinchEnabled = zoomableEngine != null
                                 view.isPagedTapZonesEnabled = pagingKind == PagingKind.PAGED
-                                view.isFontPinchEnabled = engine.format != BookFormat.PDF
+                                view.isFontPinchEnabled = ReaderFeature.FONT in availableFeatures
+                                view.pageReadingDirection = pageReadingDirection
                             },
                         )
                     }
@@ -2706,6 +2718,7 @@ private class ReaderTapContainer(
             refreshContentDescription()
         }
     var isPagedTapZonesEnabled = false
+    var pageReadingDirection: PageReadingDirection = PageReadingDirection.LEFT_TO_RIGHT
     var isFontPinchEnabled = true
         set(value) {
             field = value
@@ -2848,13 +2861,18 @@ private class ReaderTapContainer(
                 xRatio = ratio,
                 interactiveChildConsumedTap = interactiveTapConsumed,
                 pagedTapZonesEnabled = isPagedTapZonesEnabled,
+                pageReadingDirection = pageReadingDirection,
             )?.let(onAction)
         }
         return handled
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val action = readerTapZoneForKey(event.keyCode, event.isShiftPressed) ?: return super.dispatchKeyEvent(event)
+        val action = readerTapZoneForKey(
+            keyCode = event.keyCode,
+            shiftPressed = event.isShiftPressed,
+            pageReadingDirection = pageReadingDirection,
+        ) ?: return super.dispatchKeyEvent(event)
         if (event.action == KeyEvent.ACTION_UP) {
             onAction(action)
         }

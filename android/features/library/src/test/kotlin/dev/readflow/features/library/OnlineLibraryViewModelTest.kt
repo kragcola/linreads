@@ -31,9 +31,11 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -1072,6 +1074,36 @@ class OnlineLibraryViewModelTest {
     }
 
     @Test
+    fun onlineReadCachesBookAndOpensTheRealReaderAfterDownload() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val entry = entry("42", "Remote EPUB")
+        val downloaded = entry.meta.copy(
+            id = stableRemoteBookId("source-json", "42"),
+            downloadStatus = DownloadStatus.DOWNLOADED,
+            localUri = "file:///cache/remote-42.epub",
+        )
+        val store = FakeLibraryStore()
+        val catalog = FakeOnlineCatalog(
+            downloadHandler = { ReadflowResult.Success(downloaded) },
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(enabledSource("source-json", SourceAdapterIds.JSON_HTTP)),
+            catalogs = mapOf("source-json" to catalog),
+        )
+        val viewModel = viewModel(store = store, registry = registry)
+        advanceUntilIdle()
+        val openedBook = backgroundScope.async { viewModel.openBook.first() }
+        runCurrent()
+
+        viewModel.readOnlineEntry(entry)
+        advanceUntilIdle()
+
+        assertEquals(downloaded.id, openedBook.await())
+        assertEquals(listOf(downloaded), store.upsertedBooks)
+        assertTrue(viewModel.onlineLibraryState.value.downloadingKeys.isEmpty())
+    }
+
+    @Test
     fun metadataFacetsDeduplicatePerBookCountAndSortDeterministically() {
         val multiAuthorEntry = entry(
             "1",
@@ -1098,6 +1130,27 @@ class OnlineLibraryViewModelTest {
             facets.formats,
         )
         assertEquals(listOf(MetadataFacet("Classic", 2), MetadataFacet("New", 1)), facets.tags)
+    }
+
+    @Test
+    fun authorFacetsMergeCjkSpacingAndExplicitAmpersandCoauthors() {
+        val facets = buildOnlineMetadataFacets(
+            listOf(
+                entry("1", "One", author = "安里アサト", authors = listOf("安里アサト")),
+                entry("2", "Two", author = "安里 アサト", authors = listOf("安里 アサト")),
+                entry(
+                    "3",
+                    "Three",
+                    author = "安里アサト & しらび",
+                    authors = listOf("安里アサト & しらび"),
+                ),
+            ),
+        )
+
+        assertEquals(
+            listOf(MetadataFacet("安里アサト", 3), MetadataFacet("しらび", 1)),
+            facets.authors,
+        )
     }
 
     @Test
@@ -1186,6 +1239,121 @@ class OnlineLibraryViewModelTest {
 
         assertEquals(listOf(0, 100, 200), requestedOffsets)
         assertEquals(setOf(matching.selectionKey()), viewModel.onlineLibraryState.value.selectedEntryKeys)
+    }
+
+    @Test
+    fun sourceWideAuthorSelectionFollowsSparseNextOffsetsAndRejectsSearch() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val first = entry("1", "Book One", author = "Ann")
+        val second = entry("2", "Book Two", author = "Ann")
+        val third = entry("3", "Book Three", author = "Ann")
+        val fourth = entry("4", "Book Four", author = "Ann")
+        val requestedOffsets = mutableListOf<Int>()
+        val catalog = FakeOnlineCatalog(
+            failOnSearch = true,
+            searchPageResultHandler = { _, filter, offset, _ ->
+                requestedOffsets += offset
+                assertEquals("Ann", filter.author)
+                when (offset) {
+                    0 -> ReadflowResult.Success(
+                        OnlineCatalogPage(
+                            entries = listOf(first),
+                            nextOffset = 17,
+                            hasMore = true,
+                        ),
+                    )
+                    17 -> ReadflowResult.Success(
+                        OnlineCatalogPage(
+                            entries = listOf(second, third),
+                            nextOffset = 51,
+                            hasMore = true,
+                        ),
+                    )
+                    51 -> ReadflowResult.Success(
+                        OnlineCatalogPage(
+                            entries = listOf(fourth),
+                            nextOffset = 0,
+                            hasMore = false,
+                        ),
+                    )
+                    else -> ReadflowResult.Failure(ReadflowError.io("unexpected searchPage offset $offset"))
+                }
+            },
+        )
+        val source = enabledSource("source-json", SourceAdapterIds.JSON_HTTP).copy(
+            capabilities = SourceCapabilities(
+                canSearch = true,
+                canFilterByAuthor = true,
+                canDownload = true,
+                canBatchAcrossSource = true,
+            ),
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = mapOf("source-json" to catalog),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+        viewModel.selectOnlineSource("source-json")
+
+        viewModel.selectOnlineByAuthor("Ann")
+        advanceUntilIdle()
+
+        assertEquals(listOf(0, 17, 51), requestedOffsets)
+        assertEquals(
+            listOf("1", "2", "3", "4"),
+            viewModel.onlineLibraryState.value.results.map { it.meta.id },
+        )
+        assertEquals(
+            setOf(first.selectionKey(), second.selectionKey(), third.selectionKey(), fourth.selectionKey()),
+            viewModel.onlineLibraryState.value.selectedEntryKeys,
+        )
+        assertFalse(viewModel.onlineLibraryState.value.isSelectingBatch)
+        assertNull(viewModel.onlineLibraryState.value.error)
+    }
+
+    @Test
+    fun sourceWideSeriesSelectionStopsWhenDuplicateSparsePageMakesNoProgress() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val only = entry("1", "Saga One", author = "Ann", series = "Saga")
+        val requestedOffsets = mutableListOf<Int>()
+        val catalog = FakeOnlineCatalog(
+            failOnSearch = true,
+            searchPageResultHandler = { _, filter, offset, _ ->
+                requestedOffsets += offset
+                assertEquals("Saga", filter.series)
+                ReadflowResult.Success(
+                    OnlineCatalogPage(
+                        entries = listOf(only),
+                        nextOffset = 0,
+                        hasMore = true,
+                    ),
+                )
+            },
+        )
+        val source = enabledSource("source-json", SourceAdapterIds.JSON_HTTP).copy(
+            capabilities = SourceCapabilities(
+                canSearch = true,
+                canFilterBySeries = true,
+                canDownload = true,
+                canBatchAcrossSource = true,
+            ),
+        )
+        val registry = FakeSourceRegistry(
+            sources = listOf(source),
+            catalogs = mapOf("source-json" to catalog),
+        )
+        val viewModel = viewModel(registry = registry)
+        advanceUntilIdle()
+        viewModel.selectOnlineSource("source-json")
+
+        viewModel.selectOnlineBySeries("Saga")
+        advanceUntilIdle()
+
+        assertEquals(listOf(0, 0), requestedOffsets)
+        assertEquals(setOf(only.selectionKey()), viewModel.onlineLibraryState.value.selectedEntryKeys)
+        assertFalse(viewModel.onlineLibraryState.value.isSelectingBatch)
+        assertNull(viewModel.onlineLibraryState.value.error)
     }
 
     @Test
@@ -2447,6 +2615,12 @@ class OnlineLibraryViewModelTest {
             Int,
             Int,
         ) -> ReadflowResult<List<OnlineCatalogEntry>>)? = null,
+        private val searchPageResultHandler: (suspend (
+            String,
+            OnlineCatalogFilter,
+            Int,
+            Int,
+        ) -> ReadflowResult<OnlineCatalogPage>)? = null,
         private val browseHandler: (suspend (
             OnlineCatalogFilter,
             Int,
@@ -2463,6 +2637,7 @@ class OnlineLibraryViewModelTest {
         private val previewHandler: suspend (OnlineCatalogEntry) -> ReadflowResult<OnlineBookPreview> = {
             ReadflowResult.Success(OnlineBookPreview(it.meta.title, it.meta.author, null, "preview"))
         },
+        private val failOnSearch: Boolean = false,
     ) : OnlineBookCatalog {
         var closeCalls = 0
             private set
@@ -2481,7 +2656,23 @@ class OnlineLibraryViewModelTest {
             filter: OnlineCatalogFilter,
             offset: Int,
             limit: Int,
-        ) = searchPageHandler?.invoke(query, filter, offset, limit) ?: searchHandler(query, filter)
+        ): ReadflowResult<List<OnlineCatalogEntry>> =
+            if (failOnSearch) {
+                ReadflowResult.Failure(
+                    ReadflowError.unsupported("catalog.search() must not be used; use searchPage()/browsePage()"),
+                )
+            } else {
+                searchPageHandler?.invoke(query, filter, offset, limit) ?: searchHandler(query, filter)
+            }
+
+        override suspend fun searchPage(
+            query: String,
+            filter: OnlineCatalogFilter,
+            offset: Int,
+            limit: Int,
+        ): ReadflowResult<OnlineCatalogPage> =
+            searchPageResultHandler?.invoke(query, filter, offset, limit)
+                ?: super<OnlineBookCatalog>.searchPage(query, filter, offset, limit)
 
         override suspend fun browse(
             filter: OnlineCatalogFilter,

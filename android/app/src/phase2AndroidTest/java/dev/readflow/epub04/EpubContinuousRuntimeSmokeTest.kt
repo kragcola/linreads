@@ -33,6 +33,7 @@ import dev.readflow.core.database.BookEntity
 import dev.readflow.core.database.ReadflowDatabase
 import dev.readflow.core.database.ReadingProgressEntity
 import dev.readflow.core.prefs.DataStoreSettingsRepository
+import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.render.api.R as RenderApiR
 import dev.readflow.render.api.SelectionAwareTextView
@@ -67,6 +68,7 @@ class EpubContinuousRuntimeSmokeTest {
         settings.setFontSize(18)
         settings.setLineSpacing(1.75f)
         settings.setThemeMode(ThemeMode.LIGHT)
+        settings.setReadingMode(ReaderReadingMode.SCROLL)
         evidenceDir().mkdirs()
         device.pressHome()
         device.waitForIdle()

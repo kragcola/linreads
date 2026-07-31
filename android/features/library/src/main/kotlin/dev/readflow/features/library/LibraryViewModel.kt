@@ -36,6 +36,8 @@ import dev.readflow.extensions.api.SourceCredentials
 import dev.readflow.extensions.api.SourceAdapterIds
 import dev.readflow.extensions.api.SourceRegistry
 import dev.readflow.extensions.api.BUILTIN_CALIBRE_SOURCE_ID
+import dev.readflow.extensions.api.individualAuthors as catalogIndividualAuthors
+import dev.readflow.extensions.api.onlineAuthorIdentityKey
 import dev.readflow.extensions.api.stableRemoteBookId
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -118,7 +120,10 @@ data class OnlineMetadataFacets(
 
 internal fun buildOnlineMetadataFacets(entries: List<OnlineCatalogEntry>): OnlineMetadataFacets =
     OnlineMetadataFacets(
-        authors = buildMetadataFacet(entries.map(OnlineCatalogEntry::individualAuthors)),
+        authors = buildMetadataFacet(
+            entries.map(OnlineCatalogEntry::individualAuthors),
+            identityKey = ::onlineAuthorIdentityKey,
+        ),
         series = buildMetadataFacet(entries.map { listOfNotNull(it.series) }),
         formats = buildMetadataFacet(
             entries.map { entry ->
@@ -129,13 +134,12 @@ internal fun buildOnlineMetadataFacets(entries: List<OnlineCatalogEntry>): Onlin
     )
 
 internal fun OnlineCatalogEntry.individualAuthors(): List<String> =
-    authors
-        .map(String::trim)
-        .filter(String::isNotBlank)
-        .distinctBy { it.lowercase() }
-        .ifEmpty { listOf(meta.author.trim()).filter(String::isNotBlank) }
+    catalogIndividualAuthors()
 
-private fun buildMetadataFacet(valuesByBook: List<List<String>>): List<MetadataFacet> {
+private fun buildMetadataFacet(
+    valuesByBook: List<List<String>>,
+    identityKey: (String) -> String = { it.lowercase() },
+): List<MetadataFacet> {
     data class Counter(var displayValue: String, var count: Int)
 
     val counters = mutableMapOf<String, Counter>()
@@ -143,9 +147,9 @@ private fun buildMetadataFacet(valuesByBook: List<List<String>>): List<MetadataF
         rawValues
             .map(String::trim)
             .filter(String::isNotBlank)
-            .distinctBy { it.lowercase() }
+            .distinctBy(identityKey)
             .forEach { value ->
-                val key = value.lowercase()
+                val key = identityKey(value)
                 val counter = counters[key]
                 if (counter == null) {
                     counters[key] = Counter(value, 1)
@@ -887,11 +891,12 @@ class LibraryViewModel(
     }
 
     fun selectOnlineByAuthor(author: String) {
+        val authorKey = onlineAuthorIdentityKey(author)
         selectOnlineBatch(
             query = author,
             filter = OnlineCatalogFilter(author = author),
             matches = { entry ->
-                entry.individualAuthors().any { it.equals(author, ignoreCase = true) }
+                entry.individualAuthors().any { onlineAuthorIdentityKey(it) == authorKey }
             },
         )
     }
@@ -938,34 +943,40 @@ class LibraryViewModel(
                         try {
                             val discovered = linkedMapOf<String, OnlineCatalogEntry>()
                             val seenEntryKeys = mutableSetOf<String>()
+                            val scannedEntryKeys = mutableSetOf<String>()
                             var offset = 0
                             var pageCount = 0
                             while (pageCount < ONLINE_BATCH_MAX_PAGES && discovered.size < ONLINE_BATCH_MAX_ITEMS) {
-                                when (
-                                    val page = catalog.search(
-                                        query = query,
-                                        filter = filter,
-                                        offset = offset,
-                                        limit = ONLINE_BATCH_PAGE_SIZE,
-                                    )
-                                ) {
+                                val result = if (query.isBlank()) {
+                                    catalog.browsePage(filter, offset = offset, limit = ONLINE_BATCH_PAGE_SIZE)
+                                } else {
+                                    catalog.searchPage(query, filter, offset = offset, limit = ONLINE_BATCH_PAGE_SIZE)
+                                }
+                                when (result) {
                                     is ReadflowResult.Failure -> {
-                                        publishBatchSelectionFailure(sourceId, generation, page.error.message)
+                                        publishBatchSelectionFailure(sourceId, generation, result.error.message)
                                         return@launch
                                     }
                                     is ReadflowResult.Success -> {
-                                        if (page.value.isEmpty()) break
-                                        var sawNewEntry = false
-                                        page.value.forEach { entry ->
+                                        val page = result.value
+                                        pageCount += 1
+                                        val scannedBefore = scannedEntryKeys.size
+                                        val seenBefore = seenEntryKeys.size
+                                        val discoveredBefore = discovered.size
+                                        scannedEntryKeys += page.scannedEntryKeys
+                                        page.entries.forEach { entry ->
                                             val key = entry.selectionKey()
-                                            if (seenEntryKeys.add(key)) {
-                                                sawNewEntry = true
-                                                if (matches(entry)) discovered.putIfAbsent(key, entry)
+                                            if (seenEntryKeys.add(key) && matches(entry)) {
+                                                discovered.putIfAbsent(key, entry)
                                             }
                                         }
-                                        if (!sawNewEntry) break
-                                        offset += ONLINE_BATCH_PAGE_SIZE
-                                        pageCount += 1
+                                        val madeProgress =
+                                            page.nextOffset > offset ||
+                                                scannedEntryKeys.size > scannedBefore ||
+                                                seenEntryKeys.size > seenBefore ||
+                                                discovered.size > discoveredBefore
+                                        if (!madeProgress || !page.hasMore) break
+                                        offset = page.nextOffset
                                     }
                                 }
                             }
@@ -1185,6 +1196,52 @@ class LibraryViewModel(
         job.start()
     }
 
+    /** Cache-on-open online reading. The normal downloaded-book cache owns retention and eviction. */
+    fun readOnlineEntry(entry: OnlineCatalogEntry) {
+        val registry = sourceRegistry
+        if (registry == null) {
+            _onlineLibraryState.update { it.copy(error = "书源服务未配置") }
+            return
+        }
+        val sourceId = _onlineLibraryState.value.selectedSourceId ?: return
+        val bookId = shelfBookIdFor(entry, sourceId)
+        cachedShelfBook(bookId)?.takeIf { it.isOfflineReadable }?.let { cached ->
+            _openBook.tryEmit(cached.id)
+            return
+        }
+        if (_onlineLibraryState.value.isDownloadingBatch) return
+        val reservation = reserveOnlineDownload(sourceId, entry) ?: return
+        val key = reservation.key.selectionKey
+        _onlineLibraryState.update {
+            it.copy(
+                downloadingKeys = it.downloadingKeys + key,
+                error = null,
+                message = null,
+            )
+        }
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            when (
+                val outcome = downloadOnlineEntryInternal(
+                    entry = entry,
+                    reservation = reservation,
+                    registry = registry,
+                    clearMessages = true,
+                )
+            ) {
+                is OnlineDownloadOutcome.Success -> _openBook.emit(outcome.book.id)
+                is OnlineDownloadOutcome.Failure,
+                OnlineDownloadOutcome.Skipped,
+                -> Unit
+            }
+        }
+        onlineSingleDownloadJobs[reservation.ownerId] = job
+        job.invokeOnCompletion {
+            onlineSingleDownloadJobs.remove(reservation.ownerId)
+            releaseOnlineDownload(reservation)
+        }
+        job.start()
+    }
+
     private suspend fun downloadOnlineEntryInternal(
         entry: OnlineCatalogEntry,
         reservation: OnlineDownloadReservation,
@@ -1215,7 +1272,7 @@ class LibraryViewModel(
                                             result.value,
                                             publishUiMessage = clearMessages,
                                         )
-                                        OnlineDownloadOutcome.Success
+                                        OnlineDownloadOutcome.Success(result.value)
                                     }
                                     is ReadflowResult.Failure -> {
                                         publishDownloadFailure(
@@ -1245,9 +1302,16 @@ class LibraryViewModel(
     }
 
     private sealed class OnlineDownloadOutcome {
-        data object Success : OnlineDownloadOutcome()
+        data class Success(val book: BookMeta) : OnlineDownloadOutcome()
         data class Failure(val message: String) : OnlineDownloadOutcome()
         data object Skipped : OnlineDownloadOutcome()
+    }
+
+    private fun cachedShelfBook(bookId: String): BookMeta? = allShelfItems.firstNotNullOfOrNull { item ->
+        when (item) {
+            is LibraryItem.Single -> item.book.takeIf { it.id == bookId }
+            is LibraryItem.Bundle -> item.bundle.books.firstOrNull { it.id == bookId }
+        }
     }
 
     fun previewOnlineEntry(entry: OnlineCatalogEntry) {

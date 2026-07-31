@@ -148,6 +148,10 @@ interface InitialLocatorAwareReaderEngine : ReaderEngine {
  * into page rendering before they are ready.
  */
 interface PagedReaderEngine : ReaderEngine {
+    /** Number of pages retained on each side by bounded pager hosts. */
+    val preferredOffscreenPageLimit: Int
+        get() = 1
+
     fun createPageView(pageIndex: Int): View
     fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?)
 
@@ -155,8 +159,10 @@ interface PagedReaderEngine : ReaderEngine {
      * Report the host viewport size in pixels (typically the ViewPager content size after
      * layout / rotation). Default is a no-op so TXT/PDF/EPUB engines keep existing behaviour.
      * Markdown uses this for complete-line StaticLayout pagination instead of displayMetrics.
+     * Implementations that change page contents without changing [pageCount] must refresh their
+     * already-created page views in place; hosts deliberately do not recreate every holder.
      */
-    fun setViewportSize(widthPx: Int, heightPx: Int) {}
+    suspend fun setViewportSize(widthPx: Int, heightPx: Int) {}
 
     fun pageIndexForLocator(locator: Locator): Int {
         val total = pageCount.value.coerceAtLeast(1)
@@ -172,6 +178,13 @@ interface PagedReaderEngine : ReaderEngine {
         }
         return index.coerceIn(0, total - 1)
     }
+}
+
+enum class PageReadingDirection { LEFT_TO_RIGHT, RIGHT_TO_LEFT }
+
+/** Optional capability for image/document pagers whose physical gesture direction is authored. */
+interface DirectionalPagedReaderEngine : PagedReaderEngine {
+    val pageReadingDirection: StateFlow<PageReadingDirection>
 }
 
 /** Optional capability for fixed-layout engines that support transient matrix zoom. */

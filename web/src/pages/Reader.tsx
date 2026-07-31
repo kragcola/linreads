@@ -12,14 +12,14 @@ export default function Reader() {
   useEffect(() => {
     if (!id) return
     calibre.bookMeta(Number(id)).then((meta) => {
-      const fmt = meta.formats.find((f) => f === 'EPUB') ?? meta.formats.find((f) => f === 'PDF')
+      const fmt = meta.formats.find((f) => f.toLowerCase() === 'epub') ?? meta.formats.find((f) => f.toLowerCase() === 'pdf')
       if (!fmt) return
       setFormat(fmt)
-      if (fmt === 'EPUB' && ref.current) {
-        const book = ePub(calibre.downloadUrl(Number(id), 'EPUB'))
+      if (fmt.toLowerCase() === 'epub' && ref.current) {
+        const book = ePub(calibre.downloadUrl(Number(id), fmt, meta.libraryId))
         book.renderTo(ref.current, { width: '100%', height: '100%' })
-      } else if (fmt === 'PDF') {
-        setPdfUrl(calibre.downloadUrl(Number(id), 'PDF'))
+      } else if (fmt.toLowerCase() === 'pdf') {
+        setPdfUrl(calibre.downloadUrl(Number(id), fmt, meta.libraryId))
       }
     })
   }, [id])

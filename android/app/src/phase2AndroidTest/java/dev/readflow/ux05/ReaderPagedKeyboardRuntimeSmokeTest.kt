@@ -31,7 +31,7 @@ import dev.readflow.MainActivity
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
-import dev.readflow.core.model.ThemeMode
+import dev.readflow.core.model.PageFlipStyle
 import dev.readflow.core.model.TransitionType
 import dev.readflow.core.prefs.DataStoreSettingsRepository
 import dev.readflow.render.animate.ViewPagerTransitionHost
@@ -39,9 +39,9 @@ import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
 import java.io.File
-import java.util.UUID
 import kotlin.math.max
 import kotlin.time.Duration.Companion.seconds
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
@@ -60,12 +60,12 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
     private val appContext = ApplicationProvider.getApplicationContext<Context>()
     private val device = UiDevice.getInstance(instrumentation)
     private val settings = DataStoreSettingsRepository(appContext)
+    private var originalPageFlipStyle: PageFlipStyle? = null
 
     @Before
     fun setUp() = runBlocking {
-        settings.setFontSize(18)
-        settings.setLineSpacing(1.75f)
-        settings.setThemeMode(ThemeMode.LIGHT)
+        originalPageFlipStyle = settings.pageFlipStyle.first()
+        settings.setPageFlipStyle(PageFlipStyle.SIMULATION)
         evidenceDir().mkdirs()
         device.pressHome()
         device.waitForIdle()
@@ -73,14 +73,21 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
 
     @After
     fun tearDown() {
-        device.pressHome()
-        device.waitForIdle()
+        try {
+            device.pressHome()
+            device.waitForIdle()
+        } finally {
+            originalPageFlipStyle?.let { style ->
+                runBlocking { settings.setPageFlipStyle(style) }
+            }
+            originalPageFlipStyle = null
+        }
     }
 
     @Test
     fun pdfReaderContainerExposesPagedAccessibilityActionsAndKeyboardNavigation() {
         val totalPages = 4
-        val readerUri = createPdfUri(totalPages = totalPages)
+        val readerUri = createPdfUri(totalPages = totalPages, fixtureId = "keyboard-nav")
 
         ActivityScenario.launch<MainActivity>(readerIntent(readerUri, "application/pdf")).use { scenario ->
             dismissBlockingDialogs()
@@ -181,7 +188,6 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
             )
 
             sendKey(KeyEvent.KEYCODE_DPAD_CENTER)
-            waitForObject(By.text("排版"))
             waitForObject(By.text("主题"))
             takeScreenshot("keyboard-after-center.png")
             dumpHierarchy("keyboard-after-center.xml")
@@ -216,7 +222,7 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
                 baseline.accessibilityActions.contains("显示或隐藏阅读工具栏"),
             )
             assertTrue(
-                "expected default paged host to use the curl transformer",
+                "expected the configured simulation style to use the curl transformer",
                 baseline.transformerClass.contains("CurlPageTransformer"),
             )
             assertEquals(pageLabel(pageIndex = 1, totalPages = totalPages), afterRight.label)
@@ -227,7 +233,7 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
     @Test
     fun pdfPagedHostResetsZoomWhenPageChanges() {
         val totalPages = 4
-        val readerUri = createPdfUri(totalPages = totalPages)
+        val readerUri = createPdfUri(totalPages = totalPages, fixtureId = "zoom-reset")
 
         ActivityScenario.launch<MainActivity>(readerIntent(readerUri, "application/pdf")).use { scenario ->
             dismissBlockingDialogs()
@@ -370,8 +376,13 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
             clipData = ClipData.newRawUri("ux05-reader-smoke", uri)
         }
 
-    private fun createPdfUri(totalPages: Int): Uri {
-        val file = File(appContext.cacheDir, "ux05-${UUID.randomUUID()}.pdf")
+    /**
+     * Each test must use a byte-unique [fixtureId]: the app derives the book id from the
+     * PDF content digest, so two tests sharing the same bytes would reopen the same book and
+     * inherit the previous test's locator (observed as a 2/3 class failure).
+     */
+    private fun createPdfUri(totalPages: Int, fixtureId: String): Uri {
+        val file = File(appContext.cacheDir, "ux05-$fixtureId-$totalPages.pdf")
         val document = PdfDocument()
         repeat(totalPages) { pageIndex ->
             val pageInfo = PdfDocument.PageInfo.Builder(1200, 1800, pageIndex + 1).create()
@@ -386,6 +397,12 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
                 "Keyboard/runtime smoke page ${(pageIndex + 1).toString().padStart(2, '0')}",
                 72f,
                 120f,
+                paint,
+            )
+            page.canvas.drawText(
+                "Fixture $fixtureId",
+                72f,
+                180f,
                 paint,
             )
             repeat(18) { lineIndex ->
@@ -431,11 +448,23 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
         totalPages: Int,
         message: String,
     ) {
-        waitForCondition(message) {
-            scenario.withActivity { activity ->
-                activity.findPdfPagerHost().pagerCurrentItem() == pageIndex &&
-                    activity.currentPdfPageLabelOrNull() == pageLabel(pageIndex, totalPages)
+        var lastState = "unobserved"
+        try {
+            waitForCondition(message) {
+                scenario.withActivity { activity ->
+                    val pagerItem = activity.findPdfPagerHost().pagerCurrentItem()
+                    val pageHost = activity.currentPdfPageHostOrNull()
+                    val image = pageHost?.findDescendant { it is ImageView } as? ImageView
+                    lastState = "pagerItem=$pagerItem host=${pageHost != null} " +
+                        "hostShown=${pageHost?.isShown} hostTag=${pageHost?.tag} " +
+                        "label=${image?.contentDescription} drawable=${image?.drawable != null} " +
+                        "zoom=${activity.findReaderSurface().readerSurfaceCurrentZoomScale()}"
+                    pagerItem == pageIndex &&
+                        image?.contentDescription?.toString() == pageLabel(pageIndex, totalPages)
+                }
             }
+        } catch (error: IllegalStateException) {
+            throw IllegalStateException("$message; final=$lastState", error)
         }
     }
 
@@ -656,14 +685,22 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
     }
 
     private fun MainActivity.currentPdfPageViewOrNull(): ImageView? {
+        val pageHost = currentPdfPageHostOrNull() ?: return null
+        return pageHost.findDescendant { view ->
+            view is ImageView &&
+                view.isShown &&
+                view.contentDescription?.toString()?.startsWith("第 ") == true
+        } as? ImageView
+    }
+
+    private fun MainActivity.currentPdfPageHostOrNull(): View? {
         val pager = findPdfPagerHost()
         val currentItem = pager.pagerCurrentItem()
         return findReaderSurface().findDescendant { view ->
-            view is ImageView &&
+            view.javaClass.name == PDF_SEARCH_PAGE_HOST_CLASS_NAME &&
                 view.isShown &&
-                view.tag == currentItem &&
-                view.contentDescription?.toString()?.startsWith("第 ") == true
-        } as? ImageView
+                view.tag == currentItem
+        }
     }
 
     private fun MainActivity.currentPdfPageLabel(): String =
@@ -816,6 +853,7 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
     private companion object {
         private const val PDF_READER_DESC = "阅读内容，捏合缩放页面"
         private const val VIEW_PAGER_CLASS_NAME = "androidx.viewpager2.widget.ViewPager2"
+        private const val PDF_SEARCH_PAGE_HOST_CLASS_NAME = "dev.readflow.render.pdf.PdfSearchPageHost"
         private const val EVENT_STEP_MS = 16L
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
     }

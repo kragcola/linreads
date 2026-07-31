@@ -20,5 +20,10 @@ dependencies {
     implementation(libs.recyclerview)
 
     testImplementation(libs.junit5)
+    testImplementation(libs.junit4)
+    testImplementation(project(":render:animate"))
+    testImplementation(libs.viewpager2)
     testImplementation(libs.coroutines.test)
+    testImplementation(libs.robolectric)
+    testRuntimeOnly(libs.junit.vintage)
 }

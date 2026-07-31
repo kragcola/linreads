@@ -7,6 +7,27 @@ import org.junit.jupiter.api.Test
 class IncomingBookIntentResolverTest {
 
     @Test
+    fun `CBZ mime and extension are accepted while engine-less DOCX is rejected`() {
+        val cbz = IncomingBookIntentResolver.resolve(
+            action = "android.intent.action.VIEW",
+            mimeType = "application/vnd.comicbook+zip",
+            dataUri = "content://provider/library/story.cbz",
+            streamUris = emptyList(),
+            clipDataUris = emptyList(),
+        )
+        val docx = IncomingBookIntentResolver.resolve(
+            action = "android.intent.action.VIEW",
+            mimeType = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            dataUri = "content://provider/library/story.docx",
+            streamUris = emptyList(),
+            clipDataUris = emptyList(),
+        )
+
+        assertEquals("content://provider/library/story.cbz", cbz)
+        assertNull(docx)
+    }
+
+    @Test
     fun `ACTION_VIEW resolves supported data uri`() {
         val uri = IncomingBookIntentResolver.resolve(
             action = "android.intent.action.VIEW",

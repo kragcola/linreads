@@ -69,14 +69,39 @@ internal class TxtDocument private constructor(
     @Synchronized
     fun readParagraph(index: Int): String {
         check(index in ranges.indices)
-        paragraphCache[index]?.let { return it }
-        val range = ranges[index]
-        val text = FileChannel.open(file.toPath(), StandardOpenOption.READ).use { channel ->
-            channel.position(range.startByte)
-            channel.readTextRange(range.length, charsetDetection.charset)
-        }.removePrefix(UNICODE_BOM).trim()
-        paragraphCache[index] = text
-        return text
+        return readParagraphs(listOf(index)).getValue(index)
+    }
+
+    /** Reads one rendered page with one channel open instead of one open/close per paragraph. */
+    @Synchronized
+    fun readParagraphs(indices: Collection<Int>): Map<Int, String> {
+        val orderedIndices = indices.distinct()
+        orderedIndices.forEach { check(it in ranges.indices) }
+        val resolved = HashMap<Int, String>(orderedIndices.size)
+        val missing = orderedIndices.filter { index ->
+            val cached = paragraphCache[index]
+            if (cached == null) {
+                true
+            } else {
+                resolved[index] = cached
+                false
+            }
+        }
+        if (missing.isNotEmpty()) {
+            FileChannel.open(file.toPath(), StandardOpenOption.READ).use { channel ->
+                missing.forEach { index ->
+                    val range = ranges[index]
+                    channel.position(range.startByte)
+                    val paragraph = channel
+                        .readTextRange(range.length, charsetDetection.charset)
+                        .removePrefix(UNICODE_BOM)
+                        .trim()
+                    resolved[index] = paragraph
+                    paragraphCache[index] = paragraph
+                }
+            }
+        }
+        return orderedIndices.associateWith(resolved::getValue)
     }
 
     fun rangeAt(index: Int): TxtParagraphRange? = ranges.getOrNull(index)
@@ -177,6 +202,54 @@ internal class TxtDocument private constructor(
                 totalProgression = (endByte.toFloat() / totalBytes).coerceIn(0f, 1f),
             ),
             selectedText = selectedText,
+        )
+    }
+
+    fun selectionForPagedText(
+        pageText: TxtPagedText,
+        selectionStart: Int,
+        selectionEnd: Int,
+    ): ReaderTextSelection? {
+        val selection = pageText.mapSelection(selectionStart, selectionEnd) ?: return null
+        if (selection.startParagraphIndex == selection.endParagraphIndex) {
+            return selectionForParagraphRange(
+                paragraphIndex = selection.startParagraphIndex,
+                selectionStart = selection.startCharacterOffset,
+                selectionEnd = selection.endCharacterOffset,
+            )
+        }
+        val startRange = ranges.getOrNull(selection.startParagraphIndex) ?: return null
+        val endRange = ranges.getOrNull(selection.endParagraphIndex) ?: return null
+        val paragraphs = readParagraphs(
+            (selection.startParagraphIndex..selection.endParagraphIndex).toList(),
+        )
+        val startParagraph = paragraphs.getValue(selection.startParagraphIndex)
+        val endParagraph = paragraphs.getValue(selection.endParagraphIndex)
+        val startCharacter = selection.startCharacterOffset.coerceIn(0, startParagraph.length)
+        val endCharacter = selection.endCharacterOffset.coerceIn(0, endParagraph.length)
+        val startByte = startRange.startByte + startParagraph
+            .substring(0, startCharacter)
+            .toByteArray(charsetDetection.charset)
+            .size
+        val endByte = endRange.startByte + endParagraph
+            .substring(0, endCharacter)
+            .toByteArray(charsetDetection.charset)
+            .size
+        if (endByte <= startByte || selection.selectedText.isBlank()) return null
+        val totalBytes = byteLength.coerceAtLeast(1L).toFloat()
+        val totalItems = ranges.size.coerceAtLeast(1)
+        return ReaderTextSelection(
+            start = Locator(
+                strategy = LocatorStrategy.ByteOffset(startByte, (endByte - startByte).toInt()),
+                progression = selection.startParagraphIndex.toFloat() / totalItems,
+                totalProgression = (startByte.toFloat() / totalBytes).coerceIn(0f, 1f),
+            ),
+            end = Locator(
+                strategy = LocatorStrategy.ByteOffset(endByte, 0),
+                progression = selection.endParagraphIndex.toFloat() / totalItems,
+                totalProgression = (endByte.toFloat() / totalBytes).coerceIn(0f, 1f),
+            ),
+            selectedText = selection.selectedText,
         )
     }
 

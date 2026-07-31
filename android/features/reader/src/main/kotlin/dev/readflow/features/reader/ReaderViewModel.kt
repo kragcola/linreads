@@ -1,6 +1,7 @@
 package dev.readflow.features.reader
 
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -268,6 +269,11 @@ class ReaderViewModel(
         data class ByUri(val uri: Uri) : OpenRequest
     }
 
+    private data class InitialProgressCandidate(
+        val locator: Locator?,
+        val updatedAt: Long,
+    )
+
     private data class ReaderOpenSettings(
         val fontSize: Float,
         val lineSpacing: Float,
@@ -282,6 +288,7 @@ class ReaderViewModel(
     )
 
     private fun openById(bookId: String) {
+        Log.i(IMPORT_TRACE_TAG, "reader openById start id=$bookId")
         lastOpenRequest = OpenRequest.ById(bookId)
         val restoredForBook = restoredReaderState?.takeIf { it.bookId == bookId }
         _uiState.update { it.copy(loadingState = LoadingState.Loading) }
@@ -293,6 +300,7 @@ class ReaderViewModel(
                 persistReaderState(bookId = bookId, loadingState = LoadingState.Loading)
                 val book = bookDao.getById(bookId)
                 if (book == null) {
+                    Log.e(IMPORT_TRACE_TAG, "reader book missing id=$bookId")
                     val error = ReadflowError.notFound("book", bookId)
                     _uiState.update { it.copy(loadingState = LoadingState.Error(error)) }
                     persistReaderState(bookId = bookId, loadingState = LoadingState.Error(error), error = error)
@@ -300,6 +308,7 @@ class ReaderViewModel(
                 }
                 val uri = book.localUri?.let { Uri.parse(it) }
                 if (uri == null) {
+                    Log.e(IMPORT_TRACE_TAG, "reader local uri missing id=$bookId")
                     val error = ReadflowError.io("本地文件未找到")
                     _uiState.update { it.copy(loadingState = LoadingState.Error(error), bookTitle = book.title) }
                     persistReaderState(bookId = bookId, loadingState = LoadingState.Error(error), error = error)
@@ -346,7 +355,9 @@ class ReaderViewModel(
         title: String,
         restoredForBook: ReaderState?,
     ) {
+        Log.i(IMPORT_TRACE_TAG, "reader resolve start id=$bookId scheme=${uri.scheme}")
         val engine = runCatching { engineRegistry.resolve(uri) }.getOrElse { error ->
+            Log.e(IMPORT_TRACE_TAG, "reader resolve failure id=$bookId message=${error.message}", error)
             if (error is CancellationException) throw error
             val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
             _uiState.update { it.copy(loadingState = LoadingState.Error(readflowError), bookTitle = title) }
@@ -358,17 +369,15 @@ class ReaderViewModel(
         var engineAttached = false
         try {
             restoreEngineStateIfPresent(bookId, engine)
-            val restoredLocator = restoredForBook?.currentLocator
             val persistedProgress = bookId?.let { id -> progressDao.get(id) }
-            val persistedLocator = persistedProgress?.let { saved ->
-                runCatching { Json.decodeFromString<Locator>(saved.locatorJson) }.getOrNull()
-            }
-            val requestedInitialLocator = restoredLocator ?: persistedLocator
+            val requestedInitialProgress = initialProgressCandidate(restoredForBook, persistedProgress)
+            val requestedInitialLocator = requestedInitialProgress.locator
             var displayLocator = if (bookId != null && requestedInitialLocator != null) {
                 syncInitialProgressBeforeLoad(
                     bookId = bookId,
                     locator = requestedInitialLocator,
                     persistedProgress = persistedProgress,
+                    locatorUpdatedAt = requestedInitialProgress.updatedAt,
                 ) ?: requestedInitialLocator
             } else {
                 requestedInitialLocator
@@ -379,7 +388,9 @@ class ReaderViewModel(
                 applyReaderOpenSettings(engine, openSettings)
             }
             initialLocatorAwareEngine?.setInitialLocator(displayLocator)
+            Log.i(IMPORT_TRACE_TAG, "reader engine open start id=$bookId engine=${engine::class.java.simpleName}")
             val openedLocator = runCatching { engine.openBook(uri) }.getOrElse { error ->
+                Log.e(IMPORT_TRACE_TAG, "reader engine open failure id=$bookId message=${error.message}", error)
                 if (error is CancellationException) throw error
                 val readflowError = ReadflowError.io(error.message ?: "无法打开文件")
                 _uiState.update { it.copy(loadingState = LoadingState.Error(readflowError), bookTitle = title) }
@@ -441,6 +452,7 @@ class ReaderViewModel(
                     textSelection = null,
                 )
             }
+            Log.i(IMPORT_TRACE_TAG, "reader loaded id=$bookId engine=${engine::class.java.simpleName}")
             watchProgress(engine, bookId)
             watchBookmarks(engine, bookId)
             watchTextSelection(engine)
@@ -537,12 +549,14 @@ class ReaderViewModel(
         bookId: String,
         locator: Locator,
         persistedProgress: ReadingProgressEntity?,
+        locatorUpdatedAt: Long = 0L,
     ): Locator? {
         val local = initialProgressForSync(
             bookId = bookId,
             locator = locator,
             persistedProgress = persistedProgress,
             deviceId = settings.deviceId.first(),
+            locatorUpdatedAt = locatorUpdatedAt,
         )
         val remoteWinner = syncManager.syncProgress(bookId, local) ?: return null
         persistRemoteProgress(bookId, remoteWinner)
@@ -555,6 +569,7 @@ class ReaderViewModel(
         locator: Locator,
         persistedProgress: ReadingProgressEntity?,
         deviceId: String,
+        locatorUpdatedAt: Long = 0L,
     ): ReadingProgress {
         val persistedLocator = persistedProgress?.let {
             runCatching { Json.decodeFromString<Locator>(it.locatorJson) }.getOrNull()
@@ -573,9 +588,28 @@ class ReaderViewModel(
             bookId = bookId,
             locator = locator,
             progressPercent = progression,
-            updatedAt = 0L,
+            updatedAt = locatorUpdatedAt,
             deviceId = deviceId,
         )
+    }
+
+    private fun initialProgressCandidate(
+        restoredForBook: ReaderState?,
+        persistedProgress: ReadingProgressEntity?,
+    ): InitialProgressCandidate {
+        val restoredLocator = restoredForBook?.currentLocator
+        val persistedLocator = persistedProgress?.let { saved ->
+            runCatching { Json.decodeFromString<Locator>(saved.locatorJson) }.getOrNull()
+        }
+        return when {
+            restoredLocator == null ->
+                InitialProgressCandidate(persistedLocator, persistedProgress?.updatedAt ?: 0L)
+            persistedLocator == null ->
+                InitialProgressCandidate(restoredLocator, restoredForBook.currentLocatorUpdatedAt)
+            restoredForBook.currentLocatorUpdatedAt > persistedProgress.updatedAt ->
+                InitialProgressCandidate(restoredLocator, restoredForBook.currentLocatorUpdatedAt)
+            else -> InitialProgressCandidate(persistedLocator, persistedProgress.updatedAt)
+        }
     }
 
     private fun watchProgress(engine: ReaderEngine, bookId: String?) {
@@ -1537,13 +1571,22 @@ class ReaderViewModel(
     ) {
         val id = bookId ?: return
         val state = _uiState.value
+        val stateEngineLocator = state.engine?.currentLocator?.value
         val currentLocator = locator
-            ?: state.engine?.currentLocator?.value
+            ?: stateEngineLocator
             ?: restoredReaderState?.takeIf { it.bookId == id }?.currentLocator
+        val previousReaderState = restoredReaderState?.takeIf { it.bookId == id }
+        val currentLocatorUpdatedAt = when {
+            currentLocator == null -> 0L
+            locator != null || stateEngineLocator != null -> clock()
+            previousReaderState?.currentLocator == currentLocator -> previousReaderState.currentLocatorUpdatedAt
+            else -> clock()
+        }
         val readerState = ReaderState(
             bookId = id,
             loadingState = loadingState,
             currentLocator = currentLocator,
+            currentLocatorUpdatedAt = currentLocatorUpdatedAt,
             fontSize = state.fontSizeSp.toInt(),
             lineSpacing = state.lineSpacing,
             readingMode = state.readingMode.toReaderReadingMode(),
@@ -1616,6 +1659,7 @@ class ReaderViewModel(
     }
 
     private companion object {
+        const val IMPORT_TRACE_TAG = "ReadflowImportTrace"
         const val MIN_FONT_SP = dev.readflow.core.prefs.ReaderTypography.MIN_FONT_SP
         const val MAX_FONT_SP = dev.readflow.core.prefs.ReaderTypography.MAX_FONT_SP
         const val MIN_ZOOM_SCALE = 1f

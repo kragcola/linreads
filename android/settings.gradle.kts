@@ -35,7 +35,7 @@ fun phaseInclude(minPhase: Int, vararg paths: String) {
 // (`:core:ui`, `:core:database`) MUST be present this phase (F9).
 phaseInclude(
     1,
-    ":app", ":core:model", ":core:calibre", ":core:prefs",
+    ":app", ":core:model", ":core:archive", ":core:calibre", ":core:prefs",
     ":core:sync", ":core:database", ":core:ui",
     ":extensions:api", ":features:library",
 )
@@ -43,7 +43,7 @@ phaseInclude(
 phaseInclude(
     2,
     ":render:api", ":render:epub", ":render:pdf", ":render:txt",
-    ":render:md", ":render:animate",
+    ":render:md", ":render:cbz", ":render:animate",
     ":features:reader", ":features:settings",
 )
 // Phase 3 — implemented premium add-ons only (Phase D + E).

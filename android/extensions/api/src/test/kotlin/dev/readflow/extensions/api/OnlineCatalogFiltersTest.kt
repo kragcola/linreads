@@ -45,14 +45,31 @@ class OnlineCatalogFiltersTest {
         assertEquals(entries, entries.applyCatalogFilter(OnlineCatalogFilter()))
     }
 
+    @Test
+    fun authorFilterUsesNormalizedIndividualsInsteadOfSubstringMatching() {
+        val entries = listOf(
+            entry("1", author = "安里アサト", authors = listOf("安里アサト")),
+            entry("2", author = "安里 アサト", authors = listOf("安里 アサト")),
+            entry("3", author = "安里アサト & しらび", authors = listOf("安里アサト & しらび")),
+            entry("4", author = "安里アサト別人", authors = listOf("安里アサト別人")),
+        )
+
+        assertEquals(
+            listOf("1", "2", "3"),
+            entries.applyCatalogFilter(OnlineCatalogFilter(author = "安里アサト")).map { it.meta.id },
+        )
+    }
+
     private fun entry(
         id: String,
         author: String = "Author",
+        authors: List<String> = emptyList(),
         series: String? = null,
         format: BookFormat = BookFormat.EPUB,
         tags: List<String> = emptyList(),
     ) = OnlineCatalogEntry(
         meta = BookMeta(id = id, title = "Title $id", author = author, format = format),
+        authors = authors,
         series = series,
         tags = tags,
         availableFormats = listOf(format.name),

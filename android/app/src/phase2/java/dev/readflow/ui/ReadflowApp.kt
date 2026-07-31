@@ -2,6 +2,7 @@ package dev.readflow.ui
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.AlertDialog
@@ -27,7 +28,6 @@ import dev.readflow.core.database.LibraryRepository
 import dev.readflow.core.model.BookAssetOperationCoordinator
 import dev.readflow.core.model.ReadflowResult
 import dev.readflow.core.model.ThemeMode
-import dev.readflow.core.model.readerPaletteFor
 import dev.readflow.core.ui.ReadflowTheme
 import dev.readflow.extensions.api.LocalFileBookSource
 import dev.readflow.features.library.LibraryScreen
@@ -60,7 +60,7 @@ fun ReadflowApp(
     // The reading presets (see ReaderPalette) decide the app chrome too: any night preset → dark
     // chrome, SEPIA keeps its dedicated parchment chrome, the rest → light chrome.
     val sepiaTheme = themeMode == ThemeMode.SEPIA
-    val darkTheme = !sepiaTheme && readerPaletteFor(themeMode, systemDark).isNight
+    val darkTheme = !sepiaTheme && themeMode.usesNightChrome(systemDark)
 
     ReadflowTheme(darkTheme = darkTheme, sepiaTheme = sepiaTheme) {
         val navController = rememberNavController()
@@ -71,22 +71,27 @@ fun ReadflowApp(
 
         LaunchedEffect(incomingBookUri) {
             val uri = incomingBookUri ?: return@LaunchedEffect
+            Log.i("ReadflowImportTrace", "import start scheme=${uri.scheme} mime=$incomingBookMimeType")
             try {
                 assetOperations.produce(bookId = null) {
                     when (val result = localSource.import(uri, incomingBookMimeType)) {
                         is ReadflowResult.Success -> {
                             val book = result.value.first
+                            Log.i("ReadflowImportTrace", "import success id=${book.id}")
                             libraryRepository.upsertBook(book)
                             navController.navigate("reader/${book.id}") {
                                 launchSingleTop = true
                             }
+                            Log.i("ReadflowImportTrace", "navigate reader/${book.id}")
                         }
                         is ReadflowResult.Failure -> {
+                            Log.e("ReadflowImportTrace", "import failure=${result.error.message}")
                             incomingImportError = result.error.message
                         }
                     }
                 }
             } finally {
+                Log.i("ReadflowImportTrace", "import consumed scheme=${uri.scheme}")
                 onIncomingBookConsumed()
             }
         }
@@ -146,6 +151,21 @@ fun ReadflowApp(
         }
 
     }
+}
+
+private fun ThemeMode.usesNightChrome(systemDark: Boolean): Boolean = when (this) {
+    ThemeMode.SYSTEM -> systemDark
+    ThemeMode.DARK,
+    ThemeMode.SLATE,
+    ThemeMode.NAVY,
+    ThemeMode.BLACK,
+    -> true
+    ThemeMode.LIGHT,
+    ThemeMode.WHITE,
+    ThemeMode.SEPIA,
+    ThemeMode.GREEN,
+    ThemeMode.GREY,
+    -> false
 }
 
 @Composable

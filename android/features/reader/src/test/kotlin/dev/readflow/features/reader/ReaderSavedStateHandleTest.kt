@@ -326,6 +326,131 @@ class ReaderSavedStateHandleTest {
     }
 
     @Test
+    fun `durable progress wins over stale SavedState locator when reopening the same book`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val staleSavedLocator = Locator(
+                LocatorStrategy.Section(spineIndex = 0, elementIndex = 2, charOffset = 20),
+                totalProgression = 0.2f,
+            )
+            val durableLocator = Locator(
+                LocatorStrategy.Section(spineIndex = 0, elementIndex = 8, charOffset = 80),
+                totalProgression = 0.8f,
+            )
+            val handle = SavedStateHandle(
+                mapOf(
+                    READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY to ReaderTypography.BASELINE_VERSION,
+                    READER_STATE_SAVED_STATE_KEY to Json.encodeToString(
+                        ReaderState(
+                            bookId = "book-1",
+                            currentLocator = staleSavedLocator,
+                        ),
+                    ),
+                ),
+            )
+            val progressDao = FakeProgressDao().apply {
+                upsert(
+                    ReadingProgressEntity(
+                        bookId = "book-1",
+                        locatorJson = Json.encodeToString(durableLocator),
+                        totalProgression = 0.8f,
+                        progressPercent = 0.8f,
+                        updatedAt = 2_000L,
+                        deviceId = "tablet",
+                    ),
+                )
+            }
+            val events = mutableListOf<String>()
+            val engine = FakeInitialLocatorAwareReaderEngine(
+                initialLocator = Locator(
+                    LocatorStrategy.Page(index = 0, total = 10),
+                    totalProgression = 0f,
+                ),
+                events = events,
+            )
+            val viewModel = readerViewModel(
+                handle = handle,
+                engine = engine,
+                progressDao = progressDao,
+            )
+
+            viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+            advanceUntilIdle()
+
+            assertEquals(
+                "the newer durable locator must prime reopen instead of the stale SavedState locator",
+                listOf(durableLocator),
+                engine.initialLocators,
+            )
+            assertEquals(durableLocator, engine.openLocators.single())
+            assertEquals(durableLocator, engine.currentLocator.value)
+            assertEquals(emptyList<Locator>(), engine.goToLocators)
+        }
+
+    @Test
+    fun `newer SavedState locator wins over older durable progress when reopening the same book`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val olderDurableLocator = Locator(
+                LocatorStrategy.Section(spineIndex = 0, elementIndex = 2, charOffset = 20),
+                totalProgression = 0.2f,
+            )
+            val newerSavedLocator = Locator(
+                LocatorStrategy.Section(spineIndex = 0, elementIndex = 8, charOffset = 80),
+                totalProgression = 0.8f,
+            )
+            val handle = SavedStateHandle(
+                mapOf(
+                    READER_TYPOGRAPHY_BASELINE_SAVED_STATE_KEY to ReaderTypography.BASELINE_VERSION,
+                    READER_STATE_SAVED_STATE_KEY to Json.encodeToString(
+                        ReaderState(
+                            bookId = "book-1",
+                            currentLocator = newerSavedLocator,
+                            currentLocatorUpdatedAt = 3_000L,
+                        ),
+                    ),
+                ),
+            )
+            val progressDao = FakeProgressDao().apply {
+                upsert(
+                    ReadingProgressEntity(
+                        bookId = "book-1",
+                        locatorJson = Json.encodeToString(olderDurableLocator),
+                        totalProgression = 0.2f,
+                        progressPercent = 0.2f,
+                        updatedAt = 1_000L,
+                        deviceId = "tablet",
+                    ),
+                )
+            }
+            val events = mutableListOf<String>()
+            val engine = FakeInitialLocatorAwareReaderEngine(
+                initialLocator = Locator(
+                    LocatorStrategy.Page(index = 0, total = 10),
+                    totalProgression = 0f,
+                ),
+                events = events,
+            )
+            val viewModel = readerViewModel(
+                handle = handle,
+                engine = engine,
+                progressDao = progressDao,
+            )
+
+            viewModel.onIntent(ReaderIntent.OpenById("book-1"))
+            advanceUntilIdle()
+
+            assertEquals(
+                "the newer SavedState locator must prime reopen when Room debounce has not caught up",
+                listOf(newerSavedLocator),
+                engine.initialLocators,
+            )
+            assertEquals(newerSavedLocator, engine.openLocators.single())
+            assertEquals(newerSavedLocator, engine.currentLocator.value)
+            assertEquals(emptyList<Locator>(), engine.goToLocators)
+        }
+
+    @Test
     fun `restores saved line spacing before opening restored book`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val restoredLocator = Locator(LocatorStrategy.Page(index = 4, total = 10), totalProgression = 0.4f)

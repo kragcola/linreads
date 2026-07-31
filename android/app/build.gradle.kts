@@ -7,8 +7,29 @@ plugins {
 }
 
 val readflowPhase = (project.findProperty("readflow.phase") as String?)?.toInt() ?: 1
+require(readflowPhase in 1..3) {
+    "readflow.phase must be 1, 2, or 3"
+}
 val updateHelperProtocolVersion = providers.gradleProperty("readflow.updateHelperProtocolVersion")
     .get().toInt().also { require(it > 0) }
+
+// Phase 1 and phase 2 intentionally share the Android module name and variant names, but their
+// source sets are mutually exclusive. A normal incremental build cannot infer that a phase changed
+// and can otherwise leave reader classes in a phase-1 APK (or drop them from a phase-2 APK). Keep a
+// small marker in the module output and invalidate the whole app output on a phase transition.
+val phaseOutputMarker = layout.buildDirectory.file(".readflow-phase")
+tasks.named("preBuild").configure {
+    doFirst {
+        val marker = phaseOutputMarker.get().asFile
+        val expected = readflowPhase.toString()
+        val actual = marker.takeIf { it.isFile }?.readText()?.trim()
+        if (actual != expected) {
+            project.delete(layout.buildDirectory.get().asFile)
+        }
+        marker.parentFile.mkdirs()
+        marker.writeText(expected)
+    }
+}
 
 android {
     namespace = "dev.readflow"
@@ -129,6 +150,7 @@ dependencies {
         implementation(project(":render:epub"))
         implementation(project(":render:pdf"))
         implementation(project(":render:md"))
+        implementation(project(":render:cbz"))
         implementation(project(":render:animate"))
         implementation(project(":features:reader"))
         implementation(project(":features:settings"))

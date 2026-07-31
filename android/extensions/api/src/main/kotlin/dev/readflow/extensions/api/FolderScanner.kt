@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import dev.readflow.core.model.BookFormat
+import dev.readflow.core.model.LocalReadingCapabilities
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -24,8 +25,8 @@ object FolderScanner {
             if (f.isDirectory) collect(f, onFound)
             else {
                 val name = f.name ?: continue
-                val fmt = BookFormat.fromExtension(name.substringAfterLast('.', ""))
-                if (fmt != BookFormat.UNKNOWN) onFound(ScannedBook(f.uri, name, fmt))
+                val fmt = LocalReadingCapabilities.formatForExtension(name.substringAfterLast('.', ""))
+                if (fmt != null) onFound(ScannedBook(f.uri, name, fmt))
             }
         }
     }

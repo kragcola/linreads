@@ -12,6 +12,9 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
+import java.io.RandomAccessFile
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -72,6 +75,63 @@ class LocalFileBookSourceTest {
                 orphans?.joinToString { it.name },
             orphans.isNullOrEmpty(),
         )
+    }
+
+    @Test
+    fun `oversized CBZ file URI is rejected before copying`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val source = LocalFileBookSource(context)
+        val archive = File(context.cacheDir, "oversized.cbz")
+        RandomAccessFile(archive, "rw").use { file ->
+            file.setLength(2L * 1024L * 1024L * 1024L + 1L)
+        }
+
+        val result = source.import(Uri.fromFile(archive), "application/vnd.comicbook+zip")
+
+        assertTrue(result is ReadflowResult.Failure)
+        assertTrue((result as ReadflowResult.Failure).error.message.contains("CBZ 源文件"))
+    }
+
+    @Test
+    fun `comic zip mime imports generic zip filename as CBZ`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val source = LocalFileBookSource(context)
+        val archive = File(context.cacheDir, "comic-as-zip.zip")
+        ZipOutputStream(archive.outputStream()).use { zip ->
+            zip.putNextEntry(ZipEntry("001.jpg"))
+            zip.write(byteArrayOf(1, 2, 3, 4))
+            zip.closeEntry()
+        }
+
+        val imported = source.import(Uri.fromFile(archive), "application/vnd.comicbook+zip").successValue()
+
+        assertEquals("CBZ", imported.second.format)
+        assertTrue(imported.first.id.startsWith("local-cbz-"))
+        assertTrue(imported.first.localUri?.endsWith(".cbz") == true)
+    }
+
+    @Test
+    fun `CBZ with forged excessive entry count is rejected before private import`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val source = LocalFileBookSource(context)
+        val archive = File(context.cacheDir, "forged-count.cbz")
+        ZipOutputStream(archive.outputStream()).use { zip ->
+            zip.putNextEntry(ZipEntry("1.jpg"))
+            zip.write(byteArrayOf(1, 2, 3))
+            zip.closeEntry()
+        }
+        RandomAccessFile(archive, "rw").use { file ->
+            file.seek(file.length() - 22L + 8L)
+            repeat(2) {
+                file.write(10_001 and 0xFF)
+                file.write(10_001 ushr 8 and 0xFF)
+            }
+        }
+
+        val result = source.import(Uri.fromFile(archive), "application/vnd.comicbook+zip")
+
+        assertTrue(result is ReadflowResult.Failure)
+        assertTrue((result as ReadflowResult.Failure).error.message.contains("CBZ 条目数"))
     }
 
     private fun <T> ReadflowResult<T>.successValue(): T =

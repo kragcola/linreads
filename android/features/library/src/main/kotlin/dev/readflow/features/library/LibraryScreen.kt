@@ -90,6 +90,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import dev.readflow.core.model.BookBundle
+import dev.readflow.core.model.LocalReadingCapabilities
 import dev.readflow.core.ui.BookGrid
 import dev.readflow.core.ui.EmptyState
 import dev.readflow.core.ui.PaperSurface
@@ -97,7 +98,7 @@ import dev.readflow.core.ui.ReadflowType
 import dev.readflow.core.ui.Dimens
 import org.koin.androidx.compose.koinViewModel
 
-private val SUPPORTED_MIMES = arrayOf("text/plain", "application/epub+zip", "application/pdf")
+private val SUPPORTED_MIMES = LocalReadingCapabilities.pickerMimeTypes
 private val SOURCE_CONFIG_MIMES = arrayOf("application/json", "text/json", "application/octet-stream", "text/*")
 
 private enum class LibraryPage { LOCAL, ONLINE }
@@ -417,6 +418,7 @@ fun LibraryScreen(
                         onSelectAuthor = viewModel::selectOnlineByAuthor,
                         onSelectSeries = viewModel::selectOnlineBySeries,
                         onDownloadEntry = viewModel::downloadOnlineEntry,
+                        onReadOnline = viewModel::readOnlineEntry,
                         onDownloadSelected = viewModel::downloadSelectedOnlineBooks,
                         onPreview = viewModel::previewOnlineEntry,
                         onOpenSourceEditor = { sourceId ->

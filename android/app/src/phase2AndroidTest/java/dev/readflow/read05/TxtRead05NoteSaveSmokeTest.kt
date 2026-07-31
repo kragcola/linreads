@@ -67,6 +67,7 @@ class TxtRead05NoteSaveSmokeTest {
 
         ActivityScenario.launch<MainActivity>(readerIntent(readerUri)).use {
             dismissBlockingDialogs()
+            dismissReaderGuide()
             waitForObject(By.desc("阅读内容，捏合调整字号"))
             waitForObject(By.text(anchorParagraph))
 
@@ -94,7 +95,7 @@ class TxtRead05NoteSaveSmokeTest {
                 annotation?.selectedText?.isNotBlank() == true,
             )
 
-            waitForObject(By.desc("阅读内容，捏合调整字号")).click()
+            ensureChromeVisible()
             waitForObject(By.text("标注")).click()
             waitForObject(By.text(note))
         }
@@ -124,6 +125,25 @@ class TxtRead05NoteSaveSmokeTest {
             device.wait(Until.findObject(By.text(text)), 1_000)?.click()
             device.waitForIdle()
         }
+    }
+
+    private fun dismissReaderGuide() {
+        val guide = device.wait(
+            Until.findObject(By.descStartsWith("阅读手势引导")),
+            UI_TIMEOUT_MS,
+        )
+        guide?.click()
+        if (guide != null) {
+            check(device.wait(Until.gone(By.descStartsWith("阅读手势引导")), UI_TIMEOUT_MS)) {
+                "expected first-reader gesture guide to dismiss"
+            }
+        }
+    }
+
+    private fun ensureChromeVisible() {
+        if (device.findObject(By.text("目录")) != null) return
+        waitForObject(By.desc("阅读内容，捏合调整字号")).click()
+        waitForObject(By.text("目录"))
     }
 
     private fun waitForObject(selector: BySelector, timeoutMs: Long = UI_TIMEOUT_MS): UiObject2 =

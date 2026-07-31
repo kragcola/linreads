@@ -19,7 +19,7 @@ export default function Library() {
       <div className="book-grid">
         {books.map((b) => (
           <div key={b.id} className="book-card" onClick={() => nav(`/read/${b.id}`)}>
-            <img src={`/calibre/get/cover/${b.id}/calibre-library`} alt="" onError={(e) => (e.currentTarget.style.display = 'none')} />
+            {b.cover && <img src={b.cover} alt="" onError={(e) => (e.currentTarget.style.display = 'none')} />}
             <div className="book-title">{b.title[0]}</div>
             <div className="book-author">{b.authors.join(' / ')}</div>
             <div className="book-formats">{b.formats.join(' · ')}</div>

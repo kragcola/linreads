@@ -32,6 +32,7 @@ data class ReaderState(
     val format: BookFormat = BookFormat.UNKNOWN,
     val loadingState: LoadingState = LoadingState.Idle,
     val currentLocator: Locator? = null,
+    val currentLocatorUpdatedAt: Long = 0L,
     val totalPages: Int = 0,
     val currentPageIndex: Int = 0,
     val fontSize: Int = ReaderTypographyRange.DEFAULT_FONT_SIZE,

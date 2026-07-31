@@ -1,7 +1,7 @@
 # ADR: MuPDF License And DOCX/CBZ Optional Formats
 
 > Date: 2026-06-23  
-> Status: accepted for current pure-reading backfill  
+> Status: accepted; CBZ alternative activated 2026-07-27
 > Scope: Android optional DOCX/CBZ engines, base APK packaging, license gate  
 > Note: this is an engineering release decision, not legal advice. Revisit with legal/commercial review before shipping MuPDF-linked binaries.
 
@@ -33,16 +33,29 @@ Source links:
 4. **CBZ is deferred for this pure-reading backfill.** MuPDF does support CBZ, but using it would still introduce AGPL/commercial licensing and native binary cost. If CBZ becomes a priority, prefer evaluating a first-party ZIP image pager before MuPDF. MuPDF CBZ remains allowed only behind the license gate above.
 5. **If MuPDF is revisited later, it must be isolated.** Requirements: `:render:mupdf` only, feature flag or dynamic delivery/ABI split, no cold-start initialization, explicit notices/source-offer or commercial-license record, app-store release checklist, and CI proof that the base APK contains no `libmupdf`.
 
+## 2026-07-27 CBZ implementation update
+
+The CBZ part of decision 4 is no longer deferred. LinReads now uses the preferred alternative named
+by this ADR: a first-party `:render:cbz` ZIP image pager plus Apache-2.0 ZoomImage subsampling. This
+does not change the MuPDF license gate and does not add any Artifex binary or native archive engine.
+
+The implemented scope is local CBZ single-page reading, natural page ordering, ComicInfo RTL,
+bounded current-page/neighbour extraction, zoom/pan, import/cover support and shared page transitions.
+Webtoon, two-page spreads, CBR/7z and remote comic catalogs remain separately gated. See
+`docs/research/android-comic-reader-architecture-2026-07-27.md`.
+
 ## Consequences
 
 - `OPT-01` is closed as `DONE`: the AGPL/commercial/alternative decision is recorded.
 - `OPT-02` is `DEFERRED`: DOCX optional engine is not implemented in this milestone.
-- `OPT-03` is `DEFERRED`: CBZ optional engine is not implemented in this milestone.
-- Future work can still implement DOCX/CBZ, but only through a new ADR update that names the chosen engine, license posture, package-size budget, and smoke-test plan.
+- `OPT-03` is reopened and implemented through the MuPDF-free `:render:cbz` route; no MuPDF license
+  obligation or native package cost is introduced.
+- Future DOCX work, or CBZ work that requires a different archive/render engine, needs a new ADR
+  update naming the engine, license posture, package-size budget and smoke-test plan.
 
 ## Revisit Conditions
 
-- User explicitly prioritizes DOCX/CBZ over remaining reader quality gates.
+- User explicitly prioritizes DOCX or additional comic formats over remaining reader quality gates.
 - Commercial licensing is available and acceptable.
-- A no-AGPL alternative is selected, such as a lightweight CBZ ZIP image pager.
+- A new format requires MuPDF rather than the existing lightweight CBZ ZIP image pager.
 - Dynamic delivery / ABI split pipeline exists and can prove base APK remains MuPDF-free.

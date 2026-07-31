@@ -7,10 +7,12 @@ android {
 }
 
 dependencies {
+    implementation(project(":core:archive"))
     implementation(project(":core:model"))
     implementation(project(":core:database"))
     implementation(libs.coroutines.core)
     implementation(libs.documentfile)
+    implementation(libs.exifinterface)
 
     testImplementation(libs.junit4)
     testImplementation(libs.coroutines.test)

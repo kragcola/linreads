@@ -90,7 +90,7 @@
 
 ### 2.1 五条轻量基线
 
-1. **安装轻** — base APK 只含首发必须能力。MuPDF（DOCX/CBZ）、Ink、TTS、OPDS、Sync 为可选/按需，不进 base 包成本。每个引擎登记 APK 增量、ABI 影响、冷启动影响。
+1. **安装轻** — base APK 只含首发必须能力。MuPDF/DOCX、Ink、TTS、OPDS、Sync 为可选/按需，不进 base 包成本；CBZ 使用无 native/无 MuPDF 的轻量 ZIP 图片引擎。每个引擎登记 APK 增量、ABI 影响、冷启动影响。
 2. **首开轻** — 第一次启动不要求账号、不要求连接 Calibre、不要求选引擎。主路径是「打开本地书」与「继续阅读」。Calibre 是增强书源，有向导、自动探测、失败解释。
 3. **阅读轻** — 普通用户只看到字号、主题、行距、翻页方式、目录、书签。引擎选择、同步后端、调试信息进入高级设置。格式差异由系统吸收，手势语义一致。
 4. **数据轻** — 进度/书签/标注离线本地优先；一键导出开放备份包（`LinReads Backup`：ZIP + JSON manifest）。同步是可选增强，停服/断网/换设备不导致数据不可取回。
@@ -106,7 +106,7 @@
 | **B Calibre 可选书源** | 连接流程短、失败可理解 | baseUrl 来自设置/向导不硬编码；可搜索真实书籍；书名/作者/格式/封面可见；失败有原因和下一步 |
 | **C 阅读质量闭环** | 主流格式稳定阅读、设置不打扰 | 系统自动选引擎；字号/主题/行距/翻页可用；首屏/翻页/内存达预算；TalkBack smoke 通过 |
 | **D 数据出口与离线缓存** | 用户能控制自己的书和数据 | 已下载可离线打开；缓存可解释可清理；进度/书签/标注可导出恢复 |
-| **E 精品增强** | Ink/TTS/OPDS/Sync/DOCX/CBZ 逐个进入不污染基础体验 | 每能力独立 ADR、权限说明、包体积预算、关闭路径；默认关闭或按需；出错不影响基础阅读 |
+| **E 精品增强** | Ink/TTS/OPDS/Sync/DOCX 与漫画增强模式逐个进入不污染基础体验 | 每能力独立 ADR、权限说明、包体积预算、关闭路径；默认关闭或按需；出错不影响基础阅读 |
 
 ### 2.3 自研引擎裁决准则
 
@@ -117,7 +117,8 @@
 - **TXT** — 自研虚拟分页器成立（降低大文件内存、编码兼容、进度稳定）。
 - **PDF** — 优先系统 `PdfRenderer`，除非功能缺口明确且第三方/自研在用户指标上明显胜出。
 - **EPUB** — **原生重排**（jsoup 解析 XHTML → Compose `AnnotatedString`），去 WebView。见 ADR-EPUB-Engine。
-- **DOCX/CBZ** — 重引擎适合可选能力，不让所有用户默认承担成本。
+- **DOCX** — 重引擎适合可选能力，不让所有用户默认承担成本。
+- **CBZ** — 第一方 ZIP 索引 + 大图分块渲染成立；保持 MuPDF-free，缓存仅覆盖当前页与邻页。
 
 ## 三、模块地图
 
@@ -137,7 +138,7 @@
  9  :render:epub                    # 原生重排（jsoup → AnnotatedString），无 WebView
 10  :render:pdf                     # PdfRenderer
 11  :render:txt                     # RecyclerView + TxtVirtualPager + Paging3
-12  :render:mupdf                   # DOCX + CBZ (MuPDF JNI) — optional / 按需
+12  :render:cbz                     # first-party ZIP image pager + ZoomImage，MuPDF-free
 13  :render:md                      # Markdown (Markwon Spannables)
 14  :render:animate                 # PageTransitionHost 实现（翻页动效）
 15  :ink                            # InkOverlay + Canvas（androidx.ink）
@@ -157,7 +158,7 @@
 | **0** | 纯 Kotlin | `:core:model` | `kotlin("jvm")`，零 Android import。**仅含数据值对象，零行为接口**：`BookMeta`、`BookFormat`、`Locator`、`ReaderState`、`ReadflowError`、`InkAnchor`、`TransitionType`、`ThemeMode`、`DownloadStatus`、`DownloadedAsset`、`Bookmark`、`LoadingState`、`Offset`。`SyncBackend` 已移出（v4，P1-F）。依赖：**无**。 |
 | **1** | Android 数据 | `:core:calibre`、`:core:database`、`:core:prefs`、`:core:sync`、`:extensions:api` | `android-library`（`:core:sync`/`:extensions:api` 为纯 Kotlin），可用 `android.*`，禁用 Compose。 |
 | **2** | 渲染抽象 | `:render:api` | `android-library`，允许 `android.view.View`/`android.net.Uri`，禁用 Compose。定义 `ReaderEngine`、`EngineDescriptor`、`ReaderEngineRegistry`、`PageTransitionHost`、`PageTransitionHostFactory`（F10：host 工厂接口在此层，feature 仅依赖此抽象）、`EngineStateStore`（M1：加速缓存仓库接口，实现在 `:app`）、`ReadingMode`、`PagingKind`。`Locator` 从 `:core:model` import。 |
-| **3** | 渲染实现 | `:render:epub`、`:render:pdf`、`:render:txt`、`:render:mupdf`、`:render:md`、`:render:animate` | `android-library`，产出 `View`。**例外（E1 后）**：`:render:epub`、`:render:md` 因产出 `ComposeView`（原生重排文本/Markwon→Compose）**允许依赖 Compose runtime**，但仍**禁用** `:core:ui`（不复用 app 主题，自带渲染所需最小 Compose）；其余 `:render:*`（pdf/txt/mupdf/animate）禁用 Compose。全部**不得**依赖 `:core:ui`、`:core:calibre`、`:core:database`、`:core:prefs`、`:ink`、任何 feature、任何 extension。 |
+| **3** | 渲染实现 | `:render:epub`、`:render:pdf`、`:render:txt`、`:render:cbz`、`:render:md`、`:render:animate` | `android-library`，产出 `View`。**例外（E1 后）**：`:render:epub`、`:render:md` 因产出 `ComposeView`（原生重排文本/Markwon→Compose）**允许依赖 Compose runtime**，但仍**禁用** `:core:ui`（不复用 app 主题，自带渲染所需最小 Compose）；其余 `:render:*`（pdf/txt/cbz/animate）禁用 Compose。全部**不得**依赖 `:core:ui`、`:core:calibre`、`:core:database`、`:core:prefs`、`:ink`、任何 feature、任何 extension。 |
 | **4** | Ink | `:ink` | `android-library`，View 系统，无 Compose。依赖 `:core:model` + `:core:database` + `:render:api`。`InkAnchor` 在 `:core:model`，编解码由 `:ink` 的 `InkAnchorCodec` 处理。 |
 | **5** | UI 基础 | `:core:ui` | `android-library`，Compose 可用。Material3 主题、色板、字体、间距 tokens、共享 composable。 |
 | **6** | 功能模块 | `:features:library`、`:features:reader`、`:features:settings` | `android-library`，Compose + ViewModels。(1) 不得直接依赖 `render:*` 实现模块，仅通过 `:app` DI 注入；(2) 功能模块之间不得相互依赖。 |
@@ -168,9 +169,9 @@
 
 每条都给出可直接落 CI 的判定命令（F-M5：约束 2 收紧为可机械 grep 的规则，不靠人判定「行为接口」）：
 
-1. **非 Compose 渲染实现不得依赖 Compose**：`:render:pdf`/`:render:txt`/`:render:mupdf`/`:render:animate` 的 `./gradlew :render:pdf:dependencies --configuration releaseCompileClasspath | grep -i compose` 必须返回空。**例外**：`:render:epub`/`:render:md` 允许 Compose（产出 ComposeView，见 §3.2 Layer 3 例外），但仍不得出现 `:core:ui`（`grep core:ui` 返回空）。
+1. **非 Compose 渲染实现不得依赖 Compose**：`:render:pdf`/`:render:txt`/`:render:cbz`/`:render:animate` 的 release compile classpath 不得包含 Compose。**例外**：`:render:epub`/`:render:md` 允许 Compose（产出 ComposeView，见 §3.2 Layer 3 例外），但仍不得出现 `:core:ui`（`grep core:ui` 返回空）。
 2. `:core:model` 纯度（可机械判定）：源码目录 `grep -rE '(^import android\.|: *Flow<|suspend |interface )' core/model/src/main` 必须返回空——即不含 `android.*` import、不含 `suspend`、不含返回 `Flow` 的成员、不声明 `interface`（仅 `data class`/`enum`/`sealed interface`+`@Serializable` 数据；`sealed interface` 作纯数据多态用 `InkAnchor`、`LocatorStrategy`、`LoadingState` 等需在白名单显式豁免）。
-3. `:features:reader` 不得依赖具体引擎：`./gradlew :features:reader:dependencies | grep -E 'render:(epub|pdf|txt|mupdf|md)'` 返回空（仅允许 `render:api`）。
+3. `:features:reader` 不得依赖具体引擎：`./gradlew :features:reader:dependencies | grep -E 'render:(epub|pdf|txt|cbz|md)'` 返回空（仅允许 `render:api`）。
 4. 功能模块之间零依赖：任两 `:features:*` 互不出现在对方 `dependencies` 输出中。
 5. **base APK 不得包含 `:render:mupdf` 的 MuPDF `.so`**（v4，见 §5.7 optional gate）：`unzip -l app-base-release.apk | grep -i 'libmupdf'` 返回空。
 
@@ -191,7 +192,7 @@ FrameLayout (match_parent) ← reader_root, clipChildren=false（允许 ink 超�
 │   同一时刻只有 ONE child；分页格式由 PageTransitionHost 包装（见 §5.6），连续格式直接挂载：
 │     EPUB(滚动) → 单 ComposeView（LazyColumn 连续滚动）；EPUB(分页) → host 的 per-page ComposeView（见 §5.5，不在单 ComposeView 内套 HorizontalPager）
 │     PDF  → ImageView（PdfRenderer，Bitmap LRU 3 页，ScaleType.MATRIX）
-│     DOCX/CBZ → ImageView（MuPDF JNI，optional 引擎）
+│     DOCX → 当前延期；CBZ → ZoomImageView（ZIP 图片分页，无 MuPDF）
 │     TXT  → RecyclerView（TxtVirtualPager + Paging3，字符边界对齐，见 §5.4）
 │     MD   → ScrollView > TextView（Markwon Spannables，无 WebView）
 │
@@ -217,7 +218,9 @@ FrameLayout (match_parent) ← reader_root, clipChildren=false（允许 ink 超�
 | 格式 | 实现 |
 |------|------|
 | EPUB | Pinch **进行中**只做廉价视觉缩放预览（当前页文本 `scale`），`ACTION_UP` 后 debounce 提交一次 `setFontSize()` 真重排，非 viewport 缩放（F-R7：避免每帧重测整章分页丢帧） |
-| PDF / DOCX / CBZ | `ScaleGestureDetector` + `ImageView.matrix`；翻页时 matrix 重置 |
+| PDF | `ScaleGestureDetector` + `ImageView.matrix`；翻页时 matrix 重置 |
+| CBZ | ZoomImage 分块缩放与平移；页切换后由新 page holder 拥有独立矩阵 |
+| DOCX | 当前延期 |
 | TXT / MD | 同 EPUB：pinch 预览 + `ACTION_UP` 提交 `setFontSize()`，非 viewport 缩放 |
 
 > **重排测量惰性化（F-R7 / 配合 F14）**：分页模式下 `setFontSize` 不一次性重测全书，只测当前视口 ±1 页即可翻页，`pageCount`（§5.1 `StateFlow<Int>`）随后台测量异步回填，与其 reactive 语义一致。
@@ -398,8 +401,8 @@ class NoEngineException(uri: Uri) : IllegalStateException("No ReaderEngine suppo
 | PDF | `PdfRendererEngine` | 0 | `:render:pdf` | ImageView | base |
 | TXT | `TxtVirtualPagerEngine` | 0 | `:render:txt` | RecyclerView | base |
 | MD | `MarkwonEngine` | 0 | `:render:md` | TextView | base |
-| DOCX | `MuPdfEngine` | 10 | `:render:mupdf` | ImageView | **optional（§5.7）** |
-| CBZ | `MuPdfEngine` | 10 | `:render:mupdf` | ImageView | **optional（§5.7）** |
+| DOCX | — | — | — | — | **deferred（§5.7）** |
+| CBZ | `CbzReaderEngine` | 0 | `:render:cbz` | ZoomImageView | base, MuPDF-free |
 | 翻页动效 | `PageTransitionHost` 实现 | — | `:render:animate` | — | base |
 
 ### 5.4 TXT 字符边界对齐（P2-J）
@@ -524,13 +527,13 @@ lifecycleScope.launch { engine.pagingKind.collect { mountHostFor(it) } }
 
 **运行时切换阅读模式（R-6）**：`pagingKind`（§5.1）声明引擎的**默认**分页形态，但用户经 `setMode(SCROLL/PAGED)`（§4.4）可在阅读中切换滚动↔分页。约定：`ReaderEngine` 暴露 `val pagingKind: StateFlow<PagingKind>`（而非常量），`ReaderRootLayout` 观察其变化——值变时 `host.unbind()` → 按新值经 `hostFactory` 取新 host → `bind` 并以 `currentLocator` 恢复位置。这样「Phase1 仅 CONTINUOUS、Phase2 支持运行时切 PAGED」「同一 EPUB 引擎实例两种形态」都被覆盖，不需换引擎实例。
 
-### 5.7 Optional DOCX/CBZ gate（MuPDF license decision）
+### 5.7 Optional DOCX gate / MuPDF-free CBZ decision
 
-- DOCX/CBZ 保持 **optional / deferred**，**不进 base APK**（§3.3 CI 约束 5）。
+- DOCX 保持 **optional / deferred**，不进 base APK；MuPDF 仍不得进入 base APK（§3.3 CI 约束 5）。
 - 2026-06-23 `ADR-MuPDF-License` 已裁决：当前里程碑不启用 AGPL MuPDF 路线；任何 MuPDF-linked binary 必须先满足完整 AGPL 合规或商业授权。
 - DOCX 不再假定由 MuPDF Core 直接支持；当前官方资料把 Office DOC/DOCX 放在 PyMuPDF Pro / conversion-layer 范畴，故 DOCX optional engine 延期。
-- CBZ 可被 MuPDF 支持，但本轮也延期；若未来优先级升高，先评估无 AGPL 的 first-party ZIP image pager，再比较 MuPDF。
-- 用户打开 DOCX/CBZ 时应显示「此格式当前未启用」与后续路线说明，而非静默失败。
+- CBZ 已采用无 AGPL 的 first-party `:render:cbz`：安全 ZIP 索引、自然排序、ComicInfo RTL、邻页缓存与 ZoomImage 分块渲染。
+- 用户打开 DOCX 时应显示「此格式当前未启用」与后续路线说明，而非静默失败。
 
 ## 六、Ink / 手写笔集成
 
@@ -1071,9 +1074,9 @@ phaseInclude(1, ":app", ":core:model", ":core:calibre", ":core:prefs",
                 ":extensions:api", ":features:library")
 // Phase 2 = 渲染引擎 + reader，用户验收 Phase A「本地阅读闭环」在此达成。
 phaseInclude(2, ":render:api", ":render:epub", ":render:pdf", ":render:txt",
-                ":render:md", ":render:animate",
+                ":render:md", ":render:cbz", ":render:animate",
                 ":features:reader", ":features:settings")
-phaseInclude(3, ":render:mupdf", ":ink",
+phaseInclude(3, ":ink",
                 ":extensions:tts", ":extensions:stats", ":extensions:opds")
 ```
 
@@ -1111,13 +1114,13 @@ phaseInclude(3, ":render:mupdf", ":ink",
 
 ### Phase 2：渲染引擎 + 阅读器（Phase B + C）
 
-9–20：`:render:api`（`ReaderEngine` + `EngineDescriptor` + Registry + `PageTransitionHost` + `PageTransitionHostFactory`）→ `:render:epub`/`:render:pdf`/`:render:txt`/`:render:md`/`:render:animate` → `:features:reader`（含 `ReaderRootLayout`）/`:features:settings` → `:app`（Navigation host + Koin）。`:core:database`/`:core:ui` 已在 phase1 就位。Calibre 接入向导 + 自动探测。
+9–20：`:render:api`（`ReaderEngine` + `EngineDescriptor` + Registry + `PageTransitionHost` + `PageTransitionHostFactory`）→ `:render:epub`/`:render:pdf`/`:render:txt`/`:render:md`/`:render:cbz`/`:render:animate` → `:features:reader`（含 `ReaderRootLayout`）/`:features:settings` → `:app`（Navigation host + Koin）。`:core:database`/`:core:ui` 已在 phase1 就位。Calibre 接入向导 + 自动探测。
 
-**结束态**：浏览 Calibre 书库、打开 EPUB/PDF/TXT/MD、翻页、调字号/主题；系统自动选引擎；首屏/翻页/内存达预算；TalkBack smoke 通过。
+**结束态**：浏览 Calibre 书库、打开 EPUB/PDF/TXT/MD/CBZ、翻页、调字号/主题；系统自动选引擎；首屏/翻页/内存达预算；TalkBack smoke 通过。
 
 ### Phase 3：精品增强（Phase D + E）
 
-数据出口（`LinReads Backup` 导出/恢复、离线缓存）→ `:extensions:tts`/`:extensions:stats`/`:extensions:opds` → `:ink` 实现（`CanvasView` + `InProgressStrokesView` + 触摸路由 + `InkToolbar`）。DOCX/CBZ 已由 `ADR-MuPDF-License` 延期，不再作为当前 Phase 3 默认下一项。每能力独立 ADR + 权限说明 + 包体积预算 + 关闭路径。
+数据出口（`LinReads Backup` 导出/恢复、离线缓存）→ `:extensions:tts`/`:extensions:stats`/`:extensions:opds` → `:ink` 实现（`CanvasView` + `InProgressStrokesView` + 触摸路由 + `InkToolbar`）。DOCX 继续由 `ADR-MuPDF-License` 延期；CBZ 的条漫、双页、额外压缩格式与远程漫画服务按漫画调研文档分期。每能力独立 ADR + 权限说明 + 包体积预算 + 关闭路径。
 
 ---
 
@@ -1138,7 +1141,7 @@ R1 `ReaderState` 不含 View 引用；R2 `Locator` 唯一定义在 `:core:model`
 | **V5** | 扩展发现统一 Koin multibind，删 ServiceLoader | P1-G：机制重叠 + Android R8 裁剪风险 |
 | **V6** | `PageTransitionHost` 拆分翻页宿主与文档渲染 | R1-3：单 child document_host 与 ViewPager2 矛盾 |
 | **V7** | `BookSource.download()` 返回 `DownloadedAsset` | R1-2：`java.io.File` 削弱跨平台/SAF/导出可携带性 |
-| **V8** | MuPDF DOCX/CBZ 为 optional，不进 base APK | 用户安装轻 + license 风险隔离 |
+| **V8** | MuPDF/DOCX 为 optional，不进 base APK；CBZ 使用第一方 ZIP 图片引擎 | 用户安装轻 + license 风险隔离 |
 | **V9** | ~~nanohttpd loopback + path token~~ → **EPUB 去 WebView 后整体移除**（见 E1） | P2-I 失效：无 WebView 即无本地 HTTP server 泄露面 |
 | **V10** | TXT 分页对齐字符边界，`ByteOffset` 落字符起始 | P2-J：多字节编码半字符乱码 |
 | **V11** | 用户轻量契约为实现前 P0 gate | Round 1 P0 |
@@ -1197,13 +1200,13 @@ R1 `ReaderState` 不含 View 引用；R2 `Locator` 唯一定义在 `:core:model`
 | R-3 | ReaderItem→渲染降级矩阵 | §5.5 |
 | R-7 | pinch 预览+ACTION_UP 提交重排 | §4.4 |
 
-### 12.4 ADR-MuPDF-License（DOCX/CBZ optional，2026-06-23 裁决）
+### 12.4 ADR-MuPDF-License（DOCX optional / CBZ alternative）
 
-详见 `docs/audit/adr-mupdf-license-2026-06-23.md`。结论：当前纯阅读回填不启用 AGPL MuPDF；base APK 必须保持 MuPDF-free；任何 MuPDF-linked binary 都必须先完成 AGPL 合规或商业授权。DOCX 因当前官方资料未显示为 MuPDF Core 标准输入而延期；CBZ 虽可由 MuPDF 支持，但本轮也延期，未来优先评估无 AGPL 的 first-party ZIP image pager。
+详见 `docs/audit/adr-mupdf-license-2026-06-23.md`。结论：不启用 AGPL MuPDF；base APK 必须保持 MuPDF-free；任何 MuPDF-linked binary 都必须先完成 AGPL 合规或商业授权。DOCX 因当前官方资料未显示为 MuPDF Core 标准输入而延期；CBZ 已于 2026-07-27 启用无 AGPL 的 first-party ZIP image pager。
 
 ### 12.5 关键技术选型
 
-EPUB→原生重排（jsoup→AnnotatedString，无 WebView）；PDF→系统 PdfRenderer；DOCX/CBZ→当前延期（MuPDF 不进 base，未来另行 ADR 更新）；MD→Markwon Spannables；TXT→RecyclerView+Paging3+FileChannel；翻页→PageTransitionHost(ViewPager2)；DI→Koin；HTTP→Ktor；序列化→kotlinx.serialization；同步(P1)→NoOpSyncBackend（可选 KoSync 互通）。
+EPUB→原生重排（jsoup→AnnotatedString，无 WebView）；PDF→系统 PdfRenderer；CBZ→第一方 ZIP + ZoomImage；DOCX→当前延期（MuPDF 不进 base）；MD→Markwon Spannables；TXT→RecyclerView+Paging3+FileChannel；翻页→PageTransitionHost(ViewPager2)；DI→Koin；HTTP→Ktor；序列化→kotlinx.serialization；同步(P1)→NoOpSyncBackend（可选 KoSync 互通）。
 
 ### 12.6 安全 / 权限矩阵（R1）
 

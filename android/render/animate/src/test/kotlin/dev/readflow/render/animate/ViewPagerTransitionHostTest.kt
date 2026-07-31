@@ -1,10 +1,8 @@
 package dev.readflow.render.animate
 
 import android.app.Application
-import android.app.Activity
 import android.content.Context
 import android.net.Uri
-import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
 import androidx.recyclerview.widget.RecyclerView
@@ -14,6 +12,8 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.TransitionType
 import dev.readflow.render.api.PagedReaderEngine
+import dev.readflow.render.api.DirectionalPagedReaderEngine
+import dev.readflow.render.api.PageReadingDirection
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReadingMode
 import dev.readflow.render.api.SelfPagingReaderEngine
@@ -34,9 +34,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
-import org.robolectric.Robolectric
 import org.robolectric.RuntimeEnvironment
-import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
@@ -74,6 +72,34 @@ class ViewPagerTransitionHostTest {
 
         assertEquals(1, refreshCount)
         assertEquals(3, adapter?.itemCount)
+        host.unbind()
+    }
+
+    @Test
+    fun `paged host ignores initial page count replay after adapter binding`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = FakePagedEngine(context, initialPageCount = 3)
+        val host = ViewPagerTransitionHost(context, TransitionType.NONE)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(engine)
+        val adapter = checkNotNull(pager.adapter)
+        var refreshCount = 0
+        adapter.registerAdapterDataObserver(object : RecyclerView.AdapterDataObserver() {
+            override fun onChanged() {
+                refreshCount += 1
+            }
+        })
+
+        runCurrent()
+
+        assertEquals(
+            "StateFlow's initial replay must not recreate every retained page",
+            0,
+            refreshCount,
+        )
+        assertEquals(3, adapter.itemCount)
         host.unbind()
     }
 
@@ -124,6 +150,116 @@ class ViewPagerTransitionHostTest {
         assertEquals(0, pager.currentItem)
         host.unbind()
     }
+
+    @Test
+    fun `paged host ignores stale selection while rebinding a fresh engine`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val firstEngine = FakePagedEngine(context, initialPageCount = 4)
+        val secondEngine = FakePagedEngine(context, initialPageCount = 4)
+        val host = ViewPagerTransitionHost(context, TransitionType.NONE)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(firstEngine)
+        pager.setCurrentItem(1, false)
+        host.bind(secondEngine)
+
+        val callback = ViewPagerTransitionHost::class.java
+            .getDeclaredField("pageCallback")
+            .apply { isAccessible = true }
+            .get(host) as ViewPager2.OnPageChangeCallback
+        callback.onPageSelected(1)
+        runCurrent()
+
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(640, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(960, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 640, 960)
+        runCurrent()
+
+        assertEquals("a rebind must return to the new engine's page zero", 0, pager.currentItem)
+        assertEquals(
+            LocatorStrategy.Page(0, 4),
+            secondEngine.currentLocator.value.strategy,
+        )
+        host.unbind()
+    }
+
+    @Test
+    fun `paged host keeps initial guard when stale adapter reports settling during rebind`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val firstEngine = FakePagedEngine(context, initialPageCount = 4, initialPageIndex = 1)
+        val secondEngine = FakePagedEngine(context, initialPageCount = 4, initialPageIndex = 3)
+        val host = ViewPagerTransitionHost(context, TransitionType.NONE)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(firstEngine)
+        host.bind(secondEngine)
+
+        val callback = ViewPagerTransitionHost::class.java
+            .getDeclaredField("pageCallback")
+            .apply { isAccessible = true }
+            .get(host) as ViewPager2.OnPageChangeCallback
+        // ViewPager2 may deliver an already queued callback from the detached adapter after the
+        // new adapter has been installed. It must not release the new binding's initial guard.
+        callback.onPageScrollStateChanged(ViewPager2.SCROLL_STATE_SETTLING)
+        callback.onPageSelected(1)
+        callback.onPageScrollStateChanged(ViewPager2.SCROLL_STATE_IDLE)
+
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(640, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(960, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 640, 960)
+        runCurrent()
+
+        assertEquals(3, pager.currentItem)
+        assertEquals(LocatorStrategy.Page(3, 4), secondEngine.currentLocator.value.strategy)
+        host.unbind()
+    }
+
+    @Test
+    fun `initial page guard settles the expected idle page and reports onPageSettled exactly once`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication() as Application
+            val engine = FakePagedEngine(context, initialPageCount = 3, initialPageIndex = 1)
+            val host = ViewPagerTransitionHost(context, TransitionType.NONE)
+            val pager = host.hostView() as ViewPager2
+            val settledPages = mutableListOf<Int>()
+            host.setOnPageSettled(settledPages::add)
+
+            host.bind(engine)
+            val callback = ViewPagerTransitionHost::class.java
+                .getDeclaredField("pageCallback")
+                .apply { isAccessible = true }
+                .get(host) as ViewPager2.OnPageChangeCallback
+
+            // Simulate the queued ViewPager2 callbacks that arrive while the initial-page
+            // guard is still active. The idle event must release the guard AND report the
+            // expected page exactly once — never zero and never duplicated by the release path.
+            callback.onPageSelected(1)
+            callback.onPageScrollStateChanged(ViewPager2.SCROLL_STATE_IDLE)
+
+            assertEquals(1, pager.currentItem)
+            assertEquals(
+                "initial guard must settle and report the expected idle page exactly once",
+                listOf(1),
+                settledPages,
+            )
+
+            // A later genuine idle event still reports through the normal path.
+            callback.onPageSelected(1)
+            callback.onPageScrollStateChanged(ViewPager2.SCROLL_STATE_IDLE)
+            assertEquals(
+                "a later settle must keep reporting through the normal path",
+                listOf(1, 1),
+                settledPages,
+            )
+            host.unbind()
+        }
 
     @Test
     fun `self paging engine is mounted directly without ViewPager adapter`() = runTest(dispatcher) {
@@ -199,16 +335,18 @@ class ViewPagerTransitionHostTest {
     }
 
     @Test
-    fun `paged host rebinds page content after equal-count viewport layout`() = runTest(dispatcher) {
+    fun `paged host does not recreate holders for equal-count viewport layout`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val context = RuntimeEnvironment.getApplication() as Application
         val engine = FakePagedEngine(context, initialPageCount = 2)
         val host = ViewPagerTransitionHost(context, TransitionType.NONE)
         val pager = host.hostView() as ViewPager2
-        val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-        activity.addContentView(pager, ViewGroup.LayoutParams(720, 1280))
-
         host.bind(engine)
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(1200, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 720, 1200)
         runCurrent()
         val adapter = checkNotNull(pager.adapter)
         var refreshCount = 0
@@ -219,27 +357,177 @@ class ViewPagerTransitionHostTest {
         })
 
         pager.measure(
-            View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(1280, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(700, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(1100, View.MeasureSpec.EXACTLY),
         )
-        pager.layout(0, 0, 720, 1280)
-        shadowOf(Looper.getMainLooper()).idle()
+        pager.layout(0, 0, 700, 1100)
         runCurrent()
 
+        assertTrue(engine.viewportReports.any { it == 700 to 1100 })
         assertEquals(
-            "equal page count still requires a holder rebind after viewport-dependent content changes",
-            1,
+            "the engine refreshes active equal-count pages in place",
+            0,
             refreshCount,
         )
         host.unbind()
     }
 
+    @Test
+    fun `paged host retains exactly one neighbour for responsive turns`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val host = ViewPagerTransitionHost(context, TransitionType.SLIDE)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(FakePagedEngine(context, initialPageCount = 5))
+
+        assertEquals(
+            "current plus one bounded neighbour on each side avoids blank turns without an unbounded bitmap cache",
+            1,
+            pager.offscreenPageLimit,
+        )
+        host.unbind()
+    }
+
+    @Test
+    fun `paged host honors an engine-specific bounded retention preference`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val host = ViewPagerTransitionHost(context, TransitionType.SLIDE)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(
+            FakePagedEngine(
+                context = context,
+                initialPageCount = 8,
+                preferredOffscreenPageLimit = 2,
+            ),
+        )
+
+        assertEquals(2, pager.offscreenPageLimit)
+        host.unbind()
+    }
+
+    @Test
+    fun `curl host makes a restored nonzero page visible on its first layout`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = FakePagedEngine(
+            context = context,
+            initialPageCount = 12,
+            initialPageIndex = 4,
+        )
+        val host = ViewPagerTransitionHost(context, TransitionType.CURL)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(engine)
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(1200, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 720, 1200)
+        runCurrent()
+
+        val recycler = pager.getChildAt(0) as RecyclerView
+        val restoredPage = checkNotNull(recycler.findViewHolderForAdapterPosition(4)).itemView
+        assertEquals(4, pager.currentItem)
+        assertEquals(ViewPager2.SCROLL_STATE_IDLE, pager.scrollState)
+        assertEquals(1f, restoredPage.alpha, 0.001f)
+        assertEquals(0f, restoredPage.rotationY, 0.001f)
+        host.unbind()
+    }
+
+    @Test
+    fun `paged adapter clears a recycled holder transform before binding current content`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = FakePagedEngine(
+            context = context,
+            initialPageCount = 12,
+            initialPageIndex = 4,
+        )
+        val host = ViewPagerTransitionHost(context, TransitionType.CURL)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(engine)
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(1200, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 720, 1200)
+        runCurrent()
+
+        val recycler = pager.getChildAt(0) as RecyclerView
+        val holder = checkNotNull(recycler.findViewHolderForAdapterPosition(4))
+        holder.itemView.alpha = 0f
+        holder.itemView.rotationY = 45f
+
+        @Suppress("UNCHECKED_CAST")
+        (checkNotNull(pager.adapter) as RecyclerView.Adapter<RecyclerView.ViewHolder>)
+            .onBindViewHolder(holder, 4)
+
+        assertEquals(1f, holder.itemView.alpha, 0.001f)
+        assertEquals(0f, holder.itemView.rotationY, 0.001f)
+        host.unbind()
+    }
+
+    @Test
+    fun `curl host repairs a stale current-page transform when pager is idle`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val engine = FakePagedEngine(
+            context = context,
+            initialPageCount = 12,
+            initialPageIndex = 4,
+        )
+        val host = ViewPagerTransitionHost(context, TransitionType.CURL)
+        val pager = host.hostView() as ViewPager2
+
+        host.bind(engine)
+        pager.measure(
+            View.MeasureSpec.makeMeasureSpec(720, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(1200, View.MeasureSpec.EXACTLY),
+        )
+        pager.layout(0, 0, 720, 1200)
+        runCurrent()
+        val recycler = pager.getChildAt(0) as RecyclerView
+        val currentPage = checkNotNull(recycler.findViewHolderForAdapterPosition(4)).itemView
+        currentPage.alpha = 0f
+        currentPage.rotationY = 45f
+
+        val callback = ViewPagerTransitionHost::class.java
+            .getDeclaredField("pageCallback")
+            .apply { isAccessible = true }
+            .get(host) as ViewPager2.OnPageChangeCallback
+        callback.onPageScrollStateChanged(ViewPager2.SCROLL_STATE_IDLE)
+
+        assertEquals(1f, currentPage.alpha, 0.001f)
+        assertEquals(0f, currentPage.rotationY, 0.001f)
+        host.unbind()
+    }
+
+    @Test
+    fun `page reading direction maps to Android layout direction`() {
+        assertEquals(
+            View.LAYOUT_DIRECTION_LTR,
+            pageLayoutDirection(PageReadingDirection.LEFT_TO_RIGHT),
+        )
+        assertEquals(
+            View.LAYOUT_DIRECTION_RTL,
+            pageLayoutDirection(PageReadingDirection.RIGHT_TO_LEFT),
+        )
+    }
+
     private class FakePagedEngine(
         private val context: Context,
         initialPageCount: Int,
-    ) : PagedReaderEngine {
+        initialPageIndex: Int = 0,
+        override val preferredOffscreenPageLimit: Int = 1,
+        override val pageReadingDirection: StateFlow<PageReadingDirection> =
+            MutableStateFlow(PageReadingDirection.LEFT_TO_RIGHT),
+    ) : PagedReaderEngine, DirectionalPagedReaderEngine {
         private val locatorState = MutableStateFlow(
-            Locator(LocatorStrategy.Page(index = 0, total = initialPageCount)),
+            Locator(LocatorStrategy.Page(index = initialPageIndex, total = initialPageCount)),
         )
 
         val pageCountState = MutableStateFlow(initialPageCount)
@@ -269,7 +557,7 @@ class ViewPagerTransitionHostTest {
             pageRequestCallback = callback
         }
 
-        override fun setViewportSize(widthPx: Int, heightPx: Int) {
+        override suspend fun setViewportSize(widthPx: Int, heightPx: Int) {
             viewportReports += widthPx to heightPx
         }
 

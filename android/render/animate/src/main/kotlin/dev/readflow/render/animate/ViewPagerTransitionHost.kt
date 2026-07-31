@@ -10,10 +10,13 @@ import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.TransitionType
 import dev.readflow.render.api.PageTransitionHost
+import dev.readflow.render.api.DirectionalPagedReaderEngine
+import dev.readflow.render.api.PageReadingDirection
 import dev.readflow.render.api.PagedReaderEngine
 import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.SelfPagingReaderEngine
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -44,10 +47,15 @@ class ViewPagerTransitionHost(
     private var pagedEngine: PagedReaderEngine? = null
     private var selfPagingEngine: SelfPagingReaderEngine? = null
     private var pageCountJob: Job? = null
+    private var pageDirectionJob: Job? = null
+    private var viewportJob: Job? = null
     private var onPageSettled: ((pageIndex: Int) -> Unit)? = null
     private var transitionType: TransitionType = transition
     private var lastReportedViewportWidth: Int = 0
     private var lastReportedViewportHeight: Int = 0
+    private var bindGeneration: Long = 0L
+    private var suppressPageCallbacks: Boolean = false
+    private var initialPageGuard: Int? = null
 
     private val viewportLayoutListener =
         View.OnLayoutChangeListener { _, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom ->
@@ -66,23 +74,55 @@ class ViewPagerTransitionHost(
         override fun onPageSelected(position: Int) {
             // Self-paging engines own their paging + locator inside one static view. Let the engine
             // drive its own locator instead of reacting to stale ViewPager2 callbacks.
-            if (selfPagingEngine != null) return
+            if (selfPagingEngine != null || suppressPageCallbacks) return
+            initialPageGuard?.let { expected ->
+                if (position != expected && pager.scrollState == ViewPager2.SCROLL_STATE_IDLE) {
+                    pager.setCurrentItem(expected, false)
+                }
+                return
+            }
             val activeEngine = engine ?: return
             val total = activeEngine.pageCount.value
             if (total <= 0) return
+            val callbackGeneration = bindGeneration
             scope.launch {
+                if (
+                    callbackGeneration != bindGeneration ||
+                    suppressPageCallbacks ||
+                    engine !== activeEngine
+                ) return@launch
                 activeEngine.goTo(pageLocator(position, total))
             }
         }
 
         override fun onPageScrollStateChanged(state: Int) {
+            if (
+                state == ViewPager2.SCROLL_STATE_DRAGGING ||
+                state == ViewPager2.SCROLL_STATE_SETTLING
+            ) {
+                // A callback queued by the previous adapter can arrive after bind() installs a
+                // new adapter. Keep the new binding guarded until its expected page is confirmed
+                // at idle; explicit next()/previous() calls release the guard intentionally.
+                return
+            }
             if (state == ViewPager2.SCROLL_STATE_IDLE) {
-                onPageSettled?.invoke(pager.currentItem)
+                restoreCurrentPageTransform()
+                val expected = initialPageGuard
+                if (expected != null) {
+                    if (pager.currentItem != expected) {
+                        pager.setCurrentItem(expected, false)
+                    } else {
+                        releaseInitialPageGuard()
+                    }
+                    return
+                }
+                if (!suppressPageCallbacks) onPageSettled?.invoke(pager.currentItem)
             }
         }
     }
 
     init {
+        pager.offscreenPageLimit = DEFAULT_OFFSCREEN_PAGE_LIMIT
         pager.registerOnPageChangeCallback(pageCallback)
         pager.addOnLayoutChangeListener(viewportLayoutListener)
         setTransition(transition)
@@ -92,8 +132,17 @@ class ViewPagerTransitionHost(
         if (selfPagingEngine != null) selfPagingContainer else pager
 
     override fun bind(engine: ReaderEngine) {
+        val currentBindGeneration = ++bindGeneration
+        suppressPageCallbacks = true
+        initialPageGuard = null
         pageCountJob?.cancel()
         pageCountJob = null
+        pageDirectionJob?.cancel()
+        pageDirectionJob = null
+        viewportJob?.cancel()
+        viewportJob = null
+        lastReportedViewportWidth = 0
+        lastReportedViewportHeight = 0
         pagedEngine?.setPageRequestCallback(null)
         pager.adapter = null
         selfPagingContainer.removeAllViews()
@@ -110,6 +159,7 @@ class ViewPagerTransitionHost(
             val view = engine.createView()
             (view.parent as? ViewGroup)?.removeView(view)
             selfPagingContainer.addView(view, matchParentLayoutParams())
+            suppressPageCallbacks = false
             return
         }
         pager.isUserInputEnabled = true
@@ -119,7 +169,22 @@ class ViewPagerTransitionHost(
             pager.adapter = SingleViewAdapter(engine.createView())
             return
         }
+        pager.offscreenPageLimit = fixedPageEngine.preferredOffscreenPageLimit.coerceAtLeast(1)
+        val directionalEngine = fixedPageEngine as? DirectionalPagedReaderEngine
+        applyPageReadingDirection(
+            directionalEngine?.pageReadingDirection?.value ?: PageReadingDirection.LEFT_TO_RIGHT,
+        )
+        if (directionalEngine != null) {
+            pageDirectionJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                directionalEngine.pageReadingDirection.collect(::applyPageReadingDirection)
+            }
+        }
         fixedPageEngine.setPageRequestCallback { pageIndex ->
+            if (
+                currentBindGeneration != bindGeneration ||
+                suppressPageCallbacks ||
+                pagedEngine !== fixedPageEngine
+            ) return@setPageRequestCallback
             val lastIndex = (pager.adapter?.itemCount ?: 0) - 1
             if (lastIndex < 0) return@setPageRequestCallback
             val target = pageIndex.coerceIn(0, lastIndex)
@@ -132,7 +197,35 @@ class ViewPagerTransitionHost(
         val total = engine.pageCount.value
         if (total > 0) {
             val initial = fixedPageEngine.pageIndexForLocator(engine.currentLocator.value)
+            initialPageGuard = initial
             pager.setCurrentItem(initial, false)
+            pager.post {
+                if (
+                    currentBindGeneration != bindGeneration ||
+                    pagedEngine !== fixedPageEngine
+                ) return@post
+                // ViewPager2 may dispatch a queued selection from the previous adapter after the
+                // first setCurrentItem call. Reassert the engine's semantic start while callbacks
+                // are still suppressed, then publish the binding as interactive.
+                pager.setCurrentItem(initial, false)
+                if (pager.scrollState == ViewPager2.SCROLL_STATE_IDLE) restoreCurrentPageTransform()
+                pager.post {
+                    if (
+                        currentBindGeneration != bindGeneration ||
+                        pagedEngine !== fixedPageEngine
+                    ) return@post
+                    if (
+                        pager.scrollState == ViewPager2.SCROLL_STATE_IDLE &&
+                        pager.currentItem == initial
+                    ) {
+                        releaseInitialPageGuard()
+                    } else {
+                        pager.setCurrentItem(initial, false)
+                    }
+                }
+            }
+        } else {
+            suppressPageCallbacks = false
         }
         // Report actual pager viewport once layout has a size (and again on size changes).
         if (pager.width > 0 && pager.height > 0) {
@@ -147,7 +240,7 @@ class ViewPagerTransitionHost(
         pageCountJob = scope.launch {
             fixedPageEngine.pageCount.collect { pageCount ->
                 if (pager.adapter !== adapter) return@collect
-                adapter.refreshPageCount()
+                adapter.refreshPageCount(pageCount)
                 clampCurrentItemTo(pageCount)
             }
         }
@@ -174,6 +267,8 @@ class ViewPagerTransitionHost(
 
     override suspend fun next() {
         selfPagingEngine?.let { it.goToAdjacentPage(1); return }
+        initialPageGuard = null
+        suppressPageCallbacks = false
         val lastIndex = (pager.adapter?.itemCount ?: 0) - 1
         if (lastIndex < 0) return
         val target = (pager.currentItem + 1).coerceAtMost(lastIndex)
@@ -184,6 +279,8 @@ class ViewPagerTransitionHost(
 
     override suspend fun previous() {
         selfPagingEngine?.let { it.goToAdjacentPage(-1); return }
+        initialPageGuard = null
+        suppressPageCallbacks = false
         val target = (pager.currentItem - 1).coerceAtLeast(0)
         if (target != pager.currentItem) {
             pager.setCurrentItem(target, transitionType != TransitionType.NONE)
@@ -195,12 +292,21 @@ class ViewPagerTransitionHost(
     }
 
     override fun unbind() {
+        bindGeneration++
+        suppressPageCallbacks = true
+        initialPageGuard = null
         pageCountJob?.cancel()
         pageCountJob = null
+        pageDirectionJob?.cancel()
+        pageDirectionJob = null
+        viewportJob?.cancel()
+        viewportJob = null
         pagedEngine?.setPageRequestCallback(null)
         lastReportedViewportWidth = 0
         lastReportedViewportHeight = 0
         pager.isUserInputEnabled = true
+        pager.offscreenPageLimit = DEFAULT_OFFSCREEN_PAGE_LIMIT
+        applyPageReadingDirection(PageReadingDirection.LEFT_TO_RIGHT)
         pager.adapter = null
         selfPagingContainer.removeAllViews()
         pagedEngine = null
@@ -215,21 +321,37 @@ class ViewPagerTransitionHost(
         lastReportedViewportWidth = widthPx
         lastReportedViewportHeight = heightPx
         val activeEngine = pagedEngine ?: return
-        val pageCountBefore = activeEngine.pageCount.value
-        activeEngine.setViewportSize(widthPx, heightPx)
-        if (activeEngine.pageCount.value == pageCountBefore) {
-            // A viewport repack can replace the active page's child views without changing the
-            // page count. StateFlow then emits nothing, so ViewPager2 must rebind on the next frame
-            // after its current layout traversal has finished.
-            pager.post {
-                if (pagedEngine === activeEngine &&
-                    lastReportedViewportWidth == widthPx &&
-                    lastReportedViewportHeight == heightPx
-                ) {
-                    pager.adapter?.notifyDataSetChanged()
-                }
-            }
+        viewportJob?.cancel()
+        viewportJob = scope.launch {
+            activeEngine.setViewportSize(widthPx, heightPx)
         }
+    }
+
+    private fun applyPageReadingDirection(direction: PageReadingDirection) {
+        val layoutDirection = pageLayoutDirection(direction)
+        pager.layoutDirection = layoutDirection
+        pager.getChildAt(0)?.layoutDirection = layoutDirection
+        pager.requestLayout()
+    }
+
+    private fun restoreCurrentPageTransform() {
+        val recycler = pager.getChildAt(0) as? RecyclerView ?: return
+        recycler.findViewHolderForAdapterPosition(pager.currentItem)
+            ?.itemView
+            ?.resetPageTransform()
+    }
+
+    /**
+     * Publish the binding as interactive and report the initial settle exactly once.
+     * Both the ViewPager2 idle callback and the bind() post chain may observe the guarded
+     * page at idle; the guard null-check makes the release idempotent so a host never sees
+     * zero or duplicate settle callbacks for the initial page.
+     */
+    private fun releaseInitialPageGuard() {
+        if (initialPageGuard == null) return
+        initialPageGuard = null
+        suppressPageCallbacks = false
+        onPageSettled?.invoke(pager.currentItem)
     }
 
     private fun clampCurrentItemTo(pageCount: Int) {
@@ -243,7 +365,9 @@ class ViewPagerTransitionHost(
     private class PagedEngineAdapter(
         private val engine: PagedReaderEngine,
     ) : RecyclerView.Adapter<PageHolder>() {
-        override fun getItemCount(): Int = engine.pageCount.value
+        private var pageCount = engine.pageCount.value
+
+        override fun getItemCount(): Int = pageCount
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): PageHolder =
             PageHolder(FrameLayout(parent.context).apply {
@@ -254,15 +378,21 @@ class ViewPagerTransitionHost(
             })
 
         override fun onBindViewHolder(holder: PageHolder, position: Int) {
+            // PageTransformer properties live on the recycled holder, not its content. A holder
+            // rebound after the last scroll callback must never inherit a hidden neighbour state.
+            holder.container.resetPageTransform()
             holder.container.removeAllViews()
             holder.container.addView(engine.createPageView(position), matchParentLayoutParams())
         }
 
         override fun onViewRecycled(holder: PageHolder) {
+            holder.container.resetPageTransform()
             holder.container.removeAllViews()
         }
 
-        fun refreshPageCount() {
+        fun refreshPageCount(newPageCount: Int) {
+            if (pageCount == newPageCount) return
+            pageCount = newPageCount
             notifyDataSetChanged()
         }
     }
@@ -308,6 +438,15 @@ class ViewPagerTransitionHost(
             page.resetPageTransform()
         }
     }
+
+    private companion object {
+        const val DEFAULT_OFFSCREEN_PAGE_LIMIT = 1
+    }
+}
+
+internal fun pageLayoutDirection(direction: PageReadingDirection): Int = when (direction) {
+    PageReadingDirection.LEFT_TO_RIGHT -> View.LAYOUT_DIRECTION_LTR
+    PageReadingDirection.RIGHT_TO_LEFT -> View.LAYOUT_DIRECTION_RTL
 }
 
 private fun View.applyCurlTransform(values: PageTransformValues) {

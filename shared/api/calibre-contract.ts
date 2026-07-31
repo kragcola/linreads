@@ -13,6 +13,7 @@ export interface BookMeta {
   tags: string[]
   series: string | null
   series_index: number | null
+  libraryId: string         // e.g. 'calibre-library' or OPDS library path
   cover: string            // URL path: /get/cover/<id>/<library>
   last_modified: string    // ISO 8601
 }

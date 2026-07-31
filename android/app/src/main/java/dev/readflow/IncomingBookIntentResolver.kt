@@ -3,6 +3,7 @@ package dev.readflow
 import android.content.ClipData
 import android.content.Intent
 import android.net.Uri
+import dev.readflow.core.model.LocalReadingCapabilities
 
 internal object IncomingBookIntentResolver {
     fun resolve(
@@ -25,11 +26,11 @@ internal object IncomingBookIntentResolver {
 
     private fun isSupportedBookUri(uri: String, mimeType: String?): Boolean {
         val normalizedMime = mimeType?.substringBefore(';')?.trim()?.lowercase()
-        if (normalizedMime in SUPPORTED_MIME_TYPES) return true
+        if (LocalReadingCapabilities.supportsMimeType(normalizedMime)) return true
 
         val path = uri.substringBefore('?').substringBefore('#')
         val ext = path.substringAfterLast('/').substringAfterLast('.', "").lowercase()
-        return ext in SUPPORTED_EXTENSIONS
+        return LocalReadingCapabilities.supportsExtension(ext)
     }
 
     private const val ACTION_VIEW = "android.intent.action.VIEW"
@@ -37,14 +38,6 @@ internal object IncomingBookIntentResolver {
     private const val ACTION_SEND_MULTIPLE = "android.intent.action.SEND_MULTIPLE"
 
     private val SUPPORTED_ACTIONS = setOf(ACTION_VIEW, ACTION_SEND, ACTION_SEND_MULTIPLE)
-    private val SUPPORTED_EXTENSIONS = setOf("txt", "epub", "pdf", "md", "markdown")
-    private val SUPPORTED_MIME_TYPES = setOf(
-        "text/plain",
-        "text/markdown",
-        "text/x-markdown",
-        "application/epub+zip",
-        "application/pdf",
-    )
 }
 
 internal fun Intent.extractIncomingBookUri(): Uri? {

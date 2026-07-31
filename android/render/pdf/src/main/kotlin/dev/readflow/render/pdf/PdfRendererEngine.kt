@@ -3,8 +3,6 @@ package dev.readflow.render.pdf
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Bitmap
-import android.graphics.Matrix
-import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
@@ -119,6 +117,10 @@ class PdfRendererEngine(private val context: Context) :
     private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
     private val activePageViews = Collections.newSetFromMap(WeakHashMap<ImageView, Boolean>())
     private val activePageHosts = Collections.newSetFromMap(WeakHashMap<PdfSearchPageHost, Boolean>())
+    private val trackedPageHosts = WeakHashMap<PdfSearchPageHost, PageHostRegistration>()
+    private var pageHostSession = 0
+    private var pageHostSessionActive = false
+    private var pageSurfaceMode = PageSurfaceMode.UNDECIDED
     private var renderScope = pdfRenderScope()
     private val renderDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val pageBitmapAttachments = PdfBitmapAttachmentRegistry<Bitmap, ImageView>(
@@ -184,6 +186,18 @@ class PdfRendererEngine(private val context: Context) :
         val heightPt: Float,
     )
 
+    private data class PageHostRegistration(
+        val session: Int,
+        val attachListener: View.OnAttachStateChangeListener,
+        val layoutListener: View.OnLayoutChangeListener,
+    )
+
+    private enum class PageSurfaceMode {
+        UNDECIDED,
+        LEGACY,
+        PAGED,
+    }
+
     private val pageMetricsCache = HashMap<Int, PageMetrics>()
 
     private val pageSelectionListener = object : PdfPageSelectionListener {
@@ -205,6 +219,7 @@ class PdfRendererEngine(private val context: Context) :
     override suspend fun supports(uri: Uri): Boolean = true
 
     override suspend fun openBook(uri: Uri): Locator = withContext(Dispatchers.IO) {
+        invalidatePageHostsOnMain()
         recyclePageCacheOnMain()
         invalidateSearchState()
         clearTextSelectionInternal()
@@ -247,18 +262,23 @@ class PdfRendererEngine(private val context: Context) :
             )
             pageStore = createPageStore(renderScope, pageCachePolicy)
             initialBitmap?.let { pageStore.put(0, it) }
+            if (total > 0) {
+                pageStore.retainAround(0, pageCachePolicy.radius)
+            }
             realOutlineEntries = outline
             openTextSession = session
             _pageCount.value = total
             _tableOfContents.value = toc
             publishLocator(initial)
             updateZoom(1f)
+            pageHostSessionActive = true
         }
         initial
     }
 
     override fun createView(): View {
         val renderer = pdfRenderer ?: error("openBook not called")
+        selectPageSurface(PageSurfaceMode.LEGACY)
         return RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
             adapter = PdfPageAdapter(
@@ -278,6 +298,7 @@ class PdfRendererEngine(private val context: Context) :
     }
 
     override fun createPageView(pageIndex: Int): View {
+        selectPageSurface(PageSurfaceMode.PAGED)
         val total = _pageCount.value.coerceAtLeast(1)
         val safeIndex = pageIndex.coerceIn(0, total - 1)
         return PdfSearchPageHost(context).apply {
@@ -287,20 +308,6 @@ class PdfRendererEngine(private val context: Context) :
                 ViewGroup.LayoutParams.MATCH_PARENT,
             )
             background = paperBackground(context, themeMode, resources.configuration)
-            selectionListener = pageSelectionListener
-            applyAllPaintForHost(this, safeIndex)
-            val iv = imageView
-            pageStore.cached(safeIndex)?.let { iv.setImageBitmap(it) }
-            pageStore.load(safeIndex) { bitmap ->
-                if (bitmap == null) return@load
-                if (tag != safeIndex) return@load
-                if (!activePageHosts.contains(this)) return@load
-                iv.setImageBitmap(bitmap)
-                iv.applyPdfZoom(_zoomScale.value)
-                applyAllPaintForHost(this, safeIndex)
-            }
-            pageStore.prefetchAround(safeIndex, pageCachePolicy.radius, 0 until total)
-            pageStore.retainAround(safeIndex, pageCachePolicy.radius)
         }.also(::trackPageHost)
     }
 
@@ -376,8 +383,11 @@ class PdfRendererEngine(private val context: Context) :
             }
             (recyclerView?.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(idx, 0)
             publishLocator(target)
-            pageStore.prefetchAround(idx, pageCachePolicy.radius, 0 until total)
             pageStore.retainAround(idx, pageCachePolicy.radius)
+            refreshRetainedPageHosts(idx)
+            if (pageSurfaceMode == PageSurfaceMode.PAGED) {
+                pageStore.prefetchAround(idx, pageCachePolicy.radius, 0 until total)
+            }
             pageRequestCallback?.invoke(idx)
         }
     }
@@ -401,7 +411,10 @@ class PdfRendererEngine(private val context: Context) :
     }
 
     override suspend fun close() {
-        (recyclerView?.adapter as? PdfPageAdapter)?.recycle()
+        invalidatePageHostsOnMain()
+        withContext(Dispatchers.Main) {
+            (recyclerView?.adapter as? PdfPageAdapter)?.recycle()
+        }
         recyclePageCacheOnMain()
         invalidateSearchState()
         clearTextSelectionInternal()
@@ -960,36 +973,145 @@ class PdfRendererEngine(private val context: Context) :
     }
 
     private fun trackPageHost(host: PdfSearchPageHost) {
-        activePageHosts.add(host)
+        val registrationSession = pageHostSession
         val imageView = host.imageView
-        activePageViews.add(imageView)
-        pageBitmapAttachments.track(imageView)
-        host.selectionListener = pageSelectionListener
-        host.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
-            override fun onViewAttachedToWindow(view: View) = Unit
+        val attachListener = object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) {
+                val attached = view as? PdfSearchPageHost ?: return
+                if (!pageHostSessionActive || registrationSession != pageHostSession) return
+                if (attached !in activePageHosts) activatePageHost(attached)
+            }
 
             override fun onViewDetachedFromWindow(view: View) {
                 val detached = view as? PdfSearchPageHost ?: return
-                activePageHosts.remove(detached)
-                activePageViews.remove(detached.imageView)
-                pageBitmapAttachments.untrack(detached.imageView)
-                detached.imageView.setImageDrawable(null)
-                detached.clearAllPaint()
-                detached.selectionListener = null
+                deactivatePageHost(detached)
             }
-        })
-        imageView.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
-            (view as? ImageView)?.applyPdfZoom(_zoomScale.value)
-            host.rebindHighlightPaint()
         }
-        imageView.applyPdfZoom(_zoomScale.value)
-        applyAllPaintForHost(host, host.tag as? Int ?: -1)
+        val layoutListener = View.OnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
+            if (pageHostSessionActive && registrationSession == pageHostSession && view is ImageView) {
+                (view.parent as? PdfSearchPageHost)?.reapplyPdfTransform()
+            }
+        }
+        trackedPageHosts[host] = PageHostRegistration(
+            session = registrationSession,
+            attachListener = attachListener,
+            layoutListener = layoutListener,
+        )
+        host.addOnAttachStateChangeListener(attachListener)
+        imageView.addOnLayoutChangeListener(layoutListener)
+    }
+
+    private fun activatePageHost(host: PdfSearchPageHost) {
+        val registration = trackedPageHosts[host] ?: return
+        if (!pageHostSessionActive || registration.session != pageHostSession || pdfRenderer == null) {
+            return
+        }
+        val pageIndex = host.tag as? Int ?: return
+        val total = _pageCount.value
+        if (total <= 0) return
+        if (pageIndex !in 0 until total) return
+        val imageView = host.imageView
+        activePageHosts.add(host)
+        activePageViews.add(imageView)
+        pageBitmapAttachments.track(imageView)
+        host.selectionListener = pageSelectionListener
+        host.boundaryPageTurnListener = { pageDelta ->
+            val target = (pageIndex + pageDelta).coerceIn(0, total - 1)
+            if (target != pageIndex) pageRequestCallback?.invoke(target)
+        }
+        host.setZoomScale(_zoomScale.value)
+        applyAllPaintForHost(host, pageIndex)
+        if (!pageStore.isRetained(pageIndex)) return
+        pageStore.load(pageIndex) { bitmap ->
+            if (bitmap == null ||
+                host.tag != pageIndex ||
+                host !in activePageHosts ||
+                !pageStore.isRetained(pageIndex)
+            ) {
+                return@load
+            }
+            imageView.setImageBitmap(bitmap)
+            host.setZoomScale(_zoomScale.value)
+            applyAllPaintForHost(host, pageIndex)
+        }
+    }
+
+    private fun deactivatePageHost(host: PdfSearchPageHost) {
+        activePageHosts.remove(host)
+        activePageViews.remove(host.imageView)
+        pageBitmapAttachments.untrack(host.imageView)
+        host.imageView.setImageDrawable(null)
+        host.clearAllPaint()
+        host.selectionListener = null
+        host.boundaryPageTurnListener = null
+        host.contentDescription = null
+        host.imageView.contentDescription = null
+    }
+
+    private fun selectPageSurface(requested: PageSurfaceMode) {
+        if (pageSurfaceMode == PageSurfaceMode.UNDECIDED || pageSurfaceMode == requested) {
+            pageSurfaceMode = requested
+            return
+        }
+        // Confirmed mixed-surface remount: reset the previous surface session so the engine can
+        // serve the requested surface instead of hard-crashing. Single-surface sessions (the
+        // normal paged host) keep the exact current behavior.
+        resetPageSurfaceSession()
+        pageSurfaceMode = requested
+    }
+
+    /**
+     * Tear down the previous surface's state before serving a differently shaped surface:
+     * deactivate and untrack paged page hosts (bumping the session invalidates their
+     * registrations) and drop the legacy recycler reference. Runs on the caller (main) thread
+     * like [createView]/[createPageView]; no raw PdfRenderer access happens during the reset.
+     */
+    private fun resetPageSurfaceSession() {
+        pageHostSession += 1
+        trackedPageHosts.toMap().forEach { (host, registration) ->
+            host.removeOnAttachStateChangeListener(registration.attachListener)
+            host.imageView.removeOnLayoutChangeListener(registration.layoutListener)
+            deactivatePageHost(host)
+        }
+        trackedPageHosts.clear()
+        activePageViews.clear()
+        activePageHosts.clear()
+        recyclerView = null
+    }
+
+    private suspend fun invalidatePageHostsOnMain() {
+        withContext(Dispatchers.Main) {
+            pageHostSessionActive = false
+            pageHostSession += 1
+            pageSurfaceMode = PageSurfaceMode.UNDECIDED
+            trackedPageHosts.toMap().forEach { (host, registration) ->
+                host.removeOnAttachStateChangeListener(registration.attachListener)
+                host.imageView.removeOnLayoutChangeListener(registration.layoutListener)
+                deactivatePageHost(host)
+            }
+            trackedPageHosts.clear()
+            activePageViews.clear()
+            activePageHosts.clear()
+        }
+    }
+
+    private fun refreshRetainedPageHosts(currentPageIndex: Int) {
+        activePageHosts
+            .toList()
+            .sortedBy { host ->
+                (host.tag as? Int)?.let { pageIndex ->
+                    kotlin.math.abs(pageIndex - currentPageIndex)
+                } ?: Int.MAX_VALUE
+            }
+            .forEach { host ->
+                val pageIndex = host.tag as? Int ?: return@forEach
+                if (pageStore.isRetained(pageIndex)) activatePageHost(host)
+            }
     }
 
     private fun updateZoom(scale: Float) {
         _zoomScale.value = scale
-        activePageViews.forEach { it.applyPdfZoom(scale) }
-        activePageHosts.forEach { it.rebindHighlightPaint() }
+        activePageHosts.forEach { it.setZoomScale(scale) }
     }
 
     private fun ensureRenderScope() {
@@ -1009,42 +1131,6 @@ class PdfRendererEngine(private val context: Context) :
             release = { bitmap -> pageBitmapAttachments.release(bitmap) { it.recycle() } },
             render = { pageIndex -> renderPageBlocking(pageIndex) },
         )
-
-    private fun ImageView.applyPdfZoom(scale: Float) {
-        if (scale <= MIN_ZOOM_SCALE) {
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            imageMatrix = Matrix()
-            return
-        }
-        scaleType = ImageView.ScaleType.MATRIX
-        imageMatrix = fittedPageMatrix(scale)
-    }
-
-    private fun ImageView.fittedPageMatrix(scale: Float): Matrix {
-        val drawable = drawable
-        val contentWidth = width - paddingLeft - paddingRight
-        val contentHeight = height - paddingTop - paddingBottom
-        if (drawable == null || contentWidth <= 0 || contentHeight <= 0) {
-            return Matrix().apply { setScale(scale, scale) }
-        }
-
-        val src = RectF(
-            0f,
-            0f,
-            drawable.intrinsicWidth.toFloat(),
-            drawable.intrinsicHeight.toFloat(),
-        )
-        val dst = RectF(
-            paddingLeft.toFloat(),
-            paddingTop.toFloat(),
-            (paddingLeft + contentWidth).toFloat(),
-            (paddingTop + contentHeight).toFloat(),
-        )
-        return Matrix().apply {
-            setRectToRect(src, dst, Matrix.ScaleToFit.CENTER)
-            postScale(scale, scale, dst.centerX(), dst.centerY())
-        }
-    }
 
     private companion object {
         const val MIN_ZOOM_SCALE = 1f

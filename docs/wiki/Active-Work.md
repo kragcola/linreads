@@ -42,7 +42,7 @@ Android 补充：Reader 持续体验打磨中；本地 JVM 聚焦回归与外部
 2. Android EPUB：读 `docs/android-architecture-v4.md` §5.5 / §12.3（原生重排，去 WebView）；**不要**按 v3 的 WebView+epub-ts 实现
 3. Web EPUB：仍是 epubjs，见 `.claude/skills/linreads-epub/SKILL.md`
 4. Web `/calibre` 代理在 `web/vite.config.ts`（dev）
-5. Android 本地验证：定向 Gradle 单测即可；全量回归 / R8 / OTA 走 GitHub Actions
+5. Android 本地验证：2026-07-31 交接后禁止本地 Gradle 构建/测试；仅做静态审查、ADB/日志诊断，所有 APK、test APK、全量回归、R8 与 OTA 走 GitHub Actions
 6. HarmonyOS `CalibreService.ets` 用 `@ohos.net.http`，不能用 fetch/axios
 7. 中文 UI，英文代码/注释/commit
 8. 现网任务进度只写 `ACTIVE.md`（Codex 整合 tracker）；本 wiki 页只导航

@@ -59,6 +59,7 @@ import dev.readflow.render.api.ReaderEngineRegistry
 import dev.readflow.render.epub.EpubReflowEngine
 import dev.readflow.render.pdf.PdfRendererEngine
 import dev.readflow.render.md.MarkdownEngine
+import dev.readflow.render.cbz.CbzReaderEngine
 import dev.readflow.render.txt.TxtVirtualPagerEngine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.CoroutineScope
@@ -176,6 +177,18 @@ val renderModule = module {
             provider = { MarkdownEngine(androidContext()) },
         )
     }
+    single(named("cbz")) {
+        EngineDescriptor(
+            id = "cbz-image-pager",
+            format = BookFormat.CBZ,
+            priority = 0,
+            quickSupports = { uri ->
+                (uri.lastPathSegment ?: uri.path ?: "").substringAfterLast('.', "")
+                    .equals("cbz", ignoreCase = true)
+            },
+            provider = { CbzReaderEngine(androidContext()) },
+        )
+    }
     single {
         ReaderEngineRegistry(
             descriptors = setOf(
@@ -183,6 +196,7 @@ val renderModule = module {
                 get<EngineDescriptor>(named("epub")),
                 get<EngineDescriptor>(named("pdf")),
                 get<EngineDescriptor>(named("md")),
+                get<EngineDescriptor>(named("cbz")),
             ),
             userOverrides = MutableStateFlow(emptyMap<BookFormat, String>()),
         )

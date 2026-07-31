@@ -58,6 +58,20 @@ internal fun epubFlowImageTargetSize(
     return Rect(0, 0, w, h)
 }
 
+/** Keeps unknown-size inline images bounded while full-page art reserves the viewport. */
+private fun epubUnknownImageTargetSize(
+    columnWidthPx: Int,
+    pageHeightPx: Int,
+    inlineMaxHeightPx: Int,
+    isFullPage: Boolean,
+): Rect {
+    val width = columnWidthPx.coerceAtLeast(1)
+    val height = pageHeightPx.coerceAtLeast(1)
+    if (isFullPage) return Rect(0, 0, width, height)
+    val inlineSize = min(width, inlineMaxHeightPx.coerceAtLeast(1))
+    return Rect(0, 0, inlineSize, inlineSize)
+}
+
 internal class EpubMaxHeightImageSizeResolver(
     private val delegate: ImageSizeResolver,
     private val maxHeightProvider: () -> Int,
@@ -349,10 +363,20 @@ internal class EpubFlowImageLoader(
         }
 
     /**
-     * Returns true only when every image occurrence at [layoutStarts] owns attached DISPLAY pixels.
+     * Returns true only when every image occurrence at [layoutStarts] owns attached decoded pixels.
      * Rapid page turns use this exact-page contract instead of waiting for unrelated decode work.
+     *
+     * With [requireDisplayPromotion] (the default) the gate additionally requires DISPLAY quality
+     * and a completed promotion crossfade, which is the settled-page contract. While a rapid motion
+     * window owns the frames the view passes `false`, so retained decoded pixels of any installed
+     * quality keep the queued burst moving while DISPLAY promotion completes in the quiet-idle
+     * cleanup. An occurrence with no retained pixels yet (only the transparent placeholder) still
+     * fails conservatively, so a queue waits instead of parking on a page that could disappear.
      */
-    fun hasStablePixels(layoutStarts: Collection<Int>): Boolean =
+    fun hasStablePixels(
+        layoutStarts: Collection<Int>,
+        requireDisplayPromotion: Boolean = true,
+    ): Boolean =
         synchronized(lifecycleLock) {
             val starts = layoutStarts.filter { it >= 0 }.distinct()
             if (starts.isEmpty()) return true
@@ -364,8 +388,14 @@ internal class EpubFlowImageLoader(
                         (
                             (
                                 (drawable.result as? EpubImagePixelSource)?.hasDecodedPixels == true &&
-                                    installedQualityByDrawable[drawable] == EpubImageRenderQuality.DISPLAY &&
-                                    promotionCompletionByDrawable[drawable] == null
+                                    (
+                                        !requireDisplayPromotion ||
+                                            (
+                                                installedQualityByDrawable[drawable] ==
+                                                    EpubImageRenderQuality.DISPLAY &&
+                                                    promotionCompletionByDrawable[drawable] == null
+                                                )
+                                        )
                                 ) || terminalFailureGenerationByDrawable[drawable] == lifecycleGeneration
                             )
                 }
@@ -646,7 +676,15 @@ internal class EpubFlowImageLoader(
                     isFullPage = true,
                 ),
             )
-            !drawable.bounds.isEmpty -> Rect(drawable.bounds)
+            // When intrinsic bounds are unavailable, the placeholder still reserves a full-page
+            // fallback. Re-fit that fallback against the measured viewport instead of reusing a
+            // pre-measure page height that can clip or push the illustration across a page break.
+            isFullPage -> epubUnknownImageTargetSize(
+                columnWidthPx = currentColumnWidthPx,
+                pageHeightPx = pageHeightPx,
+                inlineMaxHeightPx = inlineMaxHeightPx,
+                isFullPage = true,
+            )
             intrinsicBounds != null -> drawable.constrainTarget(
                 epubFlowImageTargetSize(
                     intrinsicWidth = intrinsicBounds.width,
@@ -657,7 +695,13 @@ internal class EpubFlowImageLoader(
                     isFullPage = false,
                 ),
             )
-            else -> Rect(0, 0, currentColumnWidthPx, pageHeightPx)
+            !drawable.bounds.isEmpty -> Rect(drawable.bounds)
+            else -> epubUnknownImageTargetSize(
+                columnWidthPx = currentColumnWidthPx,
+                pageHeightPx = pageHeightPx,
+                inlineMaxHeightPx = inlineMaxHeightPx,
+                isFullPage = false,
+            )
         }
         val quality = forcedQuality ?: try {
             imageQualityProvider(layoutStart)
@@ -765,23 +809,37 @@ internal class EpubFlowImageLoader(
         val bounds = try {
             imageBoundsProvider(drawable.destination)
         } catch (_: RuntimeException) {
-            null
-        } ?: return null
+            return null
+        }
         val pageHeightPx = try {
             pageHeightProvider().coerceAtLeast(1)
         } catch (_: RuntimeException) {
             return null
         }
-        val target = drawable.constrainTarget(
-            epubFlowImageTargetSize(
-                intrinsicWidth = bounds.width,
-                intrinsicHeight = bounds.height,
-                columnWidthPx = currentColumnWidthPx(),
+        val currentColumnWidthPx = currentColumnWidthPx()
+        val isFullPage = drawable.isFullPageOccurrence(fullPageHrefs)
+        val target = if (bounds == null) {
+            // Keep a stable layer when intrinsic dimensions are unavailable. requestLoad uses the
+            // same fallback, so first pixels update this layer in place instead of rebinding the
+            // chapter TextView during a page turn.
+            epubUnknownImageTargetSize(
+                columnWidthPx = currentColumnWidthPx,
                 pageHeightPx = pageHeightPx,
                 inlineMaxHeightPx = inlineMaxHeightPx,
-                isFullPage = drawable.isFullPageOccurrence(fullPageHrefs),
-            ),
-        )
+                isFullPage = isFullPage,
+            )
+        } else {
+            drawable.constrainTarget(
+                epubFlowImageTargetSize(
+                    intrinsicWidth = bounds.width,
+                    intrinsicHeight = bounds.height,
+                    columnWidthPx = currentColumnWidthPx,
+                    pageHeightPx = pageHeightPx,
+                    inlineMaxHeightPx = inlineMaxHeightPx,
+                    isFullPage = isFullPage,
+                ),
+            )
+        }
         return EpubImagePixelDrawable(target)
     }
 

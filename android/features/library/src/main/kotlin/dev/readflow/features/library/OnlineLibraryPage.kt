@@ -98,6 +98,7 @@ internal fun OnlineLibraryPage(
     onSelectAuthor: (String) -> Unit,
     onSelectSeries: (String) -> Unit,
     onDownloadEntry: (OnlineCatalogEntry) -> Unit,
+    onReadOnline: (OnlineCatalogEntry) -> Unit,
     onDownloadSelected: () -> Unit,
     onPreview: (OnlineCatalogEntry) -> Unit,
     onOpenSourceEditor: (String?) -> Unit,
@@ -427,6 +428,7 @@ internal fun OnlineLibraryPage(
                                 canBatchAcrossSource = selectedSource?.capabilities?.canBatchAcrossSource == true,
                                 onToggleSelect = { onToggleSelect(entry) },
                                 onDownload = { onDownloadEntry(entry) },
+                                onReadOnline = { onReadOnline(entry) },
                                 onPreview = { onPreview(entry) },
                                 onAuthorBatch = { author ->
                                     selectionMode = true
@@ -790,6 +792,7 @@ private fun OnlineCatalogBookCard(
     canBatchAcrossSource: Boolean,
     onToggleSelect: () -> Unit,
     onDownload: () -> Unit,
+    onReadOnline: () -> Unit,
     onPreview: () -> Unit,
     onAuthorBatch: (String) -> Unit,
     onSeriesBatch: () -> Unit,
@@ -798,7 +801,18 @@ private fun OnlineCatalogBookCard(
     val batchAuthors = entry.individualAuthors()
     var overflowExpanded by remember { mutableStateOf(false) }
     val downloadLabel = if (isDownloading) "正在下载《${book.title}》" else "下载《${book.title}》"
-    val cardAction = if (selectionMode) onToggleSelect else if (canPreview) onPreview else ({ overflowExpanded = true })
+    val cardAction = when {
+        selectionMode -> onToggleSelect
+        canPreview -> onPreview
+        canDownload -> onReadOnline
+        else -> ({ overflowExpanded = true })
+    }
+    val cardActionLabel = when {
+        selectionMode -> if (selected) "取消选择" else "选择"
+        canPreview -> "正文预览"
+        canDownload -> "在线阅读"
+        else -> "更多操作"
+    }
 
     Column(
         modifier = Modifier
@@ -807,7 +821,7 @@ private fun OnlineCatalogBookCard(
                 contentDescription = "${book.title}，${book.author}"
                 if (selectionMode) stateDescription = if (selected) "已选择" else "未选择"
             }
-            .clickable(role = Role.Button, onClick = cardAction),
+            .clickable(role = Role.Button, onClickLabel = cardActionLabel, onClick = cardAction),
     ) {
         Box(modifier = Modifier.aspectRatio(Dimens.coverAspectRatio)) {
             BookCover(
@@ -873,6 +887,13 @@ private fun OnlineCatalogBookCard(
                         onDismissRequest = { overflowExpanded = false },
                     ) {
                         if (canDownload) {
+                            DropdownMenuItem(
+                                text = { Text("在线阅读") },
+                                onClick = {
+                                    overflowExpanded = false
+                                    onReadOnline()
+                                },
+                            )
                             batchAuthors.forEach { author ->
                                 DropdownMenuItem(
                                     text = {

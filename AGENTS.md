@@ -1,11 +1,12 @@
-# LinReads Codex-to-Grok Workflow
+# LinReads Codex Hybrid Delegation Workflow
 
 ## Delegated execution
 
-- Grok is an authorized write-capable worker for tasks delegated by Codex in this repository.
+- DeepSeek V4 Flash is the default text-only worker for bounded audits, implementation, debugging, testing, and review tasks. Grok remains an authorized write-capable worker only when the task packet and user authorization allow it. GPT-5.6 Luna is reserved for multimodal, high-ambiguity, cross-module, or tool-orchestration work when that provider is available to the worker runtime.
 - Follow `CLAUDE.md` for architecture, build commands, language, and mandatory skill routing.
 - Keep work bounded to the delegated task. Preserve all unrelated tracked and untracked changes.
-- Local edits, builds, tests, emulators, and diagnostics are allowed when required by the task.
+- Local edits, ADB/device diagnostics, log capture, static file inspection, and non-build tooling are allowed when required by the task.
+- Effective 2026-07-31 after the current handoff, local Android builds/tests/assemble tasks are disabled for all agents and Grok workers. New APKs, full regression, R8/minification, and Android test artifacts must be produced by GitHub Actions/cloud build only.
 - Do not commit, push, publish OTA builds, create releases, or contact external systems unless the delegated prompt explicitly requests it.
 
 ## Parallel workflow
@@ -19,10 +20,26 @@
 - Integrate all delegated results and run the smallest meaningful verification before reporting completion.
 - Never create duplicate replacement agents for the same live workstream; reconnect or resume the existing one first.
 
+## Hybrid delegation strategy
+
+- **DeepSeek V4 Flash first:** use it for text-only source discovery, static code audit, logs, UI XML, `gfxinfo`/Perfetto summaries, structured extraction, bounded implementation, targeted tests, and focused self-review. Never send screenshots, image paths, video frames, base64 media, or visual-inspection requests to DeepSeek.
+- **GPT-5.6 Luna escalation:** use it for image or screenshot interpretation, multimodal evidence, complex cross-module reasoning, difficult tool orchestration, or an independent review when DeepSeek results conflict or the risk is high. If Luna is not exposed by the current worker runtime, keep the task with the main agent or use the configured text-capable fallback; do not fake a Luna dispatch.
+- **Grok lane:** use Grok for authorized write-capable execution when its packet is explicitly requested or when the accepted project workflow selects it. Grok does not replace the main agent's architecture, scope, acceptance, or integration ownership.
+- **Normal mode flow:** split read-only discovery first, select the smallest independent conflict domains, then assign one writer per domain. Use DS for the broad text pass, Luna for multimodal/ambiguous review, and only then integrate and verify in the main agent. Parallel children must use isolated worktrees or provably disjoint files.
+- **Escalation triggers:** escalate from DS to Luna/main-agent review when evidence is visual, the worker reports unresolved ambiguity, two workers disagree, a shared contract or migration is affected, or the change is release/security critical.
+- **No forced parallelism:** if the work is tightly coupled or has no safe independent stream, run one worker or no worker. Do not create a planning child merely to satisfy the hybrid label.
+
+## Low-cost mode
+
+- Set `Cost mode: cost-saving` only when the user explicitly requests lower cost, token savings, or reduced GPT/Sol usage. In this mode, prefer DeepSeek V4 Flash for text-only execution and Grok for authorized write-capable slices; use Luna only for the escalation triggers above.
+- In low-cost mode, the main Sol agent **should not directly perform broad implementation, debugging, or routine test edits**. Delegate those concrete operations inside bounded packets and let the worker return the diff, checks, and residual risks.
+- Sol remains responsible for the overall plan, architecture, conflict ordering, scope control, acceptance, independent risk review, and final integration. Direct Sol edits are limited to small integration glue, conflict resolution, security/credential handling, or an explicitly user-approved exception.
+- A child that only reports a plan or partial tool output is not completion. Require changed files, exact checks, failures, and residual risks before accepting the slice.
+
 ## Cost-saving delegation
 
-- When a Codex task packet explicitly sets `Cost mode: cost-saving`, Grok owns the concrete work inside that Codex-defined slice: detailed investigation, relevant-file discovery, local implementation choices consistent with the accepted direction, implementation, debugging, targeted tests, and focused self-review.
-- Codex remains responsible for the overall solution, architecture, task decomposition, sequencing, scope decisions, and acceptance. Grok must report plan conflicts or cross-cutting tradeoffs instead of silently changing direction.
+- When a Codex task packet explicitly sets `Cost mode: cost-saving`, the selected worker (DeepSeek by default, or authorized Grok for a write-capable slice) owns the concrete work inside that Codex-defined slice: detailed investigation, relevant-file discovery, local implementation choices consistent with the accepted direction, implementation, debugging, targeted tests, and focused self-review.
+- Codex/Sol remains responsible for the overall solution, architecture, task decomposition, sequencing, scope decisions, and acceptance. Workers must report plan conflicts or cross-cutting tradeoffs instead of silently changing direction.
 - Return a consolidated diff summary, implementation rationale, exact checks, and residual risks so Codex can limit its hands-on work to leadership, architecture and scope acceptance, code-quality review, risk-based independent verification, and final integration.
 - Avoid routine clarification and unnecessary broad work. Make conservative in-scope assumptions without expanding authority, and never trade away required LinReads skill routing, correctness, or verification to save cost.
 

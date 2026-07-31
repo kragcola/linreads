@@ -31,9 +31,11 @@ import android.text.Spanned
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
 import io.noties.markwon.ext.tables.TablePlugin
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
@@ -51,6 +53,8 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.io.File
+import java.util.ArrayDeque
+import kotlin.coroutines.CoroutineContext
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -94,6 +98,167 @@ class MarkdownEngineTest {
 
         assertEquals(Typeface.SERIF, textView.typeface)
     }
+
+    @Test
+    fun `unchanged typography is a no-op in paged mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val file = tempMarkdown((0 until 30).joinToString("\n\n") { "Paragraph $it" })
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(420, 640)
+        engine.setMode(ReadingMode.PAGED)
+        val requests = mutableListOf<Int>()
+        engine.setPageRequestCallback(requests::add)
+
+        engine.setFontSize(ReaderTypographyRange.DEFAULT_FONT_SIZE.toFloat())
+        engine.setLineSpacing(ReaderTypographyRange.DEFAULT_LINE_SPACING)
+        engine.setFont("system_serif")
+
+        assertTrue("no-op settings must not repaginate or move the visible page", requests.isEmpty())
+    }
+
+    @Test
+    fun `stale background pagination cannot restore paged mode after scroll wins`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication() as Application
+            val file = tempMarkdown((0 until 80).joinToString("\n\n") { "Paragraph $it" })
+            val paginationDispatcher = QueuedMarkdownDispatcher()
+            val engine = MarkdownEngine(context, paginationDispatcher)
+            engine.openBook(Uri.fromFile(file))
+            engine.setViewportSize(420, 640)
+            val requests = mutableListOf<Int>()
+            engine.setPageRequestCallback(requests::add)
+
+            val paged = launch { engine.setMode(ReadingMode.PAGED) }
+            testScheduler.runCurrent()
+            assertTrue("pagination must be waiting on its background dispatcher", !paged.isCompleted)
+
+            engine.setMode(ReadingMode.SCROLL)
+            paginationDispatcher.runAll()
+            testScheduler.runCurrent()
+            paged.join()
+
+            assertEquals(PagingKind.CONTINUOUS, engine.pagingKind.value)
+            assertEquals(1, engine.pageCount.value)
+            assertTrue(requests.isEmpty())
+        }
+
+    @Test
+    fun `queued one-page pagination refreshes an already created fallback page`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication() as Application
+            val file = tempMarkdown("Only page body.")
+            val paginationDispatcher = QueuedMarkdownDispatcher()
+            val engine = MarkdownEngine(context, paginationDispatcher)
+            engine.openBook(Uri.fromFile(file))
+            engine.setViewportSize(1080, 2400)
+
+            val enterPaged = launch { engine.setMode(ReadingMode.PAGED) }
+            testScheduler.runCurrent()
+            assertTrue("pagination must still be queued", !enterPaged.isCompleted)
+            assertEquals(
+                "a host must never observe PAGED while the windows are still being packed",
+                PagingKind.CONTINUOUS,
+                engine.pagingKind.value,
+            )
+
+            val page = engine.createPageView(0) as FrameLayout
+            val textView = page.getChildAt(0) as TextView
+            assertEquals("", textView.text.toString())
+            assertEquals(1, engine.pageCount.value)
+
+            paginationDispatcher.runAll()
+            testScheduler.runCurrent()
+            enterPaged.join()
+
+            assertEquals(PagingKind.PAGED, engine.pagingKind.value)
+            assertEquals("one-page pagination must keep the count stable", 1, engine.pageCount.value)
+            assertTrue(
+                "successful pagination must refresh the already-created fallback page",
+                textView.text.toString().contains("Only page body."),
+            )
+        }
+
+    @Test
+    fun `paged mode is published only after pagination installs its windows`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication() as Application
+            val file = tempMarkdown(buildLongMarkdown())
+            val paginationDispatcher = QueuedMarkdownDispatcher()
+            val engine = MarkdownEngine(context, paginationDispatcher)
+            engine.openBook(Uri.fromFile(file))
+            engine.setViewportSize(420, 640)
+
+            val enterPaged = launch { engine.setMode(ReadingMode.PAGED) }
+            testScheduler.runCurrent()
+            assertTrue("pagination must still be queued", !enterPaged.isCompleted)
+            assertEquals(PagingKind.CONTINUOUS, engine.pagingKind.value)
+
+            paginationDispatcher.runAll()
+            testScheduler.runCurrent()
+            enterPaged.join()
+
+            assertEquals(PagingKind.PAGED, engine.pagingKind.value)
+            @Suppress("UNCHECKED_CAST")
+            val installedWindows = engine.privateField("pageWindows") as List<*>
+            assertTrue(
+                "PAGED must only be published with an installed window set",
+                installedWindows.isNotEmpty(),
+            )
+            assertEquals(installedWindows.size, engine.pageCount.value)
+        }
+
+    @Test
+    fun `cancelled viewport rebuild leaves requested dimensions retryable`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication() as Application
+            val file = tempMarkdown(buildLongMarkdown())
+            val paginationDispatcher = QueuedMarkdownDispatcher()
+            val engine = MarkdownEngine(context, paginationDispatcher)
+            engine.openBook(Uri.fromFile(file))
+            engine.setViewportSize(1080, 2400)
+
+            val enterPaged = launch { engine.setMode(ReadingMode.PAGED) }
+            testScheduler.runCurrent()
+            paginationDispatcher.runAll()
+            testScheduler.runCurrent()
+            enterPaged.join()
+            val largePageCount = engine.pageCount.value
+            val largeFirstWindow = enginePageWindow(engine, 0)
+
+            val cancelledResize = launch { engine.setViewportSize(480, 700) }
+            testScheduler.runCurrent()
+            assertTrue("resize pagination must still be queued", !cancelledResize.isCompleted)
+            cancelledResize.cancel()
+            paginationDispatcher.runAll()
+            testScheduler.runCurrent()
+            cancelledResize.join()
+
+            assertEquals(1080, engine.privateField("viewportWidthPx") as Int)
+            assertEquals(2400, engine.privateField("viewportHeightPx") as Int)
+            assertEquals(largePageCount, engine.pageCount.value)
+            assertEquals(largeFirstWindow, enginePageWindow(engine, 0))
+
+            val retry = launch { engine.setViewportSize(480, 700) }
+            testScheduler.runCurrent()
+            assertTrue("same-size retry must schedule fresh pagination", !retry.isCompleted)
+            paginationDispatcher.runAll()
+            testScheduler.runCurrent()
+            retry.join()
+
+            assertEquals(480, engine.privateField("viewportWidthPx") as Int)
+            assertEquals(700, engine.privateField("viewportHeightPx") as Int)
+            val smallFirstWindow = enginePageWindow(engine, 0)
+            assertTrue(
+                "retry must install the smaller-viewport packing",
+                engine.pageCount.value != largePageCount || smallFirstWindow != largeFirstWindow,
+            )
+        }
 
     @Test
     fun `headingless open publishes empty toc and document chapterInfo`() = runTest(dispatcher) {
@@ -1606,5 +1771,17 @@ class MarkdownEngineTest {
             super.setText(text, type)
             (parent as? ScrollView)?.scrollTo(0, 0)
         }
+    }
+}
+
+private class QueuedMarkdownDispatcher : CoroutineDispatcher() {
+    private val tasks = ArrayDeque<Runnable>()
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        tasks.addLast(block)
+    }
+
+    fun runAll() {
+        while (tasks.isNotEmpty()) tasks.removeFirst().run()
     }
 }

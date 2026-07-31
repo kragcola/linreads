@@ -7,8 +7,8 @@
 | Web | Dev server | `cd web && npm run dev` |
 | Web | Build | `cd web && npm run build` |
 | Web | Type check | `cd web && npx tsc --noEmit` |
-| Android | Local targeted test only | `cd android && ./gradlew <module>:test... --tests '<test>'` |
-| Android | Full regression / R8 / OTA build | GitHub Actions only |
+| Android | Local builds/tests | Disabled after 2026-07-31 handoff; use GitHub Actions/cloud build only |
+| Android | Full regression / R8 / OTA build / test APKs | GitHub Actions only |
 | Android | Push OTA update to tablet | `git push` → Actions builds → tablet notified automatically |
 | HarmonyOS | Build | DevEco Studio → Build → Build Hap |
 
@@ -33,7 +33,7 @@ Web         Android           HarmonyOS
 Key design choices:
 - **Shared type contract** — `shared/api/calibre-contract.ts` 是三端共同的 Calibre API 类型定义；改 API shape 必须同步三端实现
 - **Calibre proxy（Web）** — dev 阶段 Vite 将 `/calibre/*` 代理到 `VITE_CALIBRE_URL`，绕 CORS；Android/HarmonyOS 直连 LAN IP
-- **格式优先级** — EPUB > PDF > TXT > MD > DOCX/CBZ；EPUB 渲染：Web 用 epubjs，**Android 用原生重排（jsoup→AnnotatedString，去 WebView）**，PDF 使用系统 PdfRenderer
+- **格式能力** — Android base 支持 EPUB/PDF/TXT/MD/CBZ；DOCX 延期。EPUB 渲染：Web 用 epubjs，**Android 用原生重排（jsoup→AnnotatedString，去 WebView）**；PDF 使用系统 PdfRenderer；CBZ 使用第一方 ZIP 图片分页器
 - **三端进度同步** — 待实现；策略设计见 `.claude/skills/linreads-sync/SKILL.md`
 - **EPUB 渲染** — Web：epubjs（已知陷阱见 `.claude/skills/linreads-epub/SKILL.md`）。Android：自研原生重排（`ZipFile`+jsoup 解析 → Compose `AnnotatedString`，参考 Myne `EpubParser`），无 WebView/CFI，定位用 spine+章节内字符偏移+progression
 - **引擎策略** — 复用成熟开源引擎（PdfRenderer/MuPDF/Markwon）；自研：TXT 大文件 TxtVirtualPager（~300行）+ Android EPUB 原生重排解析/渲染
@@ -73,18 +73,21 @@ compact 后任务判定：system-reminder 注入的 `### Skill:` 段尾若带 `A
 
 ### Build resource policy
 
+- **2026-07-31 user override:** after the current handoff, do not run local Android Gradle builds, local Android unit tests, `assemble*`, `connected*`, or local test-APK generation. Treat GitHub Actions/cloud build as the only Android build/test artifact producer. ADB installs, device logs, UI XML, package state, and other non-build diagnostics remain allowed.
 - Full Android regression suites, R8/minification, `:app:assembleOta`, and
   `:updater-helper:assembleOta` run in GitHub Actions only.
-- Local Android verification is limited to the smallest targeted test tasks needed for the current change.
+- Local Android verification is limited to non-build diagnostics and already-produced artifacts. Do not create new local Android APKs or test outputs.
 - After pushing, monitor `.github/workflows/android-release.yml` through completion and verify the published `dev-latest` APK; do not duplicate that release build locally.
 
 ### Release lanes
 
-1. **Local lane**: freeze one problem packet, review its exact diff/allowlist, then run each targeted test and static contract check once.
+1. **Local lane**: freeze one problem packet, review its exact diff/allowlist, then run static contract checks and device/log diagnostics that do not invoke Android local builds.
 2. **Cloud lane**: make one scoped commit and let GitHub Actions own full regression, R8, dual-APK signing/building, publication, and byte verification. A failed run returns to one explicit root cause; do not stack speculative fixes.
 3. **Device lane**: start only after CI and release metadata are verified. Bootstrap the production helper and helper-aware app once without clearing data, then validate the next OTA in one physical-device batch. Capture text logs, package/session state, version/signature, task stack, and library counts; the main agent does not load screenshots.
 
-Do not interleave local builds, emulator runs, ADB installs, and manual device checks between small edits. The order for an OTA packet is always local targeted checks -> CI full/R8/publication -> one final device acceptance batch.
+Each iteration freezes one acceptance matrix and one build identity. Collect all device findings before changing code, group them by root cause, and use those findings to design the next iteration. Documentation and tracker-only pushes do not publish Android builds; use `workflow_dispatch` when the same source revision needs a deliberate OTA acceptance bump.
+
+Do not interleave local builds, emulator runs, ADB installs, and manual device checks between small edits. The order for an OTA packet is always static review/non-build diagnostics -> CI full/R8/publication -> one final device acceptance batch.
 
 改完代码后，先检查工作树并只暂存本次文件，再推送到远端平板：
 
@@ -138,10 +141,17 @@ Android 端 `CalibreClient` 初始化时传 `baseUrl`，来源待接 Settings Sh
 
 Chinese: user-facing strings, UI labels. English: code, comments, commit messages, logs.
 
+## Hybrid Subagent Routing
+
+- Project routing is defined in `AGENTS.md`. Use `DeepSeek V4 Flash` first for bounded text-only source, log, metrics, structured-data, implementation, and targeted-test work.
+- Route `GPT-5.6 Luna` only when the worker runtime exposes it and the task needs images/multimodal evidence, complex cross-module reasoning, difficult tool orchestration, or independent arbitration of conflicting/high-risk findings. Never send visual payloads to DeepSeek.
+- Grok remains an explicit, authorized write-capable lane; it is not a reason to bypass the packet, conflict-domain ownership, cloud-only Android build policy, or Sol's final acceptance.
+- In `Cost mode: cost-saving`, prefer DS/Grok to perform the concrete discovery, implementation, debugging, targeted verification, and self-review. The main Sol agent should avoid broad direct edits and may only handle architecture, conflict resolution, small integration glue, security-sensitive changes, and final acceptance unless the user explicitly authorizes an exception.
+
 ## Grok Delegated Execution
 
 - Codex may dispatch bounded implementation, debugging, audit, and verification tasks to Grok from the repository root.
-- Grok has workspace write permission and may run normal local builds/tests, but must follow `AGENTS.md` for parallel ownership and handoff rules.
+- Grok has workspace write permission, but Android local builds/tests are disabled after the 2026-07-31 handoff; Grok must use cloud-build evidence or non-build diagnostics and follow `AGENTS.md` for parallel ownership and handoff rules.
 - Grok must invoke the same mandatory LinReads skills listed above before touching their trigger scopes.
 - Grok must preserve the existing dirty worktree and must not commit, push, publish OTA builds, deploy, or contact external systems unless the delegated task explicitly authorizes it.
 - Headless Grok tasks must return a final result with changed files and verification evidence; a tool-only or partial response is not completion.

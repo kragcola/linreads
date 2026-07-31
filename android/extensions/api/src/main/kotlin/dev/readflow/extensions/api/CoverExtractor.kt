@@ -2,9 +2,14 @@ package dev.readflow.extensions.api
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import androidx.exifinterface.media.ExifInterface
+import dev.readflow.core.archive.ZipArchiveLimits
+import dev.readflow.core.archive.ZipArchivePreflight
 import dev.readflow.core.model.BookFormat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -40,6 +45,7 @@ internal object CoverExtractor {
                 val extracted = when (format) {
                     BookFormat.EPUB -> epubCover(srcFile, staging)
                     BookFormat.PDF -> pdfCover(srcFile, staging)
+                    BookFormat.CBZ -> cbzCover(srcFile, staging)
                     else -> null
                 } ?: return@withContext null
                 if (extracted.length() <= 0L) return@withContext null
@@ -165,6 +171,130 @@ internal object CoverExtractor {
         }
     }
 
+    // ── CBZ ──────────────────────────────────────────────────────────────────
+
+    private fun cbzCover(cbz: File, out: File): File? {
+        ZipArchivePreflight.inspect(cbz, CBZ_ZIP_LIMITS)
+        return ZipFile(cbz).use { zip ->
+            val candidates = mutableListOf<java.util.zip.ZipEntry>()
+            val entries = zip.entries()
+            var scanned = 0
+            while (entries.hasMoreElements()) {
+                if (++scanned > MAX_CBZ_ARCHIVE_ENTRIES) return null
+                val entry = entries.nextElement()
+                if (!entry.isDirectory && isCbzImageCandidate(entry.name)) candidates += entry
+            }
+            candidates.sortWith { left, right -> naturalNameCompare(left.name, right.name) }
+            for (entry in candidates) {
+                if (entry.size > MAX_COVER_BYTES) continue
+                if (entry.size > 0L && entry.compressedSize > 0L &&
+                    entry.size > entry.compressedSize * MAX_CBZ_COMPRESSION_RATIO
+                ) {
+                    continue
+                }
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                zip.getInputStream(entry).use { input ->
+                    BitmapFactory.decodeStream(
+                        SizeLimitedInputStream(input, MAX_COVER_BYTES),
+                        null,
+                        bounds,
+                    )
+                }
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) continue
+                if (
+                    bounds.outWidth > MAX_CBZ_IMAGE_DIMENSION ||
+                    bounds.outHeight > MAX_CBZ_IMAGE_DIMENSION ||
+                    bounds.outWidth.toLong() * bounds.outHeight.toLong() > MAX_CBZ_IMAGE_PIXELS
+                ) {
+                    continue
+                }
+                var sampleSize = 1
+                val longEdge = maxOf(bounds.outWidth, bounds.outHeight)
+                while (longEdge / sampleSize > MAX_COVER_LONG_EDGE_PX * 2) sampleSize *= 2
+                val bitmap = zip.getInputStream(entry).use { input ->
+                    BitmapFactory.decodeStream(
+                        SizeLimitedInputStream(input, MAX_COVER_BYTES),
+                        null,
+                        BitmapFactory.Options().apply {
+                            inSampleSize = sampleSize
+                            inPreferredConfig = Bitmap.Config.RGB_565
+                        },
+                    )
+                } ?: continue
+                val rotationDegrees = runCatching {
+                    zip.getInputStream(entry).use { input ->
+                        ExifInterface(SizeLimitedInputStream(input, MAX_COVER_BYTES)).rotationDegrees
+                    }
+                }.getOrDefault(0)
+                val oriented = if (rotationDegrees % 360 == 0) {
+                    bitmap
+                } else {
+                    Bitmap.createBitmap(
+                        bitmap,
+                        0,
+                        0,
+                        bitmap.width,
+                        bitmap.height,
+                        Matrix().apply { postRotate(rotationDegrees.toFloat()) },
+                        true,
+                    )
+                }
+                try {
+                    out.outputStream().use { output ->
+                        if (!oriented.compress(Bitmap.CompressFormat.JPEG, 85, output)) return null
+                    }
+                    return out
+                } finally {
+                    if (oriented !== bitmap) oriented.recycle()
+                    bitmap.recycle()
+                }
+            }
+            null
+        }
+    }
+
+    private fun isCbzImageCandidate(name: String): Boolean {
+        val normalized = name.replace('\\', '/')
+        if (normalized.startsWith("__MACOSX/", ignoreCase = true)) return false
+        val leaf = normalized.substringAfterLast('/')
+        if (leaf.startsWith('.')) return false
+        return leaf.substringAfterLast('.', "").lowercase() in CBZ_IMAGE_EXTENSIONS
+    }
+
+    private fun naturalNameCompare(left: String, right: String): Int {
+        var leftIndex = 0
+        var rightIndex = 0
+        while (leftIndex < left.length && rightIndex < right.length) {
+            val leftChar = left[leftIndex]
+            val rightChar = right[rightIndex]
+            if (leftChar.isDigit() && rightChar.isDigit()) {
+                val leftStart = leftIndex
+                val rightStart = rightIndex
+                while (leftIndex < left.length && left[leftIndex].isDigit()) leftIndex++
+                while (rightIndex < right.length && right[rightIndex].isDigit()) rightIndex++
+                val leftDigits = left.substring(leftStart, leftIndex)
+                val rightDigits = right.substring(rightStart, rightIndex)
+                val leftNumber = leftDigits.trimStart('0').ifEmpty { "0" }
+                val rightNumber = rightDigits.trimStart('0').ifEmpty { "0" }
+                if (leftNumber.length != rightNumber.length) return leftNumber.length.compareTo(rightNumber.length)
+                val numeric = leftNumber.compareTo(rightNumber)
+                if (numeric != 0) return numeric
+                if (leftDigits.length != rightDigits.length) return rightDigits.length.compareTo(leftDigits.length)
+            } else {
+                val foldedLeft = leftChar.lowercaseChar()
+                val foldedRight = rightChar.lowercaseChar()
+                if (foldedLeft != foldedRight) return foldedLeft.compareTo(foldedRight)
+                leftIndex++
+                rightIndex++
+            }
+        }
+        return when {
+            leftIndex < left.length -> 1
+            rightIndex < right.length -> -1
+            else -> left.compareTo(right)
+        }
+    }
+
     private fun securePullParser(input: InputStream): XmlPullParser =
         XmlPullParserFactory.newInstance().apply {
             isNamespaceAware = true
@@ -248,5 +378,12 @@ internal object CoverExtractor {
 
     private const val MAX_COVER_BYTES = 32L * 1024 * 1024
     private const val MAX_PACKAGE_XML_BYTES = 2L * 1024 * 1024
+    private const val MAX_CBZ_ARCHIVE_ENTRIES = ZipArchiveLimits.DEFAULT_MAX_ENTRIES
+    private const val MAX_CBZ_COMPRESSION_RATIO = 100L
+    private const val MAX_CBZ_IMAGE_DIMENSION = 65_535
+    private const val MAX_CBZ_IMAGE_PIXELS = 268_435_456L
+    private const val MAX_COVER_LONG_EDGE_PX = 800
+    private val CBZ_ZIP_LIMITS = ZipArchiveLimits()
+    private val CBZ_IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp")
     private val WHITESPACE = Regex("\\s+")
 }

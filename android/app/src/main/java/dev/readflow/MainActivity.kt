@@ -3,6 +3,7 @@ package dev.readflow
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -66,5 +67,15 @@ class MainActivity : ComponentActivity() {
     private fun updateIncomingBook(intent: Intent) {
         incomingBookUri = intent.extractIncomingBookUri()
         incomingBookMimeType = if (incomingBookUri != null) intent.type else null
+        Log.i(
+            IMPORT_TRACE_TAG,
+            "incoming action=${intent.action} type=${intent.type} " +
+                "hasData=${intent.data != null} resolved=${incomingBookUri != null} " +
+                "scheme=${incomingBookUri?.scheme}",
+        )
+    }
+
+    private companion object {
+        const val IMPORT_TRACE_TAG = "ReadflowImportTrace"
     }
 }

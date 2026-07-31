@@ -8,6 +8,7 @@ room = "2.7.1"
 koin = "4.0.2"
 ktor = "3.1.0"
 coil = "3.1.0"
+zoomimage = "1.4.0"
 paging = "3.3.6"
 navigation = "2.9.4"
 lifecycle = "2.9.0"
@@ -15,6 +16,7 @@ activity-compose = "1.10.0"
 recyclerview = "1.4.0"
 viewpager2 = "1.1.0"
 documentfile = "1.1.0"
+exifinterface = "1.4.1"
 datastore = "1.1.4"
 markwon = "4.6.2"
 mupdf = "1.27.0"
@@ -65,6 +67,7 @@ ktor-serialization-kotlinx-json = { group = "io.ktor", name = "ktor-serializatio
 coil = { group = "io.coil-kt.coil3", name = "coil", version.ref = "coil" }
 coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
 coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
+zoomimage-view = { group = "io.github.panpf.zoomimage", name = "zoomimage-view", version.ref = "zoomimage" }
 compose-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core" }
 compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
 paging-runtime = { group = "androidx.paging", name = "paging-runtime", version.ref = "paging" }
@@ -80,6 +83,7 @@ juniversalchardet = { group = "com.github.albfernandez", name = "juniversalchard
 recyclerview = { group = "androidx.recyclerview", name = "recyclerview", version.ref = "recyclerview" }
 viewpager2 = { group = "androidx.viewpager2", name = "viewpager2", version.ref = "viewpager2" }
 documentfile = { group = "androidx.documentfile", name = "documentfile", version.ref = "documentfile" }
+exifinterface = { group = "androidx.exifinterface", name = "exifinterface", version.ref = "exifinterface" }
 # Gradle plugin artifacts — consumed by build-logic convention plugins (compileOnly)
 android-gradlePlugin = { group = "com.android.tools.build", name = "gradle", version.ref = "agp" }
 kotlin-gradlePlugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }

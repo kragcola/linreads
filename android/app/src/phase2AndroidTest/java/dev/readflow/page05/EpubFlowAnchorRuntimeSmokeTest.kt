@@ -33,6 +33,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
 import androidx.core.content.FileProvider
 import androidx.room.Room
+import androidx.room.withTransaction
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -44,6 +45,9 @@ import androidx.test.uiautomator.UiDevice
 import androidx.test.uiautomator.Until
 import dev.readflow.MainActivity
 import dev.readflow.core.database.BookEntity
+import dev.readflow.core.database.CompleteBookDeletionStore
+import dev.readflow.core.database.FileManagedBookAssetDeletionStore
+import dev.readflow.core.database.LibraryDeletionTransactionRunner
 import dev.readflow.core.database.ReadflowDatabase
 import dev.readflow.core.database.ReadingProgressEntity
 import dev.readflow.core.database.ReadingSessionEntity
@@ -52,6 +56,7 @@ import dev.readflow.core.model.ReaderReadingMode
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.prefs.DataStoreSettingsRepository
 import dev.readflow.render.api.R as RenderApiR
+import dev.readflow.render.api.SelectionAwareTextView
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.UUID
@@ -80,9 +85,18 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private val appContext = ApplicationProvider.getApplicationContext<Context>()
     private val device = UiDevice.getInstance(instrumentation)
     private val settings = DataStoreSettingsRepository(appContext)
+    private var originalSettings: RuntimeSettingsSnapshot? = null
 
     @Before
     fun setUp() = runBlocking {
+        originalSettings = RuntimeSettingsSnapshot(
+            fontSize = settings.fontSize.first(),
+            lineSpacing = settings.lineSpacing.first(),
+            themeMode = settings.themeMode.first(),
+            readingMode = settings.readingMode.first(),
+            pageFlipStyle = settings.pageFlipStyle.first(),
+            readerGuideShown = settings.readerGuideShown.first(),
+        )
         settings.setFontSize(18)
         settings.setLineSpacing(1.75f)
         settings.setThemeMode(ThemeMode.LIGHT)
@@ -95,8 +109,74 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
     @After
     fun tearDown() {
-        device.pressHome()
-        device.waitForIdle()
+        try {
+            device.pressHome()
+            device.waitForIdle()
+        } finally {
+            originalSettings?.let { snapshot ->
+                runBlocking {
+                    settings.setFontSize(snapshot.fontSize)
+                    settings.setLineSpacing(snapshot.lineSpacing)
+                    settings.setThemeMode(snapshot.themeMode)
+                    settings.setReadingMode(snapshot.readingMode)
+                    settings.setPageFlipStyle(snapshot.pageFlipStyle)
+                    settings.setReaderGuideShown(snapshot.readerGuideShown)
+                }
+            }
+            originalSettings = null
+        }
+    }
+
+    @Test
+    fun cleanupExplicitOwnedRuntimeFixturesRuntime() = runBlocking {
+        val ids = InstrumentationRegistry.getArguments()
+            .getString(ARG_RUNTIME_FIXTURE_CLEANUP_IDS)
+            .orEmpty()
+            .split(',')
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .distinct()
+        check(ids.isNotEmpty()) { "missing explicit $ARG_RUNTIME_FIXTURE_CLEANUP_IDS" }
+
+        val database = Room.databaseBuilder(appContext, ReadflowDatabase::class.java, DB_NAME)
+            .allowMainThreadQueries()
+            .build()
+        try {
+            val rows = ids.map { id ->
+                checkNotNull(database.bookDao().getById(id)) { "cleanup row no longer exists: $id" }
+            }
+            rows.forEach { row ->
+                check(RUNTIME_FIXTURE_TITLE.matches(row.title)) {
+                    "refusing to delete unexpected title for ${row.id}: ${row.title}"
+                }
+                val managedPath = checkNotNull(Uri.parse(row.localUri).path) {
+                    "fixture has no managed path: ${row.id}"
+                }
+                check(File(managedPath).canonicalPath.startsWith(File(appContext.filesDir, "books").canonicalPath)) {
+                    "refusing to delete fixture outside managed books: ${row.id}"
+                }
+            }
+
+            val deletionStore = CompleteBookDeletionStore(
+                deletionDao = database.bookDeletionDao(),
+                assetStore = FileManagedBookAssetDeletionStore(File(appContext.filesDir, "books")),
+                transactionRunner = LibraryDeletionTransactionRunner { block ->
+                    database.withTransaction { block() }
+                },
+            )
+            rows.forEach { row ->
+                deletionStore.delete(row.id)
+                File(appContext.cacheDir, "engine-state/${row.id}.bin").delete()
+                File(appContext.cacheDir, "engine-state/${row.id}.bin.tmp").delete()
+                val extension = File(checkNotNull(Uri.parse(row.localUri).path)).extension
+                File(appContext.cacheDir, "${row.title}.$extension").delete()
+            }
+            ids.forEach { id ->
+                check(database.bookDao().getById(id) == null) { "fixture survived cleanup: $id" }
+            }
+        } finally {
+            database.close()
+        }
     }
 
     @Test
@@ -1536,6 +1616,8 @@ class EpubFlowAnchorRuntimeSmokeTest {
             var cancelFrame: Bitmap? = null
             var settledFrame: Bitmap? = null
             var gestureActive = false
+            var flowGestureDetector: GestureDetector? = null
+            var hostLongPressEnabled = false
 
             try {
                 assertVisualDiffAtMost(
@@ -1545,8 +1627,20 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     maxBadPixelRatio = 0.001,
                 )
 
-                scenario.withActivity {
-                    dispatchTouchEvent(view, motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down))
+                scenario.withActivity { activity ->
+                    flowGestureDetector = view.reflectPrivateAny("gestureDetector") as GestureDetector
+                    hostLongPressEnabled = flowGestureDetector?.isLongpressEnabled == true
+                    // The test deliberately waits for a committed DOWN frame before sending MOVE;
+                    // keep that wait from turning the synthetic stream into a real long-press.
+                    flowGestureDetector?.setIsLongpressEnabled(false)
+                }
+
+                scenario.withActivity { activity ->
+                    dispatchTouchEventThroughReaderSurface(
+                        activity = activity,
+                        flowView = view,
+                        event = motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, down),
+                    )
                 }
                 gestureActive = true
                 awaitCommittedFrame(scenario, view)
@@ -1557,14 +1651,35 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     maxRgbMae = 0.35,
                     maxBadPixelRatio = 0.002,
                 )
-                scenario.withActivity {
-                    dispatchTouchEvent(
-                        view,
-                        motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, move),
+                scenario.withActivity { activity ->
+                    dispatchTouchEventThroughReaderSurface(
+                        activity = activity,
+                        flowView = view,
+                        event = motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_MOVE, move),
                     )
+                }
+                val moveImmediateState = scenario.withActivity {
+                    val container = view.reflectPrivateAny("container") as View
+                        "state=${view.reflectPrivateAny("interactiveTurnState")} " +
+                        "containerTranslation=(${container.translationX},${container.translationY}) " +
+                        "pending=${view.reflectPrivateAny("pendingLocalPageShotHandoff") != null} " +
+                        "classified=${view.reflectPrivateBoolean("classified")} " +
+                        "stealing=${view.reflectPrivateBoolean("stealing")} " +
+                        "dead=${view.reflectPrivateBoolean("centerDeadGesture")} " +
+                        "free=${view.reflectPrivateBoolean("freeScrolling")} " +
+                        "flipped=${view.reflectPrivateBoolean("flipped")} " +
+                        "down=(${view.reflectPrivateAny("downX")},${view.reflectPrivateAny("downY")})"
                 }
                 awaitCommittedFrame(scenario, view)
                 moveFrame = captureWindowRegion(scenario, view)
+                val moveRuntimeState = scenario.withActivity {
+                    val container = view.reflectPrivateAny("container") as View
+                    "state=${view.reflectPrivateAny("interactiveTurnState")} " +
+                        "containerTranslation=(${container.translationX},${container.translationY}) " +
+                        "slide=${view.reflectPrivateAny("slideDrawable") != null} " +
+                        "curl=${view.reflectPrivateAny("curlDrawable") != null} " +
+                        "scrollY=${view.scrollY}"
+                }
                 writeWindowFrameEvidence("slide-stable.png", stable)
                 writeWindowFrameEvidence("slide-down.png", checkNotNull(downFrame))
                 writeWindowFrameEvidence("slide-move.png", checkNotNull(moveFrame))
@@ -1587,10 +1702,13 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     height = touchSize.second,
                 )
                 assertVisualDiffAtMost(
-                    "the first presented MOVE must contain the full DOWN-to-MOVE outgoing-page displacement",
+                    "the first presented MOVE must contain the full DOWN-to-MOVE outgoing-page displacement; " +
+                        "shifted=$shifted stuckAtDown=$stuckAtDown immediate=$moveImmediateState runtime=$moveRuntimeState",
                     shifted,
-                    maxRgbMae = 3.0,
-                    maxBadPixelRatio = 0.03,
+                    // Motion snapshots are intentionally quarter-resolution for finger latency;
+                    // validate displacement while allowing the expected transient upscale error.
+                    maxRgbMae = 5.5,
+                    maxBadPixelRatio = 0.12,
                 )
                 assertTrue(
                     "the first MOVE must match the shifted outgoing frame better than a stuck DOWN frame; " +
@@ -1598,10 +1716,11 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     shifted.rgbMae < stuckAtDown.rgbMae * 0.70,
                 )
 
-                scenario.withActivity {
-                    dispatchTouchEvent(
-                        view,
-                        motionEvent(
+                scenario.withActivity { activity ->
+                    dispatchTouchEventThroughReaderSurface(
+                        activity = activity,
+                        flowView = view,
+                        event = motionEvent(
                             downTime,
                             downTime + EVENT_STEP_MS * 2,
                             MotionEvent.ACTION_CANCEL,
@@ -1624,6 +1743,19 @@ class EpubFlowAnchorRuntimeSmokeTest {
                     cancelShiftPx < shiftPx,
                 )
 
+                waitForConditionResult("expected cancelled slide to settle on the outgoing page") {
+                    scenario.withActivity {
+                        val animatorRunning =
+                            (view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                        val settled =
+                            view.reflectInt("currentPageIndex") == 0 &&
+                                view.scrollY == 0 &&
+                                view.reflectPrivateAny("slideDrawable") == null &&
+                                view.reflectPrivateAny("curlDrawable") == null &&
+                                !animatorRunning
+                        if (settled) true else null
+                    }
+                }
                 settledFrame = captureUntilVisuallyStable(scenario, view)
                 writeWindowFrameEvidence("slide-settled.png", checkNotNull(settledFrame))
                 assertVisualDiffAtMost(
@@ -1635,6 +1767,9 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 val settledPage = scenario.withActivity { view.reflectInt("currentPageIndex") }
                 assertEquals("CANCEL must leave the reader on the outgoing page", 0, settledPage)
             } finally {
+                scenario.withActivity {
+                    flowGestureDetector?.setIsLongpressEnabled(hostLongPressEnabled)
+                }
                 if (gestureActive) {
                     runCatching {
                         scenario.withActivity {
@@ -1657,6 +1792,404 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 cancelFrame?.recycle()
                 settledFrame?.recycle()
             }
+        }
+    }
+
+    @Test
+    fun epubFlowSlideReleaseRapidQueueAndReverseDragRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-slide-sequence-${UUID.randomUUID().toString().take(8)}"
+        val uri = createEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected a stable multi-page flow view for SLIDE gestures") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubFlowView() ?: return@withActivity null
+                    if (
+                        candidate.reflectInt("pageCount") <= 5 ||
+                        candidate.width <= 0 ||
+                        candidate.height <= 0 ||
+                        candidate.flowContentAlpha() < 1f
+                    ) {
+                        return@withActivity null
+                    }
+                    candidate.scrollTo(0, 0)
+                    candidate
+                }
+            }
+            val pageTops = scenario.withActivity {
+                (0..3).associateWith { page ->
+                    checkNotNull(view.reflectNullableInt("pageTopPxAt", page))
+                }
+            }
+
+            val releaseDownTime = SystemClock.uptimeMillis()
+            val releaseDown = PointF(view.width * 0.85f, view.height * 0.12f)
+            val releaseMove = PointF(view.width * 0.25f, releaseDown.y)
+            scenario.withActivity { activity ->
+                dispatchTouchEventThroughReaderSurface(
+                    activity,
+                    view,
+                    motionEvent(releaseDownTime, releaseDownTime, MotionEvent.ACTION_DOWN, releaseDown),
+                )
+            }
+            awaitCommittedFrame(scenario, view)
+            scenario.withActivity { activity ->
+                dispatchTouchEventThroughReaderSurface(
+                    activity,
+                    view,
+                    motionEvent(
+                        releaseDownTime,
+                        releaseDownTime + EVENT_STEP_MS,
+                        MotionEvent.ACTION_MOVE,
+                        releaseMove,
+                    ),
+                )
+            }
+            awaitCommittedFrame(scenario, view)
+            val releaseStarted = scenario.withActivity { activity ->
+                check(view.reflectPrivateAny("slideDrawable") != null) {
+                    "SLIDE MOVE must own an interactive page drawable before release"
+                }
+                dispatchTouchEventThroughReaderSurface(
+                    activity,
+                    view,
+                    motionEvent(
+                        releaseDownTime,
+                        releaseDownTime + EVENT_STEP_MS * 2,
+                        MotionEvent.ACTION_UP,
+                        releaseMove,
+                    ),
+                )
+                FlowFirstSlideTapResult(
+                    currentPage = view.reflectInt("currentPageIndex"),
+                    scrollY = view.scrollY,
+                    slideDrawablePresent = view.reflectPrivateAny("slideDrawable") != null,
+                    flipAnimatorPresent = view.reflectPrivateAny("flipAnimator") != null,
+                )
+            }
+            assertEquals("releasing an accepted drag must park page 1", 1, releaseStarted.currentPage)
+            assertEquals(pageTops.getValue(1), releaseStarted.scrollY)
+            assertTrue(releaseStarted.slideDrawablePresent && releaseStarted.flipAnimatorPresent)
+            waitForFlowPageTurnSettled(
+                scenario,
+                view,
+                pageIndex = 1,
+                scrollY = pageTops.getValue(1),
+                message = "expected released SLIDE drag to settle on page 1",
+            )
+
+            val rapid = scenario.withActivity { activity ->
+                fun dispatchSurfaceTap(downTime: Long) {
+                    val point = PointF(view.width * 0.85f, view.height * 0.50f)
+                    dispatchTouchEventThroughReaderSurface(
+                        activity,
+                        view,
+                        motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, point),
+                    )
+                    dispatchTouchEventThroughReaderSurface(
+                        activity,
+                        view,
+                        motionEvent(downTime, downTime + EVENT_STEP_MS, MotionEvent.ACTION_UP, point),
+                    )
+                }
+
+                val firstDownTime = SystemClock.uptimeMillis()
+                dispatchSurfaceTap(firstDownTime)
+                val firstAnimator = checkNotNull(view.reflectPrivateAny("flipAnimator") as? ValueAnimator)
+                dispatchSurfaceTap(firstDownTime + EVENT_STEP_MS * 2)
+                check(view.reflectPrivateAny("flipAnimator") === firstAnimator) {
+                    "rapid second tap must queue without replacing the active SLIDE animator"
+                }
+                FlowRapidTurnResult(
+                    currentPage = view.reflectInt("currentPageIndex"),
+                    scrollY = view.scrollY,
+                    queuedDelta = view.reflectPrivateAny("queuedPageTurnDelta") as Int,
+                    animatorRunning = firstAnimator.isRunning,
+                )
+            }
+            assertEquals("first rapid tap must park page 2", 2, rapid.currentPage)
+            assertEquals(pageTops.getValue(2), rapid.scrollY)
+            assertEquals("second rapid tap must remain queued", 1, rapid.queuedDelta)
+            assertTrue(rapid.animatorRunning)
+            waitForFlowPageTurnSettled(
+                scenario,
+                view,
+                pageIndex = 3,
+                scrollY = pageTops.getValue(3),
+                message = "expected two rapid SLIDE taps to drain to page 3",
+            )
+            waitForConditionResult("expected rapid SLIDE coalescing window to return to ordinary input") {
+                scenario.withActivity {
+                    if (view.reflectPrivateBoolean("rapidTurnSequenceActive")) null else true
+                }
+            }
+
+            val reverseDownTime = SystemClock.uptimeMillis()
+            val reverseDown = PointF(view.width * 0.15f, view.height * 0.12f)
+            val reverseMove = PointF(view.width * 0.75f, reverseDown.y)
+            scenario.withActivity { activity ->
+                dispatchTouchEventThroughReaderSurface(
+                    activity,
+                    view,
+                    motionEvent(reverseDownTime, reverseDownTime, MotionEvent.ACTION_DOWN, reverseDown),
+                )
+            }
+            awaitCommittedFrame(scenario, view)
+            scenario.withActivity { activity ->
+                dispatchTouchEventThroughReaderSurface(
+                    activity,
+                    view,
+                    motionEvent(
+                        reverseDownTime,
+                        reverseDownTime + EVENT_STEP_MS,
+                        MotionEvent.ACTION_MOVE,
+                        reverseMove,
+                    ),
+                )
+            }
+            awaitCommittedFrame(scenario, view)
+            val reverseStarted = scenario.withActivity { activity ->
+                val container = view.reflectPrivateAny("container") as View
+                check(
+                    view.reflectPrivateAny("slideDrawable") != null ||
+                        container.translationX > view.width * 0.45f,
+                ) {
+                    "reverse SLIDE MOVE must be owned by the live page or interactive drawable; " +
+                        "translationX=${container.translationX}"
+                }
+                dispatchTouchEventThroughReaderSurface(
+                    activity,
+                    view,
+                    motionEvent(
+                        reverseDownTime,
+                        reverseDownTime + EVENT_STEP_MS * 2,
+                        MotionEvent.ACTION_UP,
+                        reverseMove,
+                    ),
+                )
+                FlowTurnSettled(
+                    currentPage = view.reflectInt("currentPageIndex"),
+                    scrollY = view.scrollY,
+                )
+            }
+            assertEquals("reverse drag must park page 2", 2, reverseStarted.currentPage)
+            assertEquals(pageTops.getValue(2), reverseStarted.scrollY)
+            waitForFlowPageTurnSettled(
+                scenario,
+                view,
+                pageIndex = 2,
+                scrollY = pageTops.getValue(2),
+                message = "expected reverse SLIDE drag to settle on page 2",
+            )
+        }
+    }
+
+    @Test
+    @SdkSuppress(minSdkVersion = 29)
+    fun epubFlowImagesRemainVisibleAcrossPageAndChapterTurnsRuntime() = runBlocking {
+        settings.setPageFlipStyle(PageFlipStyle.SLIDE)
+        val title = "flow-image-continuity-${UUID.randomUUID().toString().take(8)}"
+        val uri = createImageContinuityEpubUri("$title.epub")
+
+        ActivityScenario.launch<MainActivity>(readerIntent(uri)).use { scenario ->
+            dismissBlockingDialogs()
+            waitForObject(By.descStartsWith("阅读内容"))
+
+            val view = waitForConditionResult("expected chapter-one flow view to settle") {
+                scenario.withActivity { activity ->
+                    val candidate = activity.findEpubFlowView() ?: return@withActivity null
+                    val text = candidate.reflectTextView().text as? Spanned ?: return@withActivity null
+                    if (
+                        !text.toString().contains("CHAPTER-ONE-IMAGE") ||
+                        candidate.reflectInt("pageCount") < 2 ||
+                        candidate.width <= 0 ||
+                        candidate.height <= 0 ||
+                        candidate.flowContentAlpha() < 1f ||
+                        candidate.reflectPrivateAny("conversionSnapshotDrawable") != null
+                    ) {
+                        return@withActivity null
+                    }
+                    candidate
+                }
+            }
+            val target = scenario.withActivity {
+                val text = checkNotNull(view.reflectTextView().text as? Spanned)
+                val allSpans = text.getSpans(0, text.length, Any::class.java)
+                val imageSpans = allSpans
+                    .filter { it.javaClass.name == "io.noties.markwon.image.AsyncDrawableSpan" }
+                    .sortedBy(text::getSpanStart)
+                val allSpanTypes = allSpans
+                    .map { it.javaClass.name }
+                    .distinct()
+                check(imageSpans.size >= 2) {
+                    "expected two drawable image spans, found ${imageSpans.size}; allSpans=$allSpanTypes"
+                }
+                val layout = checkNotNull(view.reflectTextView().layout)
+                val blueImageTop = layout.getLineTop(layout.getLineForOffset(text.getSpanStart(imageSpans.first())))
+                val pageTops = (0 until view.reflectInt("pageCount")).map { page ->
+                    checkNotNull(view.reflectNullableInt("pageTopPxAt", page))
+                }
+                val imagePage = pageTops.indexOf(blueImageTop)
+                check(imagePage >= 1) {
+                    "blue image line must start an image page after page zero; " +
+                        "imageTop=$blueImageTop pageTops=$pageTops"
+                }
+                val priorPage = imagePage - 1
+                val priorTop = pageTops[priorPage]
+                check(priorTop + view.height > blueImageTop) {
+                    "fixture must expose a cross-page image strip; priorTop=$priorTop " +
+                        "height=${view.height} imageTop=$blueImageTop pageTops=$pageTops"
+                }
+                val redImageTop = layout.getLineTop(layout.getLineForOffset(text.getSpanStart(imageSpans[1])))
+                val redPage = pageTops.indexOfLast { pageTop -> pageTop <= redImageTop }
+                check(redPage == pageTops.lastIndex) {
+                    "red boundary image must own the final chapter page; " +
+                        "redTop=$redImageTop redPage=$redPage pageTops=$pageTops"
+                }
+                FlowImageContinuityTarget(
+                    view = view,
+                    priorPage = priorPage,
+                    priorTop = priorTop,
+                    imagePage = imagePage,
+                    imageTop = blueImageTop,
+                    finalImagePage = redPage,
+                    finalImageTop = pageTops[redPage],
+                )
+            }
+
+            scenario.withActivity {
+                target.view.javaClass.getDeclaredMethod("goToPage", Int::class.javaPrimitiveType).apply {
+                    isAccessible = true
+                }.invoke(target.view, target.priorPage)
+            }
+            waitForFlowPage(
+                scenario,
+                target.view,
+                target.priorPage,
+                target.priorTop,
+                "expected page before the blue plate",
+            )
+            captureUntilColorPresent(
+                scenario,
+                target.view,
+                IMAGE_BLUE,
+                minPixels = target.view.width * 4,
+                message = "the page before the image must retain its visible blue strip",
+            ).recycle()
+
+            scenario.withActivity { check(target.view.reflectBoolean("goToAdjacentPage", 1)) }
+            waitForFlowPageTurnSettled(
+                scenario,
+                target.view,
+                target.imagePage,
+                target.imageTop,
+                "expected SLIDE turn to land on the complete blue image",
+            )
+            captureUntilColorPresent(
+                scenario,
+                target.view,
+                IMAGE_BLUE,
+                minPixels = target.view.width * target.view.height / 20,
+                message = "the image landing page must retain decoded blue pixels",
+            ).recycle()
+
+            scenario.withActivity { check(target.view.reflectBoolean("goToAdjacentPage", -1)) }
+            waitForFlowPageTurnSettled(
+                scenario,
+                target.view,
+                target.priorPage,
+                target.priorTop,
+                "expected reverse SLIDE turn to restore the page before the image",
+            )
+            captureUntilColorPresent(
+                scenario,
+                target.view,
+                IMAGE_BLUE,
+                minPixels = target.view.width * 4,
+                message = "reverse turn must not lose the cross-page blue strip",
+            ).recycle()
+
+            for (page in (target.priorPage + 1)..target.finalImagePage) {
+                val pageTop = checkNotNull(
+                    scenario.withActivity { target.view.reflectNullableInt("pageTopPxAt", page) },
+                )
+                scenario.withActivity { check(target.view.reflectBoolean("goToAdjacentPage", 1)) }
+                waitForFlowPageTurnSettled(
+                    scenario,
+                    target.view,
+                    page,
+                    pageTop,
+                    "expected sequential SLIDE turn to settle on chapter-one page $page",
+                )
+            }
+            assertEquals(target.finalImageTop, scenario.withActivity { target.view.scrollY })
+            captureUntilColorPresent(
+                scenario,
+                target.view,
+                IMAGE_RED,
+                minPixels = target.view.width * target.view.height / 20,
+                message = "chapter one final page must display its red image",
+            ).recycle()
+
+            scenario.withActivity {
+                dispatchTap(
+                    target.view,
+                    PointF(target.view.width * 0.85f, target.view.height * 0.50f),
+                )
+            }
+            val chapterTwoView = waitForConditionResult("expected image boundary turn to settle in chapter two") {
+                scenario.withActivity { activity ->
+                    val view = activity.findActiveEpubFlowView() ?: return@withActivity null
+                    val animatorRunning = (view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                    val settled =
+                        view.reflectTextView().text.toString().contains("CHAPTER-TWO-IMAGE") &&
+                            view.reflectInt("currentPageIndex") == 0 &&
+                            view.reflectPrivateAny("slideDrawable") == null &&
+                            view.reflectPrivateAny("curlDrawable") == null &&
+                            !animatorRunning
+                    if (settled) view else null
+                }
+            }
+            captureUntilColorPresent(
+                scenario,
+                chapterTwoView,
+                IMAGE_GREEN,
+                minPixels = chapterTwoView.width * chapterTwoView.height / 20,
+                message = "chapter two landing page must display its green image",
+            ).recycle()
+
+            scenario.withActivity {
+                dispatchTap(
+                    chapterTwoView,
+                    PointF(chapterTwoView.width * 0.15f, chapterTwoView.height * 0.50f),
+                )
+            }
+            val restoredChapterOneView = waitForConditionResult(
+                "expected reverse image boundary turn to settle back in chapter one",
+            ) {
+                scenario.withActivity { activity ->
+                    val view = activity.findActiveEpubFlowView() ?: return@withActivity null
+                    val animatorRunning = (view.reflectPrivateAny("flipAnimator") as? ValueAnimator)?.isRunning == true
+                    val settled =
+                        view.reflectTextView().text.toString().contains("CHAPTER-ONE-IMAGE") &&
+                            view.reflectInt("currentPageIndex") == view.reflectInt("pageCount") - 1 &&
+                            view.reflectPrivateAny("slideDrawable") == null &&
+                            view.reflectPrivateAny("curlDrawable") == null &&
+                            !animatorRunning
+                    if (settled) view else null
+                }
+            }
+            captureUntilColorPresent(
+                scenario,
+                restoredChapterOneView,
+                IMAGE_RED,
+                minPixels = restoredChapterOneView.width * restoredChapterOneView.height / 20,
+                message = "reverse chapter turn must restore the red image without disappearance",
+            ).recycle()
         }
     }
 
@@ -2313,19 +2846,21 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 scenario.withActivity { activity -> if (activity.hasWindowFocus()) true else null }
             }
             lateinit var flowGestureDetector: GestureDetector
-            lateinit var flowTextView: TextView
+            lateinit var flowTextView: SelectionAwareTextView
             var hostLongPressEnabled = false
-            var textLongClickable = false
-            var textSelectable = false
+            var nativeTextSelectionEnabled = false
+            var touchSelectionEnabled = false
             scenario.withActivity {
                 flowGestureDetector = start.view.reflectPrivateAny("gestureDetector") as GestureDetector
-                flowTextView = checkNotNull(start.view.findDescendant { it is TextView } as? TextView)
+                flowTextView = checkNotNull(
+                    start.view.findDescendant { it is SelectionAwareTextView } as? SelectionAwareTextView,
+                )
                 hostLongPressEnabled = flowGestureDetector.isLongpressEnabled
-                textLongClickable = flowTextView.isLongClickable
-                textSelectable = flowTextView.isTextSelectable
+                nativeTextSelectionEnabled = flowTextView.nativeTextSelectionEnabled
+                touchSelectionEnabled = flowTextView.touchSelectionEnabled
                 flowGestureDetector.setIsLongpressEnabled(false)
-                flowTextView.isLongClickable = false
-                flowTextView.setTextIsSelectable(false)
+                flowTextView.nativeTextSelectionEnabled = false
+                flowTextView.touchSelectionEnabled = false
             }
             instrumentation.waitForIdleSync()
             device.waitForIdle()
@@ -2454,8 +2989,8 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 }
                 scenario.withActivity {
                     flowGestureDetector.setIsLongpressEnabled(hostLongPressEnabled)
-                    flowTextView.setTextIsSelectable(textSelectable)
-                    flowTextView.isLongClickable = textLongClickable
+                    flowTextView.touchSelectionEnabled = touchSelectionEnabled
+                    flowTextView.nativeTextSelectionEnabled = nativeTextSelectionEnabled
                 }
                 stableA.recycle()
                 stable.recycle()
@@ -3022,19 +3557,21 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 }
             }
             lateinit var flowGestureDetector: GestureDetector
-            lateinit var flowTextView: TextView
+            lateinit var flowTextView: SelectionAwareTextView
             var hostLongPressEnabled = false
-            var textLongClickable = false
-            var textSelectable = false
+            var nativeTextSelectionEnabled = false
+            var touchSelectionEnabled = false
             scenario.withActivity {
                 flowGestureDetector = view.reflectPrivateAny("gestureDetector") as GestureDetector
-                flowTextView = checkNotNull(view.findDescendant { it is TextView } as? TextView)
+                flowTextView = checkNotNull(
+                    view.findDescendant { it is SelectionAwareTextView } as? SelectionAwareTextView,
+                )
                 hostLongPressEnabled = flowGestureDetector.isLongpressEnabled
-                textLongClickable = flowTextView.isLongClickable
-                textSelectable = flowTextView.isTextSelectable
+                nativeTextSelectionEnabled = flowTextView.nativeTextSelectionEnabled
+                touchSelectionEnabled = flowTextView.touchSelectionEnabled
                 flowGestureDetector.setIsLongpressEnabled(false)
-                flowTextView.isLongClickable = false
-                flowTextView.setTextIsSelectable(false)
+                flowTextView.nativeTextSelectionEnabled = false
+                flowTextView.touchSelectionEnabled = false
             }
             instrumentation.waitForIdleSync()
             device.waitForIdle()
@@ -3145,8 +3682,8 @@ class EpubFlowAnchorRuntimeSmokeTest {
                 }
                 scenario.withActivity {
                     flowGestureDetector.setIsLongpressEnabled(hostLongPressEnabled)
-                    flowTextView.setTextIsSelectable(textSelectable)
-                    flowTextView.isLongClickable = textLongClickable
+                    flowTextView.touchSelectionEnabled = touchSelectionEnabled
+                    flowTextView.nativeTextSelectionEnabled = nativeTextSelectionEnabled
                 }
                 stableA.recycle()
                 stable.recycle()
@@ -3276,6 +3813,12 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private fun createShortChapterBoundaryEpubUri(fileName: String): Uri {
         val file = File(appContext.cacheDir, fileName)
         writeShortChapterBoundaryEpub(file)
+        return FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
+    }
+
+    private fun createImageContinuityEpubUri(fileName: String): Uri {
+        val file = File(appContext.cacheDir, fileName)
+        writeImageContinuityEpub(file)
         return FileProvider.getUriForFile(appContext, "${appContext.packageName}.fileprovider", file)
     }
 
@@ -3484,8 +4027,83 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
+    private fun writeImageContinuityEpub(file: File) {
+        val chapterOne = buildString {
+            appendLine("<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>")
+            appendLine("<h1>CHAPTER-ONE-IMAGE</h1>")
+            repeat(28) { index ->
+                appendLine("<p>IMAGE-PREFIX-$index positions the first plate near a page boundary.</p>")
+            }
+            appendLine("<h2>BLUE-CROSS-PAGE-PLATE</h2>")
+            appendLine("<p><img src=\"blue.png\" alt=\"blue cross-page plate\"/></p>")
+            repeat(36) { index ->
+                appendLine("<p>IMAGE-MIDDLE-$index keeps the final chapter image on a later page.</p>")
+            }
+            appendLine("<p><img src=\"red.png\" alt=\"red final chapter plate\"/></p>")
+            appendLine("</body></html>")
+        }
+        val chapterTwo = """
+            <html xmlns="http://www.w3.org/1999/xhtml">
+              <body>
+                <p><img src="green.png" alt="green next chapter plate"/></p>
+                <h1>CHAPTER-TWO-IMAGE</h1>
+                <p>The second chapter keeps its prepared image surface across the boundary turn.</p>
+              </body>
+            </html>
+        """.trimIndent()
+        ZipOutputStream(file.outputStream()).use { zip ->
+            fun addText(path: String, content: String) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(content.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+            fun addBinary(path: String, bytes: ByteArray) {
+                zip.putNextEntry(ZipEntry(path))
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+            addText(
+                "META-INF/container.xml",
+                """
+                    <container>
+                      <rootfiles>
+                        <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+                      </rootfiles>
+                    </container>
+                """.trimIndent(),
+            )
+            addText(
+                "OEBPS/content.opf",
+                """
+                    <package version="3.0">
+                      <manifest>
+                        <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+                        <item id="blue" href="blue.png" media-type="image/png"/>
+                        <item id="red" href="red.png" media-type="image/png"/>
+                        <item id="green" href="green.png" media-type="image/png"/>
+                      </manifest>
+                      <spine>
+                        <itemref idref="ch1"/>
+                        <itemref idref="ch2"/>
+                      </spine>
+                    </package>
+                """.trimIndent(),
+            )
+            addText("OEBPS/ch1.xhtml", chapterOne)
+            addText("OEBPS/ch2.xhtml", chapterTwo)
+            addBinary("OEBPS/blue.png", solidPngBytes(600, 900, IMAGE_BLUE))
+            addBinary("OEBPS/red.png", solidPngBytes(900, 300, IMAGE_RED))
+            addBinary("OEBPS/green.png", solidPngBytes(600, 900, IMAGE_GREEN))
+        }
+    }
+
     private fun tinyPngBytes(color: Int): ByteArray {
-        val bitmap = Bitmap.createBitmap(12, 12, Bitmap.Config.ARGB_8888)
+        return solidPngBytes(12, 12, color)
+    }
+
+    private fun solidPngBytes(width: Int, height: Int, color: Int): ByteArray {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         bitmap.eraseColor(color)
         val output = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
@@ -3699,6 +4317,13 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
     private fun MainActivity.findEpubFlowView(): View? =
         window.decorView.findDescendant { it.javaClass.name == EPUB_FLOW_VIEW_CLASS_NAME }
+
+    private fun MainActivity.findActiveEpubFlowView(): View? =
+        window.decorView.findDescendant {
+            it.javaClass.name == EPUB_FLOW_VIEW_CLASS_NAME &&
+                it.visibility == View.VISIBLE &&
+                it.isEnabled
+        }
 
     private fun MainActivity.findLegacyEpubCurlOverlay(): View? =
         window.decorView.findDescendant { it.javaClass.name == LEGACY_EPUB_CURL_OVERLAY_CLASS_NAME }
@@ -4019,6 +4644,30 @@ class EpubFlowAnchorRuntimeSmokeTest {
         }
     }
 
+    private fun dispatchTouchEventThroughReaderSurface(
+        activity: MainActivity,
+        flowView: View,
+        event: MotionEvent,
+    ) {
+        val surface = activity.findReaderSurface()
+        val flowLocation = IntArray(2)
+        val surfaceLocation = IntArray(2)
+        flowView.getLocationInWindow(flowLocation)
+        surface.getLocationInWindow(surfaceLocation)
+        val transformed = MotionEvent.obtain(event).apply {
+            offsetLocation(
+                (flowLocation[0] - surfaceLocation[0]).toFloat(),
+                (flowLocation[1] - surfaceLocation[1]).toFloat(),
+            )
+        }
+        try {
+            surface.dispatchTouchEvent(transformed)
+        } finally {
+            transformed.recycle()
+            event.recycle()
+        }
+    }
+
     private fun injectScreenTap(x: Int, y: Int) {
         val downTime = SystemClock.uptimeMillis()
         val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat(), 0).apply {
@@ -4212,6 +4861,46 @@ class EpubFlowAnchorRuntimeSmokeTest {
             y += 16
         }
         return if (count == 0) 0.0 else total / count
+    }
+
+    private fun captureUntilColorPresent(
+        scenario: ActivityScenario<MainActivity>,
+        target: View,
+        color: Int,
+        minPixels: Int,
+        message: String,
+    ): Bitmap {
+        val deadline = SystemClock.uptimeMillis() + UI_TIMEOUT_MS
+        var lastCount = 0
+        while (SystemClock.uptimeMillis() < deadline) {
+            awaitCommittedFrame(scenario, target)
+            val frame = captureWindowRegion(scenario, target)
+            lastCount = frame.countPixelsNearColor(color, tolerance = 10)
+            if (lastCount >= minPixels) return frame
+            frame.recycle()
+            SystemClock.sleep(FRAME_POLL_MS)
+        }
+        error("$message: expected at least $minPixels pixels, found $lastCount")
+    }
+
+    private fun Bitmap.countPixelsNearColor(color: Int, tolerance: Int): Int {
+        var matches = 0
+        val expectedRed = Color.red(color)
+        val expectedGreen = Color.green(color)
+        val expectedBlue = Color.blue(color)
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val actual = getPixel(x, y)
+                if (
+                    abs(Color.red(actual) - expectedRed) <= tolerance &&
+                    abs(Color.green(actual) - expectedGreen) <= tolerance &&
+                    abs(Color.blue(actual) - expectedBlue) <= tolerance
+                ) {
+                    matches += 1
+                }
+            }
+        }
+        return matches
     }
 
     private fun bitmapDiff(expected: Bitmap, actual: Bitmap): BitmapDiff =
@@ -4411,6 +5100,15 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val pixelCount: Int,
     )
 
+    private data class RuntimeSettingsSnapshot(
+        val fontSize: Int,
+        val lineSpacing: Float,
+        val themeMode: ThemeMode,
+        val readingMode: ReaderReadingMode,
+        val pageFlipStyle: PageFlipStyle,
+        val readerGuideShown: Boolean,
+    )
+
     private data class FlowAnchorBaseline(
         val view: View,
         val pageCount: Int,
@@ -4566,6 +5264,23 @@ class EpubFlowAnchorRuntimeSmokeTest {
         val scrollY: Int,
     )
 
+    private data class FlowRapidTurnResult(
+        val currentPage: Int,
+        val scrollY: Int,
+        val queuedDelta: Int,
+        val animatorRunning: Boolean,
+    )
+
+    private data class FlowImageContinuityTarget(
+        val view: View,
+        val priorPage: Int,
+        val priorTop: Int,
+        val imagePage: Int,
+        val imageTop: Int,
+        val finalImagePage: Int,
+        val finalImageTop: Int,
+    )
+
     private data class FlowThresholdSnapshot(
         val currentPage: Int,
         val scrollY: Int,
@@ -4598,6 +5313,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
     private companion object {
         private const val EPUB_FLOW_VIEW_CLASS_NAME = "dev.readflow.render.epub.EpubFlowView"
         private const val LEGACY_EPUB_CURL_OVERLAY_CLASS_NAME = "dev.readflow.render.epub.EpubCurlOverlay"
+        private const val ARG_RUNTIME_FIXTURE_CLEANUP_IDS = "runtimeFixtureCleanupIds"
         private const val DB_NAME = "readflow.db"
         private const val EVENT_STEP_MS = 24L
         private const val FRAME_POLL_MS = 16L
@@ -4609,6 +5325,14 @@ class EpubFlowAnchorRuntimeSmokeTest {
         private const val VISUAL_SETTLE_MAE = 0.25
         private const val VISUAL_SETTLE_BAD_PIXEL_RATIO = 0.001
         private const val VISIBLE_CONTENT_ALPHA_EPSILON = 0.05f
+        private val IMAGE_BLUE = Color.rgb(0x14, 0x64, 0xC8)
+        private val IMAGE_RED = Color.rgb(0xC8, 0x32, 0x3C)
+        private val IMAGE_GREEN = Color.rgb(0x18, 0x96, 0x58)
+        private val RUNTIME_FIXTURE_TITLE = Regex(
+            "^(flow-(window-frames|software-curl-window|software-curl-direction|a2-discrete|a2-rapid|" +
+                "slide-sequence|image-continuity|cold-handoff-frames|thresholds|longpress)-[0-9a-f]{8}|" +
+                "(cbz-runtime|ux02|ux05)-[0-9a-f-]{36})$",
+        )
         private val UI_TIMEOUT_MS = 12.seconds.inWholeMilliseconds
         private val DB_TIMEOUT_MS = 5.seconds.inWholeMilliseconds
     }

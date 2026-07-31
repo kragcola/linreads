@@ -1,6 +1,10 @@
 package dev.readflow.extensions.api
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import androidx.exifinterface.media.ExifInterface
 import androidx.test.core.app.ApplicationProvider
 import dev.readflow.core.model.BookFormat
 import kotlinx.coroutines.test.runTest
@@ -14,6 +18,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.io.File
+import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -22,6 +27,62 @@ import java.util.zip.ZipOutputStream
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class CoverExtractorTest {
+
+    @Test
+    fun `cbz cover uses the first decodable page in natural order`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val bookId = "natural-cbz-cover"
+        val archive = File(context.cacheDir, "$bookId.cbz")
+        val cover = File(context.filesDir, "covers/$bookId.jpg").apply { delete() }
+        writeEpub(
+            archive,
+            linkedMapOf(
+                "pages/page-10.png" to solidPng(width = 7, height = 5, color = Color.RED),
+                "__MACOSX/._page-1.png" to byteArrayOf(1),
+                "pages/page-2.png" to solidPng(width = 2, height = 3, color = Color.BLUE),
+            ),
+        )
+
+        val result = CoverExtractor.extract(context, archive, BookFormat.CBZ, bookId)
+
+        assertEquals(android.net.Uri.fromFile(cover).toString(), result)
+        val decoded = BitmapFactory.decodeFile(cover.absolutePath)
+        assertEquals(2, decoded.width)
+        assertEquals(3, decoded.height)
+        decoded.recycle()
+    }
+
+    @Test
+    fun `cbz cover applies JPEG EXIF orientation`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val bookId = "oriented-cbz-cover"
+        val archive = File(context.cacheDir, "$bookId.cbz")
+        val source = File(context.cacheDir, "$bookId.jpg")
+        val sourceBitmap = Bitmap.createBitmap(8, 12, Bitmap.Config.ARGB_8888)
+        try {
+            source.outputStream().use { output ->
+                assertTrue(sourceBitmap.compress(Bitmap.CompressFormat.JPEG, 90, output))
+            }
+        } finally {
+            sourceBitmap.recycle()
+        }
+        ExifInterface(source).apply {
+            setAttribute(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_ROTATE_90.toString(),
+            )
+            saveAttributes()
+        }
+        writeEpub(archive, linkedMapOf("1.jpg" to source.readBytes()))
+
+        val result = CoverExtractor.extract(context, archive, BookFormat.CBZ, bookId)
+
+        val cover = File(checkNotNull(android.net.Uri.parse(result).path))
+        val decoded = BitmapFactory.decodeFile(cover.absolutePath)
+        assertEquals(12, decoded.width)
+        assertEquals(8, decoded.height)
+        decoded.recycle()
+    }
 
     @Test
     fun `container actual stream larger than package limit is rejected when metadata underreports size`() = runTest {
@@ -143,6 +204,17 @@ class CoverExtractorTest {
                 zip.write(bytes)
                 zip.closeEntry()
             }
+        }
+    }
+
+    private fun solidPng(width: Int, height: Int, color: Int): ByteArray {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
+            eraseColor(color)
+        }
+        return ByteArrayOutputStream().use { output ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+            bitmap.recycle()
+            output.toByteArray()
         }
     }
 

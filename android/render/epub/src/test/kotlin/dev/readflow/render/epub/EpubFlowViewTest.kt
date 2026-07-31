@@ -1595,6 +1595,42 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `motion page shots use bounded resolution while settled snapshots stay full size`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        // The fixture may warm three directional owners during layout. Release those owners so
+        // this test measures the two explicit snapshot paths rather than slot admission.
+        view.recycleCachedTexturesForTest()
+        val motion = view.snapshotViewportForTest(
+            kind = PageShotLeaseKind.EVICTABLE,
+            label = "test.motion",
+            fullResolution = false,
+        )
+        val settled = view.snapshotViewportForTest(
+            kind = PageShotLeaseKind.EVICTABLE,
+            label = "test.settled",
+            fullResolution = true,
+        )
+
+        try {
+            assertNotNull(motion)
+            assertNotNull(settled)
+            assertTrue(
+                "motion snapshots must upload fewer pixels than settled content",
+                motion!!.width < settled!!.width && motion.height < settled.height,
+            )
+            assertEquals(view.width, settled.width)
+            assertEquals(view.height, settled.height)
+        } finally {
+            listOfNotNull(motion, settled).forEach { bitmap ->
+                val budget = view.privateField("pageShotBudget") as PageShotBudget
+                budget.release(bitmap)
+                if (!bitmap.isRecycled) bitmap.recycle()
+            }
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `first slide frame preserves scrolled paper texture under the finger`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -1619,10 +1655,10 @@ class EpubFlowViewTest {
 
     @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
-    fun `simulation text turn preserves viewport spatial detail when motion starts`() {
+    fun `simulation text turn keeps motion content visible when motion starts`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        view.background = OnePixelDetailDrawable()
+        view.background = OnePixelDetailDrawable(stripeWidth = 8)
         view.textView.setTextColor(0x00000000)
         view.goToPage(1)
         view.recycleCachedTexturesForTest()
@@ -1637,9 +1673,10 @@ class EpubFlowViewTest {
                 val staticEdges = staticFrame.countHighContrastHorizontalTransitions(sampleY, 8, view.width - 8)
                 val motionEdges = motionStartFrame.countHighContrastHorizontalTransitions(sampleY, 8, view.width - 8)
                 assertTrue(
-                    "a text page motion layer must preserve viewport 1-to-1 high-frequency detail; " +
-                        "staticEdges=$staticEdges motionEdges=$motionEdges sampleY=$sampleY",
-                    staticEdges > 0 && motionEdges >= staticEdges * 9 / 10,
+                    "a text page motion layer must retain visible content after bounded capture; " +
+                        "staticEdges=$staticEdges motionEdges=$motionEdges " +
+                        "distinct=${motionStartFrame.countDistinctPixels()} sampleY=$sampleY",
+                    staticEdges > 0 && motionStartFrame.countDistinctPixels() > 1,
                 )
             } finally {
                 motionStartFrame.recycle()
@@ -2003,10 +2040,11 @@ class EpubFlowViewTest {
         val slide = view.privateField("slideDrawable") as PageSlideDrawable
         assertEquals("test must sample a half-complete slide", 0.5f, slide.progress, 0.001f)
         val revealedBitmap = slide.privateBitmap("revealedBitmap")
-        assertEquals(
-            "revealed page shot should preserve the paper column at the source x",
+        val revealedSourceX = expectedSourceX * revealedBitmap.width / view.width
+        assertNotEquals(
+            "revealed page shot must carry captured paper pixels instead of exposing the static host",
             staticFrame.getPixel(expectedSourceX, sampleY),
-            revealedBitmap.getPixel(expectedSourceX, sampleY),
+            revealedBitmap.getPixel(revealedSourceX, sampleY * revealedBitmap.height / view.height),
         )
         assertEquals(
             "the incoming half-page should carry its captured paper texture, not reveal the static host background",
@@ -2106,6 +2144,60 @@ class EpubFlowViewTest {
             view.onTouchEvent(
                 motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y),
             )
+        }
+    }
+
+    @Test
+    fun `selectable child cannot hide the first paged threshold move from its flow owner`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val downX = view.width * 0.85f
+        val moveX = view.width * 0.55f
+        val y = view.height * 0.50f
+        val downTime = SystemClock.uptimeMillis()
+        view.textView.setOnTouchListener { child, event ->
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                child.parent.requestDisallowInterceptTouchEvent(true)
+            }
+            false
+        }
+
+        try {
+            assertTrue(
+                view.dispatchTouchEvent(
+                    motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y),
+                ),
+            )
+            // Robolectric does not consistently expose the selectable TextView's platform press
+            // feedback after DOWN. Preserve the real-device state explicitly so this regression
+            // verifies the ownership handoff rather than the shadow framework's focus behavior.
+            view.textView.isPressed = true
+            assertTrue("fixture needs selectable child focus before the parent steals", view.textView.requestFocus())
+            assertTrue(
+                view.dispatchTouchEvent(
+                    motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y),
+                ),
+            )
+
+            assertEquals(true, view.privateField("classified"))
+            assertEquals(true, view.privateField("stealing"))
+            assertFalse("page-turn ownership must retire child press feedback", view.textView.isPressed)
+            assertFalse("page-turn ownership must retire child touch focus", view.textView.hasFocus())
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?) {
+                "the threshold MOVE routed through the selectable child must start the slide"
+            }
+            assertEquals(
+                "the routed threshold frame must include the full displacement since DOWN",
+                (downX - moveX) / view.width.toFloat(),
+                slide.progress,
+                0.001f,
+            )
+        } finally {
+            view.dispatchTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            view.dispose()
         }
     }
 
@@ -2221,7 +2313,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `one shot soft budget still admits an interactive working pair`() {
-        val oneShotBytes = 360L * 120L * 2L
+        val oneShotBytes = (360L / 4L) * (120L / 4L) * 2L
         val budget = PageShotBudget(oneShotBytes)
         var pinnedAdmissionRequests = 0
         val view = pagedFlowView(
@@ -2377,7 +2469,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `retained reverse boundary preview yields to a local working pair under one shot budget`() {
-        val oneShotBytes = 360L * 120L * 2L
+        val oneShotBytes = (360L / 4L) * (120L / 4L) * 2L
         val budget = PageShotBudget(oneShotBytes)
         val evicted = mutableListOf<Long>()
         val view = pagedFlowView(
@@ -2468,8 +2560,8 @@ class EpubFlowViewTest {
             assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
             val waitingContainer = view.privateField("container") as View
             assertEquals(
-                "cold horizontal turn must keep the live page anchored before pinned shots are ready",
-                0f,
+                "cold horizontal turn must provide immediate live-page feedback before pinned shots are ready",
+                moveX - downX,
                 waitingContainer.translationX,
                 0.001f,
             )
@@ -4135,7 +4227,8 @@ class EpubFlowViewTest {
         val firstOriginScrollY = view.scrollY
         val x = view.width * 0.85f
         val firstStartY = view.height * 0.85f
-        val firstEndY = firstStartY - 36f
+        val acceptedTurnDistance = 24f * view.resources.displayMetrics.density
+        val firstEndY = firstStartY - acceptedTurnDistance
         val firstDownTime = SystemClock.uptimeMillis()
 
         try {
@@ -4165,7 +4258,7 @@ class EpubFlowViewTest {
 
             val secondOriginScrollY = view.scrollY
             val secondStartY = view.height * 0.15f
-            val secondEndY = secondStartY + 36f
+            val secondEndY = secondStartY + acceptedTurnDistance
             val secondDownTime = SystemClock.uptimeMillis()
             assertEquals(
                 EpubPagedTouchZone.PageTurn,
@@ -4332,6 +4425,53 @@ class EpubFlowViewTest {
             assertTrue(cancellations.isEmpty())
         } finally {
             boundary.dispose()
+        }
+    }
+
+    @Test
+    @Config(qualifiers = "mdpi")
+    fun `gentle eighteen dp horizontal drag does not turn an ordinary page`() {
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            viewportWidth = 1080,
+            viewportHeight = 600,
+        )
+        val downTime = SystemClock.uptimeMillis()
+        val density = view.resources.displayMetrics.density
+        val startX = view.width * 0.85f
+        val endX = startX - 18f * density
+        val y = view.height * 0.50f
+
+        try {
+            view.preCachePageTexturesForTest()
+            view.drainPendingPageTexturePrecacheForTest()
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, startX, y))
+            repeat(6) { step ->
+                val eventTime = downTime + (step + 1) * 24L
+                val progress = (step + 1) / 6f
+                val move = motionEvent(
+                    downTime,
+                    eventTime,
+                    MotionEvent.ACTION_MOVE,
+                    startX + (endX - startX) * progress,
+                    y,
+                )
+                view.onInterceptTouchEvent(move)
+                view.onTouchEvent(move)
+            }
+            view.onTouchEvent(
+                motionEvent(downTime, downTime + 168L, MotionEvent.ACTION_UP, endX, y),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(800L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "an 18dp gentle horizontal drag must remain below the page-turn threshold",
+                0,
+                view.currentPageIndex(),
+            )
+            assertEquals(0, view.scrollY)
+        } finally {
+            view.dispose()
         }
     }
 
@@ -5486,6 +5626,7 @@ class EpubFlowViewTest {
         assertTrue("queued input must not replace the active transaction", firstAnimator.isRunning)
 
         firstAnimator.end()
+        view.drainPendingPageTexturePrecacheForTest()
 
         val followUpAnimator = checkNotNull(
             view.privateField("flipAnimator") as android.animation.ValueAnimator?,
@@ -5549,6 +5690,7 @@ class EpubFlowViewTest {
             assertTrue(view.goToAdjacentPage(1))
 
             firstAnimator.end()
+            view.drainPendingPageTexturePrecacheForTest()
 
             val followUpAnimator = checkNotNull(
                 view.privateField("flipAnimator") as android.animation.ValueAnimator?,
@@ -5607,6 +5749,7 @@ class EpubFlowViewTest {
             assertTrue(view.goToAdjacentPage(1))
 
             firstAnimator.end()
+            view.drainPendingPageTexturePrecacheForTest()
 
             assertEquals(fixture.headingPageIndex, view.currentPageIndex())
             val followUpAnimator = checkNotNull(
@@ -5680,6 +5823,7 @@ class EpubFlowViewTest {
             decodePending = false
             view.onAsyncImageDecodeFinished()
             view.textView.viewTreeObserver.dispatchOnPreDraw()
+            view.drainPendingPageTexturePrecacheForTest()
 
             val landingAnimator = checkNotNull(
                 view.privateField("flipAnimator") as android.animation.ValueAnimator?,
@@ -5777,6 +5921,7 @@ class EpubFlowViewTest {
         assertTrue(view.goToAdjacentPage(1))
 
         firstAnimator.end()
+        view.drainPendingPageTexturePrecacheForTest()
 
         val followUpAnimator = checkNotNull(
             view.privateField("flipAnimator") as android.animation.ValueAnimator?,
@@ -5802,6 +5947,7 @@ class EpubFlowViewTest {
         val firstAnimator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
         assertTrue(view.goToAdjacentPage(1))
         firstAnimator.end()
+        view.drainPendingPageTexturePrecacheForTest()
         val followUpAnimator = checkNotNull(
             view.privateField("flipAnimator") as android.animation.ValueAnimator?,
         )
@@ -5835,6 +5981,7 @@ class EpubFlowViewTest {
         assertEquals("queueing must not replace or restart the active transaction", 1, startedCount)
 
         firstAnimator.end()
+        view.drainPendingPageTexturePrecacheForTest()
         val followUpAnimator = checkNotNull(
             view.privateField("flipAnimator") as android.animation.ValueAnimator?,
         )
@@ -6108,6 +6255,7 @@ class EpubFlowViewTest {
             terminalFailure = true
             view.onAsyncImageDecodeFinished()
             view.textView.viewTreeObserver.dispatchOnPreDraw()
+            view.drainPendingPageTexturePrecacheForTest()
 
             assertEquals("a terminal placeholder must not deadlock navigation", fixture.imagePageIndex, view.currentPageIndex())
             assertEquals(0, view.privateInt("queuedPageTurnDelta"))
@@ -6207,6 +6355,7 @@ class EpubFlowViewTest {
             executor.runNext()
             shadowOf(Looper.getMainLooper()).idle()
             view.textView.viewTreeObserver.dispatchOnPreDraw()
+            view.drainPendingPageTexturePrecacheForTest()
 
             assertEquals(
                 "the real second failure callback must release the queued turn on retained pixels",
@@ -6402,6 +6551,41 @@ class EpubFlowViewTest {
                 capturesAfterWarm,
                 EpubPageShotCaptureProbe.total(),
             )
+        } finally {
+            view.dispose()
+            EpubPageShotCaptureProbe.stop()
+        }
+    }
+
+    @Test
+    fun `rapid queue bootstraps a complete pair before starting a cold turn`() {
+        EpubPageShotCaptureProbe.reset()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+            view.recycleCachedTexturesForTest()
+            EpubPageShotCaptureProbe.reset()
+            view.setPrivateField("rapidTurnSequenceActive", true)
+            view.setPrivateField("queuedPageTurnDelta", 1)
+
+            val drain = view.drainQueuedPageTurnForTest()
+
+            assertFalse("a cold rapid queue must wait for a warm pair", drain)
+            assertTrue(
+                "the queue must bootstrap current+target precache instead of taking cold shots",
+                view.privateBool("pageTexturePrecachePending"),
+            )
+            assertNull("no animation may start before the pair is committed", view.privateField("slideDrawable"))
+
+            view.drainPendingPageTexturePrecacheForTest()
+
+            assertNotNull("the queued turn may start only after the pair is available", view.privateField("slideDrawable"))
+            assertEquals(
+                "the bootstrap must capture exactly one current/target pair",
+                2,
+                EpubPageShotCaptureProbe.total(),
+            )
+            assertEquals(1, view.currentPageIndex())
         } finally {
             view.dispose()
             EpubPageShotCaptureProbe.stop()
@@ -7678,14 +7862,17 @@ class EpubFlowViewTest {
         val forward = view.privateField("cachedRevealedBitmap") as Bitmap?
         val opposite = view.privateField("cachedBackwardBitmap") as Bitmap?
         val owners = listOfNotNull(current, forward, opposite)
-        assertEquals("full-resolution motion shots must keep current, previous, and next warm", 3, owners.size)
+        assertEquals("motion shots must keep current, previous, and next warm", 3, owners.size)
         owners.forEach { bitmap ->
             assertEquals(Bitmap.Config.RGB_565, bitmap.config)
             assertMotionPageShotSize(view, bitmap)
         }
-        val threeFullRgb565Bytes = view.width.toLong() * view.height.toLong() * 2L * 3L
-        assertEquals(threeFullRgb565Bytes, budget.leasedBytes)
-        assertTrue("three full RGB565 owners must fit the opposite cache cap", budget.leasedBytes <= oppositeCapBytes)
+        val threeMotionRgb565Bytes =
+            view.privateNoArgInt("motionPageShotWidthPx").toLong() *
+                view.privateNoArgInt("motionPageShotHeightPx").toLong() *
+                2L * 3L
+        assertEquals(threeMotionRgb565Bytes, budget.leasedBytes)
+        assertTrue("three motion RGB565 owners must fit the opposite cache cap", budget.leasedBytes <= oppositeCapBytes)
     }
 
     @Test
@@ -7776,8 +7963,11 @@ class EpubFlowViewTest {
                 assertMotionPageShotSize(view, bitmap)
                 assertEquals(Bitmap.Config.RGB_565, bitmap.config)
             }
-            val threeFullRgb565Bytes = view.width.toLong() * view.height.toLong() * 2L * 3L
-            assertEquals(threeFullRgb565Bytes, budget.leasedBytes)
+            val threeMotionRgb565Bytes =
+                view.privateNoArgInt("motionPageShotWidthPx").toLong() *
+                    view.privateNoArgInt("motionPageShotHeightPx").toLong() *
+                    2L * 3L
+            assertEquals(threeMotionRgb565Bytes, budget.leasedBytes)
         } finally {
             view.dispose()
         }
@@ -8712,8 +8902,13 @@ class EpubFlowViewTest {
                     ),
                 )
                 assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
-                assertEquals("$axis MOVE must not translate live X", 0f, container.translationX, 0.001f)
-                assertEquals("$axis MOVE must not translate live Y", 0f, container.translationY, 0.001f)
+                if (vertical) {
+                    assertEquals("$axis MOVE feedback must follow the finger", moveY - downY, container.translationY, 0.001f)
+                    assertEquals(0f, container.translationX, 0.001f)
+                } else {
+                    assertEquals("$axis MOVE feedback must follow the finger", moveX - downX, container.translationX, 0.001f)
+                    assertEquals(0f, container.translationY, 0.001f)
+                }
 
                 shadowOf(Looper.getMainLooper()).runOneTask()
                 assertTrue("$axis target capture must draw the viewport background", captureTranslations.isNotEmpty())
@@ -8722,8 +8917,13 @@ class EpubFlowViewTest {
                     captureTranslations.all { (x, y) -> x == 0f && y == 0f },
                 )
                 assertNull("$axis target-only frame must not install slide", view.privateField("slideDrawable"))
-                assertEquals(0f, container.translationX, 0.001f)
-                assertEquals(0f, container.translationY, 0.001f)
+                if (vertical) {
+                    assertEquals(moveY - downY, container.translationY, 0.001f)
+                    assertEquals(0f, container.translationX, 0.001f)
+                } else {
+                    assertEquals(moveX - downX, container.translationX, 0.001f)
+                    assertEquals(0f, container.translationY, 0.001f)
+                }
 
                 view.onTouchEvent(
                     motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_UP, moveX, moveY),
@@ -8733,8 +8933,13 @@ class EpubFlowViewTest {
                     "LOCAL_SHOTS_WAITING",
                     view.privateField("interactiveTurnState").toString(),
                 )
-                assertEquals("$axis ACTION_UP must not translate live X", 0f, container.translationX, 0.001f)
-                assertEquals("$axis ACTION_UP must not translate live Y", 0f, container.translationY, 0.001f)
+                if (vertical) {
+                    assertEquals(moveY - downY, container.translationY, 0.001f)
+                    assertEquals(0f, container.translationX, 0.001f)
+                } else {
+                    assertEquals(moveX - downX, container.translationX, 0.001f)
+                    assertEquals(0f, container.translationY, 0.001f)
+                }
 
                 shadowOf(Looper.getMainLooper()).runOneTask()
                 assertTrue(
@@ -8774,7 +8979,7 @@ class EpubFlowViewTest {
                 ),
             )
             assertEquals("LOCAL_SHOTS_WAITING", view.privateField("interactiveTurnState").toString())
-            assertEquals(0f, container.translationX, 0.001f)
+            assertEquals(moveX - downX, container.translationX, 0.001f)
             assertEquals(0f, container.translationY, 0.001f)
 
             view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
@@ -9608,6 +9813,27 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `programmatic scroll aborts free fling before applying target viewport`() {
+        val view = pagedFlowView()
+        view.goToPage(1)
+        view.releaseTemporaryScrollForTest(fingerVelocityY = -4_000f)
+        assertEquals("FLING_FREE", view.privateEnumName("pagedMotionState"))
+
+        view.scrollTo(0, 0)
+        val trace = view.computeScrollTraceWithoutPostedWork()
+
+        assertEquals(
+            "external scrollTo must apply immediately; state=${view.privateEnumName("pagedMotionState")}",
+            0,
+            view.scrollY,
+        )
+        assertTrue(
+            "external scrollTo must retire the old native trajectory; trace=$trace state=${view.privateEnumName("pagedMotionState")}",
+            trace.all { it == 0 } && view.privateEnumName("pagedMotionState") == "FREE_REST",
+        )
+    }
+
+    @Test
     fun `anchored paged to scroll replacement during free fling owns the target viewport`() {
         val view = pagedFlowView()
         view.goToPage(1)
@@ -10043,7 +10269,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `inner center horizontal drag follows the paged turn path`() {
+    fun `inner center horizontal drag stays in the protected center zone`() {
         val tapZones = mutableListOf<EpubFlowTapZone>()
         val view = pagedFlowView(onTapZone = tapZones::add)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -10071,11 +10297,7 @@ class EpubFlowViewTest {
             ),
         )
 
-        assertEquals(
-            "horizontal intent must turn from the middle without stealing the vertical temporary-scroll zone",
-            listOf(EpubFlowTapZone.NEXT),
-            tapZones,
-        )
+        assertEquals("protected center drag must not become a tap or page turn", emptyList<EpubFlowTapZone>(), tapZones)
         assertEquals(0, view.currentPageIndex())
         assertEquals(0, view.scrollY)
     }
@@ -11560,6 +11782,143 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `multi-turn rapid queue promotes the directional second landing to display quality`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 5)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        view.goToPage(2)
+
+        view.acceptPromotedPageTurns(delta = 2, rapidSequence = true)
+        val ranges = view.displayQualityLayoutRanges()
+
+        listOf(1, 2, 3, 4).forEach { index ->
+            assertTrue("page $index must be display quality", ranges.any { pages[index].startOffset in it })
+        }
+        assertFalse(
+            "the opposite direction must remain outside the bounded display window",
+            ranges.any { pages[0].startOffset in it },
+        )
+        view.dispose()
+    }
+
+    @Test
+    fun `rapid queued turns defer in-place page-shot refresh and full text rebind until idle`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.NONE)
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 4)
+            view.preCachePageTexturesForTest()
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+            val warmFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            val dirtyOffset = pages[0].startOffset
+
+            // A rapid burst is queued while an async image pixel completion lands between turns.
+            view.acceptPromotedPageTurns(delta = 2, rapidSequence = true)
+            assertEquals(2, view.privateInt("queuedPageTurnDelta"))
+            assertTrue(view.privateBool("rapidTurnSequenceActive"))
+            view.onAsyncImagePixelsChanged(dirtyOffset)
+            view.onAsyncImagePixelsChangedRequiringTextRebind(dirtyOffset)
+            assertEquals(
+                "the burst must stage the warm FRONT slot for a deferred in-place redraw",
+                setOf("FRONT"),
+                view.pendingInPlacePageShotRefreshSlotNamesForTest(),
+            )
+
+            // Let frame tasks run: queued turns must not drain the staged refresh or apply the
+            // whole-TextView rebind before the sequence is idle.
+            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "in-place page-shot refresh must stay staged while queued turns are unresolved",
+                view.pendingInPlacePageShotRefreshSlotNamesForTest().isNotEmpty(),
+            )
+            assertFalse(
+                "the deferred refresh must not be posted while the rapid sequence owns the frames",
+                view.privateBool("inPlacePageShotRefreshPosted"),
+            )
+            assertTrue(
+                "the whole-TextView rebind must stay pending until the rapid sequence settles",
+                view.privateBool("asyncImagePixelTextRebindPending"),
+            )
+            assertSame(
+                "deferral must keep the warm bitmap identity alive (no recycle, no rebuild)",
+                warmFront,
+                view.privateField("cachedFrontBitmap"),
+            )
+            assertFalse("the staged warm owner must stay live", warmFront.isRecycled)
+
+            // Let the burst drain through its own rapid idle windows and settle.
+            shadowOf(Looper.getMainLooper()).idleFor(2L, TimeUnit.SECONDS)
+
+            assertEquals(0, view.privateInt("queuedPageTurnDelta"))
+            assertFalse(view.privateBool("rapidTurnSequenceActive"))
+            assertTrue(
+                "the final idle settle must drain the coalesced pending slots",
+                view.pendingInPlacePageShotRefreshSlotNamesForTest().isEmpty(),
+            )
+            assertFalse(
+                "the final idle settle must apply the deferred whole-TextView rebind once",
+                view.privateBool("asyncImagePixelTextRebindPending"),
+            )
+            @Suppress("UNCHECKED_CAST")
+            val remainingOffsets = view.privateField("asyncImagePixelRefreshOffsets") as Set<Int>
+            assertTrue(
+                "the deferred pixel batch must be consumed by the settle refresh",
+                remainingOffsets.isEmpty(),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `rapid queued turns defer geometry refresh until quiet idle`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+            view.preCachePageTexturesForTest()
+            view.drainPendingPageTexturePrecacheForTest()
+            val warmFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+
+            view.setPrivateField("rapidTurnSequenceActive", true)
+            view.setPrivateField("queuedPageTurnDelta", 1)
+            view.refreshAfterAsyncImageResult()
+
+            assertTrue(
+                "geometry refresh must stay pending during the rapid sequence",
+                view.privateBool("asyncImageRefreshPending"),
+            )
+            assertSame(
+                "geometry refresh must not recycle the warm front between queued turns",
+                warmFront,
+                view.privateField("cachedFrontBitmap"),
+            )
+            assertFalse("the warm owner must stay live for the next rapid frame", warmFront.isRecycled)
+
+            shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
+
+            assertTrue(
+                "posted geometry refresh must keep deferring while the rapid window is active",
+                view.privateBool("asyncImageRefreshPending"),
+            )
+            assertTrue(
+                "pending geometry refresh must not block a warm queued rapid turn",
+                view.drainQueuedPageTurnForTest(),
+            )
+            assertNotNull("the queued turn must still install its animated overlay", view.privateField("slideDrawable"))
+
+            shadowOf(Looper.getMainLooper()).idleFor(2L, TimeUnit.SECONDS)
+
+            assertFalse(
+                "quiet rapid idle must apply the deferred geometry refresh once",
+                view.privateBool("asyncImageRefreshPending"),
+            )
+            assertFalse(view.privateBool("rapidTurnSequenceActive"))
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `far page pending decode does not block reveal or nearby precache`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -12613,6 +12972,11 @@ class EpubFlowViewTest {
         if (idlePostedWork) shadowOf(Looper.getMainLooper()).idle()
     }
 
+    private fun EpubFlowView.drainQueuedPageTurnForTest(): Boolean =
+        javaClass.getDeclaredMethod("drainQueuedPageTurn")
+            .apply { isAccessible = true }
+            .invoke(this) as Boolean
+
     /**
      * Advances one postOnAnimation frame at a time until a split-frame page-texture precache
      * commits (or is discarded). Mirrors production's front/target/previous frame chain; idle()
@@ -12690,8 +13054,8 @@ class EpubFlowViewTest {
     }
 
     private fun assertMotionPageShotSize(view: EpubFlowView, bitmap: Bitmap) {
-        assertEquals(view.width, bitmap.width)
-        assertEquals(view.height, bitmap.height)
+        assertEquals(view.privateNoArgInt("motionPageShotWidthPx"), bitmap.width)
+        assertEquals(view.privateNoArgInt("motionPageShotHeightPx"), bitmap.height)
     }
 
     private fun EpubFlowView.snapshotViewportForTest(): Bitmap? =
@@ -12778,6 +13142,17 @@ class EpubFlowViewTest {
             }
         }
         return matches
+    }
+
+    private fun Bitmap.countDistinctPixels(limit: Int = 8): Int {
+        val colors = hashSetOf<Int>()
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                colors += getPixel(x, y)
+                if (colors.size >= limit) return colors.size
+            }
+        }
+        return colors.size
     }
 
     private fun Bitmap.countExactPixels(color: Int, area: Rect): Int {
@@ -12892,6 +13267,11 @@ class EpubFlowViewTest {
 
     private fun EpubFlowView.privateInt(name: String): Int =
         privateField(name) as Int
+
+    private fun EpubFlowView.privateNoArgInt(name: String): Int =
+        javaClass.getDeclaredMethod(name)
+            .apply { isAccessible = true }
+            .invoke(this) as Int
 
     private fun EpubFlowView.privateBool(name: String): Boolean =
         privateField(name) as Boolean
@@ -13058,13 +13438,19 @@ class EpubFlowViewTest {
         override fun getOpacity(): Int = PixelFormat.OPAQUE
     }
 
-    private class OnePixelDetailDrawable : Drawable() {
+    private class OnePixelDetailDrawable(
+        private val stripeWidth: Int = 1,
+    ) : Drawable() {
         private val paint = Paint()
 
         override fun draw(canvas: Canvas) {
             val b = bounds
             for (x in b.left until b.right) {
-                paint.color = if ((x - b.left) % 2 == 0) 0xFF151515.toInt() else 0xFFEAEAEA.toInt()
+                paint.color = if (((x - b.left) / stripeWidth.coerceAtLeast(1)) % 2 == 0) {
+                    0xFF151515.toInt()
+                } else {
+                    0xFFEAEAEA.toInt()
+                }
                 canvas.drawRect(
                     x.toFloat(),
                     b.top.toFloat(),

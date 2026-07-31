@@ -4,6 +4,7 @@ import android.content.Context
 import android.text.Layout
 import android.text.Selection
 import android.text.Spannable
+import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ClickableSpan
 import android.util.AttributeSet
@@ -49,7 +50,20 @@ class SelectionAwareTextView @JvmOverloads constructor(
             pendingLongPressTextOffset = NO_TEXT_OFFSET
             clearInteractiveTapReport()
         }
-        super.setText(text, type)
+        // Android's selectable TextView path casts its buffer to Spannable when focus changes.
+        // Markwon commonly supplies a SpannedString, which is immutable and crashes that path on
+        // API 31. Keep the spans but install a mutable Spannable whenever selection is enabled.
+        val selectable = nativeTextSelectionEnabled && touchSelectionEnabled
+        val safeText = if (selectable && text is Spanned && text !is Spannable) {
+            SpannableString(text)
+        } else {
+            text
+        }
+        // TextView may wrap a SpannableString back into an immutable SpannedString when
+        // BufferType.NORMAL is requested. That is unsafe for its selectable/focus path,
+        // which casts the buffer to Spannable on Android 12.
+        val safeType = if (selectable) BufferType.SPANNABLE else type
+        super.setText(safeText, safeType)
         keepTextSelectable()
     }
 

@@ -42,13 +42,19 @@ import dev.readflow.render.api.withTextHighlightSpans
 import io.noties.markwon.Markwon
 import io.noties.markwon.ext.strikethrough.StrikethroughPlugin
 import io.noties.markwon.ext.tables.TablePlugin
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Markdown engine (Markwon 4.6.2).
@@ -62,7 +68,10 @@ import java.util.WeakHashMap
  * displayMetrics). Active page views are keyed by stable page index with a mutable binding
  * so equal-pageCount typography rebuilds refresh text/selection base correctly.
  */
-class MarkdownEngine(private val context: Context) :
+class MarkdownEngine(
+    private val context: Context,
+    private val paginationDispatcher: CoroutineDispatcher = Dispatchers.Default,
+) :
     ReaderEngine,
     PagedReaderEngine,
     TextSelectableReaderEngine,
@@ -125,6 +134,8 @@ class MarkdownEngine(private val context: Context) :
     private var cachedRendered: Spanned = SpannableStringBuilder("")
     /** Page windows over [cachedRendered] line geometry; empty in SCROLL. */
     private var pageWindows: List<MarkdownPageWindow> = emptyList()
+    private val paginationGeneration = AtomicLong()
+    private val paginationMutex = Mutex()
     private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
 
     /**
@@ -163,6 +174,7 @@ class MarkdownEngine(private val context: Context) :
     override suspend fun supports(uri: Uri): Boolean = true
 
     override suspend fun openBook(uri: Uri): Locator = withContext(Dispatchers.IO) {
+        paginationGeneration.incrementAndGet()
         val markdown = context.contentResolver.openInputStream(uri)?.use {
             it.readBytes().toString(Charsets.UTF_8)
         } ?: ""
@@ -175,7 +187,8 @@ class MarkdownEngine(private val context: Context) :
             // Invalidate any post{} callbacks from a previous open on this engine instance.
             invalidateHighlightRefreshCallbacks()
             cachedRendered = rendered
-            pageWindows = emptyList()
+            // Preserve the last valid window set until the rebuilt set is installed: a host
+            // observing PAGED must never see a published pageCount backed by empty windows.
             document.clearMappingCache()
             searchHighlightHit = null
             cachedSearchHighlightRanges = emptyList()
@@ -183,7 +196,9 @@ class MarkdownEngine(private val context: Context) :
             _tableOfContents.value = parsed.tableOfContents
             publishLocator(initial)
             if (_pagingKind.value == PagingKind.PAGED) {
-                rebuildPageWindows(requestPageForAnchor = false)
+                if (rebuildPageWindows(requestPageForAnchor = false)) {
+                    refreshActivePageContents()
+                }
             } else {
                 _pageCount.value = 1
             }
@@ -251,9 +266,8 @@ class MarkdownEngine(private val context: Context) :
     }
 
     override fun createPageView(pageIndex: Int): View {
-        ensurePageWindows()
         val windows = pageWindows.ifEmpty {
-            listOf(MarkdownPageWindow(0, 0, 0, cachedRendered.length.coerceAtLeast(0)))
+            listOf(MarkdownPageWindow(0, 0, 0, 0))
         }
         val pageCount = windows.size.coerceAtLeast(1)
         val safeIndex = pageIndex.coerceIn(0, pageCount - 1)
@@ -307,25 +321,34 @@ class MarkdownEngine(private val context: Context) :
         pageRequestCallback = callback
     }
 
-    override fun setViewportSize(widthPx: Int, heightPx: Int) {
+    override suspend fun setViewportSize(widthPx: Int, heightPx: Int) {
         if (widthPx <= 0 || heightPx <= 0) return
         val changed = widthPx != viewportWidthPx || heightPx != viewportHeightPx
-        viewportWidthPx = widthPx
-        viewportHeightPx = heightPx
         if (!changed) return
-        if (_pagingKind.value != PagingKind.PAGED) return
+        if (_pagingKind.value != PagingKind.PAGED) {
+            viewportWidthPx = widthPx
+            viewportHeightPx = heightPx
+            return
+        }
         // Preserve source Section anchor across rotation / real size change.
         val anchor = normalizeToSourceSection(_currentLocator.value)
         publishLocator(anchor)
-        rebuildPageWindows(requestPageForAnchor = true)
-        refreshActivePageContents()
+        if (
+            rebuildPageWindows(
+                requestPageForAnchor = true,
+                requestedViewportWidthPx = widthPx,
+                requestedViewportHeightPx = heightPx,
+                commitViewport = true,
+            )
+        ) {
+            refreshActivePageContents()
+        }
     }
 
     override fun pageIndexForLocator(locator: Locator): Int {
         if (_pagingKind.value != PagingKind.PAGED) {
             return super.pageIndexForLocator(locator)
         }
-        ensurePageWindows()
         val windows = pageWindows
         if (windows.isEmpty()) return 0
         when (val strategy = locator.strategy) {
@@ -358,7 +381,6 @@ class MarkdownEngine(private val context: Context) :
     }
 
     private fun goToPaged(locator: Locator) {
-        ensurePageWindows()
         val sourceLocator = when (locator.strategy) {
             is LocatorStrategy.Page -> {
                 // Host ViewPager emits Page locators on settle; normalize to source Section
@@ -728,6 +750,7 @@ class MarkdownEngine(private val context: Context) :
     }
 
     override suspend fun close() {
+        paginationGeneration.incrementAndGet()
         invalidateHighlightRefreshCallbacks()
         scrollView = null
         textView = null
@@ -754,6 +777,7 @@ class MarkdownEngine(private val context: Context) :
     }
 
     override suspend fun setFontSize(sp: Float) {
+        if (fontSizeSp == sp) return
         fontSizeSp = sp
         textView?.textSize = sp
         activePageBindings.forEach { it.textView?.textSize = sp }
@@ -761,6 +785,7 @@ class MarkdownEngine(private val context: Context) :
     }
 
     override suspend fun setLineSpacing(multiplier: Float) {
+        if (lineSpacingMultiplier == multiplier) return
         lineSpacingMultiplier = multiplier
         textView?.setLineSpacing(0f, multiplier)
         activePageBindings.forEach { it.textView?.setLineSpacing(0f, multiplier) }
@@ -772,6 +797,7 @@ class MarkdownEngine(private val context: Context) :
     }
 
     override suspend fun setFont(fontId: String) {
+        if (currentFontId == fontId) return
         currentFontId = fontId
         val face = resolveTypeface()
         textView?.typeface = face
@@ -795,6 +821,7 @@ class MarkdownEngine(private val context: Context) :
             ReadingMode.SCROLL -> PagingKind.CONTINUOUS
             ReadingMode.PAGED -> PagingKind.PAGED
         }
+        val startingKind = _pagingKind.value
         withContext(Dispatchers.Main) {
             // Capture stable source anchor before mode switch.
             val anchor = when (_pagingKind.value) {
@@ -813,12 +840,25 @@ class MarkdownEngine(private val context: Context) :
                 PagingKind.PAGED -> normalizeToSourceSection(_currentLocator.value)
             }
             publishLocator(anchor)
-            _pagingKind.value = targetKind
-            if (targetKind == PagingKind.PAGED) {
-                rebuildPageWindows(requestPageForAnchor = true)
-            } else {
+            if (targetKind != PagingKind.PAGED) {
+                _pagingKind.value = targetKind
+                paginationGeneration.incrementAndGet()
                 pageWindows = emptyList()
                 _pageCount.value = 1
+            }
+        }
+        if (targetKind == PagingKind.PAGED) {
+            withContext(Dispatchers.Main) {
+                val rebuilt = rebuildPageWindows(
+                    requestPageForAnchor = true,
+                    expectedPagingKind = startingKind,
+                )
+                if (rebuilt) {
+                    // Publish PAGED only after the new windows are installed so a host can
+                    // never observe PAGED backed by empty/uninstalled windows during the switch.
+                    _pagingKind.value = PagingKind.PAGED
+                    refreshActivePageContents()
+                }
             }
         }
     }
@@ -828,26 +868,44 @@ class MarkdownEngine(private val context: Context) :
      * Always requests the page for the current source anchor and refreshes active page
      * views even when [pageCount] stays equal (avoids stale slices).
      */
-    private fun rebuildAfterTypographyChange() {
+    private suspend fun rebuildAfterTypographyChange() {
         if (_pagingKind.value != PagingKind.PAGED) return
-        rebuildPageWindows(requestPageForAnchor = true)
-        refreshActivePageContents()
+        if (rebuildPageWindows(requestPageForAnchor = true)) {
+            refreshActivePageContents()
+        }
     }
 
-    private fun rebuildPageWindows(requestPageForAnchor: Boolean) {
-        val windows = measurePageWindows()
+    private suspend fun rebuildPageWindows(
+        requestPageForAnchor: Boolean,
+        requestedViewportWidthPx: Int = viewportWidthPx,
+        requestedViewportHeightPx: Int = viewportHeightPx,
+        commitViewport: Boolean = false,
+        expectedPagingKind: PagingKind = PagingKind.PAGED,
+    ): Boolean {
+        val snapshot = paginationSnapshot(requestedViewportWidthPx, requestedViewportHeightPx)
+        val windows = withContext(paginationDispatcher) {
+            paginationMutex.withLock {
+                if (snapshot.generation != paginationGeneration.get()) return@withLock null
+                measurePageWindows(snapshot)
+            }
+        } ?: return false
+        if (
+            !snapshot.isCurrent(requestedViewportWidthPx, requestedViewportHeightPx) ||
+            _pagingKind.value != expectedPagingKind
+        ) {
+            return false
+        }
+        if (commitViewport) {
+            viewportWidthPx = requestedViewportWidthPx
+            viewportHeightPx = requestedViewportHeightPx
+        }
         pageWindows = windows
-        _pageCount.value = windows.size.coerceAtLeast(1)
+        _pageCount.value = pageWindows.size.coerceAtLeast(1)
         if (requestPageForAnchor) {
             val pageIndex = pageIndexForLocator(_currentLocator.value)
             pageRequestCallback?.invoke(pageIndex)
         }
-    }
-
-    private fun ensurePageWindows() {
-        if (_pagingKind.value == PagingKind.PAGED && pageWindows.isEmpty()) {
-            rebuildPageWindows(requestPageForAnchor = false)
-        }
+        return true
     }
 
     private fun ensureCachedRendered(): Spanned {
@@ -864,31 +922,88 @@ class MarkdownEngine(private val context: Context) :
      *
      * Prefer host-reported viewport; fall back to displayMetrics only before first layout.
      */
-    private fun measurePageWindows(): List<MarkdownPageWindow> {
+    private fun paginationSnapshot(
+        requestedViewportWidthPx: Int,
+        requestedViewportHeightPx: Int,
+    ): MarkdownPaginationSnapshot {
         val rendered = ensureCachedRendered()
         val metrics = context.resources.displayMetrics
-        val widthPx = if (viewportWidthPx > 0) viewportWidthPx else metrics.widthPixels.coerceAtLeast(1)
-        val heightPx = if (viewportHeightPx > 0) viewportHeightPx else metrics.heightPixels.coerceAtLeast(1)
+        val widthPx = if (requestedViewportWidthPx > 0) {
+            requestedViewportWidthPx
+        } else {
+            metrics.widthPixels.coerceAtLeast(1)
+        }
+        val heightPx = if (requestedViewportHeightPx > 0) {
+            requestedViewportHeightPx
+        } else {
+            metrics.heightPixels.coerceAtLeast(1)
+        }
         val padding = textPaddingPx
         val contentWidth = (widthPx - padding * 2).coerceAtLeast(1)
         val contentHeight = (heightPx - padding * 2).coerceAtLeast(1)
-        val paint = TextPaint(TextPaint.ANTI_ALIAS_FLAG).apply {
-            density = metrics.density
-            textSize = TypedValue.applyDimension(
+        return MarkdownPaginationSnapshot(
+            document = document,
+            rendered = rendered,
+            contentWidthPx = contentWidth,
+            contentHeightPx = contentHeight,
+            density = metrics.density,
+            textSizePx = TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_SP,
                 fontSizeSp,
                 metrics,
-            )
-            typeface = resolveTypeface()
-        }
-        val layout = StaticLayout.Builder
-            .obtain(rendered, 0, rendered.length, paint, contentWidth)
-            .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-            .setLineSpacing(0f, lineSpacingMultiplier.coerceAtLeast(0.1f))
-            .setIncludePad(true)
-            .build()
-        return markdownPaginate(StaticLayoutMarkdownGeometry(layout), contentHeight)
+            ),
+            lineSpacingMultiplier = lineSpacingMultiplier.coerceAtLeast(0.1f),
+            typeface = resolveTypeface(),
+            fontId = currentFontId,
+            viewportWidthPx = requestedViewportWidthPx,
+            viewportHeightPx = requestedViewportHeightPx,
+            generation = paginationGeneration.incrementAndGet(),
+        )
     }
+
+    private suspend fun measurePageWindows(
+        snapshot: MarkdownPaginationSnapshot,
+    ): List<MarkdownPageWindow>? {
+        val paint = TextPaint(TextPaint.ANTI_ALIAS_FLAG).apply {
+            density = snapshot.density
+            textSize = snapshot.textSizePx
+            typeface = snapshot.typeface
+        }
+        val layoutBuilder = StaticLayout.Builder
+            .obtain(
+                snapshot.rendered,
+                0,
+                snapshot.rendered.length,
+                paint,
+                snapshot.contentWidthPx,
+            )
+            .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+            .setLineSpacing(0f, snapshot.lineSpacingMultiplier)
+            .setIncludePad(true)
+        currentCoroutineContext().ensureActive()
+        if (snapshot.generation != paginationGeneration.get()) return null
+        val layout = layoutBuilder.build()
+        currentCoroutineContext().ensureActive()
+        if (snapshot.generation != paginationGeneration.get()) return null
+        return markdownPaginate(StaticLayoutMarkdownGeometry(layout), snapshot.contentHeightPx)
+    }
+
+    private fun MarkdownPaginationSnapshot.isCurrent(
+        expectedViewportWidthPx: Int,
+        expectedViewportHeightPx: Int,
+    ): Boolean =
+        document === this@MarkdownEngine.document &&
+            rendered === cachedRendered &&
+            fontId == currentFontId &&
+            viewportWidthPx == expectedViewportWidthPx &&
+            viewportHeightPx == expectedViewportHeightPx &&
+            textSizePx == TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_SP,
+                fontSizeSp,
+                context.resources.displayMetrics,
+            ) &&
+            lineSpacingMultiplier == this@MarkdownEngine.lineSpacingMultiplier.coerceAtLeast(0.1f) &&
+            generation == paginationGeneration.get()
 
     private fun pageSlice(base: Spanned, window: MarkdownPageWindow): CharSequence {
         val length = base.length
@@ -974,6 +1089,21 @@ internal class PageViewBinding(
     var startOffset: Int,
     var endOffset: Int,
     var textView: TextView? = null,
+)
+
+private data class MarkdownPaginationSnapshot(
+    val document: MarkdownDocument,
+    val rendered: Spanned,
+    val contentWidthPx: Int,
+    val contentHeightPx: Int,
+    val density: Float,
+    val textSizePx: Float,
+    val lineSpacingMultiplier: Float,
+    val typeface: Typeface,
+    val fontId: String,
+    val viewportWidthPx: Int,
+    val viewportHeightPx: Int,
+    val generation: Long,
 )
 
 /** Adapts [StaticLayout] / [Layout] to [MarkdownLineGeometry]. */

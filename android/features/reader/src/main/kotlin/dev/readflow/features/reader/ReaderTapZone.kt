@@ -1,6 +1,7 @@
 package dev.readflow.features.reader
 
 import android.view.KeyEvent
+import dev.readflow.render.api.PageReadingDirection
 
 internal enum class ReaderTapZone {
     PreviousPage,
@@ -21,9 +22,16 @@ internal fun readerTapZoneForTap(
     xRatio: Float,
     interactiveChildConsumedTap: Boolean = false,
     pagedTapZonesEnabled: Boolean = true,
+    pageReadingDirection: PageReadingDirection = PageReadingDirection.LEFT_TO_RIGHT,
 ): ReaderTapZone? {
     if (interactiveChildConsumedTap) return null
-    val zone = classifyReaderTapZone(xRatio)
+    val physicalZone = classifyReaderTapZone(xRatio)
+    val zone = when {
+        pageReadingDirection != PageReadingDirection.RIGHT_TO_LEFT -> physicalZone
+        physicalZone == ReaderTapZone.PreviousPage -> ReaderTapZone.NextPage
+        physicalZone == ReaderTapZone.NextPage -> ReaderTapZone.PreviousPage
+        else -> physicalZone
+    }
     return when {
         pagedTapZonesEnabled -> zone
         zone == ReaderTapZone.ToggleChrome -> zone
@@ -31,12 +39,24 @@ internal fun readerTapZoneForTap(
     }
 }
 
-internal fun readerTapZoneForKey(keyCode: Int, shiftPressed: Boolean = false): ReaderTapZone? = when (keyCode) {
-    KeyEvent.KEYCODE_DPAD_LEFT,
+internal fun readerTapZoneForKey(
+    keyCode: Int,
+    shiftPressed: Boolean = false,
+    pageReadingDirection: PageReadingDirection = PageReadingDirection.LEFT_TO_RIGHT,
+): ReaderTapZone? = when (keyCode) {
+    KeyEvent.KEYCODE_DPAD_LEFT -> if (pageReadingDirection == PageReadingDirection.RIGHT_TO_LEFT) {
+        ReaderTapZone.NextPage
+    } else {
+        ReaderTapZone.PreviousPage
+    }
+    KeyEvent.KEYCODE_DPAD_RIGHT -> if (pageReadingDirection == PageReadingDirection.RIGHT_TO_LEFT) {
+        ReaderTapZone.PreviousPage
+    } else {
+        ReaderTapZone.NextPage
+    }
     KeyEvent.KEYCODE_PAGE_UP,
     KeyEvent.KEYCODE_VOLUME_UP,
     -> ReaderTapZone.PreviousPage
-    KeyEvent.KEYCODE_DPAD_RIGHT,
     KeyEvent.KEYCODE_PAGE_DOWN,
     KeyEvent.KEYCODE_VOLUME_DOWN,
     -> ReaderTapZone.NextPage

@@ -2202,7 +2202,10 @@ class EpubFlowSpannableTest {
             shadowOf(Looper.getMainLooper()).idle()
 
             assertFalse(loader.hasPendingDecodes())
-            assertFalse("a released loader must not install a late bitmap", drawable.result is BitmapDrawable)
+            assertFalse(
+                "a released loader must not install a late bitmap",
+                (drawable.result as? EpubImagePixelSource)?.hasDecodedPixels == true,
+            )
             assertEquals("a released loader must not wake its retired host", 0, refreshes.get())
             assertEquals("a released loader must not wake its retired host", 0, completions.get())
         } finally {
@@ -2234,7 +2237,10 @@ class EpubFlowSpannableTest {
             shadowOf(Looper.getMainLooper()).idle()
 
             assertFalse(loader.hasPendingDecodes())
-            assertFalse("the retired generation must not install its late result", retired.result is BitmapDrawable)
+            assertFalse(
+                "the retired generation must not install its late pixels",
+                (retired.result as? EpubImagePixelSource)?.hasDecodedPixels == true,
+            )
             assertTrue("cancelAll must not permanently release the loader", replacement.result is BitmapDrawable)
             assertEquals("only the replacement result may refresh the host", 1, refreshes.get())
         } finally {
@@ -2275,6 +2281,130 @@ class EpubFlowSpannableTest {
             assertNull(placeholder.getOrNull())
         } finally {
             executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `missing intrinsic bounds retains fallback geometry through first pixel install`() {
+        val epub = createImageEpub("missing-intrinsic-bounds")
+        val executor = QueuedExecutorService()
+        val results = mutableListOf<EpubAsyncImageResult>()
+        try {
+            val loader = imageLoader(
+                epub = epub,
+                executor = executor,
+                imageBoundsProvider = { null },
+                onImageResultChanged = results::add,
+            )
+            val drawable = asyncDrawable(loader)
+            val retainedLayer = assertNotNull(drawable.result).let { drawable.result }
+
+            assertEquals(Rect(0, 0, 8, 8), drawable.bounds)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertSame("first pixels must update the pre-measured layer in place", retainedLayer, drawable.result)
+            assertEquals(1, results.size)
+            assertEquals(EpubAsyncImageResultKind.PIXELS_ONLY, results.single().kind)
+            assertFalse("fallback geometry must not rebind the chapter TextView", results.single().requiresTextRebind)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `unknown inline bounds stay bounded and reflow when decode-time bounds appear`() {
+        val epub = createImageEpub("unknown-inline-bounds")
+        val executor = QueuedExecutorService()
+        var bounds: EpubImageBounds? = null
+        val results = mutableListOf<EpubAsyncImageResult>()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 120,
+                fullPageHrefs = emptySet(),
+                imageBoundsProvider = { bounds },
+                imageDecoder = { _, _, _ ->
+                    android.graphics.Bitmap.createBitmap(
+                        4,
+                        4,
+                        android.graphics.Bitmap.Config.ARGB_8888,
+                    )
+                },
+                onImageResultChanged = results::add,
+            )
+            val resolver = EpubFlowImageSizeResolver(
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 120,
+                fullPageHrefs = emptySet(),
+            )
+            val drawable = AsyncDrawable(TEST_IMAGE_HREF, loader, resolver, null)
+            assertEquals("unknown inline art must not reserve a full page", Rect(0, 0, 120, 120), drawable.bounds)
+
+            bounds = EpubImageBounds(width = 400, height = 200)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(Rect(0, 0, 240, 120), drawable.bounds)
+            assertEquals(EpubAsyncImageResultKind.GEOMETRY_CHANGED, results.single().kind)
+            assertFalse("retained placeholder geometry must not force a full text rebind", results.single().requiresTextRebind)
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `unknown full page bounds follow the measured viewport at decode time`() {
+        val epub = createImageEpub("unknown-full-page-viewport")
+        val executor = QueuedExecutorService()
+        val pageHeightPx = AtomicInteger(1200)
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { pageHeightPx.get() },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { null },
+                imageDecoder = { _, _, _ ->
+                    android.graphics.Bitmap.createBitmap(
+                        4,
+                        4,
+                        android.graphics.Bitmap.Config.ARGB_8888,
+                    )
+                },
+            )
+            val resolver = EpubFlowImageSizeResolver(
+                columnWidthPx = 800,
+                pageHeightProvider = { pageHeightPx.get() },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+            )
+            val drawable = AsyncDrawable(TEST_IMAGE_HREF, loader, resolver, null)
+            assertEquals(Rect(0, 0, 800, 1200), drawable.bounds)
+
+            pageHeightPx.set(700)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(
+                "unknown full-page geometry must be re-fit against the measured viewport",
+                Rect(0, 0, 800, 700),
+                drawable.bounds,
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
         }
     }
 

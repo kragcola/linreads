@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Typeface
 import android.net.Uri
+import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import android.util.TypedValue
@@ -27,6 +28,7 @@ import dev.readflow.core.ui.readerPaperBackground
 import dev.readflow.core.model.ThemeMode
 import dev.readflow.core.model.TocEntry
 import dev.readflow.render.api.PagedReaderEngine
+import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReaderTextHighlightRange
@@ -38,16 +40,23 @@ import dev.readflow.render.api.SelectionAwareTextView
 import dev.readflow.render.api.TextAnnotatableReaderEngine
 import dev.readflow.render.api.TextSelectableReaderEngine
 import dev.readflow.render.api.withTextHighlightSpans
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Collections
 import java.util.WeakHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.CRC32
 import kotlin.math.abs
+import kotlin.math.ceil
 
 /**
  * Minimal TXT engine (v4 §5.3/§5.4). CONTINUOUS scroll via RecyclerView.
@@ -57,7 +66,9 @@ import kotlin.math.abs
  */
 class TxtVirtualPagerEngine(
     private val context: Context,
+    private val paginationDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) : PagedReaderEngine,
+    InitialLocatorAwareReaderEngine,
     TextSelectableReaderEngine,
     TextAnnotatableReaderEngine,
     SearchHighlightableReaderEngine {
@@ -97,6 +108,7 @@ class TxtVirtualPagerEngine(
     private var txtDocument: TxtDocument? = null
     private var txtFingerprint: TxtDocumentFingerprint? = null
     private var pendingEngineState: ByteArray? = null
+    private var pendingInitialLocator: Locator? = null
     private var fontSizeSp: Float = ReaderTypographyRange.DEFAULT_FONT_SIZE.toFloat()
     private var lineSpacingMultiplier: Float = ReaderTypographyRange.DEFAULT_LINE_SPACING
     private var useSourceHan: Boolean = true
@@ -116,53 +128,104 @@ class TxtVirtualPagerEngine(
      */
     private var viewportWidthPx: Int = 0
     private var viewportHeightPx: Int = 0
-    /**
-     * PAGED 模式下的页→段落区间映射（贪心装箱：把多段落填进一页直到页高用尽，非必要不分页）。
-     * 每个元素是该页起始段落下标（含），区间到下一元素前一段（含）。空表示尚未构建/SCROLL 模式。
-     */
+    /** Compatibility projection retained for diagnostics/tests; duplicate indexes mean one
+     * paragraph spans multiple visual pages. Rendering and navigation use [pagedPageWindows]. */
     private var pagedParagraphStarts: List<Int> = emptyList()
+    private var pagedPageWindows: List<TxtPageWindow> = emptyList()
+    private val paginationGeneration = AtomicLong()
+    private val paginationMutex = Mutex()
     private val activePageTextViews = Collections.newSetFromMap(WeakHashMap<TextView, Boolean>())
+    private val pagedPageTexts = WeakHashMap<TextView, TxtPagedText>()
     private val activePageContainers = Collections.newSetFromMap(WeakHashMap<FrameLayout, Boolean>())
     /** Weak tracking of active PAGED page bindings for same-count viewport rebind. */
     private val activePageBindings = Collections.newSetFromMap(WeakHashMap<TxtPageViewBinding, Boolean>())
 
     override suspend fun supports(uri: Uri): Boolean = true
 
-    override suspend fun openBook(uri: Uri): Locator = withContext(Dispatchers.IO) {
-        currentUri = uri
-        txtDocument?.close()
-        pendingProgrammaticScroll = null
-        // Engine instance may be reused for a different book; drop transient search paint state.
-        searchHighlightHit = null
-        val requiresFingerprint = pendingEngineState != null
-        val copied = resolveReadableFile(uri, requiresFingerprint)
-        val overrideDetection = encodingOverride?.let { name ->
-            runCatching { java.nio.charset.Charset.forName(name) }.getOrNull()
-        }?.let { cs ->
-            TxtCharsetDetection(
-                charset = cs,
-                source = TxtCharsetDetectionSource.Fallback,
-                fallbackReason = "user-override"
+    override fun setInitialLocator(locator: Locator?) {
+        pendingInitialLocator = locator
+    }
+
+    override suspend fun openBook(uri: Uri): Locator {
+        val requestedInitialLocator = pendingInitialLocator
+        pendingInitialLocator = null
+        return withContext(Dispatchers.IO) {
+            paginationGeneration.incrementAndGet()
+            currentUri = uri
+            val previousDocument = txtDocument
+            txtDocument = null
+            paginationMutex.withLock {
+                previousDocument?.close()
+            }
+            pendingProgrammaticScroll = null
+            // Engine instance may be reused for a different book; drop transient search paint state.
+            searchHighlightHit = null
+            val requiresFingerprint = pendingEngineState != null
+            val copied = resolveReadableFile(uri, requiresFingerprint)
+            val overrideDetection = encodingOverride?.let { name ->
+                runCatching { java.nio.charset.Charset.forName(name) }.getOrNull()
+            }?.let { cs ->
+                TxtCharsetDetection(
+                    charset = cs,
+                    source = TxtCharsetDetectionSource.Fallback,
+                    fallbackReason = "user-override"
+                )
+            }
+            val document = TxtDocument.index(
+                file = copied.file,
+                deleteOnClose = copied.deleteOnClose,
+                fingerprint = copied.fingerprint,
+                cachedEngineState = pendingEngineState,
+                charsetDetection = overrideDetection,
             )
+            pendingEngineState = null
+            txtDocument = document
+            txtFingerprint = copied.fingerprint
+            _tableOfContents.value = buildToc(document)
+
+            // Preserve the last valid window set until the new windows are installed: a host
+            // observing PAGED must never see a published pageCount backed by empty windows.
+            var installedFreshWindows = false
+            if (_pagingKind.value == PagingKind.PAGED) {
+                val result = calculatePagedPageWindows()
+                if (result != null && result.isCurrent()) {
+                    installPagedPageWindows(result.windows)
+                    installedFreshWindows = true
+                }
+            }
+            val initialPosition = requestedInitialLocator
+                ?.let(::paragraphPositionForLocator)
+                ?: TxtParagraphPosition(0, 0)
+            if (_pagingKind.value == PagingKind.PAGED && installedFreshWindows) {
+                installPagedPageWindows(pagedPageWindows.rebasedAt(initialPosition))
+                _pageCount.value = pagedPageWindows.size.coerceAtLeast(1)
+            } else if (_pagingKind.value == PagingKind.PAGED) {
+                // No freshly installed window set: never advertise a paragraph-based count the
+                // host would bind into blank page slots. Keep the last published pageCount
+                // (0 for a fresh session) and the preserved windows until repagination lands.
+            } else {
+                _pageCount.value = document.paragraphCount
+            }
+            val resolvedInitialLocator = locatorForPosition(initialPosition, document.paragraphCount)
+            val initialLocator = requestedInitialLocator?.takeIf { requested ->
+                val requestedOffset = (requested.strategy as? LocatorStrategy.ByteOffset)?.offset
+                val resolvedOffset =
+                    (resolvedInitialLocator.strategy as? LocatorStrategy.ByteOffset)?.offset
+                requestedOffset != null && requestedOffset == resolvedOffset
+            } ?: resolvedInitialLocator
+            publishLocator(initialLocator)
+            if (_pagingKind.value == PagingKind.PAGED && installedFreshWindows) {
+                val initialPage = pageForPosition(initialPosition.paragraphIndex, initialPosition.charOffset)
+                withContext(Dispatchers.Main) {
+                    pageRequestCallback?.invoke(initialPage)
+                }
+            }
+            initialLocator
         }
-        val document = TxtDocument.index(
-            file = copied.file,
-            deleteOnClose = copied.deleteOnClose,
-            fingerprint = copied.fingerprint,
-            cachedEngineState = pendingEngineState,
-            charsetDetection = overrideDetection,
-        )
-        pendingEngineState = null
-        txtDocument = document
-        txtFingerprint = copied.fingerprint
-        pagedParagraphStarts = emptyList()
-        _pageCount.value = document.paragraphCount
-        _tableOfContents.value = buildToc(document)
-        publishLocator(locatorForIndex(0, document.paragraphCount))
-        _currentLocator.value
     }
 
     override fun createView(): View {
+        val initialPosition = currentParagraphPosition()
         val rv = RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
             val palette = paletteFor(themeMode, resources.configuration)
@@ -187,31 +250,44 @@ class TxtVirtualPagerEngine(
                     reportProgression(view)
                 }
             })
-            (layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(currentParagraphIndex(), 0)
+            (layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(initialPosition.paragraphIndex, 0)
+            if (initialPosition.charOffset > 0) {
+                addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
+                    override fun onLayoutChange(
+                        view: View,
+                        left: Int,
+                        top: Int,
+                        right: Int,
+                        bottom: Int,
+                        oldLeft: Int,
+                        oldTop: Int,
+                        oldRight: Int,
+                        oldBottom: Int,
+                    ) {
+                        if (restoreContinuousPosition(this@apply, initialPosition)) {
+                            removeOnLayoutChangeListener(this)
+                        }
+                    }
+                })
+            }
         }
         recyclerView = rv
         return rv
     }
 
     override fun createPageView(pageIndex: Int): View {
-        val total = paragraphCount().coerceAtLeast(1)
-        val starts = pagedParagraphStarts.ifEmpty { buildPagedParagraphStarts().also { pagedParagraphStarts = it } }
-        val pageCount = starts.size.coerceAtLeast(1)
+        val pageCount = pagedPageWindows.size.coerceAtLeast(1)
         val safePageIndex = pageIndex.coerceIn(0, pageCount - 1)
-        val startParagraph = starts.getOrNull(safePageIndex) ?: 0
-        val endParagraphExclusive = starts.getOrNull(safePageIndex + 1) ?: total
+        val segments = pagedPageWindows.getOrNull(safePageIndex)?.segments.orEmpty()
         val palette = paletteFor(themeMode, context.resources.configuration)
         val density = context.resources.displayMetrics.density
         val maxLineWidthPx = (TxtParagraphAdapter.MAX_LINE_WIDTH_DP * density).toInt()
         val pageTextViews = mutableListOf<TextView>()
         val binding = TxtPageViewBinding(
             pageIndex = safePageIndex,
-            startParagraph = startParagraph,
-            endParagraphExclusive = endParagraphExclusive.coerceAtMost(total),
+            segments = segments,
         )
 
-        // 一页内按段落顺序竖直堆叠（顶对齐），每个 TextView 仍对应单一段落 →
-        // 选择/高亮/标注沿用既有“按段落下标”逻辑，无需偏移重映射。
         val column = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = FrameLayout.LayoutParams(
@@ -220,25 +296,8 @@ class TxtVirtualPagerEngine(
                 Gravity.TOP,
             )
         }
-        for (paragraphIndex in startParagraph until endParagraphExclusive.coerceAtMost(total)) {
-            val textView = SelectionAwareTextView(context).apply {
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { gravity = Gravity.CENTER_HORIZONTAL }
-                maxWidth = maxLineWidthPx
-                setPadding((28 * density).toInt(), (10 * density).toInt(), (28 * density).toInt(), (10 * density).toInt())
-                gravity = Gravity.START
-                typeface = resolveTypeface()
-                tag = paragraphIndex
-                text = paragraphAt(paragraphIndex).withTextHighlightSpans(
-                    ranges = highlightRangesForParagraph(paragraphIndex),
-                    searchRanges = searchHighlightRangesForParagraph(paragraphIndex),
-                )
-                setTextIsSelectable(true)
-                onSelectionRangeChanged = { start, end -> updateTextSelection(paragraphIndex, start, end) }
-                applyTextStyle(palette.ink)
-            }
+        if (segments.isNotEmpty()) {
+            val textView = createPagedTextView(segments, maxLineWidthPx, density, palette.ink)
             column.addView(textView)
             pageTextViews += textView
         }
@@ -259,67 +318,231 @@ class TxtVirtualPagerEngine(
         return container.also { trackPageView(it, binding) }
     }
 
-    /**
-     * 贪心把段落装进页：逐段测量视觉行数，累加到接近页可容纳行数时换页。
-     * 段落本身超过一页则独占（不会无限循环）。返回各页起始段落下标。
-     *
-     * Prefer host-reported viewport; fall back to displayMetrics only before first layout.
-     */
-    private fun buildPagedParagraphStarts(): List<Int> {
-        val total = paragraphCount()
-        if (total <= 0) return listOf(0)
+    private suspend fun calculatePagedPageWindows(
+        requestedViewportWidthPx: Int = viewportWidthPx,
+        requestedViewportHeightPx: Int = viewportHeightPx,
+    ): TxtPaginationResult? {
+        val snapshot = paginationSnapshot(requestedViewportWidthPx, requestedViewportHeightPx) ?: return null
+        val windows = withContext(paginationDispatcher) {
+            paginationMutex.withLock {
+                if (snapshot.generation != paginationGeneration.get()) return@withLock null
+                buildPagedPageWindows(snapshot)
+            }
+        } ?: return null
+        return TxtPaginationResult(snapshot, windows)
+    }
+
+    private fun paginationSnapshot(
+        requestedViewportWidthPx: Int,
+        requestedViewportHeightPx: Int,
+    ): TxtPaginationSnapshot? {
+        val document = txtDocument ?: return null
+        val total = document.paragraphCount
         val metrics = context.resources.displayMetrics
         val density = metrics.density
-        val widthPx = if (viewportWidthPx > 0) viewportWidthPx else metrics.widthPixels.coerceAtLeast(1)
-        val heightPx = if (viewportHeightPx > 0) viewportHeightPx else metrics.heightPixels.coerceAtLeast(1)
+        val widthPx = if (requestedViewportWidthPx > 0) {
+            requestedViewportWidthPx
+        } else {
+            metrics.widthPixels.coerceAtLeast(1)
+        }
+        val heightPx = if (requestedViewportHeightPx > 0) {
+            requestedViewportHeightPx
+        } else {
+            metrics.heightPixels.coerceAtLeast(1)
+        }
         val contentWidthPx = ((TxtParagraphAdapter.MAX_LINE_WIDTH_DP * density)
             .coerceAtMost((widthPx - 56 * density)))
             .toInt().coerceAtLeast(1)
         val textSizePx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, metrics)
-        val lineHeightPx = (textSizePx * lineSpacingMultiplier).coerceAtLeast(1f)
-        // 页内容高度：视口高 - 上下纸边(24dp×2) - 每段竖直 padding(10dp×2) 的安全余量。
-        val contentHeightPx = (heightPx - 48 * density).coerceAtLeast(1f)
-        val linesPerPage = (contentHeightPx / lineHeightPx).toInt().coerceAtLeast(1)
+        val contentHeightPx = (heightPx - 48 * density).toInt().coerceAtLeast(1)
+        val rowVerticalPaddingPx = (PAGED_PARAGRAPH_GAP_DP * density).toInt()
+        return TxtPaginationSnapshot(
+            document = document,
+            totalParagraphs = total,
+            contentWidthPx = contentWidthPx,
+            contentHeightPx = contentHeightPx,
+            textSizePx = textSizePx,
+            rowVerticalPaddingPx = rowVerticalPaddingPx,
+            lineSpacingMultiplier = lineSpacingMultiplier.coerceAtLeast(0.1f),
+            typeface = resolveTypeface(),
+            fontId = currentFontId,
+            viewportWidthPx = requestedViewportWidthPx,
+            viewportHeightPx = requestedViewportHeightPx,
+            generation = paginationGeneration.incrementAndGet(),
+        )
+    }
+
+    private suspend fun buildPagedPageWindows(snapshot: TxtPaginationSnapshot): List<TxtPageWindow> {
         val paint = TextPaint().apply {
-            textSize = textSizePx
-            typeface = resolveTypeface()
+            textSize = snapshot.textSizePx
+            typeface = snapshot.typeface
         }
-        val starts = mutableListOf(0)
-        var usedLines = 0
-        for (index in 0 until total) {
-            val lines = paragraphLineCount(paragraphAt(index), contentWidthPx, paint)
-            val paragraphGap = if (index == starts.last()) 0 else 1 // 段间一行视觉间隔
-            if (usedLines > 0 && usedLines + paragraphGap + lines > linesPerPage) {
-                starts += index
-                usedLines = lines
-            } else {
-                usedLines += paragraphGap + lines
+        val pages = mutableListOf<TxtPageWindow>()
+        val pageSegments = mutableListOf<TxtPageSegment>()
+        var usedHeightPx = 0
+
+        fun flushPage() {
+            if (pageSegments.isEmpty()) return
+            pages += TxtPageWindow(pageSegments.toList())
+            pageSegments.clear()
+            usedHeightPx = 0
+        }
+
+        for (index in 0 until snapshot.totalParagraphs) {
+            currentCoroutineContext().ensureActive()
+            if (snapshot.generation != paginationGeneration.get()) return emptyList()
+            val paragraph = snapshot.document.readParagraph(index)
+            val layout = StaticLayout.Builder
+                .obtain(paragraph, 0, paragraph.length, paint, snapshot.contentWidthPx)
+                .setLineSpacing(0f, snapshot.lineSpacingMultiplier)
+                .setIncludePad(false)
+                .setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE)
+                .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
+                .build()
+            val measuredLineStarts = fallbackMeasuredLineStarts(
+                paragraph,
+                paint,
+                snapshot.contentWidthPx,
+                layout.lineCount,
+            )
+            val lineCount = measuredLineStarts?.lastIndex ?: layout.lineCount.coerceAtLeast(1)
+            val measuredLineHeight = maxOf(
+                ceil(
+                    (paint.fontMetrics.descent - paint.fontMetrics.ascent) * snapshot.lineSpacingMultiplier,
+                ).toInt(),
+                ceil(snapshot.textSizePx * snapshot.lineSpacingMultiplier).toInt(),
+                1,
+            )
+
+            fun lineStart(line: Int): Int = measuredLineStarts?.get(line) ?: layout.getLineStart(line)
+
+            fun linesHeight(startLine: Int, endLineExclusive: Int): Int =
+                if (measuredLineStarts != null) {
+                    (endLineExclusive - startLine).coerceAtLeast(1) * measuredLineHeight
+                } else {
+                    layout.getLineBottom(endLineExclusive - 1) - layout.getLineTop(startLine)
+                }
+
+            var startLine = 0
+            while (startLine < lineCount) {
+                val availableHeight = snapshot.contentHeightPx - usedHeightPx
+                var endLine = startLine
+                while (endLine < lineCount) {
+                    val candidateHeight =
+                        linesHeight(startLine, endLine + 1) + snapshot.rowVerticalPaddingPx
+                    if (candidateHeight > availableHeight) break
+                    endLine++
+                }
+                if (endLine == startLine && pageSegments.isNotEmpty()) {
+                    flushPage()
+                    continue
+                }
+                if (endLine == startLine) {
+                    endLine = (startLine + 1).coerceAtMost(lineCount)
+                }
+                val startOffset = lineStart(startLine).coerceIn(0, paragraph.length)
+                val endOffset = if (endLine < lineCount) {
+                    lineStart(endLine).coerceIn(startOffset, paragraph.length)
+                } else {
+                    paragraph.length
+                }
+                val segmentHeight = linesHeight(startLine, endLine) + snapshot.rowVerticalPaddingPx
+                pageSegments += TxtPageSegment(index, startOffset, endOffset)
+                usedHeightPx += segmentHeight
+                startLine = endLine
+                if (startLine < lineCount) flushPage()
             }
         }
-        return starts
+        flushPage()
+        return pages
     }
 
-    private fun paragraphLineCount(text: String, contentWidthPx: Int, paint: TextPaint): Int {
-        if (text.isEmpty()) return 1
-        return StaticLayout.Builder
-            .obtain(text, 0, text.length, paint, contentWidthPx)
-            .setLineSpacing(0f, lineSpacingMultiplier.coerceAtLeast(0.1f))
-            .setIncludePad(false)
-            .build()
-            .lineCount
-            .coerceAtLeast(1)
+    private fun TxtPaginationResult.isCurrent(
+        expectedViewportWidthPx: Int = viewportWidthPx,
+        expectedViewportHeightPx: Int = viewportHeightPx,
+    ): Boolean =
+        snapshot.document === txtDocument &&
+            snapshot.fontId == currentFontId &&
+            snapshot.viewportWidthPx == expectedViewportWidthPx &&
+            snapshot.viewportHeightPx == expectedViewportHeightPx &&
+            snapshot.textSizePx == TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_SP,
+                fontSizeSp,
+                context.resources.displayMetrics,
+            ) &&
+            snapshot.lineSpacingMultiplier == lineSpacingMultiplier.coerceAtLeast(0.1f) &&
+            snapshot.generation == paginationGeneration.get()
+
+    private fun installPagedPageWindows(windows: List<TxtPageWindow>) {
+        pagedPageWindows = windows
+        pagedParagraphStarts = windows.map { it.anchor.paragraphIndex }
     }
 
-    /** 段落下标 → 所在页下标（PAGED 装箱映射）。 */
-    private fun pageForParagraph(paragraphIndex: Int): Int {
-        val starts = pagedParagraphStarts
-        if (starts.isEmpty()) return paragraphIndex
-        // starts 升序，找最后一个 <= paragraphIndex 的页。
-        var page = 0
-        for (i in starts.indices) {
-            if (starts[i] <= paragraphIndex) page = i else break
+    /** Robolectric and a few vendor shapers may report one unbreakable line for long CJK/token
+     * runs. Use a linear code-point estimate only for that inconsistent geometry. */
+    private fun fallbackMeasuredLineStarts(
+        text: String,
+        paint: TextPaint,
+        widthPx: Int,
+        staticLineCount: Int,
+    ): IntArray? {
+        if (text.isEmpty() || staticLineCount > 1 || fallbackMeasuredWidth(text, paint) <= widthPx) return null
+        val starts = mutableListOf(0)
+        var lineStart = 0
+        var lineWidth = 0f
+        var index = 0
+        while (index < text.length) {
+            val codePoint = text.codePointAt(index)
+            val advance = fallbackEstimatedAdvance(codePoint, paint)
+            if (index > lineStart && lineWidth + advance > widthPx) {
+                starts += index
+                lineStart = index
+                lineWidth = 0f
+            }
+            lineWidth += advance
+            index += Character.charCount(codePoint)
         }
-        return page
+        if (starts.last() != text.length) starts += text.length
+        return starts.toIntArray()
+    }
+
+    private fun fallbackMeasuredWidth(text: String, paint: TextPaint): Float {
+        var estimated = 0f
+        var index = 0
+        while (index < text.length) {
+            val codePoint = text.codePointAt(index)
+            estimated += fallbackEstimatedAdvance(codePoint, paint)
+            index += Character.charCount(codePoint)
+        }
+        return maxOf(paint.measureText(text), estimated)
+    }
+
+    private fun fallbackEstimatedAdvance(codePoint: Int, paint: TextPaint): Float =
+        paint.textSize * when {
+            Character.isWhitespace(codePoint) -> 0.33f
+            Character.isIdeographic(codePoint) || codePoint >= 0x1F000 -> 1f
+            else -> 0.55f
+        }
+
+    private fun pageForParagraph(paragraphIndex: Int): Int = pageForPosition(paragraphIndex, 0)
+
+    private fun pageForPosition(paragraphIndex: Int, charOffset: Int): Int {
+        if (paragraphCount() == 0) return 0
+        if (pagedPageWindows.isEmpty()) return paragraphIndex
+        val paragraphLength = paragraphAt(paragraphIndex.coerceIn(0, paragraphCount() - 1)).length
+        val offset = charOffset.coerceIn(0, paragraphLength)
+        val exact = pagedPageWindows.indexOfFirst { page ->
+            page.segments.any { segment ->
+                segment.paragraphIndex == paragraphIndex &&
+                    offset >= segment.startOffset &&
+                    (offset < segment.endOffset ||
+                        offset == segment.endOffset && segment.endOffset == paragraphLength)
+            }
+        }
+        if (exact >= 0) return exact
+        return pagedPageWindows.indexOfFirst { page ->
+            page.segments.any { it.paragraphIndex == paragraphIndex }
+        }.takeIf { it >= 0 } ?: paragraphIndex.coerceIn(0, pagedPageWindows.lastIndex)
     }
 
     override fun setPageRequestCallback(callback: ((pageIndex: Int) -> Unit)?) {
@@ -332,17 +555,24 @@ class TxtVirtualPagerEngine(
      * repacks with the host viewport (not displayMetrics alone), preserves the
      * paragraph/ByteOffset anchor, requests the containing page, and rebinds active pages.
      */
-    override fun setViewportSize(widthPx: Int, heightPx: Int) {
+    override suspend fun setViewportSize(widthPx: Int, heightPx: Int) {
         if (widthPx <= 0 || heightPx <= 0) return
         val changed = widthPx != viewportWidthPx || heightPx != viewportHeightPx
-        viewportWidthPx = widthPx
-        viewportHeightPx = heightPx
         if (!changed) return
-        if (_pagingKind.value != PagingKind.PAGED) return
+        if (_pagingKind.value != PagingKind.PAGED) {
+            viewportWidthPx = widthPx
+            viewportHeightPx = heightPx
+            return
+        }
         // Preserve paragraph/source anchor across rotation — never publish bare Page.
-        val paragraphIndex = currentParagraphIndex()
-        publishLocator(locatorForIndex(paragraphIndex))
-        rebuildPagedRangesAfterTypographyChange()
+        val position = currentParagraphPosition()
+        publishLocator(locatorForPosition(position))
+        rebuildPagedRangesAfterTypographyChange(
+            requestedViewportWidthPx = widthPx,
+            requestedViewportHeightPx = heightPx,
+            commitViewport = true,
+            preservedPosition = position,
+        )
     }
 
     private fun buildToc(document: TxtDocument): List<TocEntry> {
@@ -376,7 +606,7 @@ class TxtVirtualPagerEngine(
         val total = paragraphCount()
         if (total == 0) return
         val lm = rv.layoutManager as? LinearLayoutManager ?: return
-        val first = lm.findFirstVisibleItemPosition().coerceAtLeast(0)
+        val first = lm.findFirstVisibleItemPosition().takeIf { it != RecyclerView.NO_POSITION } ?: return
         val pending = pendingProgrammaticScroll
         if (pending != null) {
             if (pending.isStaleReport(first)) {
@@ -384,7 +614,42 @@ class TxtVirtualPagerEngine(
             }
             pendingProgrammaticScroll = null
         }
-        publishLocator(locatorForIndex(first, total))
+        val position = paragraphPositionAtViewportY(rv, first, rv.paddingTop)
+        publishLocator(locatorForPosition(position, total))
+    }
+
+    private fun restoreContinuousPosition(
+        rv: RecyclerView,
+        position: TxtParagraphPosition,
+    ): Boolean {
+        val holder = rv.findViewHolderForAdapterPosition(position.paragraphIndex)
+            as? TxtParagraphAdapter.ParagraphHolder ?: return false
+        val textView = holder.textView
+        val layout = textView.layout ?: return false
+        if (layout.lineCount == 0) return false
+        val safeOffset = position.charOffset.coerceIn(0, textView.text.length)
+        val line = layout.getLineForOffset(safeOffset)
+        val lineTopInRecycler = holder.itemView.top + textView.top + textView.totalPaddingTop +
+            layout.getLineTop(line)
+        rv.scrollBy(0, lineTopInRecycler - rv.paddingTop)
+        return true
+    }
+
+    private fun paragraphPositionAtViewportY(
+        rv: RecyclerView,
+        paragraphIndex: Int,
+        viewportY: Int,
+    ): TxtParagraphPosition {
+        val holder = rv.findViewHolderForAdapterPosition(paragraphIndex)
+            as? TxtParagraphAdapter.ParagraphHolder
+            ?: return TxtParagraphPosition(paragraphIndex, 0)
+        val textView = holder.textView
+        val layout = textView.layout ?: return TxtParagraphPosition(paragraphIndex, 0)
+        if (layout.lineCount == 0) return TxtParagraphPosition(paragraphIndex, 0)
+        val textTopInRecycler = holder.itemView.top + textView.top + textView.totalPaddingTop
+        val localY = (viewportY - textTopInRecycler).coerceIn(0, (layout.height - 1).coerceAtLeast(0))
+        val line = layout.getLineForVertical(localY)
+        return TxtParagraphPosition(paragraphIndex, layout.getLineStart(line))
     }
 
     override suspend fun goTo(locator: Locator) {
@@ -392,35 +657,46 @@ class TxtVirtualPagerEngine(
         // PAGED packing: ViewPager slots are pages, not paragraphs (see pageIndexForLocator /
         // setMode). pageRequestCallback must receive a page index; LocatorStrategy.Page is a
         // page slot from the host settle path, not a paragraph index.
-        val paged = _pagingKind.value == PagingKind.PAGED && pagedParagraphStarts.isNotEmpty()
-        val index = when (val s = locator.strategy) {
-            is LocatorStrategy.Section -> s.elementIndex
+        val paged = _pagingKind.value == PagingKind.PAGED && pagedPageWindows.isNotEmpty()
+        val position = paragraphPositionForLocator(locator)
+        val target = locatorForPosition(position, total)
+        recyclerView?.let { rv ->
+            pendingProgrammaticScroll = PendingProgrammaticScroll(
+                fromIndex = currentVisibleParagraphIndex() ?: currentParagraphIndex(),
+                targetIndex = position.paragraphIndex,
+            )
+            (rv.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(position.paragraphIndex, 0)
+        }
+        publishLocator(target)
+        pageRequestCallback?.invoke(
+            if (paged) pageForPosition(position.paragraphIndex, position.charOffset)
+            else position.paragraphIndex,
+        )
+    }
+
+    private fun paragraphPositionForLocator(locator: Locator): TxtParagraphPosition {
+        val total = paragraphCount().coerceAtLeast(1)
+        val paged = _pagingKind.value == PagingKind.PAGED && pagedPageWindows.isNotEmpty()
+        return when (val s = locator.strategy) {
+            is LocatorStrategy.Section -> TxtParagraphPosition(s.elementIndex, s.charOffset)
             is LocatorStrategy.Page -> {
                 if (paged) {
-                    val page = s.index.coerceIn(0, pagedParagraphStarts.lastIndex)
-                    pagedParagraphStarts[page]
+                    val page = s.index.coerceIn(0, pagedPageWindows.lastIndex)
+                    pagedPageWindows[page].anchor.toParagraphPosition()
                 } else {
-                    s.index
+                    TxtParagraphPosition(s.index, 0)
                 }
             }
             // PageText is PDF text-point identity — never treat index as TXT paragraph.
             is LocatorStrategy.PageText,
             LocatorStrategy.Unknown,
-            -> locator.totalProgression?.let { (it * total).toInt() } ?: 0
-            is LocatorStrategy.ByteOffset -> txtDocument?.indexForOffset(s.offset)
-                ?: locator.totalProgression?.let { (it * total).toInt() }
-                ?: 0
-        }.coerceIn(0, total - 1)
-        val target = locatorForIndex(index, total)
-        recyclerView?.let { rv ->
-            pendingProgrammaticScroll = PendingProgrammaticScroll(
-                fromIndex = currentVisibleParagraphIndex() ?: currentParagraphIndex(),
-                targetIndex = index,
-            )
-            (rv.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(index, 0)
-        }
-        publishLocator(target)
-        pageRequestCallback?.invoke(if (paged) pageForParagraph(index) else index)
+            -> TxtParagraphPosition(locator.totalProgression?.let { (it * total).toInt() } ?: 0, 0)
+            is LocatorStrategy.ByteOffset -> paragraphPositionForByteOffset(s.offset)
+                ?: TxtParagraphPosition(
+                    locator.totalProgression?.let { (it * total).toInt() } ?: 0,
+                    0,
+                )
+        }.clamp(total, ::paragraphAt)
     }
 
     override suspend fun goToAdjacentChapter(delta: Int) {
@@ -461,12 +737,63 @@ class TxtVirtualPagerEngine(
     private fun refreshBoundHighlightSurfaces() {
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateTextAnnotations()
         activePageTextViews.forEach { textView ->
-            val index = textView.tag as? Int ?: return@forEach
-            textView.text = paragraphAt(index).withTextHighlightSpans(
-                ranges = highlightRangesForParagraph(index),
-                searchRanges = searchHighlightRangesForParagraph(index),
-            )
+            val pageText = pagedPageTexts[textView]
+            if (pageText != null) {
+                val refreshed = buildPagedText(pageText.segments)
+                pagedPageTexts[textView] = refreshed
+                textView.text = refreshed.text
+            } else {
+                val index = textView.tag as? Int ?: return@forEach
+                textView.text = paragraphAt(index).withTextHighlightSpans(
+                    ranges = highlightRangesForParagraph(index),
+                    searchRanges = searchHighlightRangesForParagraph(index),
+                )
+            }
         }
+    }
+
+    private fun createPagedTextView(
+        segments: List<TxtPageSegment>,
+        maxLineWidthPx: Int,
+        density: Float,
+        inkColor: Int,
+    ): SelectionAwareTextView = SelectionAwareTextView(context).apply {
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { gravity = Gravity.CENTER_HORIZONTAL }
+        maxWidth = maxLineWidthPx
+        setPadding(
+            (28 * density).toInt(),
+            (10 * density).toInt(),
+            (28 * density).toInt(),
+            (10 * density).toInt(),
+        )
+        gravity = Gravity.START
+        typeface = resolveTypeface()
+        includeFontPadding = false
+        breakStrategy = Layout.BREAK_STRATEGY_SIMPLE
+        hyphenationFrequency = Layout.HYPHENATION_FREQUENCY_NONE
+        val pageText = buildPagedText(segments)
+        tag = pageText.anchorParagraphIndex
+        text = pageText.text
+        setTextIsSelectable(true)
+        onSelectionRangeChanged = { start, end ->
+            _currentTextSelection.value = txtDocument?.selectionForPagedText(pageText, start, end)
+        }
+        applyTextStyle(inkColor)
+        pagedPageTexts[this] = pageText
+    }
+
+    private fun buildPagedText(segments: List<TxtPageSegment>): TxtPagedText {
+        val paragraphs = txtDocument?.readParagraphs(segments.map(TxtPageSegment::paragraphIndex).distinct()).orEmpty()
+        return buildTxtPagedText(
+            segments = segments,
+            paragraphProvider = { index -> paragraphs[index].orEmpty() },
+            highlightRangesProvider = ::highlightRangesForParagraph,
+            searchHighlightRangesProvider = ::searchHighlightRangesForParagraph,
+            paragraphGapPx = (PAGED_PARAGRAPH_GAP_DP * context.resources.displayMetrics.density).toInt(),
+        )
     }
 
     private fun updateTextSelection(paragraphIndex: Int, start: Int, end: Int) {
@@ -482,33 +809,84 @@ class TxtVirtualPagerEngine(
         return listOf(range)
     }
 
-    private fun locatorForIndex(index: Int, totalItems: Int = paragraphCount().coerceAtLeast(1)): Locator {
+    private fun locatorForIndex(index: Int, totalItems: Int = paragraphCount().coerceAtLeast(1)): Locator =
+        locatorForPosition(TxtParagraphPosition(index, 0), totalItems)
+
+    private fun locatorForPosition(
+        position: TxtParagraphPosition,
+        totalItems: Int = paragraphCount().coerceAtLeast(1),
+    ): Locator {
+        if (paragraphCount() == 0 || totalItems <= 0) {
+            return Locator(
+                strategy = LocatorStrategy.ByteOffset(offset = 0L, length = 0),
+                progression = 0f,
+                totalProgression = 0f,
+            )
+        }
         val total = totalItems.coerceAtLeast(1)
-        val safeIndex = index.coerceIn(0, total - 1)
+        val safeIndex = position.paragraphIndex.coerceIn(0, total - 1)
         val range = txtDocument?.rangeAt(safeIndex)
+        val paragraph = txtDocument?.readParagraph(safeIndex).orEmpty()
+        val charOffset = position.charOffset.coerceIn(0, paragraph.length)
+        val prefixBytes = paragraph.substring(0, charOffset)
+            .toByteArray(txtDocument?.charsetDetection?.charset ?: Charsets.UTF_8)
+            .size
+            .toLong()
+        val absoluteOffset = (range?.startByte ?: 0L) + prefixBytes
+        val remainingLength = ((range?.length ?: 0L) - prefixBytes).coerceAtLeast(0L)
+        val withinParagraph = if (paragraph.isEmpty()) 0f else charOffset.toFloat() / paragraph.length
         return Locator(
             strategy = LocatorStrategy.ByteOffset(
-                offset = range?.startByte ?: 0L,
-                length = range?.length?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt() ?: 0,
+                offset = absoluteOffset,
+                length = remainingLength.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
             ),
             progression = safeIndex.toFloat() / total,
-            totalProgression = safeIndex.toFloat() / total,
+            totalProgression = ((safeIndex + withinParagraph) / total).coerceIn(0f, 1f),
         )
     }
 
-    private fun currentParagraphIndex(): Int {
+    private fun currentParagraphPosition(): TxtParagraphPosition {
+        if (paragraphCount() == 0) return TxtParagraphPosition(0, 0)
         val total = paragraphCount().coerceAtLeast(1)
         return when (val strategy = _currentLocator.value.strategy) {
-            is LocatorStrategy.Section -> strategy.elementIndex
-            is LocatorStrategy.Page -> strategy.index
-            is LocatorStrategy.ByteOffset -> txtDocument?.indexForOffset(strategy.offset) ?: 0
+            is LocatorStrategy.Section -> TxtParagraphPosition(strategy.elementIndex, strategy.charOffset)
+            is LocatorStrategy.Page -> if (pagedPageWindows.isNotEmpty()) {
+                pagedPageWindows[strategy.index.coerceIn(0, pagedPageWindows.lastIndex)].anchor.toParagraphPosition()
+            } else {
+                TxtParagraphPosition(strategy.index, 0)
+            }
+            is LocatorStrategy.ByteOffset -> paragraphPositionForByteOffset(strategy.offset)
+                ?: TxtParagraphPosition(0, 0)
             is LocatorStrategy.PageText,
             LocatorStrategy.Unknown,
-            -> 0
-        }.coerceIn(0, total - 1)
+            -> TxtParagraphPosition(0, 0)
+        }.clamp(total, ::paragraphAt)
+    }
+
+    private fun currentParagraphIndex(): Int = currentParagraphPosition().paragraphIndex
+
+    private fun paragraphPositionForByteOffset(offset: Long): TxtParagraphPosition? {
+        val document = txtDocument ?: return null
+        if (document.paragraphCount <= 0) return null
+        val paragraphIndex = document.indexForOffset(offset).coerceIn(0, document.paragraphCount - 1)
+        val range = document.rangeAt(paragraphIndex) ?: return TxtParagraphPosition(paragraphIndex, 0)
+        val paragraph = document.readParagraph(paragraphIndex)
+        val localByteOffset = (offset - range.startByte).coerceAtLeast(0L)
+        return TxtParagraphPosition(
+            paragraphIndex,
+            paragraph.characterIndexForByteOffset(localByteOffset, document.charsetDetection.charset),
+        )
     }
 
     override suspend fun close() {
+        paginationGeneration.incrementAndGet()
+        val closingDocument = txtDocument
+        txtDocument = null
+        withContext(paginationDispatcher) {
+            paginationMutex.withLock {
+                closingDocument?.close()
+            }
+        }
         recyclerView = null
         pageRequestCallback = null
         pendingProgrammaticScroll = null
@@ -518,11 +896,11 @@ class TxtVirtualPagerEngine(
         viewportWidthPx = 0
         viewportHeightPx = 0
         pagedParagraphStarts = emptyList()
+        pagedPageWindows = emptyList()
+        pagedPageTexts.clear()
         _currentTextSelection.value = null
         textAnnotations = emptyList()
         searchHighlightHit = null
-        txtDocument?.close()
-        txtDocument = null
         txtFingerprint = null
         pendingEngineState = null
         _tableOfContents.value = emptyList()
@@ -542,6 +920,7 @@ class TxtVirtualPagerEngine(
     }
 
     override suspend fun setFontSize(sp: Float) {
+        if (fontSizeSp == sp) return
         fontSizeSp = sp
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateFontSize(sp)
         activePageTextViews.forEach { it.applyTextStyle() }
@@ -558,6 +937,7 @@ class TxtVirtualPagerEngine(
     }
 
     override suspend fun setFont(fontId: String) {
+        if (currentFontId == fontId) return
         currentFontId = fontId
         useSourceHan = fontId == "source_han"
         withContext(Dispatchers.Main) {
@@ -572,13 +952,97 @@ class TxtVirtualPagerEngine(
     /**
      * PAGED 模式下排版/视口变化后重算装箱，回调新页号，并刷新已挂载页（pageCount 不变也要 rebind）。
      */
-    private fun rebuildPagedRangesAfterTypographyChange() {
-        if (_pagingKind.value != PagingKind.PAGED) return
-        val paragraphIndex = currentParagraphIndex()
-        pagedParagraphStarts = buildPagedParagraphStarts()
-        _pageCount.value = pagedParagraphStarts.size.coerceAtLeast(1)
-        pageRequestCallback?.invoke(pageForParagraph(paragraphIndex))
+    private suspend fun rebuildPagedRangesAfterTypographyChange(
+        requestedViewportWidthPx: Int = viewportWidthPx,
+        requestedViewportHeightPx: Int = viewportHeightPx,
+        commitViewport: Boolean = false,
+        preservedPosition: TxtParagraphPosition = currentPagedPageStartPosition(),
+    ): Boolean {
+        if (_pagingKind.value != PagingKind.PAGED) return false
+        val result = calculatePagedPageWindows(
+            requestedViewportWidthPx = requestedViewportWidthPx,
+            requestedViewportHeightPx = requestedViewportHeightPx,
+        ) ?: return false
+        if (
+            !result.isCurrent(requestedViewportWidthPx, requestedViewportHeightPx) ||
+            _pagingKind.value != PagingKind.PAGED
+        ) {
+            return false
+        }
+        if (commitViewport) {
+            viewportWidthPx = requestedViewportWidthPx
+            viewportHeightPx = requestedViewportHeightPx
+        }
+        installPagedPageWindows(result.windows.rebasedAt(preservedPosition))
+        _pageCount.value = pagedPageWindows.size.coerceAtLeast(1)
+        publishLocator(locatorForPosition(preservedPosition))
+        pageRequestCallback?.invoke(
+            pageForPosition(preservedPosition.paragraphIndex, preservedPosition.charOffset),
+        )
         refreshActivePageContents()
+        return true
+    }
+
+    /**
+     * Typography changes are anchored to the first source character on the visible page. Search,
+     * selection, and annotation navigation can leave [currentLocator] inside that page; promoting
+     * that inner locator to the next layout's page start makes the text jump under the reader.
+     */
+    private fun currentPagedPageStartPosition(): TxtParagraphPosition {
+        val current = currentParagraphPosition()
+        if (pagedPageWindows.isEmpty()) return current
+        return pagedPageWindows[
+            pageForPosition(current.paragraphIndex, current.charOffset)
+        ].anchor.toParagraphPosition()
+    }
+
+    private fun TxtPageSegment.contains(position: TxtParagraphPosition): Boolean =
+        paragraphIndex == position.paragraphIndex &&
+            position.charOffset >= startOffset &&
+            (
+                position.charOffset < endOffset ||
+                    position.charOffset == endOffset && endOffset == paragraphAt(paragraphIndex).length
+                )
+
+    /**
+     * Keep the saved viewport start as an actual page boundary after reflow. A global repack may
+     * otherwise place a few earlier lines above the anchor even when the host opens the containing
+     * page. Splitting only that page preserves every source character and leaves all other windows
+     * unchanged.
+     */
+    private fun List<TxtPageWindow>.rebasedAt(
+        position: TxtParagraphPosition,
+    ): List<TxtPageWindow> {
+        val pageIndex = indexOfFirst { page ->
+            page.segments.any { segment ->
+                segment.contains(position)
+            }
+        }
+        if (pageIndex < 0) return this
+        val page = this[pageIndex]
+        if (page.anchor.toParagraphPosition() == position) return this
+        val segmentIndex = page.segments.indexOfFirst { it.contains(position) }
+        if (segmentIndex < 0) return this
+        val segment = page.segments[segmentIndex]
+        val before = buildList {
+            addAll(page.segments.take(segmentIndex))
+            if (position.charOffset > segment.startOffset) {
+                add(segment.copy(endOffset = position.charOffset))
+            }
+        }
+        val after = buildList {
+            if (position.charOffset < segment.endOffset) {
+                add(segment.copy(startOffset = position.charOffset))
+            }
+            addAll(page.segments.drop(segmentIndex + 1))
+        }
+        if (after.isEmpty()) return this
+        return buildList(size + if (before.isEmpty()) 0 else 1) {
+            addAll(this@rebasedAt.take(pageIndex))
+            if (before.isNotEmpty()) add(TxtPageWindow(before))
+            add(TxtPageWindow(after))
+            addAll(this@rebasedAt.drop(pageIndex + 1))
+        }
     }
 
     /**
@@ -586,10 +1050,8 @@ class TxtVirtualPagerEngine(
      * Rebuilds paragraph grouping/text even when packed pageCount is unchanged.
      */
     private fun refreshActivePageContents() {
-        if (pagedParagraphStarts.isEmpty()) return
-        val total = paragraphCount().coerceAtLeast(1)
-        val pageCount = pagedParagraphStarts.size.coerceAtLeast(1)
-        val starts = pagedParagraphStarts
+        if (pagedPageWindows.isEmpty()) return
+        val pageCount = pagedPageWindows.size.coerceAtLeast(1)
         val density = context.resources.displayMetrics.density
         val maxLineWidthPx = (TxtParagraphAdapter.MAX_LINE_WIDTH_DP * density).toInt()
         val palette = paletteFor(themeMode, context.resources.configuration)
@@ -600,41 +1062,15 @@ class TxtVirtualPagerEngine(
             val column = binding.column ?: return@forEach
             val container = binding.container ?: return@forEach
             val pageIndex = binding.pageIndex
-            if (pageIndex !in starts.indices) return@forEach
-            val startParagraph = starts[pageIndex]
-            val endParagraphExclusive = starts.getOrElse(pageIndex + 1) { total }.coerceAtMost(total)
-            binding.startParagraph = startParagraph
-            binding.endParagraphExclusive = endParagraphExclusive
+            val segments = pagedPageWindows.getOrNull(pageIndex)?.segments ?: return@forEach
+            binding.segments = segments
 
             detachedTextViews.addAll(binding.textViews)
+            binding.textViews.forEach(pagedPageTexts::remove)
             column.removeAllViews()
             val pageTextViews = mutableListOf<TextView>()
-            for (paragraphIndex in startParagraph until endParagraphExclusive) {
-                val textView = SelectionAwareTextView(context).apply {
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                    ).apply { gravity = Gravity.CENTER_HORIZONTAL }
-                    maxWidth = maxLineWidthPx
-                    setPadding(
-                        (28 * density).toInt(),
-                        (10 * density).toInt(),
-                        (28 * density).toInt(),
-                        (10 * density).toInt(),
-                    )
-                    gravity = Gravity.START
-                    typeface = resolveTypeface()
-                    tag = paragraphIndex
-                    text = paragraphAt(paragraphIndex).withTextHighlightSpans(
-                        ranges = highlightRangesForParagraph(paragraphIndex),
-                        searchRanges = searchHighlightRangesForParagraph(paragraphIndex),
-                    )
-                    setTextIsSelectable(true)
-                    onSelectionRangeChanged = { start, end ->
-                        updateTextSelection(paragraphIndex, start, end)
-                    }
-                    applyTextStyle(palette.ink)
-                }
+            if (segments.isNotEmpty()) {
+                val textView = createPagedTextView(segments, maxLineWidthPx, density, palette.ink)
                 column.addView(textView)
                 pageTextViews += textView
                 attachedTextViews += textView
@@ -662,8 +1098,13 @@ class TxtVirtualPagerEngine(
         openBook(uri)
         if (wasPaged) {
             // openBook does not reset pagingKind; rebuild packing with stored host viewport.
-            pagedParagraphStarts = buildPagedParagraphStarts()
-            _pageCount.value = pagedParagraphStarts.size.coerceAtLeast(1)
+            val result = calculatePagedPageWindows()
+            if (result != null && result.isCurrent()) {
+                installPagedPageWindows(result.windows)
+            }
+            if (pagedPageWindows.isNotEmpty()) {
+                _pageCount.value = pagedPageWindows.size.coerceAtLeast(1)
+            }
             val totalParas = paragraphCount().coerceAtLeast(1)
             val targetIndex = resolveEncodingReopenParagraph(
                 savedStrategy = savedStrategy,
@@ -716,6 +1157,7 @@ class TxtVirtualPagerEngine(
     }
 
     override suspend fun setLineSpacing(multiplier: Float) {
+        if (lineSpacingMultiplier == multiplier) return
         lineSpacingMultiplier = multiplier
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateLineSpacing(multiplier)
         activePageTextViews.forEach { it.applyTextStyle() }
@@ -738,40 +1180,63 @@ class TxtVirtualPagerEngine(
             ReadingMode.SCROLL -> PagingKind.CONTINUOUS
             ReadingMode.PAGED -> PagingKind.PAGED
         }
-        withContext(Dispatchers.Main) {
-            val paragraphIndex = if (_pagingKind.value == PagingKind.CONTINUOUS) {
-                currentVisibleParagraphIndex() ?: currentParagraphIndex()
+        val startingKind = _pagingKind.value
+        val position = withContext(Dispatchers.Main) {
+            val anchor = if (_pagingKind.value == PagingKind.CONTINUOUS) {
+                TxtParagraphPosition(currentVisibleParagraphIndex() ?: currentParagraphIndex(), 0)
             } else {
-                currentParagraphIndex()
+                currentParagraphPosition()
             }
-            publishLocator(locatorForIndex(paragraphIndex))
-            _pagingKind.value = targetKind
-            if (targetKind == PagingKind.PAGED) {
-                pagedParagraphStarts = buildPagedParagraphStarts()
-                _pageCount.value = pagedParagraphStarts.size
-                pageRequestCallback?.invoke(pageForParagraph(paragraphIndex))
-            } else {
+            publishLocator(locatorForPosition(anchor))
+            if (targetKind != PagingKind.PAGED) {
+                _pagingKind.value = targetKind
+                paginationGeneration.incrementAndGet()
                 pagedParagraphStarts = emptyList()
+                pagedPageWindows = emptyList()
                 _pageCount.value = paragraphCount()
+            }
+            anchor
+        }
+        if (targetKind == PagingKind.PAGED) {
+            val result = calculatePagedPageWindows()
+            if (result == null) {
+                // Mode is applied before openBook (cold open); there is no document to pack yet.
+                // Publish PAGED without advertising a page count — openBook installs the windows
+                // and publishes the count before the host can bind any page slot.
+                withContext(Dispatchers.Main) {
+                    if (_pagingKind.value == startingKind) _pagingKind.value = PagingKind.PAGED
+                }
+                return
+            }
+            withContext(Dispatchers.Main) {
+                if (!result.isCurrent() || _pagingKind.value != startingKind) return@withContext
+                installPagedPageWindows(result.windows)
+                // Publish PAGED only after the new windows are installed so a host can never
+                // observe PAGED backed by empty/uninstalled windows during the switch.
+                _pagingKind.value = PagingKind.PAGED
+                _pageCount.value = pagedPageWindows.size.coerceAtLeast(1)
+                refreshActivePageContents()
+                pageRequestCallback?.invoke(pageForPosition(position.paragraphIndex, position.charOffset))
             }
         }
     }
 
     override fun pageIndexForLocator(locator: Locator): Int {
-        if (_pagingKind.value != PagingKind.PAGED || pagedParagraphStarts.isEmpty()) {
+        if (_pagingKind.value != PagingKind.PAGED || pagedPageWindows.isEmpty()) {
             return super.pageIndexForLocator(locator)
         }
         val total = paragraphCount().coerceAtLeast(1)
-        val paragraphIndex = when (val s = locator.strategy) {
-            is LocatorStrategy.Section -> s.elementIndex
-            is LocatorStrategy.Page -> return s.index.coerceIn(0, pagedParagraphStarts.lastIndex)
+        val position = when (val s = locator.strategy) {
+            is LocatorStrategy.Section -> TxtParagraphPosition(s.elementIndex, s.charOffset)
+            is LocatorStrategy.Page -> return s.index.coerceIn(0, pagedPageWindows.lastIndex)
             // PageText must not map to a paged paragraph slot — fall back like Unknown.
             is LocatorStrategy.PageText,
             LocatorStrategy.Unknown,
-            -> locator.totalProgression?.let { (it * total).toInt() } ?: 0
-            is LocatorStrategy.ByteOffset -> txtDocument?.indexForOffset(s.offset) ?: 0
-        }.coerceIn(0, total - 1)
-        return pageForParagraph(paragraphIndex)
+            -> TxtParagraphPosition(locator.totalProgression?.let { (it * total).toInt() } ?: 0, 0)
+            is LocatorStrategy.ByteOffset -> paragraphPositionForByteOffset(s.offset)
+                ?: TxtParagraphPosition(0, 0)
+        }.clamp(total, ::paragraphAt)
+        return pageForPosition(position.paragraphIndex, position.charOffset)
     }
 
     private fun currentVisibleParagraphIndex(): Int? {
@@ -800,6 +1265,7 @@ class TxtVirtualPagerEngine(
                 activePageContainers.remove(container)
                 activePageBindings.remove(binding)
                 activePageTextViews.removeAll(binding.textViews.toSet())
+                binding.textViews.forEach(pagedPageTexts::remove)
             }
         })
     }
@@ -830,6 +1296,7 @@ class TxtVirtualPagerEngine(
 
     private companion object {
         private const val DOCUMENT_TITLE_FALLBACK = "正文"
+        private const val PAGED_PARAGRAPH_GAP_DP = 20
         private val TXT_HEADING = Regex("""^(第.{1,12}[章节回卷部篇集].*|Chapter\s+\d+.*|CHAPTER\s+\d+.*)$""")
 
         private fun isTxtHeading(value: String): Boolean =
@@ -845,7 +1312,11 @@ class TxtVirtualPagerEngine(
 
     private fun paragraphCount(): Int = txtDocument?.paragraphCount ?: 0
 
-    private fun paragraphAt(index: Int): String = txtDocument?.readParagraph(index).orEmpty()
+    private fun paragraphAt(index: Int): String {
+        val document = txtDocument ?: return ""
+        if (index !in 0 until document.paragraphCount) return ""
+        return document.readParagraph(index)
+    }
 
     private fun resolveReadableFile(uri: Uri, requiresFingerprint: Boolean): CopiedTxtFile {
         resolveAppPrivateFile(uri)?.let { file ->
@@ -908,17 +1379,67 @@ private data class CopiedTxtFile(
 
 /**
  * Mutable binding for an active PAGED page. Keyed by stable [pageIndex];
- * paragraph range and child TextViews update on typography/viewport rebuild so
- * selection/highlight keep paragraph tags without relying on host page destruction.
+ * paragraph range and the composited page TextView update on typography/viewport rebuild so
+ * selection/highlight mappings stay current without relying on host page destruction.
  */
 internal class TxtPageViewBinding(
     var pageIndex: Int,
-    var startParagraph: Int,
-    var endParagraphExclusive: Int,
+    var segments: List<TxtPageSegment>,
     var container: FrameLayout? = null,
     var column: LinearLayout? = null,
     var textViews: MutableList<TextView> = mutableListOf(),
 )
+
+internal data class TxtPageSegment(
+    val paragraphIndex: Int,
+    val startOffset: Int,
+    val endOffset: Int,
+)
+
+internal data class TxtPageWindow(
+    val segments: List<TxtPageSegment>,
+) {
+    init {
+        require(segments.isNotEmpty())
+    }
+
+    val anchor: TxtPageSegment
+        get() = segments.first()
+}
+
+private data class TxtPaginationSnapshot(
+    val document: TxtDocument,
+    val totalParagraphs: Int,
+    val contentWidthPx: Int,
+    val contentHeightPx: Int,
+    val textSizePx: Float,
+    val rowVerticalPaddingPx: Int,
+    val lineSpacingMultiplier: Float,
+    val typeface: Typeface,
+    val fontId: String,
+    val viewportWidthPx: Int,
+    val viewportHeightPx: Int,
+    val generation: Long,
+)
+
+private data class TxtPaginationResult(
+    val snapshot: TxtPaginationSnapshot,
+    val windows: List<TxtPageWindow>,
+)
+
+private data class TxtParagraphPosition(
+    val paragraphIndex: Int,
+    val charOffset: Int,
+) {
+    fun clamp(total: Int, paragraphProvider: (Int) -> String): TxtParagraphPosition {
+        if (total <= 0) return TxtParagraphPosition(0, 0)
+        val index = paragraphIndex.coerceIn(0, total.coerceAtLeast(1) - 1)
+        return TxtParagraphPosition(index, charOffset.coerceIn(0, paragraphProvider(index).length))
+    }
+}
+
+private fun TxtPageSegment.toParagraphPosition(): TxtParagraphPosition =
+    TxtParagraphPosition(paragraphIndex, startOffset)
 
 private data class PendingProgrammaticScroll(
     val fromIndex: Int,

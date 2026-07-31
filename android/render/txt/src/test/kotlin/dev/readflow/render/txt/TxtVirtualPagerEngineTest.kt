@@ -3,16 +3,17 @@ package dev.readflow.render.txt
 import android.net.Uri
 import android.text.Selection
 import android.text.Spannable
-import android.util.TypedValue
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import dev.readflow.core.model.ChapterInfo
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
 import dev.readflow.core.model.ReaderTypographyRange
+import dev.readflow.render.api.InitialLocatorAwareReaderEngine
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderSearchHit
 import dev.readflow.render.api.ReadingMode
@@ -21,8 +22,10 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -40,6 +43,8 @@ import org.robolectric.Shadows.shadowOf
 import android.os.Looper
 import java.nio.charset.StandardCharsets
 import java.io.File
+import java.util.ArrayDeque
+import kotlin.coroutines.CoroutineContext
 import kotlin.math.abs
 
 @RunWith(RobolectricTestRunner::class)
@@ -69,6 +74,26 @@ class TxtVirtualPagerEngineTest {
             0.001f,
         )
         assertEquals("source_han", engine.privateField("currentFontId"))
+    }
+
+    @Test
+    fun `empty file opens and enters paged mode with a stable empty locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-empty-", suffix = ".txt").toFile()
+        val engine = TxtVirtualPagerEngine(context)
+
+        val opened = engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(420, 640)
+        engine.setMode(ReadingMode.PAGED)
+        val page = engine.createPageView(0) as FrameLayout
+
+        assertEquals(LocatorStrategy.ByteOffset(offset = 0L, length = 0), opened.strategy)
+        assertEquals(opened, engine.currentLocator.value)
+        assertEquals(PagingKind.PAGED, engine.pagingKind.value)
+        assertEquals(1, engine.pageCount.value)
+        assertEquals(0, (page.getChildAt(0) as LinearLayout).childCount)
+        assertEquals(0, engine.pageIndexForLocator(engine.currentLocator.value))
     }
 
     @Test
@@ -116,6 +141,457 @@ class TxtVirtualPagerEngineTest {
                 row.width > 0 && row.height > 0
             },
         )
+    }
+
+    @Test
+    fun `paged page composites many short paragraphs into one text surface`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val paragraphs = (0 until 80).map { index ->
+            "Short paragraph %02d keeps the real reader page densely populated.".format(index)
+        }
+        val file = kotlin.io.path.createTempFile(
+            prefix = "readflow-txt-composited-page-",
+            suffix = ".txt",
+        ).toFile()
+        file.writeText(paragraphs.joinToString("\n\n"), charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(720, 1280)
+        engine.setMode(ReadingMode.PAGED)
+
+        val page = engine.createPageView(0) as FrameLayout
+        val column = page.getChildAt(0) as LinearLayout
+        assertEquals(
+            "one page must bind one selectable text surface instead of one TextView per paragraph",
+            1,
+            column.childCount,
+        )
+        val pageText = (column.getChildAt(0) as SelectionAwareTextView).text.toString()
+        assertTrue(pageText.contains(paragraphs[0]))
+        assertTrue(pageText.contains(paragraphs[1]))
+        page.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(720, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(1280, android.view.View.MeasureSpec.EXACTLY),
+        )
+        page.layout(0, 0, 720, 1280)
+        assertTrue(
+            "composited text must stay inside the page geometry used by pagination",
+            column.height <= page.height - page.paddingTop - page.paddingBottom,
+        )
+    }
+
+    @Test
+    fun `paged composite selection maps across paragraph boundaries`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val first = "First paragraph starts with alpha and stays selectable."
+        val second = "Second paragraph ends with omega for the cross-boundary range."
+        val third = "Third paragraph keeps the page populated."
+        val source = listOf(first, second, third).joinToString("\n\n")
+        val file = kotlin.io.path.createTempFile(
+            prefix = "readflow-txt-composite-selection-",
+            suffix = ".txt",
+        ).toFile()
+        file.writeText(source, charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(720, 1280)
+        engine.setMode(ReadingMode.PAGED)
+
+        val page = engine.createPageView(0) as FrameLayout
+        val column = page.getChildAt(0) as LinearLayout
+        val textView = column.getChildAt(0) as SelectionAwareTextView
+        val visible = textView.text.toString()
+        val selectionStart = visible.indexOf("alpha")
+        val selectionEnd = visible.indexOf("omega") + "omega".length
+        assertTrue(selectionStart >= 0 && selectionEnd > selectionStart)
+        textView.onSelectionRangeChanged?.invoke(selectionStart, selectionEnd)
+
+        val selection = checkNotNull(engine.currentTextSelection.value)
+        val start = selection.start.strategy as LocatorStrategy.ByteOffset
+        val end = selection.end.strategy as LocatorStrategy.ByteOffset
+        val expectedStart = source.indexOf("alpha")
+        val expectedEnd = source.indexOf("omega") + "omega".length
+        assertEquals(expectedStart.toLong(), start.offset)
+        assertEquals(expectedEnd.toLong(), end.offset)
+        assertEquals(expectedEnd - expectedStart, start.length)
+        assertEquals(visible.substring(selectionStart, selectionEnd), selection.selectedText)
+    }
+
+    @Test
+    fun `paged mode splits one visually long paragraph without clipping content`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val source = "长段落内容".repeat(1_200)
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-long-page-", suffix = ".txt").toFile()
+        file.writeText(source, charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(420, 640)
+        engine.setMode(ReadingMode.PAGED)
+
+        assertTrue("a long visual paragraph must span multiple readable pages", engine.pageCount.value > 1)
+        engine.goTo(
+            Locator(
+                LocatorStrategy.Page(index = 1, total = engine.pageCount.value),
+            ),
+        )
+        val secondPageAnchor = engine.currentLocator.value.strategy as LocatorStrategy.ByteOffset
+        assertTrue("a later fragment must publish a paragraph-internal byte anchor", secondPageAnchor.offset > 0L)
+        assertEquals(
+            "the paragraph-internal anchor must map back to the same visual page",
+            1,
+            engine.pageIndexForLocator(engine.currentLocator.value),
+        )
+        val rendered = buildString {
+            repeat(engine.pageCount.value) { pageIndex ->
+                val page = engine.createPageView(pageIndex) as FrameLayout
+                val column = page.getChildAt(0) as LinearLayout
+                repeat(column.childCount) { childIndex ->
+                    append((column.getChildAt(childIndex) as TextView).text)
+                }
+                page.measure(
+                    android.view.View.MeasureSpec.makeMeasureSpec(420, android.view.View.MeasureSpec.EXACTLY),
+                    android.view.View.MeasureSpec.makeMeasureSpec(640, android.view.View.MeasureSpec.EXACTLY),
+                )
+                page.layout(0, 0, 420, 640)
+                assertTrue(
+                    "page $pageIndex content must fit inside the viewport",
+                    column.height <= page.height - page.paddingTop - page.paddingBottom,
+                )
+            }
+        }
+        assertEquals(source, rendered)
+    }
+
+    @Test
+    fun `paged to scroll preserves position inside one long paragraph`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val source = (0 until 80).joinToString("\n") { index ->
+            "Long line %03d anchors scroll.".format(index)
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-long-scroll-", suffix = ".txt").toFile()
+        file.writeText(source, charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(420, 640)
+        engine.setMode(ReadingMode.PAGED)
+        assertTrue("fixture must split the single paragraph", engine.pageCount.value > 4)
+
+        val targetPage = engine.pageCount.value / 2
+        engine.goTo(Locator(LocatorStrategy.Page(targetPage, engine.pageCount.value)))
+        val before = engine.currentLocator.value
+        val beforeOffset = (before.strategy as LocatorStrategy.ByteOffset).offset
+        assertTrue("fixture must use a paragraph-internal anchor", beforeOffset > 0L)
+
+        engine.setMode(ReadingMode.SCROLL)
+        val view = engine.createView() as RecyclerView
+        view.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(420, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(640, android.view.View.MeasureSpec.EXACTLY),
+        )
+        view.layout(0, 0, 420, 640)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(420, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(640, android.view.View.MeasureSpec.EXACTLY),
+        )
+        view.layout(0, 0, 420, 640)
+        engine.reportProgressionForTest(view)
+
+        val after = engine.currentLocator.value
+        val afterOffset = (after.strategy as LocatorStrategy.ByteOffset).offset
+        val holder = view.findViewHolderForAdapterPosition(0) as? TxtParagraphAdapter.ParagraphHolder
+        assertTrue(
+            "continuous row must not reset the middle-page anchor to byte zero; " +
+                "first=${(view.layoutManager as LinearLayoutManager).findFirstVisibleItemPosition()} " +
+                "rowTop=${holder?.itemView?.top} textTop=${holder?.textView?.top} " +
+                "padding=${holder?.textView?.totalPaddingTop} layoutHeight=${holder?.textView?.layout?.height}",
+            afterOffset > 0L,
+        )
+        assertEquals(before.totalProgression ?: 0f, after.totalProgression ?: 0f, 0.02f)
+        assertTrue(
+            "continuous anchor must remain near the paged fragment; before=$beforeOffset after=$afterOffset",
+            abs(afterOffset - beforeOffset) <= 512L,
+        )
+    }
+
+    @Test
+    fun `unchanged typography is a no-op in paged mode`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-noop-", suffix = ".txt").toFile()
+        file.writeText((0 until 20).joinToString("\n\n") { "段落 $it" })
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(420, 640)
+        engine.setMode(ReadingMode.PAGED)
+        val requests = mutableListOf<Int>()
+        engine.setPageRequestCallback(requests::add)
+
+        engine.setFontSize(ReaderTypographyRange.DEFAULT_FONT_SIZE.toFloat())
+        engine.setLineSpacing(ReaderTypographyRange.DEFAULT_LINE_SPACING)
+        engine.setFont("source_han")
+
+        assertTrue("no-op settings must not repaginate or move the visible page", requests.isEmpty())
+    }
+
+    @Test
+    fun `typography repagination preserves the visible page start instead of an inner locator`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication()
+            val source = (0 until 5_000).joinToString(" ") { index ->
+                "token%05d".format(index)
+            }
+            val file = kotlin.io.path.createTempFile(
+                prefix = "readflow-txt-typography-anchor-",
+                suffix = ".txt",
+            ).toFile()
+            file.writeText(source, charset = StandardCharsets.UTF_8)
+            val behaviorFailures = mutableListOf<String>()
+
+            suspend fun verifyChange(
+                label: String,
+                changeTypography: suspend (TxtVirtualPagerEngine) -> Unit,
+            ) {
+                val engine = TxtVirtualPagerEngine(context)
+                engine.setFontSize(12f)
+                engine.setLineSpacing(1f)
+                engine.openBook(Uri.fromFile(file))
+                engine.setViewportSize(420, 640)
+                engine.setMode(ReadingMode.PAGED)
+                shadowOf(Looper.getMainLooper()).idle()
+                assertTrue("$label fixture must span several pages", engine.pageCount.value > 4)
+
+                val targetPage = 2
+                engine.goTo(Locator(LocatorStrategy.Page(targetPage, engine.pageCount.value)))
+                shadowOf(Looper.getMainLooper()).idle()
+                val pageStartOffset =
+                    (engine.currentLocator.value.strategy as LocatorStrategy.ByteOffset).offset.toInt()
+                engine.goTo(Locator(LocatorStrategy.Page(targetPage + 1, engine.pageCount.value)))
+                shadowOf(Looper.getMainLooper()).idle()
+                val nextPageStartOffset =
+                    (engine.currentLocator.value.strategy as LocatorStrategy.ByteOffset).offset.toInt()
+                val innerOffset = pageStartOffset + (nextPageStartOffset - pageStartOffset) * 3 / 4
+                val visiblePageStart = Locator(
+                    LocatorStrategy.Section(spineIndex = 0, elementIndex = 0, charOffset = pageStartOffset),
+                )
+                val innerLocator = Locator(
+                    LocatorStrategy.Section(spineIndex = 0, elementIndex = 0, charOffset = innerOffset),
+                )
+                assertTrue(
+                    "$label fixture locator must be strictly inside the old visual page",
+                    innerOffset > pageStartOffset && innerOffset < nextPageStartOffset,
+                )
+                assertEquals(targetPage, engine.pageIndexForLocator(visiblePageStart))
+                assertEquals(targetPage, engine.pageIndexForLocator(innerLocator))
+                engine.goTo(innerLocator)
+                shadowOf(Looper.getMainLooper()).idle()
+
+                val requestedPages = mutableListOf<Int>()
+                engine.setPageRequestCallback(requestedPages::add)
+                changeTypography(engine)
+                shadowOf(Looper.getMainLooper()).idle()
+
+                val expectedPage = engine.pageIndexForLocator(visiblePageStart)
+                val promotedInnerPage = engine.pageIndexForLocator(innerLocator)
+                assertTrue(
+                    "$label fixture must distinguish the old page start from the inner locator after repagination",
+                    expectedPage != promotedInnerPage,
+                )
+                assertTrue("$label change must request a repaginated page", requestedPages.isNotEmpty())
+                val requestedPage = requestedPages.last()
+                val page = engine.createPageView(requestedPage) as FrameLayout
+                val column = page.getChildAt(0) as LinearLayout
+                val visibleText = buildString {
+                    repeat(column.childCount) { childIndex ->
+                        append((column.getChildAt(childIndex) as TextView).text)
+                    }
+                }
+                val oldPageStartPrefix = source.substring(
+                    pageStartOffset,
+                    (pageStartOffset + 48).coerceAtMost(source.length),
+                )
+                if (requestedPage != expectedPage) {
+                    behaviorFailures +=
+                        "$label page request expected=$expectedPage actual=$requestedPage " +
+                            "oldStart=(paragraph=0,charOffset=$pageStartOffset) innerCharOffset=$innerOffset"
+                }
+                if (!visibleText.startsWith(oldPageStartPrefix)) {
+                    behaviorFailures +=
+                        "$label requested page text must start at old visual page start " +
+                            "(paragraph=0,charOffset=$pageStartOffset); " +
+                            "expectedPrefix=${oldPageStartPrefix.take(32)} " +
+                            "actualPrefix=${visibleText.take(32)}"
+                }
+            }
+
+            verifyChange("font size") { it.setFontSize(24f) }
+            verifyChange("line spacing") { it.setLineSpacing(2f) }
+            assertTrue(
+                behaviorFailures.joinToString(separator = "\n"),
+                behaviorFailures.isEmpty(),
+            )
+        }
+
+    @Test
+    fun `cold paged open starts exactly at an initial locator inside a standard page`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication()
+            val source = (0 until 5_000).joinToString(" ") { index ->
+                "cold%05d".format(index)
+            }
+            val file = kotlin.io.path.createTempFile(
+                prefix = "readflow-txt-cold-inner-anchor-",
+                suffix = ".txt",
+            ).toFile()
+            file.writeText(source, charset = StandardCharsets.UTF_8)
+            val uri = Uri.fromFile(file)
+            val fontSizeSp = 12f
+            val lineSpacing = 1f
+            val viewportWidth = 420
+            val viewportHeight = 640
+
+            val baseline = TxtVirtualPagerEngine(context)
+            baseline.setFontSize(fontSizeSp)
+            baseline.setLineSpacing(lineSpacing)
+            baseline.setViewportSize(viewportWidth, viewportHeight)
+            baseline.openBook(uri)
+            baseline.setMode(ReadingMode.PAGED)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("fixture must produce several standard pages", baseline.pageCount.value > 4)
+
+            val targetPage = 2
+            baseline.goTo(Locator(LocatorStrategy.Page(targetPage, baseline.pageCount.value)))
+            val pageStart = baseline.currentLocator.value.strategy as LocatorStrategy.ByteOffset
+            baseline.goTo(Locator(LocatorStrategy.Page(targetPage + 1, baseline.pageCount.value)))
+            val nextPageStart = baseline.currentLocator.value.strategy as LocatorStrategy.ByteOffset
+            val innerOffset = pageStart.offset + (nextPageStart.offset - pageStart.offset) * 3 / 4
+            val innerLocator = Locator(
+                strategy = LocatorStrategy.ByteOffset(offset = innerOffset, length = 0),
+                totalProgression = innerOffset.toFloat() / source.length,
+            )
+            assertTrue(
+                "fixture locator must be strictly inside standard page $targetPage",
+                innerOffset > pageStart.offset && innerOffset < nextPageStart.offset,
+            )
+            assertEquals(targetPage, baseline.pageIndexForLocator(innerLocator))
+            baseline.close()
+
+            val cold = TxtVirtualPagerEngine(context)
+            val initialLocatorAware = (cold as Any) as? InitialLocatorAwareReaderEngine
+            assertNotNull(
+                "TXT engine must expose InitialLocatorAwareReaderEngine for exact cold-open restoration",
+                initialLocatorAware,
+            )
+            if (initialLocatorAware == null) return@runTest
+            initialLocatorAware.setInitialLocator(innerLocator)
+            cold.setFontSize(fontSizeSp)
+            cold.setLineSpacing(lineSpacing)
+            cold.setViewportSize(viewportWidth, viewportHeight)
+            cold.setMode(ReadingMode.PAGED)
+            val requestedPages = mutableListOf<Int>()
+            cold.setPageRequestCallback(requestedPages::add)
+
+            cold.openBook(uri)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue("cold PAGED open must request its first visible page", requestedPages.isNotEmpty())
+            val requestedPage = requestedPages.first()
+            val page = cold.createPageView(requestedPage) as FrameLayout
+            val column = page.getChildAt(0) as LinearLayout
+            val visibleText = buildString {
+                repeat(column.childCount) { childIndex ->
+                    append((column.getChildAt(childIndex) as TextView).text)
+                }
+            }
+            val expectedPrefix = source.substring(
+                innerOffset.toInt(),
+                (innerOffset.toInt() + 48).coerceAtMost(source.length),
+            )
+            assertTrue(
+                "first cold-open page must start exactly at byteOffset=$innerOffset; " +
+                    "expectedPrefix=${expectedPrefix.take(32)} actualPrefix=${visibleText.take(32)}",
+                visibleText.startsWith(expectedPrefix),
+            )
+            assertEquals(innerLocator.strategy, cold.currentLocator.value.strategy)
+            assertEquals(requestedPage, cold.pageIndexForLocator(cold.currentLocator.value))
+        }
+
+    @Test
+    fun `stale background pagination cannot restore paged mode after scroll wins`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication()
+            val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-stale-page-", suffix = ".txt")
+                .toFile()
+            val paragraphs = (0 until 40).map { "Queued paragraph $it remains readable." }
+            file.writeText(paragraphs.joinToString("\n\n"), StandardCharsets.UTF_8)
+            val paginationDispatcher = QueuedCoroutineDispatcher()
+            val engine = TxtVirtualPagerEngine(context, paginationDispatcher)
+            engine.openBook(Uri.fromFile(file))
+            engine.setViewportSize(420, 640)
+            val requests = mutableListOf<Int>()
+            engine.setPageRequestCallback(requests::add)
+
+            val paged = launch { engine.setMode(ReadingMode.PAGED) }
+            testScheduler.runCurrent()
+            assertTrue("pagination must be waiting on its background dispatcher", !paged.isCompleted)
+
+            engine.setMode(ReadingMode.SCROLL)
+            paginationDispatcher.runAll()
+            testScheduler.runCurrent()
+            paged.join()
+
+            assertEquals(PagingKind.CONTINUOUS, engine.pagingKind.value)
+            assertEquals(paragraphs.size, engine.pageCount.value)
+            assertTrue(requests.isEmpty())
+        }
+
+    @Test
+    fun `paged mode stays unpublished until pagination installs its windows`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val source = "Queued pagination must replace the temporary blank page."
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-queued-bind-", suffix = ".txt").toFile()
+        file.writeText(source, StandardCharsets.UTF_8)
+        val paginationDispatcher = QueuedCoroutineDispatcher()
+        val engine = TxtVirtualPagerEngine(context, paginationDispatcher)
+        engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(420, 640)
+
+        val paged = launch { engine.setMode(ReadingMode.PAGED) }
+        testScheduler.runCurrent()
+        assertTrue("pagination must still be queued", !paged.isCompleted)
+        assertEquals(
+            "a host must never observe PAGED while the windows are still being packed",
+            PagingKind.CONTINUOUS,
+            engine.pagingKind.value,
+        )
+        assertEquals("the previous continuous pageCount must stay published", 1, engine.pageCount.value)
+        val page = engine.createPageView(0) as FrameLayout
+        val column = page.getChildAt(0) as LinearLayout
+        assertEquals(0, column.childCount)
+
+        paginationDispatcher.runAll()
+        testScheduler.runCurrent()
+        paged.join()
+
+        assertEquals(PagingKind.PAGED, engine.pagingKind.value)
+        @Suppress("UNCHECKED_CAST")
+        val installedWindows = engine.privateField("pagedPageWindows") as List<*>
+        assertTrue(
+            "PAGED must only be published with an installed window set",
+            installedWindows.isNotEmpty(),
+        )
+        assertEquals(installedWindows.size, engine.pageCount.value)
+        assertEquals(1, engine.pageCount.value)
+        assertEquals(1, column.childCount)
+        assertEquals(source, (column.getChildAt(0) as TextView).text.toString())
     }
 
     @Test
@@ -825,6 +1301,50 @@ class TxtVirtualPagerEngineTest {
         }
 
     @Test
+    fun `cancelled viewport rebuild leaves the size retryable`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val lines = (0 until 48).map { index -> "Cancelled viewport paragraph %02d.".format(index) }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-cancel-viewport-", suffix = ".txt")
+            .toFile()
+        file.writeText(lines.joinToString("\n\n"), StandardCharsets.UTF_8)
+        val paginationDispatcher = QueuedCoroutineDispatcher()
+        val engine = TxtVirtualPagerEngine(context, paginationDispatcher)
+        engine.openBook(Uri.fromFile(file))
+        engine.setViewportSize(1080, 2400)
+
+        val enterPaged = launch { engine.setMode(ReadingMode.PAGED) }
+        testScheduler.runCurrent()
+        paginationDispatcher.runAll()
+        testScheduler.runCurrent()
+        enterPaged.join()
+        val largePageCount = engine.pageCount.value
+
+        val cancelledResize = launch { engine.setViewportSize(480, 700) }
+        testScheduler.runCurrent()
+        assertTrue("resize pagination must still be queued", !cancelledResize.isCompleted)
+        cancelledResize.cancel()
+        paginationDispatcher.runAll()
+        testScheduler.runCurrent()
+        cancelledResize.join()
+
+        assertEquals(1080, engine.privateField("viewportWidthPx") as Int)
+        assertEquals(2400, engine.privateField("viewportHeightPx") as Int)
+        assertEquals(largePageCount, engine.pageCount.value)
+
+        val retry = launch { engine.setViewportSize(480, 700) }
+        testScheduler.runCurrent()
+        assertTrue("same-size retry must schedule fresh pagination", !retry.isCompleted)
+        paginationDispatcher.runAll()
+        testScheduler.runCurrent()
+        retry.join()
+
+        assertEquals(480, engine.privateField("viewportWidthPx") as Int)
+        assertEquals(700, engine.privateField("viewportHeightPx") as Int)
+        assertTrue("retry must install the smaller-viewport packing", engine.pageCount.value != largePageCount)
+    }
+
+    @Test
     fun `setViewportSize rebinds active PAGED page content when pageCount stays equal`() =
         runTest(dispatcher) {
             Dispatchers.setMain(dispatcher)
@@ -840,7 +1360,8 @@ class TxtVirtualPagerEngineTest {
             val engine = TxtVirtualPagerEngine(context)
             engine.openBook(Uri.fromFile(file))
 
-            // Fixed typography; viewport heights derived from density so floor(linesPerPage) is exact.
+            // Fixed typography; choose two real measured heights that keep pageCount equal while
+            // changing page-0 grouping. This remains valid when font metrics or row padding change.
             val fontSizeSp = 16f
             val lineSpacing = 1.5f
             engine.setFontSize(fontSizeSp)
@@ -848,24 +1369,7 @@ class TxtVirtualPagerEngineTest {
             engine.setMode(ReadingMode.PAGED)
             shadowOf(Looper.getMainLooper()).idle()
 
-            val metrics = context.resources.displayMetrics
-            val density = metrics.density
-            // Match production: textSizePx = applyDimension(SP), lineHeight = textSize * spacing,
-            // contentHeight = height - 48*density, linesPerPage = floor(contentHeight / lineHeight).
-            val textSizePx = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSizeSp, metrics)
-            val lineHeightPx = (textSizePx * lineSpacing).coerceAtLeast(1f)
-            fun heightForLinesPerPage(targetLines: Int): Int {
-                // Half-line safety margin so integer floor yields exactly targetLines.
-                val contentHeightPx = (targetLines + 0.5f) * lineHeightPx
-                return (contentHeightPx + 48f * density).toInt().coerceAtLeast(1)
-            }
-            val heightA = heightForLinesPerPage(5)
-            val heightB = heightForLinesPerPage(7)
-            val expectedStartsA = listOf(0, 3, 6)
-            val expectedStartsB = listOf(0, 4, 8)
-            val expectedPageCount = 3
-
-            fun packAt(w: Int, h: Int): Pair<Int, List<Int>> {
+            suspend fun packAt(w: Int, h: Int): Pair<Int, List<Int>> {
                 engine.setViewportSize(w, h)
                 shadowOf(Looper.getMainLooper()).idle()
                 @Suppress("UNCHECKED_CAST")
@@ -873,45 +1377,37 @@ class TxtVirtualPagerEngineTest {
                 return engine.pageCount.value to starts
             }
 
-            val (countA, startsA) = packAt(720, heightA)
-            assertEquals(
-                "capacity-5 height must pack pageCount=3 (density=$density " +
-                    "hA=$heightA lineH=$lineHeightPx)",
-                expectedPageCount,
-                countA,
-            )
-            assertEquals(
-                "capacity-5 starts must be [0,3,6]",
-                expectedStartsA,
-                startsA,
-            )
-
-            val (countB, startsB) = packAt(720, heightB)
-            assertEquals(
-                "capacity-7 height must pack pageCount=3 (density=$density " +
-                    "hB=$heightB lineH=$lineHeightPx)",
-                expectedPageCount,
-                countB,
-            )
-            assertEquals(
-                "capacity-7 starts must be [0,4,8]",
-                expectedStartsB,
-                startsB,
-            )
-            assertTrue(
-                "equal pageCount with different packing is required for rebind path",
-                countA == countB && startsA != startsB,
-            )
+            val candidates = (140..720 step 4).map { height ->
+                val (count, starts) = packAt(720, height)
+                Triple(height, count, starts)
+            }
+            val selected = candidates.firstNotNullOfOrNull { left ->
+                candidates.firstOrNull { right ->
+                    right.first > left.first &&
+                        left.second > 1 && left.second == right.second && left.third != right.third
+                }?.let { right -> left to right }
+            }
+            assertNotNull("fixture must find equal-count viewports with different grouping", selected)
+            val (left, right) = requireNotNull(selected)
+            val heightA = left.first
+            val countA = left.second
+            val startsA = left.third
+            val heightB = right.first
+            val countB = right.second
+            val startsB = right.third
+            val expectedPageCount = countA
+            val expectedTagsA = (startsA.first() until startsA.getOrElse(1) { lines.size }).toList()
+            val expectedTagsB = (startsB.first() until startsB.getOrElse(1) { lines.size }).toList()
+            assertTrue(expectedTagsA != expectedTagsB)
 
             // Restore A, bind page 0, then switch to B without destroying the page view.
             packAt(720, heightA)
             val pageView = engine.createPageView(0) as FrameLayout
             val columnBefore = pageView.getChildAt(0) as android.widget.LinearLayout
-            val tagsBefore = (0 until columnBefore.childCount).map { i ->
-                columnBefore.getChildAt(i).tag as Int
-            }
+            assertEquals(1, columnBefore.childCount)
+            val textBefore = (columnBefore.getChildAt(0) as TextView).text.toString()
             val descBefore = pageView.contentDescription?.toString()
-            assertEquals(listOf(0, 1, 2), tagsBefore)
+            assertEquals(expectedTagsA.map(lines::get).joinToString("\n"), textBefore)
             assertEquals(
                 "第 1 页，共 $expectedPageCount 页",
                 descBefore,
@@ -927,20 +1423,19 @@ class TxtVirtualPagerEngineTest {
             )
             @Suppress("UNCHECKED_CAST")
             val startsAfter = engine.privateField("pagedParagraphStarts") as List<Int>
-            assertEquals(expectedStartsB, startsAfter)
+            assertEquals(startsB, startsAfter)
 
             val columnAfter = pageView.getChildAt(0) as android.widget.LinearLayout
-            val tagsAfter = (0 until columnAfter.childCount).map { i ->
-                columnAfter.getChildAt(i).tag as Int
-            }
+            assertEquals(1, columnAfter.childCount)
+            val textAfter = (columnAfter.getChildAt(0) as TextView).text.toString()
             assertEquals(
                 "active page paragraph grouping must match rebuilt packing even when pageCount unchanged",
-                listOf(0, 1, 2, 3),
-                tagsAfter,
+                expectedTagsB.map(lines::get).joinToString("\n"),
+                textAfter,
             )
             assertTrue(
                 "grouping must differ from pre-resize page-0 tags when packing changes",
-                tagsAfter != tagsBefore,
+                textAfter != textBefore,
             )
             assertEquals(
                 "contentDescription must refresh for current packing",
@@ -1055,4 +1550,16 @@ class TxtVirtualPagerEngineTest {
                     engine.currentLocator.value.strategy is LocatorStrategy.Section,
             )
         }
+}
+
+private class QueuedCoroutineDispatcher : CoroutineDispatcher() {
+    private val tasks = ArrayDeque<Runnable>()
+
+    override fun dispatch(context: CoroutineContext, block: Runnable) {
+        tasks.addLast(block)
+    }
+
+    fun runAll() {
+        while (tasks.isNotEmpty()) tasks.removeFirst().run()
+    }
 }
