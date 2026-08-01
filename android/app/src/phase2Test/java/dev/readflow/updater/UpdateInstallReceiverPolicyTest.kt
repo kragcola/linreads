@@ -39,4 +39,24 @@ class UpdateInstallReceiverPolicyTest {
             ),
         )
     }
+
+    @Test
+    fun `explicit retry replaces a stalled running or pending download`() {
+        assertEquals(
+            ReusableDownloadAction.ENQUEUE_NEW,
+            reusableDownloadAction(
+                downloadStatus = DownloadManager.STATUS_RUNNING,
+                hasDownloadedApk = false,
+                retryRequested = true,
+            ),
+        )
+        assertEquals(
+            ReusableDownloadAction.ENQUEUE_NEW,
+            reusableDownloadAction(
+                downloadStatus = DownloadManager.STATUS_PENDING,
+                hasDownloadedApk = false,
+                retryRequested = true,
+            ),
+        )
+    }
 }

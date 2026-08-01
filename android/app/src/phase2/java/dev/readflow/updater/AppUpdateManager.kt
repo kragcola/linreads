@@ -128,7 +128,6 @@ object AppUpdateManager {
                 putExtra(UPDATE_EXTRA_APK_URL, request.apkUrl)
                 putExtra(UPDATE_EXTRA_BUILD_TAG, request.buildTag)
                 request.versionCode?.let { putExtra(UPDATE_EXTRA_VERSION_CODE, it) }
-                putExtra(UPDATE_EXTRA_AUTH_TOKEN, request.authToken)
                 putExtra(UPDATE_EXTRA_AUTOMATIC, request.automatic)
             },
         )
@@ -145,15 +144,15 @@ object AppUpdateManager {
             versionCode = info.versionCode,
             currentVersionCode = BuildConfig.OTA_VERSION_CODE.toLong(),
         )
-        // A verified newer build is already downloading. A tap only retries/resumes it.
+        // Notification taps are explicit user retries, even when foreground detection started
+        // the download automatically. This lets a user replace a stalled app-owned task.
         val installIntent = PendingIntent.getBroadcast(
             ctx, 0,
             Intent(ctx, UpdateInstallReceiver::class.java).apply {
                 putExtra(UPDATE_EXTRA_APK_URL, info.apkUrl)
                 putExtra(UPDATE_EXTRA_BUILD_TAG, info.buildTag)
                 info.versionCode?.let { putExtra(UPDATE_EXTRA_VERSION_CODE, it) }
-                putExtra(UPDATE_EXTRA_AUTH_TOKEN, BuildConfig.GITHUB_OTA_TOKEN)
-                putExtra(UPDATE_EXTRA_AUTOMATIC, automaticDownloadStarted)
+                putExtra(UPDATE_EXTRA_AUTOMATIC, false)
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
