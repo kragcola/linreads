@@ -27,8 +27,8 @@ class UpdateDownloadPolicyTest {
     }
 
     @Test
-    fun `update authorization is limited to the github origin`() {
-        assertTrue(
+    fun `download manager never attaches the OTA token`() {
+        assertFalse(
             shouldAttachUpdateAuthorization(
                 "https://github.com/kragcola/linreads/releases/download/dev-latest/app.apk",
             ),
@@ -38,8 +38,8 @@ class UpdateDownloadPolicyTest {
     }
 
     @Test
-    fun `explicit update can retry its persisted identity but not a stale version`() {
-        assertTrue(
+    fun `explicit update rejects a known installed version even when its identity is persisted`() {
+        assertFalse(
             isExplicitUpdateRequestEligible(
                 versionCode = 100L,
                 currentVersionCode = 100L,
@@ -48,9 +48,9 @@ class UpdateDownloadPolicyTest {
         )
         assertFalse(
             isExplicitUpdateRequestEligible(
-                versionCode = 100L,
+                versionCode = 99L,
                 currentVersionCode = 100L,
-                reusesPersistedDownload = false,
+                reusesPersistedDownload = true,
             ),
         )
         assertTrue(
@@ -60,6 +60,31 @@ class UpdateDownloadPolicyTest {
                 reusesPersistedDownload = false,
             ),
         )
+        assertTrue(
+            isExplicitUpdateRequestEligible(
+                versionCode = null,
+                currentVersionCode = 100L,
+                reusesPersistedDownload = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `active installer ownership defers download replacement`() {
+        listOf(InstallStage.STAGING, InstallStage.COMMITTED, InstallStage.AWAITING_USER).forEach { stage ->
+            assertTrue(invokeShouldDeferUpdateReplacement(stage, ApkInstallBridgeState.NONE))
+        }
+        listOf(ApkInstallBridgeState.LAUNCHING, ApkInstallBridgeState.ACTIVE).forEach { bridgeState ->
+            assertTrue(invokeShouldDeferUpdateReplacement(null, bridgeState))
+        }
+        assertFalse(invokeShouldDeferUpdateReplacement(InstallStage.FAILED, ApkInstallBridgeState.NONE))
+        listOf(
+            ApkInstallBridgeState.DEFERRED,
+            ApkInstallBridgeState.DEFERRED_WITHOUT_NOTIFICATION,
+            ApkInstallBridgeState.FAILED,
+        ).forEach { bridgeState ->
+            assertFalse(invokeShouldDeferUpdateReplacement(null, bridgeState))
+        }
     }
 
     @Test
@@ -178,5 +203,20 @@ class UpdateDownloadPolicyTest {
                 nowEpochMs = 1L,
             ),
         )
+    }
+
+    private fun invokeShouldDeferUpdateReplacement(
+        installStage: InstallStage?,
+        bridgeState: ApkInstallBridgeState,
+    ): Boolean {
+        val method = runCatching {
+            Class.forName("dev.readflow.updater.UpdateDownloadPolicyKt").getDeclaredMethod(
+                "shouldDeferUpdateReplacement",
+                InstallStage::class.java,
+                ApkInstallBridgeState::class.java,
+            )
+        }.getOrNull()
+        assertTrue(method != null, "UpdateDownloadPolicy must define shouldDeferUpdateReplacement")
+        return requireNotNull(method).invoke(null, installStage, bridgeState) as Boolean
     }
 }
