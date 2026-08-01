@@ -4671,7 +4671,7 @@ internal class EpubFlowView(
             }
         }
         trimStablePageShotsToBudget()
-        continueQueuedTurnsOrPrecache()
+        if (!rapidTurnSequenceActive || queuedPageTurnDelta != 0) continueQueuedTurnsOrPrecache()
     }
 
     /**
