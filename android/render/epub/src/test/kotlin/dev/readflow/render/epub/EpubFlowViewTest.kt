@@ -1914,39 +1914,86 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `active page shot overlay skips parked text child draw`() {
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
-        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
-        val childDraws = RecordingBoundsTopDrawable()
-        view.textView.background = childDraws
-        view.goToPage(1)
+    fun `active slide keeps parked text draw warm while simulation suppresses it`() {
+        for (style in listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION)) {
+            val view = pagedFlowView(flipStyle = style)
+            assertTrue("style=$style pageCount=${view.pageCount()}", view.pageCount() > 2)
+            val skipContentDrawStates = mutableListOf<Boolean>()
+            val container = view.getChildAt(0)
+            val childDraws = RecordingBoundsTopDrawable {
+                skipContentDrawStates += container.reflectedField("skipContentDraw") as Boolean
+            }
+            view.textView.background = childDraws
+            view.goToPage(1)
 
-        view.drawToBitmapForTest().recycle()
-        val drawsBeforeTurn = childDraws.boundsTops.size
-        assertTrue("baseline draw must visit the parked TextView", drawsBeforeTurn > 0)
+            view.drawToBitmapForTest().recycle()
+            val drawsBeforeTurn = childDraws.boundsTops.size
+            assertTrue("style=$style baseline draw must visit the parked TextView", drawsBeforeTurn > 0)
+
+            try {
+                assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+                // A cold direct start may capture the live outgoing/target pages before installing the
+                // renderer. Start the overdraw window after that setup work has completed.
+                val drawsAfterRendererStart = childDraws.boundsTops.size
+                skipContentDrawStates.clear()
+                view.drawToBitmapForTest().recycle()
+                if (style == PageFlipStyle.SLIDE) {
+                    assertTrue(
+                        "the opaque SLIDE View must keep the parked TextView RenderNode warm",
+                        childDraws.boundsTops.size > drawsAfterRendererStart,
+                    )
+                    assertTrue(
+                        "SLIDE dispatchDraw must leave skipContentDraw false while visiting the live page; " +
+                            "states=$skipContentDrawStates",
+                        skipContentDrawStates.isNotEmpty() && skipContentDrawStates.none { it },
+                    )
+                } else {
+                    assertEquals(
+                        "SIMULATION must keep suppressing image and text draws beneath its translucent curl",
+                        drawsAfterRendererStart,
+                        childDraws.boundsTops.size,
+                    )
+                    assertTrue(
+                        "a suppressed SIMULATION child must not receive a draw callback",
+                        skipContentDrawStates.isEmpty(),
+                    )
+                }
+            } finally {
+                view.endInteractiveCurl(velocityX = 0f)
+                shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
+    fun `slide teardown keeps the parked text RenderNode warm`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
 
         try {
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
-            // A cold direct start may capture the live outgoing/target pages before installing the
-            // overlay. Start the overdraw window after that setup work has completed.
-            val drawsAfterOverlayStart = childDraws.boundsTops.size
-            view.drawToBitmapForTest().recycle()
-            assertEquals(
-                "cached page-shot overlay must not repaint image/text spans beneath it",
-                drawsAfterOverlayStart,
-                childDraws.boundsTops.size,
+            assertNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val textShadow = shadowOf(view.textView)
+            textShadow.clearWasInvalidated()
+
+            view.clearFlipOverlayForTest()
+
+            assertNull(view.privateField("slideDrawable"))
+            assertFalse(
+                "removing an opaque SLIDE View must not dirty the already warm TextView RenderNode",
+                textShadow.wasInvalidated(),
             )
         } finally {
-            view.endInteractiveCurl(velocityX = 0f)
-            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            if (view.privateField("slideDrawable") != null) view.clearFlipOverlayForTest()
             view.dispose()
         }
     }
 
     @Test
-    fun `active page shot overlay covers live synthetic boundary image until cleared`() {
+    fun `active simulation page shot overlay covers live synthetic boundary image until cleared`() {
         val fixture = visibleHeadingImageContinuationFixture()
         val view = fixture.view
+        view.flipStyle = PageFlipStyle.SIMULATION
         val baselineImageColor = fixture.imageDrawable.color
         val liveSyntheticColor = 0xFF16A34A.toInt()
         val overlayColor = 0xFF3B82F6.toInt()
@@ -1972,7 +2019,7 @@ class EpubFlowViewTest {
             val revealed = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).apply {
                 eraseColor(0xFF1E3A8A.toInt())
             }
-            val slide = PageSlideDrawable(
+            val curl = PageCurlDrawable(
                 front,
                 revealed,
                 view.width,
@@ -1983,8 +2030,8 @@ class EpubFlowViewTest {
                 progress = 0f
                 setBounds(0, view.scrollY, view.width, view.scrollY + view.height)
             }
-            view.overlay.add(slide)
-            view.setPrivateField("slideDrawable", slide)
+            view.overlay.add(curl)
+            view.setPrivateField("curlDrawable", curl)
 
             fixture.imageDrawable.color = liveSyntheticColor
             view.textView.invalidate()
@@ -2013,7 +2060,7 @@ class EpubFlowViewTest {
             textShadow.clearWasInvalidated()
             view.clearFlipOverlayForTest()
             shadowOf(Looper.getMainLooper()).idle()
-            assertNull(view.privateField("slideDrawable"))
+            assertNull(view.privateField("curlDrawable"))
             assertTrue(
                 "overlay teardown must invalidate the container so the live page replaces the page shot",
                 containerShadow.wasInvalidated(),
@@ -2034,7 +2081,7 @@ class EpubFlowViewTest {
                 settledFrame.recycle()
             }
         } finally {
-            if (view.privateField("slideDrawable") != null) view.clearFlipOverlayForTest()
+            if (view.privateField("curlDrawable") != null) view.clearFlipOverlayForTest()
             view.dispose()
             shadowOf(Looper.getMainLooper()).idle()
         }
@@ -13533,10 +13580,13 @@ class EpubFlowViewTest {
         override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
     }
 
-    private class RecordingBoundsTopDrawable : Drawable() {
+    private class RecordingBoundsTopDrawable(
+        private val beforeDraw: (() -> Unit)? = null,
+    ) : Drawable() {
         val boundsTops = mutableListOf<Int>()
 
         override fun draw(canvas: Canvas) {
+            beforeDraw?.invoke()
             boundsTops += bounds.top
         }
 
