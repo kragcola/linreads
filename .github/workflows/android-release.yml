@@ -7,6 +7,12 @@ on:
       - "android/**"
       - ".github/workflows/android-release.yml"
   workflow_dispatch:
+    inputs:
+      publish_ota:
+        description: "Publish the verified APKs to dev-latest"
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: android-dev-release-${{ github.ref }}
@@ -111,7 +117,19 @@ jobs:
         working-directory: android
         run: ./gradlew -Preadflow.phase=2 :updater-helper:assembleOta :app:assembleOta
 
+      - name: Upload unpublished OTA candidates
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish_ota }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-ota-candidate-${{ steps.build_identity.outputs.version_code }}
+          path: |
+            android/app/build/outputs/apk/ota/app-ota.apk
+            android/updater-helper/build/outputs/apk/ota/updater-helper-ota.apk
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Publish verified dev-latest release
+        if: ${{ github.event_name == 'push' || inputs.publish_ota }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

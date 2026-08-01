@@ -116,6 +116,117 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `interactive slide keeps drawable ownership but renders through a distinct overlay view`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+
+        try {
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val renderer = view.requireActiveSlideRendererView()
+
+            assertFalse("the slide renderer must be distinct from the live page", renderer === view.getChildAt(0))
+            assertFalse("the slide renderer must be distinct from the selectable text", renderer === view.textView)
+            assertNotNull("the active slide renderer must be attached through the View overlay", renderer.parent)
+            assertNull(
+                "PageSlideDrawable must remain the bitmap owner without invalidating the Compose host overlay",
+                slide.callback,
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `interactive slide progress moves only the renderer by mirrored page width geometry`() {
+        val progress = 0.375f
+        for (forward in listOf(true, false)) {
+            val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+            try {
+                assertTrue("direction forward=$forward needs adjacent pages", view.pageCount() > 2)
+                if (!forward) view.goToPage(1)
+                val anchorX = if (forward) view.width.toFloat() else 0f
+                assertTrue(view.beginInteractiveCurl(forward = forward, anchorX = anchorX))
+                val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+                val renderer = view.requireActiveSlideRendererView()
+                val livePage = view.getChildAt(0)
+                val front = slide.privateBitmap("frontBitmap")
+                val revealed = slide.privateBitmap("revealedBitmap")
+                val initialFrame = intArrayOf(renderer.left, renderer.top, renderer.right, renderer.bottom)
+                val initialTranslationY = renderer.translationY
+
+                assertEquals(0f, renderer.translationX, 0.001f)
+                assertNull("progress must not route Drawable invalidation into the host overlay", slide.callback)
+
+                val x = if (forward) view.width * (1f - progress) else view.width * progress
+                view.updateInteractiveCurl(x)
+
+                val expectedTranslation = (if (forward) -1f else 1f) * progress * view.width
+                assertEquals(progress, slide.progress, 0.001f)
+                assertEquals(expectedTranslation, renderer.translationX, 0.001f)
+                assertEquals(initialTranslationY, renderer.translationY, 0.001f)
+                assertTrue(
+                    "progress must not relayout the recorded page pair",
+                    initialFrame.contentEquals(
+                        intArrayOf(renderer.left, renderer.top, renderer.right, renderer.bottom),
+                    ),
+                )
+                assertEquals(0f, livePage.translationX, 0.001f)
+                assertEquals(0f, livePage.translationY, 0.001f)
+                assertSame("progress must retain the outgoing bitmap identity", front, slide.privateBitmap("frontBitmap"))
+                assertSame(
+                    "progress must retain the revealed bitmap identity",
+                    revealed,
+                    slide.privateBitmap("revealedBitmap"),
+                )
+                assertFalse(front.isRecycled)
+                assertFalse(revealed.isRecycled)
+            } finally {
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
+    fun `slide settle and cancel detach renderer after transferring bitmap ownership`() {
+        for (commit in listOf(true, false)) {
+            val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+            try {
+                assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+                val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+                val renderer = view.requireActiveSlideRendererView()
+                val front = slide.privateBitmap("frontBitmap")
+                val revealed = slide.privateBitmap("revealedBitmap")
+
+                view.updateInteractiveCurl(x = view.width * if (commit) 0.10f else 0.98f)
+                view.endInteractiveCurl(velocityX = 0f)
+                val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+                assertNotNull("commit=$commit requires a settle animator", animator)
+                animator!!.end()
+
+                assertTrue(
+                    "commit=$commit must clear the active slide View field",
+                    view.activeSlideRendererViews().isEmpty(),
+                )
+                assertNull("commit=$commit must detach the slide View from its overlay", renderer.parent)
+                assertNull("commit=$commit must clear the drawable field", view.privateField("slideDrawable"))
+                assertNull("commit=$commit must release the outgoing reference", slide.reflectedField("frontBitmap"))
+                assertNull("commit=$commit must release the revealed reference", slide.reflectedField("revealedBitmap"))
+                assertFalse("commit=$commit must preserve the outgoing page shot", front.isRecycled)
+                assertFalse("commit=$commit must preserve the revealed page shot", revealed.isRecycled)
+                if (commit) {
+                    assertSame(revealed, view.privateField("cachedFrontBitmap"))
+                    assertSame(front, view.privateField("cachedBackwardBitmap"))
+                } else {
+                    assertSame(front, view.privateField("cachedFrontBitmap"))
+                    assertSame(revealed, view.privateField("cachedRevealedBitmap"))
+                }
+            } finally {
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
     fun `release inside the directional threshold restores the exact free rest viewport`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -13313,6 +13424,29 @@ class EpubFlowViewTest {
         javaClass.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this)
+
+    private fun EpubFlowView.activeSlideRendererViews(): List<View> {
+        val livePage = getChildAt(0)
+        return javaClass.declaredFields.asSequence()
+            .filter { View::class.java.isAssignableFrom(it.type) }
+            .mapNotNull { field ->
+                field.isAccessible = true
+                field.get(this) as? View
+            }
+            .filterNot { candidate -> candidate === livePage || candidate === textView }
+            .distinct()
+            .toList()
+    }
+
+    private fun EpubFlowView.requireActiveSlideRendererView(): View {
+        val candidates = activeSlideRendererViews()
+        assertEquals(
+            "an active SLIDE turn must retain exactly one dedicated View renderer; candidates=$candidates",
+            1,
+            candidates.size,
+        )
+        return candidates.single()
+    }
 
     private fun Any.reflectedField(name: String): Any? =
         javaClass.getDeclaredField(name)
