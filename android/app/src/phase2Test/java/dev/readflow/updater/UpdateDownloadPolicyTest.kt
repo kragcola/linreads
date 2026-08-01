@@ -83,8 +83,32 @@ class UpdateDownloadPolicyTest {
             ApkInstallBridgeState.DEFERRED_WITHOUT_NOTIFICATION,
             ApkInstallBridgeState.FAILED,
         ).forEach { bridgeState ->
-            assertFalse(invokeShouldDeferUpdateReplacement(null, bridgeState))
+            listOf(null, InstallStage.COMMITTED, InstallStage.AWAITING_USER).forEach { stage ->
+                assertFalse(invokeShouldDeferUpdateReplacement(stage, bridgeState))
+            }
         }
+    }
+
+    @Test
+    fun `replacement activates only after metadata commit while installer stays replaceable`() {
+        assertTrue(
+            invokeShouldActivateEnqueuedUpdate(
+                metadataCommitted = true,
+                replacementDeferredAfterEnqueue = false,
+            ),
+        )
+        assertFalse(
+            invokeShouldActivateEnqueuedUpdate(
+                metadataCommitted = false,
+                replacementDeferredAfterEnqueue = false,
+            ),
+        )
+        assertFalse(
+            invokeShouldActivateEnqueuedUpdate(
+                metadataCommitted = true,
+                replacementDeferredAfterEnqueue = true,
+            ),
+        )
     }
 
     @Test
@@ -218,5 +242,24 @@ class UpdateDownloadPolicyTest {
         }.getOrNull()
         assertTrue(method != null, "UpdateDownloadPolicy must define shouldDeferUpdateReplacement")
         return requireNotNull(method).invoke(null, installStage, bridgeState) as Boolean
+    }
+
+    private fun invokeShouldActivateEnqueuedUpdate(
+        metadataCommitted: Boolean,
+        replacementDeferredAfterEnqueue: Boolean,
+    ): Boolean {
+        val method = runCatching {
+            Class.forName("dev.readflow.updater.UpdateDownloadPolicyKt").getDeclaredMethod(
+                "shouldActivateEnqueuedUpdate",
+                Boolean::class.javaPrimitiveType!!,
+                Boolean::class.javaPrimitiveType!!,
+            )
+        }.getOrNull()
+        assertTrue(method != null, "UpdateDownloadPolicy must define shouldActivateEnqueuedUpdate")
+        return requireNotNull(method).invoke(
+            null,
+            metadataCommitted,
+            replacementDeferredAfterEnqueue,
+        ) as Boolean
     }
 }
