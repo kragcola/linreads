@@ -38,6 +38,7 @@ import dev.readflow.features.settings.SettingsScreen
 import dev.readflow.features.settings.SettingsViewModel
 import dev.readflow.updater.AppUpdateManager
 import dev.readflow.updater.ForegroundUpdateCheckGate
+import dev.readflow.updater.requestExplicitUpdateDownload
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -130,8 +131,15 @@ fun ReadflowApp(
                 SettingsScreen(
                     onBack = { navController.popBackStack() },
                     onCheckForUpdate = { AppUpdateManager.checkForUpdate(context) },
+                    onStartUpdateDownload = { update ->
+                        requestExplicitUpdateDownload(
+                            context = context,
+                            apkUrl = update.apkUrl,
+                            buildTag = update.buildTag,
+                            versionCode = update.versionCode,
+                        )
+                    },
                     cachedNotes = AppUpdateManager.getCachedNotes(context),
-                    authToken = dev.readflow.BuildConfig.GITHUB_OTA_TOKEN,
                     buildTag = dev.readflow.BuildConfig.BUILD_TAG,
                 )
             }

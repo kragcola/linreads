@@ -79,8 +79,8 @@ import org.koin.androidx.compose.koinViewModel
 fun SettingsScreen(
     onBack: () -> Unit,
     onCheckForUpdate: suspend (Context) -> UpdatePackageInfo? = { null },
+    onStartUpdateDownload: (UpdatePackageInfo) -> Long? = { null },
     cachedNotes: String = "",
-    authToken: String = "",
     buildTag: String = "",
 ) {
     val vm = koinViewModel<SettingsViewModel>()
@@ -105,8 +105,13 @@ fun SettingsScreen(
     var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
     var pendingUpdateDownload by remember { mutableStateOf<UpdateState.Available?>(null) }
     fun startUpdateDownload(update: UpdateState.Available) {
-        val dlId = context.startFreshDownload(update.packageInfo)
-        updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
+        val result = runCatching { onStartUpdateDownload(update.packageInfo) }
+        val dlId = result.getOrNull()
+        updateState = when {
+            result.isFailure -> UpdateState.Error("无法启动更新下载，请检查网络后重试")
+            dlId == null -> UpdateState.Error("已有更新正在安装，请完成或退出安装后重试")
+            else -> UpdateState.Downloading(progress = -1f, dlId = dlId)
+        }
     }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -1240,52 +1245,6 @@ private fun ConnectionResultText(title: String, detail: String, isError: Boolean
             )
         }
     }
-}
-
-/**
- * Always start a fresh download — GitHub release URL never changes between builds
- * so we cannot rely on URL comparison for version detection.
- * Clears the previous download identity before starting a new one.
- * The completed APK is retained after launching the installer so a cancelled or misrouted install
- * can be retried. Replacement downloads use a separate file so they cannot invalidate an installer
- * that is still reading the previous DownloadManager URI.
- */
-private fun Context.startFreshDownload(update: UpdatePackageInfo): Long {
-    applyUpdateArtifactEvent(UpdateArtifactEvent.ReplacedByNewDownload)
-    val metadata = updateDownloadMetadata(update)
-    val prefs = getSharedPreferences("update", Context.MODE_PRIVATE)
-    val dm = getSystemService(DownloadManager::class.java)
-
-    val dlId = dm.enqueue(
-        DownloadManager.Request(Uri.parse(metadata.apkUrl)).apply {
-            setTitle("LinReads 更新下载中")
-            setDescription("正在下载新版本…")
-            setMimeType("application/vnd.android.package-archive")
-            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            setDestinationInExternalFilesDir(
-                this@startFreshDownload,
-                null,
-                createUpdateDownloadFileName(),
-            )
-        }
-    )
-    val editor = prefs.edit()
-        .putLong("dl_id", dlId)
-        .putString("dl_url", metadata.apkUrl)
-        .putString("dl_tag", metadata.buildTag)
-        .putString("dl_backend", "download_manager")
-        .remove("dl_state")
-        .remove("dl_started_at")
-        .remove("dl_apk_path")
-        .remove("dl_bytes")
-        .remove("dl_total")
-    if (metadata.versionCode == null) {
-        editor.remove("dl_version_code")
-    } else {
-        editor.putLong("dl_version_code", metadata.versionCode)
-    }
-    editor.apply()
-    return dlId
 }
 
 private fun Context.applyUpdateArtifactEvent(event: UpdateArtifactEvent) {

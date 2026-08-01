@@ -49,14 +49,25 @@ internal fun isExplicitUpdateRequestEligible(
 internal fun shouldDeferUpdateReplacement(
     installStage: InstallStage?,
     bridgeState: ApkInstallBridgeState,
-): Boolean = installStage in setOf(
-    InstallStage.STAGING,
-    InstallStage.COMMITTED,
-    InstallStage.AWAITING_USER,
-) || bridgeState in setOf(
+): Boolean = when (bridgeState) {
     ApkInstallBridgeState.LAUNCHING,
     ApkInstallBridgeState.ACTIVE,
-)
+    -> true
+    ApkInstallBridgeState.DEFERRED,
+    ApkInstallBridgeState.DEFERRED_WITHOUT_NOTIFICATION,
+    ApkInstallBridgeState.FAILED,
+    -> false
+    ApkInstallBridgeState.NONE -> installStage in setOf(
+        InstallStage.STAGING,
+        InstallStage.COMMITTED,
+        InstallStage.AWAITING_USER,
+    )
+}
+
+internal fun shouldActivateEnqueuedUpdate(
+    metadataCommitted: Boolean,
+    replacementDeferredAfterEnqueue: Boolean,
+): Boolean = metadataCommitted && !replacementDeferredAfterEnqueue
 
 internal enum class AppOwnedDownloadAction {
     STAGE_EXISTING,

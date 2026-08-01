@@ -291,6 +291,7 @@ internal object UpdatePackageInstaller {
         val previousDownloadId: Long
         synchronized(lock) {
             val prefs = appContext.installPreferences()
+            if (prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) return false
             previousDownloadId = prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD)
             val currentStage = prefs.installStage()
             if (
@@ -308,16 +309,19 @@ internal object UpdatePackageInstaller {
             if (action == InstallEnqueueAction.KEEP_EXISTING) return true
 
             previousSessionId = prefs.getInt(KEY_INSTALL_SESSION_ID, NO_SESSION)
-            prefs.edit()
+            val expectedVersion = prefs.getLong(KEY_DOWNLOAD_VERSION_CODE, -1L).takeIf { it > 0L }
+            val editor = prefs.edit()
                 .putLong(KEY_INSTALL_DOWNLOAD_ID, downloadId)
                 .putString(KEY_INSTALL_STAGE, InstallStage.STAGING.name)
                 .remove(KEY_INSTALL_SESSION_ID)
+                .remove(KEY_INSTALL_EXPECTED_VERSION_CODE)
                 .remove(KEY_INSTALL_ERROR)
                 .remove(KEY_INSTALL_BRIDGE_STATE)
                 .remove(KEY_INSTALL_BRIDGE_TASK_ID)
                 .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
                 .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
-                .apply()
+            expectedVersion?.let { editor.putLong(KEY_INSTALL_EXPECTED_VERSION_CODE, it) }
+            editor.apply()
         }
 
         if (previousDownloadId != NO_DOWNLOAD && previousDownloadId != downloadId) {
@@ -365,7 +369,7 @@ internal object UpdatePackageInstaller {
     fun expectedVersionForCurrentSession(context: Context): Long? = synchronized(lock) {
         val prefs = context.installPreferences()
         if (prefs.getInt(KEY_INSTALL_SESSION_ID, NO_SESSION) == NO_SESSION) return@synchronized null
-        prefs.getLong(KEY_DOWNLOAD_VERSION_CODE, -1L).takeIf { it > 0L }
+        prefs.getLong(KEY_INSTALL_EXPECTED_VERSION_CODE, -1L).takeIf { it > 0L }
     }
 
     fun commitSession(context: Context, sessionId: Int, statusSender: IntentSender): Boolean {
@@ -405,6 +409,7 @@ internal object UpdatePackageInstaller {
             prefs.edit()
                 .remove(KEY_INSTALL_DOWNLOAD_ID)
                 .remove(KEY_INSTALL_SESSION_ID)
+                .remove(KEY_INSTALL_EXPECTED_VERSION_CODE)
                 .remove(KEY_INSTALL_STAGE)
                 .remove(KEY_INSTALL_ERROR)
                 .remove(KEY_INSTALL_BRIDGE_STATE)
@@ -423,6 +428,7 @@ internal object UpdatePackageInstaller {
             prefs.edit()
                 .remove(KEY_INSTALL_DOWNLOAD_ID)
                 .remove(KEY_INSTALL_SESSION_ID)
+                .remove(KEY_INSTALL_EXPECTED_VERSION_CODE)
                 .remove(KEY_INSTALL_STAGE)
                 .remove(KEY_INSTALL_ERROR)
                 .remove(KEY_INSTALL_BRIDGE_STATE)
@@ -438,6 +444,71 @@ internal object UpdatePackageInstaller {
         runCatching {
             appContext.getSystemService(NotificationManager::class.java).cancel(INSTALL_NOTIFICATION_ID)
         }
+    }
+
+    fun activateDownloadReplacement(
+        context: Context,
+        downloadId: Long,
+        apkUrl: String,
+        buildTag: String?,
+        versionCode: Long?,
+    ): Boolean {
+        val appContext = context.applicationContext
+        var previousInstallDownloadId = NO_DOWNLOAD
+        var previousSessionId = NO_SESSION
+        val activated = synchronized(lock) {
+            val prefs = appContext.installPreferences()
+            val replacementDeferred = shouldDeferUpdateReplacement(
+                installStage = prefs.installStage(),
+                bridgeState = prefs.installBridgeState(),
+            )
+            if (replacementDeferred) return@synchronized false
+
+            previousInstallDownloadId = prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD)
+            previousSessionId = prefs.getInt(KEY_INSTALL_SESSION_ID, NO_SESSION)
+            val editor = prefs.edit()
+                .putLong(KEY_DOWNLOAD_ID, downloadId)
+                .putString(KEY_DOWNLOAD_URL, apkUrl)
+                .putString(KEY_DOWNLOAD_TAG, buildTag)
+                .putString(KEY_DOWNLOAD_BACKEND, DOWNLOAD_BACKEND_DOWNLOAD_MANAGER)
+                .remove(KEY_DOWNLOAD_STATE)
+                .remove(KEY_DOWNLOAD_STARTED_AT)
+                .remove(KEY_DOWNLOAD_APK_PATH)
+                .remove(KEY_DOWNLOAD_BYTES)
+                .remove(KEY_DOWNLOAD_TOTAL)
+                .remove(KEY_UNKNOWN_SOURCES_PERMISSION_PENDING)
+                .remove(KEY_POST_INSTALL_ARMED_TAG)
+                .remove(KEY_INSTALL_DOWNLOAD_ID)
+                .remove(KEY_INSTALL_SESSION_ID)
+                .remove(KEY_INSTALL_EXPECTED_VERSION_CODE)
+                .remove(KEY_INSTALL_STAGE)
+                .remove(KEY_INSTALL_ERROR)
+                .remove(KEY_INSTALL_BRIDGE_STATE)
+                .remove(KEY_INSTALL_BRIDGE_TASK_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_PROCESS_ID)
+                .remove(KEY_INSTALL_BRIDGE_CLAIM_ELAPSED_MS)
+            if (versionCode == null) {
+                editor.remove(KEY_DOWNLOAD_VERSION_CODE)
+            } else {
+                editor.putLong(KEY_DOWNLOAD_VERSION_CODE, versionCode)
+            }
+            shouldActivateEnqueuedUpdate(
+                metadataCommitted = editor.commit(),
+                replacementDeferredAfterEnqueue = replacementDeferred,
+            )
+        }
+        if (!activated) return false
+
+        if (previousInstallDownloadId != NO_DOWNLOAD) {
+            WorkManager.getInstance(appContext).cancelUniqueWork(workName(previousInstallDownloadId))
+        }
+        if (previousSessionId != NO_SESSION) {
+            runCatching { appContext.packageManager.packageInstaller.abandonSession(previousSessionId) }
+        }
+        runCatching {
+            appContext.getSystemService(NotificationManager::class.java).cancel(INSTALL_NOTIFICATION_ID)
+        }
+        return true
     }
 
     fun recordSession(context: Context, downloadId: Long, sessionId: Int) {
@@ -1243,8 +1314,20 @@ private fun workName(downloadId: Long) = "linreads-update-install-$downloadId"
 private class InstallSupersededException : Exception()
 
 private const val UPDATE_PREFS_NAME = "update"
+private const val KEY_DOWNLOAD_ID = "dl_id"
+private const val KEY_DOWNLOAD_URL = "dl_url"
+private const val KEY_DOWNLOAD_TAG = "dl_tag"
+private const val KEY_DOWNLOAD_BACKEND = "dl_backend"
+private const val KEY_DOWNLOAD_STATE = "dl_state"
+private const val KEY_DOWNLOAD_STARTED_AT = "dl_started_at"
+private const val KEY_DOWNLOAD_APK_PATH = "dl_apk_path"
+private const val KEY_DOWNLOAD_BYTES = "dl_bytes"
+private const val KEY_DOWNLOAD_TOTAL = "dl_total"
+private const val KEY_UNKNOWN_SOURCES_PERMISSION_PENDING = "unknown_sources_permission_pending"
+private const val KEY_POST_INSTALL_ARMED_TAG = "post_install_armed_tag"
 private const val KEY_INSTALL_DOWNLOAD_ID = "install_dl_id"
 private const val KEY_INSTALL_SESSION_ID = "install_session_id"
+private const val KEY_INSTALL_EXPECTED_VERSION_CODE = "install_expected_version_code"
 private const val KEY_INSTALL_STAGE = "install_stage"
 private const val KEY_INSTALL_ERROR = "install_error"
 private const val KEY_INSTALL_BRIDGE_STATE = "install_bridge_state"

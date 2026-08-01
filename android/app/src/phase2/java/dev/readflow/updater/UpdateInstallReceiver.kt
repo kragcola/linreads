@@ -163,12 +163,12 @@ private fun enqueueDownloadManagerUpdate(
     apkUrl: String,
     buildTag: String?,
     versionCode: Long?,
-): Long = synchronized(UPDATE_DOWNLOAD_STATE_LOCK) {
+): Long? = synchronized(UPDATE_DOWNLOAD_STATE_LOCK) {
     val appContext = context.applicationContext
     val prefs = appContext.updatePreferences()
     val oldId = prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD)
     val oldBackend = prefs.getString(KEY_DOWNLOAD_BACKEND, null)
-    if (shouldDeferCurrentInstallReplacement(appContext)) return@synchronized oldId
+    if (shouldDeferCurrentInstallReplacement(appContext)) return@synchronized null
 
     val request = DownloadManager.Request(Uri.parse(apkUrl)).apply {
         setTitle("LinReads 更新下载中")
@@ -179,9 +179,17 @@ private fun enqueueDownloadManagerUpdate(
     }
     val downloadManager = appContext.getSystemService(DownloadManager::class.java)
     val downloadId = downloadManager.enqueue(request)
-    if (shouldDeferCurrentInstallReplacement(appContext)) {
+    if (
+        !UpdatePackageInstaller.activateDownloadReplacement(
+            context = appContext,
+            downloadId = downloadId,
+            apkUrl = apkUrl,
+            buildTag = buildTag,
+            versionCode = versionCode,
+        )
+    ) {
         runCatching { downloadManager.remove(downloadId) }
-        return@synchronized oldId
+        return@synchronized null
     }
     if (oldId != NO_DOWNLOAD) {
         if (isAppOwnedDownloadBackend(oldBackend)) {
@@ -189,26 +197,31 @@ private fun enqueueDownloadManagerUpdate(
         } else {
             runCatching { downloadManager.remove(oldId) }
         }
-        UpdatePackageInstaller.clearRecordedInstall(appContext)
     }
-    val editor = prefs.edit()
-        .putLong(KEY_DOWNLOAD_ID, downloadId)
-        .putString(KEY_DOWNLOAD_URL, apkUrl)
-        .putString(KEY_DOWNLOAD_TAG, buildTag)
-        .putString(KEY_DOWNLOAD_BACKEND, DOWNLOAD_BACKEND_DOWNLOAD_MANAGER)
-        .remove(KEY_DOWNLOAD_STATE)
-        .remove(KEY_DOWNLOAD_STARTED_AT)
-        .remove(KEY_DOWNLOAD_APK_PATH)
-        .remove(KEY_DOWNLOAD_BYTES)
-        .remove(KEY_DOWNLOAD_TOTAL)
-        .remove(KEY_UNKNOWN_SOURCES_PERMISSION_PENDING)
-    if (versionCode == null) {
-        editor.remove(KEY_DOWNLOAD_VERSION_CODE)
-    } else {
-        editor.putLong(KEY_DOWNLOAD_VERSION_CODE, versionCode)
-    }
-    editor.commit()
     downloadId
+}
+
+internal fun requestExplicitUpdateDownload(
+    context: Context,
+    apkUrl: String,
+    buildTag: String?,
+    versionCode: Long?,
+): Long? = synchronized(UPDATE_DOWNLOAD_LOCK) {
+    if (
+        !isExplicitUpdateRequestEligible(
+            versionCode = versionCode,
+            currentVersionCode = BuildConfig.OTA_VERSION_CODE.toLong(),
+            reusesPersistedDownload = false,
+        )
+    ) {
+        return@synchronized null
+    }
+    enqueueDownloadManagerUpdate(
+        context = context.applicationContext,
+        apkUrl = apkUrl,
+        buildTag = buildTag,
+        versionCode = versionCode,
+    )
 }
 
 /** Handles automatic update starts, explicit retry taps, and DownloadManager completion. */
