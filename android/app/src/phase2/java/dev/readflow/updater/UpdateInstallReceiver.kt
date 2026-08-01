@@ -99,38 +99,43 @@ internal fun resumePendingUpdateOnForeground(context: Context) {
                 stageDownloadedUpdate(appContext, downloadId, apkUri)
                 return
             }
-            restartPersistedAppDownload(appContext, prefs, retryRequested = true)
+            restartPersistedAppDownload(appContext, prefs)
             return
         }
         DownloadWorkState.RUNNING -> {
-            restartPersistedAppDownload(appContext, prefs, retryRequested = true)
+            restartPersistedAppDownload(appContext, prefs)
             return
         }
         DownloadWorkState.FAILED -> {
-            restartPersistedAppDownload(appContext, prefs, retryRequested = true)
+            restartPersistedAppDownload(appContext, prefs)
             return
         }
         DownloadWorkState.NONE -> Unit
     }
 
     if (isAppOwnedDownloadBackend(prefs.getString(KEY_DOWNLOAD_BACKEND, null))) {
-        restartPersistedAppDownload(appContext, prefs, retryRequested = true)
+        restartPersistedAppDownload(appContext, prefs)
         return
     }
 
     val apkUri = appContext.getSystemService(DownloadManager::class.java)
         .getUriForDownloadedFile(downloadId)
         ?: return
-    if (UpdatePackageInstaller.resumeAwaitingInstallerOnForeground(appContext, downloadId, apkUri)) {
-        return
+    synchronized(UPDATE_DOWNLOAD_STATE_LOCK) {
+        if (shouldDeferCurrentInstallReplacement(appContext, downloadId)) return
+        if (
+            UpdatePackageInstaller.isCurrentDownload(appContext, downloadId) &&
+                UpdatePackageInstaller.resumeAwaitingInstallerOnForeground(appContext, downloadId, apkUri)
+        ) {
+            return
+        }
+        UpdatePackageInstaller.requestInstall(appContext, downloadId, apkUri)
     }
-    UpdatePackageInstaller.requestInstall(appContext, downloadId, apkUri)
 }
 
 private fun restartPersistedAppDownload(
     context: Context,
     prefs: android.content.SharedPreferences,
-    retryRequested: Boolean,
 ) {
     val apkUrl = prefs.getString(KEY_DOWNLOAD_URL, null) ?: return
     enqueueDownloadManagerUpdate(
@@ -138,7 +143,18 @@ private fun restartPersistedAppDownload(
         apkUrl = apkUrl,
         buildTag = prefs.getString(KEY_DOWNLOAD_TAG, null),
         versionCode = prefs.optionalVersionCode(KEY_DOWNLOAD_VERSION_CODE),
-        retryRequested = retryRequested,
+    )
+}
+
+private fun shouldDeferCurrentInstallReplacement(
+    context: Context,
+    requestedDownloadId: Long? = null,
+): Boolean {
+    val installDownloadId = UpdatePackageInstaller.currentDownloadId(context)
+    if (installDownloadId == NO_DOWNLOAD || installDownloadId == requestedDownloadId) return false
+    return shouldDeferUpdateReplacement(
+        installStage = UpdatePackageInstaller.stageForDownload(context, installDownloadId),
+        bridgeState = UpdatePackageInstaller.bridgeStateForDownload(context, installDownloadId),
     )
 }
 
@@ -147,33 +163,34 @@ private fun enqueueDownloadManagerUpdate(
     apkUrl: String,
     buildTag: String?,
     versionCode: Long?,
-    retryRequested: Boolean,
 ): Long = synchronized(UPDATE_DOWNLOAD_STATE_LOCK) {
     val appContext = context.applicationContext
     val prefs = appContext.updatePreferences()
     val oldId = prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD)
     val oldBackend = prefs.getString(KEY_DOWNLOAD_BACKEND, null)
-    if (oldId != NO_DOWNLOAD) {
-        if (isAppOwnedDownloadBackend(oldBackend)) {
-            clearDownloadedUpdateArtifact(appContext, oldId)
-        } else if (retryRequested) {
-            runCatching { appContext.getSystemService(DownloadManager::class.java).remove(oldId) }
-        }
-        UpdatePackageInstaller.clearRecordedInstall(appContext)
-    }
+    if (shouldDeferCurrentInstallReplacement(appContext)) return@synchronized oldId
 
     val request = DownloadManager.Request(Uri.parse(apkUrl)).apply {
-        val token = BuildConfig.GITHUB_OTA_TOKEN
-        if (token.isNotBlank() && shouldAttachUpdateAuthorization(apkUrl)) {
-            addRequestHeader("Authorization", "Bearer $token")
-        }
         setTitle("LinReads 更新下载中")
         setDescription("正在下载新版本…")
         setMimeType("application/vnd.android.package-archive")
         setNotificationVisibility(automaticDownloadNotificationVisibility())
         setDestinationInExternalFilesDir(appContext, null, createUpdateDownloadFileName())
     }
-    val downloadId = appContext.getSystemService(DownloadManager::class.java).enqueue(request)
+    val downloadManager = appContext.getSystemService(DownloadManager::class.java)
+    val downloadId = downloadManager.enqueue(request)
+    if (shouldDeferCurrentInstallReplacement(appContext)) {
+        runCatching { downloadManager.remove(downloadId) }
+        return@synchronized oldId
+    }
+    if (oldId != NO_DOWNLOAD) {
+        if (isAppOwnedDownloadBackend(oldBackend)) {
+            clearDownloadedUpdateArtifact(appContext, oldId)
+        } else {
+            runCatching { downloadManager.remove(oldId) }
+        }
+        UpdatePackageInstaller.clearRecordedInstall(appContext)
+    }
     val editor = prefs.edit()
         .putLong(KEY_DOWNLOAD_ID, downloadId)
         .putString(KEY_DOWNLOAD_URL, apkUrl)
@@ -287,7 +304,6 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                     apkUrl = apkUrl,
                     buildTag = buildTag,
                     versionCode = versionCode,
-                    retryRequested = true,
                 )
                 return
             }
@@ -298,7 +314,6 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                     apkUrl = apkUrl,
                     buildTag = buildTag,
                     versionCode = versionCode,
-                    retryRequested = true,
                 )
                 return
             }
@@ -328,10 +343,8 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                         return
                     }
                     ReusableDownloadAction.KEEP_EXISTING -> return
-                    ReusableDownloadAction.ENQUEUE_NEW -> if (status != null) dm.remove(prevId)
+                    ReusableDownloadAction.ENQUEUE_NEW -> Unit
                 }
-            } else {
-                dm.remove(prevId)
             }
         }
 
@@ -340,7 +353,6 @@ class UpdateInstallReceiver : BroadcastReceiver() {
             apkUrl = apkUrl,
             buildTag = buildTag,
             versionCode = versionCode,
-            retryRequested = retryRequested,
         )
     }
 
@@ -428,11 +440,13 @@ internal fun stageDownloadedUpdate(
     downloadId: Long,
     apkUri: Uri,
     retryRequested: Boolean = false,
-) {
+): Unit = synchronized(UPDATE_DOWNLOAD_STATE_LOCK) {
+    // Installation ownership and download replacement must change under the same lock.
     if (!isPersistedUpdateInstallable(context, downloadId)) {
         discardPersistedUpdate(context, downloadId)
-        return
+        return@synchronized
     }
+    if (shouldDeferCurrentInstallReplacement(context, downloadId)) return@synchronized
     when (completedUpdateAction(context.packageManager.canRequestPackageInstalls())) {
         CompletedUpdateAction.STAGE_INSTALL -> {
             UpdatePackageInstaller.requestInstall(context, downloadId, apkUri, retryRequested)

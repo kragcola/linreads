@@ -105,7 +105,7 @@ fun SettingsScreen(
     var updateState by remember { mutableStateOf<UpdateState>(UpdateState.Idle) }
     var pendingUpdateDownload by remember { mutableStateOf<UpdateState.Available?>(null) }
     fun startUpdateDownload(update: UpdateState.Available) {
-        val dlId = context.startFreshDownload(update.packageInfo, authToken)
+        val dlId = context.startFreshDownload(update.packageInfo)
         updateState = UpdateState.Downloading(progress = -1f, dlId = dlId)
     }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -1250,7 +1250,7 @@ private fun ConnectionResultText(title: String, detail: String, isError: Boolean
  * can be retried. Replacement downloads use a separate file so they cannot invalidate an installer
  * that is still reading the previous DownloadManager URI.
  */
-private fun Context.startFreshDownload(update: UpdatePackageInfo, authToken: String): Long {
+private fun Context.startFreshDownload(update: UpdatePackageInfo): Long {
     applyUpdateArtifactEvent(UpdateArtifactEvent.ReplacedByNewDownload)
     val metadata = updateDownloadMetadata(update)
     val prefs = getSharedPreferences("update", Context.MODE_PRIVATE)
@@ -1258,14 +1258,6 @@ private fun Context.startFreshDownload(update: UpdatePackageInfo, authToken: Str
 
     val dlId = dm.enqueue(
         DownloadManager.Request(Uri.parse(metadata.apkUrl)).apply {
-            val parsedUrl = Uri.parse(metadata.apkUrl)
-            if (
-                authToken.isNotEmpty() &&
-                    parsedUrl.scheme.equals("https", ignoreCase = true) &&
-                    parsedUrl.host.equals("github.com", ignoreCase = true)
-            ) {
-                addRequestHeader("Authorization", "Bearer $authToken")
-            }
             setTitle("LinReads 更新下载中")
             setDescription("正在下载新版本…")
             setMimeType("application/vnd.android.package-archive")

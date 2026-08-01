@@ -16,12 +16,9 @@ internal fun persistedDownloadBackend(value: String?): PersistedDownloadBackend 
     else -> PersistedDownloadBackend.LEGACY
 }
 
-internal fun shouldAttachUpdateAuthorization(url: String): Boolean = runCatching {
-    URI(url).let { uri ->
-        uri.scheme.equals("https", ignoreCase = true) &&
-            uri.host.equals("github.com", ignoreCase = true)
-    }
-}.getOrDefault(false)
+internal fun shouldAttachUpdateAuthorization(
+    @Suppress("UNUSED_PARAMETER") url: String,
+): Boolean = false
 
 internal enum class DownloadWriteMode {
     APPEND,
@@ -42,11 +39,24 @@ internal fun isAppOwnedDownloadBackend(backend: String?): Boolean =
 internal fun shouldHandleDownloadManagerCompletion(backend: String?): Boolean =
     !isAppOwnedDownloadBackend(backend)
 
+@Suppress("UNUSED_PARAMETER")
 internal fun isExplicitUpdateRequestEligible(
     versionCode: Long?,
     currentVersionCode: Long,
     reusesPersistedDownload: Boolean,
-): Boolean = reusesPersistedDownload || versionCode == null || versionCode > currentVersionCode
+): Boolean = versionCode == null || versionCode > currentVersionCode
+
+internal fun shouldDeferUpdateReplacement(
+    installStage: InstallStage?,
+    bridgeState: ApkInstallBridgeState,
+): Boolean = installStage in setOf(
+    InstallStage.STAGING,
+    InstallStage.COMMITTED,
+    InstallStage.AWAITING_USER,
+) || bridgeState in setOf(
+    ApkInstallBridgeState.LAUNCHING,
+    ApkInstallBridgeState.ACTIVE,
+)
 
 internal enum class AppOwnedDownloadAction {
     STAGE_EXISTING,

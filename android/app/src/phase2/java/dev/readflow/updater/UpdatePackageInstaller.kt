@@ -293,6 +293,12 @@ internal object UpdatePackageInstaller {
             val prefs = appContext.installPreferences()
             previousDownloadId = prefs.getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD)
             val currentStage = prefs.installStage()
+            if (
+                previousDownloadId != downloadId &&
+                    shouldDeferUpdateReplacement(currentStage, prefs.installBridgeState())
+            ) {
+                return true
+            }
             val action = installEnqueueAction(
                 currentDownloadId = previousDownloadId,
                 currentStage = currentStage,
@@ -486,6 +492,10 @@ internal object UpdatePackageInstaller {
 
     fun isCurrentDownload(context: Context, downloadId: Long): Boolean =
         context.installPreferences().getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD) == downloadId
+
+    fun currentDownloadId(context: Context): Long = synchronized(lock) {
+        context.installPreferences().getLong(KEY_INSTALL_DOWNLOAD_ID, NO_DOWNLOAD)
+    }
 
     fun stageForDownload(context: Context, downloadId: Long): InstallStage? {
         val prefs = context.installPreferences()
