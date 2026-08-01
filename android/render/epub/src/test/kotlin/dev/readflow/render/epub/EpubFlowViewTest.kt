@@ -227,6 +227,114 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `low budget slide settle keeps detached display list bitmaps leased through two host frames`() {
+        val oneMotionShotBytes = (360L / 4L) * (120L / 4L) * 2L
+        val budget = PageShotBudget(oneMotionShotBytes)
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            pageShotBudget = budget,
+        )
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
+        view.recycleCachedTexturesForTest()
+
+        try {
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val renderer = view.requireActiveSlideRendererView()
+            val front = slide.privateBitmap("frontBitmap")
+            val revealed = slide.privateBitmap("revealedBitmap")
+            view.drawToBitmapForTest().recycle()
+            val leasedWhileRecorded = budget.leasedBytes
+            val chargedWhileRecorded = budget.chargedBytes
+            assertEquals(oneMotionShotBytes * 2L, leasedWhileRecorded)
+
+            view.updateInteractiveCurl(x = view.width * 0.10f)
+            view.endInteractiveCurl(velocityX = 0f)
+            val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+            assertNotNull("the committed turn must enter visual settle", animator)
+            animator!!.end()
+
+            val stableCacheBitmaps = listOfNotNull(
+                view.privateField("cachedFrontBitmap") as Bitmap?,
+                view.privateField("cachedRevealedBitmap") as Bitmap?,
+                view.privateField("cachedBackwardBitmap") as Bitmap?,
+            )
+            assertNull("settle must detach the renderer before its frame barriers begin", renderer.parent)
+            assertSame("the revealed shot must become the stable current-page cache", revealed, view.privateField("cachedFrontBitmap"))
+            assertTrue(
+                "low-budget trim must remove the outgoing shot from stable cache ownership",
+                stableCacheBitmaps.none { it === front },
+            )
+            assertFalse("the detached outgoing display-list bitmap must survive before frame one", front.isRecycled)
+            assertFalse("the stable revealed display-list bitmap must survive before frame one", revealed.isRecycled)
+            assertEquals(leasedWhileRecorded, budget.leasedBytes)
+            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            assertFalse("the outgoing bitmap must remain protected after only one host frame", front.isRecycled)
+            assertFalse("the stable revealed bitmap must remain protected after only one host frame", revealed.isRecycled)
+            assertEquals(leasedWhileRecorded, budget.leasedBytes)
+            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            assertTrue("the trimmed outgoing bitmap may recycle only after frame two", front.isRecycled)
+            assertFalse("frame barriers must not recycle a bitmap still owned by the stable cache", revealed.isRecycled)
+            assertSame(revealed, view.privateField("cachedFrontBitmap"))
+            assertEquals(revealed.allocationByteCount.toLong(), budget.leasedBytes)
+            assertEquals(revealed.allocationByteCount.toLong(), budget.chargedBytes)
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `disposing an active slide defers display list bitmap release through two host frames`() {
+        val budget = PageShotBudget(48L * 1024L * 1024L)
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            pageShotBudget = budget,
+        )
+        view.recycleCachedTexturesForTest()
+
+        assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+        val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+        val renderer = view.requireActiveSlideRendererView()
+        val front = slide.privateBitmap("frontBitmap")
+        val revealed = slide.privateBitmap("revealedBitmap")
+        view.drawToBitmapForTest().recycle()
+        val leasedWhileRecorded = budget.leasedBytes
+        val chargedWhileRecorded = budget.chargedBytes
+        val recordedBytes = front.allocationByteCount.toLong() + revealed.allocationByteCount.toLong()
+        assertEquals(recordedBytes, leasedWhileRecorded)
+        assertEquals(recordedBytes, chargedWhileRecorded)
+
+        view.dispose()
+
+        assertNull("dispose must detach the renderer before its frame barriers begin", renderer.parent)
+        assertFalse("dispose must not recycle the recorded outgoing bitmap before frame one", front.isRecycled)
+        assertFalse("dispose must not recycle the recorded revealed bitmap before frame one", revealed.isRecycled)
+        assertEquals(leasedWhileRecorded, budget.leasedBytes)
+        assertEquals(chargedWhileRecorded, budget.chargedBytes)
+
+        shadowOf(Looper.getMainLooper()).runOneTask()
+
+        assertFalse("dispose must keep the outgoing bitmap protected after one host frame", front.isRecycled)
+        assertFalse("dispose must keep the revealed bitmap protected after one host frame", revealed.isRecycled)
+        assertEquals(leasedWhileRecorded, budget.leasedBytes)
+        assertEquals(chargedWhileRecorded, budget.chargedBytes)
+
+        shadowOf(Looper.getMainLooper()).runOneTask()
+
+        assertTrue("dispose may recycle the outgoing bitmap only after frame two", front.isRecycled)
+        assertTrue("dispose may recycle the revealed bitmap only after frame two", revealed.isRecycled)
+        assertEquals(0L, budget.leasedBytes)
+        assertEquals(0L, budget.chargedBytes)
+    }
+
+    @Test
     fun `release inside the directional threshold restores the exact free rest viewport`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
