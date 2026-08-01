@@ -1,6 +1,6 @@
 # Active Work
 
-_最后更新：2026-07-31_
+_最后更新：2026-08-01_
 
 Mode: `acceptance-hold`
 Objective: 验收 Android TXT/Markdown/PDF 跨格式对齐与 CBZ Stage 1；验收结论前冻结产品代码
@@ -23,6 +23,13 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 - 用户已明确要求：本轮交接后禁止本机构建，关闭本地 Android 构建/测试/assemble 相关工具使用，只允许 GitHub Actions / 云端构建产出 APK、test APK、R8/minification 与全量回归证据。
 - 后续代理可继续做 ADB 真机诊断、安装已验真云端产物、读取日志、导出 UI XML、采集包状态/签名/帧时文本指标和静态源码审查；不得再运行 `./gradlew` 生成或测试 Android 本地产物。
 - 本记录不授权清理真机数据、不授权读取/附带截图；主代理仍只消费文本、JSON、哈希、日志和证据路径。
+
+### 100319 发布与真机收口（2026-08-01）
+
+- 云端发布已完成：GitHub Actions workflow `30698541661` 全量 regression、R8、app/helper OTA 与资产验真均通过；Release 为 `dev-latest`，`VERSION_CODE=100319`，`BUILD_TAG=dev-100319-f99afc956ed42da45e1f53c09dd4a5c043418830`。app SHA-256 为 `ba0cacd4ea51b0fa10c125f727c03a788fcac0c911a11eee3afcbe617e2b6f7b`，helper SHA-256 为 `3367d8e540ce2caf37a3acec2300e18f33223e1666ec5b76805645cbf2f0b223`；两包 `unzip -t`、AAPT2 `versionCode=100319` 验证通过。
+- Huawei `BKY-W20`（`3FYBB24C06201100`，Android 12）已用保数据覆盖安装 app/helper `100319`；主包与 helper 的 `firstInstallTime` 均保持不变，未卸载、未清除数据。安装后从书架进入《86-不存在的战区- 10 - 安里アサト》，UI XML 确认阅读节点恢复到“幼态延续：断章〈誓言〉”，正文存在 4 个图片占位；没有“笔记”或“保存”操作层残留（`保存` 的唯一命中属于书籍正文语料）。聚焦任务栈为 `dev.readflow/.MainActivity`，无 FATAL、ANR、OOM 或 recycled bitmap 日志。
+- 图片章节连续快翻终验：`P95=32ms`、`P99=46ms`、slow bitmap uploads=`0`；视觉代理基于 4 张代表帧确认连续页面位移、无硬切、无空白、无松手内容消失、无跨页图片丢失、无两页画质不一致。原始录屏与文本化证据保留在 `.evidence/page-shot-100318-20260801/`，主代理未读取或附带截图。
+- 自动更新仍有一个独立未收口点：前台检查曾创建 DownloadManager 任务 `151` 并显示“LinReads 新版本下载中”，但约 15 分钟未生成 `update-*.apk`，设备仍停留在 `100318`。本轮以已验真的云端 APK 做 ADB 保数据覆盖安装完成升级；安装后 `content://downloads/my_downloads` 无残留记录，通知与任务栈均已清理。该兜底证明包与数据链路可用，但不宣称 DownloadManager 自动下载/自动安装链路已重新验收。
 
 ### OTA 授权记录（2026-07-30）
 
