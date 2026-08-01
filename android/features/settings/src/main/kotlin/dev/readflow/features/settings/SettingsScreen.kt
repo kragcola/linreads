@@ -1258,7 +1258,14 @@ private fun Context.startFreshDownload(update: UpdatePackageInfo, authToken: Str
 
     val dlId = dm.enqueue(
         DownloadManager.Request(Uri.parse(metadata.apkUrl)).apply {
-            if (authToken.isNotEmpty()) addRequestHeader("Authorization", "Bearer $authToken")
+            val parsedUrl = Uri.parse(metadata.apkUrl)
+            if (
+                authToken.isNotEmpty() &&
+                    parsedUrl.scheme.equals("https", ignoreCase = true) &&
+                    parsedUrl.host.equals("github.com", ignoreCase = true)
+            ) {
+                addRequestHeader("Authorization", "Bearer $authToken")
+            }
             setTitle("LinReads 更新下载中")
             setDescription("正在下载新版本…")
             setMimeType("application/vnd.android.package-archive")
@@ -1274,6 +1281,12 @@ private fun Context.startFreshDownload(update: UpdatePackageInfo, authToken: Str
         .putLong("dl_id", dlId)
         .putString("dl_url", metadata.apkUrl)
         .putString("dl_tag", metadata.buildTag)
+        .putString("dl_backend", "download_manager")
+        .remove("dl_state")
+        .remove("dl_started_at")
+        .remove("dl_apk_path")
+        .remove("dl_bytes")
+        .remove("dl_total")
     if (metadata.versionCode == null) {
         editor.remove("dl_version_code")
     } else {
@@ -1297,6 +1310,12 @@ private fun Context.applyUpdateArtifactEvent(event: UpdateArtifactEvent) {
             .remove("dl_url")
             .remove("dl_tag")
             .remove("dl_version_code")
+            .remove("dl_backend")
+            .remove("dl_state")
+            .remove("dl_started_at")
+            .remove("dl_apk_path")
+            .remove("dl_bytes")
+            .remove("dl_total")
             .apply()
     }
 }

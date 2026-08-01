@@ -7,6 +7,62 @@ import org.junit.jupiter.api.Test
 
 class UpdateDownloadPolicyTest {
     @Test
+    fun `system download manager is distinct from legacy app owned transport`() {
+        assertTrue(isAppOwnedDownloadBackend(DOWNLOAD_BACKEND_APP_HTTP))
+        assertFalse(isAppOwnedDownloadBackend(DOWNLOAD_BACKEND_DOWNLOAD_MANAGER))
+        assertFalse(isAppOwnedDownloadBackend(null))
+        assertFalse(shouldHandleDownloadManagerCompletion(DOWNLOAD_BACKEND_APP_HTTP))
+        assertTrue(shouldHandleDownloadManagerCompletion(DOWNLOAD_BACKEND_DOWNLOAD_MANAGER))
+        assertTrue(shouldHandleDownloadManagerCompletion(null))
+    }
+
+    @Test
+    fun `persisted backend mapping treats missing marker as legacy`() {
+        assertEquals(PersistedDownloadBackend.APP_HTTP, persistedDownloadBackend(DOWNLOAD_BACKEND_APP_HTTP))
+        assertEquals(
+            PersistedDownloadBackend.DOWNLOAD_MANAGER,
+            persistedDownloadBackend(DOWNLOAD_BACKEND_DOWNLOAD_MANAGER),
+        )
+        assertEquals(PersistedDownloadBackend.LEGACY, persistedDownloadBackend(null))
+    }
+
+    @Test
+    fun `update authorization is limited to the github origin`() {
+        assertTrue(
+            shouldAttachUpdateAuthorization(
+                "https://github.com/kragcola/linreads/releases/download/dev-latest/app.apk",
+            ),
+        )
+        assertFalse(shouldAttachUpdateAuthorization("http://github.com/kragcola/linreads/app.apk"))
+        assertFalse(shouldAttachUpdateAuthorization("https://example.com/app.apk"))
+    }
+
+    @Test
+    fun `explicit update can retry its persisted identity but not a stale version`() {
+        assertTrue(
+            isExplicitUpdateRequestEligible(
+                versionCode = 100L,
+                currentVersionCode = 100L,
+                reusesPersistedDownload = true,
+            ),
+        )
+        assertFalse(
+            isExplicitUpdateRequestEligible(
+                versionCode = 100L,
+                currentVersionCode = 100L,
+                reusesPersistedDownload = false,
+            ),
+        )
+        assertTrue(
+            isExplicitUpdateRequestEligible(
+                versionCode = 101L,
+                currentVersionCode = 100L,
+                reusesPersistedDownload = false,
+            ),
+        )
+    }
+
+    @Test
     fun `completed app-owned download stages only when its artifact is present`() {
         assertEquals(
             AppOwnedDownloadAction.STAGE_EXISTING,
@@ -109,6 +165,17 @@ class UpdateDownloadPolicyTest {
                 state = DownloadWorkState.RUNNING,
                 startedAtEpochMs = 1_000L,
                 nowEpochMs = 121_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun `failed app owned download is eligible for foreground migration`() {
+        assertTrue(
+            shouldRetryStaleDownload(
+                state = DownloadWorkState.FAILED,
+                startedAtEpochMs = 0L,
+                nowEpochMs = 1L,
             ),
         )
     }

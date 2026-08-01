@@ -2,6 +2,27 @@ package dev.readflow.updater
 
 import java.net.URI
 
+internal const val DOWNLOAD_BACKEND_DOWNLOAD_MANAGER = "download_manager"
+
+internal enum class PersistedDownloadBackend {
+    LEGACY,
+    DOWNLOAD_MANAGER,
+    APP_HTTP,
+}
+
+internal fun persistedDownloadBackend(value: String?): PersistedDownloadBackend = when (value) {
+    DOWNLOAD_BACKEND_DOWNLOAD_MANAGER -> PersistedDownloadBackend.DOWNLOAD_MANAGER
+    DOWNLOAD_BACKEND_APP_HTTP -> PersistedDownloadBackend.APP_HTTP
+    else -> PersistedDownloadBackend.LEGACY
+}
+
+internal fun shouldAttachUpdateAuthorization(url: String): Boolean = runCatching {
+    URI(url).let { uri ->
+        uri.scheme.equals("https", ignoreCase = true) &&
+            uri.host.equals("github.com", ignoreCase = true)
+    }
+}.getOrDefault(false)
+
 internal enum class DownloadWriteMode {
     APPEND,
     RESTART,
@@ -14,6 +35,18 @@ internal enum class DownloadWorkState {
     COMPLETE,
     FAILED,
 }
+
+internal fun isAppOwnedDownloadBackend(backend: String?): Boolean =
+    backend == DOWNLOAD_BACKEND_APP_HTTP
+
+internal fun shouldHandleDownloadManagerCompletion(backend: String?): Boolean =
+    !isAppOwnedDownloadBackend(backend)
+
+internal fun isExplicitUpdateRequestEligible(
+    versionCode: Long?,
+    currentVersionCode: Long,
+    reusesPersistedDownload: Boolean,
+): Boolean = reusesPersistedDownload || versionCode == null || versionCode > currentVersionCode
 
 internal enum class AppOwnedDownloadAction {
     STAGE_EXISTING,

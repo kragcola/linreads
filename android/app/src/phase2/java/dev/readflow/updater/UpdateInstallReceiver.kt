@@ -19,6 +19,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import dev.readflow.BuildConfig
 import dev.readflow.MainActivity
+import dev.readflow.features.settings.createUpdateDownloadFileName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -102,13 +103,19 @@ internal fun resumePendingUpdateOnForeground(context: Context) {
             return
         }
         DownloadWorkState.RUNNING -> {
-            if (appOwnedDownloadIsStale(appContext, downloadId)) {
-                restartPersistedAppDownload(appContext, prefs, retryRequested = true)
-            }
+            restartPersistedAppDownload(appContext, prefs, retryRequested = true)
             return
         }
-        DownloadWorkState.FAILED -> return
+        DownloadWorkState.FAILED -> {
+            restartPersistedAppDownload(appContext, prefs, retryRequested = true)
+            return
+        }
         DownloadWorkState.NONE -> Unit
+    }
+
+    if (isAppOwnedDownloadBackend(prefs.getString(KEY_DOWNLOAD_BACKEND, null))) {
+        restartPersistedAppDownload(appContext, prefs, retryRequested = true)
+        return
     }
 
     val apkUri = appContext.getSystemService(DownloadManager::class.java)
@@ -126,13 +133,65 @@ private fun restartPersistedAppDownload(
     retryRequested: Boolean,
 ) {
     val apkUrl = prefs.getString(KEY_DOWNLOAD_URL, null) ?: return
-    enqueueAppOwnedUpdate(
+    enqueueDownloadManagerUpdate(
         context = context,
         apkUrl = apkUrl,
         buildTag = prefs.getString(KEY_DOWNLOAD_TAG, null),
         versionCode = prefs.optionalVersionCode(KEY_DOWNLOAD_VERSION_CODE),
         retryRequested = retryRequested,
     )
+}
+
+private fun enqueueDownloadManagerUpdate(
+    context: Context,
+    apkUrl: String,
+    buildTag: String?,
+    versionCode: Long?,
+    retryRequested: Boolean,
+): Long = synchronized(UPDATE_DOWNLOAD_STATE_LOCK) {
+    val appContext = context.applicationContext
+    val prefs = appContext.updatePreferences()
+    val oldId = prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD)
+    val oldBackend = prefs.getString(KEY_DOWNLOAD_BACKEND, null)
+    if (oldId != NO_DOWNLOAD) {
+        if (isAppOwnedDownloadBackend(oldBackend)) {
+            clearDownloadedUpdateArtifact(appContext, oldId)
+        } else if (retryRequested) {
+            runCatching { appContext.getSystemService(DownloadManager::class.java).remove(oldId) }
+        }
+        UpdatePackageInstaller.clearRecordedInstall(appContext)
+    }
+
+    val request = DownloadManager.Request(Uri.parse(apkUrl)).apply {
+        val token = BuildConfig.GITHUB_OTA_TOKEN
+        if (token.isNotBlank() && shouldAttachUpdateAuthorization(apkUrl)) {
+            addRequestHeader("Authorization", "Bearer $token")
+        }
+        setTitle("LinReads 更新下载中")
+        setDescription("正在下载新版本…")
+        setMimeType("application/vnd.android.package-archive")
+        setNotificationVisibility(automaticDownloadNotificationVisibility())
+        setDestinationInExternalFilesDir(appContext, null, createUpdateDownloadFileName())
+    }
+    val downloadId = appContext.getSystemService(DownloadManager::class.java).enqueue(request)
+    val editor = prefs.edit()
+        .putLong(KEY_DOWNLOAD_ID, downloadId)
+        .putString(KEY_DOWNLOAD_URL, apkUrl)
+        .putString(KEY_DOWNLOAD_TAG, buildTag)
+        .putString(KEY_DOWNLOAD_BACKEND, DOWNLOAD_BACKEND_DOWNLOAD_MANAGER)
+        .remove(KEY_DOWNLOAD_STATE)
+        .remove(KEY_DOWNLOAD_STARTED_AT)
+        .remove(KEY_DOWNLOAD_APK_PATH)
+        .remove(KEY_DOWNLOAD_BYTES)
+        .remove(KEY_DOWNLOAD_TOTAL)
+        .remove(KEY_UNKNOWN_SOURCES_PERMISSION_PENDING)
+    if (versionCode == null) {
+        editor.remove(KEY_DOWNLOAD_VERSION_CODE)
+    } else {
+        editor.putLong(KEY_DOWNLOAD_VERSION_CODE, versionCode)
+    }
+    editor.commit()
+    downloadId
 }
 
 /** Handles automatic update starts, explicit retry taps, and DownloadManager completion. */
@@ -185,10 +244,19 @@ class UpdateInstallReceiver : BroadcastReceiver() {
             requestedTag = buildTag,
             requestedVersionCode = versionCode,
         )
+        if (
+            !automatic &&
+                !isExplicitUpdateRequestEligible(
+                    versionCode = versionCode,
+                    currentVersionCode = BuildConfig.OTA_VERSION_CODE.toLong(),
+                    reusesPersistedDownload = reusableDownload,
+                )
+        ) {
+            return
+        }
 
-        // New requests are owned by WorkManager. The DownloadManager branch below is retained
-        // only for already-recorded legacy downloads so an OTA started by an older build can
-        // still complete after the app is upgraded.
+        // System DownloadManager is the primary transport because it handles the GitHub CDN and
+        // OEM network stack reliably. The WorkManager branch only resumes a legacy app-owned task.
         if (prevId != NO_DOWNLOAD) {
             val appState = appOwnedDownloadState(context, prevId)
             if (appState != DownloadWorkState.NONE) {
@@ -214,7 +282,18 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                         AppOwnedDownloadAction.ENQUEUE_NEW -> Unit
                     }
                 }
-                enqueueAppOwnedUpdate(
+                enqueueDownloadManagerUpdate(
+                    context = context,
+                    apkUrl = apkUrl,
+                    buildTag = buildTag,
+                    versionCode = versionCode,
+                    retryRequested = true,
+                )
+                return
+            }
+
+            if (isAppOwnedDownloadBackend(prefs.getString(KEY_DOWNLOAD_BACKEND, null))) {
+                enqueueDownloadManagerUpdate(
                     context = context,
                     apkUrl = apkUrl,
                     buildTag = buildTag,
@@ -256,7 +335,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
             }
         }
 
-        enqueueAppOwnedUpdate(
+        enqueueDownloadManagerUpdate(
             context = context,
             apkUrl = apkUrl,
             buildTag = buildTag,
@@ -268,7 +347,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
     private fun onDownloadComplete(context: Context, intent: Intent) {
         val dlId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
         val prefs = context.getSharedPreferences("update", Context.MODE_PRIVATE)
-        if (prefs.getString(KEY_DOWNLOAD_BACKEND, null) == DOWNLOAD_BACKEND_APP_HTTP) return
+        if (!shouldHandleDownloadManagerCompletion(prefs.getString(KEY_DOWNLOAD_BACKEND, null))) return
         val savedId = prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD)
         if (dlId != savedId) return
 
@@ -377,7 +456,7 @@ private fun discardPersistedUpdate(context: Context, downloadId: Long) {
     val appContext = context.applicationContext
     val prefs = appContext.updatePreferences()
     if (prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) return
-    val appOwned = appOwnedDownloadState(appContext, downloadId) != DownloadWorkState.NONE
+    val appOwned = isAppOwnedDownloadBackend(prefs.getString(KEY_DOWNLOAD_BACKEND, null))
     if (appOwned) {
         clearDownloadedUpdateArtifact(appContext, downloadId)
     } else {
@@ -441,7 +520,7 @@ private fun clearInstalledUpdateState(context: Context) {
     val prefs = appContext.updatePreferences()
     val downloadId = prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD)
     if (downloadId != NO_DOWNLOAD) {
-        if (appOwnedDownloadState(appContext, downloadId) != DownloadWorkState.NONE) {
+        if (isAppOwnedDownloadBackend(prefs.getString(KEY_DOWNLOAD_BACKEND, null))) {
             clearDownloadedUpdateArtifact(appContext, downloadId)
         } else {
             runCatching { appContext.getSystemService(DownloadManager::class.java).remove(downloadId) }
