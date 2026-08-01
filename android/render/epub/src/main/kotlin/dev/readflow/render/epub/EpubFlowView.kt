@@ -960,7 +960,9 @@ internal class EpubFlowView(
         val canonicalIndex = canonicalPageIndexForWindow(fromWindow)
         val availableShots = stablePageShotCapacity()
         if (availableShots == 0) {
-            recycleCachedTextures()
+            // A detached SLIDE renderer remains budget-charged through its frame fence. Keep the
+            // just-settled cache until that transient owner retires; frame-two completion trims it.
+            if (renderRetiredPageShots.isEmpty()) recycleCachedTextures()
             return
         }
         val rapidDirection = queuedPageTurnDelta.coerceIn(-1, 1)
@@ -4655,7 +4657,8 @@ internal class EpubFlowView(
     private fun completeRenderRetiredGeneration() {
         renderRetiredFlushHandler.removeCallbacks(renderRetiredFlushRunnable)
         renderRetiredBarrierGeneration += 1L
-        val entries = renderRetiredPageShots.entries.toList()
+        // IdentityHashMap entries are backed by the map and lose their values after clear().
+        val entries = renderRetiredPageShots.map { (bitmap, state) -> bitmap to state }
         renderRetiredPageShots.clear()
         entries.forEach { (bitmap, state) ->
             if (state.recycleRequested) {
@@ -6666,12 +6669,12 @@ internal class EpubFlowView(
         } else {
             ((externalBytes + bytesPerShot - 1L) / bytesPerShot).toInt()
         }
-        return (3 downTo 0).first { localShotCount ->
+        return (3 downTo 0).firstOrNull { localShotCount ->
             val totalBytes = externalBytes + bytesPerShot * localShotCount
             val totalShotCount = externalShotCount + localShotCount
             totalBytes <= pageShotBudget.capacityBytes &&
                 (totalShotCount <= 2 || totalBytes <= PAGE_SHOT_OPPOSITE_BUDGET_BYTES)
-        }
+        } ?: 0
     }
 
     private fun threePageShotsFitOppositeBudget(): Boolean {

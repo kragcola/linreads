@@ -335,6 +335,128 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `slide retirement fence resumes budget-deferred current page precache after frame two`() {
+        val oneMotionShotBytes = (360L / 4L) * (120L / 4L) * 2L
+        val budget = PageShotBudget(oneMotionShotBytes * 2L)
+        val view = pagedFlowView(
+            flipStyle = PageFlipStyle.SLIDE,
+            pageShotBudget = budget,
+        )
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
+        view.recycleCachedTexturesForTest()
+
+        try {
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val renderer = view.requireActiveSlideRendererView()
+            val front = slide.privateBitmap("frontBitmap")
+            val revealed = slide.privateBitmap("revealedBitmap")
+            view.drawToBitmapForTest().recycle()
+            val leasedWhileRecorded = budget.leasedBytes
+            val chargedWhileRecorded = budget.chargedBytes
+            assertEquals(oneMotionShotBytes * 2L, leasedWhileRecorded)
+
+            view.updateInteractiveCurl(x = view.width * 0.10f)
+            view.endInteractiveCurl(velocityX = 0f)
+            val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+            assertNotNull("the committed turn must enter visual settle", animator)
+            // Hold the rapid-idle window across the settle callback so continueQueuedTurnsOrPrecache
+            // schedules rapid idle instead of starting normal precache that would clear the retained
+            // current/backward owners before the manual ownerless-fence setup below.
+            view.setPrivateField("rapidTurnSequenceActive", true)
+            animator!!.end()
+            view.setPrivateField("rapidTurnSequenceActive", false)
+
+            assertNull("settle must detach the renderer before its frame barriers begin", renderer.parent)
+            assertNull(
+                "the settle callback must not stage a pending precache while the rapid window is active",
+                view.privateField("pendingPageTexturePrecache"),
+            )
+            assertFalse(
+                "the settle callback must not arm precache while the rapid window is active",
+                view.privateBool("pageTexturePrecachePending"),
+            )
+            assertSame(
+                "the revealed shot must become the stable current-page cache",
+                revealed,
+                view.privateField("cachedFrontBitmap"),
+            )
+            assertSame(
+                "the outgoing shot must become the stable backward-page cache",
+                front,
+                view.privateField("cachedBackwardBitmap"),
+            )
+            assertFalse("the stable backward display-list bitmap must survive before frame one", front.isRecycled)
+            assertFalse("the stable current display-list bitmap must survive before frame one", revealed.isRecycled)
+            assertEquals(leasedWhileRecorded, budget.leasedBytes)
+            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+
+            // While the retirement fence still holds the outgoing shot, drop its stable backward
+            // owner and request its recycle through the render fence. Front becomes ownerless with
+            // recycleRequested queued, but the fence keeps it leased/charged through frame two.
+            view.detachCachedTextureOwnerForTest(front)
+            view.recyclePageShotForTest(front)
+
+            assertNull(
+                "detaching must remove the outgoing shot from stable cache ownership",
+                view.privateField("cachedBackwardBitmap"),
+            )
+            assertFalse("detached outgoing bitmap must stay live while the fence charges it", front.isRecycled)
+            assertFalse("detaching the outgoing owner must not disturb the stable current owner", revealed.isRecycled)
+            assertEquals(leasedWhileRecorded, budget.leasedBytes)
+            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+
+            // Ownerless front plus stable revealed fill the two-shot budget exactly: normal precache
+            // must defer rather than stage the adjacent target or replace the current-page owner.
+            view.preCachePageTexturesForTest(idlePostedWork = false)
+
+            assertFalse(
+                "speculative precache must defer while the fence charges consume capacity",
+                view.privateBool("pageTexturePrecachePending"),
+            )
+            assertNull(
+                "a budget-deferred precache must not stage a pending request",
+                view.privateField("pendingPageTexturePrecache"),
+            )
+            assertSame(
+                "deferred precache must not replace the stable current-page owner",
+                revealed,
+                view.privateField("cachedFrontBitmap"),
+            )
+            assertFalse("deferred precache must not recycle the outgoing fenced bitmap", front.isRecycled)
+            assertFalse("deferred precache must not recycle the stable revealed bitmap", revealed.isRecycled)
+            assertEquals(leasedWhileRecorded, budget.leasedBytes)
+            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            assertFalse("the ownerless outgoing bitmap must remain protected after only one host frame", front.isRecycled)
+            assertFalse("the stable current bitmap must remain protected after only one host frame", revealed.isRecycled)
+            assertEquals(leasedWhileRecorded, budget.leasedBytes)
+            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            assertTrue("the ownerless outgoing bitmap may recycle only after frame two", front.isRecycled)
+            assertFalse("frame barriers must not recycle a bitmap still owned by the stable cache", revealed.isRecycled)
+            assertSame(revealed, view.privateField("cachedFrontBitmap"))
+            assertEquals(revealed.allocationByteCount.toLong(), budget.leasedBytes)
+            assertEquals(revealed.allocationByteCount.toLong(), budget.chargedBytes)
+            assertTrue(
+                "frame two must immediately re-arm the deferred precache for the newly admissible " +
+                    "adjacent target without a new event; " +
+                    "pending=${view.privateBool("pageTexturePrecachePending")} " +
+                    "request=${view.privateField("pendingPageTexturePrecache")}",
+                view.privateBool("pageTexturePrecachePending") ||
+                    view.privateField("pendingPageTexturePrecache") != null,
+            )
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
     fun `release inside the directional threshold restores the exact free rest viewport`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -13334,6 +13456,12 @@ class EpubFlowViewTest {
 
     private fun EpubFlowView.detachCachedTextureOwnerForTest(bitmap: Bitmap) {
         javaClass.getDeclaredMethod("detachCachedTextureOwner", Bitmap::class.java)
+            .apply { isAccessible = true }
+            .invoke(this, bitmap)
+    }
+
+    private fun EpubFlowView.recyclePageShotForTest(bitmap: Bitmap) {
+        javaClass.getDeclaredMethod("recyclePageShot", Bitmap::class.java)
             .apply { isAccessible = true }
             .invoke(this, bitmap)
     }
