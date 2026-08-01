@@ -517,9 +517,23 @@ internal class EpubFlowView(
 
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
+    private var slideOverlayView: PageSlideOverlayView? = null
+    /**
+     * Bitmaps recorded by a detached SLIDE renderer whose HWUI display list may still be in flight.
+     * Each entry stays PINNED and fully budget-charged until the two-frame fence completes; recycle
+     * requests and EVICTABLE relabels are deferred so RenderThread cannot race a physical recycle.
+     */
+    private val renderRetiredPageShots =
+        java.util.IdentityHashMap<Bitmap, RenderRetiredPageShot>()
+    private var renderRetiredBarrierGeneration = 0L
+    private val renderRetiredFlushHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val renderRetiredFlushRunnable = Runnable { completeRenderRetiredGeneration() }
     private var curlDrawable: PageCurlDrawable? = null
     private val pageShotOverlayActive: Boolean
         get() = slideDrawable != null || curlDrawable != null
+    /** True only while the active page-shot renderer is a Drawable that hides the live TextView. */
+    private val liveContentDrawSuppressedByPageShot: Boolean
+        get() = curlDrawable != null || (slideDrawable != null && slideOverlayView == null)
     private val fullViewportOverlayActive: Boolean
         get() = pageShotOverlayActive || conversionSnapshotDrawable != null
     /** Defensive settle bookkeeping; dirty cache owners are rejected before an active turn starts. */
@@ -1642,8 +1656,9 @@ internal class EpubFlowView(
 
     // ---- Finger-tracking (跟手) software page turn ---------------------------------------------
     // Horizontal and side-column vertical drags drive software turn progress directly from finger
-    // displacement. Release settles by position+axis velocity; SIMULATION uses PageCurlDrawable while
-    // SLIDE uses PageSlideDrawable. Both remain in the reader's View hierarchy.
+    // displacement. Release settles by position+axis velocity; SIMULATION renders through
+    // PageCurlDrawable in the View overlay while SLIDE renders through the PageSlideOverlayView strip
+    // (PageSlideDrawable stays a detached bitmap/progress owner).
     /** The page we slide FROM (restore target on cancel); the incoming page is already parked beneath. */
     private var curlFromPage = 0
     private var curlOrigin: PageTurnOrigin? = null
@@ -1858,7 +1873,7 @@ internal class EpubFlowView(
         // The page-turn overlay owns the complete viewport and draws cached page shots. Avoid
         // repainting the parked TextView (including all image spans) underneath it on every finger
         // MOVE; EpubFlowContainer keeps the parent ViewGroup overlay in the draw pass.
-        container.skipContentDraw = pageShotOverlayActive
+        container.skipContentDraw = liveContentDrawSuppressedByPageShot
         try {
             if (clipBottom == null && topClip <= scrollY) {
                 super.dispatchDraw(canvas)
@@ -3440,18 +3455,7 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            val drawable = PageSlideDrawable(
-                outgoing,
-                preview.bitmap,
-                width,
-                height,
-                preview.forward,
-                density,
-                ::recyclePageShot,
-            )
-            drawable.setBounds(0, scrollY, width, scrollY + height)
-            overlay.add(drawable)
-            slideDrawable = drawable
+            installSlideOverlay(outgoing, preview.bitmap, preview.forward)
         }
         applyFlipProgress(0f, preview.forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
@@ -3993,7 +3997,8 @@ internal class EpubFlowView(
 
     /**
      * Page turn with a hardware slide (滑动翻页): snapshot the current and target pages, jump the real
-     * content to the target, then animate the two page shots as one strip (see [PageSlideDrawable]). Turns
+     * content to the target, then animate the two page shots as one translated strip rendered by
+     * [PageSlideOverlayView], while [PageSlideDrawable] stays the detached bitmap/progress owner. Turns
      * instantly only when animation is off; a missing snapshot reports failure so queued input can retry.
      */
     private fun goToPageAnimated(targetWindow: EpubFlowPage, forward: Boolean): Boolean {
@@ -4180,12 +4185,27 @@ internal class EpubFlowView(
     }
 
     private fun recyclePageShot(bitmap: Bitmap) {
+        val protected = renderRetiredPageShots[bitmap]
+        if (protected != null) {
+            // The HWUI display list may still reference this render-retired identity; keep the lease
+            // and charge intact and queue the physical recycle for the frame-two fence.
+            protected.recycleRequested = true
+            return
+        }
         pageShotBudget.release(bitmap)
         if (!bitmap.isRecycled) bitmap.recycle()
     }
 
     private fun relabelPageShot(bitmap: Bitmap?, kind: PageShotLeaseKind, label: String) {
-        bitmap?.takeUnless(Bitmap::isRecycled)?.let { pageShotBudget.relabel(it, kind, label) }
+        bitmap?.takeUnless(Bitmap::isRecycled)?.let { identity ->
+            val protected = renderRetiredPageShots[identity]
+            if (protected != null && kind == PageShotLeaseKind.EVICTABLE) {
+                // Defer so external PageShotBudget.evictEvictable cannot release a recorded identity.
+                protected.deferredEvictableLabel = label
+                return
+            }
+            pageShotBudget.relabel(identity, kind, label)
+        }
     }
 
     private fun drawPageBoundaryImagePreview(
@@ -4564,24 +4584,168 @@ internal class EpubFlowView(
         else canonicalFloorPageIndexForTopPx(scrollY)
     }
 
+    /** Pending fence state for one render-retired page-shot identity. */
+    private class RenderRetiredPageShot {
+        var recycleRequested = false
+        var deferredEvictableLabel: String? = null
+    }
+
+    /**
+     * Detaches the SLIDE renderer before any ownership transfer or recycle: takes its recorded
+     * identities, removes the View, clears the field, pins the identities so external eviction cannot
+     * release them, and schedules a generation-guarded two-postOnAnimation host-frame fence.
+     */
+    private fun detachSlideOverlayRenderer(): List<Bitmap> {
+        val renderer = slideOverlayView ?: return emptyList()
+        val identities = renderer.takeRecordedBitmaps()
+        overlay.remove(renderer)
+        slideOverlayView = null
+        if (identities.isNotEmpty()) {
+            identities.forEach { identity ->
+                renderRetiredPageShots.getOrPut(identity) { RenderRetiredPageShot() }
+                relabelPageShot(identity, PageShotLeaseKind.PINNED, "render.fence")
+            }
+            scheduleRenderRetiredFence()
+        }
+        return identities
+    }
+
+    /**
+     * Two attached-host frame traversals give HWUI a concrete opportunity to drop the display list
+     * that recorded the retired bitmaps. A newer generation (reactivation or a later detach) makes
+     * stale callbacks exit; a detached host falls back to a main-Handler delayed completion.
+     */
+    private fun scheduleRenderRetiredFence() {
+        if (renderRetiredPageShots.isEmpty()) return
+        renderRetiredBarrierGeneration += 1L
+        val generation = renderRetiredBarrierGeneration
+        renderRetiredFlushHandler.removeCallbacks(renderRetiredFlushRunnable)
+        if (!isAttachedToWindow) {
+            renderRetiredFlushHandler.postDelayed(
+                renderRetiredFlushRunnable,
+                RENDER_RETIRED_FALLBACK_DELAY_MS,
+            )
+            return
+        }
+        var remainingFrames = 2
+        lateinit var frameBarrier: Runnable
+        frameBarrier = Runnable {
+            if (renderRetiredBarrierGeneration != generation) return@Runnable
+            remainingFrames -= 1
+            if (remainingFrames > 0 && isAttachedToWindow) {
+                // Chain from frame one so the callbacks cannot collapse into the same VSYNC.
+                postOnAnimation(frameBarrier)
+            } else if (isAttachedToWindow) {
+                completeRenderRetiredGeneration()
+            } else {
+                renderRetiredFlushHandler.postDelayed(
+                    renderRetiredFlushRunnable,
+                    RENDER_RETIRED_FALLBACK_DELAY_MS,
+                )
+            }
+        }
+        postOnAnimation(frameBarrier)
+    }
+
+    /**
+     * Frame two of the current generation: queued/ownerless identities release their lease and
+     * recycle exactly once; identities still owned by stable caches stay live and receive their
+     * deferred EVICTABLE label. Stable trim then reruns if the budget is still over capacity.
+     */
+    private fun completeRenderRetiredGeneration() {
+        renderRetiredFlushHandler.removeCallbacks(renderRetiredFlushRunnable)
+        renderRetiredBarrierGeneration += 1L
+        val entries = renderRetiredPageShots.entries.toList()
+        renderRetiredPageShots.clear()
+        entries.forEach { (bitmap, state) ->
+            if (state.recycleRequested) {
+                pageShotBudget.release(bitmap)
+                if (!bitmap.isRecycled) bitmap.recycle()
+            } else {
+                state.deferredEvictableLabel?.let { label ->
+                    relabelPageShot(bitmap, PageShotLeaseKind.EVICTABLE, label)
+                }
+            }
+        }
+        trimStablePageShotsToBudget()
+    }
+
+    /**
+     * Installs a SLIDE turn: the zero-copy [PageSlideDrawable] owner keeps progress and the page-shot
+     * pair (never added to the View overlay), while the opaque [PageSlideOverlayView] strip renders the
+     * same pair as a static 2W x H strip laid out at the current scrollY. Only the View joins the
+     * ViewGroupOverlay so per-frame motion is a View translation and the live TextView RenderNode stays
+     * warm.
+     */
+    private fun installSlideOverlay(outgoing: Bitmap, revealed: Bitmap, forward: Boolean) {
+        // Reactivate identities still behind an earlier render fence: the new renderer records them
+        // again, so cancel their pending recycle/deferred state and invalidate stale frame callbacks.
+        var reactivated = false
+        listOf(outgoing, revealed).forEach { identity ->
+            if (renderRetiredPageShots.remove(identity) != null) reactivated = true
+        }
+        if (reactivated) {
+            renderRetiredBarrierGeneration += 1L
+            renderRetiredFlushHandler.removeCallbacks(renderRetiredFlushRunnable)
+            if (renderRetiredPageShots.isNotEmpty()) scheduleRenderRetiredFence()
+        }
+        relabelPageShot(outgoing, PageShotLeaseKind.PINNED, "render.active")
+        if (revealed !== outgoing) {
+            relabelPageShot(revealed, PageShotLeaseKind.PINNED, "render.active")
+        }
+        val drawable = PageSlideDrawable(
+            outgoing,
+            revealed,
+            width,
+            height,
+            forward,
+            density,
+            ::recyclePageShot,
+        )
+        drawable.setBounds(0, scrollY, width, scrollY + height)
+        val renderer = PageSlideOverlayView(
+            context = context,
+            frontBitmap = outgoing,
+            revealedBitmap = revealed,
+            viewportW = width,
+            viewportH = height,
+            forward = forward,
+            density = density,
+        )
+        val stripLeft = if (forward) 0 else -width
+        renderer.layout(stripLeft, scrollY, stripLeft + 2 * width, scrollY + height)
+        overlay.add(renderer)
+        slideDrawable = drawable
+        slideOverlayView = renderer
+    }
+
+    /** Relays the slide renderer at its base-left/top after scroll restore, without changing progress. */
+    private fun positionSlideOverlay(forward: Boolean) {
+        val renderer = slideOverlayView ?: return
+        val stripLeft = if (forward) 0 else -width
+        renderer.layout(stripLeft, scrollY, stripLeft + 2 * width, scrollY + height)
+    }
 
     /**
      * Drives the active page-turn animation to [progress] (0 = outgoing covers viewport, 1 = complete).
-     * SLIDE: the outgoing snapshot moves inside [PageSlideDrawable] AND the incoming page (the real
-     * [container]) is already parked on the target page. Both normal and rapid turns use one frozen
-     * outgoing/target pair so a visual transaction cannot mix image quality generations. SIMULATION
-     * draws the revealed shot flat inside [PageCurlDrawable], while only the outgoing shot warps over it.
+     * SLIDE: the frozen strip renders through [PageSlideOverlayView], whose translation tracks progress
+     * while [PageSlideDrawable] retains the progress value and the incoming page (the real [container])
+     * is already parked on the target page. Both normal and rapid turns use one frozen outgoing/target
+     * pair so a visual transaction cannot mix image quality generations. SIMULATION draws the revealed
+     * shot flat inside [PageCurlDrawable], while only the outgoing shot warps over it.
      */
     private fun applyFlipProgress(progress: Float, forward: Boolean) {
         slideDrawable?.let {
             it.progress = progress
         }
         curlDrawable?.progress = progress
+        slideOverlayView?.translationX = (if (forward) -progress else progress) * width
         container.translationX = 0f
         container.translationY = 0f
     }
 
     private fun takeActiveFlipBitmaps(): Pair<Bitmap, Bitmap>? {
+        detachSlideOverlayRenderer()
         val front = slideDrawable?.takeFrontBitmap() ?: curlDrawable?.takeFrontBitmap()
         val revealed = slideDrawable?.takeRevealedBitmap() ?: curlDrawable?.takeRevealedBitmap()
         if (front == null || revealed == null) {
@@ -4665,6 +4829,7 @@ internal class EpubFlowView(
             val victim = cachedBackwardBitmap ?: cachedRevealedBitmap ?: cachedFrontBitmap ?: return
             detachCachedTextureOwner(victim)
             recyclePageShot(victim)
+            if (renderRetiredPageShots.containsKey(victim)) break
         }
     }
 
@@ -4702,12 +4867,7 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            val drawable = PageSlideDrawable(
-                outgoing, revealed, width, height, forward, density, ::recyclePageShot,
-            )
-            drawable.setBounds(bounds[0], bounds[1], bounds[2], bounds[3])
-            overlay.add(drawable)
-            slideDrawable = drawable
+            installSlideOverlay(outgoing, revealed, forward)
         }
         applyFlipProgress(0f, forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
@@ -4779,6 +4939,11 @@ internal class EpubFlowView(
 
     private fun clearFlipOverlay(preserveActivePixelRefreshes: Boolean = false) {
         cancelPendingLocalPageShotHandoff(consumeGesture = true)
+        // A Drawable-only owner suppressed the live TextView while it was active (SIMULATION or a
+        // legacy/manual Drawable-only SLIDE). An opaque SLIDE View renderer keeps the live TextView
+        // warm, so its teardown must not rerecord the long chapter RenderNode.
+        val rerecordLiveText = liveContentDrawSuppressedByPageShot
+        detachSlideOverlayRenderer()
         slideDrawable?.let {
             overlay.remove(it)
             it.recycle()
@@ -4806,7 +4971,7 @@ internal class EpubFlowView(
         // suppression is active, removing the overlay alone can keep replaying an empty RenderNode.
         // Dirty both levels so the first settled frame records the parked page and image spans again.
         container.skipContentDraw = false
-        textView.invalidate()
+        if (rerecordLiveText) textView.invalidate()
         container.invalidate()
         postInvalidateOnAnimation()
     }
@@ -5257,18 +5422,7 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            val drawable = PageSlideDrawable(
-                outgoing,
-                revealed,
-                width,
-                height,
-                forward,
-                density,
-                ::recyclePageShot,
-            )
-            drawable.setBounds(0, scrollY, width, scrollY + height)
-            overlay.add(drawable)
-            slideDrawable = drawable
+            installSlideOverlay(outgoing, revealed, forward)
         }
         interactiveTurnState = InteractiveTurnState.SOFTWARE
         curlFromPage = origin.pageProjection
@@ -5426,18 +5580,7 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            val drawable = PageSlideDrawable(
-                outgoing,
-                preview.bitmap,
-                width,
-                height,
-                preview.forward,
-                density,
-                ::recyclePageShot,
-            )
-            drawable.setBounds(0, scrollY, width, scrollY + height)
-            overlay.add(drawable)
-            slideDrawable = drawable
+            installSlideOverlay(outgoing, preview.bitmap, preview.forward)
         }
         interactiveTurnState = InteractiveTurnState.BOUNDARY_SOFTWARE
         curlFromPage = origin.pageProjection
@@ -5530,9 +5673,9 @@ internal class EpubFlowView(
         if (!commit) {
             // Cancelled: restore the exact outgoing viewport beneath as the overlay retreats.
             curlOrigin?.let(::restorePageTurnOrigin)
-            val left = 0; val top = scrollY
-            slideDrawable?.setBounds(left, top, width, top + height)
-            curlDrawable?.setBounds(left, top, width, top + height)
+            positionSlideOverlay(curlForward)
+            val top = scrollY
+            curlDrawable?.setBounds(0, top, width, top + height)
         }
         val forward = curlForward
         val distance = kotlin.math.abs(end - start)
@@ -6000,6 +6143,7 @@ internal class EpubFlowView(
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
         if (!disposed) onImageDrawableHostAttached?.invoke()
+        if (renderRetiredPageShots.isNotEmpty()) scheduleRenderRetiredFence()
     }
 
     /**
@@ -6495,6 +6639,8 @@ internal class EpubFlowView(
         const val RAPID_DECODE_WINDOW_MAX_PAGES = 4
         const val RAPID_TURN_IDLE_TIMEOUT_MS = 320L
         const val RAPID_FOLLOW_UP_PREFETCH_DELAY_MS = 32L
+        /** Detached-host fallback for render-retired SLIDE page shots that never saw a host frame. */
+        const val RENDER_RETIRED_FALLBACK_DELAY_MS = 320L
         /**
          * Motion snapshots are transient animation textures. Keep the settled/live page at full
          * resolution, but upload a bounded quarter-resolution pair while the finger owns the turn.
