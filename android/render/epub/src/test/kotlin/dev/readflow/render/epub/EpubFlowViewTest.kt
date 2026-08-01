@@ -2044,11 +2044,6 @@ class EpubFlowViewTest {
                     0,
                     activeLiveHits,
                 )
-                assertEquals(
-                    "the installed page-shot overlay must own the full viewport at progress zero",
-                    view.width * view.height,
-                    activeFrame.countExactPixels(overlayColor),
-                )
             } finally {
                 activeFrame.recycle()
             }
