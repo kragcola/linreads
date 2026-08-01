@@ -2361,7 +2361,15 @@ internal class EpubFlowView(
         val clipTop = snapshotClipTopFor(topPx, window)
         val clipBottom = snapshotClipBottomFor(topPx, window)
         canvas.clipRect(0, clipTop, width, clipBottom)
-        container.draw(canvas)
+        // Draw the TextView layout directly instead of traversing the View tree: the container adds
+        // nothing (no background, no other children) and the view-level pass re-enters TextView.draw.
+        // TextView paints its layout at (paddingLeft - scrollX, paddingTop - scrollY) in its own
+        // coordinates; after the -topPx translate above that offset matches the live draw path.
+        canvas.translate(
+            textView.paddingLeft.toFloat() - textView.scrollX.toFloat(),
+            textView.paddingTop.toFloat() - textView.scrollY.toFloat(),
+        )
+        textView.layout?.draw(canvas)
         canvas.restoreToCount(contentSave)
         window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx = 0) }
     }
@@ -4336,7 +4344,27 @@ internal class EpubFlowView(
                 // Public View.draw(Canvas) does not apply the -scroll transform supplied by the normal
                 // parent/ViewRoot draw path. dispatchDraw expects that content-space transform already.
                 canvas.translate(-scrollX.toFloat(), -scrollY.toFloat())
-                dispatchDraw(canvas)
+                // Mirror dispatchDraw's clip semantics without traversing the View tree: PAGED clips to
+                // the current page's line box, SCROLL (or no clip) takes the shortcut and paints the
+                // whole layout unclipped.
+                val clipBottom = pageClipBottomInViewport()
+                val topClip = pageClipTopInViewport()
+                if (clipBottom != null || topClip > scrollY) {
+                    val bottom = if (clipBottom != null) {
+                        minOf(scrollY + clipBottom + textView.paddingTop, scrollY + height)
+                    } else {
+                        scrollY + height
+                    }
+                    canvas.clipRect(0, topClip, width, bottom)
+                }
+                // TextView paints its layout at (paddingLeft - scrollX, paddingTop - scrollY) in its
+                // own coordinates; the -scrollX/-scrollY translate above cancels the parked scroll, so
+                // the net layout offset in viewport space is just the TextView's own padding.
+                canvas.translate(
+                    textView.paddingLeft.toFloat() - textView.scrollX.toFloat(),
+                    textView.paddingTop.toFloat() - textView.scrollY.toFloat(),
+                )
+                textView.layout?.draw(canvas)
                 canvas.restoreToCount(save)
                 activePageWindow?.takeIf { it.topPx == scrollY }
                     ?.let { drawPageBoundaryImagePreview(canvas, scrollY, it, canvasViewportTopPx = 0) }
@@ -4385,13 +4413,14 @@ internal class EpubFlowView(
                 val clipTop = snapshotClipTopFor(topPx, window)
                 val clipBottom = snapshotClipBottomFor(topPx, window)
                 canvas.clipRect(0, clipTop, width, clipBottom)
-                val skipContentDraw = container.skipContentDraw
-                container.skipContentDraw = false
-                try {
-                    container.draw(canvas)
-                } finally {
-                    container.skipContentDraw = skipContentDraw
-                }
+                // Draw the TextView layout directly (see redrawPageShotInto): same clip and content
+                // translation as the live draw path, without traversing the View tree or toggling the
+                // overlay-owned skipContentDraw state.
+                canvas.translate(
+                    textView.paddingLeft.toFloat() - textView.scrollX.toFloat(),
+                    textView.paddingTop.toFloat() - textView.scrollY.toFloat(),
+                )
+                textView.layout?.draw(canvas)
                 canvas.restoreToCount(contentSave)
                 window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx = 0) }
             }

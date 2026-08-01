@@ -1567,6 +1567,30 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `page shot rendering bypasses TextView view level background`() {
+        val view = pagedFlowView()
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val pageOneTop = requireNotNull(view.pageTopPxAt(1))
+        val textBackground = RecordingBoundsTopDrawable()
+        view.textView.background = textBackground
+
+        try {
+            view.goToPage(1)
+            textBackground.boundsTops.clear()
+
+            val shot = requireNotNull(view.snapshotPageAt(pageOneTop))
+            shot.recycle()
+
+            assertTrue(
+                "page shots must render the TextView layout directly without traversing its View background",
+                textBackground.boundsTops.isEmpty(),
+            )
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `page turn snapshot preserves exact paper colour under the finger`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
