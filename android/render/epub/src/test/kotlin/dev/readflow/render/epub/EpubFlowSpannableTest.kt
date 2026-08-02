@@ -1396,6 +1396,49 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `rapid stable pixel gate accepts retained pixels while display promotion is in flight`() {
+        val epub = File.createTempFile("readflow-rapid-promotion-gate", ".epub")
+        val executor = QueuedExecutorService()
+        try {
+            val loader = EpubFlowImageLoader(
+                epubFileProvider = { epub },
+                executor = executor,
+                columnWidthPx = 800,
+                pageHeightProvider = { 1200 },
+                inlineMaxHeightPx = 720,
+                fullPageHrefs = setOf(TEST_IMAGE_HREF),
+                imageBoundsProvider = { EpubImageBounds(width = 1600, height = 2400) },
+                imageQualityProvider = { EpubImageRenderQuality.RAPID },
+                imageDecoder = { _, _, _ ->
+                    android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888)
+                },
+            )
+            val drawable = asyncDrawable(loader)
+            loader.registerOccurrence(drawable, layoutStart = 42)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue(
+                "retained RAPID pixels must satisfy the motion gate before DISPLAY promotion completes",
+                loader.hasStablePixels(listOf(42), requireDisplayPromotion = false),
+            )
+            assertEquals(1, loader.promoteToDisplayQuality(listOf(0 until 100)))
+            assertTrue(
+                "an in-flight DISPLAY promotion must not block the rapid gate when old pixels exist",
+                loader.hasStablePixels(listOf(42), requireDisplayPromotion = false),
+            )
+            assertFalse(
+                "the settled gate must still wait for DISPLAY promotion",
+                loader.hasStablePixels(listOf(42)),
+            )
+        } finally {
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `terminal image decode failure is stable placeholder and does not requeue`() {
         val epub = File.createTempFile("readflow-terminal-image-failure", ".epub")
         val executor = QueuedExecutorService()
@@ -1606,6 +1649,44 @@ class EpubFlowSpannableTest {
                 0,
                 backgroundExecutor.queuedTaskCount,
             )
+        } finally {
+            loader.releaseAll()
+            nearbyExecutor.shutdownNow()
+            backgroundExecutor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `rapid runway image decode uses bulk executor while display stays on priority executor`() {
+        val epub = createImageEpub("rapid-runway-executor")
+        val backgroundExecutor = QueuedExecutorService()
+        val nearbyExecutor = QueuedExecutorService()
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = backgroundExecutor,
+            priorityExecutor = nearbyExecutor,
+            priorityLayoutRangesProvider = { listOf(0 until 100) },
+            columnWidthPx = 8,
+            pageHeightProvider = { 8 },
+            inlineMaxHeightPx = 8,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+            imageQualityProvider = { EpubImageRenderQuality.RAPID },
+        )
+        val resolver = EpubFlowImageSizeResolver(
+            columnWidthPx = 8,
+            pageHeightProvider = { 8 },
+            inlineMaxHeightPx = 8,
+            fullPageHrefs = emptySet(),
+        )
+        try {
+            val drawable = AsyncDrawable("runway.png", loader, resolver, null)
+            loader.registerOccurrence(drawable, layoutStart = 50)
+            drawable.setCallback2(attachedDrawableCallback)
+
+            assertEquals("RAPID runway must avoid the critical executor", 0, nearbyExecutor.queuedTaskCount)
+            assertEquals("RAPID runway must use the bulk executor", 1, backgroundExecutor.queuedTaskCount)
         } finally {
             loader.releaseAll()
             nearbyExecutor.shutdownNow()

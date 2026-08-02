@@ -1821,7 +1821,12 @@ internal class EpubFlowView(
         val layout = textView.layout ?: return@Runnable
         if (flow == null || layout.height <= 0) return@Runnable
         if (layout.height == paginatedLayoutHeight) return@Runnable
-        if (turnInFlight) {
+        if (
+            turnInFlight ||
+            rapidTurnSequenceActive ||
+            rapidIdlePageTurnGesture ||
+            queuedPageTurnDelta != 0
+        ) {
             postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
             return@Runnable
         }

@@ -382,12 +382,17 @@ internal class EpubFlowImageLoader(
             if (starts.isEmpty()) return true
             starts.all { start ->
                 layoutStartByDrawable.entries.any { (drawable, registeredStart) ->
+                    val retainedPixels =
+                        (drawable.result as? EpubImagePixelSource)?.hasDecodedPixels == true
+                    val request = inFlight[drawable]
+                    val rapidPromotionMayRunAhead =
+                        !requireDisplayPromotion && retainedPixels && request?.isPromotion == true
                     registeredStart == start &&
                         drawable.isAttached &&
-                        inFlight[drawable] == null &&
+                        (request == null || rapidPromotionMayRunAhead) &&
                         (
                             (
-                                (drawable.result as? EpubImagePixelSource)?.hasDecodedPixels == true &&
+                                retainedPixels &&
                                     (
                                         !requireDisplayPromotion ||
                                             (
@@ -737,8 +742,13 @@ internal class EpubFlowImageLoader(
             new to old
         }
         superseded?.future?.cancel(true)
+        // Keep the critical lane for visible DISPLAY work. RAPID runway images are deliberately
+        // speculative and must not serialize behind a full-resolution landing decode; they can
+        // fill the bulk lane while the current/adjacent display contract stays responsive.
         val decodeExecutor = priorityExecutor?.takeIf {
-            layoutStart >= 0 && decodeWindow.ranges.any { range -> layoutStart in range }
+            quality == EpubImageRenderQuality.DISPLAY &&
+                layoutStart >= 0 &&
+                decodeWindow.ranges.any { range -> layoutStart in range }
         } ?: executor
         val future = try {
             decodeExecutor.submit {

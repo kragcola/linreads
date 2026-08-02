@@ -7224,6 +7224,29 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `queued rapid idle defers layout reflow until the sequence settles`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        try {
+            val generationBefore = view.privateField("pageLayoutGeneration") as Long
+            val layoutHeight = requireNotNull(view.textView.layout).height
+            view.setPrivateField("paginatedLayoutHeight", layoutHeight - 1)
+            view.setPrivateField("rapidTurnSequenceActive", true)
+            view.setPrivateField("queuedPageTurnDelta", 1)
+
+            view.runReflowRunnable(idlePostedWork = false)
+
+            assertEquals(
+                "queued rapid input must keep the reflow pending instead of rebuilding pagination between turns",
+                generationBefore,
+                view.privateField("pageLayoutGeneration") as Long,
+            )
+            assertEquals(layoutHeight - 1, view.privateInt("paginatedLayoutHeight"))
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `async reflow recycles stale turn texture cache before rebuilding pagination`() {
         val view = pagedFlowView()
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
