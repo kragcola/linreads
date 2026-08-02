@@ -45,6 +45,7 @@ import android.os.Looper
 import java.nio.charset.StandardCharsets
 import java.io.File
 import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.CoroutineContext
 import kotlin.math.abs
 
@@ -1195,6 +1196,98 @@ class TxtVirtualPagerEngineTest {
     }
 
     @Test
+    fun `dedicated surface report generation keeps the live surface and blocks stale reports`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val lines = (0 until 80).map { index ->
+            "Stale report paragraph %03d keeps the remounted surface locator stable.".format(index)
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-stale-report-", suffix = ".txt").toFile()
+        file.writeText(lines.joinToString("\n\n"), charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+
+        // Surface A establishes a locator deep in the document.
+        val first = engine.createView() as RecyclerView
+        val firstGeneration = engine.currentScrollReportGenerationForTest()
+        first.measureLayout(1080, 2400)
+        repeat(2) {
+            shadowOf(Looper.getMainLooper()).idle()
+            first.measureLayout(1080, 2400)
+        }
+        (first.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(10, 0)
+        first.measureLayout(1080, 2400)
+        shadowOf(Looper.getMainLooper()).idle()
+        engine.reportProgressionForTest(first)
+        val firstProgression = engine.currentLocator.value.totalProgression ?: 0f
+
+        // Remount surface B and navigate it to a different paragraph.
+        val second = engine.createView() as RecyclerView
+        val secondGeneration = engine.currentScrollReportGenerationForTest()
+        second.measureLayout(1080, 2400)
+        repeat(2) {
+            shadowOf(Looper.getMainLooper()).idle()
+            second.measureLayout(1080, 2400)
+        }
+        (second.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(20, 0)
+        second.measureLayout(1080, 2400)
+        shadowOf(Looper.getMainLooper()).idle()
+        engine.goTo(Locator(LocatorStrategy.Section(0, 30, 0), totalProgression = 30f / lines.size))
+        second.measureLayout(1080, 2400)
+        shadowOf(Looper.getMainLooper()).idle()
+        second.measureLayout(1080, 2400)
+        val afterGoTo = engine.currentLocator.value.totalProgression ?: 0f
+        assertTrue("goTo must move the locator past the stale surface", afterGoTo > firstProgression)
+
+        // The CURRENT surface's normal scrolling must still publish after the navigation bump:
+        // the report token is dedicated, so goTo/typography bumps must not silence the live view.
+        second.scrollBy(0, 400)
+        second.measureLayout(1080, 2400)
+        shadowOf(Looper.getMainLooper()).idle()
+        val afterScroll = engine.currentLocator.value.totalProgression ?: 0f
+        assertTrue(
+            "current-surface scrolling must still publish after a navigation bump; afterScroll=$afterScroll",
+            afterScroll > afterGoTo,
+        )
+
+        // A report from the old surface identity must not publish into B.
+        engine.reportProgressionForTest(first)
+        assertEquals(
+            "a stale surface report must not republish into the remounted surface",
+            afterScroll,
+            engine.currentLocator.value.totalProgression ?: 0f,
+            0f,
+        )
+
+        // The same live surface with an older captured generation must also be ignored.
+        engine.reportProgressionForTest(second, firstGeneration)
+        assertEquals(afterScroll, engine.currentLocator.value.totalProgression ?: 0f, 0f)
+
+        // Mode transitions invalidate the old surface token before the host installs the next
+        // view. A queued callback from the continuous surface must not overwrite either mode's
+        // preserved anchor during that handoff.
+        engine.setMode(ReadingMode.PAGED)
+        val pagedModeLocator = engine.currentLocator.value
+        engine.reportProgressionForTest(second, secondGeneration)
+        assertEquals(pagedModeLocator, engine.currentLocator.value)
+        engine.setMode(ReadingMode.SCROLL)
+        val scrollModeLocator = engine.currentLocator.value
+        engine.reportProgressionForTest(second, secondGeneration)
+        assertEquals(scrollModeLocator, engine.currentLocator.value)
+
+        // Reopening invalidates the old surface token even before the host remounts the new book.
+        val replacement = kotlin.io.path.createTempFile(prefix = "readflow-txt-stale-open-", suffix = ".txt").toFile()
+        replacement.writeText(
+            "A replacement book with a fresh head.\n\nA second paragraph makes stale progress observable.",
+            charset = StandardCharsets.UTF_8,
+        )
+        engine.openBook(Uri.fromFile(replacement))
+        val afterOpen = engine.currentLocator.value.totalProgression ?: 0f
+        engine.reportProgressionForTest(second, secondGeneration)
+        assertEquals(afterOpen, engine.currentLocator.value.totalProgression ?: 0f, 0f)
+    }
+
+    @Test
     fun `PageText is not treated as paragraph index falls back to total progression`() = runTest {
         val context = RuntimeEnvironment.getApplication()
         val lines = (0 until 20).map { index ->
@@ -1240,12 +1333,32 @@ class TxtVirtualPagerEngineTest {
             .apply { isAccessible = true }
             .invoke(this) as Int
 
-    private fun TxtVirtualPagerEngine.reportProgressionForTest(view: RecyclerView) {
-        TxtVirtualPagerEngine::class.java
-            .getDeclaredMethod("reportProgression", RecyclerView::class.java)
-            .apply { isAccessible = true }
-            .invoke(this, view)
+    private fun TxtVirtualPagerEngine.reportProgressionForTest(
+        view: RecyclerView,
+        surfaceGeneration: Long? = null,
+    ) {
+        if (surfaceGeneration == null) {
+            TxtVirtualPagerEngine::class.java
+                .getDeclaredMethod("reportProgression", RecyclerView::class.java)
+                .apply { isAccessible = true }
+                .invoke(this, view)
+        } else {
+            TxtVirtualPagerEngine::class.java
+                .getDeclaredMethod(
+                    "reportProgression",
+                    RecyclerView::class.java,
+                    Long::class.javaPrimitiveType!!,
+                )
+                .apply { isAccessible = true }
+                .invoke(this, view, surfaceGeneration)
+        }
     }
+
+    private fun TxtVirtualPagerEngine.currentScrollReportGenerationForTest(): Long =
+        (TxtVirtualPagerEngine::class.java
+            .getDeclaredField("scrollReportGeneration")
+            .apply { isAccessible = true }
+            .get(this) as AtomicLong).get()
 
     private fun RecyclerView.centeredAdapterPosition(layoutManager: LinearLayoutManager): Int {
         val viewportCenter = paddingTop + (height - paddingTop - paddingBottom) / 2

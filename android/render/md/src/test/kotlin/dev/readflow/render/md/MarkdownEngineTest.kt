@@ -2011,6 +2011,84 @@ class MarkdownEngineTest {
             assertTrue(engine.privateField("scrollView") === scroll)
         }
 
+    @Test
+    fun `stale onScrollChange from a remounted or reopened surface cannot republish a locator`() =
+        runTest(dispatcher) {
+            Dispatchers.setMain(dispatcher)
+            val context = RuntimeEnvironment.getApplication() as Application
+            val file = tempMarkdown(buildLongMarkdown())
+            val engine = MarkdownEngine(context)
+            engine.openBook(Uri.fromFile(file))
+
+            val firstScroll = engine.createView() as ScrollView
+            val firstText = firstScroll.getChildAt(0) as TextView
+            val firstParent = attachMeasured(firstScroll, context)
+            repeat(4) {
+                idleMainLooper()
+                relayout(firstParent)
+            }
+            // A real user scroll on the first surface publishes a head-away locator.
+            firstScroll.scrollTo(0, 600)
+            idleMainLooper()
+            assertTrue(
+                "fixture must publish a scrolled locator; actual=${engine.currentLocator.value}",
+                (engine.currentLocator.value.totalProgression ?: 0f) > 0f,
+            )
+
+            // Remount: the old ScrollView/TextView pair is detached and no longer the active
+            // pair, so its onScrollChange listener must be rejected.
+            val secondScroll = engine.createView() as ScrollView
+            val secondText = secondScroll.getChildAt(0) as TextView
+            val secondParent = attachMeasured(secondScroll, context)
+            repeat(4) {
+                idleMainLooper()
+                relayout(secondParent)
+            }
+            assertNotSame(firstScroll, secondScroll)
+            assertNotSame(firstText, secondText)
+
+            // Move the active surface to a distinguishable position and let its restore settle.
+            secondScroll.scrollTo(0, 900)
+            idleMainLooper()
+            relayout(secondParent)
+            val activeLocator = engine.currentLocator.value
+            assertTrue(
+                "active surface must publish a scrolled locator; actual=$activeLocator",
+                (activeLocator.totalProgression ?: 0f) > 0f,
+            )
+
+            // Poison the old surface so a stale publish would be observably different.
+            firstText.text = "POISONED_OLD_SURFACE"
+            firstScroll.scrollTo(0, 1200)
+            idleMainLooper()
+            assertEquals(
+                "a detached pre-remount surface must not republish over the active locator",
+                activeLocator,
+                engine.currentLocator.value,
+            )
+
+            // Open a second book WITHOUT remount: the same surface stays current, but the
+            // generation bump must orphan its onScrollChange listener too. Without the guard a
+            // scroll would publish an old-text/new-document locator, so this is the strongest
+            // stale-generation regression.
+            val fileB = tempMarkdown(buildLongMarkdown())
+            engine.openBook(Uri.fromFile(fileB))
+            val afterOpenLocator = engine.currentLocator.value
+            assertEquals(0f, afterOpenLocator.totalProgression ?: 0f, 0.001f)
+            assertTrue(
+                "openBook must keep the same active surface",
+                engine.privateField("scrollView") === secondScroll,
+            )
+
+            secondScroll.scrollTo(0, 1800)
+            idleMainLooper()
+            assertEquals(
+                "openBook must orphan the reused surface onScrollChange so it cannot republish",
+                afterOpenLocator,
+                engine.currentLocator.value,
+            )
+        }
+
     private class ResettingTextView(context: Context) : TextView(context) {
         override fun setText(text: CharSequence?, type: BufferType?) {
             super.setText(text, type)

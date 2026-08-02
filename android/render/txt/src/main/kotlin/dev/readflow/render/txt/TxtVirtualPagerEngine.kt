@@ -125,6 +125,16 @@ class TxtVirtualPagerEngine(
     private var pendingContinuousTypographyAnchor: TxtParagraphPosition? = null
     private var continuousTypographyRestoreGeneration = 0L
     /**
+     * Surface-scoped scroll-report token. Bumped on createView remount and document lifecycle
+     * changes, while typography and navigation bumps can never disable the current surface's
+     * normal scroll reporting. Each RecyclerView's scroll listener captures its own surface's
+     * generation, and reportProgression refuses any callback whose captured generation is no
+     * longer current or whose view is not the live surface. openBook/close also bump it so a reused
+     * RecyclerView cannot publish offsets from the previous document; the host must remount before
+     * reporting the new document.
+     */
+    private val scrollReportGeneration = AtomicLong()
+    /**
      * Host-reported ViewPager viewport. Zero means "not yet laid out" — fall back to
      * displayMetrics until the first real layout arrives (Markdown parity).
      */
@@ -162,6 +172,7 @@ class TxtVirtualPagerEngine(
             pendingProgrammaticScroll = null
             pendingContinuousTypographyAnchor = null
             continuousTypographyRestoreGeneration += 1L
+            scrollReportGeneration.incrementAndGet()
             // Engine instance may be reused for a different book; drop transient search paint state.
             searchHighlightHit = null
             val requiresFingerprint = pendingEngineState != null
@@ -234,6 +245,10 @@ class TxtVirtualPagerEngine(
         // viewport instead of reusing the stale anchor after the user scrolls the new surface.
         pendingContinuousTypographyAnchor = null
         continuousTypographyRestoreGeneration += 1L
+        // Assign a fresh surface/report generation: only this RecyclerView's scroll callbacks may
+        // publish into the engine, so a stale previous surface's callback is refused by both the
+        // captured-generation check and the exact RecyclerView identity check.
+        val surfaceReportGeneration = scrollReportGeneration.incrementAndGet()
         val initialPosition = currentParagraphPosition()
         val rv = RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
@@ -256,7 +271,7 @@ class TxtVirtualPagerEngine(
             setPadding(0, padV, 0, padV)
             addOnScrollListener(object : RecyclerView.OnScrollListener() {
                 override fun onScrolled(view: RecyclerView, dx: Int, dy: Int) {
-                    reportProgression(view)
+                    reportProgression(view, surfaceReportGeneration)
                 }
             })
             (layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(initialPosition.paragraphIndex, 0)
@@ -612,6 +627,17 @@ class TxtVirtualPagerEngine(
     }
 
     private fun reportProgression(rv: RecyclerView) {
+        reportProgression(rv, scrollReportGeneration.get())
+    }
+
+    private fun reportProgression(rv: RecyclerView, surfaceGeneration: Long) {
+        if (
+            surfaceGeneration != scrollReportGeneration.get() ||
+            recyclerView !== rv ||
+            _pagingKind.value != PagingKind.CONTINUOUS
+        ) {
+            return
+        }
         val total = paragraphCount()
         if (total == 0) return
         val lm = rv.layoutManager as? LinearLayoutManager ?: return
@@ -1058,6 +1084,7 @@ class TxtVirtualPagerEngine(
             }
         }
         recyclerView = null
+        scrollReportGeneration.incrementAndGet()
         pageRequestCallback = null
         pendingProgrammaticScroll = null
         pendingContinuousTypographyAnchor = null
@@ -1376,6 +1403,7 @@ class TxtVirtualPagerEngine(
             }
             // Invalidate every restore armed on the previous surface so no stale callback can
             // republish or scroll the new mode's surface; the preserved anchor is captured above.
+            scrollReportGeneration.incrementAndGet()
             pendingContinuousTypographyAnchor = null
             continuousTypographyRestoreGeneration += 1L
             publishLocator(locatorForPosition(anchor))

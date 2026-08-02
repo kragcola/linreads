@@ -124,7 +124,8 @@ class MarkdownEngine(
     private var suppressLocatorUpdates = false
     /**
      * Bumps on open/close/createView remount so deferred ScrollView.post {} highlight refresh
-     * callbacks cannot mutate a newer view tree or republish an old book's locator.
+     * callbacks and the SCROLL onScrollChange listener cannot mutate a newer view tree or
+     * republish an old book's locator.
      */
     private var highlightRefreshGeneration: Long = 0L
     private var pendingScrollTypographyAnchor: Locator? = null
@@ -183,6 +184,11 @@ class MarkdownEngine(
     override suspend fun supports(uri: Uri): Boolean = true
 
     override suspend fun openBook(uri: Uri): Locator = withContext(Dispatchers.IO) {
+        // Fence the old surface before any background parse or document replacement. The old
+        // ScrollView may still receive main-thread callbacks while this suspend function is on IO.
+        withContext(Dispatchers.Main) {
+            invalidateHighlightRefreshCallbacks()
+        }
         paginationGeneration.incrementAndGet()
         val markdown = context.contentResolver.openInputStream(uri)?.use {
             it.readBytes().toString(Charsets.UTF_8)
@@ -191,10 +197,10 @@ class MarkdownEngine(
         val initial = parsed.locatorForOffset(0)
         // Markwon.toMarkdown is pure text→Spanned (no TextView); safe off-main.
         val rendered = markwon.toMarkdown(markdown)
-        document = parsed
         withContext(Dispatchers.Main) {
-            // Invalidate any post{} callbacks from a previous open on this engine instance.
-            invalidateHighlightRefreshCallbacks()
+            // Install the new document only after the previous surface has been fenced on Main;
+            // no callback can observe a mixed old-view/new-document pair.
+            document = parsed
             cachedRendered = rendered
             // Preserve the last valid window set until the rebuilt set is installed: a host
             // observing PAGED must never see a published pageCount backed by empty windows.
@@ -230,6 +236,11 @@ class MarkdownEngine(
         val padding = textPaddingPx
         // Remount: drop ownership of any prior ScrollView/TextView so stale post{} cannot write them.
         invalidateHighlightRefreshCallbacks()
+        // Capture the generation AFTER invalidation: this onScrollChange listener may only
+        // publish progress while this exact surface is the engine's current SCROLL pair.
+        // openBook/close/another createView bump the generation and/or swap the fields, so a
+        // callback from this (now detached) surface must never republish an old locator.
+        val generation = highlightRefreshGeneration
         val tv = SelectionAwareTextView(context).apply {
             textSize = fontSizeSp
             setLineSpacing(0f, lineSpacingMultiplier)
@@ -257,6 +268,12 @@ class MarkdownEngine(
             )
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
                 if (suppressLocatorUpdates) return@setOnScrollChangeListener
+                // Reject stale callbacks: after remount/open/close the generation is bumped or
+                // this surface is no longer the active pair — publishing here would mix a newer
+                // document with this surface's old rendered text.
+                if (generation != highlightRefreshGeneration) return@setOnScrollChangeListener
+                if (_pagingKind.value != PagingKind.CONTINUOUS) return@setOnScrollChangeListener
+                if (scrollView !== this@apply || textView !== tv) return@setOnScrollChangeListener
                 publishLocator(
                     document.locatorForRenderedOffset(
                         renderedOffset = tv.characterOffsetForScrollY(scrollY),
