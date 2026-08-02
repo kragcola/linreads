@@ -1,5 +1,6 @@
 package dev.readflow.updater
 
+import android.app.DownloadManager
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -27,14 +28,48 @@ class UpdateDownloadPolicyTest {
     }
 
     @Test
-    fun `download manager never attaches the OTA token`() {
-        assertFalse(
+    fun `download manager attaches the OTA token only to https github assets`() {
+        assertTrue(
             shouldAttachUpdateAuthorization(
                 "https://github.com/kragcola/linreads/releases/download/dev-latest/app.apk",
             ),
         )
+        assertTrue(
+            shouldAttachUpdateAuthorization(
+                "https://github.com/kragcola/linreads/releases/download/dev-latest/app-ota-100353.apk",
+            ),
+        )
         assertFalse(shouldAttachUpdateAuthorization("http://github.com/kragcola/linreads/app.apk"))
         assertFalse(shouldAttachUpdateAuthorization("https://example.com/app.apk"))
+        assertFalse(shouldAttachUpdateAuthorization("https://github.com.evil.test/app.apk"))
+        assertFalse(shouldAttachUpdateAuthorization("not a url"))
+        assertFalse(shouldAttachUpdateAuthorization(""))
+    }
+
+    @Test
+    fun `failed download is re-enqueued only inside the bounded retry cap`() {
+        assertTrue(downloadFailureRetry(DownloadManager.STATUS_FAILED, attemptCount = 0))
+        assertTrue(downloadFailureRetry(DownloadManager.STATUS_FAILED, attemptCount = 1))
+        assertFalse(downloadFailureRetry(DownloadManager.STATUS_FAILED, attemptCount = 2))
+        assertFalse(
+            downloadFailureRetry(
+                DownloadManager.STATUS_FAILED,
+                attemptCount = DOWNLOAD_FAILURE_RETRY_CAP,
+            ),
+        )
+    }
+
+    @Test
+    fun `non failed completion never triggers a download retry`() {
+        assertFalse(downloadFailureRetry(DownloadManager.STATUS_SUCCESSFUL, attemptCount = 0))
+        assertFalse(downloadFailureRetry(DownloadManager.STATUS_PAUSED, attemptCount = 0))
+        assertFalse(downloadFailureRetry(DownloadManager.STATUS_PENDING, attemptCount = 0))
+    }
+
+    @Test
+    fun `fresh update requests reset the failure counter but failure retries preserve it`() {
+        assertTrue(shouldResetDownloadFailureCount(triggeredByDownloadFailure = false))
+        assertFalse(shouldResetDownloadFailureCount(triggeredByDownloadFailure = true))
     }
 
     @Test

@@ -163,6 +163,8 @@ private fun enqueueDownloadManagerUpdate(
     apkUrl: String,
     buildTag: String?,
     versionCode: Long?,
+    authToken: String = BuildConfig.GITHUB_OTA_TOKEN,
+    resetFailures: Boolean = true,
 ): Long? = synchronized(UPDATE_DOWNLOAD_STATE_LOCK) {
     val appContext = context.applicationContext
     val prefs = appContext.updatePreferences()
@@ -171,6 +173,9 @@ private fun enqueueDownloadManagerUpdate(
     if (shouldDeferCurrentInstallReplacement(appContext)) return@synchronized null
 
     val request = DownloadManager.Request(Uri.parse(apkUrl)).apply {
+        if (authToken.isNotBlank() && shouldAttachUpdateAuthorization(apkUrl)) {
+            addRequestHeader("Authorization", "Bearer $authToken")
+        }
         setTitle("LinReads 更新下载中")
         setDescription("正在下载新版本…")
         setMimeType("application/vnd.android.package-archive")
@@ -186,6 +191,9 @@ private fun enqueueDownloadManagerUpdate(
             apkUrl = apkUrl,
             buildTag = buildTag,
             versionCode = versionCode,
+            resetFailures = shouldResetDownloadFailureCount(
+                triggeredByDownloadFailure = !resetFailures,
+            ),
         )
     ) {
         runCatching { downloadManager.remove(downloadId) }
@@ -317,6 +325,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                     apkUrl = apkUrl,
                     buildTag = buildTag,
                     versionCode = versionCode,
+                    authToken = BuildConfig.GITHUB_OTA_TOKEN,
                 )
                 return
             }
@@ -327,6 +336,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
                     apkUrl = apkUrl,
                     buildTag = buildTag,
                     versionCode = versionCode,
+                    authToken = BuildConfig.GITHUB_OTA_TOKEN,
                 )
                 return
             }
@@ -366,6 +376,7 @@ class UpdateInstallReceiver : BroadcastReceiver() {
             apkUrl = apkUrl,
             buildTag = buildTag,
             versionCode = versionCode,
+            authToken = BuildConfig.GITHUB_OTA_TOKEN,
         )
     }
 
@@ -377,9 +388,43 @@ class UpdateInstallReceiver : BroadcastReceiver() {
         if (dlId != savedId) return
 
         val dm = context.getSystemService(DownloadManager::class.java)
-        val apkUri = dm.getUriForDownloadedFile(dlId) ?: return
+        val apkUri = dm.getUriForDownloadedFile(dlId)
+        if (apkUri != null) {
+            resetPersistedDownloadFailures(context, dlId)
+            stageDownloadedUpdate(context, dlId, apkUri)
+            return
+        }
 
-        stageDownloadedUpdate(context, dlId, apkUri)
+        // A failed current task must not silently stay "downloading": retry inside a bounded cap,
+        // then surface the failure with a tap-to-retry notification.
+        val outcome = queryDownloadStatus(context, dlId) ?: return
+        val (status, reason) = outcome
+        val failures = prefs.getInt(KEY_DOWNLOAD_FAILURES, 0)
+        if (downloadFailureRetry(status, failures)) {
+            Log.w(TAG, "update download ${statusToText(status)} reason=$reason; re-enqueuing")
+            prefs.edit().putInt(KEY_DOWNLOAD_FAILURES, failures + 1).apply()
+            val apkUrl = prefs.getString(KEY_DOWNLOAD_URL, null)
+            val buildTag = prefs.getString(KEY_DOWNLOAD_TAG, null)
+            val versionCode = prefs.optionalVersionCode(KEY_DOWNLOAD_VERSION_CODE)
+            if (apkUrl != null) {
+                enqueueDownloadManagerUpdate(
+                    context = context,
+                    apkUrl = apkUrl,
+                    buildTag = buildTag,
+                    versionCode = versionCode,
+                    authToken = BuildConfig.GITHUB_OTA_TOKEN,
+                    resetFailures = false,
+                )
+            }
+            return
+        }
+
+        Log.w(
+            TAG,
+            "update download ${statusToText(status)} reason=$reason; " +
+                "automatic retries exhausted (${DOWNLOAD_FAILURE_RETRY_CAP})",
+        )
+        postDownloadFailureNotification(context)
     }
 }
 
@@ -501,6 +546,7 @@ private fun discardPersistedUpdate(context: Context, downloadId: Long) {
         .remove(KEY_DOWNLOAD_APK_PATH)
         .remove(KEY_DOWNLOAD_BYTES)
         .remove(KEY_DOWNLOAD_TOTAL)
+        .remove(KEY_DOWNLOAD_FAILURES)
         .remove(KEY_UNKNOWN_SOURCES_PERMISSION_PENDING)
         .remove(KEY_POST_INSTALL_ARMED_TAG)
         .apply()
@@ -565,6 +611,7 @@ private fun clearInstalledUpdateState(context: Context) {
         .remove(KEY_DOWNLOAD_APK_PATH)
         .remove(KEY_DOWNLOAD_BYTES)
         .remove(KEY_DOWNLOAD_TOTAL)
+        .remove(KEY_DOWNLOAD_FAILURES)
         .remove(KEY_UNKNOWN_SOURCES_PERMISSION_PENDING)
         .remove(KEY_POST_INSTALL_ARMED_TAG)
         .apply()
@@ -670,6 +717,71 @@ private fun canPostUpdateNotification(context: Context): Boolean {
     )
 }
 
+private fun queryDownloadStatus(
+    context: Context,
+    downloadId: Long,
+): Pair<Int, Int>? = runCatching {
+    val dm = context.getSystemService(DownloadManager::class.java)
+    dm.query(DownloadManager.Query().setFilterById(downloadId)).use { cursor ->
+        if (cursor.moveToFirst()) {
+            val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+            val reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON))
+            status to reason
+        } else {
+            null
+        }
+    }
+}.getOrNull()
+
+private fun resetPersistedDownloadFailures(context: Context, downloadId: Long) {
+    val prefs = context.getSharedPreferences("update", Context.MODE_PRIVATE)
+    if (prefs.getLong(KEY_DOWNLOAD_ID, NO_DOWNLOAD) != downloadId) return
+    prefs.edit().putInt(KEY_DOWNLOAD_FAILURES, 0).apply()
+}
+
+private fun statusToText(status: Int): String = when (status) {
+    DownloadManager.STATUS_PENDING -> "pending"
+    DownloadManager.STATUS_RUNNING -> "running"
+    DownloadManager.STATUS_PAUSED -> "paused"
+    DownloadManager.STATUS_SUCCESSFUL -> "successful"
+    DownloadManager.STATUS_FAILED -> "failed"
+    else -> "status=$status"
+}
+
+private fun postDownloadFailureNotification(context: Context) {
+    runCatching {
+        if (!canPostUpdateNotification(context)) return@runCatching
+        val appContext = context.applicationContext
+        appContext.getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(UPDATE_CHANNEL_ID, "应用更新", NotificationManager.IMPORTANCE_HIGH),
+        )
+        val prefs = appContext.getSharedPreferences("update", Context.MODE_PRIVATE)
+        val retryIntent = PendingIntent.getBroadcast(
+            appContext,
+            UPDATE_DETECTION_NOTIFICATION_ID,
+            Intent(appContext, UpdateInstallReceiver::class.java).apply {
+                putExtra(UPDATE_EXTRA_APK_URL, prefs.getString(KEY_DOWNLOAD_URL, null))
+                putExtra(UPDATE_EXTRA_BUILD_TAG, prefs.getString(KEY_DOWNLOAD_TAG, null))
+                prefs.optionalVersionCode(KEY_DOWNLOAD_VERSION_CODE)?.let {
+                    putExtra(UPDATE_EXTRA_VERSION_CODE, it)
+                }
+                putExtra(UPDATE_EXTRA_AUTOMATIC, false)
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        NotificationManagerCompat.from(appContext).notify(
+            UPDATE_DETECTION_NOTIFICATION_ID,
+            NotificationCompat.Builder(appContext, UPDATE_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentTitle("LinReads 更新下载失败")
+                .setContentText("点按重试下载")
+                .setAutoCancel(true)
+                .setContentIntent(retryIntent)
+                .build(),
+        )
+    }
+}
+
 private fun unknownSourcesSettingsIntent(context: Context) =
     Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
         data = Uri.parse("package:${context.packageName}")
@@ -689,6 +801,7 @@ internal const val KEY_DOWNLOAD_ID = "dl_id"
 internal const val KEY_DOWNLOAD_URL = "dl_url"
 internal const val KEY_DOWNLOAD_TAG = "dl_tag"
 private const val KEY_DOWNLOAD_VERSION_CODE = "dl_version_code"
+internal const val KEY_DOWNLOAD_FAILURES = "dl_failures"
 internal const val KEY_UNKNOWN_SOURCES_PERMISSION_PENDING = "unknown_sources_permission_pending"
 internal const val KEY_POST_INSTALL_ARMED_TAG = "post_install_armed_tag"
 internal const val KEY_POST_INSTALL_HANDLED_TAG = "post_install_handled_tag"

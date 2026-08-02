@@ -1,8 +1,10 @@
 package dev.readflow.updater
 
+import android.app.DownloadManager
 import java.net.URI
 
 internal const val DOWNLOAD_BACKEND_DOWNLOAD_MANAGER = "download_manager"
+internal const val DOWNLOAD_FAILURE_RETRY_CAP = 2
 
 internal enum class PersistedDownloadBackend {
     LEGACY,
@@ -16,9 +18,31 @@ internal fun persistedDownloadBackend(value: String?): PersistedDownloadBackend 
     else -> PersistedDownloadBackend.LEGACY
 }
 
-internal fun shouldAttachUpdateAuthorization(
-    @Suppress("UNUSED_PARAMETER") url: String,
-): Boolean = false
+/** Only GitHub-owned HTTPS asset URLs may receive the private-repo bearer token. */
+internal fun shouldAttachUpdateAuthorization(url: String): Boolean = runCatching {
+    val uri = URI(url)
+    uri.scheme.equals("https", ignoreCase = true) &&
+        uri.host.equals("github.com", ignoreCase = true)
+}.getOrDefault(false)
+
+/**
+ * A failed system DownloadManager task is re-enqueued only while its failure
+ * counter stays inside the bounded retry cap. Crossing the cap surfaces the
+ * failure instead of looping forever.
+ */
+internal fun downloadFailureRetry(
+    downloadStatus: Int,
+    attemptCount: Int,
+): Boolean = downloadStatus == DownloadManager.STATUS_FAILED &&
+    attemptCount < DOWNLOAD_FAILURE_RETRY_CAP
+
+/**
+ * A genuinely new update request starts with a zero failure counter; a
+ * replacement triggered by a failed DownloadManager task must preserve the
+ * counter so the bounded retry cap is actually reached.
+ */
+internal fun shouldResetDownloadFailureCount(triggeredByDownloadFailure: Boolean): Boolean =
+    !triggeredByDownloadFailure
 
 internal enum class DownloadWriteMode {
     APPEND,

@@ -452,6 +452,7 @@ internal object UpdatePackageInstaller {
         apkUrl: String,
         buildTag: String?,
         versionCode: Long?,
+        resetFailures: Boolean = true,
     ): Boolean {
         val appContext = context.applicationContext
         var previousInstallDownloadId = NO_DOWNLOAD
@@ -491,6 +492,9 @@ internal object UpdatePackageInstaller {
                 editor.remove(KEY_DOWNLOAD_VERSION_CODE)
             } else {
                 editor.putLong(KEY_DOWNLOAD_VERSION_CODE, versionCode)
+            }
+            if (resetFailures) {
+                editor.putInt(KEY_DOWNLOAD_FAILURES, 0)
             }
             shouldActivateEnqueuedUpdate(
                 metadataCommitted = editor.commit(),
