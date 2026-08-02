@@ -909,8 +909,7 @@ class TxtVirtualPagerEngineTest {
                 "maxLines=${textView.maxLines} minLines=${textView.minLines} " +
                 "inputType=${textView.inputType} " +
                 "transformation=${textView.transformationMethod?.javaClass?.name ?: "null"} " +
-                "selectable=${textView.isTextSelectable} " +
-                "horizontallyScrollable=${textView.isHorizontallyScrollable}" +
+                "selectable=${textView.isTextSelectable}" +
                 "}"
         }
         val textViewStates = mutableListOf<String>()
