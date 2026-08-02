@@ -679,9 +679,21 @@ class TxtVirtualPagerEngine(
 
         // goTo already positioned the paragraph at offset zero. LinearLayoutManager corrects a
         // negative offset for the first/only oversized row back to its start gap, so apply the
-        // in-row correction only after that paragraph has a stable layout.
+        // in-row correction only after that paragraph has a stable layout. RecyclerView can leave
+        // a residual for its only oversized child, so the layout manager consumes that bounded tail.
         rv.scrollBy(0, distanceToAnchor)
-        return false
+        val remainingDistance = holder.itemView.top + textView.top + textView.totalPaddingTop +
+            layout.getLineTop(line) - rv.paddingTop
+        (rv.layoutManager as? TxtParagraphLayoutManager)?.offsetOversizedChildToAnchor(
+            child = holder.itemView,
+            distanceToAnchor = remainingDistance,
+            viewportStart = rv.paddingTop,
+            viewportEnd = rv.height - rv.paddingBottom,
+        )
+        val finalDistance = holder.itemView.top + textView.top + textView.totalPaddingTop +
+            layout.getLineTop(line) - rv.paddingTop
+        return abs(finalDistance) <= CONTINUOUS_ANCHOR_TOLERANCE_PX ||
+            isAtContinuousScrollBoundary(rv, finalDistance)
     }
 
     private fun isAtContinuousScrollBoundary(rv: RecyclerView, distanceToAnchor: Int): Boolean {
@@ -1628,6 +1640,27 @@ class TxtVirtualPagerEngine(
      */
     private class TxtParagraphLayoutManager(context: Context) : LinearLayoutManager(context) {
         private val afterLayoutCallbacks = mutableListOf<() -> Unit>()
+
+        fun offsetOversizedChildToAnchor(
+            child: View,
+            distanceToAnchor: Int,
+            viewportStart: Int,
+            viewportEnd: Int,
+        ) {
+            val childTop = getDecoratedTop(child)
+            val childBottom = getDecoratedBottom(child)
+            if (childBottom - childTop <= viewportEnd - viewportStart) return
+            val correction = when {
+                distanceToAnchor > 0 -> distanceToAnchor.coerceAtMost(
+                    (childBottom - viewportEnd).coerceAtLeast(0),
+                )
+                distanceToAnchor < 0 -> -(-distanceToAnchor).coerceAtMost(
+                    (viewportStart - childTop).coerceAtLeast(0),
+                )
+                else -> 0
+            }
+            if (correction != 0) offsetChildrenVertical(-correction)
+        }
 
         fun doAfterNextLayout(callback: () -> Unit) {
             afterLayoutCallbacks += callback
