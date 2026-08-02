@@ -658,12 +658,6 @@ class MarkdownEngine(
                 sv.requestLayout()
             }
             sv.scrollTo(0, y)
-            // A pending ScrollView layout means the new WRAP_CONTENT height is not committed to
-            // the hierarchy yet: the upcoming pass can clamp scrollY to zero (or below the target).
-            // Complete only after the committed layout confirms the reach.
-            if (sv.isLayoutRequested) {
-                return false
-            }
             // Completion is real only when the viewport actually reaches the computed target line.
             // A positive-but-still-clamped scrollY (content height under-committed) must keep
             // retrying instead of reporting success.
@@ -1019,6 +1013,13 @@ class MarkdownEngine(
     private fun captureScrollTypographyAnchor(): Locator? {
         if (_pagingKind.value != PagingKind.CONTINUOUS) return null
         pendingScrollTypographyAnchor?.let { return it }
+        // Keep an exact source locator already owned by the engine (for example a goTo target).
+        // Re-deriving from the viewport only gives the visual line start and silently discards an
+        // inner-character anchor during a typography rebuild.
+        val current = normalizeToSourceSection(_currentLocator.value)
+        if ((current.strategy as? LocatorStrategy.Section)?.charOffset ?: 0 > 0) {
+            return current
+        }
         val sv = scrollView ?: return normalizeToSourceSection(_currentLocator.value)
         val tv = textView ?: return normalizeToSourceSection(_currentLocator.value)
         if (tv.layout == null) return normalizeToSourceSection(_currentLocator.value)

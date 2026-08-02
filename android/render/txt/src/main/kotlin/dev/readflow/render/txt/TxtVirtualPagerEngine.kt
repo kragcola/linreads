@@ -251,7 +251,12 @@ class TxtVirtualPagerEngine(
         val surfaceReportGeneration = scrollReportGeneration.incrementAndGet()
         val initialPosition = currentParagraphPosition()
         val rv = RecyclerView(context).apply {
-            layoutManager = LinearLayoutManager(context)
+            // A paragraph is one adapter row, but it can be taller than the viewport. The stock
+            // LinearLayoutManager measures WRAP_CONTENT children with an AT_MOST viewport height,
+            // which truncates a single long paragraph and makes inner-character scrolling a no-op.
+            // Measure paragraph rows with an unspecified height so RecyclerView can scroll through
+            // their full TextView layout while retaining LinearLayoutManager semantics.
+            layoutManager = TxtParagraphLayoutManager(context)
             val palette = paletteFor(themeMode, resources.configuration)
             adapter = TxtParagraphAdapter(
                 paragraphCount = paragraphCount(),
@@ -1531,6 +1536,30 @@ class TxtVirtualPagerEngine(
                     getChildAt(index).clearNativeSelectionsRecursively()
                 }
             }
+        }
+    }
+
+    /**
+     * Lets a long single paragraph retain its complete measured height inside the scroll surface.
+     * RecyclerView's default child spec caps WRAP_CONTENT rows at the viewport height, preventing
+     * inner-line scrolling when a TXT source has no paragraph breaks.
+     */
+    private class TxtParagraphLayoutManager(context: Context) : LinearLayoutManager(context) {
+        override fun measureChildWithMargins(child: View, widthUsed: Int, heightUsed: Int) {
+            val lp = child.layoutParams as? RecyclerView.LayoutParams
+            if (lp == null || lp.height != ViewGroup.LayoutParams.WRAP_CONTENT) {
+                super.measureChildWithMargins(child, widthUsed, heightUsed)
+                return
+            }
+            val availableWidth = (
+                width - paddingLeft - paddingRight - lp.leftMargin - lp.rightMargin - widthUsed
+            ).coerceAtLeast(0)
+            val widthSpec = View.MeasureSpec.makeMeasureSpec(
+                availableWidth,
+                View.MeasureSpec.EXACTLY,
+            )
+            val heightSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            child.measure(widthSpec, heightSpec)
         }
     }
 
