@@ -22,6 +22,7 @@ import dev.readflow.render.api.SelectionAwareTextView
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -704,11 +705,15 @@ class TxtVirtualPagerEngineTest {
             shadowOf(Looper.getMainLooper()).idle()
             view.measureLayout(420, 640)
         }
-        // Scroll deep inside the single paragraph so the viewport top and center differ.
-        view.scrollBy(0, 1200)
-        view.measureLayout(420, 640)
-        shadowOf(Looper.getMainLooper()).idle()
-        view.measureLayout(420, 640)
+        // Establish the same paragraph-internal continuous position through the public locator
+        // path. A detached Robolectric RecyclerView does not reliably consume raw scrollBy()
+        // deltas for a single oversized child.
+        val requestedOffset = source.length / 3
+        engine.goTo(Locator(LocatorStrategy.Section(0, 0, requestedOffset)))
+        repeat(2) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
 
         val holder = view.findViewHolderForAdapterPosition(0)
             as? TxtParagraphAdapter.ParagraphHolder
@@ -717,8 +722,18 @@ class TxtVirtualPagerEngineTest {
         val layout = requireNotNull(textView.layout)
         val textTopInRecycler = holder.itemView.top + textView.top + textView.totalPaddingTop
         val topLineCharOffset = layout.getLineStart(layout.getLineForVertical(view.paddingTop - textTopInRecycler))
+        val expectedLineStart = layout.getLineStart(layout.getLineForOffset(requestedOffset))
         val centerY = view.paddingTop + (view.height - view.paddingTop - view.paddingBottom) / 2
         val centerLineCharOffset = layout.getLineStart(layout.getLineForVertical(centerY - textTopInRecycler))
+        assertEquals(
+            "public goTo must place its requested line at the viewport top",
+            expectedLineStart,
+            topLineCharOffset,
+        )
+        assertTrue(
+            "fixture must establish a non-zero public goTo top anchor; top=$topLineCharOffset",
+            topLineCharOffset > 0,
+        )
         assertTrue(
             "fixture must separate the top anchor from the viewport center; top=$topLineCharOffset center=$centerLineCharOffset",
             centerLineCharOffset > topLineCharOffset,
@@ -766,10 +781,28 @@ class TxtVirtualPagerEngineTest {
         view.measureLayout(420, 640)
         shadowOf(Looper.getMainLooper()).idle()
         view.measureLayout(420, 640)
-        // Scroll deep inside the single paragraph so the viewport center is mid-text.
-        view.scrollBy(0, 2000)
-        view.measureLayout(420, 640)
-        shadowOf(Looper.getMainLooper()).idle()
+        // Use the public locator path to establish an in-paragraph continuous position.
+        val requestedOffset = source.length / 3
+        engine.goTo(Locator(LocatorStrategy.Section(0, 0, requestedOffset)))
+        repeat(2) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+        val holder = view.findViewHolderForAdapterPosition(0)
+            as? TxtParagraphAdapter.ParagraphHolder
+            ?: error("fixture paragraph must be bound after public goTo")
+        val layout = requireNotNull(holder.textView.layout)
+        val textTopInRecycler = holder.itemView.top + holder.textView.top + holder.textView.totalPaddingTop
+        val topLineCharOffset = layout.getLineStart(
+            layout.getLineForVertical(view.paddingTop - textTopInRecycler),
+        )
+        val expectedLineStart = layout.getLineStart(layout.getLineForOffset(requestedOffset))
+        assertTrue("fixture request must be a paragraph-internal line", expectedLineStart > 0)
+        assertEquals(
+            "public goTo must place its requested line at the viewport top",
+            expectedLineStart,
+            topLineCharOffset,
+        )
         assertEquals(0, (view.layoutManager as LinearLayoutManager).findFirstVisibleItemPosition())
 
         engine.setMode(ReadingMode.PAGED)
@@ -781,6 +814,50 @@ class TxtVirtualPagerEngineTest {
             offset > 0L,
         )
         assertEquals(0, engine.currentParagraphIndexForTest())
+    }
+
+    @Test
+    fun `continuous goTo at document end settles at the physical scroll boundary`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val source = buildString {
+            repeat(1_200) { index -> append("terminal paragraph row %04d ".format(index)) }
+            append("END_ANCHOR")
+        }
+        val targetOffset = source.indexOf("END_ANCHOR")
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-goto-end-", suffix = ".txt").toFile()
+        file.writeText(source, charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measureLayout(420, 640)
+        engine.goTo(Locator(LocatorStrategy.Section(0, 0, targetOffset)))
+        repeat(8) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+
+        val holder = view.findViewHolderForAdapterPosition(0)
+            as? TxtParagraphAdapter.ParagraphHolder
+            ?: error("end-anchor paragraph must remain bound")
+        val layout = requireNotNull(holder.textView.layout)
+        val endLine = layout.getLineForOffset(targetOffset)
+        val endLineTop = holder.itemView.top + holder.textView.top +
+            holder.textView.totalPaddingTop + layout.getLineTop(endLine)
+        val endLineBottom = holder.itemView.top + holder.textView.top +
+            holder.textView.totalPaddingTop + layout.getLineBottom(endLine)
+        assertTrue("fixture must navigate to the document's lower scroll boundary", !view.canScrollVertically(1))
+        assertTrue(
+            "the final line is visible at the lower boundary instead of being forced beyond it; " +
+                "top=$endLineTop bottom=$endLineBottom",
+            endLineTop >= view.paddingTop && endLineBottom <= view.height - view.paddingBottom,
+        )
+        repeat(3) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse("a boundary anchor must not leave a perpetual layout request", view.isLayoutRequested)
     }
 
     @Test

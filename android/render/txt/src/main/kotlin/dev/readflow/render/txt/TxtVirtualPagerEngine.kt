@@ -280,27 +280,15 @@ class TxtVirtualPagerEngine(
                 }
             })
             (layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(initialPosition.paragraphIndex, 0)
-            if (initialPosition.charOffset > 0) {
-                addOnLayoutChangeListener(object : View.OnLayoutChangeListener {
-                    override fun onLayoutChange(
-                        view: View,
-                        left: Int,
-                        top: Int,
-                        right: Int,
-                        bottom: Int,
-                        oldLeft: Int,
-                        oldTop: Int,
-                        oldRight: Int,
-                        oldBottom: Int,
-                    ) {
-                        if (restoreContinuousPosition(this@apply, initialPosition)) {
-                            removeOnLayoutChangeListener(this)
-                        }
-                    }
-                })
-            }
         }
         recyclerView = rv
+        if (initialPosition.charOffset > 0) {
+            scheduleContinuousInnerOffsetRestore(
+                rv = rv,
+                position = initialPosition,
+                navigationGeneration = continuousTypographyRestoreGeneration,
+            )
+        }
         return rv
     }
 
@@ -671,8 +659,26 @@ class TxtVirtualPagerEngine(
         val line = layout.getLineForOffset(safeOffset)
         val lineTopInRecycler = holder.itemView.top + textView.top + textView.totalPaddingTop +
             layout.getLineTop(line)
-        rv.scrollBy(0, lineTopInRecycler - rv.paddingTop)
-        return true
+        val distanceToAnchor = lineTopInRecycler - rv.paddingTop
+        if (
+            abs(distanceToAnchor) <= CONTINUOUS_ANCHOR_TOLERANCE_PX ||
+            (distanceToAnchor > 0 && !rv.canScrollVertically(1)) ||
+            (distanceToAnchor < 0 && !rv.canScrollVertically(-1))
+        ) {
+            // The document boundary can leave a final/initial line visible without enough content
+            // on the other side to place it exactly at the viewport top. It is already stable.
+            return true
+        }
+
+        // A line inside an oversized paragraph must become the LayoutManager's pending anchor.
+        // Calling scrollBy while the child is being laid out races its pending position request and
+        // can consume a stale delta. The next layout places this paragraph at the exact in-row offset.
+        val itemOffset = -(textView.top + textView.totalPaddingTop + layout.getLineTop(line))
+        (rv.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(
+            position.paragraphIndex,
+            itemOffset,
+        )
+        return false
     }
 
     private fun captureContinuousTypographyAnchor(): TxtParagraphPosition? {
@@ -746,6 +752,7 @@ class TxtVirtualPagerEngine(
         lateinit var childAttachListener: RecyclerView.OnChildAttachStateChangeListener
         var observedChild: View? = null
         var completed = false
+        var retryPosted = false
 
         fun detach() {
             observedChild?.removeOnLayoutChangeListener(childLayoutListener)
@@ -757,6 +764,16 @@ class TxtVirtualPagerEngine(
             if (completed) return
             if (!isCurrent()) {
                 detach()
+                return
+            }
+            if (rv.isComputingLayout) {
+                if (!retryPosted) {
+                    retryPosted = true
+                    rv.post {
+                        retryPosted = false
+                        tryRestore()
+                    }
+                }
                 return
             }
             val holder = rv.findViewHolderForAdapterPosition(paragraphIndex)
@@ -1566,6 +1583,7 @@ class TxtVirtualPagerEngine(
     private companion object {
         private const val DOCUMENT_TITLE_FALLBACK = "正文"
         private const val PAGED_PARAGRAPH_GAP_DP = 20
+        private const val CONTINUOUS_ANCHOR_TOLERANCE_PX = 2
         private val TXT_HEADING = Regex("""^(第.{1,12}[章节回卷部篇集].*|Chapter\s+\d+.*|CHAPTER\s+\d+.*)$""")
 
         private fun isTxtHeading(value: String): Boolean =
