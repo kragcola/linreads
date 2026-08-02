@@ -917,9 +917,22 @@ class TxtVirtualPagerEngineTest {
             val line = layout.getLineForOffset(renderedOffset)
             return holder.itemView.top + textView.top + textView.totalPaddingTop + layout.getLineTop(line)
         }
+        val beforeManualRestoreTop = tokenLineTop()
+        val currentPosition = TxtVirtualPagerEngine::class.java
+            .getDeclaredMethod("currentParagraphPosition")
+            .apply { isAccessible = true }
+            .invoke(engine)
+        val manualRestoreResult = TxtVirtualPagerEngine::class.java.declaredMethods
+            .single { it.name == "restoreContinuousPosition" }
+            .apply { isAccessible = true }
+            .invoke(engine, view, currentPosition) as Boolean
+        val afterManualRestoreTop = tokenLineTop()
         assertTrue(
-            "initial restore must put the target line at the viewport top; top=${tokenLineTop()} padding=${view.paddingTop}",
-            abs(tokenLineTop() - view.paddingTop) <= 2,
+            "initial restore must put the target line at the viewport top; " +
+                "before=$beforeManualRestoreTop afterManual=$afterManualRestoreTop " +
+                "manualResult=$manualRestoreResult padding=${view.paddingTop} " +
+                "layoutRequested=${view.isLayoutRequested} computingLayout=${view.isComputingLayout}",
+            abs(beforeManualRestoreTop - view.paddingTop) <= 2,
         )
 
         engine.setFontSize(30f)
