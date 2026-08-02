@@ -927,10 +927,19 @@ class TxtVirtualPagerEngineTest {
             .apply { isAccessible = true }
             .invoke(engine, view, currentPosition) as Boolean
         val afterManualRestoreTop = tokenLineTop()
+        val diagnosticHolder = view.findViewHolderForAdapterPosition(0)
+            as? TxtParagraphAdapter.ParagraphHolder ?: error("diagnostic holder must remain bound")
+        val diagnosticLayoutManager = view.layoutManager as LinearLayoutManager
         assertTrue(
             "initial restore must put the target line at the viewport top; " +
                 "before=$beforeManualRestoreTop afterManual=$afterManualRestoreTop " +
                 "manualResult=$manualRestoreResult padding=${view.paddingTop} " +
+                "rowTop=${diagnosticHolder.itemView.top} rowBottom=${diagnosticHolder.itemView.bottom} " +
+                "decoratedTop=${diagnosticLayoutManager.getDecoratedTop(diagnosticHolder.itemView)} " +
+                "decoratedBottom=${diagnosticLayoutManager.getDecoratedBottom(diagnosticHolder.itemView)} " +
+                "textHeight=${diagnosticHolder.textView.height} " +
+                "layoutHeight=${diagnosticHolder.textView.layout?.height} " +
+                "itemCount=${view.adapter?.itemCount} viewHeight=${view.height} " +
                 "layoutRequested=${view.isLayoutRequested} computingLayout=${view.isComputingLayout}",
             abs(beforeManualRestoreTop - view.paddingTop) <= 2,
         )
