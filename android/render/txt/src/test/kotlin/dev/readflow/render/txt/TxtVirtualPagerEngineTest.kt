@@ -894,17 +894,64 @@ class TxtVirtualPagerEngineTest {
             repeat(700) { index -> append("suffix%04d ".format(index)) }
         }
         val targetOffset = source.indexOf("TARGET_ANCHOR")
+        fun textViewState(
+            phase: String,
+            textView: SelectionAwareTextView,
+            rowHeight: Int,
+        ): String {
+            val layout = textView.layout
+            return "$phase{" +
+                "lineCount=${layout?.lineCount} rowHeight=$rowHeight " +
+                "textSize=${textView.width}x${textView.height} " +
+                "layoutSize=${layout?.width}x${layout?.height} " +
+                "padding=${textView.totalPaddingLeft},${textView.totalPaddingTop}," +
+                "${textView.totalPaddingRight},${textView.totalPaddingBottom} " +
+                "maxLines=${textView.maxLines} minLines=${textView.minLines} " +
+                "inputType=${textView.inputType} " +
+                "transformation=${textView.transformationMethod?.javaClass?.name ?: "null"} " +
+                "selectable=${textView.isTextSelectable} " +
+                "horizontallyScrollable=${textView.isHorizontallyScrollable}" +
+                "}"
+        }
+        val textViewStates = mutableListOf<String>()
+        val probeAdapter = TxtParagraphAdapter(
+            paragraphCount = 1,
+            paragraphProvider = { source },
+            fontSizeSp = 18f,
+            lineSpacingMultiplier = 1.75f,
+        )
+        val probeHolder = probeAdapter.onCreateViewHolder(RecyclerView(context), 0)
+        textViewStates += textViewState("probe-created", probeHolder.textView, probeHolder.itemView.height)
+        probeAdapter.onBindViewHolder(probeHolder, 0)
+        textViewStates += textViewState("probe-bound", probeHolder.textView, probeHolder.itemView.height)
         val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-rapid-typography-", suffix = ".txt").toFile()
         file.writeText(source, charset = StandardCharsets.UTF_8)
         val engine = TxtVirtualPagerEngine(context)
         engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, targetOffset)))
         engine.openBook(Uri.fromFile(file))
         val view = engine.createView() as RecyclerView
+        fun recordEngineState(phase: String) {
+            val holder = view.findViewHolderForAdapterPosition(0) as? TxtParagraphAdapter.ParagraphHolder
+            textViewStates += if (holder == null) "$phase{holder=unbound}" else {
+                textViewState(phase, holder.textView, holder.itemView.height)
+            }
+        }
+        view.addOnChildAttachStateChangeListener(object : RecyclerView.OnChildAttachStateChangeListener {
+            override fun onChildViewAttachedToWindow(child: View) {
+                val textView = (child as? FrameLayout)?.getChildAt(0) as? SelectionAwareTextView ?: return
+                textViewStates += textViewState("engine-child-attached", textView, child.height)
+            }
+
+            override fun onChildViewDetachedFromWindow(child: View) = Unit
+        })
         attachToActivityWindow(view)
+        recordEngineState("engine-after-attach")
         view.measureLayout(420, 640)
-        repeat(5) {
+        recordEngineState("engine-after-first-measure")
+        repeat(5) { pass ->
             shadowOf(Looper.getMainLooper()).idle()
             view.measureLayout(420, 640)
+            recordEngineState("engine-after-idle-measure-$pass")
         }
 
         fun tokenLineTop(): Int {
@@ -920,7 +967,7 @@ class TxtVirtualPagerEngineTest {
         val initialHolder = view.findViewHolderForAdapterPosition(0)
             as? TxtParagraphAdapter.ParagraphHolder ?: error("initial holder must remain bound")
         assertTrue(
-            "fixture must exercise one vertically wrapped oversized row",
+            "fixture must exercise one vertically wrapped oversized row; ${textViewStates.joinToString(" | ")}",
             requireNotNull(initialHolder.textView.layout).lineCount > 1 &&
                 initialHolder.itemView.height > view.height,
         )
