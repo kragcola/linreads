@@ -553,6 +553,7 @@ internal class EpubFlowView(
     private val flipDurationMs = 280L
     private var queuedPageTurnDelta = 0
     private var rapidTurnSequenceActive = false
+    private var rapidQueuedTurnDrainPosted = false
     private var rapidTurnPairBootstrapRetries = 0
     private val rapidTurnIdleRunnable = object : Runnable {
         override fun run() {
@@ -1827,6 +1828,11 @@ internal class EpubFlowView(
             rapidIdlePageTurnGesture ||
             queuedPageTurnDelta != 0
         ) {
+            // Geometry reflow must stay out of the rapid visual transaction, but an already
+            // accepted queued turn must still get a frame to drain. Posting this separately keeps
+            // the queue observable until the caller returns while allowing pair bootstrap/animation
+            // to start on the next frame instead of waiting for the idle timeout.
+            scheduleRapidQueuedTurnDrain()
             postDelayed(reflowRunnable, REFLOW_DEBOUNCE_MS)
             return@Runnable
         }
@@ -3548,6 +3554,7 @@ internal class EpubFlowView(
         clearRapidFollowUpPageShot()
         queuedPageTurnDelta = 0
         rapidTurnSequenceActive = false
+        rapidQueuedTurnDrainPosted = false
         rapidTurnPairBootstrapRetries = 0
         busyPageTurnGesture = false
         rapidIdlePageTurnGesture = false
@@ -3581,6 +3588,22 @@ internal class EpubFlowView(
         if (!rapidTurnSequenceActive) return
         removeCallbacks(rapidTurnIdleRunnable)
         postDelayed(rapidTurnIdleRunnable, RAPID_TURN_IDLE_TIMEOUT_MS)
+    }
+
+    private fun scheduleRapidQueuedTurnDrain() {
+        if (
+            disposed ||
+            rapidQueuedTurnDrainPosted ||
+            turnInFlight ||
+            queuedPageTurnDelta == 0
+        ) return
+        rapidQueuedTurnDrainPosted = true
+        postOnAnimation {
+            rapidQueuedTurnDrainPosted = false
+            if (!disposed && !turnInFlight && queuedPageTurnDelta != 0) {
+                continueQueuedTurnsOrPrecache()
+            }
+        }
     }
 
     private fun rapidTurnPairGateActive(): Boolean =
