@@ -517,6 +517,7 @@ class MarkdownEngine(
         var terminated = false
         var retryPosted = false
         var retryBudget = SCROLL_RESTORE_RETRY_BUDGET
+        lateinit var postRetry: () -> Unit
 
         fun detach() {
             terminated = true
@@ -554,7 +555,7 @@ class MarkdownEngine(
                 if (
                     sv.width > 0 &&
                     sv.height > 0 &&
-                    restoreScrollToLocator(locator, generation, transaction, ::postRetry)
+                    restoreScrollToLocator(locator, generation, transaction, postRetry)
                 ) {
                     detach()
                     reportCompletion()
@@ -569,15 +570,15 @@ class MarkdownEngine(
          * replenished solely by a real layout listener pass (see below), never by this retry
          * itself, so a layout that never commits or an unreachable Y cannot self-repost forever.
          */
-        fun postRetry() {
-            if (completionReported || terminated) return
-            if (retryPosted || retryBudget <= 0) return
-            retryPosted = true
-            retryBudget -= 1
-            sv.postOnAnimation {
-                retryPosted = false
-                if (completionReported || terminated) return@postOnAnimation
-                attemptRestore()
+        postRetry = {
+            if (!completionReported && !terminated && !retryPosted && retryBudget > 0) {
+                retryPosted = true
+                retryBudget -= 1
+                sv.postOnAnimation {
+                    retryPosted = false
+                    if (completionReported || terminated) return@postOnAnimation
+                    attemptRestore()
+                }
             }
         }
         scrollListener = object : View.OnLayoutChangeListener {
