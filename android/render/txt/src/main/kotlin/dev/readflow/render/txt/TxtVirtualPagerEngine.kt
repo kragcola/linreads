@@ -283,11 +283,19 @@ class TxtVirtualPagerEngine(
         }
         recyclerView = rv
         if (initialPosition.charOffset > 0) {
-            scheduleContinuousInnerOffsetRestore(
-                rv = rv,
-                position = initialPosition,
-                navigationGeneration = continuousTypographyRestoreGeneration,
-            )
+            val navigationGeneration = continuousTypographyRestoreGeneration
+            rv.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(view: View) {
+                    rv.removeOnAttachStateChangeListener(this)
+                    scheduleContinuousInnerOffsetRestore(
+                        rv = rv,
+                        position = initialPosition,
+                        navigationGeneration = navigationGeneration,
+                    )
+                }
+
+                override fun onViewDetachedFromWindow(view: View) = Unit
+            })
         }
         return rv
     }

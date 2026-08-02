@@ -478,6 +478,7 @@ class TxtVirtualPagerEngineTest {
         engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, targetOffset)))
         engine.openBook(Uri.fromFile(file))
         val view = engine.createView() as RecyclerView
+        attachToActivityWindow(view)
         view.measure(
             android.view.View.MeasureSpec.makeMeasureSpec(420, android.view.View.MeasureSpec.EXACTLY),
             android.view.View.MeasureSpec.makeMeasureSpec(640, android.view.View.MeasureSpec.EXACTLY),
