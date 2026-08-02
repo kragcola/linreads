@@ -517,6 +517,7 @@ class MarkdownEngine(
         var terminated = false
         var retryPosted = false
         var retryBudget = SCROLL_RESTORE_RETRY_BUDGET
+        var layoutObserved = false
         lateinit var postRetry: () -> Unit
 
         fun detach() {
@@ -555,7 +556,13 @@ class MarkdownEngine(
                 if (
                     sv.width > 0 &&
                     sv.height > 0 &&
-                    restoreScrollToLocator(locator, generation, transaction, postRetry)
+                    restoreScrollToLocator(
+                        locator = locator,
+                        generation = generation,
+                        transaction = transaction,
+                        onRetry = postRetry,
+                        allowRequestedLayout = layoutObserved,
+                    )
                 ) {
                     detach()
                     reportCompletion()
@@ -596,7 +603,10 @@ class MarkdownEngine(
                 // A real layout pass replenishes the retry budget so the next attempt may use one
                 // next-frame retry. Never replenish while an attempt is measuring/layouting: the
                 // synchronous TextView.layout reentry below cannot feed an infinite retry loop.
-                if (!attemptInProgress) retryBudget = SCROLL_RESTORE_RETRY_BUDGET
+                if (!attemptInProgress) {
+                    layoutObserved = true
+                    retryBudget = SCROLL_RESTORE_RETRY_BUDGET
+                }
                 attemptRestore()
             }
         }
@@ -612,7 +622,10 @@ class MarkdownEngine(
                 oldRight: Int,
                 oldBottom: Int,
             ) {
-                if (!attemptInProgress) retryBudget = SCROLL_RESTORE_RETRY_BUDGET
+                if (!attemptInProgress) {
+                    layoutObserved = true
+                    retryBudget = SCROLL_RESTORE_RETRY_BUDGET
+                }
                 attemptRestore()
             }
         }
@@ -631,6 +644,7 @@ class MarkdownEngine(
         generation: Long = highlightRefreshGeneration,
         transaction: Long = scrollRestoreTransaction,
         onRetry: () -> Unit,
+        allowRequestedLayout: Boolean = false,
     ): Boolean {
         if (generation != highlightRefreshGeneration || transaction != scrollRestoreTransaction) return true
         val sv = scrollView ?: return true
@@ -658,6 +672,12 @@ class MarkdownEngine(
                 sv.requestLayout()
             }
             sv.scrollTo(0, y)
+            // The first attempt after a typography change may see a positive but still-clamped
+            // scrollY while the WRAP_CONTENT height request is pending. Require one real layout
+            // listener pass before accepting that value; later passes may converge immediately.
+            if (sv.isLayoutRequested && !allowRequestedLayout) {
+                return false
+            }
             // Completion is real only when the viewport actually reaches the computed target line.
             // A positive-but-still-clamped scrollY (content height under-committed) must keep
             // retrying instead of reporting success.
