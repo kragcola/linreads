@@ -513,6 +513,7 @@ class MarkdownEngine(
         lateinit var scrollListener: View.OnLayoutChangeListener
         lateinit var contentListener: View.OnLayoutChangeListener
         var observedTextView: TextView? = null
+        var attemptInProgress = false
 
         fun detach() {
             sv.removeOnLayoutChangeListener(scrollListener)
@@ -521,25 +522,38 @@ class MarkdownEngine(
         }
 
         fun attemptRestore() {
-            if (
-                generation != highlightRefreshGeneration ||
-                transaction != scrollRestoreTransaction ||
-                scrollView !== sv
-            ) {
-                detach()
-                return
-            }
-            // Retry on TextView content layout too: WRAP_CONTENT reflow commits its height on a
-            // later pass, and the ScrollView's own outer bounds may not change while content does.
-            val tv = textView
-            if (tv != null && tv !== observedTextView) {
-                observedTextView?.removeOnLayoutChangeListener(contentListener)
-                observedTextView = tv
-                tv.addOnLayoutChangeListener(contentListener)
-            }
-            if (sv.width > 0 && sv.height > 0 && restoreScrollToLocator(locator, generation, transaction)) {
-                detach()
-                reportCompletion()
+            // Robolectric and some Android layout paths deliver TextView layout callbacks
+            // synchronously from ensureScrollTextViewMeasured(). Do not re-enter the same
+            // restore transaction while it is measuring/layouting the content.
+            if (attemptInProgress) return
+            attemptInProgress = true
+            try {
+                if (
+                    generation != highlightRefreshGeneration ||
+                    transaction != scrollRestoreTransaction ||
+                    scrollView !== sv
+                ) {
+                    detach()
+                    return
+                }
+                // Retry on TextView content layout too: WRAP_CONTENT reflow commits its height on a
+                // later pass, and the ScrollView's own outer bounds may not change while content does.
+                val tv = textView
+                if (tv != null && tv !== observedTextView) {
+                    observedTextView?.removeOnLayoutChangeListener(contentListener)
+                    observedTextView = tv
+                    tv.addOnLayoutChangeListener(contentListener)
+                }
+                if (
+                    sv.width > 0 &&
+                    sv.height > 0 &&
+                    restoreScrollToLocator(locator, generation, transaction)
+                ) {
+                    detach()
+                    reportCompletion()
+                }
+            } finally {
+                attemptInProgress = false
             }
         }
         scrollListener = object : View.OnLayoutChangeListener {
