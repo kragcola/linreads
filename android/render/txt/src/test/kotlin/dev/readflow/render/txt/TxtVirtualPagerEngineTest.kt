@@ -885,7 +885,7 @@ class TxtVirtualPagerEngineTest {
     }
 
     @Test
-    fun `rapid typography restore waits for child reflow before completing`() = runTest(dispatcher) {
+    fun `rapid typography restore completes after child reflow`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val context = RuntimeEnvironment.getApplication()
         val source = buildString {
@@ -922,9 +922,12 @@ class TxtVirtualPagerEngineTest {
         }
         val initialHolder = view.findViewHolderForAdapterPosition(0)
             as? TxtParagraphAdapter.ParagraphHolder ?: error("initial holder must remain bound")
+        val initialLayout = requireNotNull(initialHolder.textView.layout)
+        val initialTextSize = initialHolder.textView.textSize
+        val initialLineSpacing = initialHolder.textView.lineSpacingMultiplier
         assertTrue(
             "fixture must exercise one vertically wrapped oversized row",
-            requireNotNull(initialHolder.textView.layout).lineCount > 1 &&
+            initialLayout.lineCount > 1 &&
                 initialHolder.itemView.height > view.height,
         )
         assertTrue(
@@ -935,17 +938,39 @@ class TxtVirtualPagerEngineTest {
 
         engine.setFontSize(30f)
         engine.setLineSpacing(0.9f)
-        // Drain only the one-shot posts: the child has not reflowed yet, so the restore must stay
-        // pending instead of completing against the stale pre-reflow holder layout.
+        fun assertTypographyApplied(phase: String) {
+            val holder = view.findViewHolderForAdapterPosition(0)
+                as? TxtParagraphAdapter.ParagraphHolder ?: error("$phase holder must remain bound")
+            assertTrue(
+                "$phase must apply the requested font size",
+                holder.textView.textSize > initialTextSize,
+            )
+            assertTrue(
+                "$phase must change the line spacing",
+                abs(holder.textView.lineSpacingMultiplier - initialLineSpacing) > 0.001f,
+            )
+            assertEquals(
+                "$phase must apply the requested line spacing",
+                0.9f,
+                holder.textView.lineSpacingMultiplier,
+                0.001f,
+            )
+            assertTrue(
+                "$phase must use a re-created child layout",
+                requireNotNull(holder.textView.layout) !== initialLayout,
+            )
+        }
+        // An attached Activity window may run the child's real reflow while draining posts.
         shadowOf(Looper.getMainLooper()).idle()
-        assertNotNull(
-            "restore must not complete on the stale pre-reflow holder layout",
-            engine.privateField("pendingContinuousTypographyAnchor"),
-        )
-        // One real layout pass rebinds/reflows the child; the content listener must converge.
+        if (engine.privateField("pendingContinuousTypographyAnchor") == null) {
+            assertTypographyApplied("idle-completed restore")
+        }
+        // If idle did not perform the child layout, explicit layout passes must converge it.
         view.measureLayout(420, 640)
         shadowOf(Looper.getMainLooper()).idle()
         view.measureLayout(420, 640)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTypographyApplied("settled restore")
         assertNull(
             "child reflow must complete the restore",
             engine.privateField("pendingContinuousTypographyAnchor"),
