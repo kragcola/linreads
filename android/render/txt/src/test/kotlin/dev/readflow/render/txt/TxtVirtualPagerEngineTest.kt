@@ -1,5 +1,6 @@
 package dev.readflow.render.txt
 
+import android.app.Activity
 import android.net.Uri
 import android.text.Selection
 import android.text.Spannable
@@ -39,9 +40,11 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
+import org.robolectric.android.controller.ActivityController
 import android.os.Looper
 import java.nio.charset.StandardCharsets
 import java.io.File
@@ -55,10 +58,21 @@ import kotlin.math.abs
 class TxtVirtualPagerEngineTest {
 
     private val dispatcher = StandardTestDispatcher()
+    private val attachedActivityControllers = mutableListOf<ActivityController<Activity>>()
 
     @After
     fun tearDown() {
+        attachedActivityControllers.asReversed().forEach { controller ->
+            controller.pause().stop().destroy()
+        }
+        attachedActivityControllers.clear()
         Dispatchers.resetMain()
+    }
+
+    private fun attachToActivityWindow(view: View) {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup().visible()
+        controller.get().setContentView(view)
+        attachedActivityControllers += controller
     }
 
     @Test
@@ -291,6 +305,7 @@ class TxtVirtualPagerEngineTest {
 
         engine.setMode(ReadingMode.SCROLL)
         val view = engine.createView() as RecyclerView
+        attachToActivityWindow(view)
         view.measure(
             android.view.View.MeasureSpec.makeMeasureSpec(420, android.view.View.MeasureSpec.EXACTLY),
             android.view.View.MeasureSpec.makeMeasureSpec(640, android.view.View.MeasureSpec.EXACTLY),
@@ -575,6 +590,7 @@ class TxtVirtualPagerEngineTest {
         val engine = TxtVirtualPagerEngine(context)
         engine.openBook(Uri.fromFile(file))
         val view = engine.createView() as RecyclerView
+        attachToActivityWindow(view)
         view.measureLayout(420, 640)
         repeat(2) {
             shadowOf(Looper.getMainLooper()).idle()
@@ -700,6 +716,7 @@ class TxtVirtualPagerEngineTest {
         engine.setViewportSize(420, 640)
         engine.openBook(Uri.fromFile(file))
         val view = engine.createView() as RecyclerView
+        attachToActivityWindow(view)
         view.measureLayout(420, 640)
         repeat(2) {
             shadowOf(Looper.getMainLooper()).idle()
@@ -778,6 +795,7 @@ class TxtVirtualPagerEngineTest {
         val engine = TxtVirtualPagerEngine(context)
         engine.openBook(Uri.fromFile(file))
         val view = engine.createView() as RecyclerView
+        attachToActivityWindow(view)
         view.measureLayout(420, 640)
         shadowOf(Looper.getMainLooper()).idle()
         view.measureLayout(420, 640)
@@ -881,6 +899,7 @@ class TxtVirtualPagerEngineTest {
         engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, targetOffset)))
         engine.openBook(Uri.fromFile(file))
         val view = engine.createView() as RecyclerView
+        attachToActivityWindow(view)
         view.measureLayout(420, 640)
         repeat(5) {
             shadowOf(Looper.getMainLooper()).idle()
