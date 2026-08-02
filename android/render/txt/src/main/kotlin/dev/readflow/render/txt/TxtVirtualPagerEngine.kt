@@ -662,8 +662,7 @@ class TxtVirtualPagerEngine(
         val distanceToAnchor = lineTopInRecycler - rv.paddingTop
         if (
             abs(distanceToAnchor) <= CONTINUOUS_ANCHOR_TOLERANCE_PX ||
-            (distanceToAnchor > 0 && !rv.canScrollVertically(1)) ||
-            (distanceToAnchor < 0 && !rv.canScrollVertically(-1))
+            isAtContinuousScrollBoundary(rv, distanceToAnchor)
         ) {
             // The document boundary can leave a final/initial line visible without enough content
             // on the other side to place it exactly at the viewport top. It is already stable.
@@ -679,6 +678,25 @@ class TxtVirtualPagerEngine(
             itemOffset,
         )
         return false
+    }
+
+    private fun isAtContinuousScrollBoundary(rv: RecyclerView, distanceToAnchor: Int): Boolean {
+        val layoutManager = rv.layoutManager as? LinearLayoutManager ?: return false
+        val itemCount = rv.adapter?.itemCount ?: return false
+        if (itemCount <= 0) return true
+        return when {
+            distanceToAnchor > 0 -> {
+                val lastItem = layoutManager.findViewByPosition(itemCount - 1) ?: return false
+                layoutManager.getDecoratedBottom(lastItem) <=
+                    rv.height - rv.paddingBottom + CONTINUOUS_ANCHOR_TOLERANCE_PX
+            }
+            distanceToAnchor < 0 -> {
+                val firstItem = layoutManager.findViewByPosition(0) ?: return false
+                layoutManager.getDecoratedTop(firstItem) >=
+                    rv.paddingTop - CONTINUOUS_ANCHOR_TOLERANCE_PX
+            }
+            else -> true
+        }
     }
 
     private fun captureContinuousTypographyAnchor(): TxtParagraphPosition? {

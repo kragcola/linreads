@@ -692,7 +692,7 @@ class TxtVirtualPagerEngineTest {
         Dispatchers.setMain(dispatcher)
         val context = RuntimeEnvironment.getApplication()
         val source = buildString {
-            repeat(400) { index -> append("Wide paragraph row %04d ".format(index)) }
+            repeat(120) { index -> append("Wide paragraph row %04d\n".format(index)) }
         }
         val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-mode-pending-", suffix = ".txt").toFile()
         file.writeText(source, charset = StandardCharsets.UTF_8)
@@ -771,7 +771,7 @@ class TxtVirtualPagerEngineTest {
         Dispatchers.setMain(dispatcher)
         val context = RuntimeEnvironment.getApplication()
         val source = buildString {
-            repeat(300) { index -> append("Centered paragraph row %03d ".format(index)) }
+            repeat(100) { index -> append("Centered paragraph row %03d\n".format(index)) }
         }
         val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-mode-center-", suffix = ".txt").toFile()
         file.writeText(source, charset = StandardCharsets.UTF_8)
@@ -846,7 +846,12 @@ class TxtVirtualPagerEngineTest {
             holder.textView.totalPaddingTop + layout.getLineTop(endLine)
         val endLineBottom = holder.itemView.top + holder.textView.top +
             holder.textView.totalPaddingTop + layout.getLineBottom(endLine)
-        assertTrue("fixture must navigate to the document's lower scroll boundary", !view.canScrollVertically(1))
+        val layoutManager = view.layoutManager as LinearLayoutManager
+        val lastItem = requireNotNull(layoutManager.findViewByPosition(requireNotNull(view.adapter).itemCount - 1))
+        assertTrue(
+            "fixture must navigate to the document's lower scroll boundary",
+            layoutManager.getDecoratedBottom(lastItem) <= view.height - view.paddingBottom,
+        )
         assertTrue(
             "the final line is visible at the lower boundary instead of being forced beyond it; " +
                 "top=$endLineTop bottom=$endLineBottom",
