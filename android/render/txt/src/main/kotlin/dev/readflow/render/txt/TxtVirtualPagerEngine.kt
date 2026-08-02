@@ -669,14 +669,10 @@ class TxtVirtualPagerEngine(
             return true
         }
 
-        // A line inside an oversized paragraph must become the LayoutManager's pending anchor.
-        // Calling scrollBy while the child is being laid out races its pending position request and
-        // can consume a stale delta. The next layout places this paragraph at the exact in-row offset.
-        val itemOffset = -(textView.top + textView.totalPaddingTop + layout.getLineTop(line))
-        (rv.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(
-            position.paragraphIndex,
-            itemOffset,
-        )
+        // goTo already positioned the paragraph at offset zero. LinearLayoutManager corrects a
+        // negative offset for the first/only oversized row back to its start gap, so apply the
+        // in-row correction only after that paragraph has a stable layout.
+        rv.scrollBy(0, distanceToAnchor)
         return false
     }
 
@@ -771,6 +767,8 @@ class TxtVirtualPagerEngine(
         var observedChild: View? = null
         var completed = false
         var retryPosted = false
+        var geometryCheckPosted = false
+        var layoutCompletionRetryScheduled = false
 
         fun detach() {
             observedChild?.removeOnLayoutChangeListener(childLayoutListener)
@@ -794,6 +792,23 @@ class TxtVirtualPagerEngine(
                 }
                 return
             }
+            if (rv.isLayoutRequested) {
+                val layoutManager = rv.layoutManager as? TxtParagraphLayoutManager
+                if (layoutManager != null && !layoutCompletionRetryScheduled) {
+                    layoutCompletionRetryScheduled = true
+                    layoutManager.doAfterNextLayout {
+                        layoutCompletionRetryScheduled = false
+                        if (!retryPosted) {
+                            retryPosted = true
+                            rv.post {
+                                retryPosted = false
+                                tryRestore()
+                            }
+                        }
+                    }
+                }
+                return
+            }
             val holder = rv.findViewHolderForAdapterPosition(paragraphIndex)
                 as? TxtParagraphAdapter.ParagraphHolder
             val child = holder?.itemView
@@ -801,10 +816,22 @@ class TxtVirtualPagerEngine(
                 observedChild?.removeOnLayoutChangeListener(childLayoutListener)
                 observedChild = child
                 child?.addOnLayoutChangeListener(childLayoutListener)
+                geometryCheckPosted = false
             }
             if (attempt()) {
                 completed = true
                 detach()
+            } else if (!completed && !geometryCheckPosted) {
+                // scrollBy is synchronous, but child bounds do not promise an OnLayoutChange
+                // callback. One posted geometry check completes the second restore phase.
+                geometryCheckPosted = true
+                if (!retryPosted) {
+                    retryPosted = true
+                    rv.post {
+                        retryPosted = false
+                        tryRestore()
+                    }
+                }
             }
         }
 
@@ -819,10 +846,16 @@ class TxtVirtualPagerEngine(
                 oldTop: Int,
                 oldRight: Int,
                 oldBottom: Int,
-            ) = tryRestore()
+            ) {
+                geometryCheckPosted = false
+                tryRestore()
+            }
         }
         childAttachListener = object : RecyclerView.OnChildAttachStateChangeListener {
-            override fun onChildViewAttachedToWindow(view: View) = tryRestore()
+            override fun onChildViewAttachedToWindow(view: View) {
+                geometryCheckPosted = false
+                tryRestore()
+            }
 
             override fun onChildViewDetachedFromWindow(view: View) {
                 if (view === observedChild) {
@@ -833,7 +866,13 @@ class TxtVirtualPagerEngine(
         }
         rv.addOnChildAttachStateChangeListener(childAttachListener)
         tryRestore()
-        rv.post { tryRestore() }
+        if (!retryPosted) {
+            retryPosted = true
+            rv.post {
+                retryPosted = false
+                tryRestore()
+            }
+        }
     }
 
     /**
@@ -1580,6 +1619,20 @@ class TxtVirtualPagerEngine(
      * inner-line scrolling when a TXT source has no paragraph breaks.
      */
     private class TxtParagraphLayoutManager(context: Context) : LinearLayoutManager(context) {
+        private val afterLayoutCallbacks = mutableListOf<() -> Unit>()
+
+        fun doAfterNextLayout(callback: () -> Unit) {
+            afterLayoutCallbacks += callback
+        }
+
+        override fun onLayoutCompleted(state: RecyclerView.State?) {
+            super.onLayoutCompleted(state)
+            if (afterLayoutCallbacks.isEmpty()) return
+            val callbacks = afterLayoutCallbacks.toList()
+            afterLayoutCallbacks.clear()
+            callbacks.forEach { callback -> callback() }
+        }
+
         override fun measureChildWithMargins(child: View, widthUsed: Int, heightUsed: Int) {
             val lp = child.layoutParams as? RecyclerView.LayoutParams
             if (lp == null || lp.height != ViewGroup.LayoutParams.WRAP_CONTENT) {
