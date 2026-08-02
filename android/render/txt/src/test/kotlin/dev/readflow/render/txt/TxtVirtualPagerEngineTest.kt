@@ -899,30 +899,46 @@ class TxtVirtualPagerEngineTest {
             textView: SelectionAwareTextView,
             rowHeight: Int,
         ): String {
+            fun textViewField(name: String): String {
+                var type: Class<*>? = textView.javaClass
+                while (type != null) {
+                    val currentType = type
+                    val field = runCatching { currentType.getDeclaredField(name) }.getOrNull()
+                    if (field != null) {
+                        return runCatching {
+                            field.isAccessible = true
+                            field.get(textView)?.toString() ?: "null"
+                        }.getOrElse { "unreadable:${it.javaClass.simpleName}" }
+                    }
+                    type = currentType.superclass
+                }
+                return "absent"
+            }
             val layout = textView.layout
+            val firstLineWidth = layout?.takeIf { it.lineCount > 0 }?.getLineWidth(0)
+            val firstLineMax = layout?.takeIf { it.lineCount > 0 }?.getLineMax(0)
+            val boringMetricsWidth = (layout as? android.text.BoringLayout)
+                ?.let { android.text.BoringLayout.isBoring(textView.text, textView.paint)?.width }
             return "$phase{" +
                 "lineCount=${layout?.lineCount} rowHeight=$rowHeight " +
                 "textSize=${textView.width}x${textView.height} " +
                 "layoutSize=${layout?.width}x${layout?.height} " +
+                "layoutClass=${layout?.javaClass?.name} " +
+                "lineWidth0=${firstLineWidth ?: "n/a"} " +
+                "lineMax0=${firstLineMax ?: "n/a"} " +
+                "desiredWidth=${android.text.Layout.getDesiredWidth(textView.text, textView.paint)} " +
+                "boringMetricsWidth=${boringMetricsWidth ?: "n/a"} " +
                 "padding=${textView.totalPaddingLeft},${textView.totalPaddingTop}," +
                 "${textView.totalPaddingRight},${textView.totalPaddingBottom} " +
                 "maxLines=${textView.maxLines} minLines=${textView.minLines} " +
                 "inputType=${textView.inputType} " +
                 "transformation=${textView.transformationMethod?.javaClass?.name ?: "null"} " +
-                "selectable=${textView.isTextSelectable}" +
+                "selectable=${textView.isTextSelectable} " +
+                "mHorizontallyScrolling=${textViewField("mHorizontallyScrolling")} " +
+                "mSingleLine=${textViewField("mSingleLine")}" +
                 "}"
         }
         val textViewStates = mutableListOf<String>()
-        val probeAdapter = TxtParagraphAdapter(
-            paragraphCount = 1,
-            paragraphProvider = { source },
-            fontSizeSp = 18f,
-            lineSpacingMultiplier = 1.75f,
-        )
-        val probeHolder = probeAdapter.onCreateViewHolder(RecyclerView(context), 0)
-        textViewStates += textViewState("probe-created", probeHolder.textView, probeHolder.itemView.height)
-        probeAdapter.onBindViewHolder(probeHolder, 0)
-        textViewStates += textViewState("probe-bound", probeHolder.textView, probeHolder.itemView.height)
         val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-rapid-typography-", suffix = ".txt").toFile()
         file.writeText(source, charset = StandardCharsets.UTF_8)
         val engine = TxtVirtualPagerEngine(context)
@@ -935,16 +951,7 @@ class TxtVirtualPagerEngineTest {
                 textViewState(phase, holder.textView, holder.itemView.height)
             }
         }
-        view.addOnChildAttachStateChangeListener(object : RecyclerView.OnChildAttachStateChangeListener {
-            override fun onChildViewAttachedToWindow(child: View) {
-                val textView = (child as? FrameLayout)?.getChildAt(0) as? SelectionAwareTextView ?: return
-                textViewStates += textViewState("engine-child-attached", textView, child.height)
-            }
-
-            override fun onChildViewDetachedFromWindow(child: View) = Unit
-        })
         attachToActivityWindow(view)
-        recordEngineState("engine-after-attach")
         view.measureLayout(420, 640)
         recordEngineState("engine-after-first-measure")
         repeat(5) { pass ->
