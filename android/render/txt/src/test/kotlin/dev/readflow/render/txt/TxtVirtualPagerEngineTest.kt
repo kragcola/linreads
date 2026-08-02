@@ -919,10 +919,17 @@ class TxtVirtualPagerEngineTest {
         }
         val initialHolder = view.findViewHolderForAdapterPosition(0)
             as? TxtParagraphAdapter.ParagraphHolder ?: error("initial holder must remain bound")
+        val initialLayout = requireNotNull(initialHolder.textView.layout)
+        val initialLineCount = initialLayout.lineCount
+        val initialRowHeight = initialHolder.itemView.height
         assertTrue(
-            "fixture must exercise one vertically wrapped oversized row",
-            requireNotNull(initialHolder.textView.layout).lineCount > 1 &&
-                initialHolder.itemView.height > view.height,
+            "fixture must exercise one vertically wrapped oversized row; " +
+                "lineCount=$initialLineCount rowHeight=$initialRowHeight viewHeight=${view.height} " +
+                "textWidth=${initialHolder.textView.width} textHeight=${initialHolder.textView.height} " +
+                "layoutWidth=${initialLayout.width} layoutHeight=${initialLayout.height} " +
+                "paddingLeft=${initialHolder.textView.totalPaddingLeft} " +
+                "paddingRight=${initialHolder.textView.totalPaddingRight}",
+            initialLineCount > 1 && initialRowHeight > view.height,
         )
         assertTrue(
             "initial restore must put the target line at the viewport top; " +
