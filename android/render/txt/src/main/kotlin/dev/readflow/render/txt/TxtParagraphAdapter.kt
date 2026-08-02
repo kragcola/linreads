@@ -50,7 +50,6 @@ class TxtParagraphAdapter(
             setTextColor(inkColor)
             typeface = this@TxtParagraphAdapter.typeface
             setTextIsSelectable(true)
-            setSingleLine(false)
         }
         val container = FrameLayout(parent.context).apply {
             layoutParams = RecyclerView.LayoutParams(
