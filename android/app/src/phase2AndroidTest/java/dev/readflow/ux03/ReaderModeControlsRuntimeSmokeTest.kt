@@ -100,7 +100,7 @@ class ReaderModeControlsRuntimeSmokeTest {
                 ?: error("Unable to determine visible TXT paragraph range before mode switch")
             val scrollVisibleIndexMax = scrollVisibleIndexes.maxOrNull()
                 ?: error("Unable to determine visible TXT paragraph range before mode switch")
-            openBottomPanel(buttonText = "排版", expectedText = "正文预览")
+            openBottomPanel(buttonText = "阅读设置", expectedText = "正文预览")
             takeScreenshot("ux03-font-panel-before-switch.png")
             dumpHierarchy("ux03-font-panel-before-switch.xml")
             waitForObject(By.text("分页")).click()
@@ -306,8 +306,8 @@ class ReaderModeControlsRuntimeSmokeTest {
             waitForVisibleTxtParagraph(scenario, corpusParagraph("UX04", 0))
             waitForBookByTitle(title)
 
-            openBottomPanel(buttonText = "排版", expectedText = "正文预览")
-            waitForObject(By.text("排版"))
+            openBottomPanel(buttonText = "阅读设置", expectedText = "正文预览")
+            waitForObject(By.text("阅读设置"))
             val fontLabel = waitForObject(By.textContains("sp")).text
             val lineSpacingLabel = waitForObject(By.textContains("1.75")).text
             waitForObject(By.text("行距"))

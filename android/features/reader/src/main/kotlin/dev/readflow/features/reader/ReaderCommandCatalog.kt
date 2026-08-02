@@ -26,7 +26,12 @@ object ReaderCommandCatalog {
             ReaderPanel.ANNOTATIONS,
             ReaderFeature.ANNOTATIONS,
         ),
-        ReaderCommandSpec(ReaderCommandId.FONT, "排版", ReaderPanel.FONT, ReaderFeature.FONT),
+        ReaderCommandSpec(
+            ReaderCommandId.FONT,
+            "阅读设置",
+            ReaderPanel.FONT,
+            ReaderFeature.READING_SETTINGS,
+        ),
         ReaderCommandSpec(ReaderCommandId.THEME, "主题", ReaderPanel.THEME, ReaderFeature.THEME),
     )
 

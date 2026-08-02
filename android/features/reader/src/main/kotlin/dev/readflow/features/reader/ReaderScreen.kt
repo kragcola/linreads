@@ -148,6 +148,7 @@ enum class ReaderFeature(val label: String) {
     BOOKMARKS("书签"),
     ANNOTATIONS("标注"),
     PROGRESS("进度"),
+    READING_SETTINGS("阅读设置"),
     FONT("排版"),
     THEME("主题"),
 }
@@ -166,6 +167,7 @@ internal fun readerFeaturesFor(
         add(ReaderFeature.ANNOTATIONS)
     }
     add(ReaderFeature.PROGRESS)
+    if (engine.supportedModes.isNotEmpty()) add(ReaderFeature.READING_SETTINGS)
     if (ReadingMode.SCROLL in engine.supportedModes) add(ReaderFeature.FONT)
     add(ReaderFeature.THEME)
 }
@@ -686,6 +688,7 @@ fun ReaderScreen(
                     // Keep the variable-height panel independent from the fixed base chrome.
                     ReaderControlPanel(
                         panel = state.activePanel.takeIf { state.isUiVisible },
+                        supportsTypography = ReaderFeature.FONT in availableFeatures,
                         fontSizeSp = state.fontSizeSp,
                         lineSpacing = state.lineSpacing,
                         fontChoice = state.fontChoice,
@@ -933,6 +936,7 @@ fun ReaderScreen(
                                             label = command.label,
                                             icon = command.icon,
                                             selected = readerCommandSelected(command.id, state.activePanel),
+                                            modifier = Modifier.weight(1f),
                                         ) {
                                             viewModel.onIntent(readerCommandIntent(command.id))
                                         }
@@ -1014,6 +1018,7 @@ private fun ReaderBookmarkRail(
 @Composable
 private fun ReaderControlPanel(
     panel: ReaderPanel?,
+    supportsTypography: Boolean,
     fontSizeSp: Float,
     lineSpacing: Float,
     fontChoice: FontChoice,
@@ -1108,6 +1113,7 @@ private fun ReaderControlPanel(
                         onClear = onSearchClear,
                     )
                     ReaderPanel.FONT -> ReaderTypographyPanel(
+                        supportsTypography = supportsTypography,
                         fontSizeSp = fontSizeSp,
                         lineSpacing = lineSpacing,
                         fontChoice = fontChoice,
@@ -1682,6 +1688,7 @@ internal fun readerCurrentTocIndex(tocEntries: List<TocEntry>, currentProgressio
 
 @Composable
 private fun ReaderTypographyPanel(
+    supportsTypography: Boolean,
     fontSizeSp: Float,
     lineSpacing: Float,
     fontChoice: FontChoice,
@@ -1718,71 +1725,81 @@ private fun ReaderTypographyPanel(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("字体与排版", style = MaterialTheme.typography.titleSmall)
                 Text(
-                    text = "$fontValue · ${lineSpacingValue.removeSuffix("倍")}x",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    if (supportsTypography) "字体与排版" else "阅读设置",
+                    style = MaterialTheme.typography.titleSmall,
                 )
+                if (supportsTypography) {
+                    Text(
+                        text = "$fontValue · ${lineSpacingValue.removeSuffix("倍")}x",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
 
-            if (useExpandedLayout) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(20.dp),
-                    verticalAlignment = Alignment.Top,
-                ) {
+            if (supportsTypography) {
+                if (useExpandedLayout) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(20.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        TypographyControls(
+                            fontSizeSp = clampedFontSize,
+                            lineSpacing = clampedLineSpacing,
+                            onFontSizeChange = onFontSizeChange,
+                            onLineSpacingChange = onLineSpacingChange,
+                            modifier = Modifier.weight(1.3f),
+                        )
+                        TypographyPreview(
+                            fontSizeSp = clampedFontSize,
+                            lineSpacing = clampedLineSpacing,
+                            fontChoice = fontChoice,
+                            modifier = Modifier.weight(0.7f),
+                        )
+                    }
+                } else {
                     TypographyControls(
                         fontSizeSp = clampedFontSize,
                         lineSpacing = clampedLineSpacing,
                         onFontSizeChange = onFontSizeChange,
                         onLineSpacingChange = onLineSpacingChange,
-                        modifier = Modifier.weight(1.3f),
                     )
                     TypographyPreview(
                         fontSizeSp = clampedFontSize,
                         lineSpacing = clampedLineSpacing,
                         fontChoice = fontChoice,
-                        modifier = Modifier.weight(0.7f),
                     )
                 }
-            } else {
-                TypographyControls(
-                    fontSizeSp = clampedFontSize,
-                    lineSpacing = clampedLineSpacing,
-                    onFontSizeChange = onFontSizeChange,
-                    onLineSpacingChange = onLineSpacingChange,
-                )
-                TypographyPreview(
-                    fontSizeSp = clampedFontSize,
-                    lineSpacing = clampedLineSpacing,
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+                FontManagementEntry(
                     fontChoice = fontChoice,
+                    bookFontCount = epubCssFontCatalog.size,
+                    onClick = onOpenFontManagement,
                 )
             }
 
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
-            FontManagementEntry(
-                fontChoice = fontChoice,
-                bookFontCount = epubCssFontCatalog.size,
-                onClick = onOpenFontManagement,
-            )
-
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
-            ReaderOptionRow(label = "阅读模式") {
-                ReadingMode.entries.forEach { mode ->
-                    FilterChip(
-                        selected = readingMode == mode,
-                        enabled = mode in supportedModes,
-                        onClick = { onModeChange(mode) },
-                        label = { Text(mode.readerLabel(), maxLines = 1) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .heightIn(min = 48.dp),
-                    )
+            if (supportedModes.size > 1) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+                ReaderOptionRow(label = "阅读模式") {
+                    ReadingMode.entries.forEach { mode ->
+                        FilterChip(
+                            selected = readingMode == mode,
+                            enabled = mode in supportedModes,
+                            onClick = { onModeChange(mode) },
+                            label = { Text(mode.readerLabel(), maxLines = 1) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp),
+                        )
+                    }
                 }
             }
 
             if (readingMode == ReadingMode.PAGED) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
                 ReaderOptionRow(label = "翻页动画") {
                     dev.readflow.core.model.PageFlipStyle.entries.forEach { style ->
                         FilterChip(
@@ -3120,12 +3137,13 @@ private fun ReaderMenuButton(
     label: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     selected: Boolean,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
 ) {
     TextButton(
         onClick = onClick,
-        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-        modifier = Modifier
+        contentPadding = PaddingValues(horizontal = 2.dp, vertical = 4.dp),
+        modifier = modifier
             .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
             .background(
                 color = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
@@ -3140,7 +3158,7 @@ private fun ReaderMenuButton(
             Icon(icon, contentDescription = null, modifier = Modifier.size(22.dp),
                 tint = if (selected) MaterialTheme.colorScheme.onPrimaryContainer
                 else MaterialTheme.colorScheme.onSurface)
-            Text(label, style = MaterialTheme.typography.labelSmall,
+            Text(label, maxLines = 1, style = MaterialTheme.typography.labelSmall,
                 color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer
                 else MaterialTheme.colorScheme.onSurface)
         }

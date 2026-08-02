@@ -5,6 +5,8 @@ import android.view.View
 import dev.readflow.core.model.BookFormat
 import dev.readflow.core.model.Locator
 import dev.readflow.core.model.LocatorStrategy
+import dev.readflow.core.model.ReaderCommandId
+import dev.readflow.core.model.ReaderMenuConfig
 import dev.readflow.render.api.PagingKind
 import dev.readflow.render.api.ReaderEngine
 import dev.readflow.render.api.ReaderTextAnnotation
@@ -19,7 +21,7 @@ import org.junit.Test
 class ReaderEngineFeatureProjectionTest {
 
     @Test
-    fun `fixed layout engine hides unsupported search annotation and typography commands`() {
+    fun `fixed layout engine exposes reading settings without claiming typography`() {
         val engine = FakeReaderEngine(
             format = BookFormat.PDF,
             supportsSearch = false,
@@ -31,9 +33,16 @@ class ReaderEngineFeatureProjectionTest {
                 ReaderFeature.TOC,
                 ReaderFeature.BOOKMARKS,
                 ReaderFeature.PROGRESS,
+                ReaderFeature.READING_SETTINGS,
                 ReaderFeature.THEME,
             ),
             readerFeaturesFor(engine),
+        )
+        assertTrue(
+            ReaderCommandCatalog.visibleSpecs(
+                config = ReaderMenuConfig.v1Defaults(),
+                features = readerFeaturesFor(engine),
+            ).any { it.id == ReaderCommandId.FONT },
         )
     }
 
@@ -72,6 +81,7 @@ class ReaderEngineFeatureProjectionTest {
         assertTrue(features.contains(ReaderFeature.BOOKMARKS))
         assertTrue(features.contains(ReaderFeature.TOC))
         assertTrue(features.contains(ReaderFeature.PROGRESS))
+        assertTrue(features.contains(ReaderFeature.READING_SETTINGS))
         assertTrue(features.contains(ReaderFeature.THEME))
         assertFalse(features.contains(ReaderFeature.FONT))
     }
@@ -91,6 +101,7 @@ class ReaderEngineFeatureProjectionTest {
         assertTrue(features.contains(ReaderFeature.BOOKMARKS))
         assertTrue(features.contains(ReaderFeature.TOC))
         assertTrue(features.contains(ReaderFeature.PROGRESS))
+        assertTrue(features.contains(ReaderFeature.READING_SETTINGS))
         assertTrue(features.contains(ReaderFeature.THEME))
         assertFalse(features.contains(ReaderFeature.FONT))
     }

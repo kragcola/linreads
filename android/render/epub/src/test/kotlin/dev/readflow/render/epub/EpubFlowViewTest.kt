@@ -2144,7 +2144,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `active slide keeps parked text draw warm while simulation suppresses it`() {
+    fun `active page shot suppresses parked text draw for slide and simulation`() {
         for (style in listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION)) {
             val view = pagedFlowView(flipStyle = style)
             assertTrue("style=$style pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -2165,57 +2165,94 @@ class EpubFlowViewTest {
                 // A cold direct start may capture the live outgoing/target pages before installing the
                 // renderer. Start the overdraw window after that setup work has completed.
                 val drawsAfterRendererStart = childDraws.boundsTops.size
+                assertTrue(
+                    "style=$style must hold live-content suppression between parent draws",
+                    container.javaClass.getDeclaredField("skipContentDraw")
+                        .apply { isAccessible = true }
+                        .getBoolean(container),
+                )
                 skipContentDrawStates.clear()
                 view.drawToBitmapForTest().recycle()
-                if (style == PageFlipStyle.SLIDE) {
-                    assertTrue(
-                        "the opaque SLIDE View must keep the parked TextView RenderNode warm",
-                        childDraws.boundsTops.size > drawsAfterRendererStart,
-                    )
-                    assertTrue(
-                        "SLIDE dispatchDraw must leave skipContentDraw false while visiting the live page; " +
-                            "states=$skipContentDrawStates",
-                        skipContentDrawStates.isNotEmpty() && skipContentDrawStates.none { it },
-                    )
-                } else {
-                    assertEquals(
-                        "SIMULATION must keep suppressing image and text draws beneath its translucent curl",
-                        drawsAfterRendererStart,
-                        childDraws.boundsTops.size,
-                    )
-                    assertTrue(
-                        "a suppressed SIMULATION child must not receive a draw callback",
-                        skipContentDrawStates.isEmpty(),
-                    )
-                }
+                assertEquals(
+                    "style=$style must suppress live child traversal beneath its complete page-shot overlay",
+                    drawsAfterRendererStart,
+                    childDraws.boundsTops.size,
+                )
+                assertTrue(
+                    "style=$style dispatchDraw must mark the live container suppressed; states=$skipContentDrawStates",
+                    skipContentDrawStates.isEmpty(),
+                )
+                assertTrue(
+                    "style=$style must keep live-content suppression after the draw pass",
+                    container.javaClass.getDeclaredField("skipContentDraw")
+                        .apply { isAccessible = true }
+                        .getBoolean(container),
+                )
             } finally {
                 view.endInteractiveCurl(velocityX = 0f)
                 shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+                assertFalse(
+                    "style=$style overlay teardown must restore live-content traversal",
+                    container.javaClass.getDeclaredField("skipContentDraw")
+                        .apply { isAccessible = true }
+                        .getBoolean(container),
+                )
                 view.dispose()
             }
         }
     }
 
     @Test
-    fun `slide teardown keeps the parked text RenderNode warm`() {
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+    fun `slide teardown rerecords the parked image page after suppressing live draw`() {
+        val fixture = visibleHeadingImageContinuationFixture(minHeadingPageIndex = 1)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        val liveImageColor = 0xFF16A34A.toInt()
 
         try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(
+                "fixture must start from a non-zero page so overlay bounds exercise content coordinates",
+                view.scrollY > 0,
+            )
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
             assertNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            assertNotNull(view.privateField("slideOverlayView") as PageSlideOverlayView?)
+            fixture.imageDrawable.color = liveImageColor
+            val content = view.getChildAt(0)
+            val contentShadow = shadowOf(content)
             val textShadow = shadowOf(view.textView)
+            contentShadow.clearWasInvalidated()
             textShadow.clearWasInvalidated()
 
             view.clearFlipOverlayForTest()
+            shadowOf(Looper.getMainLooper()).idle()
 
             assertNull(view.privateField("slideDrawable"))
-            assertFalse(
-                "removing an opaque SLIDE View must not dirty the already warm TextView RenderNode",
+            assertNull(view.privateField("slideOverlayView"))
+            assertTrue(
+                "removing an opaque SLIDE View must rerecord the container that skipped its child",
+                contentShadow.wasInvalidated(),
+            )
+            assertTrue(
+                "removing an opaque SLIDE View must dirty the suppressed TextView RenderNode",
                 textShadow.wasInvalidated(),
             )
+            val settledFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val liveImageHits = settledFrame.countExactPixels(liveImageColor)
+                assertTrue(
+                    "SLIDE teardown must restore the live boundary image pixels; hits=$liveImageHits",
+                    liveImageHits > 0,
+                )
+            } finally {
+                settledFrame.recycle()
+            }
         } finally {
             if (view.privateField("slideDrawable") != null) view.clearFlipOverlayForTest()
             view.dispose()
+            shadowOf(Looper.getMainLooper()).idle()
         }
     }
 

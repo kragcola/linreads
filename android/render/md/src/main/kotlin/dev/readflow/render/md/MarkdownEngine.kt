@@ -55,6 +55,7 @@ import kotlinx.coroutines.withContext
 import java.util.Collections
 import java.util.WeakHashMap
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.abs
 
 /**
  * Markdown engine (Markwon 4.6.2).
@@ -126,6 +127,14 @@ class MarkdownEngine(
      * callbacks cannot mutate a newer view tree or republish an old book's locator.
      */
     private var highlightRefreshGeneration: Long = 0L
+    private var pendingScrollTypographyAnchor: Locator? = null
+    private var scrollTypographyRestoreGeneration: Long = 0L
+    /**
+     * Latest-operation-wins token for [scheduleScrollRestore]: every new scheduled restore bumps
+     * it, orphaning all earlier scroll/content listeners and delayed retry posts so an older
+     * restore can never scroll or republish after a newer goTo/typography/mode action.
+     */
+    private var scrollRestoreTransaction: Long = 0L
     /** ScrollView identity that owns the active SCROLL highlight surface (null when detached). */
     private var highlightRefreshScrollView: ScrollView? = null
     private var highlightRefreshTextView: TextView? = null
@@ -375,6 +384,11 @@ class MarkdownEngine(
     private suspend fun goToScroll(locator: Locator) {
         val offset = document.offsetFor(locator)
         val target = document.locatorForOffset(offset)
+        // A pending typography restore is stale once the user navigates: drop its anchor and
+        // generation so its callback cannot republish an old locator or scroll the viewport back.
+        // scheduleScrollRestore below also bumps the restore transaction to orphan its listeners.
+        pendingScrollTypographyAnchor = null
+        scrollTypographyRestoreGeneration += 1L
         publishLocator(target)
         if (scrollView == null || textView == null) return
         scheduleScrollRestore(target)
@@ -465,12 +479,53 @@ class MarkdownEngine(
      * Re-applies across layout passes (Robolectric and real devices remeasure WRAP_CONTENT
      * children and can clamp scrollY to 0 until content height is committed).
      */
-    private fun scheduleScrollRestore(locator: Locator) {
+    private fun scheduleScrollRestore(locator: Locator, onApplied: (() -> Unit)? = null) {
         val sv = scrollView ?: return
         // Capture generation so open/close/createView invalidation drops deferred restores even
         // when the same ScrollView instance is reused (openBook without remount).
         val generation = highlightRefreshGeneration
-        val listener = object : View.OnLayoutChangeListener {
+        // Latest-operation-wins: each new scheduled restore orphans every earlier listener and
+        // delayed post, so an older restore can never scroll or republish after a newer action.
+        val transaction = ++scrollRestoreTransaction
+        var completionReported = false
+        fun reportCompletion() {
+            if (completionReported) return
+            completionReported = true
+            onApplied?.invoke()
+        }
+        lateinit var scrollListener: View.OnLayoutChangeListener
+        lateinit var contentListener: View.OnLayoutChangeListener
+        var observedTextView: TextView? = null
+
+        fun detach() {
+            sv.removeOnLayoutChangeListener(scrollListener)
+            observedTextView?.removeOnLayoutChangeListener(contentListener)
+            observedTextView = null
+        }
+
+        fun attemptRestore() {
+            if (
+                generation != highlightRefreshGeneration ||
+                transaction != scrollRestoreTransaction ||
+                scrollView !== sv
+            ) {
+                detach()
+                return
+            }
+            // Retry on TextView content layout too: WRAP_CONTENT reflow commits its height on a
+            // later pass, and the ScrollView's own outer bounds may not change while content does.
+            val tv = textView
+            if (tv != null && tv !== observedTextView) {
+                observedTextView?.removeOnLayoutChangeListener(contentListener)
+                observedTextView = tv
+                tv.addOnLayoutChangeListener(contentListener)
+            }
+            if (sv.width > 0 && sv.height > 0 && restoreScrollToLocator(locator, generation, transaction)) {
+                detach()
+                reportCompletion()
+            }
+        }
+        scrollListener = object : View.OnLayoutChangeListener {
             override fun onLayoutChange(
                 v: View?,
                 left: Int,
@@ -481,29 +536,25 @@ class MarkdownEngine(
                 oldTop: Int,
                 oldRight: Int,
                 oldBottom: Int,
-            ) {
-                if (generation != highlightRefreshGeneration || scrollView !== sv) {
-                    sv.removeOnLayoutChangeListener(this)
-                    return
-                }
-                if (sv.width <= 0 || sv.height <= 0) return
-                val applied = restoreScrollToLocator(locator, generation)
-                if (applied) {
-                    sv.removeOnLayoutChangeListener(this)
-                }
-            }
+            ) = attemptRestore()
         }
-        sv.addOnLayoutChangeListener(listener)
+        contentListener = object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(
+                v: View?,
+                left: Int,
+                top: Int,
+                right: Int,
+                bottom: Int,
+                oldLeft: Int,
+                oldTop: Int,
+                oldRight: Int,
+                oldBottom: Int,
+            ) = attemptRestore()
+        }
+        sv.addOnLayoutChangeListener(scrollListener)
+        attemptRestore()
         // Immediate attempts for already-laid-out hosts and post-attach frames.
-        sv.post {
-            if (generation != highlightRefreshGeneration || scrollView !== sv) {
-                sv.removeOnLayoutChangeListener(listener)
-                return@post
-            }
-            if (sv.width > 0 && sv.height > 0 && restoreScrollToLocator(locator, generation)) {
-                sv.removeOnLayoutChangeListener(listener)
-            }
-        }
+        sv.post { attemptRestore() }
     }
 
     /**
@@ -513,8 +564,9 @@ class MarkdownEngine(
     private fun restoreScrollToLocator(
         locator: Locator,
         generation: Long = highlightRefreshGeneration,
+        transaction: Long = scrollRestoreTransaction,
     ): Boolean {
-        if (generation != highlightRefreshGeneration) return true
+        if (generation != highlightRefreshGeneration || transaction != scrollRestoreTransaction) return true
         val sv = scrollView ?: return true
         val tv = textView ?: return true
         if (sv.width <= 0 || sv.height <= 0) return false
@@ -540,10 +592,35 @@ class MarkdownEngine(
                 sv.requestLayout()
             }
             sv.scrollTo(0, y)
-            // Some measure passes clamp once; retry on next frame if target not reached.
-            if (y > 0 && sv.scrollY == 0) {
+            // A pending ScrollView layout means the new WRAP_CONTENT height is not committed to
+            // the hierarchy yet: the upcoming pass can clamp scrollY to zero (or below the target).
+            // Complete only after the committed layout confirms the reach.
+            if (sv.isLayoutRequested) {
                 sv.post {
-                    if (generation != highlightRefreshGeneration) return@post
+                    if (
+                        generation != highlightRefreshGeneration ||
+                        transaction != scrollRestoreTransaction
+                    ) {
+                        return@post
+                    }
+                    if (scrollView === sv && textView === tv) {
+                        ensureScrollTextViewMeasured(sv, tv)
+                        sv.scrollTo(0, y)
+                    }
+                }
+                return false
+            }
+            // Completion is real only when the viewport actually reaches the computed target line.
+            // A positive-but-still-clamped scrollY (content height under-committed) must keep
+            // retrying instead of reporting success.
+            if (abs(sv.scrollY - y) > SCROLL_RESTORE_TOLERANCE_PX) {
+                sv.post {
+                    if (
+                        generation != highlightRefreshGeneration ||
+                        transaction != scrollRestoreTransaction
+                    ) {
+                        return@post
+                    }
                     if (scrollView === sv && textView === tv) {
                         ensureScrollTextViewMeasured(sv, tv)
                         sv.scrollTo(0, y)
@@ -554,10 +631,12 @@ class MarkdownEngine(
         } finally {
             suppressLocatorUpdates = false
         }
-        if (generation != highlightRefreshGeneration) return true
+        if (
+            generation != highlightRefreshGeneration ||
+            transaction != scrollRestoreTransaction
+        ) return true
         publishLocator(document.locatorForOffset(document.offsetFor(locator)))
-        // Success when we needed no scroll, or scroll moved (or content fits).
-        return y == 0 || sv.scrollY > 0 || maxScroll == 0
+        return true
     }
 
     private fun ensureScrollTextViewMeasured(sv: ScrollView, tv: TextView) {
@@ -732,6 +811,9 @@ class MarkdownEngine(
 
     private fun invalidateHighlightRefreshCallbacks() {
         highlightRefreshGeneration += 1L
+        pendingScrollTypographyAnchor = null
+        scrollTypographyRestoreGeneration += 1L
+        scrollRestoreTransaction += 1L
         highlightRefreshScrollView = null
         highlightRefreshTextView = null
     }
@@ -778,18 +860,20 @@ class MarkdownEngine(
 
     override suspend fun setFontSize(sp: Float) {
         if (fontSizeSp == sp) return
+        val scrollAnchor = captureScrollTypographyAnchor()
         fontSizeSp = sp
         textView?.textSize = sp
         activePageBindings.forEach { it.textView?.textSize = sp }
-        rebuildAfterTypographyChange()
+        rebuildAfterTypographyChange(scrollAnchor)
     }
 
     override suspend fun setLineSpacing(multiplier: Float) {
         if (lineSpacingMultiplier == multiplier) return
+        val scrollAnchor = captureScrollTypographyAnchor()
         lineSpacingMultiplier = multiplier
         textView?.setLineSpacing(0f, multiplier)
         activePageBindings.forEach { it.textView?.setLineSpacing(0f, multiplier) }
-        rebuildAfterTypographyChange()
+        rebuildAfterTypographyChange(scrollAnchor)
     }
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {
@@ -798,11 +882,12 @@ class MarkdownEngine(
 
     override suspend fun setFont(fontId: String) {
         if (currentFontId == fontId) return
+        val scrollAnchor = captureScrollTypographyAnchor()
         currentFontId = fontId
         val face = resolveTypeface()
         textView?.typeface = face
         activePageBindings.forEach { it.textView?.typeface = face }
-        rebuildAfterTypographyChange()
+        rebuildAfterTypographyChange(scrollAnchor)
     }
 
     override suspend fun setTheme(mode: ThemeMode) {
@@ -839,6 +924,12 @@ class MarkdownEngine(
                 }
                 PagingKind.PAGED -> normalizeToSourceSection(_currentLocator.value)
             }
+            // A mode switch away from CONTINUOUS invalidates every active scroll restore before
+            // the paged anchor is finalized; otherwise a stale typography/goTo callback could
+            // republish an older anchor or yank the new surface back after the switch.
+            pendingScrollTypographyAnchor = null
+            scrollTypographyRestoreGeneration += 1L
+            scrollRestoreTransaction += 1L
             publishLocator(anchor)
             if (targetKind != PagingKind.PAGED) {
                 _pagingKind.value = targetKind
@@ -868,10 +959,45 @@ class MarkdownEngine(
      * Always requests the page for the current source anchor and refreshes active page
      * views even when [pageCount] stays equal (avoids stale slices).
      */
-    private suspend fun rebuildAfterTypographyChange() {
-        if (_pagingKind.value != PagingKind.PAGED) return
+    private suspend fun rebuildAfterTypographyChange(scrollAnchor: Locator? = null) {
+        if (_pagingKind.value != PagingKind.PAGED) {
+            // TextView reflow changes line heights in place. Restore by source offset after the
+            // new layout is measured so a typography change cannot leave the reader at the old
+            // pixel Y (which is a different passage after reflow).
+            scrollAnchor?.let(::restoreScrollTypographyAnchor)
+            return
+        }
         if (rebuildPageWindows(requestPageForAnchor = true)) {
             refreshActivePageContents()
+        }
+    }
+
+    /** Captures the first visible rendered line as a stable source anchor before TextView reflow. */
+    private fun captureScrollTypographyAnchor(): Locator? {
+        if (_pagingKind.value != PagingKind.CONTINUOUS) return null
+        pendingScrollTypographyAnchor?.let { return it }
+        val sv = scrollView ?: return normalizeToSourceSection(_currentLocator.value)
+        val tv = textView ?: return normalizeToSourceSection(_currentLocator.value)
+        if (tv.layout == null) return normalizeToSourceSection(_currentLocator.value)
+        return document.locatorForRenderedOffset(
+            renderedOffset = tv.characterOffsetForScrollY(sv.scrollY),
+            renderedText = tv.text,
+        )
+    }
+
+    private fun restoreScrollTypographyAnchor(anchor: Locator) {
+        val normalized = normalizeToSourceSection(anchor)
+        pendingScrollTypographyAnchor = normalized
+        val generation = ++scrollTypographyRestoreGeneration
+        publishLocator(normalized)
+        if (scrollView == null || textView == null) {
+            pendingScrollTypographyAnchor = null
+            return
+        }
+        scheduleScrollRestore(normalized) {
+            if (generation == scrollTypographyRestoreGeneration) {
+                pendingScrollTypographyAnchor = null
+            }
         }
     }
 
@@ -1071,6 +1197,8 @@ class MarkdownEngine(
     private companion object {
         /** Density-aware padding shared by measured StaticLayout and displayed TextViews. */
         const val TEXT_PADDING_DP: Float = 16f
+        /** Max pixel distance between scrollY and the computed target that counts as restored. */
+        private const val SCROLL_RESTORE_TOLERANCE_PX = 2f
         private const val DOCUMENT_TITLE_FALLBACK = "正文"
 
         private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {

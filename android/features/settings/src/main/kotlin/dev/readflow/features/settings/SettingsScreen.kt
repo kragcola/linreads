@@ -1065,7 +1065,7 @@ internal fun readerMenuCommandLabel(id: ReaderCommandId): String = when (id) {
     ReaderCommandId.SEARCH -> "搜索"
     ReaderCommandId.BOOKMARKS -> "书签"
     ReaderCommandId.ANNOTATIONS -> "标注"
-    ReaderCommandId.FONT -> "排版"
+    ReaderCommandId.FONT -> "阅读设置"
     ReaderCommandId.THEME -> "主题"
 }
 

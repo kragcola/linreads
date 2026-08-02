@@ -3,6 +3,7 @@ package dev.readflow.render.txt
 import android.net.Uri
 import android.text.Selection
 import android.text.Spannable
+import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -438,6 +439,411 @@ class TxtVirtualPagerEngineTest {
         }
 
     @Test
+    fun `continuous typography keeps an inner paragraph anchor visible`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val source = buildString {
+            repeat(700) { index ->
+                append("prefix%04d ".format(index))
+            }
+            append("TARGET_ANCHOR ")
+            repeat(700) { index ->
+                append("suffix%04d ".format(index))
+            }
+        }
+        val targetOffset = source.indexOf("TARGET_ANCHOR")
+        val file = kotlin.io.path.createTempFile(
+            prefix = "readflow-txt-scroll-typography-",
+            suffix = ".txt",
+        ).toFile()
+        file.writeText(source, charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, targetOffset)))
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(420, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(640, android.view.View.MeasureSpec.EXACTLY),
+        )
+        view.layout(0, 0, 420, 640)
+        repeat(5) { shadowOf(Looper.getMainLooper()).idle() }
+
+        val holder = view.findViewHolderForAdapterPosition(0) as TxtParagraphAdapter.ParagraphHolder
+        val textView = holder.textView
+        val targetInText = textView.text.toString().indexOf("TARGET_ANCHOR")
+        assertTrue("fixture must bind the target anchor", targetInText >= 0)
+        fun targetIsVisible(): Boolean {
+            val layout = textView.layout ?: return false
+            val line = layout.getLineForOffset(targetInText)
+            val top = holder.itemView.top + textView.top + textView.totalPaddingTop + layout.getLineTop(line)
+            val bottom = holder.itemView.top + textView.top + textView.totalPaddingTop + layout.getLineBottom(line)
+            return bottom > view.paddingTop && top < view.height - view.paddingBottom
+        }
+        assertTrue("initial inner anchor must be visible", targetIsVisible())
+
+        engine.setFontSize(30f)
+        engine.setLineSpacing(0.9f)
+        repeat(8) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measure(
+                android.view.View.MeasureSpec.makeMeasureSpec(420, android.view.View.MeasureSpec.EXACTLY),
+                android.view.View.MeasureSpec.makeMeasureSpec(640, android.view.View.MeasureSpec.EXACTLY),
+            )
+            view.layout(0, 0, 420, 640)
+        }
+        assertTrue(
+            "continuous typography changes must keep the inner source anchor visible",
+            targetIsVisible(),
+        )
+    }
+
+    @Test
+    fun `createView remount invalidates pending continuous typography anchor`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val lines = (0 until 120).map { index ->
+            "Remount anchor paragraph %03d keeps its own surface position.".format(index)
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-remount-", suffix = ".txt").toFile()
+        file.writeText(lines.joinToString("\n\n"), charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val first = engine.createView() as RecyclerView
+        first.measureLayout(1080, 2400)
+        shadowOf(Looper.getMainLooper()).idle()
+        first.measureLayout(1080, 2400)
+        (first.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(90, 0)
+        first.measureLayout(1080, 2400)
+
+        // Arm a pending continuous typography restore on the first surface; do not settle it.
+        engine.setFontSize(30f)
+        assertNotNull(
+            "fixture must arm a pending typography anchor",
+            engine.privateField("pendingContinuousTypographyAnchor"),
+        )
+
+        // Remount before the restore applies: the stale pending anchor must be invalidated.
+        val second = engine.createView() as RecyclerView
+        second.measureLayout(1080, 2400)
+        repeat(2) {
+            shadowOf(Looper.getMainLooper()).idle()
+            second.measureLayout(1080, 2400)
+        }
+        assertNull(
+            "createView remount must clear the stale pending anchor",
+            engine.privateField("pendingContinuousTypographyAnchor"),
+        )
+
+        // User scrolls the new surface to a different paragraph, then applies typography again.
+        (second.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(3, 0)
+        second.measureLayout(1080, 2400)
+        shadowOf(Looper.getMainLooper()).idle()
+        engine.setLineSpacing(1.2f)
+        repeat(6) {
+            shadowOf(Looper.getMainLooper()).idle()
+            second.measureLayout(1080, 2400)
+        }
+
+        val firstVisible = (second.layoutManager as LinearLayoutManager).findFirstVisibleItemPosition()
+        assertTrue(
+            "typography after remount must anchor to the new surface, not the stale paragraph; " +
+                "firstVisible=$firstVisible",
+            firstVisible <= 3,
+        )
+        assertTrue(
+            "locator must track the new surface anchor",
+            engine.currentParagraphIndexForTest() <= 3,
+        )
+    }
+
+    @Test
+    fun `continuous goTo honors the inner charOffset after the holder layout exists`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val lines = (0 until 60).map { index ->
+            buildString {
+                repeat(40) { row -> append("Line %02d ".format(row)) }
+                append("par%03d ".format(index))
+                if (index == 45) append("GO_TO_INNER_TARGET ")
+                repeat(40) { row -> append("tail %02d ".format(row)) }
+            }
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-goto-inner-", suffix = ".txt").toFile()
+        file.writeText(lines.joinToString("\n"), charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measureLayout(420, 640)
+        repeat(2) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+
+        val targetParagraph = 45
+        val targetCharOffset = lines[targetParagraph].indexOf("GO_TO_INNER_TARGET")
+        assertTrue("fixture must contain the inner target", targetCharOffset >= 0)
+        engine.goTo(
+            Locator(
+                strategy = LocatorStrategy.Section(0, targetParagraph, targetCharOffset),
+                totalProgression = targetParagraph.toFloat() / lines.size,
+            ),
+        )
+        repeat(8) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+
+        val holder = view.findViewHolderForAdapterPosition(targetParagraph)
+            as? TxtParagraphAdapter.ParagraphHolder
+            ?: error("target paragraph must be bound after goTo")
+        val textView = holder.textView
+        val renderedOffset = textView.text.toString().indexOf("GO_TO_INNER_TARGET")
+        assertTrue("fixture must render the target token", renderedOffset >= 0)
+        val layout = requireNotNull(textView.layout)
+        val line = layout.getLineForOffset(renderedOffset)
+        val lineTopInRecycler = holder.itemView.top + textView.top + textView.totalPaddingTop + layout.getLineTop(line)
+        assertTrue(
+            "continuous goTo must align the inner charOffset line at the viewport top; " +
+                "lineTopInRecycler=$lineTopInRecycler paddingTop=${view.paddingTop}",
+            abs(lineTopInRecycler - view.paddingTop) <= 2,
+        )
+        assertEquals(targetParagraph, engine.currentParagraphIndexForTest())
+        val afterOffset = (engine.currentLocator.value.strategy as LocatorStrategy.ByteOffset).offset
+        assertTrue("goTo must keep a paragraph-internal anchor", afterOffset > 0L)
+    }
+
+    @Test
+    fun `later zero-offset goTo invalidates the earlier inner-offset navigation restore`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val lines = (0 until 80).map { index ->
+            buildString {
+                repeat(60) { row -> append("Line %02d ".format(row)) }
+                append("par%03d ".format(index))
+                if (index == 45) append("GO_TO_A_INNER ")
+                if (index == 46) append("GO_TO_B ")
+                repeat(60) { row -> append("tail %02d ".format(row)) }
+            }
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-nav-generation-", suffix = ".txt").toFile()
+        file.writeText(lines.joinToString("\n"), charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measureLayout(420, 640)
+        repeat(2) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+
+        val aParagraph = 45
+        val aCharOffset = lines[aParagraph].indexOf("GO_TO_A_INNER")
+        val bParagraph = 46
+        assertTrue("fixture must arm an inner-offset goTo", aCharOffset > 0)
+        // Rapid navigation: goTo(A, inner offset) is immediately superseded by goTo(B, offset 0)
+        // before A's holder is ever attached.
+        engine.goTo(
+            Locator(
+                strategy = LocatorStrategy.Section(0, aParagraph, aCharOffset),
+                totalProgression = aParagraph.toFloat() / lines.size,
+            ),
+        )
+        engine.goTo(
+            Locator(
+                strategy = LocatorStrategy.Section(0, bParagraph, 0),
+                totalProgression = bParagraph.toFloat() / lines.size,
+            ),
+        )
+        repeat(8) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+
+        val bHolder = view.findViewHolderForAdapterPosition(bParagraph)
+            as? TxtParagraphAdapter.ParagraphHolder
+            ?: error("B holder must be bound after the final goTo settles")
+        assertTrue(
+            "the later goTo must own the settled viewport; bTop=${bHolder.itemView.top} paddingTop=${view.paddingTop}",
+            abs(bHolder.itemView.top - view.paddingTop) <= 2,
+        )
+
+        // Force A's holder to attach again (explicit scroll to A with offset 0). The stale A
+        // restore must be gone: the viewport must stay exactly at A's paragraph top and must not
+        // be pulled back to A's inner charOffset line.
+        (view.layoutManager as LinearLayoutManager).scrollToPositionWithOffset(aParagraph, 0)
+        repeat(6) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+        val aHolder = view.findViewHolderForAdapterPosition(aParagraph)
+            as? TxtParagraphAdapter.ParagraphHolder
+            ?: error("A holder must be bound after the explicit scroll")
+        assertTrue(
+            "the stale A restore must not pull the viewport to A's inner line; " +
+                "aTop=${aHolder.itemView.top} paddingTop=${view.paddingTop}",
+            abs(aHolder.itemView.top - view.paddingTop) <= 2,
+        )
+    }
+
+    @Test
+    fun `mode switch to paged preserves the pending typography anchor`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val source = buildString {
+            repeat(400) { index -> append("Wide paragraph row %04d ".format(index)) }
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-mode-pending-", suffix = ".txt").toFile()
+        file.writeText(source, charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.setViewportSize(420, 640)
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measureLayout(420, 640)
+        repeat(2) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+        // Scroll deep inside the single paragraph so the viewport top and center differ.
+        view.scrollBy(0, 1200)
+        view.measureLayout(420, 640)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.measureLayout(420, 640)
+
+        val holder = view.findViewHolderForAdapterPosition(0)
+            as? TxtParagraphAdapter.ParagraphHolder
+            ?: error("fixture paragraph must be bound")
+        val textView = holder.textView
+        val layout = requireNotNull(textView.layout)
+        val textTopInRecycler = holder.itemView.top + textView.top + textView.totalPaddingTop
+        val topLineCharOffset = layout.getLineStart(layout.getLineForVertical(view.paddingTop - textTopInRecycler))
+        val centerY = view.paddingTop + (view.height - view.paddingTop - view.paddingBottom) / 2
+        val centerLineCharOffset = layout.getLineStart(layout.getLineForVertical(centerY - textTopInRecycler))
+        assertTrue(
+            "fixture must separate the top anchor from the viewport center; top=$topLineCharOffset center=$centerLineCharOffset",
+            centerLineCharOffset > topLineCharOffset,
+        )
+
+        val requestedPages = mutableListOf<Int>()
+        engine.setPageRequestCallback(requestedPages::add)
+        // Arm a typography restore without settling the reflow, then switch modes immediately.
+        engine.setFontSize(30f)
+        assertNotNull(
+            "fixture must arm a pending typography anchor",
+            engine.privateField("pendingContinuousTypographyAnchor"),
+        )
+        engine.setMode(ReadingMode.PAGED)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // The PAGED anchor must be the pre-reflow captured source position (top visible line),
+        // not a recomputation from the current pixel geometry (viewport center).
+        val actualOffset = (engine.currentLocator.value.strategy as LocatorStrategy.ByteOffset).offset
+        assertEquals(
+            "PAGED anchor must preserve the pending typography anchor's byte offset",
+            topLineCharOffset.toLong(),
+            actualOffset,
+        )
+        assertTrue("mode switch must request exactly one page", requestedPages.size == 1)
+        assertEquals(
+            "the requested page must map to the preserved anchor",
+            engine.pageIndexForLocator(engine.currentLocator.value),
+            requestedPages.single(),
+        )
+    }
+
+    @Test
+    fun `setMode paged captures the centered inner line offset in continuous`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val source = buildString {
+            repeat(300) { index -> append("Centered paragraph row %03d ".format(index)) }
+        }
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-mode-center-", suffix = ".txt").toFile()
+        file.writeText(source, charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measureLayout(420, 640)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.measureLayout(420, 640)
+        // Scroll deep inside the single paragraph so the viewport center is mid-text.
+        view.scrollBy(0, 2000)
+        view.measureLayout(420, 640)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(0, (view.layoutManager as LinearLayoutManager).findFirstVisibleItemPosition())
+
+        engine.setMode(ReadingMode.PAGED)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        val offset = (engine.currentLocator.value.strategy as LocatorStrategy.ByteOffset).offset
+        assertTrue(
+            "SCROLL->PAGED must keep the centered inner line offset instead of paragraph start; offset=$offset",
+            offset > 0L,
+        )
+        assertEquals(0, engine.currentParagraphIndexForTest())
+    }
+
+    @Test
+    fun `rapid typography restore waits for child reflow before completing`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication()
+        val source = buildString {
+            repeat(700) { index -> append("prefix%04d ".format(index)) }
+            append("TARGET_ANCHOR ")
+            repeat(700) { index -> append("suffix%04d ".format(index)) }
+        }
+        val targetOffset = source.indexOf("TARGET_ANCHOR")
+        val file = kotlin.io.path.createTempFile(prefix = "readflow-txt-rapid-typography-", suffix = ".txt").toFile()
+        file.writeText(source, charset = StandardCharsets.UTF_8)
+        val engine = TxtVirtualPagerEngine(context)
+        engine.setInitialLocator(Locator(LocatorStrategy.Section(0, 0, targetOffset)))
+        engine.openBook(Uri.fromFile(file))
+        val view = engine.createView() as RecyclerView
+        view.measureLayout(420, 640)
+        repeat(5) {
+            shadowOf(Looper.getMainLooper()).idle()
+            view.measureLayout(420, 640)
+        }
+
+        fun tokenLineTop(): Int {
+            val holder = view.findViewHolderForAdapterPosition(0)
+                as? TxtParagraphAdapter.ParagraphHolder ?: return -1
+            val textView = holder.textView
+            val layout = textView.layout ?: return -1
+            val renderedOffset = textView.text.toString().indexOf("TARGET_ANCHOR")
+            if (renderedOffset < 0) return -1
+            val line = layout.getLineForOffset(renderedOffset)
+            return holder.itemView.top + textView.top + textView.totalPaddingTop + layout.getLineTop(line)
+        }
+        assertTrue(
+            "initial restore must put the target line at the viewport top; top=${tokenLineTop()} padding=${view.paddingTop}",
+            abs(tokenLineTop() - view.paddingTop) <= 2,
+        )
+
+        engine.setFontSize(30f)
+        engine.setLineSpacing(0.9f)
+        // Drain only the one-shot posts: the child has not reflowed yet, so the restore must stay
+        // pending instead of completing against the stale pre-reflow holder layout.
+        shadowOf(Looper.getMainLooper()).idle()
+        assertNotNull(
+            "restore must not complete on the stale pre-reflow holder layout",
+            engine.privateField("pendingContinuousTypographyAnchor"),
+        )
+        // One real layout pass rebinds/reflows the child; the content listener must converge.
+        view.measureLayout(420, 640)
+        shadowOf(Looper.getMainLooper()).idle()
+        view.measureLayout(420, 640)
+        assertNull(
+            "child reflow must complete the restore",
+            engine.privateField("pendingContinuousTypographyAnchor"),
+        )
+        assertTrue(
+            "typography restore must keep the captured source line at the viewport top; " +
+                "top=${tokenLineTop()} padding=${view.paddingTop}",
+            abs(tokenLineTop() - view.paddingTop) <= 2,
+        )
+    }
+
+    @Test
     fun `cold paged open starts exactly at an initial locator inside a standard page`() =
         runTest(dispatcher) {
             Dispatchers.setMain(dispatcher)
@@ -850,6 +1256,14 @@ class TxtVirtualPagerEngineTest {
             val childCenter = (child.top + child.bottom) / 2
             position to abs(childCenter - viewportCenter)
         }.minByOrNull { it.second }?.first ?: error("no visible RecyclerView children")
+    }
+
+    private fun View.measureLayout(width: Int, height: Int) {
+        measure(
+            android.view.View.MeasureSpec.makeMeasureSpec(width, android.view.View.MeasureSpec.EXACTLY),
+            android.view.View.MeasureSpec.makeMeasureSpec(height, android.view.View.MeasureSpec.EXACTLY),
+        )
+        layout(0, 0, width, height)
     }
 
     @Test

@@ -531,9 +531,13 @@ internal class EpubFlowView(
     private var curlDrawable: PageCurlDrawable? = null
     private val pageShotOverlayActive: Boolean
         get() = slideDrawable != null || curlDrawable != null
-    /** True only while the active page-shot renderer is a Drawable that hides the live TextView. */
+    /**
+     * True while a page-shot transaction owns the viewport. The slide renderer is an opaque
+     * two-page strip, so drawing the parked chapter beneath it only repeats the long TextView and
+     * all image spans on every MOVE without contributing pixels to the frame.
+     */
     private val liveContentDrawSuppressedByPageShot: Boolean
-        get() = curlDrawable != null || (slideDrawable != null && slideOverlayView == null)
+        get() = slideDrawable != null || curlDrawable != null
     private val fullViewportOverlayActive: Boolean
         get() = pageShotOverlayActive || conversionSnapshotDrawable != null
     /** Defensive settle bookkeeping; dirty cache owners are rejected before an active turn starts. */
@@ -1872,38 +1876,30 @@ internal class EpubFlowView(
     override fun dispatchDraw(canvas: Canvas) {
         val clipBottom = pageClipBottomInViewport()
         val topClip = pageClipTopInViewport()
-        // The page-turn overlay owns the complete viewport and draws cached page shots. Avoid
-        // repainting the parked TextView (including all image spans) underneath it on every finger
-        // MOVE; EpubFlowContainer keeps the parent ViewGroup overlay in the draw pass.
-        container.skipContentDraw = liveContentDrawSuppressedByPageShot
-        try {
-            if (clipBottom == null && topClip <= scrollY) {
-                super.dispatchDraw(canvas)
-                return
-            }
-            val save = canvas.save()
-            // pageClip* helpers return content-space Y (layout coords: page top = line top, +padTop for
-            // painted ink). Android's parent draw path and snapshotViewport both pre-translate the canvas
-            // by -scrollY before dispatchDraw, so clipRect must stay in content coordinates. Subtracting
-            // scrollY here would apply the scroll twice and truncate/blank later pages.
-            //
-            // The paginator works in pure StaticLayout coords (line 0 at y=0), but the child TextView paints
-            // its layout shifted DOWN by its own [TextView.paddingTop] — a line at layout-y L lands at
-            // content-y L + padTop. [pageClipBottomInViewport] returns the bottom in layout space, so without
-            // the offset the clip falls padTop px too high and slices ~padTop off the last line's painted
-            // glyphs (审计: 底部半截文字). Add padTop so the clip meets the line's PAINTED bottom; cap at the
-            // viewport bottom (a near-full page then relies on the viewport edge, off by ≤padTop, invisible).
-            val bottom = if (clipBottom != null) {
-                minOf(scrollY + clipBottom + textView.paddingTop, scrollY + height)
-            } else {
-                scrollY + height
-            }
-            canvas.clipRect(0, topClip, width, bottom)
+        if (clipBottom == null && topClip <= scrollY) {
             super.dispatchDraw(canvas)
-            canvas.restoreToCount(save)
-        } finally {
-            container.skipContentDraw = false
+            return
         }
+        val save = canvas.save()
+        // pageClip* helpers return content-space Y (layout coords: page top = line top, +padTop for
+        // painted ink). Android's parent draw path and snapshotViewport both pre-translate the canvas
+        // by -scrollY before dispatchDraw, so clipRect must stay in content coordinates. Subtracting
+        // scrollY here would apply the scroll twice and truncate/blank later pages.
+        //
+        // The paginator works in pure StaticLayout coords (line 0 at y=0), but the child TextView paints
+        // its layout shifted DOWN by its own [TextView.paddingTop] — a line at layout-y L lands at
+        // content-y L + padTop. [pageClipBottomInViewport] returns the bottom in layout space, so without
+        // the offset the clip falls padTop px too high and slices ~padTop off the last line's painted
+        // glyphs (审计: 底部半截文字). Add padTop so the clip meets the line's PAINTED bottom; cap at the
+        // viewport bottom (a near-full page then relies on the viewport edge, off by ≤padTop, invisible).
+        val bottom = if (clipBottom != null) {
+            minOf(scrollY + clipBottom + textView.paddingTop, scrollY + height)
+        } else {
+            scrollY + height
+        }
+        canvas.clipRect(0, topClip, width, bottom)
+        super.dispatchDraw(canvas)
+        canvas.restoreToCount(save)
     }
 
     /**
@@ -4678,8 +4674,8 @@ internal class EpubFlowView(
      * Installs a SLIDE turn: the zero-copy [PageSlideDrawable] owner keeps progress and the page-shot
      * pair (never added to the View overlay), while the opaque [PageSlideOverlayView] strip renders the
      * same pair as a static 2W x H strip laid out at the current scrollY. Only the View joins the
-     * ViewGroupOverlay so per-frame motion is a View translation and the live TextView RenderNode stays
-     * warm.
+     * ViewGroupOverlay so per-frame motion is a View translation; the parked live TextView is skipped
+     * for the duration of the transaction because it is fully covered by the strip.
      */
     private fun installSlideOverlay(outgoing: Bitmap, revealed: Bitmap, forward: Boolean) {
         // Reactivate identities still behind an earlier render fence: the new renderer records them
@@ -4739,6 +4735,13 @@ internal class EpubFlowView(
      * shot flat inside [PageCurlDrawable], while only the outgoing shot warps over it.
      */
     private fun applyFlipProgress(progress: Float, forward: Boolean) {
+        // Hold live-content suppression for the full page-shot transaction. Toggling it only
+        // around dispatchDraw can make HWUI record an empty container between parent draws and
+        // leave parked image spans invisible after overlay teardown.
+        if (!container.skipContentDraw && pageShotOverlayActive) {
+            container.skipContentDraw = true
+            container.invalidate()
+        }
         slideDrawable?.let {
             it.progress = progress
         }
@@ -4943,10 +4946,10 @@ internal class EpubFlowView(
 
     private fun clearFlipOverlay(preserveActivePixelRefreshes: Boolean = false) {
         cancelPendingLocalPageShotHandoff(consumeGesture = true)
-        // A Drawable-only owner suppressed the live TextView while it was active (SIMULATION or a
-        // legacy/manual Drawable-only SLIDE). An opaque SLIDE View renderer keeps the live TextView
-        // warm, so its teardown must not rerecord the long chapter RenderNode.
-        val rerecordLiveText = liveContentDrawSuppressedByPageShot
+        // Every page-shot owner suppresses the live TextView while it is active. The opaque SLIDE
+        // View renderer covers the same viewport as the Drawable owner, so teardown must explicitly
+        // rerecord the parked chapter RenderNode before the next settled frame.
+        val rerecordLiveText = container.skipContentDraw || liveContentDrawSuppressedByPageShot
         detachSlideOverlayRenderer()
         slideDrawable?.let {
             overlay.remove(it)

@@ -55,6 +55,7 @@ import org.robolectric.annotation.Config
 import java.io.File
 import java.util.ArrayDeque
 import kotlin.coroutines.CoroutineContext
+import kotlin.math.abs
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -1179,6 +1180,250 @@ class MarkdownEngineTest {
         assertEquals(
             targetSourceOffset,
             (engine.currentLocator.value.strategy as LocatorStrategy.Section).charOffset,
+        )
+    }
+
+    @Test
+    fun `scroll typography keeps the visible source anchor in the viewport`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val markdown = buildLongMarkdown()
+        val file = tempMarkdown(markdown)
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val scrollView = engine.createView() as ScrollView
+        val parent = attachMeasured(scrollView, context)
+        repeat(4) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        val token = "TargetToken070"
+        val sourceOffset = markdown.indexOf(token)
+        val sourceLocator = Locator(
+            strategy = LocatorStrategy.Section(0, 0, sourceOffset),
+            totalProgression = sourceOffset.toFloat() / markdown.length,
+        )
+        engine.goTo(sourceLocator)
+        repeat(4) {
+            idleMainLooper()
+            relayout(parent)
+        }
+        val textView = scrollView.getChildAt(0) as TextView
+        val renderedOffset = textView.text.toString().indexOf(token)
+        assertTrue("fixture must render the target token", renderedOffset >= 0)
+        val beforeLayout = requireNotNull(textView.layout)
+        val beforeLine = beforeLayout.getLineForOffset(renderedOffset)
+        assertTrue(
+            "target must be visible before typography change",
+            beforeLayout.getLineBottom(beforeLine) > scrollView.scrollY &&
+                beforeLayout.getLineTop(beforeLine) < scrollView.scrollY + scrollView.height,
+        )
+        val anchorBefore =
+            (engine.currentLocator.value.strategy as LocatorStrategy.Section).charOffset
+
+        engine.setFontSize(28f)
+        engine.setLineSpacing(0.9f)
+        repeat(6) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        val afterLayout = requireNotNull(textView.layout)
+        val afterLine = afterLayout.getLineForOffset(renderedOffset)
+        assertTrue(
+            "typography changes must keep the same source anchor in the viewport",
+            afterLayout.getLineBottom(afterLine) > scrollView.scrollY &&
+                afterLayout.getLineTop(afterLine) < scrollView.scrollY + scrollView.height,
+        )
+        assertEquals(
+            "source anchor must survive the scroll typography rebuild",
+            anchorBefore,
+            (engine.currentLocator.value.strategy as LocatorStrategy.Section).charOffset,
+        )
+    }
+
+    @Test
+    fun `scroll typography near-tail restore waits for the exact target scroll`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val markdown = buildLongMarkdown()
+        val file = tempMarkdown(markdown)
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val scrollView = engine.createView() as ScrollView
+        val parent = attachMeasured(scrollView, context)
+        repeat(4) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        val token = "TargetToken095"
+        val sourceOffset = markdown.indexOf(token)
+        val sourceLocator = Locator(
+            strategy = LocatorStrategy.Section(0, 0, sourceOffset),
+            totalProgression = sourceOffset.toFloat() / markdown.length,
+        )
+        engine.goTo(sourceLocator)
+        repeat(4) {
+            idleMainLooper()
+            relayout(parent)
+        }
+        val textView = scrollView.getChildAt(0) as TextView
+        val renderedOffset = textView.text.toString().indexOf(token)
+        assertTrue("fixture must render the near-tail token", renderedOffset >= 0)
+        assertTrue(
+            "fixture must be scrolled deep enough for a clampable tail target",
+            scrollView.scrollY > 0,
+        )
+
+        engine.setFontSize(42f)
+        // Drain only the one-shot post: the WRAP_CONTENT content height is not committed yet, so
+        // a positive-but-clamped scrollY must not be treated as restore completion.
+        idleMainLooper()
+        assertNotNull(
+            "a positive but still-clamped scrollY must not complete the restore",
+            engine.privateField("pendingScrollTypographyAnchor"),
+        )
+        repeat(12) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        assertNull(
+            "converged restore must clear the pending anchor",
+            engine.privateField("pendingScrollTypographyAnchor"),
+        )
+        val afterLayout = requireNotNull(textView.layout)
+        val afterLine = afterLayout.getLineForOffset(renderedOffset)
+        val maxScroll = (afterLayout.height + textView.totalPaddingTop + textView.totalPaddingBottom - scrollView.height)
+            .coerceAtLeast(0)
+        val expectedY = (afterLayout.getLineTop(afterLine) + textView.totalPaddingTop).coerceIn(0, maxScroll)
+        assertTrue(
+            "fixture must keep a near-tail target on the scroll boundary; expected=$expectedY max=$maxScroll",
+            expectedY > 0 && expectedY == maxScroll,
+        )
+        assertTrue(
+            "restore must converge on the exact reachable target instead of a stale partial clamp; " +
+                "scrollY=${scrollView.scrollY} expected=$expectedY",
+            abs(scrollView.scrollY - expectedY) <= 2,
+        )
+    }
+
+    @Test
+    fun `goTo supersedes a pending typography restore and owns the locator`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val markdown = buildLongMarkdown()
+        val file = tempMarkdown(markdown)
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val scrollView = engine.createView() as ScrollView
+        val parent = attachMeasured(scrollView, context)
+        repeat(4) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        val tokenA = "TargetToken030"
+        val offsetA = markdown.indexOf(tokenA)
+        engine.goTo(
+            Locator(
+                strategy = LocatorStrategy.Section(0, 0, offsetA),
+                totalProgression = offsetA.toFloat() / markdown.length,
+            ),
+        )
+        repeat(4) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        val tokenB = "TargetToken075"
+        val offsetB = markdown.indexOf(tokenB)
+        // Arm a pending typography restore (reflow not settled), then navigate to B immediately.
+        engine.setFontSize(28f)
+        engine.goTo(
+            Locator(
+                strategy = LocatorStrategy.Section(0, 0, offsetB),
+                totalProgression = offsetB.toFloat() / markdown.length,
+            ),
+        )
+        repeat(8) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        val textView = scrollView.getChildAt(0) as TextView
+        val layout = requireNotNull(textView.layout)
+        val renderedOffsetB = textView.text.toString().indexOf(tokenB)
+        assertTrue("fixture must render the newer target", renderedOffsetB >= 0)
+        val lineB = layout.getLineForOffset(renderedOffsetB)
+        val maxScroll = (layout.height + textView.totalPaddingTop + textView.totalPaddingBottom - scrollView.height)
+            .coerceAtLeast(0)
+        val expectedY = (layout.getLineTop(lineB) + textView.totalPaddingTop).coerceIn(0, maxScroll)
+        assertTrue(
+            "goTo must own the settled viewport; scrollY=${scrollView.scrollY} expected=$expectedY",
+            abs(scrollView.scrollY - expectedY) <= 2,
+        )
+        assertEquals(
+            "a stale typography restore must not republish its old anchor after the goTo",
+            offsetB,
+            (engine.currentLocator.value.strategy as LocatorStrategy.Section).charOffset,
+        )
+    }
+
+    @Test
+    fun `mode switch to paged invalidates a pending typography restore`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val context = RuntimeEnvironment.getApplication() as Application
+        val markdown = buildLongMarkdown()
+        val file = tempMarkdown(markdown)
+        val engine = MarkdownEngine(context)
+        engine.openBook(Uri.fromFile(file))
+        val scrollView = engine.createView() as ScrollView
+        val parent = attachMeasured(scrollView, context)
+        repeat(4) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        val tokenA = "TargetToken030"
+        val offsetA = markdown.indexOf(tokenA)
+        engine.goTo(
+            Locator(
+                strategy = LocatorStrategy.Section(0, 0, offsetA),
+                totalProgression = offsetA.toFloat() / markdown.length,
+            ),
+        )
+        repeat(4) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        // Arm a pending typography restore without settling the reflow...
+        engine.setFontSize(28f)
+        // ...then the user scrolls to a new passage (published locator), then switches to PAGED.
+        scrollView.scrollTo(0, scrollView.scrollY + 600)
+        val requestedPages = mutableListOf<Int>()
+        engine.setPageRequestCallback(requestedPages::add)
+        engine.setMode(ReadingMode.PAGED)
+        shadowOf(Looper.getMainLooper()).idle()
+        val modeSwitchLocator = engine.currentLocator.value
+        repeat(6) {
+            idleMainLooper()
+            relayout(parent)
+        }
+
+        assertEquals(
+            "a stale typography restore must not republish its old anchor after the mode switch",
+            modeSwitchLocator,
+            engine.currentLocator.value,
+        )
+        assertTrue("mode switch must request exactly one page", requestedPages.size == 1)
+        assertEquals(
+            "the requested page must map to the mode-switch anchor",
+            engine.pageIndexForLocator(modeSwitchLocator),
+            requestedPages.single(),
         )
     }
 

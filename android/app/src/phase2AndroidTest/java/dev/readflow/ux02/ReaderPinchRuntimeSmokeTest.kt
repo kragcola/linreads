@@ -230,7 +230,7 @@ class ReaderPinchRuntimeSmokeTest {
 
     private fun openFontPanel(readerDescription: String) {
         waitForObject(By.desc(readerDescription)).click()
-        waitForObject(By.text("排版")).click()
+        waitForObject(By.text("阅读设置")).click()
         waitForObject(By.text("正文预览"))
     }
 

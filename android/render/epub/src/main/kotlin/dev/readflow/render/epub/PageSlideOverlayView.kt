@@ -13,9 +13,9 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Opaque static SLIDE page-turn renderer. The live TextView stays warm: per-frame motion is a View
- * translation, so this renderer's display list is recorded once and its two page-shot bitmaps are
- * never reallocated or copied per MOVE.
+ * Opaque static SLIDE page-turn renderer. Per-frame motion is a View translation, so this renderer's
+ * display list is recorded once and its two page-shot bitmaps are never reallocated or copied per
+ * MOVE. The fully covered live TextView is skipped until the overlay is removed.
  *
  * The View is a 2W x H strip laid out in content coordinates. Forward content order is
  * [front][revealed] with layout left = 0; backward is [revealed][front] with layout left = -W.

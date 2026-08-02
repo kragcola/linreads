@@ -1,9 +1,9 @@
 # Active Work
 
-_最后更新：2026-08-01_
+_最后更新：2026-08-02_
 
-Mode: `acceptance-hold`
-Objective: 验收 Android TXT/Markdown/PDF 跨格式对齐与 CBZ Stage 1；验收结论前冻结产品代码
+Mode: `cloud-verification`
+Objective: 收口 Android EPUB 手感同步到 TXT/Markdown/PDF，并完成 CBZ Stage 1 研究与实现后的云端验收
 Acceptance handoff: [android-cross-format-cbz-acceptance-handoff-2026-07-27.md](android-cross-format-cbz-acceptance-handoff-2026-07-27.md)
 Parent tracker: [android-v4-pure-reading-unfinished-backfill.md](android-v4-pure-reading-unfinished-backfill.md)
 Last completed tracker: [android-epub-free-rest-pagination-2026-07-13.md](android-epub-free-rest-pagination-2026-07-13.md)
@@ -16,6 +16,13 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 
 > ⛔ **IMPLEMENTATION GATE**：已于 2026-06-19 获用户放行。2026-06-20 `38367f5` 将 v4lite L1–L5 全部落地。其后持续进行体验打磨。
 
+## 2026-08-02 任务续接
+
+- Android 已完成本轮 EPUB page-shot 抑制收口、阅读设置紧凑布局，以及 TXT/Markdown 排版锚点与导航代次修复；PDF/CBZ 共用阅读设置契约，固定版式继续隐藏字体、字号、行距和阅读模式。
+- 漫画专项已完成架构研究并落地本地 CBZ Stage 1：第一方 ZIP 图片分页、自然排序、ComicInfo RTL、ZoomImage 分块缩放、邻页准备窗口与 ZIP 安全预算。研究结论见 [android-comic-reader-architecture-2026-07-27.md](../research/android-comic-reader-architecture-2026-07-27.md)。`.claude/` 未发现 Claude 漫画专项结果，按任务要求跳过该交叉项。
+- 本轮明确不扩展条漫、双页 spread、CBR/7z、ComicInfo page-role 或远程漫画源；这些属于后续独立阶段。HarmonyOS/Web 漫画与本轮 Android 改动均未实现，提交中必须保留三端状态声明。
+- Android 构建、单测、instrumentation、R8 与 APK 产物仅由 GitHub Actions/cloud build 负责；当前主代理只做静态审查，真机验收待云端 GREEN 后进行。
+
 ## 当前执行门禁（2026-07-30）
 
 ### 本地构建禁用记录（2026-07-31）
@@ -23,6 +30,13 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 - 用户已明确要求：本轮交接后禁止本机构建，关闭本地 Android 构建/测试/assemble 相关工具使用，只允许 GitHub Actions / 云端构建产出 APK、test APK、R8/minification 与全量回归证据。
 - 后续代理可继续做 ADB 真机诊断、安装已验真云端产物、读取日志、导出 UI XML、采集包状态/签名/帧时文本指标和静态源码审查；不得再运行 `./gradlew` 生成或测试 Android 本地产物。
 - 本记录不授权清理真机数据、不授权读取/附带截图；主代理仍只消费文本、JSON、哈希、日志和证据路径。
+
+### 100329 OTA 自动安装真机收口（2026-08-02）
+
+- GitHub Actions 发布 `100329` 已完成 full regression、R8、app/helper 资产验真；真机自动前台检查创建下载任务并完成 APK 下载、PackageInstaller session 提交与华为风险确认流程。华为系统仍要求一次锁屏图案确认，不能由第三方应用静默绕过；确认后系统安装器显示“安装成功”，已返回 LinReads 前台。
+- Huawei `BKY-W20`（`3FYBB24C06201100`）安装后 app 为 `versionCode=100329`，`firstInstallTime=2026-07-31 00:32:21` 保持不变；helper 为已验真的 `versionCode=100319`，与主包签名摘要一致且仍可用。未卸载、未清除应用数据。
+- UI XML 确认书库为“共 5 本 · 5 本可离线”，《86-不存在的战区- 10 - 安里アサト》仍在书架；当前任务栈为 `dev.readflow/.MainActivity`。安装后日志未命中 FATAL、ANR、OOM、`INSTALL_FAILED` 或 updater 错误。
+- 自动下载/自动进入安装阶段已收口；剩余 OEM 约束仅是华为系统级锁屏确认与安装完成页，应用本身无法静默代替用户输入。
 
 ### 100319 发布与真机收口（2026-08-01）
 

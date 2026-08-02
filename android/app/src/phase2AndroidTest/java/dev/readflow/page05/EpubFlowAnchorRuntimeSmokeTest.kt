@@ -1060,7 +1060,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
 
             val surfaceBounds = readerSurface.visibleBounds
             injectScreenTap(surfaceBounds.centerX(), surfaceBounds.centerY())
-            val fontButton = waitForObject(By.text("排版"))
+            val fontButton = waitForObject(By.text("阅读设置"))
             val fontBounds = fontButton.visibleBounds
             injectScreenTap(fontBounds.centerX(), fontBounds.centerY())
             waitForObject(By.text("滚动"))
@@ -3027,13 +3027,13 @@ class EpubFlowAnchorRuntimeSmokeTest {
             assertEquals("center tap test should start at the first canonical top", 0, target.startScrollY)
             assertTrue(
                 "chrome should start hidden for a single-toggle assertion",
-                device.findObject(By.text("排版")) == null,
+                device.findObject(By.text("阅读设置")) == null,
             )
 
             val bounds = readerSurface.visibleBounds
             device.click(bounds.centerX(), bounds.centerY())
             device.waitForIdle()
-            waitForObject(By.text("排版"))
+            waitForObject(By.text("阅读设置"))
             waitForObject(By.text("主题"))
 
             val result = scenario.withActivity {
@@ -3110,7 +3110,7 @@ class EpubFlowAnchorRuntimeSmokeTest {
             )
 
             sendKey(KeyEvent.KEYCODE_DPAD_CENTER)
-            waitForObject(By.text("排版"))
+            waitForObject(By.text("阅读设置"))
             waitForObject(By.text("主题"))
         }
     }

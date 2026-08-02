@@ -35,7 +35,7 @@ class ReaderCommandRegistryTest {
     @Test
     fun `default labels and panels match previous hard-coded row`() {
         val labels = ReaderCommandCatalog.specs.map { it.label }
-        assertEquals(listOf("目录", "搜索", "书签", "标注", "排版", "主题"), labels)
+        assertEquals(listOf("目录", "搜索", "书签", "标注", "阅读设置", "主题"), labels)
         val byId = ReaderCommandCatalog.specs.associateBy { it.id }
         assertEquals(ReaderPanel.TOC, byId[ReaderCommandId.TOC]!!.panel)
         assertEquals(ReaderPanel.SEARCH, byId[ReaderCommandId.SEARCH]!!.panel)
@@ -74,7 +74,7 @@ class ReaderCommandRegistryTest {
 
     @Test
     fun `feature filter intersection hides disabled features while keeping order`() {
-        val features = setOf(ReaderFeature.TOC, ReaderFeature.FONT, ReaderFeature.THEME)
+        val features = setOf(ReaderFeature.TOC, ReaderFeature.READING_SETTINGS, ReaderFeature.THEME)
         val visible = ReaderCommandCatalog.visibleSpecs(
             config = ReaderMenuConfig.v1Defaults(),
             features = features,
@@ -143,7 +143,7 @@ class ReaderCommandRegistryTest {
         val visible = defaultVisibleReaderCommands()
         assertEquals(6, visible.size)
         assertEquals(
-            listOf("目录", "搜索", "书签", "标注", "排版", "主题"),
+            listOf("目录", "搜索", "书签", "标注", "阅读设置", "主题"),
             visible.map { it.label },
         )
         assertTrue(readerCommandSelected(ReaderCommandId.TOC, ReaderPanel.TOC))
@@ -185,7 +185,7 @@ class ReaderCommandRegistryTest {
         val features = setOf(
             ReaderFeature.TOC,
             ReaderFeature.BOOKMARKS,
-            ReaderFeature.FONT,
+            ReaderFeature.READING_SETTINGS,
             ReaderFeature.THEME,
         )
         val visible = ReaderCommandCatalog.visibleSpecs(config, features)

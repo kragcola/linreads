@@ -122,6 +122,8 @@ class TxtVirtualPagerEngine(
     private var recyclerView: RecyclerView? = null
     private var pageRequestCallback: ((pageIndex: Int) -> Unit)? = null
     private var pendingProgrammaticScroll: PendingProgrammaticScroll? = null
+    private var pendingContinuousTypographyAnchor: TxtParagraphPosition? = null
+    private var continuousTypographyRestoreGeneration = 0L
     /**
      * Host-reported ViewPager viewport. Zero means "not yet laid out" — fall back to
      * displayMetrics until the first real layout arrives (Markdown parity).
@@ -158,6 +160,8 @@ class TxtVirtualPagerEngine(
                 previousDocument?.close()
             }
             pendingProgrammaticScroll = null
+            pendingContinuousTypographyAnchor = null
+            continuousTypographyRestoreGeneration += 1L
             // Engine instance may be reused for a different book; drop transient search paint state.
             searchHighlightHit = null
             val requiresFingerprint = pendingEngineState != null
@@ -225,6 +229,11 @@ class TxtVirtualPagerEngine(
     }
 
     override fun createView(): View {
+        // Remount: a pending continuous typography anchor belongs to the previous surface. Drop
+        // its state and generation so a later typography edit captures the new surface's actual
+        // viewport instead of reusing the stale anchor after the user scrolls the new surface.
+        pendingContinuousTypographyAnchor = null
+        continuousTypographyRestoreGeneration += 1L
         val initialPosition = currentParagraphPosition()
         val rv = RecyclerView(context).apply {
             layoutManager = LinearLayoutManager(context)
@@ -635,6 +644,157 @@ class TxtVirtualPagerEngine(
         return true
     }
 
+    private fun captureContinuousTypographyAnchor(): TxtParagraphPosition? {
+        if (_pagingKind.value != PagingKind.CONTINUOUS) return null
+        if (paragraphCount() == 0) return null
+        pendingContinuousTypographyAnchor?.let { return it }
+        val rv = recyclerView ?: return currentParagraphPosition()
+        val lm = rv.layoutManager as? LinearLayoutManager ?: return currentParagraphPosition()
+        val first = lm.findFirstVisibleItemPosition()
+            .takeIf { it != RecyclerView.NO_POSITION }
+            ?: return currentParagraphPosition()
+        return paragraphPositionAtViewportY(rv, first, rv.paddingTop)
+    }
+
+    private fun scheduleContinuousTypographyRestore(position: TxtParagraphPosition?) {
+        position ?: return
+        if (_pagingKind.value != PagingKind.CONTINUOUS) return
+        val anchor = position.clamp(paragraphCount().coerceAtLeast(1), ::paragraphAt)
+        pendingContinuousTypographyAnchor = anchor
+        val generation = ++continuousTypographyRestoreGeneration
+        publishLocator(locatorForPosition(anchor))
+        val rv = recyclerView ?: run {
+            pendingContinuousTypographyAnchor = null
+            return
+        }
+        // The holder's layout at schedule time is still the pre-reflow geometry: notifyDataSetChanged
+        // only rebinds during the next layout pass. Completing against that stale layout would leave
+        // the surface at the old pixel position, so completion must wait for a re-created layout.
+        val staleLayout = (rv.findViewHolderForAdapterPosition(anchor.paragraphIndex)
+            as? TxtParagraphAdapter.ParagraphHolder)?.textView?.layout
+        retryContinuousHolderRestore(
+            rv = rv,
+            paragraphIndex = anchor.paragraphIndex,
+            isCurrent = {
+                generation == continuousTypographyRestoreGeneration &&
+                    recyclerView === rv &&
+                    _pagingKind.value == PagingKind.CONTINUOUS
+            },
+            attempt = {
+                val layout = (rv.findViewHolderForAdapterPosition(anchor.paragraphIndex)
+                    as? TxtParagraphAdapter.ParagraphHolder)?.textView?.layout
+                if (layout == null || layout === staleLayout) {
+                    // Child content has not reflowed yet; keep waiting for the holder layout.
+                    false
+                } else if (restoreContinuousPosition(rv, anchor)) {
+                    pendingContinuousTypographyAnchor = null
+                    publishLocator(locatorForPosition(anchor))
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+    }
+
+    /**
+     * Retries [attempt] until it returns true, driven by the target holder's content layout
+     * (child layout changes + child attach/detach) instead of the RecyclerView's own outer
+     * bounds. notifyDataSetChanged reflows/rebinds children without necessarily changing the
+     * RecyclerView bounds, and a one-shot rv.post can run before the holder has its new layout.
+     * [isCurrent] gates every callback (generation + exact RecyclerView identity + CONTINUOUS
+     * mode); once stale, callbacks detach themselves without touching newer restore state.
+     */
+    private fun retryContinuousHolderRestore(
+        rv: RecyclerView,
+        paragraphIndex: Int,
+        isCurrent: () -> Boolean,
+        attempt: () -> Boolean,
+    ) {
+        lateinit var childLayoutListener: View.OnLayoutChangeListener
+        lateinit var childAttachListener: RecyclerView.OnChildAttachStateChangeListener
+        var observedChild: View? = null
+        var completed = false
+
+        fun detach() {
+            observedChild?.removeOnLayoutChangeListener(childLayoutListener)
+            observedChild = null
+            rv.removeOnChildAttachStateChangeListener(childAttachListener)
+        }
+
+        fun tryRestore() {
+            if (completed) return
+            if (!isCurrent()) {
+                detach()
+                return
+            }
+            val holder = rv.findViewHolderForAdapterPosition(paragraphIndex)
+                as? TxtParagraphAdapter.ParagraphHolder
+            val child = holder?.itemView
+            if (child !== observedChild) {
+                observedChild?.removeOnLayoutChangeListener(childLayoutListener)
+                observedChild = child
+                child?.addOnLayoutChangeListener(childLayoutListener)
+            }
+            if (attempt()) {
+                completed = true
+                detach()
+            }
+        }
+
+        childLayoutListener = object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(
+                view: View,
+                left: Int,
+                top: Int,
+                right: Int,
+                bottom: Int,
+                oldLeft: Int,
+                oldTop: Int,
+                oldRight: Int,
+                oldBottom: Int,
+            ) = tryRestore()
+        }
+        childAttachListener = object : RecyclerView.OnChildAttachStateChangeListener {
+            override fun onChildViewAttachedToWindow(view: View) = tryRestore()
+
+            override fun onChildViewDetachedFromWindow(view: View) {
+                if (view === observedChild) {
+                    observedChild?.removeOnLayoutChangeListener(childLayoutListener)
+                    observedChild = null
+                }
+            }
+        }
+        rv.addOnChildAttachStateChangeListener(childAttachListener)
+        tryRestore()
+        rv.post { tryRestore() }
+    }
+
+    /**
+     * After scrollToPositionWithOffset lands, aligns [position.charOffset]'s line at the viewport
+     * top once the target holder/content layout exists (continuous goTo inner-offset semantics).
+     * [navigationGeneration] is captured after this goTo invalidated older restores; every
+     * callback is gated on it so a later goTo/typography/remount/mode change self-detaches this
+     * restore instead of pulling the viewport back to the previous navigation target.
+     */
+    private fun scheduleContinuousInnerOffsetRestore(
+        rv: RecyclerView,
+        position: TxtParagraphPosition,
+        navigationGeneration: Long,
+    ) {
+        if (position.charOffset <= 0) return
+        retryContinuousHolderRestore(
+            rv = rv,
+            paragraphIndex = position.paragraphIndex,
+            isCurrent = {
+                navigationGeneration == continuousTypographyRestoreGeneration &&
+                    recyclerView === rv &&
+                    _pagingKind.value == PagingKind.CONTINUOUS
+            },
+            attempt = { restoreContinuousPosition(rv, position) },
+        )
+    }
+
     private fun paragraphPositionAtViewportY(
         rv: RecyclerView,
         paragraphIndex: Int,
@@ -661,11 +821,21 @@ class TxtVirtualPagerEngine(
         val position = paragraphPositionForLocator(locator)
         val target = locatorForPosition(position, total)
         recyclerView?.let { rv ->
+            // A pending continuous typography restore is stale once the user navigates: drop its
+            // anchor/generation so the old callback cannot scroll the surface back after goTo lands.
+            pendingContinuousTypographyAnchor = null
+            continuousTypographyRestoreGeneration += 1L
+            // This exact generation owns this navigation's inner-offset restore; any later goTo,
+            // typography change, remount, or mode switch bumps it and orphans this callback.
+            val navigationGeneration = continuousTypographyRestoreGeneration
             pendingProgrammaticScroll = PendingProgrammaticScroll(
                 fromIndex = currentVisibleParagraphIndex() ?: currentParagraphIndex(),
                 targetIndex = position.paragraphIndex,
             )
             (rv.layoutManager as? LinearLayoutManager)?.scrollToPositionWithOffset(position.paragraphIndex, 0)
+            if (_pagingKind.value == PagingKind.CONTINUOUS) {
+                scheduleContinuousInnerOffsetRestore(rv, position, navigationGeneration)
+            }
         }
         publishLocator(target)
         pageRequestCallback?.invoke(
@@ -890,6 +1060,8 @@ class TxtVirtualPagerEngine(
         recyclerView = null
         pageRequestCallback = null
         pendingProgrammaticScroll = null
+        pendingContinuousTypographyAnchor = null
+        continuousTypographyRestoreGeneration += 1L
         activePageTextViews.clear()
         activePageContainers.clear()
         activePageBindings.clear()
@@ -921,28 +1093,37 @@ class TxtVirtualPagerEngine(
 
     override suspend fun setFontSize(sp: Float) {
         if (fontSizeSp == sp) return
+        val continuousAnchor = captureContinuousTypographyAnchor()
         fontSizeSp = sp
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateFontSize(sp)
         activePageTextViews.forEach { it.applyTextStyle() }
-        rebuildPagedRangesAfterTypographyChange()
+        if (!rebuildPagedRangesAfterTypographyChange()) {
+            scheduleContinuousTypographyRestore(continuousAnchor)
+        }
     }
 
     override suspend fun setSerifFont(useSourceHan: Boolean) {
+        val continuousAnchor = captureContinuousTypographyAnchor()
         this.useSourceHan = useSourceHan
         currentFontId = if (useSourceHan) "source_han" else "system"
         withContext(Dispatchers.Main) {
             (recyclerView?.adapter as? TxtParagraphAdapter)?.updateTypeface(resolveTypeface())
-            rebuildPagedRangesAfterTypographyChange()
+            if (!rebuildPagedRangesAfterTypographyChange()) {
+                scheduleContinuousTypographyRestore(continuousAnchor)
+            }
         }
     }
 
     override suspend fun setFont(fontId: String) {
         if (currentFontId == fontId) return
+        val continuousAnchor = captureContinuousTypographyAnchor()
         currentFontId = fontId
         useSourceHan = fontId == "source_han"
         withContext(Dispatchers.Main) {
             (recyclerView?.adapter as? TxtParagraphAdapter)?.updateTypeface(resolveTypeface())
-            rebuildPagedRangesAfterTypographyChange()
+            if (!rebuildPagedRangesAfterTypographyChange()) {
+                scheduleContinuousTypographyRestore(continuousAnchor)
+            }
         }
     }
 
@@ -1158,10 +1339,13 @@ class TxtVirtualPagerEngine(
 
     override suspend fun setLineSpacing(multiplier: Float) {
         if (lineSpacingMultiplier == multiplier) return
+        val continuousAnchor = captureContinuousTypographyAnchor()
         lineSpacingMultiplier = multiplier
         (recyclerView?.adapter as? TxtParagraphAdapter)?.updateLineSpacing(multiplier)
         activePageTextViews.forEach { it.applyTextStyle() }
-        rebuildPagedRangesAfterTypographyChange()
+        if (!rebuildPagedRangesAfterTypographyChange()) {
+            scheduleContinuousTypographyRestore(continuousAnchor)
+        }
     }
 
     override suspend fun setTheme(mode: ThemeMode) {
@@ -1182,11 +1366,18 @@ class TxtVirtualPagerEngine(
         }
         val startingKind = _pagingKind.value
         val position = withContext(Dispatchers.Main) {
+            // A mode switch away from CONTINUOUS must preserve an already-captured typography
+            // anchor: the pending source position predates any reflow and is canonical, so use it
+            // instead of recomputing from the current (possibly reflowed) pixel geometry.
             val anchor = if (_pagingKind.value == PagingKind.CONTINUOUS) {
-                TxtParagraphPosition(currentVisibleParagraphIndex() ?: currentParagraphIndex(), 0)
+                pendingContinuousTypographyAnchor ?: currentVisibleParagraphPosition()
             } else {
                 currentParagraphPosition()
             }
+            // Invalidate every restore armed on the previous surface so no stale callback can
+            // republish or scroll the new mode's surface; the preserved anchor is captured above.
+            pendingContinuousTypographyAnchor = null
+            continuousTypographyRestoreGeneration += 1L
             publishLocator(locatorForPosition(anchor))
             if (targetKind != PagingKind.PAGED) {
                 _pagingKind.value = targetKind
@@ -1252,6 +1443,27 @@ class TxtVirtualPagerEngine(
         }.minByOrNull { it.second }?.first
         return (centered ?: lm.findFirstVisibleItemPosition().takeIf { it != RecyclerView.NO_POSITION })
             ?.coerceIn(0, total - 1)
+    }
+
+    /**
+     * Paragraph + line-start charOffset at the viewport center of the SCROLL surface. Unlike
+     * [currentVisibleParagraphIndex], a mid-paragraph viewport keeps its actual line-start
+     * charOffset instead of collapsing to paragraph start (mode-switch anchor preservation).
+     */
+    private fun currentVisibleParagraphPosition(): TxtParagraphPosition {
+        val rv = recyclerView ?: return currentParagraphPosition()
+        val paragraphIndex = currentVisibleParagraphIndex() ?: return currentParagraphPosition()
+        val holder = rv.findViewHolderForAdapterPosition(paragraphIndex)
+            as? TxtParagraphAdapter.ParagraphHolder
+            ?: return TxtParagraphPosition(paragraphIndex, 0)
+        val textView = holder.textView
+        val layout = textView.layout ?: return TxtParagraphPosition(paragraphIndex, 0)
+        if (layout.lineCount == 0) return TxtParagraphPosition(paragraphIndex, 0)
+        val viewportCenter = rv.paddingTop + (rv.height - rv.paddingTop - rv.paddingBottom) / 2
+        val textTopInRecycler = holder.itemView.top + textView.top + textView.totalPaddingTop
+        val localY = (viewportCenter - textTopInRecycler).coerceIn(0, (layout.height - 1).coerceAtLeast(0))
+        val line = layout.getLineForVertical(localY)
+        return TxtParagraphPosition(paragraphIndex, layout.getLineStart(line))
     }
 
     private fun trackPageView(container: FrameLayout, binding: TxtPageViewBinding) {

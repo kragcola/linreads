@@ -189,6 +189,14 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
 
             sendKey(KeyEvent.KEYCODE_DPAD_CENTER)
             waitForObject(By.text("主题"))
+            waitForObject(By.text("阅读设置")).click()
+            waitForObject(By.text("翻页动画"))
+            listOf("正文预览", "阅读模式", "字号", "行距", "字体").forEach { unsupportedLabel ->
+                assertTrue(
+                    "fixed-layout PDF must hide unsupported control: $unsupportedLabel",
+                    device.findObject(By.text(unsupportedLabel)) == null,
+                )
+            }
             takeScreenshot("keyboard-after-center.png")
             dumpHierarchy("keyboard-after-center.xml")
 
@@ -203,6 +211,8 @@ class ReaderPagedKeyboardRuntimeSmokeTest {
                     appendLine("after_dpad_right_label=${afterRight.label}")
                     appendLine("after_dpad_right_item=${afterRight.currentItem}")
                     appendLine("after_center_chrome=true")
+                    appendLine("pdf_reading_settings_animation=true")
+                    appendLine("pdf_reading_settings_typography=false")
                 },
             )
 

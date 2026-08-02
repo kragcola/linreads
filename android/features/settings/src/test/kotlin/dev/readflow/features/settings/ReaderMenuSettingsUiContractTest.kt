@@ -20,7 +20,7 @@ class ReaderMenuSettingsUiContractTest {
         assertEquals("搜索", readerMenuCommandLabel(ReaderCommandId.SEARCH))
         assertEquals("书签", readerMenuCommandLabel(ReaderCommandId.BOOKMARKS))
         assertEquals("标注", readerMenuCommandLabel(ReaderCommandId.ANNOTATIONS))
-        assertEquals("排版", readerMenuCommandLabel(ReaderCommandId.FONT))
+        assertEquals("阅读设置", readerMenuCommandLabel(ReaderCommandId.FONT))
         assertEquals("主题", readerMenuCommandLabel(ReaderCommandId.THEME))
     }
 

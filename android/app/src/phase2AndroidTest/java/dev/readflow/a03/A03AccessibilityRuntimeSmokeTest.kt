@@ -136,7 +136,7 @@ class A03AccessibilityRuntimeSmokeTest {
             val overallProgress = waitForObject(By.desc("全书进度，拖动跳转"))
             assertAdjustableTouchTarget("全书进度", overallProgress)
             waitForObject(By.descContains("第 1 / 2 章"))
-            listOf("目录", "搜索", "书签", "标注", "排版", "主题").forEach { label ->
+            listOf("目录", "搜索", "书签", "标注", "阅读设置", "主题").forEach { label ->
                 waitForObject(By.desc(label))
             }
             takeScreenshot("reader-chrome.png")
@@ -165,7 +165,7 @@ class A03AccessibilityRuntimeSmokeTest {
             takeScreenshot("panel-annotations.png")
             dumpHierarchy("panel-annotations.xml")
 
-            openBottomPanel("排版", "正文预览")
+            openBottomPanel("阅读设置", "正文预览")
             val fontSlider = waitForObject(By.desc("字号"))
             val lineSpacingSlider = waitForObject(By.desc("行距"))
             assertAdjustableTouchTarget("字号", fontSlider)
@@ -201,7 +201,7 @@ class A03AccessibilityRuntimeSmokeTest {
                     appendLine("library_menu_description=$libraryMenuDescription")
                     appendLine("reader_surface_description=${readerSurfaceSummary.contentDescription}")
                     appendLine("reader_surface_actions=${readerSurfaceSummary.actions.joinToString("|")}")
-                    appendLine("reader_chrome_labels=返回|添加书签|上一章|下一章|全书进度，拖动跳转|目录|搜索|书签|标注|排版|主题")
+                    appendLine("reader_chrome_labels=返回|添加书签|上一章|下一章|全书进度，拖动跳转|目录|搜索|书签|标注|阅读设置|主题")
                     appendLine("toc_close_description=$tocCloseDescription")
                     appendLine("toc_item_description=$tocDescription")
                     appendLine("search_actions=执行搜索|清空搜索")
