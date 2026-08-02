@@ -917,34 +917,17 @@ class TxtVirtualPagerEngineTest {
             val line = layout.getLineForOffset(renderedOffset)
             return holder.itemView.top + textView.top + textView.totalPaddingTop + layout.getLineTop(line)
         }
-        val beforeManualRestoreTop = tokenLineTop()
-        val currentPosition = TxtVirtualPagerEngine::class.java
-            .getDeclaredMethod("currentParagraphPosition")
-            .apply { isAccessible = true }
-            .invoke(engine)
-        val manualRestoreResult = TxtVirtualPagerEngine::class.java.declaredMethods
-            .single { it.name == "restoreContinuousPosition" }
-            .apply { isAccessible = true }
-            .invoke(engine, view, currentPosition) as Boolean
-        val afterManualRestoreTop = tokenLineTop()
-        val diagnosticHolder = view.findViewHolderForAdapterPosition(0)
-            as? TxtParagraphAdapter.ParagraphHolder ?: error("diagnostic holder must remain bound")
-        val diagnosticLayoutManager = view.layoutManager as LinearLayoutManager
+        val initialHolder = view.findViewHolderForAdapterPosition(0)
+            as? TxtParagraphAdapter.ParagraphHolder ?: error("initial holder must remain bound")
+        assertTrue(
+            "fixture must exercise one vertically wrapped oversized row",
+            requireNotNull(initialHolder.textView.layout).lineCount > 1 &&
+                initialHolder.itemView.height > view.height,
+        )
         assertTrue(
             "initial restore must put the target line at the viewport top; " +
-                "before=$beforeManualRestoreTop afterManual=$afterManualRestoreTop " +
-                "manualResult=$manualRestoreResult padding=${view.paddingTop} " +
-                "rowTop=${diagnosticHolder.itemView.top} rowBottom=${diagnosticHolder.itemView.bottom} " +
-                "decoratedTop=${diagnosticLayoutManager.getDecoratedTop(diagnosticHolder.itemView)} " +
-                "decoratedBottom=${diagnosticLayoutManager.getDecoratedBottom(diagnosticHolder.itemView)} " +
-                "textLength=${diagnosticHolder.textView.text.length} " +
-                "textWidth=${diagnosticHolder.textView.width} textHeight=${diagnosticHolder.textView.height} " +
-                "layoutWidth=${diagnosticHolder.textView.layout?.width} " +
-                "layoutHeight=${diagnosticHolder.textView.layout?.height} " +
-                "lineCount=${diagnosticHolder.textView.layout?.lineCount} " +
-                "itemCount=${view.adapter?.itemCount} viewHeight=${view.height} " +
-                "layoutRequested=${view.isLayoutRequested} computingLayout=${view.isComputingLayout}",
-            abs(beforeManualRestoreTop - view.paddingTop) <= 2,
+                "top=${tokenLineTop()} padding=${view.paddingTop}",
+            abs(tokenLineTop() - view.paddingTop) <= 2,
         )
 
         engine.setFontSize(30f)
