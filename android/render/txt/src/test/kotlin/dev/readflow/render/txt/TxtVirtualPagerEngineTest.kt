@@ -937,8 +937,11 @@ class TxtVirtualPagerEngineTest {
                 "rowTop=${diagnosticHolder.itemView.top} rowBottom=${diagnosticHolder.itemView.bottom} " +
                 "decoratedTop=${diagnosticLayoutManager.getDecoratedTop(diagnosticHolder.itemView)} " +
                 "decoratedBottom=${diagnosticLayoutManager.getDecoratedBottom(diagnosticHolder.itemView)} " +
-                "textHeight=${diagnosticHolder.textView.height} " +
+                "textLength=${diagnosticHolder.textView.text.length} " +
+                "textWidth=${diagnosticHolder.textView.width} textHeight=${diagnosticHolder.textView.height} " +
+                "layoutWidth=${diagnosticHolder.textView.layout?.width} " +
                 "layoutHeight=${diagnosticHolder.textView.layout?.height} " +
+                "lineCount=${diagnosticHolder.textView.layout?.lineCount} " +
                 "itemCount=${view.adapter?.itemCount} viewHeight=${view.height} " +
                 "layoutRequested=${view.isLayoutRequested} computingLayout=${view.isComputingLayout}",
             abs(beforeManualRestoreTop - view.paddingTop) <= 2,
