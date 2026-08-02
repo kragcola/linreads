@@ -2203,6 +2203,7 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun `slide teardown rerecords the parked image page after suppressing live draw`() {
         val fixture = visibleHeadingImageContinuationFixture(minHeadingPageIndex = 1)
         val view = fixture.view
@@ -2299,6 +2300,9 @@ class EpubFlowViewTest {
             }
             view.overlay.add(curl)
             view.setPrivateField("curlDrawable", curl)
+            // Mirror the production install sequence (overlay.add -> curlDrawable ->
+            // applyFlipProgress) so the transaction latch arms exactly as a real SIMULATION turn.
+            view.applyFlipProgressForTest(0f, true)
 
             fixture.imageDrawable.color = liveSyntheticColor
             view.textView.invalidate()
@@ -13543,6 +13547,16 @@ class EpubFlowViewTest {
         javaClass.getDeclaredMethod("clearFlipOverlay", Boolean::class.javaPrimitiveType)
             .apply { isAccessible = true }
             .invoke(this, false)
+    }
+
+    private fun EpubFlowView.applyFlipProgressForTest(progress: Float, forward: Boolean) {
+        javaClass.getDeclaredMethod(
+            "applyFlipProgress",
+            Float::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType,
+        )
+            .apply { isAccessible = true }
+            .invoke(this, progress, forward)
     }
 
     private fun EpubFlowView.drawToBitmapForTest(): Bitmap =

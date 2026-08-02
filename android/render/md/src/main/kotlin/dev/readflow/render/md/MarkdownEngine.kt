@@ -514,14 +514,21 @@ class MarkdownEngine(
         lateinit var contentListener: View.OnLayoutChangeListener
         var observedTextView: TextView? = null
         var attemptInProgress = false
+        var terminated = false
+        var retryPosted = false
+        var retryBudget = SCROLL_RESTORE_RETRY_BUDGET
 
         fun detach() {
+            terminated = true
             sv.removeOnLayoutChangeListener(scrollListener)
             observedTextView?.removeOnLayoutChangeListener(contentListener)
             observedTextView = null
         }
 
         fun attemptRestore() {
+            // Already-completed or detached restores are no-ops; a posted retry runnable may
+            // still be queued after the attempt that completed/terminated the transaction.
+            if (completionReported || terminated) return
             // Robolectric and some Android layout paths deliver TextView layout callbacks
             // synchronously from ensureScrollTextViewMeasured(). Do not re-enter the same
             // restore transaction while it is measuring/layouting the content.
@@ -547,13 +554,30 @@ class MarkdownEngine(
                 if (
                     sv.width > 0 &&
                     sv.height > 0 &&
-                    restoreScrollToLocator(locator, generation, transaction)
+                    restoreScrollToLocator(locator, generation, transaction, ::postRetry)
                 ) {
                     detach()
                     reportCompletion()
                 }
             } finally {
                 attemptInProgress = false
+            }
+        }
+
+        /**
+         * Bounded next-frame retry used only by the distance-not-converged branch. The budget is
+         * replenished solely by a real layout listener pass (see below), never by this retry
+         * itself, so a layout that never commits or an unreachable Y cannot self-repost forever.
+         */
+        fun postRetry() {
+            if (completionReported || terminated) return
+            if (retryPosted || retryBudget <= 0) return
+            retryPosted = true
+            retryBudget -= 1
+            sv.postOnAnimation {
+                retryPosted = false
+                if (completionReported || terminated) return@postOnAnimation
+                attemptRestore()
             }
         }
         scrollListener = object : View.OnLayoutChangeListener {
@@ -567,7 +591,13 @@ class MarkdownEngine(
                 oldTop: Int,
                 oldRight: Int,
                 oldBottom: Int,
-            ) = attemptRestore()
+            ) {
+                // A real layout pass replenishes the retry budget so the next attempt may use one
+                // next-frame retry. Never replenish while an attempt is measuring/layouting: the
+                // synchronous TextView.layout reentry below cannot feed an infinite retry loop.
+                if (!attemptInProgress) retryBudget = SCROLL_RESTORE_RETRY_BUDGET
+                attemptRestore()
+            }
         }
         contentListener = object : View.OnLayoutChangeListener {
             override fun onLayoutChange(
@@ -580,7 +610,10 @@ class MarkdownEngine(
                 oldTop: Int,
                 oldRight: Int,
                 oldBottom: Int,
-            ) = attemptRestore()
+            ) {
+                if (!attemptInProgress) retryBudget = SCROLL_RESTORE_RETRY_BUDGET
+                attemptRestore()
+            }
         }
         sv.addOnLayoutChangeListener(scrollListener)
         attemptRestore()
@@ -596,6 +629,7 @@ class MarkdownEngine(
         locator: Locator,
         generation: Long = highlightRefreshGeneration,
         transaction: Long = scrollRestoreTransaction,
+        onRetry: () -> Unit,
     ): Boolean {
         if (generation != highlightRefreshGeneration || transaction != scrollRestoreTransaction) return true
         val sv = scrollView ?: return true
@@ -627,36 +661,13 @@ class MarkdownEngine(
             // the hierarchy yet: the upcoming pass can clamp scrollY to zero (or below the target).
             // Complete only after the committed layout confirms the reach.
             if (sv.isLayoutRequested) {
-                sv.post {
-                    if (
-                        generation != highlightRefreshGeneration ||
-                        transaction != scrollRestoreTransaction
-                    ) {
-                        return@post
-                    }
-                    if (scrollView === sv && textView === tv) {
-                        ensureScrollTextViewMeasured(sv, tv)
-                        sv.scrollTo(0, y)
-                    }
-                }
                 return false
             }
             // Completion is real only when the viewport actually reaches the computed target line.
             // A positive-but-still-clamped scrollY (content height under-committed) must keep
             // retrying instead of reporting success.
             if (abs(sv.scrollY - y) > SCROLL_RESTORE_TOLERANCE_PX) {
-                sv.post {
-                    if (
-                        generation != highlightRefreshGeneration ||
-                        transaction != scrollRestoreTransaction
-                    ) {
-                        return@post
-                    }
-                    if (scrollView === sv && textView === tv) {
-                        ensureScrollTextViewMeasured(sv, tv)
-                        sv.scrollTo(0, y)
-                    }
-                }
+                onRetry()
                 return false
             }
         } finally {
@@ -1230,6 +1241,11 @@ class MarkdownEngine(
         const val TEXT_PADDING_DP: Float = 16f
         /** Max pixel distance between scrollY and the computed target that counts as restored. */
         private const val SCROLL_RESTORE_TOLERANCE_PX = 2f
+        /**
+         * Next-frame retries allowed per real layout pass. Replenished only by layout listeners
+         * outside an in-flight attempt so a stuck layout cannot self-repost forever.
+         */
+        private const val SCROLL_RESTORE_RETRY_BUDGET = 1
         private const val DOCUMENT_TITLE_FALLBACK = "正文"
 
         private fun paletteFor(mode: ThemeMode, configuration: Configuration): ReaderPalette {
