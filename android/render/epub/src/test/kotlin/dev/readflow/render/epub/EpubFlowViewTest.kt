@@ -2491,8 +2491,8 @@ class EpubFlowViewTest {
         assertEquals("test must sample a half-complete slide", 0.5f, slide.progress, 0.001f)
         val revealedBitmap = slide.privateBitmap("revealedBitmap")
         val revealedSourceX = expectedSourceX * revealedBitmap.width / view.width
-        assertNotEquals(
-            "revealed page shot must carry captured paper pixels instead of exposing the static host",
+        assertEquals(
+            "a viewport-resolution revealed shot must preserve the exact captured paper pixel",
             staticFrame.getPixel(expectedSourceX, sampleY),
             revealedBitmap.getPixel(revealedSourceX, sampleY * revealedBitmap.height / view.height),
         )
