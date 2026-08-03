@@ -228,7 +228,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `low budget slide settle keeps detached display list bitmaps leased through two host frames`() {
-        val oneMotionShotBytes = (360L / 4L) * (120L / 4L) * 2L
+        val oneMotionShotBytes = 360L * 120L * 2L
         val budget = PageShotBudget(oneMotionShotBytes)
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SLIDE,
@@ -336,7 +336,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `slide retirement fence resumes budget-deferred current page precache after frame two`() {
-        val oneMotionShotBytes = (360L / 4L) * (120L / 4L) * 2L
+        val oneMotionShotBytes = 360L * 120L * 2L
         val budget = PageShotBudget(oneMotionShotBytes * 2L)
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SLIDE,
@@ -1960,7 +1960,7 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `motion page shots use bounded resolution while settled snapshots stay full size`() {
+    fun `motion page shots preserve viewport resolution like settled snapshots`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         // The fixture may warm three directional owners during layout. Release those owners so
         // this test measures the two explicit snapshot paths rather than slot admission.
@@ -1979,10 +1979,12 @@ class EpubFlowViewTest {
         try {
             assertNotNull(motion)
             assertNotNull(settled)
-            assertTrue(
-                "motion snapshots must upload fewer pixels than settled content",
-                motion!!.width < settled!!.width && motion.height < settled.height,
+            assertEquals(
+                "motion snapshots must keep text and image detail at the viewport resolution",
+                settled!!.width,
+                motion!!.width,
             )
+            assertEquals(settled.height, motion.height)
             assertEquals(view.width, settled.width)
             assertEquals(view.height, settled.height)
         } finally {
@@ -2761,7 +2763,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `one shot soft budget still admits an interactive working pair`() {
-        val oneShotBytes = (360L / 4L) * (120L / 4L) * 2L
+        val oneShotBytes = 360L * 120L * 2L
         val budget = PageShotBudget(oneShotBytes)
         var pinnedAdmissionRequests = 0
         val view = pagedFlowView(
@@ -2917,7 +2919,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `retained reverse boundary preview yields to a local working pair under one shot budget`() {
-        val oneShotBytes = (360L / 4L) * (120L / 4L) * 2L
+        val oneShotBytes = 360L * 120L * 2L
         val budget = PageShotBudget(oneShotBytes)
         val evicted = mutableListOf<Long>()
         val view = pagedFlowView(
@@ -5716,6 +5718,10 @@ class EpubFlowViewTest {
         assertEquals(0, startedCount)
         assertEquals(0, settledCount)
         assertNull(view.privateField("slideDrawable"))
+        assertNotNull(
+            "a failed target capture must retain the outgoing continuity cover instead of hard-cutting",
+            view.privateField("conversionSnapshotDrawable"),
+        )
     }
 
     @Test

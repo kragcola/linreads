@@ -5089,7 +5089,11 @@ internal class EpubFlowView(
             return false
         }
         val revealed = snapshotViewport(PageShotLeaseKind.PINNED, "active.target") ?: run {
-            recyclePageShot(outgoing)
+            // Keep the outgoing frame visible if the larger 1:1 target shot cannot be admitted or
+            // rendered. revealContent() will cross-fade this cover over the live target instead of
+            // exposing a blank/hard-cut chapter boundary.
+            showConversionSnapshot(outgoing)
+            boundaryContinuityCover = true
             return false
         }
         onPageTurnStarted?.invoke()
@@ -6677,12 +6681,11 @@ internal class EpubFlowView(
         /** Detached-host fallback for render-retired SLIDE page shots that never saw a host frame. */
         const val RENDER_RETIRED_FALLBACK_DELAY_MS = 320L
         /**
-         * Motion snapshots are transient animation textures. Keep the settled/live page at full
-         * resolution, but upload a bounded quarter-resolution pair while the finger owns the turn.
-         * The live page is restored as soon as the transaction commits, so this does not persist as
-         * a reader-quality downgrade.
+         * Motion snapshots are transient animation textures, but they must retain the same spatial
+         * detail as the settled page. The bounded pair and RGB_565 opaque-page path keep GPU memory
+         * predictable without introducing a visible low-resolution frame during the turn.
          */
-        const val MOTION_PAGE_SHOT_SCALE = 0.25f
+        const val MOTION_PAGE_SHOT_SCALE = 1f
         const val FREE_FLING_MIN_SETTLE_MS = 64L
         const val FREE_FLING_STABLE_FRAMES = 2
     }

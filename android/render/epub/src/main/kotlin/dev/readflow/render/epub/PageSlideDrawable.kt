@@ -98,8 +98,8 @@ internal class PageSlideDrawable(
         val visibleRight = min(w, left + w)
         if (visibleRight <= visibleLeft) return
 
-        // Full-size page shots keep a clipped, translated 1:1 blit. Reduced motion shots use the
-        // scaled source/destination path below:
+        // Viewport-sized page shots keep a clipped, translated 1:1 blit. Legacy reduced owners use
+        // the scaled source/destination path below:
         // drawBitmap(src,dst) makes the GPU run a filtered scale on every MOVE even when both rects
         // are the same size, which is especially costly for image-heavy EPUB pages.
         if (bitmap.width == viewportW && bitmap.height == viewportH) {

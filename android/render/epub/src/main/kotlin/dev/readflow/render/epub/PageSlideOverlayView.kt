@@ -71,7 +71,7 @@ internal class PageSlideOverlayView(
         drawSeamShadow(canvas, w, h)
     }
 
-    /** Full-size shots keep a 1:1 blit; reduced-size motion shots map the page band to the source. */
+    /** Motion shots are viewport-sized and stay on the 1:1 blit path; keep the mapping fallback for legacy owners. */
     private fun drawBitmapWindow(canvas: Canvas, bitmap: Bitmap, left: Float, w: Float, h: Float) {
         if (bitmap.width == viewportW && bitmap.height == viewportH) {
             canvas.drawBitmap(bitmap, left, 0f, paint)

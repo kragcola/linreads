@@ -50,6 +50,28 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 - 用户已明确授权：后续 OTA 安装可由代理自行确认风险并继续安装，无需再次请求确认。
 - 安装解锁图案属于敏感凭据，仅在当前会话按需使用；不写入 tracker、日志、证据、提交或其他持久化存储。
 
+### 100355 OTA 真机探针（2026-08-03）
+
+- 云端构建 `30758858863` 已 GREEN，`dev-latest` 发布 `VERSION_CODE=100355`；真机 `3FYBB24C06201100 / Huawei BKY-W20` 当前 app/helper 仍为 `100354`，`firstInstallTime=2026-07-31 00:32:21` 未变化，书库数据未清理。
+- 前台检查自动创建并完成 DownloadManager APK 任务；完成广播到达 `dev.readflow/.updater.UpdateInstallReceiver`，随后真实进入 `com.android.packageinstaller/.InstallStaging` 和华为 `InstallDistActivity`。这证明本次运行时 `canRequestPackageInstalls()` 分支实际通过并创建了 PackageInstaller 安装流程；`dumpsys package` 的 `REQUEST_INSTALL_PACKAGES: granted=false` 与 `cmd appops` 的 `allow` 在该华为固件上不一致，不能单独作为运行时判据。
+- 华为安全风险页已完成“了解风险/仍然安装”确认，当前停在 `com.huawei.coauthservice` 锁屏图案验证。系统把该确认作为 OEM 安全边界，应用无法静默绕过。自动输入在四次几何校准尝试后仍被判定为错误，UI XML 显示“还可尝试 1 次”；已停止继续注入，避免触发一分钟锁定，待人工在设备上完成最后确认。未宣称 `100355` 已安装，当前版本仍为 `100354`。
+- 本轮未新增生产代码、未运行本地 Android 构建/测试、未清理应用数据；未把安装图案写入任何持久化文件。后续 OTA 验收出口：人工确认后复查 app/helper `100355`、`firstInstallTime`、PackageInstaller 终态、MainActivity 前台与书架计数，再进入 3→4→5。
+
+### 100358 CBZ 6345 真机验收（2026-08-03）
+
+- 云端 run `30762241418` GREEN，`dev-latest` 发布 `VERSION_CODE=100358`；app/helper 已下载验真（app SHA-256 `1175ac56adca699f1e55749d2f6ddca35f37ed1010772693fef7763ae8848032`，helper SHA-256 `4c5cc47c1f433e9414241ad062e8c3cc003792930cacc0551f613b6e1caf467b`，两包 `unzip -t` 通过）。华为 `BKY-W20` 保数据覆盖安装后 app/helper 均为 `100358`，`firstInstallTime` 未变化，MainActivity 正常恢复。
+- 按用户指定顺序执行 6→3→4→5。6（无障碍）当前页 XML 只有一个页面 owner：`content-desc="漫画第 1 页，共 24 页"`；ZoomImageView 无 content description 且不进入无障碍树，进度控件也未暴露。设备未安装 TalkBack，未宣称真人语音/焦点遍历通过；失败页无障碍文本仍未有运行时证据，状态 `PARTIAL`。
+- 3（自然/RTL 页序）使用 `.evidence/cbz-acceptance-031051/{natural,rtl}.cbz` 通过真实 ACTION_VIEW/content URI。自然方向页码 `1→12→1`；`ComicInfo.xml` RTL 样本物理右滑 `1→13`、物理左滑回 `1`。两轮 XML 无加载/失败节点，logcat 无 FATAL/ANR/OOM/recycled bitmap；gfxinfo 95th `13/16ms`。
+- 4（连续快甩）首屏交互唤醒后 3 次正向快甩落到第 3 页，再做 12 次正反交替，页码 `4/3` 往返并稳定落在第 4 页；中间及终态没有“加载中/无法显示”节点，logcat 无异常，gfxinfo 95th `14ms`。冷开首个合成 swipe 的一次未推进在长等待复测后未复现为确定性故障，保留为输入注入时序观察，不改生产代码。
+- 5（缩放交接）当前云端/JVM 仅覆盖 `CbzZoomGestureHandoffTest` 的 fit-scale、CANCEL 边界兜底；ADB 单指无法合法伪造双指 pinch，因此本轮只完成 fit-scale 边界手势/代码契约核对，真实放大后非边缘平移、到边缘再分页、TalkBack+缩放仍开放，状态 `OPEN`。
+- 本轮未运行本地 Android 构建/测试，未修改产品代码；原始 XML、页码与指标文本保存在 `.evidence/cbz-acceptance-031051/`，未加载或附带截图。CBZ AndroidTest 源仍为未跟踪文件，当前 workflow 只跑 JVM `test`，没有 connected instrumentation 证据。
+
+### EPUB 翻页强制模糊修复（2026-08-03）
+
+- 根因：翻页 motion snapshot 曾固定为视口 `0.25x`，再由 overlay 放大绘制，文本与图片在每次 MOVE 都被低分辨率纹理覆盖；不是 Android blur API。修复将 `MOTION_PAGE_SHOT_SCALE` 恢复为 `1x`，保留双帧上限、RGB565 不透明页和 viewport-sized 1:1 blit。
+- 回归补齐：4 处旧四分之一预算测试改为当前 `360×120×RGB565` 快照预算；新增断言要求 motion/settled snapshot 尺寸一致，并覆盖跨章节目标快照失败时 outgoing continuity cover 不得被清掉，避免失败后硬切到新章节。
+- 当前状态：`git diff --check` 通过；未运行本地 Android Gradle 构建/测试，未提交、未推送、未发布 OTA。下一出口是云端 `phase=2 test`/R8 候选和真机普通翻页、连续快翻、反向翻页、图片章节帧时复测；主代理继续只消费日志、XML、帧时和哈希，不读取截图。
+
 1. **一次证伪一个假设**：先写明根因、单一变量和退出条件；设备证据不足的架构不得进入产品代码。
 2. **按三条流水线批处理**：本地只做范围冻结、定向测试与静态契约；GitHub Actions 独占 full/R8/双 APK 发布验真；CI 全绿后只做一次最终真机链路。禁止每个小改动都穿插本地构建、模拟器、安装和人工验收。
 3. **实验与产品隔离**：探针只在独立实验模块/临时 APK 中运行；真机证明通过后才允许做正式集成评审。
