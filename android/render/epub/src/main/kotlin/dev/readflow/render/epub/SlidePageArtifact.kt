@@ -1,6 +1,6 @@
 package dev.readflow.render.epub
 
-import android.annotation.RequiresApi
+import androidx.annotation.RequiresApi
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Picture
