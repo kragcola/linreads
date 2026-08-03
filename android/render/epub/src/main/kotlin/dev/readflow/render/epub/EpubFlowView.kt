@@ -5829,7 +5829,7 @@ internal class EpubFlowView(
         }
         curlDrawable?.progress = progress
         val renderer = slideOverlayView
-        if (renderer === stagedSlideOverlayView) {
+        if (renderer != null && renderer === stagedSlideOverlayView) {
             renderer.applyProgress(forward, progress)
             positionSlideSeamShadow(forward, progress)
         } else {
