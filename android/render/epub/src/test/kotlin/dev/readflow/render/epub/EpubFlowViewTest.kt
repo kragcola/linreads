@@ -149,11 +149,14 @@ class EpubFlowViewTest {
                 val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
                 val renderer = view.requireActiveSlideRendererView()
                 val livePage = view.getChildAt(0)
-                val front = checkNotNull(slide.frontArtifactForTest()) {
-                    "warm SLIDE must start from a current-page artifact"
+                // The fixture does not precache, so the installed pair may be a cold BitmapFrame
+                // pair or a warm ArtifactFrame pair. This test owns renderer geometry, so pin the
+                // exact frame wrappers and keep the liveness check frame-type agnostic.
+                val front = checkNotNull(slide.frontFrameForTest()) {
+                    "a started SLIDE turn must own a current-page frame"
                 }
-                val revealed = checkNotNull(slide.revealedArtifactForTest()) {
-                    "warm SLIDE must start from a target-page artifact"
+                val revealed = checkNotNull(slide.revealedFrameForTest()) {
+                    "a started SLIDE turn must own a target-page frame"
                 }
                 val initialFrame = intArrayOf(renderer.left, renderer.top, renderer.right, renderer.bottom)
                 val initialTranslationY = renderer.translationY
@@ -176,14 +179,14 @@ class EpubFlowViewTest {
                 )
                 assertEquals(0f, livePage.translationX, 0.001f)
                 assertEquals(0f, livePage.translationY, 0.001f)
-                assertSame("progress must retain the outgoing artifact identity", front, slide.frontArtifactForTest())
+                assertSame("progress must retain the outgoing frame identity", front, slide.frontFrameForTest())
                 assertSame(
-                    "progress must retain the revealed artifact identity",
+                    "progress must retain the revealed frame identity",
                     revealed,
-                    slide.revealedArtifactForTest(),
+                    slide.revealedFrameForTest(),
                 )
-                assertTrue("progress must not discard the outgoing artifact", front.slideArtifactRecordIsLive())
-                assertTrue("progress must not discard the revealed artifact", revealed.slideArtifactRecordIsLive())
+                assertTrue("progress must not discard the outgoing frame", slide.frameIsLiveForTest(front))
+                assertTrue("progress must not discard the revealed frame", slide.frameIsLiveForTest(revealed))
             } finally {
                 view.dispose()
             }
@@ -1169,11 +1172,14 @@ class EpubFlowViewTest {
                 val leasedBeforeTurn = budget.leasedBytes
                 background.boundsTops.clear()
                 val preview = view.offerReadyBoundaryPreviewForTest(forward = true, token = 51L)
+                val warmedOutgoingBitmap = view.privateField("cachedFrontBitmap") as Bitmap?
                 try {
                     val capturesBeforeTurn = EpubPageShotCaptureProbe.total()
                     assertTrue(view.startDiscreteBoundaryTurn(1))
                     if (style == PageFlipStyle.SIMULATION) {
-                        val warmedOutgoing = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+                        val warmedOutgoing = checkNotNull(warmedOutgoingBitmap) {
+                            "warmed SIMULATION boundary requires a cached current-page owner"
+                        }
                         val paper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?)
                         assertTrue(
                             "a warmed SIMULATION boundary tap must transfer the existing current-page owner by identity",
@@ -14004,6 +14010,21 @@ class EpubFlowViewTest {
     /** Active incoming artifact of a warm artifact-framed slide turn. */
     private fun PageSlideDrawable.revealedArtifactForTest(): Any? =
         (reflectedField("revealedFrame") as? SlidePageFrame.ArtifactFrame)?.artifact
+
+    /** Active outgoing frame wrapper (Bitmap or artifact) of a slide turn, or null when absent. */
+    private fun PageSlideDrawable.frontFrameForTest(): SlidePageFrame? =
+        reflectedField("frontFrame") as? SlidePageFrame
+
+    /** Active incoming frame wrapper (Bitmap or artifact) of a slide turn, or null when absent. */
+    private fun PageSlideDrawable.revealedFrameForTest(): SlidePageFrame? =
+        reflectedField("revealedFrame") as? SlidePageFrame
+
+    /** True while the frame's owner is still live, independent of Bitmap vs artifact framing. */
+    private fun PageSlideDrawable.frameIsLiveForTest(frame: SlidePageFrame): Boolean =
+        when (frame) {
+            is SlidePageFrame.BitmapFrame -> !frame.bitmap.isRecycled
+            is SlidePageFrame.ArtifactFrame -> frame.artifact.slideArtifactRecordIsLive()
+        }
 
     private class CountingList<T>(
         private val delegate: List<T>,
