@@ -7258,8 +7258,8 @@ class EpubFlowViewTest {
             // equals the armed one and whose staged triple matches the same artifact slots. A stale
             // retry must not treat this new instance as the renderer it was armed for.
             val pages = view.privateField("paged") as List<EpubFlowPage>
-            val front = checkNotNull(view.slideFrontArtifactForTest()) as SlidePageArtifact
-            val revealed = checkNotNull(view.slideRevealedArtifactForTest()) as SlidePageArtifact
+            val front = checkNotNull(view.slideFrontArtifactForTest())
+            val revealed = checkNotNull(view.slideRevealedArtifactForTest())
             val replacement = PageSlideOverlayView(
                 context = RuntimeEnvironment.getApplication() as Application,
                 flowView = view,
@@ -9041,7 +9041,7 @@ class EpubFlowViewTest {
             assertTrue("the original renderer must match the original viewport", originalRenderer.matchesViewport(view.width, view.height))
 
             // Change the viewport and force a stage boundary: the renderer + shadow must be rebuilt.
-            view.measure(exactly(view.width * 2, view.height * 2))
+            view.measure(exactly(view.width * 2), exactly(view.height * 2))
             view.layout(0, 0, view.width * 2, view.height * 2)
             view.preCachePageTexturesForTest()
 
@@ -15088,16 +15088,16 @@ class EpubFlowViewTest {
     // ---- Warm SLIDE artifact test helpers ------------------------------------------------------
 
     /** Identity of the cached current-page SLIDE artifact, or null when no slot is armed. */
-    private fun EpubFlowView.slideFrontArtifactForTest(): Any? =
-        (privateField("slideFrontSlot") as Any?)?.reflectedField("artifact")
+    private fun EpubFlowView.slideFrontArtifactForTest(): SlidePageArtifact? =
+        (privateField("slideFrontSlot") as Any?)?.reflectedField("artifact") as? SlidePageArtifact
 
     /** Identity of the cached forward-target SLIDE artifact, or null when no slot is armed. */
-    private fun EpubFlowView.slideRevealedArtifactForTest(): Any? =
-        (privateField("slideRevealedSlot") as Any?)?.reflectedField("artifact")
+    private fun EpubFlowView.slideRevealedArtifactForTest(): SlidePageArtifact? =
+        (privateField("slideRevealedSlot") as Any?)?.reflectedField("artifact") as? SlidePageArtifact
 
     /** Identity of the cached backward-target SLIDE artifact, or null when no slot is armed. */
-    private fun EpubFlowView.slideBackwardArtifactForTest(): Any? =
-        (privateField("slideBackwardSlot") as Any?)?.reflectedField("artifact")
+    private fun EpubFlowView.slideBackwardArtifactForTest(): SlidePageArtifact? =
+        (privateField("slideBackwardSlot") as Any?)?.reflectedField("artifact") as? SlidePageArtifact
 
     /** The persistent staged three-page SLIDE renderer, or null before the first precache stage. */
     private fun EpubFlowView.stagedSlideOverlayForTest(): PageSlideOverlayView? =
