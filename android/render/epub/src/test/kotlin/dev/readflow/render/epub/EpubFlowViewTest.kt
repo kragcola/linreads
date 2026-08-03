@@ -9356,17 +9356,35 @@ class EpubFlowViewTest {
             assertFalse("cold overlay front bitmap must be live", front.isRecycled)
             assertFalse("cold overlay revealed bitmap must be live", revealed.isRecycled)
             assertNotNull("the cold renderer must still be the fresh overlay", renderer.parent)
+            // The opaque ColorDrawable background selects RGB_565 motion page shots; the exact
+            // paper reference below is derived through that same config, so pin the contract here.
+            assertEquals("cold overlay front bitmap must be an RGB_565 page shot", Bitmap.Config.RGB_565, front.config)
+            assertEquals("cold overlay revealed bitmap must be an RGB_565 page shot", Bitmap.Config.RGB_565, revealed.config)
             // Rasterize the full 2W strip: forward shadow band is local [W, W+shadowW].
             val frame = Bitmap.createBitmap(renderer.width.coerceAtLeast(1), renderer.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+            // The luma comparison must measure the shadow over real paper, not over dynamic glyph
+            // pixels whose ink can be darker than the shadowed band. Discover one row where both
+            // the front body column and the revealed-band seam column are uninked paper in the
+            // source page shots, then compare the same strip row.
+            // The opaque viewport background selects RGB_565 motion page shots, so an exact
+            // match against the original ARGB paper value is invalid after storage. Instead of
+            // assuming a packer rounding convention, derive the exact paper reference through
+            // the same renderer path: a 1x1 RGB_565 bitmap painted with the same fixture
+            // ColorDrawable via Canvas. Whatever the native packer produces for the page shots,
+            // it produces the identical value here, and the equality below stays strict against
+            // glyph pixels.
+            val paperReference = Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565).also { paper ->
+                val canvas = Canvas(paper)
+                ColorDrawable(0xFFEDE6D6.toInt()).apply {
+                    setBounds(0, 0, paper.width, paper.height)
+                    draw(canvas)
+                }
+            }
             try {
                 renderer.draw(Canvas(frame))
                 val shadowW = renderer.seamShadowWidthPx().coerceAtLeast(1)
                 val bodyX = view.width / 2
-                // The luma comparison must measure the shadow over real paper, not over dynamic glyph
-                // pixels whose ink can be darker than the shadowed band. Discover one row where both
-                // the front body column and the revealed-band seam column are pure paper in the source
-                // page shots, then compare the same strip row.
-                val paperColor = 0xFFEDE6D6.toInt()
+                val paperPixel = paperReference.getPixel(0, 0)
                 // Cold page shots can be lower resolution than the viewport: PageSlideOverlayView
                 // maps them through drawBitmapWindow, so translate viewport x into each source
                 // bitmap's width with the scale convention used elsewhere in this file
@@ -9383,15 +9401,17 @@ class EpubFlowViewTest {
                     val revealedSourceY =
                         (y * revealed.height / view.height).coerceIn(0, revealed.height - 1)
                     if (
-                        front.getPixel(bodyPageX, frontSourceY) == paperColor &&
-                        revealed.getPixel(seamPageX, revealedSourceY) == paperColor
+                        front.getPixel(bodyPageX, frontSourceY) == paperPixel &&
+                        revealed.getPixel(seamPageX, revealedSourceY) == paperPixel
                     ) {
                         paperRow = y
                         break
                     }
                 }
                 assertTrue(
-                    "the cold fixture must contain a paper-only row for a clean seam measurement; " +
+                    "the cold fixture must contain a row where both sampled source columns are " +
+                        "uninked paper equal to the RGB_565 renderer-derived reference " +
+                        "paperPixel=0x${paperPixel.toString(16).padStart(8, '0')} " +
                         "paperRow=$paperRow shadowW=$shadowW",
                     paperRow >= 0,
                 )
@@ -9403,6 +9423,7 @@ class EpubFlowViewTest {
                     seamLuma < bodyLuma,
                 )
             } finally {
+                paperReference.recycle()
                 frame.recycle()
             }
         } finally {
