@@ -12904,6 +12904,54 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `warm same-chapter SLIDE prefetch lands the adjacent page without allocating a page-shot bitmap`() {
+        val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        try {
+            assertTrue(
+                "fixture needs a nontrivial parked page followed by an adjacent image page; " +
+                    "heading=${fixture.headingPageIndex} image=${fixture.imagePageIndex}",
+                fixture.headingPageIndex > 0 &&
+                    fixture.imagePageIndex == fixture.headingPageIndex + 1,
+            )
+
+            // Park mid-chapter, drain posted work, drop warm owners, then arm the probe so only
+            // the prefetch and the turn below can be counted.
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.recycleCachedTexturesForTest()
+            EpubPageShotCaptureProbe.reset()
+
+            // Prefetch and drain the split-frame chain, then drive a real warm forward turn.
+            view.preCachePageTexturesForTest()
+            view.drainPendingPageTexturePrecacheForTest()
+
+            assertTrue(
+                "warm SLIDE turn must start from the parked page",
+                view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()),
+            )
+            view.updateInteractiveCurl(x = view.width * 0.25f)
+            view.endInteractiveCurl(velocityX = 0f)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+
+            assertEquals(
+                "warm same-chapter turn must land on the adjacent page",
+                fixture.imagePageIndex,
+                view.currentPageIndex(),
+            )
+            assertEquals(
+                "warm prefetch plus the complete turn must not allocate or recapture any full-viewport page-shot bitmap",
+                0,
+                EpubPageShotCaptureProbe.total(),
+            )
+        } finally {
+            view.dispose()
+            EpubPageShotCaptureProbe.stop()
+        }
+    }
+
+    @Test
     fun `mixed heading image cold interactive MOVE defers shots and commits once without main-thread full decode`() {
         EpubImageDecodeProbe.reset()
         EpubPageShotCaptureProbe.reset()
