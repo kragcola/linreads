@@ -519,6 +519,14 @@ internal class EpubFlowView(
     private var slideDrawable: PageSlideDrawable? = null
     private var slideOverlayView: PageSlideOverlayView? = null
     /**
+     * Persistent staged three-page SLIDE renderer for warm same-chapter turns. It is attached to the
+     * overlay while idle at alpha 0, records previous/current/next page commands directly into its own
+     * View RenderNode during artifact precache, and is promoted per turn using only render properties.
+     */
+    private var stagedSlideOverlayView: PageSlideOverlayView? = null
+    /** Lightweight directional seam shadow sibling; content display list is never re-recorded for it. */
+    private var slideSeamShadowView: SlideSeamShadowView? = null
+    /**
      * Bitmaps recorded by a detached SLIDE renderer whose HWUI display list may still be in flight.
      * Each entry stays PINNED and fully budget-charged until the two-frame fence completes; recycle
      * requests and EVICTABLE relabels are deferred so RenderThread cannot race a physical recycle.
@@ -1358,6 +1366,13 @@ internal class EpubFlowView(
         slideFrontSlot = null
         slideRevealedSlot = null
         slideBackwardSlot = null
+        // Cancel any pending stage-record retry and clear staged readiness. The staged renderer is
+        // only cleared when it is not the actively displayed turn (the settle path detaches/parks it
+        // before any later recycle; during the visual transaction the stage must remain intact).
+        cancelStagedRecordRetry()
+        if (slideOverlayView !== stagedSlideOverlayView) {
+            stagedSlideOverlayView?.clearStagedContent()
+        }
     }
 
     private fun clearCachedTextureOwnersKeeping(retained: Set<Bitmap>) {
@@ -1475,7 +1490,10 @@ internal class EpubFlowView(
                 slideBackwardSlot?.key == previousKey
             )
         if (frontMatches && targetMatches && previousMatches) {
-            if (drainQueuedPageTurn()) onPageSettled?.invoke() else scheduleRapidTurnIdle()
+            // Keep the staged strip in sync with the authoritative artifact slots even when no new
+            // artifact is recorded (e.g. right after a settled turn rekeyed the same pages).
+            stageStagedSlideRendererForSlots()
+            drainQueuedPageTurnWhenStagedRecorded()
             return
         }
         val retainedFront = slideFrontSlot?.artifact?.takeIf { frontMatches }
@@ -1699,7 +1717,135 @@ internal class EpubFlowView(
                 checkNotNull(previous),
             )
         }
+        stageStagedSlideRendererForSlots()
+        drainQueuedPageTurnWhenStagedRecorded()
+    }
+
+    /**
+     * Drains a queued warm turn only after the persistent staged renderer has recorded its hidden
+     * onDraw pass. The commit path may otherwise run drainQueuedPageTurn before HWUI recorded the
+     * alpha-0 View, which would force the first direct onDraw inside the turn frame (the ~90 ms
+     * regression). While the renderer is attached but unrecorded, the queued intent is retained and
+     * a generation-aware frame retry keeps requesting hidden record opportunities until the exact
+     * current stage records or the intent/renderer is invalidated.
+     */
+    private fun drainQueuedPageTurnWhenStagedRecorded() {
+        val renderer = stagedSlideOverlayView
+        if (renderer != null && !renderer.isRecorded() && queuedPageTurnDelta != 0) {
+            scheduleStagedRecordRetry()
+            return
+        }
         if (drainQueuedPageTurn()) onPageSettled?.invoke() else scheduleRapidTurnIdle()
+    }
+
+    /**
+     * The exact staged renderer instance and stage generation the outstanding record retry is
+     * waiting on; null renderer means no retry is armed. Identity + generation together make a
+     * stale callback inert even when a replacement renderer reuses the same numeric generation.
+     */
+    private var stagedRecordRetryRenderer: PageSlideOverlayView? = null
+    private var stagedRecordRetryGeneration = 0L
+
+    private val stagedRecordRetryRunnable = Runnable { runStagedRecordRetry() }
+
+    /** Stops the record retry loop; called from every clear/cancel/dispose boundary. */
+    private fun cancelStagedRecordRetry() {
+        stagedRecordRetryRenderer = null
+        stagedRecordRetryGeneration = 0L
+        removeCallbacks(stagedRecordRetryRunnable)
+    }
+
+    /**
+     * Arms the single frame-cadence record retry for the current staged renderer generation. Each
+     * schedule gives the hidden alpha-0 strip an animation-frame traversal (invalidate) so HWUI can
+     * record its display list, then re-checks on the next frame. The loop keeps re-arming until the
+     * exact current generation records or the queued intent/renderer is invalidated; it never falls
+     * back to the 320ms rapid-idle window merely because the hidden record passed a few frames.
+     * Invalidation only schedules property/draw work — no page draw or page-shot allocation here.
+     */
+    private fun scheduleStagedRecordRetry() {
+        val renderer = stagedSlideOverlayView
+        if (renderer == null || renderer.isRecorded() || queuedPageTurnDelta == 0) {
+            // The intent no longer needs the record retry; settle through the normal gate.
+            cancelStagedRecordRetry()
+            drainQueuedPageTurnWhenStagedRecorded()
+            return
+        }
+        stagedRecordRetryRenderer = renderer
+        stagedRecordRetryGeneration = renderer.stageGeneration
+        removeCallbacks(stagedRecordRetryRunnable)
+        renderer.invalidate()
+        postOnAnimation(stagedRecordRetryRunnable)
+    }
+
+    private fun runStagedRecordRetry() {
+        val renderer = stagedSlideOverlayView
+        if (renderer == null || queuedPageTurnDelta == 0) {
+            cancelStagedRecordRetry()
+            drainQueuedPageTurnWhenStagedRecorded()
+            return
+        }
+        if (
+            stagedRecordRetryRenderer === null ||
+            renderer !== stagedRecordRetryRenderer ||
+            stagedRecordRetryGeneration == 0L ||
+            renderer.stageGeneration != stagedRecordRetryGeneration
+        ) {
+            // The retry is stale: cancelled, or the renderer/stage it was armed for was replaced
+            // while this callback was queued. Never act on the current renderer based on a shared
+            // numeric generation; lifecycle paths (re-stage/clear/recreate) re-arm as needed.
+            cancelStagedRecordRetry()
+            return
+        }
+        if (renderer.isRecorded()) {
+            cancelStagedRecordRetry()
+            drainQueuedPageTurnWhenStagedRecorded()
+            return
+        }
+        scheduleStagedRecordRetry()
+    }
+
+    /**
+     * Stages the persistent three-page strip from the committed slide artifact slots so its content
+     * display list is re-recorded during the next idle frame (previous/current/next around scrollY).
+     */
+    private fun stageStagedSlideRendererForSlots() {
+        if (flipStyle != dev.readflow.core.model.PageFlipStyle.SLIDE) return
+        val renderer = requireStagedSlideRenderer()
+        val fromTop = scrollY
+        val fromWindow = activePageWindow?.takeIf { it.topPx == fromTop }
+        val previous = slideBackwardSlot
+        val next = slideRevealedSlot
+        val previousWindow = previous?.let { slot -> paged.getOrNull(slot.page) }
+        val nextWindow = next?.let { slot -> paged.getOrNull(slot.page) }
+        val currentArtifact = slideFrontSlot?.artifact ?: return
+        if (
+            renderer.matchesStagedArtifacts(
+                previousArtifact = previous?.artifact,
+                currentArtifact = currentArtifact,
+                nextArtifact = next?.artifact,
+            )
+        ) {
+            // Exact stage match: keep the same generation even while it is still awaiting the
+            // hidden onDraw record pass. Re-staging the same exact triple would churn generations.
+            return
+        }
+        renderer.stageStrip(
+            previousTop = previous?.topPx,
+            previousWindow = previousWindow,
+            previousArtifact = previous?.artifact,
+            currentTop = fromTop,
+            currentWindow = fromWindow,
+            currentArtifact = currentArtifact,
+            nextTop = next?.topPx,
+            nextWindow = nextWindow,
+            nextArtifact = next?.artifact,
+        )
+        // A new stage generation invalidates any outstanding record retry; the paired
+        // drainQueuedPageTurnWhenStagedRecorded call re-arms it for the fresh generation.
+        cancelStagedRecordRetry()
+        renderer.layout(-width, scrollY, 2 * width, scrollY + height)
+        positionSlideSeamShadow(forward = true, progress = 0f, forceRelayout = true)
     }
 
     private fun discardPendingSlideArtifactPrecache(request: PendingSlideArtifactPrecache) {
@@ -1729,6 +1875,10 @@ internal class EpubFlowView(
         if (slideFrontSlot?.artifact !in retained) slideFrontSlot = null
         if (slideRevealedSlot?.artifact !in retained) slideRevealedSlot = null
         if (slideBackwardSlot?.artifact !in retained) slideBackwardSlot = null
+        // The staged strip is only invalidated at precache boundaries (never while it is the
+        // actively displayed turn); clear readiness so the next precache re-stages and re-records.
+        cancelStagedRecordRetry()
+        stagedSlideOverlayView?.clearStagedContent()
     }
 
     /** Retires a detached renderer frame behind the two-host-frame barrier. */
@@ -2132,6 +2282,38 @@ internal class EpubFlowView(
         targetTop: Int,
         targetWindow: EpubFlowPage,
     ): Pair<SlidePageArtifact, SlidePageArtifact>? {
+        // Gate on the persistent staged renderer: without it no warm pair is turn-ready (pending
+        // artifacts only become ready after commit plus the hidden onDraw pass). The exact
+        // previous/current/next triple must be staged AND recorded; never consume slots for an
+        // unrecorded or mismatched stage (would force a first direct onDraw inside the turn frame).
+        val stagedRenderer = stagedSlideOverlayView
+        if (stagedRenderer == null) return null
+        val stagedFront = slideFrontSlot?.artifact
+        val stagedTarget = when {
+            slideRevealedSlot?.page == targetPage && slideRevealedSlot?.topPx == targetTop ->
+                slideRevealedSlot?.artifact
+            slideBackwardSlot?.page == targetPage && slideBackwardSlot?.topPx == targetTop ->
+                slideBackwardSlot?.artifact
+            else -> null
+        }
+        val forward = targetTop > fromTop
+        if (
+            stagedFront == null ||
+            stagedTarget == null ||
+            !stagedRenderer.matchesStagedArtifacts(
+                previousArtifact = slideBackwardSlot?.artifact,
+                currentArtifact = stagedFront,
+                nextArtifact = slideRevealedSlot?.artifact,
+            ) ||
+            !stagedRenderer.isRecorded() ||
+            !stagedRenderer.isStagedPairForDirection(
+                currentArtifact = stagedFront,
+                revealedArtifact = stagedTarget,
+                forward = forward,
+            )
+        ) {
+            return null
+        }
         val fromKey = slidePageArtifactKey(fromTop, fromWindow) ?: return null
         val targetKey = slidePageArtifactKey(targetTop, targetWindow) ?: return null
         val frontSlot = slideFrontSlot
@@ -2177,7 +2359,25 @@ internal class EpubFlowView(
                 slideBackwardSlot?.key == targetKey -> slideBackwardSlot?.artifact
             else -> null
         }
-        if (front != null && revealed != null) return true
+        if (front != null && revealed != null) {
+            // A rapid burst may only consume a pair the persistent staged renderer already recorded;
+            // otherwise the first rapid frame would force a hidden onDraw inside the turn frame.
+            // A null staged renderer means the pair is not turn-ready yet (pending artifacts are not
+            // ready before commit plus the hidden record pass).
+            val stagedRenderer = stagedSlideOverlayView
+            if (stagedRenderer == null) return false
+            return stagedRenderer.matchesStagedArtifacts(
+                previousArtifact = slideBackwardSlot?.artifact,
+                currentArtifact = front,
+                nextArtifact = slideRevealedSlot?.artifact,
+            ) &&
+                stagedRenderer.isRecorded() &&
+                stagedRenderer.isStagedPairForDirection(
+                    currentArtifact = front,
+                    revealedArtifact = revealed,
+                    forward = targetWindow.topPx > scrollY,
+                )
+        }
         val pending = pendingSlideArtifactPrecache
         if (pending != null && pendingSlideArtifactPrecacheIsValid(pending)) {
             val pendingRevealed = when {
@@ -2187,7 +2387,13 @@ internal class EpubFlowView(
                     pending.previousArtifact
                 else -> null
             }
-            if (pending.frontArtifact != null && pendingRevealed != null) return true
+            if (pending.frontArtifact != null && pendingRevealed != null) {
+                // Pending artifacts are never pair-ready: admission is only valid after
+                // commitPendingSlideArtifactPrecache installs the exact slots and
+                // stageStagedSlideRendererForSlots stages the exact triple, followed by a recorded
+                // hidden pass. An older recorded staged renderer is not sufficient.
+                return false
+            }
         }
         return false
     }
@@ -2749,6 +2955,10 @@ internal class EpubFlowView(
             }
         }
         if (slideArtifactsDirty) slideArtifactPrecacheGeneration += 1L
+        if (slideArtifactsDirty) {
+            cancelStagedRecordRetry()
+            stagedSlideOverlayView?.clearStagedContent()
+        }
         // Preserve leased warm bitmap identities. Recycle/realloc creates a cold gap where a finger
         // turn falls into beginPendingLocalPageShotHandoff and allocates two full-screen ARGB shots.
         // Refresh dependent slots in place, one slot per animation frame, coalescing offsets.
@@ -2959,7 +3169,7 @@ internal class EpubFlowView(
      * TextView paints its layout at (paddingLeft - scrollX, paddingTop - scrollY) in its own
      * coordinates; after the -topPx translate that offset matches the live draw path.
      */
-    private fun drawPageInto(
+    internal fun drawPageInto(
         canvas: Canvas,
         topPx: Int,
         window: EpubFlowPage?,
@@ -2978,6 +3188,19 @@ internal class EpubFlowView(
         textView.layout?.draw(canvas)
         canvas.restoreToCount(contentSave)
         window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx) }
+    }
+
+    /** Direct page-content draw used by [PageSlideOverlayView] while recording its own display list. */
+    internal fun drawSlideStripPage(canvas: Canvas, topPx: Int, window: EpubFlowPage?) {
+        drawPageInto(canvas, topPx, window)
+    }
+
+    /** Test hook: records each staged strip page draw's horizontal placement (local X origin). */
+    internal var slideStripDrawXOriginsForTest: MutableList<Float>? = null
+        private set
+
+    internal fun beginSlideStripDrawRecordingForTest() {
+        slideStripDrawXOriginsForTest = mutableListOf()
     }
 
     /**
@@ -3532,6 +3755,13 @@ internal class EpubFlowView(
         activeBoundaryPreview = null
         cancelWaitingBoundaryTurn(invalidateRequest = false)
         clearFlipOverlay()
+        cancelStagedRecordRetry()
+        stagedSlideOverlayView?.clearStagedContent()
+        stagedSlideOverlayView?.let { overlay.remove(it) }
+        stagedSlideOverlayView = null
+        slideSeamShadowView?.let { overlay.remove(it) }
+        slideSeamShadowView = null
+        slideOverlayView = null
         invalidateBoundaryPreviews()
         clearPendingBoundaryPageTurn()
         clearConversionSnapshot()
@@ -4036,8 +4266,6 @@ internal class EpubFlowView(
             interactiveTurnState = InteractiveTurnState.NONE
             return
         }
-        onPageTurnStarted?.invoke()
-        interactiveTurnState = InteractiveTurnState.BOUNDARY_DISCRETE_ACTIVE
         if (useSimulationDiscreteRenderer()) {
             val drawable = PageCurlDrawable(
                 outgoing,
@@ -4052,12 +4280,27 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            installSlideOverlay(
-                SlidePageFrame.BitmapFrame(outgoing),
-                SlidePageFrame.BitmapFrame(preview.bitmap),
-                preview.forward,
-            )
+            if (
+                !installSlideOverlay(
+                    SlidePageFrame.BitmapFrame(outgoing),
+                    SlidePageFrame.BitmapFrame(preview.bitmap),
+                    preview.forward,
+                )
+            ) {
+                // Rejected renderer admission: restore the preview to its directional slot so a
+                // later tap can retry the same rendered target, and report no committed page.
+                activeBoundaryPreview = null
+                recyclePageShot(outgoing)
+                if (!restoreBoundaryPreviewAfterOutgoingFailure(preview)) {
+                    recyclePageShot(preview.bitmap)
+                    onBoundaryTurnDiscarded?.invoke(preview)
+                }
+                interactiveTurnState = InteractiveTurnState.NONE
+                return
+            }
         }
+        interactiveTurnState = InteractiveTurnState.BOUNDARY_DISCRETE_ACTIVE
+        onPageTurnStarted?.invoke()
         applyFlipProgress(0f, preview.forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = activeFlipDurationMs()
@@ -4143,6 +4386,7 @@ internal class EpubFlowView(
 
     private fun clearQueuedPageTurns() {
         removeCallbacks(rapidTurnIdleRunnable)
+        cancelStagedRecordRetry()
         clearRapidFollowUpPageShot()
         queuedPageTurnDelta = 0
         rapidTurnSequenceActive = false
@@ -4699,21 +4943,29 @@ internal class EpubFlowView(
         if (slideArtifactPair != null) {
             // Warm same-chapter SLIDE: freeze the exact-key artifact pair (no page-shot Bitmap).
             parkOnPageWindow(targetWindow, report = false)
+            if (
+                !startFlip(
+                    outgoing = SlidePageFrame.ArtifactFrame(slideArtifactPair.first),
+                    revealed = SlidePageFrame.ArtifactFrame(slideArtifactPair.second),
+                    forward = forward,
+                    onCommitted = {
+                        retainSettledLocalPageShots(origin, targetWindow, forward, committed = true)
+                        reportTopOffset()
+                    },
+                    onCancelled = {
+                        retainSettledLocalPageShots(origin, targetWindow, forward, committed = false)
+                        restorePageTurnOrigin(origin)
+                    },
+                )
+            ) {
+                // Renderer admission rejected: restore the exact outgoing viewport so the live
+                // content is never left parked on the target, and report no committed page. Queued
+                // rapid work keeps its intent and retries through the idle/precache window.
+                restorePageTurnOrigin(origin)
+                return false
+            }
             onPageTurnTargetParked?.invoke()
             onPageTurnStarted?.invoke()
-            startFlip(
-                outgoing = SlidePageFrame.ArtifactFrame(slideArtifactPair.first),
-                revealed = SlidePageFrame.ArtifactFrame(slideArtifactPair.second),
-                forward = forward,
-                onCommitted = {
-                    retainSettledLocalPageShots(origin, targetWindow, forward, committed = true)
-                    reportTopOffset()
-                },
-                onCancelled = {
-                    retainSettledLocalPageShots(origin, targetWindow, forward, committed = false)
-                    restorePageTurnOrigin(origin)
-                },
-            )
             if (rapidTurnSequenceActive) scheduleRapidFollowUpPageShot(forward)
             return true
         }
@@ -4774,21 +5026,28 @@ internal class EpubFlowView(
         // Park the incoming page silently beneath the page-shot overlay. Locator publication belongs
         // to the completed visual transaction; cancellation restores the exact outgoing viewport.
         parkOnPageWindow(targetWindow, report = false)
+        if (
+            !startFlip(
+                outgoing = SlidePageFrame.BitmapFrame(outgoing),
+                revealed = SlidePageFrame.BitmapFrame(revealed),
+                forward = forward,
+                onCommitted = {
+                    retainSettledLocalPageShots(origin, targetWindow, forward, committed = true)
+                    reportTopOffset()
+                },
+                onCancelled = {
+                    retainSettledLocalPageShots(origin, targetWindow, forward, committed = false)
+                    restorePageTurnOrigin(origin)
+                },
+            )
+        ) {
+            // Renderer admission rejected: the target was only parked for this overlay, so roll the
+            // exact origin back and let queued rapid work retry without a committed-page report.
+            restorePageTurnOrigin(origin)
+            return false
+        }
         onPageTurnTargetParked?.invoke()
         onPageTurnStarted?.invoke()
-        startFlip(
-            outgoing = SlidePageFrame.BitmapFrame(outgoing),
-            revealed = SlidePageFrame.BitmapFrame(revealed),
-            forward = forward,
-            onCommitted = {
-                retainSettledLocalPageShots(origin, targetWindow, forward, committed = true)
-                reportTopOffset()
-            },
-            onCancelled = {
-                retainSettledLocalPageShots(origin, targetWindow, forward, committed = false)
-                restorePageTurnOrigin(origin)
-            },
-        )
         if (rapidTurnSequenceActive) scheduleRapidFollowUpPageShot(forward)
         return true
     }
@@ -5249,15 +5508,23 @@ internal class EpubFlowView(
     }
 
     /**
-     * Detaches the SLIDE renderer before any ownership transfer or recycle: takes its recorded
-     * identities, removes the View, clears the field, pins the identities so external eviction cannot
-     * release them, and schedules a generation-guarded two-postOnAnimation host-frame fence.
+     * Detaches (or, for the persistent staged renderer, parks) the SLIDE renderer before any
+     * ownership transfer or recycle: takes its recorded identities, pins the identities so external
+     * eviction cannot release them, and schedules a generation-guarded two-postOnAnimation host-frame
+     * fence. The staged renderer stays attached at alpha 0 and is reconfigured during later precache.
      */
     private fun detachSlideOverlayRenderer(): List<SlidePageFrame> {
         val renderer = slideOverlayView ?: return emptyList()
         val frames = renderer.takeRecordedFrames()
-        overlay.remove(renderer)
-        slideOverlayView = null
+        if (renderer === stagedSlideOverlayView) {
+            parkStagedSlideOverlay()
+            // Active-renderer ownership is separate from the persistent staged renderer: once parked
+            // the staged view stays attached at alpha 0 but is no longer the active slide renderer.
+            slideOverlayView = null
+        } else {
+            overlay.remove(renderer)
+            slideOverlayView = null
+        }
         if (frames.isNotEmpty()) {
             frames.forEach { frame ->
                 when (frame) {
@@ -5349,7 +5616,14 @@ internal class EpubFlowView(
      * ViewGroupOverlay so per-frame motion is a View translation; the parked live TextView is skipped
      * for the duration of the transaction because it is fully covered by the strip.
      */
-    private fun installSlideOverlay(outgoing: SlidePageFrame, revealed: SlidePageFrame, forward: Boolean) {
+    private fun installSlideOverlay(outgoing: SlidePageFrame, revealed: SlidePageFrame, forward: Boolean): Boolean {
+        // Reject mixed ArtifactFrame/BitmapFrame pairs cleanly instead of throwing on cast access.
+        if (
+            (outgoing is SlidePageFrame.ArtifactFrame) !=
+            (revealed is SlidePageFrame.ArtifactFrame)
+        ) {
+            return false
+        }
         // Reactivate frames still behind an earlier render fence: the new renderer records them
         // again, so cancel their pending recycle/discard state and invalidate stale frame callbacks.
         var reactivated = false
@@ -5374,6 +5648,55 @@ internal class EpubFlowView(
             .mapNotNull { (it as? SlidePageFrame.BitmapFrame)?.bitmap }
             .distinct()
             .forEach { relabelPageShot(it, PageShotLeaseKind.PINNED, "render.active") }
+        val renderer: PageSlideOverlayView
+        if (
+            outgoing is SlidePageFrame.ArtifactFrame &&
+            revealed is SlidePageFrame.ArtifactFrame
+        ) {
+            // Warm same-chapter SLIDE: promote the persistent staged three-page renderer with render
+            // properties only. Its page content was baked into its display list during artifact
+            // precache, so this never executes another page-content record pass on the turn frame.
+            renderer = requireStagedSlideRenderer()
+            // Defensive promotion gate: never promote an unrecorded or mismatched stage. The normal
+            // flow already gates on the recorded pair before consuming artifact slots; this protects
+            // against any path that would otherwise force a first direct onDraw inside the turn.
+            if (
+                !renderer.isRecorded() ||
+                !renderer.isStagedPairForDirection(
+                    currentArtifact = outgoing.artifact,
+                    revealedArtifact = revealed.artifact,
+                    forward = forward,
+                )
+            ) {
+                return false
+            }
+            // Position is a RenderNode property (not part of the display list), so re-laying the
+            // staged strip to the current scrollY never re-records its page content.
+            renderer.layout(-width, scrollY, 2 * width, scrollY + height)
+            renderer.promote(listOf(outgoing, revealed), forward, 0f)
+            positionSlideSeamShadow(forward, 0f, forceRelayout = true)
+            slideOverlayView = renderer
+        } else {
+            // Cold / boundary / continuity SLIDE stays Bitmap-based with a fresh two-page overlay,
+            // exactly as before; detach/retirement ownership is unchanged.
+            val freshRenderer = PageSlideOverlayView(
+                context = context,
+                flowView = this,
+                viewportW = width,
+                viewportH = height,
+                density = density,
+            )
+            val stripLeft = if (forward) 0 else -width
+            freshRenderer.layout(stripLeft, scrollY, stripLeft + 2 * width, scrollY + height)
+            overlay.add(freshRenderer)
+            freshRenderer.beginColdTurn(
+                front = checkNotNull((outgoing as? SlidePageFrame.BitmapFrame)?.bitmap),
+                revealed = checkNotNull((revealed as? SlidePageFrame.BitmapFrame)?.bitmap),
+                forward = forward,
+                frames = listOf(outgoing, revealed),
+            )
+            renderer = freshRenderer
+        }
         val drawable = PageSlideDrawable(
             outgoing,
             revealed,
@@ -5384,27 +5707,105 @@ internal class EpubFlowView(
             ::recycleSlideFrame,
         )
         drawable.setBounds(0, scrollY, width, scrollY + height)
-        val renderer = PageSlideOverlayView(
-            context = context,
-            frontFrame = outgoing,
-            revealedFrame = revealed,
-            viewportW = width,
-            viewportH = height,
-            forward = forward,
-            density = density,
-        )
-        val stripLeft = if (forward) 0 else -width
-        renderer.layout(stripLeft, scrollY, stripLeft + 2 * width, scrollY + height)
-        overlay.add(renderer)
         slideDrawable = drawable
         slideOverlayView = renderer
+        return true
     }
 
     /** Relays the slide renderer at its base-left/top after scroll restore, without changing progress. */
     private fun positionSlideOverlay(forward: Boolean) {
         val renderer = slideOverlayView ?: return
+        if (renderer === stagedSlideOverlayView) {
+            // The staged strip is already laid out as a 3W strip at left = -W; only translation
+            // changes are needed, and those belong to applyFlipProgress.
+            return
+        }
         val stripLeft = if (forward) 0 else -width
         renderer.layout(stripLeft, scrollY, stripLeft + 2 * width, scrollY + height)
+    }
+
+    /**
+     * Returns the persistent staged renderer, creating and attaching it (alpha 0) on first use. The
+     * renderer stays attached while idle and is only reconfigured during later precache stages.
+     */
+    private fun requireStagedSlideRenderer(): PageSlideOverlayView {
+        stagedSlideOverlayView?.let { renderer ->
+            if (renderer.matchesViewport(width, height)) return renderer
+            // Viewport changed: recreate the persistent renderer and its shadow sibling, removing
+            // only these two views (unrelated overlay members stay untouched).
+            if (slideOverlayView === renderer) slideOverlayView = null
+            // The outstanding record retry was armed for the old renderer; stop it before the
+            // replacement takes ownership (a later precache commit re-arms the fresh generation).
+            cancelStagedRecordRetry()
+            overlay.remove(renderer)
+            stagedSlideOverlayView = null
+            slideSeamShadowView?.let { overlay.remove(it) }
+            slideSeamShadowView = null
+        }
+        val renderer = PageSlideOverlayView(
+            context = context,
+            flowView = this,
+            viewportW = width,
+            viewportH = height,
+            density = density,
+        )
+        renderer.layout(-width, scrollY, 2 * width, scrollY + height)
+        renderer.alpha = 0f
+        overlay.add(renderer)
+        val shadow = SlideSeamShadowView(
+            context = context,
+            widthPx = renderer.seamShadowWidthPx(),
+        )
+        // Lay the shadow out once at x = 0; promotion only updates translationX/scaleX/alpha render
+        // properties so the (tiny) shadow display list is never re-recorded per animation frame.
+        val shadowW = renderer.seamShadowWidthPx().coerceAtLeast(1)
+        shadow.layout(0, scrollY, shadowW, scrollY + height)
+        shadow.alpha = 0f
+        overlay.add(shadow)
+        stagedSlideOverlayView = renderer
+        slideSeamShadowView = shadow
+        return renderer
+    }
+
+    /** Parks the staged renderer back to its hidden idle state after settle/cancel. */
+    private fun parkStagedSlideOverlay() {
+        stagedSlideOverlayView?.park()
+        slideSeamShadowView?.let { shadow ->
+            shadow.alpha = 0f
+            shadow.translationX = 0f
+            shadow.scaleX = 1f
+        }
+    }
+
+    /**
+     * Positions the directional seam shadow at the current progress. Per-progress updates are
+     * render-property only; [forceRelayout] additionally re-lays the shadow's bounds to the current
+     * scrollY/height at stage/promotion transaction boundaries.
+     */
+    private fun positionSlideSeamShadow(forward: Boolean, progress: Float, forceRelayout: Boolean = false) {
+        val renderer = stagedSlideOverlayView ?: return
+        val shadow = slideSeamShadowView ?: return
+        if (forceRelayout) {
+            val shadowW = renderer.seamShadowWidthPx().coerceAtLeast(1)
+            shadow.layout(0, scrollY, shadowW, scrollY + height)
+        }
+        if (progress <= 0f) {
+            shadow.alpha = 0f
+            return
+        }
+        val shadowW = renderer.seamShadowWidthPx().coerceAtLeast(1)
+        val seamX = if (forward) {
+            width - progress * width
+        } else {
+            progress * width
+        }
+        shadow.alpha = 1f
+        // The shadow view is a tiny pre-recorded gradient; scaleX/translationX are render properties
+        // so the content display list is never re-recorded per animation frame.
+        shadow.scaleX = if (forward) 1f else -1f
+        // Forward shadow occupies [seamX, seamX+shadowW]; backward (flipped) occupies
+        // [seamX-shadowW, seamX] so the dark edge stays on the outgoing page's trailing edge.
+        shadow.translationX = if (forward) seamX else seamX - shadowW
     }
 
     /**
@@ -5427,7 +5828,13 @@ internal class EpubFlowView(
             it.progress = progress
         }
         curlDrawable?.progress = progress
-        slideOverlayView?.translationX = (if (forward) -progress else progress) * width
+        val renderer = slideOverlayView
+        if (renderer === stagedSlideOverlayView) {
+            renderer.applyProgress(forward, progress)
+            positionSlideSeamShadow(forward, progress)
+        } else {
+            renderer?.translationX = (if (forward) -progress else progress) * width
+        }
         container.translationX = 0f
         container.translationY = 0f
     }
@@ -5602,7 +6009,7 @@ internal class EpubFlowView(
         forward: Boolean,
         onCommitted: () -> Unit = {},
         onCancelled: () -> Unit = {},
-    ) {
+    ): Boolean {
         flipAnimator?.cancel()
         clearFlipOverlay(preserveActivePixelRefreshes = true)
         // The overlay draws in content coords (canvas translated by scrollY). After [goToPage] the
@@ -5613,7 +6020,12 @@ internal class EpubFlowView(
             // CoolReader-PAPER-style local sine strips: flat body, flexible moving edge, no 3D.
             val outgoingBitmap = (outgoing as? SlidePageFrame.BitmapFrame)?.bitmap
             val revealedBitmap = (revealed as? SlidePageFrame.BitmapFrame)?.bitmap
-            if (outgoingBitmap == null || revealedBitmap == null) return
+            if (outgoingBitmap == null || revealedBitmap == null) {
+                // No drawable or overlay ever owned the pair; release both frames so the caller can
+                // roll its parked transaction back without leaking ownership.
+                listOf(outgoing, revealed).forEach(::retireSlideFrame)
+                return false
+            }
             val drawable = PageCurlDrawable(
                 outgoingBitmap,
                 revealedBitmap,
@@ -5627,7 +6039,10 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            installSlideOverlay(outgoing, revealed, forward)
+            if (!installSlideOverlay(outgoing, revealed, forward)) {
+                listOf(outgoing, revealed).forEach(::retireSlideFrame)
+                return false
+            }
         }
         applyFlipProgress(0f, forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
@@ -5655,6 +6070,7 @@ internal class EpubFlowView(
             })
             start()
         }
+        return true
     }
 
     /**
@@ -5704,6 +6120,8 @@ internal class EpubFlowView(
         // rerecord the parked chapter RenderNode before the next settled frame.
         val rerecordLiveText = container.skipContentDraw || liveContentDrawSuppressedByPageShot
         detachSlideOverlayRenderer()
+        // The persistent staged renderer stays attached (parked at alpha 0); only transient cold
+        // renderers and the drawable/curl owners are removed below.
         slideDrawable?.let {
             overlay.remove(it)
             it.recycle()
@@ -5821,12 +6239,18 @@ internal class EpubFlowView(
             boundaryContinuityCover = true
             return false
         }
+        if (
+            !startFlip(
+                SlidePageFrame.BitmapFrame(outgoing),
+                SlidePageFrame.BitmapFrame(revealed),
+                turn.forward,
+            )
+        ) {
+            // Rejected renderer admission: report no committed page. The reveal flow continues and
+            // a later boundary request can retry the same target.
+            return false
+        }
         onPageTurnStarted?.invoke()
-        startFlip(
-            SlidePageFrame.BitmapFrame(outgoing),
-            SlidePageFrame.BitmapFrame(revealed),
-            turn.forward,
-        )
         return true
     }
 
@@ -6171,7 +6595,7 @@ internal class EpubFlowView(
         localPageShotHandoffGeneration += 1L
         clearPendingLocalPageShotCallbacks()
         interactiveTurnState = InteractiveTurnState.NONE
-        startLocalInteractiveCurl(
+        val result = startLocalInteractiveCurl(
             origin = request.origin,
             targetWindow = request.targetWindow,
             forward = request.forward,
@@ -6180,8 +6604,16 @@ internal class EpubFlowView(
             outgoing = SlidePageFrame.BitmapFrame(outgoing),
             revealed = SlidePageFrame.BitmapFrame(target),
         )
-        updateInteractiveCurl(latestX, latestY)
-        if (releasedVelocity != null) endInteractiveCurl(releasedVelocity)
+        if (result == InteractiveTurnStartResult.STARTED) {
+            updateInteractiveCurl(latestX, latestY)
+            if (releasedVelocity != null) endInteractiveCurl(releasedVelocity)
+        } else {
+            // Rejected admission already restored the origin and retired the frames. End this
+            // finger transaction without a committed page so later input can retry cleanly.
+            flipped = true
+            interactiveTurnState = InteractiveTurnState.NONE
+            onPageSettled?.invoke()
+        }
     }
 
     private fun startLocalInteractiveCurl(
@@ -6196,13 +6628,18 @@ internal class EpubFlowView(
         finishInitialRevealForTurn()
         // Park content on the incoming page beneath the overlay; stays silent until the turn commits.
         parkOnPageWindow(targetWindow, report = false)
-        onPageTurnTargetParked?.invoke()
         flipAnimator?.cancel()
         clearFlipOverlay(preserveActivePixelRefreshes = true)
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
             val outgoingBitmap = (outgoing as? SlidePageFrame.BitmapFrame)?.bitmap
             val revealedBitmap = (revealed as? SlidePageFrame.BitmapFrame)?.bitmap
-            if (outgoingBitmap == null || revealedBitmap == null) return InteractiveTurnStartResult.REJECTED
+            if (outgoingBitmap == null || revealedBitmap == null) {
+                listOf(outgoing, revealed).forEach(::retireSlideFrame)
+                // The target was parked only for this overlay; restore the exact outgoing viewport
+                // so a rejected gesture never leaves the live content on the incoming page.
+                restorePageTurnOrigin(origin)
+                return InteractiveTurnStartResult.REJECTED
+            }
             val drawable = PageCurlDrawable(
                 outgoingBitmap,
                 revealedBitmap,
@@ -6216,8 +6653,13 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            installSlideOverlay(outgoing, revealed, forward)
+            if (!installSlideOverlay(outgoing, revealed, forward)) {
+                listOf(outgoing, revealed).forEach(::retireSlideFrame)
+                restorePageTurnOrigin(origin)
+                return InteractiveTurnStartResult.REJECTED
+            }
         }
+        onPageTurnTargetParked?.invoke()
         interactiveTurnState = InteractiveTurnState.SOFTWARE
         curlFromPage = origin.pageProjection
         curlOrigin = origin
@@ -6374,11 +6816,24 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            installSlideOverlay(
-                SlidePageFrame.BitmapFrame(outgoing),
-                SlidePageFrame.BitmapFrame(preview.bitmap),
-                preview.forward,
-            )
+            if (
+                !installSlideOverlay(
+                    SlidePageFrame.BitmapFrame(outgoing),
+                    SlidePageFrame.BitmapFrame(preview.bitmap),
+                    preview.forward,
+                )
+            ) {
+                // Rejected renderer admission: restore the preview to its directional slot so a
+                // later gesture can retry the same rendered target, and report no committed page.
+                activeBoundaryPreview = null
+                recyclePageShot(outgoing)
+                if (!restoreBoundaryPreviewAfterOutgoingFailure(preview)) {
+                    recyclePageShot(preview.bitmap)
+                    onBoundaryTurnDiscarded?.invoke(preview)
+                }
+                restorePageTurnOrigin(origin)
+                return InteractiveTurnStartResult.REJECTED
+            }
         }
         interactiveTurnState = InteractiveTurnState.BOUNDARY_SOFTWARE
         curlFromPage = origin.pageProjection

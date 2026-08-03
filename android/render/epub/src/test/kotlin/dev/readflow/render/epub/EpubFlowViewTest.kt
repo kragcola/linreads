@@ -198,6 +198,11 @@ class EpubFlowViewTest {
         for (commit in listOf(true, false)) {
             val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
             try {
+                // The fixture's idle precache arms the artifact slots; force the hidden record pass
+                // so the settle exercises the warm ArtifactFrame path (and its rekey contract).
+                checkNotNull(view.recordStagedSlideOverlayForTest()) {
+                    "the fixture must stage a hidden renderer before the warm settle"
+                }
                 assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
                 val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
                 val renderer = view.requireActiveSlideRendererView()
@@ -215,10 +220,17 @@ class EpubFlowViewTest {
                 animator!!.end()
 
                 assertTrue(
-                    "commit=$commit must clear the active slide View field",
+                    "commit=$commit must park the active slide View field",
                     view.activeSlideRendererViews().isEmpty(),
                 )
-                assertNull("commit=$commit must detach the slide View from its overlay", renderer.parent)
+                assertEquals("commit=$commit must park the staged renderer at alpha 0", 0f, renderer.alpha, 0.001f)
+                assertNotNull("commit=$commit must keep the staged renderer attached", renderer.parent)
+                assertNull("commit=$commit must clear the active slide overlay pointer", view.privateField("slideOverlayView"))
+                assertSame(
+                    "commit=$commit must keep the staged renderer as the persistent owner",
+                    renderer,
+                    view.stagedSlideOverlayForTest(),
+                )
                 assertNull("commit=$commit must clear the drawable field", view.privateField("slideDrawable"))
                 assertNull("commit=$commit must release the outgoing reference", slide.reflectedField("frontBitmap"))
                 assertNull("commit=$commit must release the revealed reference", slide.reflectedField("revealedBitmap"))
@@ -267,7 +279,10 @@ class EpubFlowViewTest {
             animator!!.end()
             view.setPrivateField("rapidTurnSequenceActive", false)
 
-            assertNull("settle must detach the renderer before its frame barriers begin", renderer.parent)
+            assertEquals("settle must park the staged renderer at alpha 0", 0f, renderer.alpha, 0.001f)
+            assertNotNull("settle must keep the staged renderer attached", renderer.parent)
+            assertNull("settle must clear the active slide overlay pointer", view.privateField("slideOverlayView"))
+            assertSame("the persistent staged renderer must remain owned", renderer, view.stagedSlideOverlayForTest())
             assertTrue(
                 "detach must pin the recorded artifacts behind the render fence",
                 view.renderRetiredSlideArtifactsForTest() == setOf(frontArtifact, revealedArtifact),
@@ -293,6 +308,80 @@ class EpubFlowViewTest {
             assertFalse("the ownerless artifact may discard only after frame two", frontArtifact.slideArtifactRecordIsLive())
             assertTrue("frame barriers must not discard an artifact still owned by the stable cache", revealedArtifact.slideArtifactRecordIsLive())
             assertSame(revealedArtifact, view.slideFrontArtifactForTest())
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `rejected slide install restores the exact origin and leaves no overlay or turn state`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+            val originWindow = pages[0]
+            val targetWindow = pages[1]
+            val origin = view.capturePageTurnOriginForTest()
+            assertEquals("the fixture origin must be the first page window", 0, origin.reflectedField("topPx") as Int)
+            assertSame(originWindow, origin.reflectedField("window"))
+
+            // A mixed ArtifactFrame/BitmapFrame pair trips the defensive admission gate inside
+            // installSlideOverlay even though the outgoing frame is a valid recorded artifact.
+            val artifact = view.recordSlidePageArtifactForTest(originWindow.topPx, originWindow) as SlidePageArtifact
+            val revealedBitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+            var parkedCount = 0
+            var startedCount = 0
+            view.onPageTurnTargetParked = { parkedCount++ }
+            view.onPageTurnStarted = { startedCount++ }
+
+            val result = view.startLocalInteractiveCurlForTest(
+                origin = origin,
+                targetWindow = targetWindow,
+                forward = true,
+                outgoing = SlidePageFrame.ArtifactFrame(artifact),
+                revealed = SlidePageFrame.BitmapFrame(revealedBitmap),
+            )
+
+            assertEquals(
+                "a rejected renderer admission must surface as REJECTED",
+                "REJECTED",
+                result.name,
+            )
+            // Target parking must be rolled back to the exact outgoing viewport, and no committed
+            // page may be reported for a transaction that never installed an overlay.
+            assertEquals("the rejected turn must not stay parked on the target", 0, view.currentPageIndex())
+            assertEquals(
+                "the rejected turn must restore the outgoing scroll position",
+                origin.reflectedField("topPx") as Int,
+                view.scrollY,
+            )
+            assertSame("the rejected turn must restore the outgoing window", originWindow, view.privateField("activePageWindow"))
+            assertEquals(
+                "the rejected turn must restore the outgoing clip state",
+                origin.reflectedField("clipActive"),
+                view.privateBool("pageClipActive"),
+            )
+            assertEquals("a rejected install must not report a parked target", 0, parkedCount)
+            assertEquals("a rejected install must not report a started turn", 0, startedCount)
+            // No active overlay, animator, or finger-turn state may survive the rejection.
+            assertNull(view.privateField("slideOverlayView"))
+            assertNull(view.privateField("slideDrawable"))
+            assertNull(view.privateField("curlDrawable"))
+            assertNull(view.privateField("flipAnimator"))
+            assertNull(view.privateField("curlOrigin"))
+            assertNull(view.privateField("curlTargetWindow"))
+            assertNull(view.privateField("pendingLocalPageShotHandoff"))
+            assertEquals("NONE", view.privateEnumName("interactiveTurnState"))
+            // The rejected frames are retired: the Bitmap is recycled immediately and the artifact
+            // is pinned behind the two-host-frame barrier instead of being leaked or discarded.
+            assertTrue("the rejected revealed bitmap must be recycled", revealedBitmap.isRecycled)
+            assertEquals(
+                "the rejected artifact must be pinned behind the render fence",
+                setOf<Any>(artifact),
+                view.renderRetiredSlideArtifactsForTest(),
+            )
+            assertTrue("the rejected artifact must stay live behind the fence", artifact.slideArtifactRecordIsLive())
         } finally {
             view.dispose()
             shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
@@ -370,7 +459,10 @@ class EpubFlowViewTest {
             animator!!.end()
             view.setPrivateField("rapidTurnSequenceActive", false)
 
-            assertNull("settle must detach the renderer before its frame barriers begin", renderer.parent)
+            assertEquals("settle must park the staged renderer at alpha 0", 0f, renderer.alpha, 0.001f)
+            assertNotNull("settle must keep the staged renderer attached", renderer.parent)
+            assertNull("settle must clear the active slide overlay pointer", view.privateField("slideOverlayView"))
+            assertSame("the persistent staged renderer must remain owned", renderer, view.stagedSlideOverlayForTest())
             assertNull(
                 "the settle callback must not stage an artifact precache while the rapid window is active",
                 view.privateField("pendingSlideArtifactPrecache"),
@@ -2225,7 +2317,11 @@ class EpubFlowViewTest {
             shadowOf(Looper.getMainLooper()).idle()
 
             assertNull(view.privateField("slideDrawable"))
-            assertNull(view.privateField("slideOverlayView"))
+            assertNull("teardown must clear the active slide overlay pointer", view.privateField("slideOverlayView"))
+            val parkedRenderer = view.stagedSlideOverlayForTest()
+            assertNotNull("the staged renderer must stay attached after teardown", parkedRenderer)
+            assertEquals("teardown must park the staged renderer at alpha 0", 0f, parkedRenderer?.alpha ?: -1f, 0.001f)
+            assertNotNull("the parked staged renderer must remain attached to the overlay", parkedRenderer?.parent)
             assertTrue(
                 "removing an opaque SLIDE View must rerecord the container that skipped its child",
                 contentShadow.wasInvalidated(),
@@ -2510,6 +2606,13 @@ class EpubFlowViewTest {
                 view.goToPage(1)
                 shadowOf(Looper.getMainLooper()).idle()
 
+                if (style == PageFlipStyle.SLIDE) {
+                    // goToPage(1) re-staged the strip after its settle precache; force the hidden
+                    // record pass so the held turn consumes the warm artifact pair.
+                    checkNotNull(view.recordStagedSlideOverlayForTest()) {
+                        "the SLIDE fixture must stage a hidden renderer before the warm held turn"
+                    }
+                }
                 assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
                 val drawable = when (style) {
                     PageFlipStyle.SLIDE -> checkNotNull(view.privateField("slideDrawable"))
@@ -2668,6 +2771,11 @@ class EpubFlowViewTest {
         val firstMove = motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, firstMoveX, y)
         val secondMove = motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_MOVE, secondMoveX, y)
 
+        // The fixture's idle precache arms the artifact slots; force the hidden record pass so the
+        // intercepted gesture consumes the warm pair and the identity assertions below are real.
+        checkNotNull(view.recordStagedSlideOverlayForTest()) {
+            "the fixture must stage a hidden renderer before the warm intercepted turn"
+        }
         view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
         assertTrue(
             "threshold-crossing MOVE must be stolen in onInterceptTouchEvent",
@@ -2678,6 +2786,8 @@ class EpubFlowViewTest {
         ) { "intercept apply must start interactive slide once" }
         val frontAfterIntercept = slideAfterIntercept.frontArtifactForTest()
         val revealedAfterIntercept = slideAfterIntercept.revealedArtifactForTest()
+        assertNotNull("the intercepted warm turn must own a current-page artifact", frontAfterIntercept)
+        assertNotNull("the intercepted warm turn must own a target-page artifact", revealedAfterIntercept)
         val progressAfterIntercept = slideAfterIntercept.progress
         val expectedFirst = (downX - firstMoveX) / view.width.toFloat()
         assertEquals(
@@ -7037,6 +7147,12 @@ class EpubFlowViewTest {
             assertNull("no animation may start before the pair is committed", view.privateField("slideDrawable"))
 
             view.drainPendingPageTexturePrecacheForTest()
+            // Model the hidden display-list traversal that records the staged strip before the
+            // queued rapid turn may consume the artifact pair.
+            view.recordStagedSlideOverlayForTest()
+            // The precache commit armed a staged-record retry while the strip was unrecorded; run
+            // posted frames until the retry observably starts the queued warm turn.
+            view.drainStagedRecordRetryUntilQueuedTurnStartsForTest()
 
             assertNotNull("the queued turn may start only after the pair is available", view.privateField("slideDrawable"))
             assertEquals(
@@ -7045,6 +7161,156 @@ class EpubFlowViewTest {
                 EpubPageShotCaptureProbe.total(),
             )
             assertEquals(1, view.currentPageIndex())
+        } finally {
+            view.dispose()
+            EpubPageShotCaptureProbe.stop()
+        }
+    }
+
+    @Test
+    fun `delayed hidden record after the retry budget starts the queued warm turn immediately`() {
+        EpubPageShotCaptureProbe.reset()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+            view.recycleCachedTexturesForTest()
+            EpubPageShotCaptureProbe.reset()
+            view.setPrivateField("rapidTurnSequenceActive", true)
+            view.setPrivateField("queuedPageTurnDelta", 1)
+
+            // An accepted rapid queue bootstraps the artifact pair and stays pending.
+            assertFalse("a cold rapid queue must wait for a warm pair", view.drainQueuedPageTurnForTest())
+            assertTrue(
+                "the queue must bootstrap current+target artifact precache instead of taking cold shots",
+                view.privateBool("slideArtifactPrecachePending"),
+            )
+            view.drainPendingPageTexturePrecacheForTest()
+            assertNull("no animation may start before the pair is recorded", view.privateField("slideDrawable"))
+            assertEquals("the accepted rapid turn must remain queued", 1, view.privateInt("queuedPageTurnDelta"))
+
+            // The hidden record does not report for longer than the old four-frame retry budget:
+            // burn the posted retry frames without recording, exactly like a real HWUI stall.
+            repeat(4) { shadowOf(Looper.getMainLooper()).runOneTask() }
+            assertNull(
+                "the queued turn must stay pending while the renderer is unrecorded",
+                view.privateField("slideDrawable"),
+            )
+            assertEquals(1, view.privateInt("queuedPageTurnDelta"))
+
+            // The record arrives late. A warm artifact turn must start on the next frames without
+            // falling back to page-shot Bitmaps or waiting for the 320ms rapid-idle window.
+            checkNotNull(view.recordStagedSlideOverlayForTest()) {
+                "the staged renderer must exist before the delayed record"
+            }
+            val elapsedStartMs = SystemClock.uptimeMillis()
+            repeat(4) { shadowOf(Looper.getMainLooper()).runOneTask() }
+            val elapsedMs = SystemClock.uptimeMillis() - elapsedStartMs
+            assertTrue(
+                "an accepted rapid queued turn must start as a warm artifact turn immediately after the " +
+                    "delayed hidden record, without a cold Bitmap fallback or the 320ms rapid-idle wait; " +
+                    "elapsedMs=$elapsedMs slideDrawable=${view.privateField("slideDrawable") != null} " +
+                    "queuedPageTurnDelta=${view.privateInt("queuedPageTurnDelta")} " +
+                    "currentPage=${view.currentPageIndex()} captures=${EpubPageShotCaptureProbe.total()}",
+                view.privateField("slideDrawable") != null &&
+                    view.privateInt("queuedPageTurnDelta") == 0 &&
+                    view.currentPageIndex() == 1 &&
+                    elapsedMs < 320L,
+            )
+            assertEquals(
+                "the late-record warm start must not allocate any viewport page-shot bitmap",
+                0,
+                EpubPageShotCaptureProbe.total(),
+            )
+        } finally {
+            view.dispose()
+            EpubPageShotCaptureProbe.stop()
+        }
+    }
+
+    @Test
+    fun `stale record retry does not drain a replaced renderer with a coincidental generation`() {
+        EpubPageShotCaptureProbe.reset()
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+            view.recycleCachedTexturesForTest()
+            EpubPageShotCaptureProbe.reset()
+            view.setPrivateField("rapidTurnSequenceActive", true)
+            view.setPrivateField("queuedPageTurnDelta", 1)
+
+            // Commit a warm pair and arm the record retry against the current staged renderer.
+            assertFalse("a cold rapid queue must wait for a warm pair", view.drainQueuedPageTurnForTest())
+            view.drainPendingPageTexturePrecacheForTest()
+            val originalRenderer = checkNotNull(view.stagedSlideOverlayForTest()) {
+                "the precache commit must stage one hidden renderer"
+            }
+            val armedGeneration = originalRenderer.stageGeneration
+            assertFalse("the armed retry must wait for a real record", originalRenderer.isRecorded())
+            assertNull("no animation may start while the stage is unrecorded", view.privateField("slideDrawable"))
+            assertEquals(1, view.privateInt("queuedPageTurnDelta"))
+            assertSame(
+                "the pending retry must still belong to the original renderer before replacement",
+                originalRenderer,
+                view.privateField("stagedRecordRetryRenderer"),
+            )
+
+            // Replace the renderer with a fresh instance whose stage generation coincidentally
+            // equals the armed one and whose staged triple matches the same artifact slots. A stale
+            // retry must not treat this new instance as the renderer it was armed for.
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+            val front = checkNotNull(view.slideFrontArtifactForTest()) as SlidePageArtifact
+            val revealed = checkNotNull(view.slideRevealedArtifactForTest()) as SlidePageArtifact
+            val replacement = PageSlideOverlayView(
+                context = RuntimeEnvironment.getApplication() as Application,
+                flowView = view,
+                viewportW = view.width,
+                viewportH = view.height,
+                density = view.resources.displayMetrics.density,
+            )
+            replacement.stageStrip(
+                previousTop = null,
+                previousWindow = null,
+                previousArtifact = null,
+                currentTop = pages[0].topPx,
+                currentWindow = pages[0],
+                currentArtifact = front,
+                nextTop = pages[1].topPx,
+                nextWindow = pages[1],
+                nextArtifact = revealed,
+            )
+            replacement.javaClass.getDeclaredField("stageGenerationValue").apply { isAccessible = true }
+                .set(replacement, armedGeneration)
+            val replacementFrame = Bitmap.createBitmap(
+                replacement.width.coerceAtLeast(1),
+                replacement.height.coerceAtLeast(1),
+                Bitmap.Config.ARGB_8888,
+            )
+            try {
+                replacement.draw(Canvas(replacementFrame))
+            } finally {
+                replacementFrame.recycle()
+            }
+            assertTrue("the replacement must be recorded for the coincidental generation", replacement.isRecorded())
+            view.setPrivateField("stagedSlideOverlayView", replacement)
+
+            // The stale retry frame must not drain the queued turn against the replacement.
+            shadowOf(Looper.getMainLooper()).runOneTask()
+
+            assertNull(
+                "a stale retry must not start a turn against a replaced renderer",
+                view.privateField("slideDrawable"),
+            )
+            assertEquals(
+                "the queued intent must stay pending after the stale retry",
+                1,
+                view.privateInt("queuedPageTurnDelta"),
+            )
+            assertEquals("the stale retry must not move the current page", 0, view.currentPageIndex())
+            assertEquals(
+                "a stale retry must not allocate page-shot bitmaps",
+                0,
+                EpubPageShotCaptureProbe.total(),
+            )
         } finally {
             view.dispose()
             EpubPageShotCaptureProbe.stop()
@@ -8436,6 +8702,12 @@ class EpubFlowViewTest {
             view.drainPendingPageTexturePrecacheForTest()
 
             assertEquals("fixture must restore chapter entry to a middle page", 1, view.currentPageIndex())
+            // Model the hidden display-list traversal so the warm slot assertions below exercise a
+            // promotion-ready stage instead of an unrecorded one.
+            val staged = checkNotNull(view.recordStagedSlideOverlayForTest()) {
+                "chapter-entry precache must attach one hidden staged renderer"
+            }
+            assertTrue("the staged renderer must be promotion-ready before warm assertions", staged.isRecorded())
             val frontSlot = view.slideArtifactSlotForTest("slideFrontSlot")
             val backwardSlot = view.slideArtifactSlotForTest("slideBackwardSlot")
             val revealedSlot = view.slideArtifactSlotForTest("slideRevealedSlot")
@@ -8459,6 +8731,661 @@ class EpubFlowViewTest {
         } finally {
             EpubPageShotCaptureProbe.stop()
             view.dispose()
+        }
+    }
+
+    @Test
+    fun `chapter entry precache stages one hidden renderer and warm turns promote the same instance without re-recording`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[1].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+
+            val staged = checkNotNull(view.stagedSlideOverlayForTest()) {
+                "chapter-entry precache must attach one hidden staged renderer"
+            }
+            assertEquals("the staged renderer must be hidden at rest", 0f, staged.alpha, 0.001f)
+            assertNotNull("the staged renderer must remain attached at rest", staged.parent)
+            // Staging alone must NOT count as a content record pass: only a real onDraw pass may.
+            assertEquals("staging must not count as a record pass", 0, staged.contentRecordPassesForTest)
+            assertFalse("an unrecorded stage must not be promotion-ready", staged.isRecorded())
+
+            // A warm turn cannot consume the artifact pair before the hidden record traversal
+            // happened: the transfer gate must return null without consuming slots.
+            val pagesForGate = view.privateField("paged") as List<EpubFlowPage>
+            val unrecordedPair = view.takeCachedSlideArtifactsForTurnForTest(
+                fromPage = 1,
+                fromTop = pagesForGate[1].topPx,
+                fromWindow = pagesForGate[1],
+                targetPage = 0,
+                targetTop = pagesForGate[0].topPx,
+                targetWindow = pagesForGate[0],
+            )
+            assertNull("an unrecorded stage must not transfer the artifact pair", unrecordedPair)
+            assertNotNull("the unrecorded gate must not consume the front slot", view.slideFrontArtifactForTest())
+            assertNotNull("the unrecorded gate must not consume the backward slot", view.slideBackwardArtifactForTest())
+
+            // Force the hidden record traversal: a direct draw pass records the exact staged content.
+            val recordedFrame = Bitmap.createBitmap(staged.width.coerceAtLeast(1), staged.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+            try {
+                staged.draw(Canvas(recordedFrame))
+            } finally {
+                recordedFrame.recycle()
+            }
+            assertEquals("the record pass must increment the counter exactly once", 1, staged.contentRecordPassesForTest)
+            assertTrue("the recorded stage must be promotion-ready", staged.isRecorded())
+            val stagedRecordPassesBefore = staged.contentRecordPassesForTest
+
+            // Reverse warm turn (page 1 -> page 0) promotes the exact staged instance.
+            assertTrue(view.beginInteractiveCurl(forward = false, anchorX = 0f))
+            val reverseRenderer = view.requireActiveSlideRendererView()
+            assertSame("reverse turn must promote the staged renderer", staged, reverseRenderer)
+            assertEquals("reverse promotion must raise alpha", 1f, staged.alpha, 0.001f)
+            assertEquals(
+                "reverse promotion must not execute another page-content record pass",
+                stagedRecordPassesBefore,
+                staged.contentRecordPassesForTest,
+            )
+            view.updateInteractiveCurl(x = view.width * 0.10f)
+            view.endInteractiveCurl(velocityX = 0f)
+            val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+            animator?.end()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            view.drainPendingPageTexturePrecacheForTest()
+            assertEquals("settle must park the staged renderer", 0f, staged.alpha, 0.001f)
+            assertNotNull("settle must keep the staged renderer attached", staged.parent)
+            // The settle re-precache re-stages the same renderer for the new current page. It only
+            // becomes promotion-ready again after a hidden record pass, so draw once and re-read the
+            // counter; promotion itself still never re-records content.
+            val settleRecordFrame = Bitmap.createBitmap(staged.width.coerceAtLeast(1), staged.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+            try {
+                staged.draw(Canvas(settleRecordFrame))
+            } finally {
+                settleRecordFrame.recycle()
+            }
+            val stagedRecordPassesAfterReverseSettle = staged.contentRecordPassesForTest
+            assertTrue("the re-staged strip must be promotion-ready after the record pass", staged.isRecorded())
+
+            // Forward warm turn (page 0 -> page 1) promotes the exact same staged instance.
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val forwardRenderer = view.requireActiveSlideRendererView()
+            assertSame("forward turn must promote the staged renderer", staged, forwardRenderer)
+            assertEquals("forward promotion must raise alpha", 1f, staged.alpha, 0.001f)
+            assertEquals(
+                "forward promotion must not execute another page-content record pass",
+                stagedRecordPassesAfterReverseSettle,
+                staged.contentRecordPassesForTest,
+            )
+            view.updateInteractiveCurl(x = view.width * 0.90f)
+            view.endInteractiveCurl(velocityX = 0f)
+            val forwardAnimator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
+            view.setPrivateField("rapidTurnSequenceActive", true)
+            forwardAnimator?.end()
+            view.setPrivateField("rapidTurnSequenceActive", false)
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+            assertEquals("final settle must park the staged renderer", 0f, staged.alpha, 0.001f)
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `staged strip places previous current next at local x 0 W and 2W`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[1].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+
+            val staged = checkNotNull(view.stagedSlideOverlayForTest())
+            view.beginSlideStripDrawRecordingForTest()
+            val frame = Bitmap.createBitmap(staged.width.coerceAtLeast(1), staged.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+            try {
+                staged.draw(Canvas(frame))
+                val origins = checkNotNull(view.slideStripDrawXOriginsForTest)
+                assertEquals("the staged strip must draw exactly three pages", 3, origins.size)
+                assertEquals("previous page local X origin", 0f, origins[0], 0.001f)
+                assertEquals("current page local X origin", view.width.toFloat(), origins[1], 0.001f)
+                assertEquals("next page local X origin", 2f * view.width, origins[2], 0.001f)
+            } finally {
+                frame.recycle()
+            }
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `staged strip exact triple mismatch rejects same geometry with a different neighbor artifact`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[1].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+
+            val staged = checkNotNull(view.stagedSlideOverlayForTest())
+            val front = checkNotNull(view.slideFrontArtifactForTest())
+            val backward = checkNotNull(view.slideBackwardArtifactForTest())
+            val revealed = checkNotNull(view.slideRevealedArtifactForTest())
+            // Same geometry, different next artifact identity must not match the staged triple.
+            assertFalse(
+                "a different next artifact must not match the staged triple",
+                staged.matchesStagedArtifacts(
+                    previousArtifact = backward,
+                    currentArtifact = front,
+                    nextArtifact = backward,
+                ),
+            )
+            assertFalse(
+                "a different previous artifact must not match the staged triple",
+                staged.matchesStagedArtifacts(
+                    previousArtifact = revealed,
+                    currentArtifact = front,
+                    nextArtifact = revealed,
+                ),
+            )
+            assertTrue(
+                "the exact staged triple must match",
+                staged.matchesStagedArtifacts(backward, front, revealed),
+            )
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `staged strip is not generation-churned by the same exact unrecorded stage`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[1].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+
+            val staged = checkNotNull(view.stagedSlideOverlayForTest())
+            assertFalse("the stage must start unrecorded", staged.isRecorded())
+            val generationBefore = staged.stageGeneration
+            // Re-running precache with the exact same slots must not re-stage (generation churn).
+            view.preCachePageTexturesForTest()
+            assertEquals(
+                "the exact unrecorded stage must not be generation-churned by a re-precache",
+                generationBefore,
+                staged.stageGeneration,
+            )
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `warm pair is rejected when the staged renderer is absent`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+
+        try {
+            // Ensure no warm precache has staged the persistent renderer yet.
+            view.pageTexturePrecacheEnabled = false
+            view.recycleCachedTexturesForTest()
+            // The pagedFlowView helper may already have staged a renderer during its setup idles;
+            // explicitly drop it so this test exercises the renderer-null rejection path.
+            view.setPrivateField("stagedSlideOverlayView", null)
+            view.setPrivateField("slideSeamShadowView", null)
+            view.setPrivateField("slideOverlayView", null)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertNull("no staged renderer exists before warm precache", view.stagedSlideOverlayForTest())
+            // Re-enable precache so the remaining turn-readiness gates are exercised normally.
+            view.pageTexturePrecacheEnabled = true
+            // Manually arm the artifact slots so the only missing ingredient is the staged renderer.
+            val front = view.recordSlidePageArtifactForTest(pages[1].topPx, pages[1])
+            val backward = view.recordSlidePageArtifactForTest(pages[0].topPx, pages[0])
+            view.installSlideArtifactSlotForTest("slideFrontSlot", pages[1], front)
+            view.installSlideArtifactSlotForTest("slideBackwardSlot", pages[0], backward)
+
+            val pair = view.takeCachedSlideArtifactsForTurnForTest(
+                fromPage = 1,
+                fromTop = pages[1].topPx,
+                fromWindow = pages[1],
+                targetPage = 0,
+                targetTop = pages[0].topPx,
+                targetWindow = pages[0],
+            )
+            assertNull("a missing staged renderer must reject the warm pair", pair)
+            assertNotNull("the rejected gate must not consume the front slot", view.slideFrontArtifactForTest())
+            assertNotNull("the rejected gate must not consume the backward slot", view.slideBackwardArtifactForTest())
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `staged renderer and shadow are recreated when the viewport size changes`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[1].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+
+            val originalRenderer = checkNotNull(view.stagedSlideOverlayForTest())
+            val originalShadow = view.privateField("slideSeamShadowView") as? SlideSeamShadowView
+            assertNotNull("the staged shadow sibling must exist before recreation", originalShadow)
+            assertTrue("the original renderer must match the original viewport", originalRenderer.matchesViewport(view.width, view.height))
+
+            // Change the viewport and force a stage boundary: the renderer + shadow must be rebuilt.
+            view.measure(exactly(view.width * 2, view.height * 2))
+            view.layout(0, 0, view.width * 2, view.height * 2)
+            view.preCachePageTexturesForTest()
+
+            val recreated = checkNotNull(view.stagedSlideOverlayForTest())
+            assertTrue("the renderer must be recreated for the new viewport", recreated !== originalRenderer)
+            assertTrue("the recreated renderer must match the new viewport", recreated.matchesViewport(view.width, view.height))
+            assertNull("the old renderer must be detached", originalRenderer.parent)
+            assertNull("the old shadow must be detached", originalShadow?.parent)
+            assertNull("no stale active slide overlay pointer may survive recreation", view.privateField("slideOverlayView"))
+            assertTrue("the recreated renderer must be attached", recreated.parent != null)
+            assertEquals("the recreated renderer must use the new width", view.width * 3, recreated.width)
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `cache recycle clears staged readiness and retry state while keeping the idle renderer attached`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[1].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+            view.recordStagedSlideOverlayForTest()
+
+            val staged = checkNotNull(view.stagedSlideOverlayForTest())
+            assertTrue("the staged strip must be ready before recycle", staged.isRecorded())
+            assertNotNull("the idle staged renderer must be attached", staged.parent)
+            assertEquals("the idle staged renderer must be hidden", 0f, staged.alpha, 0.001f)
+            val generationBefore = staged.stageGeneration
+
+            // Full cache recycle must clear staged readiness (the artifact slots are discarded) and
+            // cancel any pending record retry, while the persistent renderer stays attached.
+            view.recycleCachedTexturesForTest()
+
+            assertFalse("cache recycle must clear staged readiness", staged.isRecorded())
+            assertNotNull("cache recycle must keep the persistent renderer attached", staged.parent)
+            assertEquals("cache recycle must keep the persistent renderer hidden", 0f, staged.alpha, 0.001f)
+            assertTrue(
+                "cache recycle must advance the stage generation so the next precache re-stages",
+                staged.stageGeneration != generationBefore,
+            )
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `rapid pair admission rejects renderer-null and unrecorded states including pending precache`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+
+        try {
+            // Null staged renderer (no precache yet): admission must be rejected.
+            view.pageTexturePrecacheEnabled = false
+            view.recycleCachedTexturesForTest()
+            view.setPrivateField("stagedSlideOverlayView", null)
+            view.setPrivateField("slideSeamShadowView", null)
+            view.setPrivateField("slideOverlayView", null)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse(
+                "rapid admission must reject when the staged renderer is absent",
+                view.rapidSlideArtifactPairAvailableForTest(pages[1]),
+            )
+
+            // Warm precache staged but unrecorded: cached slots exist yet admission must stay false
+            // until the hidden record pass runs.
+            view.pageTexturePrecacheEnabled = true
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+            val staged = checkNotNull(view.stagedSlideOverlayForTest())
+            assertFalse("the stage must start unrecorded", staged.isRecorded())
+            assertNotNull("warm precache must arm the cached pair", view.slideFrontArtifactForTest())
+            assertFalse(
+                "rapid admission must reject an unrecorded staged pair",
+                view.rapidSlideArtifactPairAvailableForTest(pages[1]),
+            )
+
+            // After the hidden record pass the exact pair becomes admissible.
+            view.recordStagedSlideOverlayForTest()
+            assertTrue(
+                "rapid admission must accept the recorded exact pair",
+                view.rapidSlideArtifactPairAvailableForTest(pages[1]),
+            )
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `rapid pair admission stays false while artifacts are pending even with a recorded stale renderer`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+
+        try {
+            // Warm precache to a fully recorded staged renderer; this triple becomes the stale
+            // renderer that the pending branch must ignore.
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            val staged = checkNotNull(view.stagedSlideOverlayForTest())
+            assertTrue("the staged renderer must be recorded", staged.isRecorded())
+
+            // Clear the cached slide slots directly by reflection. This is required so that
+            // rapidSlideArtifactPairAvailable() skips its cached-slot branch (which would otherwise
+            // return false on the mismatched triple before ever reaching the pending branch).
+            // recycleCachedTextures/clearSlideArtifactSlotsKeeping are intentionally NOT used
+            // because they would also clear/invalidate the staged renderer we need to keep recorded.
+            view.setPrivateField("slideFrontSlot", null)
+            view.setPrivateField("slideRevealedSlot", null)
+            view.setPrivateField("slideBackwardSlot", null)
+            assertNull("the cached front slot must be cleared", view.slideFrontArtifactForTest())
+            assertNull("the cached revealed slot must be cleared", view.slideRevealedArtifactForTest())
+
+            // Arm a real pending precache request (front + target artifacts recorded, no commit
+            // callbacks posted). The pending artifacts are non-null and valid.
+            view.armPendingSlideArtifactPrecacheForTest(fromPageIndex = 0, targetPageIndex = 1)
+            assertTrue(
+                "the pending precache request must be armed",
+                view.privateBool("slideArtifactPrecachePending"),
+            )
+            assertNotNull(
+                "the pending precache request must hold artifacts",
+                view.privateField("pendingSlideArtifactPrecache"),
+            )
+            // Prove the manually armed request is valid under the real production predicate; an
+            // invalid request would bypass the pending branch and let the assertion falsely pass.
+            assertTrue(
+                "the manually armed pending request must satisfy pendingSlideArtifactPrecacheIsValid",
+                view.pendingSlideArtifactPrecacheIsValidForTest(),
+            )
+
+            // The original staged renderer stays recorded (stale relative to the pending artifacts).
+            assertTrue("the stale staged renderer must remain recorded", staged.isRecorded())
+
+            // Under the OLD pending branch this would have returned true: cached slots are absent,
+            // the pending artifacts are non-null, and the stale staged renderer is recorded
+            // (stagedRenderer != null && stagedRenderer.isRecorded()). The corrected pending branch
+            // returns false unconditionally while artifacts are only pending.
+            assertFalse(
+                "pending artifacts must never admit a rapid pair",
+                view.rapidSlideArtifactPairAvailableForTest(pages[1]),
+            )
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `warm seam shadow re-lays vertically at promotion and keeps backward bounds`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[2].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+            view.recordStagedSlideOverlayForTest()
+
+            // Reverse promotion from page 2 -> page 1 at partial progress.
+            assertTrue(view.beginInteractiveCurl(forward = false, anchorX = 0f))
+            view.updateInteractiveCurl(x = view.width * 0.50f)
+            val shadow = view.privateField("slideSeamShadowView") as? SlideSeamShadowView
+            assertNotNull("the warm seam shadow sibling must exist", shadow)
+            checkNotNull(shadow).let { s ->
+                assertEquals("the shadow must re-lay to the current scrollY", view.scrollY.toFloat(), s.top.toFloat(), 0.001f)
+                assertEquals("the shadow must use the current viewport height", view.height.toFloat(), s.height.toFloat(), 0.001f)
+                val shadowW = s.width.toFloat()
+                val seamX = view.width * 0.50f
+                assertEquals(
+                    "backward shadow must occupy [seamX-shadowW, seamX]",
+                    seamX - shadowW,
+                    s.translationX,
+                    0.001f,
+                )
+            }
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `cold bitmap slide overlay retains the baseline seam shadow`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        try {
+            // Cold SLIDE: no warm precache, so the turn installs a fresh BitmapFrame overlay whose
+            // onDraw must still draw the baseline seam shadow.
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val renderer = view.requireActiveSlideRendererView() as PageSlideOverlayView
+            val front = slide.privateBitmap("frontBitmap")
+            val revealed = slide.privateBitmap("revealedBitmap")
+            assertFalse("cold overlay front bitmap must be live", front.isRecycled)
+            assertFalse("cold overlay revealed bitmap must be live", revealed.isRecycled)
+            assertNotNull("the cold renderer must still be the fresh overlay", renderer.parent)
+            // Rasterize the full 2W strip: forward shadow band is local [W, W+shadowW].
+            val frame = Bitmap.createBitmap(renderer.width.coerceAtLeast(1), renderer.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+            try {
+                renderer.draw(Canvas(frame))
+                val shadowW = renderer.seamShadowWidthPx().coerceAtLeast(1)
+                val bodyX = view.width / 2
+                var bodyLuma = 0f
+                var seamLuma = 0f
+                var sampled = 0
+                for (y in listOf(view.height / 4, view.height / 2, 3 * view.height / 4)) {
+                    val bandX = (view.width + shadowW / 2).coerceAtMost(frame.width - 1)
+                    bodyLuma += android.graphics.Color.luminance(frame.getPixel(bodyX, y))
+                    seamLuma += android.graphics.Color.luminance(frame.getPixel(bandX, y))
+                    sampled += 1
+                }
+                assertTrue("cold overlay must paint the baseline seam shadow band", sampled > 0)
+                assertTrue(
+                    "cold overlay seam band must be darker than the page body; body=$bodyLuma seam=$seamLuma",
+                    seamLuma < bodyLuma,
+                )
+            } finally {
+                frame.recycle()
+            }
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `forward and reverse promotion target identity is validated against the staged strip`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[1].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+            view.recordStagedSlideOverlayForTest()
+
+            val staged = checkNotNull(view.stagedSlideOverlayForTest())
+            val current = checkNotNull(view.slideFrontArtifactForTest())
+            val previous = checkNotNull(view.slideBackwardArtifactForTest())
+            val next = checkNotNull(view.slideRevealedArtifactForTest())
+
+            assertTrue("forward promotion must accept the staged next artifact", staged.isStagedPairForDirection(current, next, forward = true))
+            assertFalse("forward promotion must reject a non-next revealed artifact", staged.isStagedPairForDirection(current, previous, forward = true))
+            assertTrue("reverse promotion must accept the staged previous artifact", staged.isStagedPairForDirection(current, previous, forward = false))
+            assertFalse("reverse promotion must reject a non-previous revealed artifact", staged.isStagedPairForDirection(current, next, forward = false))
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    fun `transfer gate rejects a direction-mismatched staged pair without consuming slots`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        val pages = view.privateField("paged") as List<EpubFlowPage>
+        val flow = view.privateField("flow") as EpubChapterFlow
+
+        try {
+            view.recycleCachedTexturesForTest()
+            view.setChapter(
+                flow,
+                view.textView.text,
+                pageHeightPx = view.height,
+                restoreOffset = pages[1].startOffset,
+            )
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+            view.recordStagedSlideOverlayForTest()
+
+            val staged = checkNotNull(view.stagedSlideOverlayForTest())
+            val current = checkNotNull(view.slideFrontArtifactForTest())
+            val previous = checkNotNull(view.slideBackwardArtifactForTest())
+            val next = checkNotNull(view.slideRevealedArtifactForTest())
+
+            // Re-stage with the direction-reversed revealed artifact (current + previous instead of
+            // current + next): same geometry, but a forward transfer must be rejected.
+            staged.stageStrip(
+                previousTop = pages[0].topPx,
+                previousWindow = pages[0],
+                previousArtifact = previous,
+                currentTop = pages[1].topPx,
+                currentWindow = pages[1],
+                currentArtifact = current,
+                nextTop = null,
+                nextWindow = null,
+                nextArtifact = null,
+            )
+            view.recordStagedSlideOverlayForTest()
+
+            val pair = view.takeCachedSlideArtifactsForTurnForTest(
+                fromPage = 1,
+                fromTop = pages[1].topPx,
+                fromWindow = pages[1],
+                targetPage = 2,
+                targetTop = pages[2].topPx,
+                targetWindow = pages[2],
+            )
+            assertNull("a direction-mismatched staged pair must not transfer", pair)
+            assertNotNull("the rejected transfer must not consume the front slot", view.slideFrontArtifactForTest())
+            assertNotNull("the rejected transfer must not consume the revealed slot", view.slideRevealedArtifactForTest())
+        } finally {
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
         }
     }
 
@@ -13456,6 +14383,41 @@ class EpubFlowViewTest {
         return result.name == "STARTED"
     }
 
+    /** Production capturePageTurnOrigin via reflection; returns the private PageTurnOrigin value. */
+    private fun EpubFlowView.capturePageTurnOriginForTest(): Any =
+        javaClass.getDeclaredMethod("capturePageTurnOrigin")
+            .apply { isAccessible = true }
+            .invoke(this)
+
+    /**
+     * Direct entry to startLocalInteractiveCurl, bypassing input classification so a test can force
+     * the renderer-admission gate with an exact frame pair.
+     */
+    private fun EpubFlowView.startLocalInteractiveCurlForTest(
+        origin: Any,
+        targetWindow: EpubFlowPage,
+        forward: Boolean,
+        outgoing: SlidePageFrame,
+        revealed: SlidePageFrame,
+    ): Enum<*> {
+        val originClass = javaClass.declaredClasses.single { it.simpleName == "PageTurnOrigin" }
+        val axisClass = javaClass.declaredClasses.single { it.simpleName == "InteractiveTurnAxis" }
+        val horizontal = checkNotNull(axisClass.enumConstants)
+            .single { (it as Enum<*>).name == "HORIZONTAL" }
+        val method = javaClass.getDeclaredMethod(
+            "startLocalInteractiveCurl",
+            originClass,
+            EpubFlowPage::class.java,
+            Boolean::class.javaPrimitiveType,
+            axisClass,
+            Float::class.javaPrimitiveType,
+            SlidePageFrame::class.java,
+            SlidePageFrame::class.java,
+        )
+        return method.apply { isAccessible = true }
+            .invoke(this, origin, targetWindow, forward, horizontal, 0f, outgoing, revealed) as Enum<*>
+    }
+
     private fun EpubFlowView.offerReadyBoundaryPreviewForTest(
         forward: Boolean,
         token: Long = 1L,
@@ -13580,6 +14542,9 @@ class EpubFlowViewTest {
             .apply { isAccessible = true }
             .invoke(this)
         if (idlePostedWork) shadowOf(Looper.getMainLooper()).idle()
+        // Mirrors the production hidden display-list traversal that records the staged strip after
+        // artifact precache staging; Robolectric has no real HWUI frame, so drive it explicitly.
+        recordStagedSlideOverlayForTest()
     }
 
     private fun EpubFlowView.drainQueuedPageTurnForTest(): Boolean =
@@ -13587,26 +14552,186 @@ class EpubFlowViewTest {
             .apply { isAccessible = true }
             .invoke(this) as Boolean
 
+    private fun EpubFlowView.takeCachedSlideArtifactsForTurnForTest(
+        fromPage: Int,
+        fromTop: Int,
+        fromWindow: EpubFlowPage?,
+        targetPage: Int,
+        targetTop: Int,
+        targetWindow: EpubFlowPage,
+    ): Pair<Any, Any>? {
+        val method = javaClass.getDeclaredMethod(
+            "takeCachedSlideArtifactsForTurn",
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+            EpubFlowPage::class.java,
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+            EpubFlowPage::class.java,
+        )
+        @Suppress("UNCHECKED_CAST")
+        return method.apply { isAccessible = true }
+            .invoke(this, fromPage, fromTop, fromWindow, targetPage, targetTop, targetWindow) as? Pair<Any, Any>
+    }
+
+    private fun EpubFlowView.recordSlidePageArtifactForTest(topPx: Int, window: EpubFlowPage): Any {
+        val method = javaClass.getDeclaredMethod(
+            "recordSlidePageArtifact",
+            Int::class.javaPrimitiveType,
+            EpubFlowPage::class.java,
+        )
+        return checkNotNull(method.apply { isAccessible = true }.invoke(this, topPx, window))
+    }
+
+    private fun EpubFlowView.installSlideArtifactSlotForTest(slotName: String, window: EpubFlowPage, artifact: Any) {
+        val slotClass = Class.forName("dev.readflow.render.epub.EpubFlowView\$SlideArtifactSlot")
+        val constructor = slotClass.declaredConstructors.single()
+        val key = javaClass.getDeclaredMethod(
+            "slidePageArtifactKey",
+            Int::class.javaPrimitiveType,
+            EpubFlowPage::class.java,
+        ).apply { isAccessible = true }.invoke(this, window.topPx, window)
+        val slot = constructor.apply { isAccessible = true }
+            .newInstance(
+                canonicalFloorPageIndexForTest(window),
+                window.topPx,
+                key,
+                artifact,
+            )
+        javaClass.getDeclaredField(slotName).apply {
+            isAccessible = true
+            set(this@installSlideArtifactSlotForTest, slot)
+        }
+    }
+
+    private fun EpubFlowView.canonicalFloorPageIndexForTest(window: EpubFlowPage): Int {
+        val method = javaClass.getDeclaredMethod(
+            "canonicalFloorPageIndexForTopPx",
+            Int::class.javaPrimitiveType,
+        )
+        return method.apply { isAccessible = true }.invoke(this, window.topPx) as Int
+    }
+
+    private fun EpubFlowView.rapidSlideArtifactPairAvailableForTest(targetWindow: EpubFlowPage): Boolean {
+        val method = javaClass.getDeclaredMethod(
+            "rapidSlideArtifactPairAvailable",
+            EpubFlowPage::class.java,
+        )
+        return method.apply { isAccessible = true }.invoke(this, targetWindow) as Boolean
+    }
+
+    /**
+     * Arms a real pending slide-artifact precache request (front + target artifacts recorded, no
+     * commit callbacks posted) via reflection, without going through the posted capture chain.
+     */
+    private fun EpubFlowView.armPendingSlideArtifactPrecacheForTest(fromPageIndex: Int, targetPageIndex: Int) {
+        val pages = privateField("paged") as List<EpubFlowPage>
+        val fromWindow = pages[fromPageIndex]
+        val targetWindow = pages[targetPageIndex]
+        val generation = privateField("slideArtifactPrecacheGeneration") as Long
+        val fromKey = javaClass.getDeclaredMethod(
+            "slidePageArtifactKey",
+            Int::class.javaPrimitiveType,
+            EpubFlowPage::class.java,
+        ).apply { isAccessible = true }.invoke(this, fromWindow.topPx, fromWindow)
+        val targetKey = javaClass.getDeclaredMethod(
+            "slidePageArtifactKey",
+            Int::class.javaPrimitiveType,
+            EpubFlowPage::class.java,
+        ).apply { isAccessible = true }.invoke(this, targetWindow.topPx, targetWindow)
+        val frontArtifact = recordSlidePageArtifactForTest(fromWindow.topPx, fromWindow)
+        val targetArtifact = recordSlidePageArtifactForTest(targetWindow.topPx, targetWindow)
+
+        val requestClass = Class.forName("dev.readflow.render.epub.EpubFlowView\$PendingSlideArtifactPrecache")
+        // Pick the 14-parameter primary constructor explicitly; default parameters may add a
+        // synthetic default-argument constructor that .single() would fail on.
+        val constructor = requestClass.declaredConstructors.single { it.parameterTypes.size == 14 }
+        val request = constructor.apply { isAccessible = true }.newInstance(
+            generation,
+            fromWindow.topPx,
+            fromWindow,
+            null,
+            targetWindow,
+            fromPageIndex,
+            -1,
+            targetPageIndex,
+            fromKey,
+            null,
+            targetKey,
+            frontArtifact,
+            null,
+            targetArtifact,
+        )
+        javaClass.getDeclaredField("pendingSlideArtifactPrecache").apply {
+            isAccessible = true
+            set(this@armPendingSlideArtifactPrecacheForTest, request)
+        }
+        javaClass.getDeclaredField("slideArtifactPrecachePending").apply {
+            isAccessible = true
+            setBoolean(this@armPendingSlideArtifactPrecacheForTest, true)
+        }
+    }
+
+    /** Invokes the real private validity predicate against the currently armed pending request. */
+    private fun EpubFlowView.pendingSlideArtifactPrecacheIsValidForTest(): Boolean {
+        val request = checkNotNull(privateField("pendingSlideArtifactPrecache"))
+        val method = javaClass.getDeclaredMethod(
+            "pendingSlideArtifactPrecacheIsValid",
+            request.javaClass,
+        )
+        return method.apply { isAccessible = true }.invoke(this, request) as Boolean
+    }
+
     /**
      * Advances one postOnAnimation frame at a time until a split-frame page-texture precache
      * commits (or is discarded). Drains both the legacy Bitmap precache pending state and the warm
      * SLIDE artifact precache pending state. Mirrors production's front/target/previous frame
      * chain; idle() alone is not reliable once work is already posted as chained animation
-     * callbacks. Caps frames so a stuck queue fails loudly.
+     * callbacks. Staged-record retry work is NOT inferred here: a test that needs it forces the
+     * hidden record and drains until the queued turn observably starts
+     * (drainStagedRecordRetryUntilQueuedTurnStartsForTest). Caps frames and fails loudly so a
+     * stuck queue cannot silently pass.
      */
     private fun EpubFlowView.drainPendingPageTexturePrecacheForTest(maxFrames: Int = 8) {
         repeat(maxFrames) {
-            if (
-                !privateBool("pageTexturePrecachePending") &&
-                privateField("pendingPageTexturePrecache") == null &&
-                !privateBool("slideArtifactPrecachePending") &&
-                privateField("pendingSlideArtifactPrecache") == null
-            ) {
-                return
-            }
+            if (!pendingPageTexturePrecacheWork()) return
             shadowOf(Looper.getMainLooper()).runOneTask()
         }
-        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue(
+            "precache drain must converge within $maxFrames frames; " +
+                "pageTexturePrecachePending=${privateBool("pageTexturePrecachePending")} " +
+                "pendingPageTexturePrecache=${privateField("pendingPageTexturePrecache") != null} " +
+                "slideArtifactPrecachePending=${privateBool("slideArtifactPrecachePending")} " +
+                "pendingSlideArtifactPrecache=${privateField("pendingSlideArtifactPrecache") != null}",
+            !pendingPageTexturePrecacheWork(),
+        )
+    }
+
+    /** True while either precache chain still owns pending capture/commit work. */
+    private fun EpubFlowView.pendingPageTexturePrecacheWork(): Boolean =
+        privateBool("pageTexturePrecachePending") ||
+            privateField("pendingPageTexturePrecache") != null ||
+            privateBool("slideArtifactPrecachePending") ||
+            privateField("pendingSlideArtifactPrecache") != null
+
+    /**
+     * Runs posted frame callbacks until the queued warm turn observably starts (the slide drawable
+     * is installed). The staged-record retry posted by a precache commit is a plain postOnAnimation
+     * frame; after the hidden record pass was modeled explicitly (recordStagedSlideOverlayForTest),
+     * its observable outcome is the queued turn starting and the queue advancing. Bounded with a
+     * loud assertion so a stuck retry cannot silently pass.
+     */
+    private fun EpubFlowView.drainStagedRecordRetryUntilQueuedTurnStartsForTest(maxFrames: Int = 8) {
+        repeat(maxFrames) {
+            if (privateField("slideDrawable") != null) return
+            shadowOf(Looper.getMainLooper()).runOneTask()
+        }
+        assertTrue(
+            "the staged-record retry must start the queued warm turn within $maxFrames frames; " +
+                "queuedPageTurnDelta=${privateInt("queuedPageTurnDelta")} " +
+                "slideDrawable=${privateField("slideDrawable") != null}",
+            privateField("slideDrawable") != null,
+        )
     }
 
     /**
@@ -13929,6 +15054,8 @@ class EpubFlowViewTest {
                 field.get(this) as? View
             }
             .filterNot { candidate -> candidate === livePage || candidate === textView }
+            .filterNot { candidate -> candidate is SlideSeamShadowView }
+            .filter { candidate -> candidate.alpha > 0f || candidate.visibility != View.VISIBLE }
             .distinct()
             .toList()
     }
@@ -13971,6 +15098,28 @@ class EpubFlowViewTest {
     /** Identity of the cached backward-target SLIDE artifact, or null when no slot is armed. */
     private fun EpubFlowView.slideBackwardArtifactForTest(): Any? =
         (privateField("slideBackwardSlot") as Any?)?.reflectedField("artifact")
+
+    /** The persistent staged three-page SLIDE renderer, or null before the first precache stage. */
+    private fun EpubFlowView.stagedSlideOverlayForTest(): PageSlideOverlayView? =
+        privateField("stagedSlideOverlayView") as? PageSlideOverlayView
+
+    /**
+     * Forces one hidden display-list record pass on the staged renderer (the production ViewOverlay
+     * traversal that normally happens on the next frame after staging). Robolectric does not run a
+     * real HWUI traversal, so tests invoke the renderer's draw directly to reach the record gate.
+     */
+    private fun EpubFlowView.recordStagedSlideOverlayForTest(): PageSlideOverlayView? {
+        val staged = stagedSlideOverlayForTest() ?: return null
+        // The staged renderer is a 3W x H strip; draw at its full size so the hidden record pass
+        // covers every page band and Robolectric's View.draw reaches onDraw correctly.
+        val frame = Bitmap.createBitmap(staged.width.coerceAtLeast(1), staged.height.coerceAtLeast(1), Bitmap.Config.ARGB_8888)
+        try {
+            staged.draw(Canvas(frame))
+        } finally {
+            frame.recycle()
+        }
+        return staged
+    }
 
     /** The raw cached slot (slideFrontSlot / slideRevealedSlot / slideBackwardSlot), or null. */
     private fun EpubFlowView.slideArtifactSlotForTest(slot: String): Any? = privateField(slot)

@@ -13,35 +13,68 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Opaque static SLIDE page-turn renderer. Per-frame motion is a View translation, so this renderer's
- * display list is recorded once and its two page frames are never reallocated or copied per MOVE.
- * Warm same-chapter turns carry [SlidePageFrame.ArtifactFrame] command artifacts (no viewport-sized
- * page-shot Bitmap); cold deferred MOVE handoffs, boundary, and continuity turns keep the
- * [SlidePageFrame.BitmapFrame] pair. The fully covered live TextView is skipped until the overlay is
- * removed.
+ * Persistent staged three-page SLIDE strip for warm same-chapter turns.
  *
- * The View is a 2W x H strip laid out in content coordinates. Forward content order is
- * [front][revealed] with layout left = 0; backward is [revealed][front] with layout left = -W.
- * Top is the current scrollY content coordinate. [PageSlideDrawable] remains the zero-copy frame
- * owner; this View only records the same geometry and seam treatment once.
+ * The renderer stays attached to the flow view's overlay while idle (alpha 0). During artifact
+ * precache the flow view stages previous/current/next pages here; the next HWUI display-list record
+ * pass bakes the page commands directly into this View's own RenderNode (via the flow view's
+ * page-draw callback, never through [SlidePageArtifact.drawTo]). A warm turn then promotes the same
+ * instance using only render properties (alpha/translationX), so the page content is never
+ * re-recorded inside the turn frame. After settle/cancel the renderer returns to alpha 0 and stays
+ * attached; it is reconfigured only during a later precache.
+ *
+ * The strip is 3W wide laid out at left = -W so the visible window [0, W] shows the current page at
+ * rest. Previous sits at strip [-W, 0], current at [0, W], next at [W, 2W]; promotion translates the
+ * whole strip ±progress*W. The directional seam shadow lives in a separate lightweight sibling view
+ * ([SlideSeamShadowView]) so flipping it never invalidates this content display list.
  */
 internal class PageSlideOverlayView(
     context: Context,
-    frontFrame: SlidePageFrame,
-    revealedFrame: SlidePageFrame,
+    private val flowView: EpubFlowView,
     private val viewportW: Int,
     private val viewportH: Int,
-    private val forward: Boolean,
     private val density: Float,
 ) : View(context) {
 
-    private var frontFrame: SlidePageFrame? = frontFrame
-    private var revealedFrame: SlidePageFrame? = revealedFrame
+    /** One staged strip slot: page content top and its paginated window (null for missing pages). */
+    private class StripPage(
+        val topPx: Int,
+        val window: EpubFlowPage?,
+    )
+
+    private var previousPage: StripPage? = null
+    private var currentPage: StripPage? = null
+    private var nextPage: StripPage? = null
+    /** Exact artifact identities the staged strip is bound to (control tokens; never drawn). */
+    private var stagedPreviousArtifact: SlidePageArtifact? = null
+    private var stagedCurrentArtifact: SlidePageArtifact? = null
+    private var stagedNextArtifact: SlidePageArtifact? = null
+    private var stageGenerationValue = 0L
+    private var recordedGeneration = -1L
+
+    /** Frames of the currently promoted turn, kept only for the ownership/retirement contract. */
+    private var activeTurnFrames: List<SlidePageFrame> = emptyList()
+
+    /** Cold BitmapFrame pair for cold/boundary/continuity turns (unchanged bitmap path). */
+    private var coldFrontBitmap: Bitmap? = null
+    private var coldRevealedBitmap: Bitmap? = null
+    private var coldForward = true
+
+    /** Whether the strip content has been staged and may be drawn. Parked renderers draw nothing. */
+    private var staged = false
+
+    /** Test-visible record-pass counter: incremented only by a real staged onDraw pass. */
+    internal var contentRecordPassesForTest: Int = 0
+        private set
+
+    /** Current stage generation (bumps only when a new stage is staged). */
+    internal val stageGeneration: Long
+        get() = stageGenerationValue
 
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-    private val shadePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bitmapSrc = Rect()
     private val bitmapDst = RectF()
+    private val shadePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val shadowMatrix = android.graphics.Matrix()
     private val seamShadowShader = LinearGradient(
         0f,
@@ -61,79 +94,210 @@ internal class PageSlideOverlayView(
         importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
     }
 
-    override fun onDraw(canvas: Canvas) {
-        val w = viewportW.toFloat()
-        val h = viewportH.toFloat()
-        if (forward) {
-            drawFrame(canvas, frontFrame, 0f, w, h)
-            drawFrame(canvas, revealedFrame, w, w, h)
-        } else {
-            drawFrame(canvas, revealedFrame, 0f, w, h)
-            drawFrame(canvas, frontFrame, w, w, h)
-        }
-        drawSeamShadow(canvas, w, h)
+    /**
+     * Stages the three-page strip bound to exact artifact identities. The strip is marked
+     * unrecorded and invalidated; only a real staged [onDraw] pass marks that exact generation
+     * recorded, so promotion can never outrun the hidden display-list record traversal.
+     */
+    fun stageStrip(
+        previousTop: Int?,
+        previousWindow: EpubFlowPage?,
+        previousArtifact: SlidePageArtifact?,
+        currentTop: Int,
+        currentWindow: EpubFlowPage?,
+        currentArtifact: SlidePageArtifact,
+        nextTop: Int?,
+        nextWindow: EpubFlowPage?,
+        nextArtifact: SlidePageArtifact?,
+    ) {
+        previousPage = previousTop?.let { StripPage(it, previousWindow) }
+        currentPage = StripPage(currentTop, currentWindow)
+        nextPage = nextTop?.let { StripPage(it, nextWindow) }
+        stagedPreviousArtifact = previousArtifact
+        stagedCurrentArtifact = currentArtifact
+        stagedNextArtifact = nextArtifact
+        staged = true
+        activeTurnFrames = emptyList()
+        stageGenerationValue += 1L
+        invalidate()
     }
 
-    /** Draws one strip-local page frame at [left]; artifacts replay at their recorded viewport size. */
-    private fun drawFrame(canvas: Canvas, frame: SlidePageFrame?, left: Float, w: Float, h: Float) {
-        when (frame) {
-            is SlidePageFrame.BitmapFrame -> drawBitmapWindow(canvas, frame.bitmap, left, w, h)
-            is SlidePageFrame.ArtifactFrame -> {
-                val save = canvas.save()
-                try {
-                    canvas.translate(left, 0f)
-                    frame.artifact.drawTo(canvas)
-                } finally {
-                    canvas.restoreToCount(save)
-                }
+    /**
+     * Exact staged triple match: previous/current/next artifact identities (null-aware) must all
+     * match, independent of record readiness. Used to avoid re-staging the same exact generation.
+     */
+    fun matchesStagedArtifacts(
+        previousArtifact: SlidePageArtifact?,
+        currentArtifact: SlidePageArtifact,
+        nextArtifact: SlidePageArtifact?,
+    ): Boolean =
+        staged &&
+            stagedPreviousArtifact === previousArtifact &&
+            stagedCurrentArtifact === currentArtifact &&
+            stagedNextArtifact === nextArtifact
+
+    /** True when the staged strip is bound to this exact current artifact identity. */
+    fun isStagedCurrentArtifact(artifact: SlidePageArtifact): Boolean =
+        staged && stagedCurrentArtifact === artifact
+
+    /**
+     * True when the staged strip is bound to the exact current + direction-specific revealed
+     * artifact identity (forward -> next, reverse -> previous).
+     */
+    fun isStagedPairForDirection(
+        currentArtifact: SlidePageArtifact,
+        revealedArtifact: SlidePageArtifact,
+        forward: Boolean,
+    ): Boolean =
+        isStagedCurrentArtifact(currentArtifact) &&
+            if (forward) {
+                stagedNextArtifact === revealedArtifact
+            } else {
+                stagedPreviousArtifact === revealedArtifact
             }
-            null -> Unit
-        }
+
+    /** True when the viewport dimensions still match the renderer's construction-time values. */
+    fun matchesViewport(viewportWidth: Int, viewportHeight: Int): Boolean =
+        this.viewportW == viewportWidth && this.viewportH == viewportHeight
+
+    /** True when the staged content has been recorded for the current stage generation. */
+    fun isRecorded(): Boolean = staged && recordedGeneration == stageGenerationValue
+
+    /** Promotes the staged strip for a warm turn. Render properties only; never re-records content. */
+    fun promote(frames: List<SlidePageFrame>, forward: Boolean, progress: Float) {
+        activeTurnFrames = frames
+        applyProgress(forward, progress)
     }
 
-    /** Motion shots are viewport-sized and stay on the 1:1 blit path; keep the mapping fallback for legacy owners. */
-    private fun drawBitmapWindow(canvas: Canvas, bitmap: Bitmap, left: Float, w: Float, h: Float) {
+    /** Updates only render properties (alpha/translation) for the promoted strip. */
+    fun applyProgress(forward: Boolean, progress: Float) {
+        alpha = 1f
+        translationX = (if (forward) -progress else progress) * viewportW
+    }
+
+    /** Returns to the hidden idle state after settle/cancel. Render properties only. */
+    fun park() {
+        alpha = 0f
+        translationX = 0f
+        activeTurnFrames = emptyList()
+        coldFrontBitmap = null
+        coldRevealedBitmap = null
+    }
+
+    /** Installs a cold BitmapFrame pair for a fresh two-page overlay (boundary/cold/continuity). */
+    fun beginColdTurn(front: Bitmap, revealed: Bitmap, forward: Boolean, frames: List<SlidePageFrame>) {
+        coldFrontBitmap = front
+        coldRevealedBitmap = revealed
+        coldForward = forward
+        activeTurnFrames = frames
+        alpha = 1f
+    }
+
+    /**
+     * Resets the staged page content, artifact identities, and record readiness. Invalidates this
+     * View so a stale display list is never replayed, and parks it hidden. Callers must only invoke
+     * this while the staged strip is not the actively displayed turn (i.e. after detach/park).
+     */
+    fun clearStagedContent() {
+        staged = false
+        previousPage = null
+        currentPage = null
+        nextPage = null
+        stagedPreviousArtifact = null
+        stagedCurrentArtifact = null
+        stagedNextArtifact = null
+        stageGenerationValue += 1L
+        recordedGeneration = -1L
+        activeTurnFrames = emptyList()
+        park()
+        invalidate()
+    }
+
+    /**
+     * Returns the promoted turn's frames without consuming them, and clears the internal reference.
+     * The flow view keeps the artifact ownership contract (cache slots / retirement fence) while this
+     * renderer only used the frames as the control token for the visual transaction.
+     */
+    fun takeRecordedFrames(): List<SlidePageFrame> {
+        val frames = activeTurnFrames
+        activeTurnFrames = emptyList()
+        return frames
+    }
+
+    /** Legacy identity accessor for Bitmap-framed renderers (cold/boundary/continuity turns). */
+    fun takeRecordedBitmaps(): List<android.graphics.Bitmap> =
+        takeRecordedFrames().mapNotNull { (it as? SlidePageFrame.BitmapFrame)?.bitmap }
+
+    override fun onDraw(canvas: Canvas) {
+        val coldFront = coldFrontBitmap
+        val coldRevealed = coldRevealedBitmap
+        if (coldFront != null && coldRevealed != null) {
+            val w = viewportW.toFloat()
+            if (coldForward) {
+                drawBitmapWindow(canvas, coldFront, 0f, w)
+                drawBitmapWindow(canvas, coldRevealed, w, w)
+            } else {
+                drawBitmapWindow(canvas, coldRevealed, 0f, w)
+                drawBitmapWindow(canvas, coldFront, w, w)
+            }
+            drawColdSeamShadow(canvas, w)
+            return
+        }
+        if (!staged) return
+        val w = viewportW.toFloat()
+        // The staged View is laid out at local strip left = -W with width = 3W, so page-local X
+        // origins are previous = 0, current = W, next = 2W. Vertical page offsets never enter the
+        // horizontal placement; drawPageInto positions content vertically itself.
+        previousPage?.let { page ->
+            val save = canvas.save()
+            canvas.translate(0f, 0f)
+            flowView.slideStripDrawXOriginsForTest?.add(0f)
+            flowView.drawSlideStripPage(canvas, page.topPx, page.window)
+            canvas.restoreToCount(save)
+        }
+        currentPage?.let { page ->
+            val save = canvas.save()
+            canvas.translate(w, 0f)
+            flowView.slideStripDrawXOriginsForTest?.add(w)
+            flowView.drawSlideStripPage(canvas, page.topPx, page.window)
+            canvas.restoreToCount(save)
+        }
+        nextPage?.let { page ->
+            val save = canvas.save()
+            canvas.translate(2f * w, 0f)
+            flowView.slideStripDrawXOriginsForTest?.add(2f * w)
+            flowView.drawSlideStripPage(canvas, page.topPx, page.window)
+            canvas.restoreToCount(save)
+        }
+        recordedGeneration = stageGenerationValue
+        contentRecordPassesForTest += 1
+    }
+
+    /** Baseline seam shadow for fresh cold/boundary/continuity Bitmap SLIDE overlays. */
+    private fun drawColdSeamShadow(canvas: Canvas, w: Float) {
+        val shadowW = min(14f * density, w * 0.06f)
+        val edge = w
+        val to = if (coldForward) edge + shadowW else edge - shadowW
+        shadowMatrix.setScale(if (coldForward) shadowW else -shadowW, 1f)
+        shadowMatrix.postTranslate(edge, 0f)
+        seamShadowShader.setLocalMatrix(shadowMatrix)
+        shadePaint.shader = seamShadowShader
+        canvas.drawRect(min(edge, to), 0f, max(edge, to), viewportH.toFloat(), shadePaint)
+        shadePaint.shader = null
+    }
+
+    /** Motion shots are viewport-sized and stay on the 1:1 blit path; keep the mapping fallback. */
+    private fun drawBitmapWindow(canvas: Canvas, bitmap: Bitmap, left: Float, w: Float) {
         if (bitmap.width == viewportW && bitmap.height == viewportH) {
             canvas.drawBitmap(bitmap, left, 0f, paint)
             return
         }
         bitmapSrc.set(0, 0, bitmap.width, bitmap.height)
-        bitmapDst.set(left, 0f, left + w, h)
+        bitmapDst.set(left, 0f, left + w, viewportH.toFloat())
         canvas.drawBitmap(bitmap, bitmapSrc, bitmapDst, paint)
     }
 
-    /**
-     * Atomically drops both bitmap references and returns the unique recorded identities without
-     * recycling or copying. Called by the flow view before any drawable transfer or recycle so the
-     * HWUI display list that recorded these frames can be retired behind a two-frame fence.
-     */
-    fun takeRecordedFrames(): List<SlidePageFrame> {
-        val front = frontFrame
-        val revealed = revealedFrame
-        frontFrame = null
-        revealedFrame = null
-        invalidate()
-        return when {
-            front == null -> listOfNotNull(revealed)
-            revealed == null || revealed === front -> listOf(front)
-            else -> listOf(front, revealed)
-        }
-    }
-
-    /** Legacy identity accessor for Bitmap-framed renderers (cold/boundary/continuity turns). */
-    fun takeRecordedBitmaps(): List<Bitmap> =
-        takeRecordedFrames().mapNotNull { (it as? SlidePageFrame.BitmapFrame)?.bitmap }
-
-    /** A soft drop shadow on the outgoing page's trailing edge, at the strip-local seam x = W. */
-    private fun drawSeamShadow(canvas: Canvas, w: Float, h: Float) {
-        val shadowW = min(14f * density, w * 0.06f)
-        val edge = w
-        val to = if (forward) edge + shadowW else edge - shadowW
-        shadowMatrix.setScale(if (forward) shadowW else -shadowW, 1f)
-        shadowMatrix.postTranslate(edge, 0f)
-        seamShadowShader.setLocalMatrix(shadowMatrix)
-        shadePaint.shader = seamShadowShader
-        canvas.drawRect(min(edge, to), 0f, max(edge, to), h, shadePaint)
-        shadePaint.shader = null
-    }
+    /** Shadow band width used to size the sibling seam-shadow view. */
+    fun seamShadowWidthPx(): Int =
+        min(14f * density, viewportW * 0.06f).toInt().coerceAtLeast(1)
 }
