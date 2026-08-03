@@ -14,26 +14,29 @@ import kotlin.math.min
 
 /**
  * Opaque static SLIDE page-turn renderer. Per-frame motion is a View translation, so this renderer's
- * display list is recorded once and its two page-shot bitmaps are never reallocated or copied per
- * MOVE. The fully covered live TextView is skipped until the overlay is removed.
+ * display list is recorded once and its two page frames are never reallocated or copied per MOVE.
+ * Warm same-chapter turns carry [SlidePageFrame.ArtifactFrame] command artifacts (no viewport-sized
+ * page-shot Bitmap); cold deferred MOVE handoffs, boundary, and continuity turns keep the
+ * [SlidePageFrame.BitmapFrame] pair. The fully covered live TextView is skipped until the overlay is
+ * removed.
  *
  * The View is a 2W x H strip laid out in content coordinates. Forward content order is
  * [front][revealed] with layout left = 0; backward is [revealed][front] with layout left = -W.
- * Top is the current scrollY content coordinate. [PageSlideDrawable] remains the zero-copy bitmap
+ * Top is the current scrollY content coordinate. [PageSlideDrawable] remains the zero-copy frame
  * owner; this View only records the same geometry and seam treatment once.
  */
 internal class PageSlideOverlayView(
     context: Context,
-    frontBitmap: Bitmap,
-    revealedBitmap: Bitmap,
+    frontFrame: SlidePageFrame,
+    revealedFrame: SlidePageFrame,
     private val viewportW: Int,
     private val viewportH: Int,
     private val forward: Boolean,
     private val density: Float,
 ) : View(context) {
 
-    private var frontBitmap: Bitmap? = frontBitmap
-    private var revealedBitmap: Bitmap? = revealedBitmap
+    private var frontFrame: SlidePageFrame? = frontFrame
+    private var revealedFrame: SlidePageFrame? = revealedFrame
 
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val shadePaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -62,13 +65,30 @@ internal class PageSlideOverlayView(
         val w = viewportW.toFloat()
         val h = viewportH.toFloat()
         if (forward) {
-            frontBitmap?.let { drawBitmapWindow(canvas, it, 0f, w, h) }
-            revealedBitmap?.let { drawBitmapWindow(canvas, it, w, w, h) }
+            drawFrame(canvas, frontFrame, 0f, w, h)
+            drawFrame(canvas, revealedFrame, w, w, h)
         } else {
-            revealedBitmap?.let { drawBitmapWindow(canvas, it, 0f, w, h) }
-            frontBitmap?.let { drawBitmapWindow(canvas, it, w, w, h) }
+            drawFrame(canvas, revealedFrame, 0f, w, h)
+            drawFrame(canvas, frontFrame, w, w, h)
         }
         drawSeamShadow(canvas, w, h)
+    }
+
+    /** Draws one strip-local page frame at [left]; artifacts replay at their recorded viewport size. */
+    private fun drawFrame(canvas: Canvas, frame: SlidePageFrame?, left: Float, w: Float, h: Float) {
+        when (frame) {
+            is SlidePageFrame.BitmapFrame -> drawBitmapWindow(canvas, frame.bitmap, left, w, h)
+            is SlidePageFrame.ArtifactFrame -> {
+                val save = canvas.save()
+                try {
+                    canvas.translate(left, 0f)
+                    frame.artifact.drawTo(canvas)
+                } finally {
+                    canvas.restoreToCount(save)
+                }
+            }
+            null -> Unit
+        }
     }
 
     /** Motion shots are viewport-sized and stay on the 1:1 blit path; keep the mapping fallback for legacy owners. */
@@ -85,13 +105,13 @@ internal class PageSlideOverlayView(
     /**
      * Atomically drops both bitmap references and returns the unique recorded identities without
      * recycling or copying. Called by the flow view before any drawable transfer or recycle so the
-     * HWUI display list that recorded these bitmaps can be retired behind a two-frame fence.
+     * HWUI display list that recorded these frames can be retired behind a two-frame fence.
      */
-    fun takeRecordedBitmaps(): List<Bitmap> {
-        val front = frontBitmap
-        val revealed = revealedBitmap
-        frontBitmap = null
-        revealedBitmap = null
+    fun takeRecordedFrames(): List<SlidePageFrame> {
+        val front = frontFrame
+        val revealed = revealedFrame
+        frontFrame = null
+        revealedFrame = null
         invalidate()
         return when {
             front == null -> listOfNotNull(revealed)
@@ -99,6 +119,10 @@ internal class PageSlideOverlayView(
             else -> listOf(front, revealed)
         }
     }
+
+    /** Legacy identity accessor for Bitmap-framed renderers (cold/boundary/continuity turns). */
+    fun takeRecordedBitmaps(): List<Bitmap> =
+        takeRecordedFrames().mapNotNull { (it as? SlidePageFrame.BitmapFrame)?.bitmap }
 
     /** A soft drop shadow on the outgoing page's trailing edge, at the strip-local seam x = W. */
     private fun drawSeamShadow(canvas: Canvas, w: Float, h: Float) {

@@ -13504,14 +13504,18 @@ class EpubFlowViewTest {
 
     /**
      * Advances one postOnAnimation frame at a time until a split-frame page-texture precache
-     * commits (or is discarded). Mirrors production's front/target/previous frame chain; idle()
-     * alone is not reliable once work is already posted as chained animation callbacks.
+     * commits (or is discarded). Drains both the legacy Bitmap precache pending state and the warm
+     * SLIDE artifact precache pending state. Mirrors production's front/target/previous frame
+     * chain; idle() alone is not reliable once work is already posted as chained animation
+     * callbacks. Caps frames so a stuck queue fails loudly.
      */
     private fun EpubFlowView.drainPendingPageTexturePrecacheForTest(maxFrames: Int = 8) {
         repeat(maxFrames) {
             if (
                 !privateBool("pageTexturePrecachePending") &&
-                privateField("pendingPageTexturePrecache") == null
+                privateField("pendingPageTexturePrecache") == null &&
+                !privateBool("slideArtifactPrecachePending") &&
+                privateField("pendingSlideArtifactPrecache") == null
             ) {
                 return
             }

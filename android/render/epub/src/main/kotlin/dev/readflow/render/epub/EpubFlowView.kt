@@ -727,6 +727,65 @@ internal class EpubFlowView(
     private var capturePrecacheFrontRunnable: Runnable? = null
     private var capturePrecacheTargetRunnable: Runnable? = null
     private var capturePrecachePreviousRunnable: Runnable? = null
+
+    // ---- Warm same-chapter SLIDE artifact cache (冻结页命令工件) --------------------------------
+    // SLIDE warm turns render from frozen RenderNode/Picture command artifacts instead of
+    // viewport-sized Bitmaps. The directional slots mirror the Bitmap cache; SIMULATION, boundary,
+    // conversion/continuity, and the cold deferred MOVE handoff stay on the Bitmap path.
+    /** Incremented whenever the viewport background drawable is replaced (theme/background change). */
+    private var backgroundGeneration = 0L
+    private data class SlidePageArtifactKey(
+        val chapterGeneration: Long,
+        val pageLayoutGeneration: Long,
+        val topPx: Int,
+        val clipTopPx: Int,
+        val clipBottomPx: Int,
+        val viewportWidthPx: Int,
+        val viewportHeightPx: Int,
+        val paddingLeft: Int,
+        val paddingTop: Int,
+        val paddingRight: Int,
+        val paddingBottom: Int,
+        val backgroundGeneration: Long,
+    )
+    private data class SlideArtifactSlot(
+        val page: Int,
+        val topPx: Int,
+        val key: SlidePageArtifactKey,
+        val artifact: SlidePageArtifact,
+    )
+    private var slideFrontSlot: SlideArtifactSlot? = null
+    private var slideRevealedSlot: SlideArtifactSlot? = null
+    private var slideBackwardSlot: SlideArtifactSlot? = null
+    private var slideArtifactPrecachePending = false
+    private var slideArtifactPrecacheGeneration = 0L
+    private data class PendingSlideArtifactPrecache(
+        val generation: Long,
+        val fromTop: Int,
+        val fromWindow: EpubFlowPage?,
+        val previousWindow: EpubFlowPage?,
+        val targetWindow: EpubFlowPage?,
+        val fromPage: Int,
+        val previousPage: Int,
+        val targetPage: Int,
+        val fromKey: SlidePageArtifactKey,
+        val previousKey: SlidePageArtifactKey?,
+        val targetKey: SlidePageArtifactKey?,
+        var frontArtifact: SlidePageArtifact? = null,
+        var previousArtifact: SlidePageArtifact? = null,
+        var targetArtifact: SlidePageArtifact? = null,
+    )
+    private var pendingSlideArtifactPrecache: PendingSlideArtifactPrecache? = null
+    private var captureSlideArtifactFrontRunnable: Runnable? = null
+    private var captureSlideArtifactTargetRunnable: Runnable? = null
+    private var captureSlideArtifactPreviousRunnable: Runnable? = null
+    /** Recorded artifact display lists retired behind the same two-host-frame barrier as Bitmaps. */
+    private val renderRetiredSlideArtifacts =
+        java.util.IdentityHashMap<SlidePageArtifact, RetiredSlideArtifact>()
+    private class RetiredSlideArtifact {
+        var discardRequested = false
+    }
+
     private var localPageShotHandoffGeneration: Long = 0L
     private var pendingLocalPageShotHandoff: PendingLocalPageShotHandoff? = null
     private var capturePendingLocalTargetRunnable: Runnable? = null
@@ -803,6 +862,12 @@ internal class EpubFlowView(
     }
 
     private fun scheduleRapidFollowUpPageShot(forward: Boolean) {
+        if (flipStyle == dev.readflow.core.model.PageFlipStyle.SLIDE) {
+            // Warm SLIDE rapid turns consume only exact-key artifact pairs from the artifact
+            // precache chain; a Bitmap follow-up capture is never armed for them.
+            clearRapidFollowUpPageShot()
+            return
+        }
         if (
             disposed ||
             !rapidTurnSequenceActive ||
@@ -942,7 +1007,10 @@ internal class EpubFlowView(
         if (mode != Mode.PAGED || paged.isEmpty() || width == 0) return
         if (turnInFlight) return
         val rapidBootstrap = allowRapidBootstrap && rapidTurnSequenceActive && queuedPageTurnDelta != 0
-        if (rapidBootstrap && stablePageShotCapacity() < 2) return
+        // Warm SLIDE artifacts do not consume the Bitmap shot budget, so the rapid-bootstrap
+        // capacity gate applies only to the Bitmap directional cache (SIMULATION etc.).
+        val slideArtifactPrecache = flipStyle == dev.readflow.core.model.PageFlipStyle.SLIDE
+        if (rapidBootstrap && !slideArtifactPrecache && stablePageShotCapacity() < 2) return
         // After a turn settles (or any idle re-entry), finish deferred in-place pixel redraws first
         // so warm owners carry latest async image pixels before the next gesture. A rapid bootstrap
         // skips this drain: the burst keeps moving on retained identities and the settle pass
@@ -959,6 +1027,10 @@ internal class EpubFlowView(
         if (pendingDecodesProvider?.invoke() == true) return
         if (textView.isLayoutRequested) return
         if (textView.layout?.height != paginatedLayoutHeight) return
+        if (slideArtifactPrecache) {
+            preCacheSlideArtifacts(rapidBootstrap)
+            return
+        }
         if (pageTexturePrecachePending) return
         val fromTop = scrollY
         val fromWindow = activePageWindow?.takeIf { it.topPx == fromTop }
@@ -1244,6 +1316,11 @@ internal class EpubFlowView(
         pageTexturePrecacheGeneration += 1L
         pageTexturePrecachePending = false
         clearPendingPageTexturePrecacheCallbacks()
+        // Warm SLIDE artifacts share the same invalidation lifecycle as the Bitmap cache.
+        slideArtifactPrecacheGeneration += 1L
+        slideArtifactPrecachePending = false
+        pendingSlideArtifactPrecache?.let(::discardPendingSlideArtifactPrecache)
+        clearPendingSlideArtifactPrecacheCallbacks()
         // Owners are gone; any staged in-place redraws are meaningless.
         cancelInPlacePageShotRefreshCallbacks()
         pendingInPlacePageShotRefreshSlots.clear()
@@ -1274,6 +1351,13 @@ internal class EpubFlowView(
         cachedFromTextureKey = null
         cachedTargetTextureKey = null
         cachedBackwardTextureKey = null
+        listOfNotNull(slideFrontSlot, slideRevealedSlot, slideBackwardSlot)
+            .map { it.artifact }
+            .distinct()
+            .forEach(::discardSlideArtifact)
+        slideFrontSlot = null
+        slideRevealedSlot = null
+        slideBackwardSlot = null
     }
 
     private fun clearCachedTextureOwnersKeeping(retained: Set<Bitmap>) {
@@ -1303,6 +1387,380 @@ internal class EpubFlowView(
             cachedBackwardTopPx = -1
             cachedBackwardTextureKey = null
         }
+    }
+
+    // ---- Warm same-chapter SLIDE artifact precache --------------------------------------------
+
+    private fun slidePageArtifactKey(topPx: Int, window: EpubFlowPage?): SlidePageArtifactKey? {
+        if (width == 0 || height == 0) return null
+        return SlidePageArtifactKey(
+            chapterGeneration = chapterGeneration,
+            pageLayoutGeneration = pageLayoutGeneration,
+            topPx = topPx,
+            clipTopPx = snapshotClipTopFor(topPx, window),
+            clipBottomPx = snapshotClipBottomFor(topPx, window),
+            viewportWidthPx = width,
+            viewportHeightPx = height,
+            paddingLeft = textView.paddingLeft,
+            paddingTop = textView.paddingTop,
+            paddingRight = textView.paddingRight,
+            paddingBottom = textView.paddingBottom,
+            backgroundGeneration = backgroundGeneration,
+        )
+    }
+
+    /**
+     * Records one frozen page as a RenderNode (API 29+) or Picture (API 26-28) command artifact.
+     * The recording replays the exact [drawPageInto] snapshot semantics and never allocates a
+     * viewport-sized Bitmap.
+     */
+    private fun recordSlidePageArtifact(topPx: Int, window: EpubFlowPage?): SlidePageArtifact? {
+        if (width == 0 || height == 0) return null
+        return try {
+            SlidePageArtifact.record(width, height) { canvas ->
+                withContainerAtRest {
+                    drawPageInto(canvas, topPx, window)
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun preCacheSlideArtifacts(rapidBootstrap: Boolean) {
+        if (slideArtifactPrecachePending) return
+        // Warm SLIDE artifacts supersede any directional Bitmap cache left by a previous cold turn;
+        // keeping both would pin two viewport-sized owners no warm path consumes.
+        clearCachedTextureOwnersKeeping(emptySet())
+        val fromTop = scrollY
+        val fromWindow = activePageWindow?.takeIf { it.topPx == fromTop }
+        val canonicalIndex = canonicalPageIndexForWindow(fromWindow)
+        val rapidDirection = queuedPageTurnDelta.coerceIn(-1, 1)
+        val candidatePreviousWindow = if (rapidBootstrap && rapidDirection < 0) {
+            if (canonicalIndex >= 0) paged.getOrNull(canonicalIndex - 1) else pageWindowForTurn(false)
+        } else {
+            (
+                if (canonicalIndex >= 0) paged.getOrNull(canonicalIndex - 1) else pageWindowForTurn(false)
+                ).takeUnless { boundaryPreviewBudgetDirection == true }
+        }
+        val candidateTargetWindow = if (rapidBootstrap && rapidDirection > 0) {
+            if (canonicalIndex >= 0) paged.getOrNull(canonicalIndex + 1) else pageWindowForTurn(true)
+        } else {
+            (
+                if (canonicalIndex >= 0) paged.getOrNull(canonicalIndex + 1) else pageWindowForTurn(true)
+                ).takeUnless { boundaryPreviewBudgetDirection == false }
+        }
+        val targetWindow = candidateTargetWindow
+        val previousWindow = candidatePreviousWindow
+        val idx = if (canonicalIndex >= 0) canonicalIndex else nearestCanonicalPageIndexForScrollY(fromTop)
+        val previousIdx = previousWindow?.let { canonicalFloorPageIndexForTopPx(it.topPx) }
+        val nextIdx = targetWindow?.let { canonicalFloorPageIndexForTopPx(it.topPx) }
+        val previousTop = previousWindow?.topPx
+        val targetTop = targetWindow?.topPx
+        val fromKey = slidePageArtifactKey(fromTop, fromWindow) ?: return
+        val previousKey = previousWindow?.let { slidePageArtifactKey(it.topPx, it) }
+        val targetKey = targetWindow?.let { slidePageArtifactKey(it.topPx, it) }
+        val frontMatches =
+            slideFrontSlot?.page == idx &&
+                slideFrontSlot?.topPx == fromTop &&
+                slideFrontSlot?.key == fromKey
+        val targetMatches = targetWindow == null || (
+            slideRevealedSlot?.page == (nextIdx ?: -1) &&
+                slideRevealedSlot?.topPx == (targetTop ?: -1) &&
+                slideRevealedSlot?.key == targetKey
+            )
+        val previousMatches = previousWindow == null || (
+            slideBackwardSlot?.page == (previousIdx ?: -1) &&
+                slideBackwardSlot?.topPx == (previousTop ?: -1) &&
+                slideBackwardSlot?.key == previousKey
+            )
+        if (frontMatches && targetMatches && previousMatches) {
+            if (drainQueuedPageTurn()) onPageSettled?.invoke() else scheduleRapidTurnIdle()
+            return
+        }
+        val retainedFront = slideFrontSlot?.artifact?.takeIf { frontMatches }
+        val retainedTarget = slideRevealedSlot?.artifact?.takeIf { targetMatches && targetWindow != null }
+        val retainedPrevious = slideBackwardSlot?.artifact?.takeIf { previousMatches && previousWindow != null }
+        clearSlideArtifactSlotsKeeping(setOfNotNull(retainedFront, retainedTarget, retainedPrevious))
+        val generation = slideArtifactPrecacheGeneration
+        val request = PendingSlideArtifactPrecache(
+            generation = generation,
+            fromTop = fromTop,
+            fromWindow = fromWindow,
+            previousWindow = previousWindow,
+            targetWindow = targetWindow,
+            fromPage = idx,
+            previousPage = previousIdx ?: -1,
+            targetPage = nextIdx ?: -1,
+            fromKey = fromKey,
+            previousKey = previousKey,
+            targetKey = targetKey,
+            frontArtifact = retainedFront,
+            previousArtifact = retainedPrevious,
+            targetArtifact = retainedTarget,
+        )
+        pendingSlideArtifactPrecache = request
+        slideArtifactPrecachePending = true
+        continuePendingSlideArtifactPrecache(request)
+    }
+
+    private fun continuePendingSlideArtifactPrecache(request: PendingSlideArtifactPrecache) {
+        if (pendingSlideArtifactPrecache !== request || request.generation != slideArtifactPrecacheGeneration) return
+        when {
+            request.frontArtifact == null -> postSlideArtifactFrontShot(request)
+            request.targetWindow != null && request.targetArtifact == null -> postSlideArtifactTargetShot(request)
+            request.previousWindow != null && request.previousArtifact == null -> postSlideArtifactPreviousShot(request)
+            else -> commitPendingSlideArtifactPrecache(request)
+        }
+    }
+
+    private fun pendingSlideArtifactPrecacheIsValid(request: PendingSlideArtifactPrecache): Boolean {
+        if (
+            disposed ||
+            !pageTexturePrecacheEnabled ||
+            pendingSlideArtifactPrecache !== request ||
+            !slideArtifactPrecachePending ||
+            request.generation != slideArtifactPrecacheGeneration ||
+            mode != Mode.PAGED ||
+            paged.isEmpty() ||
+            turnInFlight ||
+            !pageClipActive ||
+            pagedMotionState == PagedMotionState.DRAGGING_FREE ||
+            pagedMotionState == PagedMotionState.FLING_FREE ||
+            pagedMotionState == PagedMotionState.ALIGN_AND_TURN ||
+            initialRevealActive() ||
+            pendingDecodesProvider?.invoke() == true ||
+            textView.isLayoutRequested ||
+            textView.layout?.height != paginatedLayoutHeight ||
+            scrollY != request.fromTop ||
+            activePageWindow?.takeIf { it.topPx == scrollY } != request.fromWindow ||
+            slidePageArtifactKey(request.fromTop, request.fromWindow) != request.fromKey
+        ) return false
+        if (request.previousWindow != null) {
+            if (pageWindowForTurn(false) != request.previousWindow) return false
+            if (slidePageArtifactKey(request.previousWindow.topPx, request.previousWindow) != request.previousKey) {
+                return false
+            }
+        }
+        if (request.targetWindow != null) {
+            if (pageWindowForTurn(true) != request.targetWindow) return false
+            if (slidePageArtifactKey(request.targetWindow.topPx, request.targetWindow) != request.targetKey) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private fun postSlideArtifactFrontShot(request: PendingSlideArtifactPrecache) {
+        val runnable = Runnable { captureSlideArtifactFrontShot(request) }
+        captureSlideArtifactFrontRunnable = runnable
+        postOnAnimation(runnable)
+    }
+
+    private fun postSlideArtifactTargetShot(request: PendingSlideArtifactPrecache) {
+        val runnable = Runnable { captureSlideArtifactTargetShot(request) }
+        captureSlideArtifactTargetRunnable = runnable
+        postOnAnimation(runnable)
+    }
+
+    private fun postSlideArtifactPreviousShot(request: PendingSlideArtifactPrecache) {
+        val runnable = Runnable { captureSlideArtifactPreviousShot(request) }
+        captureSlideArtifactPreviousRunnable = runnable
+        postOnAnimation(runnable)
+    }
+
+    private fun clearPendingSlideArtifactPrecacheCallbacks() {
+        captureSlideArtifactFrontRunnable?.let(::removeCallbacks)
+        captureSlideArtifactTargetRunnable?.let(::removeCallbacks)
+        captureSlideArtifactPreviousRunnable?.let(::removeCallbacks)
+        captureSlideArtifactFrontRunnable = null
+        captureSlideArtifactTargetRunnable = null
+        captureSlideArtifactPreviousRunnable = null
+    }
+
+    private fun captureSlideArtifactFrontShot(request: PendingSlideArtifactPrecache) {
+        if (pendingSlideArtifactPrecache !== request || request.generation != slideArtifactPrecacheGeneration) return
+        if (request.frontArtifact != null) {
+            continuePendingSlideArtifactPrecache(request)
+            return
+        }
+        if (!pendingSlideArtifactPrecacheIsValid(request)) {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        val front = recordSlidePageArtifact(request.fromTop, request.fromWindow)
+        if (front == null) {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        if (!pendingSlideArtifactPrecacheIsValid(request)) {
+            discardSlideArtifact(front)
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        request.frontArtifact = front
+        continuePendingSlideArtifactPrecache(request)
+    }
+
+    private fun captureSlideArtifactTargetShot(request: PendingSlideArtifactPrecache) {
+        if (pendingSlideArtifactPrecache !== request || request.generation != slideArtifactPrecacheGeneration) return
+        if (request.targetArtifact != null) {
+            continuePendingSlideArtifactPrecache(request)
+            return
+        }
+        val window = request.targetWindow ?: run {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        if (!pendingSlideArtifactPrecacheIsValid(request)) {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        val target = recordSlidePageArtifact(window.topPx, window)
+        if (target == null) {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        if (!pendingSlideArtifactPrecacheIsValid(request)) {
+            discardSlideArtifact(target)
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        request.targetArtifact = target
+        continuePendingSlideArtifactPrecache(request)
+    }
+
+    private fun captureSlideArtifactPreviousShot(request: PendingSlideArtifactPrecache) {
+        if (pendingSlideArtifactPrecache !== request || request.generation != slideArtifactPrecacheGeneration) return
+        if (request.previousArtifact != null) {
+            continuePendingSlideArtifactPrecache(request)
+            return
+        }
+        val window = request.previousWindow ?: run {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        if (!pendingSlideArtifactPrecacheIsValid(request)) {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        val previous = recordSlidePageArtifact(window.topPx, window)
+        if (previous == null) {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        if (!pendingSlideArtifactPrecacheIsValid(request)) {
+            discardSlideArtifact(previous)
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        request.previousArtifact = previous
+        continuePendingSlideArtifactPrecache(request)
+    }
+
+    private fun commitPendingSlideArtifactPrecache(request: PendingSlideArtifactPrecache) {
+        if (!pendingSlideArtifactPrecacheIsValid(request)) {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        val front = request.frontArtifact ?: run {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        val target = request.targetArtifact
+        val previous = request.previousArtifact
+        if (
+            (request.targetWindow != null && target == null) ||
+            (request.previousWindow != null && previous == null)
+        ) {
+            discardPendingSlideArtifactPrecache(request)
+            return
+        }
+        request.frontArtifact = null
+        request.targetArtifact = null
+        request.previousArtifact = null
+        pendingSlideArtifactPrecache = null
+        slideArtifactPrecachePending = false
+        clearPendingSlideArtifactPrecacheCallbacks()
+        slideFrontSlot = SlideArtifactSlot(request.fromPage, request.fromTop, request.fromKey, front)
+        slideRevealedSlot = request.targetWindow?.let {
+            SlideArtifactSlot(
+                request.targetPage,
+                it.topPx,
+                checkNotNull(request.targetKey),
+                checkNotNull(target),
+            )
+        }
+        slideBackwardSlot = request.previousWindow?.let {
+            SlideArtifactSlot(
+                request.previousPage,
+                it.topPx,
+                checkNotNull(request.previousKey),
+                checkNotNull(previous),
+            )
+        }
+        if (drainQueuedPageTurn()) onPageSettled?.invoke() else scheduleRapidTurnIdle()
+    }
+
+    private fun discardPendingSlideArtifactPrecache(request: PendingSlideArtifactPrecache) {
+        if (pendingSlideArtifactPrecache === request) {
+            slideArtifactPrecacheGeneration += 1L
+            slideArtifactPrecachePending = false
+            pendingSlideArtifactPrecache = null
+            clearPendingSlideArtifactPrecacheCallbacks()
+        }
+        listOfNotNull(request.frontArtifact, request.targetArtifact, request.previousArtifact)
+            .distinct()
+            .forEach(::discardSlideArtifact)
+        request.frontArtifact = null
+        request.targetArtifact = null
+        request.previousArtifact = null
+    }
+
+    private fun clearSlideArtifactSlotsKeeping(retained: Set<SlidePageArtifact>) {
+        slideArtifactPrecacheGeneration += 1L
+        slideArtifactPrecachePending = false
+        pendingSlideArtifactPrecache?.let(::discardPendingSlideArtifactPrecache)
+        listOfNotNull(slideFrontSlot, slideRevealedSlot, slideBackwardSlot)
+            .map { it.artifact }
+            .distinct()
+            .filterNot(retained::contains)
+            .forEach(::discardSlideArtifact)
+        if (slideFrontSlot?.artifact !in retained) slideFrontSlot = null
+        if (slideRevealedSlot?.artifact !in retained) slideRevealedSlot = null
+        if (slideBackwardSlot?.artifact !in retained) slideBackwardSlot = null
+    }
+
+    /** Retires a detached renderer frame behind the two-host-frame barrier. */
+    private fun retireSlideFrame(frame: SlidePageFrame) {
+        when (frame) {
+            is SlidePageFrame.BitmapFrame -> recyclePageShot(frame.bitmap)
+            is SlidePageFrame.ArtifactFrame -> retireSlideArtifact(frame.artifact)
+        }
+    }
+
+    /** Recycles/discards an owned frame that is no longer referenced by any active renderer. */
+    private fun recycleSlideFrame(frame: SlidePageFrame) {
+        when (frame) {
+            is SlidePageFrame.BitmapFrame -> recyclePageShot(frame.bitmap)
+            is SlidePageFrame.ArtifactFrame -> discardSlideArtifact(frame.artifact)
+        }
+    }
+
+    /** Pins a recorded artifact until the fence completes; keeps it live when rekeyed. */
+    private fun retireSlideArtifact(artifact: SlidePageArtifact) {
+        if (renderRetiredSlideArtifacts.put(artifact, RetiredSlideArtifact()) != null) return
+        scheduleRenderRetiredFence()
+    }
+
+    /** Requests final discard; deferred to the fence when the display list may still be in flight. */
+    private fun discardSlideArtifact(artifact: SlidePageArtifact) {
+        val retired = renderRetiredSlideArtifacts[artifact]
+        if (retired != null) {
+            retired.discardRequested = true
+            return
+        }
+        artifact.discard()
     }
 
     private fun detachCachedTextureOwner(bitmap: Bitmap) {
@@ -1661,6 +2119,79 @@ internal class EpubFlowView(
         )
     }
 
+    /**
+     * Transfers an exact-key warm SLIDE artifact pair (current + requested neighbour) without any
+     * Bitmap allocation. Only artifacts whose image pixels are stable may be consumed; missing or
+     * stale keys fall through to the cold Bitmap paths.
+     */
+    private fun takeCachedSlideArtifactsForTurn(
+        fromPage: Int,
+        fromTop: Int,
+        fromWindow: EpubFlowPage?,
+        targetPage: Int,
+        targetTop: Int,
+        targetWindow: EpubFlowPage,
+    ): Pair<SlidePageArtifact, SlidePageArtifact>? {
+        val fromKey = slidePageArtifactKey(fromTop, fromWindow) ?: return null
+        val targetKey = slidePageArtifactKey(targetTop, targetWindow) ?: return null
+        val frontSlot = slideFrontSlot
+        val revealedSlot = when {
+            slideRevealedSlot?.page == targetPage &&
+                slideRevealedSlot?.topPx == targetTop &&
+                slideRevealedSlot?.key == targetKey -> slideRevealedSlot
+            slideBackwardSlot?.page == targetPage &&
+                slideBackwardSlot?.topPx == targetTop &&
+                slideBackwardSlot?.key == targetKey -> slideBackwardSlot
+            else -> null
+        }
+        val front = frontSlot
+            ?.takeIf { it.page == fromPage && it.topPx == fromTop && it.key == fromKey }
+            ?.artifact
+        val revealed = revealedSlot?.artifact
+        if (front == null || revealed == null) return null
+        slideFrontSlot = null
+        if (revealedSlot === slideRevealedSlot) slideRevealedSlot = null else slideBackwardSlot = null
+        return front to revealed
+    }
+
+    /**
+     * Rapid-pair admission for warm SLIDE: only an exact-key artifact pair (cached or pending) whose
+     * target pixels are stable counts. A missing pair must bootstrap artifact precache — never a
+     * page-shot Bitmap downgrade.
+     */
+    private fun rapidSlideArtifactPairAvailable(targetWindow: EpubFlowPage): Boolean {
+        val fromWindow = activePageWindow?.takeIf { it.topPx == scrollY }
+        val fromPage = capturePageTurnOrigin().pageProjection
+        val targetPage = canonicalFloorPageIndexForTopPx(targetWindow.topPx)
+        val fromKey = slidePageArtifactKey(scrollY, fromWindow) ?: return false
+        val targetKey = slidePageArtifactKey(targetWindow.topPx, targetWindow) ?: return false
+        val front = slideFrontSlot
+            ?.takeIf { it.page == fromPage && it.topPx == scrollY && it.key == fromKey }
+            ?.artifact
+        val revealed = when {
+            slideRevealedSlot?.page == targetPage &&
+                slideRevealedSlot?.topPx == targetWindow.topPx &&
+                slideRevealedSlot?.key == targetKey -> slideRevealedSlot?.artifact
+            slideBackwardSlot?.page == targetPage &&
+                slideBackwardSlot?.topPx == targetWindow.topPx &&
+                slideBackwardSlot?.key == targetKey -> slideBackwardSlot?.artifact
+            else -> null
+        }
+        if (front != null && revealed != null) return true
+        val pending = pendingSlideArtifactPrecache
+        if (pending != null && pendingSlideArtifactPrecacheIsValid(pending)) {
+            val pendingRevealed = when {
+                targetPage == pending.targetPage && targetWindow == pending.targetWindow ->
+                    pending.targetArtifact
+                targetPage == pending.previousPage && targetWindow == pending.previousWindow ->
+                    pending.previousArtifact
+                else -> null
+            }
+            if (pending.frontArtifact != null && pendingRevealed != null) return true
+        }
+        return false
+    }
+
     // ---- Finger-tracking (跟手) software page turn ---------------------------------------------
     // Horizontal and side-column vertical drags drive software turn progress directly from finger
     // displacement. Release settles by position+axis velocity; SIMULATION renders through
@@ -1747,6 +2278,7 @@ internal class EpubFlowView(
         if (viewportBackground !== background) {
             abortLocalPageShotTurnForExternalMutation(restoreOrigin = true)
             recycleCachedTextures()
+            backgroundGeneration += 1L
         }
         viewportBackground = background
         super.setBackground(null)
@@ -2182,6 +2714,41 @@ internal class EpubFlowView(
             // Drop only mid-flight speculative captures. Retained warm owners stay on cached* slots.
             discardPendingPageTexturePrecache(pendingPrecache)
         }
+        val pendingSlideArtifact = pendingSlideArtifactPrecache
+        if (
+            pendingSlideArtifact != null &&
+            nearbyOffsets.any { offset ->
+                pageWindowDependsOnImageOffset(pendingSlideArtifact.fromWindow, offset) ||
+                    pageWindowDependsOnImageOffset(pendingSlideArtifact.previousWindow, offset) ||
+                    pageWindowDependsOnImageOffset(pendingSlideArtifact.targetWindow, offset)
+            }
+        ) {
+            // Drop mid-flight artifact recordings; the next idle precache re-records them.
+            discardPendingSlideArtifactPrecache(pendingSlideArtifact)
+        }
+        // Warm SLIDE artifact slots cannot be repainted in place like Bitmap owners; invalidate the
+        // dependent slots and let the normal precache wake re-record them. Active-turn PIXELS_ONLY
+        // is already deferred by onAsyncImagePixelsChanged's turnInFlight gate, so a recorded
+        // artifact that the overlay is drawing is never mutated.
+        var slideArtifactsDirty = false
+        nearbyOffsets.forEach { offset ->
+            if (slideArtifactSlotDependsOnImageOffset(slideFrontSlot, offset)) {
+                slideFrontSlot?.artifact?.let(::discardSlideArtifact)
+                slideFrontSlot = null
+                slideArtifactsDirty = true
+            }
+            if (slideArtifactSlotDependsOnImageOffset(slideRevealedSlot, offset)) {
+                slideRevealedSlot?.artifact?.let(::discardSlideArtifact)
+                slideRevealedSlot = null
+                slideArtifactsDirty = true
+            }
+            if (slideArtifactSlotDependsOnImageOffset(slideBackwardSlot, offset)) {
+                slideBackwardSlot?.artifact?.let(::discardSlideArtifact)
+                slideBackwardSlot = null
+                slideArtifactsDirty = true
+            }
+        }
+        if (slideArtifactsDirty) slideArtifactPrecacheGeneration += 1L
         // Preserve leased warm bitmap identities. Recycle/realloc creates a cold gap where a finger
         // turn falls into beginPendingLocalPageShotHandoff and allocates two full-screen ARGB shots.
         // Refresh dependent slots in place, one slot per animation frame, coalescing offsets.
@@ -2379,23 +2946,38 @@ internal class EpubFlowView(
         bitmap.eraseColor(android.graphics.Color.TRANSPARENT)
         val canvas = Canvas(bitmap)
         scalePageShotCanvasToViewport(canvas, bitmap)
+        drawPageInto(canvas, topPx, window)
+    }
+
+    /**
+     * Paints one PAGED page — theme background + exact page clip + the TextView layout + any
+     * page-boundary image crop — at viewport coordinates. Shared by Bitmap page shots and the warm
+     * SLIDE command artifacts so both record identical composition semantics.
+     *
+     * The TextView layout is drawn directly instead of traversing the View tree: the container adds
+     * nothing (no background, no other children) and the view-level pass re-enters TextView.draw.
+     * TextView paints its layout at (paddingLeft - scrollX, paddingTop - scrollY) in its own
+     * coordinates; after the -topPx translate that offset matches the live draw path.
+     */
+    private fun drawPageInto(
+        canvas: Canvas,
+        topPx: Int,
+        window: EpubFlowPage?,
+        canvasViewportTopPx: Int = 0,
+    ) {
         drawSnapshotBackground(canvas)
         val contentSave = canvas.save()
         canvas.translate(0f, -topPx.toFloat())
         val clipTop = snapshotClipTopFor(topPx, window)
         val clipBottom = snapshotClipBottomFor(topPx, window)
         canvas.clipRect(0, clipTop, width, clipBottom)
-        // Draw the TextView layout directly instead of traversing the View tree: the container adds
-        // nothing (no background, no other children) and the view-level pass re-enters TextView.draw.
-        // TextView paints its layout at (paddingLeft - scrollX, paddingTop - scrollY) in its own
-        // coordinates; after the -topPx translate above that offset matches the live draw path.
         canvas.translate(
             textView.paddingLeft.toFloat() - textView.scrollX.toFloat(),
             textView.paddingTop.toFloat() - textView.scrollY.toFloat(),
         )
         textView.layout?.draw(canvas)
         canvas.restoreToCount(contentSave)
-        window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx = 0) }
+        window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx) }
     }
 
     /**
@@ -2423,6 +3005,12 @@ internal class EpubFlowView(
 
     private fun pageShotSlotDependsOnImageOffset(pageIndex: Int, layoutOffset: Int): Boolean =
         pageWindowDependsOnImageOffset(paged.getOrNull(pageIndex), layoutOffset)
+
+    private fun slideArtifactSlotDependsOnImageOffset(
+        slot: SlideArtifactSlot?,
+        layoutOffset: Int,
+    ): Boolean =
+        slot != null && pageWindowDependsOnImageOffset(paged.getOrNull(slot.page), layoutOffset)
 
     private fun pageWindowDependsOnImageOffset(page: EpubFlowPage?, layoutOffset: Int): Boolean {
         if (page == null) return false
@@ -3464,7 +4052,11 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            installSlideOverlay(outgoing, preview.bitmap, preview.forward)
+            installSlideOverlay(
+                SlidePageFrame.BitmapFrame(outgoing),
+                SlidePageFrame.BitmapFrame(preview.bitmap),
+                preview.forward,
+            )
         }
         applyFlipProgress(0f, preview.forward)
         flipAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
@@ -3641,7 +4233,9 @@ internal class EpubFlowView(
             !rapidTurnSequenceActive ||
             queuedPageTurnDelta == 0 ||
             pageTexturePrecachePending ||
-            pendingPageTexturePrecache != null
+            pendingPageTexturePrecache != null ||
+            slideArtifactPrecachePending ||
+            pendingSlideArtifactPrecache != null
         ) return
         preCachePageTextures(allowRapidBootstrap = true)
     }
@@ -3740,10 +4334,17 @@ internal class EpubFlowView(
             val targetPage = currentPage + delta
             val targetWindow = paged[targetPage]
             if (!targetImagePixelsAreStable(targetWindow)) return false
-            if (rapidTurnSequenceActive && rapidTurnPairGateActive() && !rapidTurnPairAvailable(targetWindow)) {
-                rapidTurnPairBootstrapRetries += 1
-                bootstrapRapidPagePairPrecache()
-                return false
+            if (rapidTurnSequenceActive && rapidTurnPairGateActive()) {
+                val pairAvailable = if (flipStyle == dev.readflow.core.model.PageFlipStyle.SLIDE) {
+                    rapidSlideArtifactPairAvailable(targetWindow)
+                } else {
+                    rapidTurnPairAvailable(targetWindow)
+                }
+                if (!pairAvailable) {
+                    rapidTurnPairBootstrapRetries += 1
+                    bootstrapRapidPagePairPrecache()
+                    return false
+                }
             }
             if (!goToPageAnimated(targetWindow, forward = delta > 0)) return false
             rapidTurnPairBootstrapRetries = 0
@@ -4048,10 +4649,35 @@ internal class EpubFlowView(
         val targetTop = targetWindow.topPx
         val fromTop = origin.topPx
         val rapidTurn = rapidTurnSequenceActive
+        val slideArtifactPair = if (frozenOutgoing == null && flipStyle == dev.readflow.core.model.PageFlipStyle.SLIDE) {
+            takeCachedSlideArtifactsForTurn(
+                fromPage = origin.pageProjection,
+                fromTop = fromTop,
+                fromWindow = origin.window,
+                targetPage = targetPage,
+                targetTop = targetTop,
+                targetWindow = targetWindow,
+            )
+        } else {
+            null
+        }
+        val rapidPairAvailable = if (flipStyle == dev.readflow.core.model.PageFlipStyle.SLIDE) {
+            rapidSlideArtifactPairAvailable(targetWindow)
+        } else {
+            rapidTurnPairAvailable(targetWindow)
+        }
+        // Warm SLIDE rapid turns consume only committed exact-key artifact pairs. A pending precache
+        // pair must commit first; falling through to the Bitmap capture path here would silently
+        // downgrade a warm burst to page-shot allocations.
+        val deferRapidPair = if (flipStyle == dev.readflow.core.model.PageFlipStyle.SLIDE) {
+            slideArtifactPair == null
+        } else {
+            !rapidPairAvailable
+        }
         if (
             rapidTurn &&
             frozenOutgoing == null &&
-            !rapidTurnPairAvailable(targetWindow)
+            deferRapidPair
         ) {
             // A rapid burst never falls through to synchronous cold captures from the input or
             // animation callback — even after the bounded bootstrap retry budget is exhausted.
@@ -4068,6 +4694,27 @@ internal class EpubFlowView(
             rapidTurnPairBootstrapRetries = 0
             parkOnPageWindow(targetWindow, report = false)
             onPageTurnTargetParked?.invoke()
+            return true
+        }
+        if (slideArtifactPair != null) {
+            // Warm same-chapter SLIDE: freeze the exact-key artifact pair (no page-shot Bitmap).
+            parkOnPageWindow(targetWindow, report = false)
+            onPageTurnTargetParked?.invoke()
+            onPageTurnStarted?.invoke()
+            startFlip(
+                outgoing = SlidePageFrame.ArtifactFrame(slideArtifactPair.first),
+                revealed = SlidePageFrame.ArtifactFrame(slideArtifactPair.second),
+                forward = forward,
+                onCommitted = {
+                    retainSettledLocalPageShots(origin, targetWindow, forward, committed = true)
+                    reportTopOffset()
+                },
+                onCancelled = {
+                    retainSettledLocalPageShots(origin, targetWindow, forward, committed = false)
+                    restorePageTurnOrigin(origin)
+                },
+            )
+            if (rapidTurnSequenceActive) scheduleRapidFollowUpPageShot(forward)
             return true
         }
         val rapidCached = if (frozenOutgoing == null && rapidTurn) {
@@ -4130,8 +4777,8 @@ internal class EpubFlowView(
         onPageTurnTargetParked?.invoke()
         onPageTurnStarted?.invoke()
         startFlip(
-            outgoing = outgoing,
-            revealed = revealed,
+            outgoing = SlidePageFrame.BitmapFrame(outgoing),
+            revealed = SlidePageFrame.BitmapFrame(revealed),
             forward = forward,
             onCommitted = {
                 retainSettledLocalPageShots(origin, targetWindow, forward, committed = true)
@@ -4453,22 +5100,7 @@ internal class EpubFlowView(
             withContainerAtRest {
                 val canvas = Canvas(bmp)
                 scalePageShotCanvasToViewport(canvas, bmp)
-                drawSnapshotBackground(canvas)
-                val contentSave = canvas.save()
-                canvas.translate(0f, -topPx.toFloat())
-                val clipTop = snapshotClipTopFor(topPx, window)
-                val clipBottom = snapshotClipBottomFor(topPx, window)
-                canvas.clipRect(0, clipTop, width, clipBottom)
-                // Draw the TextView layout directly (see redrawPageShotInto): same clip and content
-                // translation as the live draw path, without traversing the View tree or toggling the
-                // overlay-owned skipContentDraw state.
-                canvas.translate(
-                    textView.paddingLeft.toFloat() - textView.scrollX.toFloat(),
-                    textView.paddingTop.toFloat() - textView.scrollY.toFloat(),
-                )
-                textView.layout?.draw(canvas)
-                canvas.restoreToCount(contentSave)
-                window?.let { drawPageBoundaryImagePreview(canvas, topPx, it, canvasViewportTopPx = 0) }
+                drawPageInto(canvas, topPx, window)
             }
         }
     }
@@ -4621,19 +5253,24 @@ internal class EpubFlowView(
      * identities, removes the View, clears the field, pins the identities so external eviction cannot
      * release them, and schedules a generation-guarded two-postOnAnimation host-frame fence.
      */
-    private fun detachSlideOverlayRenderer(): List<Bitmap> {
+    private fun detachSlideOverlayRenderer(): List<SlidePageFrame> {
         val renderer = slideOverlayView ?: return emptyList()
-        val identities = renderer.takeRecordedBitmaps()
+        val frames = renderer.takeRecordedFrames()
         overlay.remove(renderer)
         slideOverlayView = null
-        if (identities.isNotEmpty()) {
-            identities.forEach { identity ->
-                renderRetiredPageShots.getOrPut(identity) { RenderRetiredPageShot() }
-                relabelPageShot(identity, PageShotLeaseKind.PINNED, "render.fence")
+        if (frames.isNotEmpty()) {
+            frames.forEach { frame ->
+                when (frame) {
+                    is SlidePageFrame.BitmapFrame -> {
+                        renderRetiredPageShots.getOrPut(frame.bitmap) { RenderRetiredPageShot() }
+                        relabelPageShot(frame.bitmap, PageShotLeaseKind.PINNED, "render.fence")
+                    }
+                    is SlidePageFrame.ArtifactFrame -> retireSlideArtifact(frame.artifact)
+                }
             }
             scheduleRenderRetiredFence()
         }
-        return identities
+        return frames
     }
 
     /**
@@ -4642,7 +5279,7 @@ internal class EpubFlowView(
      * stale callbacks exit; a detached host falls back to a main-Handler delayed completion.
      */
     private fun scheduleRenderRetiredFence() {
-        if (renderRetiredPageShots.isEmpty()) return
+        if (renderRetiredPageShots.isEmpty() && renderRetiredSlideArtifacts.isEmpty()) return
         renderRetiredBarrierGeneration += 1L
         val generation = renderRetiredBarrierGeneration
         renderRetiredFlushHandler.removeCallbacks(renderRetiredFlushRunnable)
@@ -4694,6 +5331,13 @@ internal class EpubFlowView(
                 }
             }
         }
+        // Artifact display lists recorded by a detached renderer are retired at the same barrier:
+        // only discardRequested entries are released; rekeyed cache owners stay live.
+        val artifactEntries = renderRetiredSlideArtifacts.map { it.key to it.value }
+        renderRetiredSlideArtifacts.clear()
+        artifactEntries.forEach { (artifact, state) ->
+            if (state.discardRequested) artifact.discard()
+        }
         trimStablePageShotsToBudget()
         if (!rapidTurnSequenceActive || queuedPageTurnDelta != 0) continueQueuedTurnsOrPrecache()
     }
@@ -4705,22 +5349,31 @@ internal class EpubFlowView(
      * ViewGroupOverlay so per-frame motion is a View translation; the parked live TextView is skipped
      * for the duration of the transaction because it is fully covered by the strip.
      */
-    private fun installSlideOverlay(outgoing: Bitmap, revealed: Bitmap, forward: Boolean) {
-        // Reactivate identities still behind an earlier render fence: the new renderer records them
-        // again, so cancel their pending recycle/deferred state and invalidate stale frame callbacks.
+    private fun installSlideOverlay(outgoing: SlidePageFrame, revealed: SlidePageFrame, forward: Boolean) {
+        // Reactivate frames still behind an earlier render fence: the new renderer records them
+        // again, so cancel their pending recycle/discard state and invalidate stale frame callbacks.
         var reactivated = false
-        listOf(outgoing, revealed).forEach { identity ->
-            if (renderRetiredPageShots.remove(identity) != null) reactivated = true
+        listOf(outgoing, revealed).forEach { frame ->
+            when (frame) {
+                is SlidePageFrame.BitmapFrame -> {
+                    if (renderRetiredPageShots.remove(frame.bitmap) != null) reactivated = true
+                }
+                is SlidePageFrame.ArtifactFrame -> {
+                    if (renderRetiredSlideArtifacts.remove(frame.artifact) != null) reactivated = true
+                }
+            }
         }
         if (reactivated) {
             renderRetiredBarrierGeneration += 1L
             renderRetiredFlushHandler.removeCallbacks(renderRetiredFlushRunnable)
-            if (renderRetiredPageShots.isNotEmpty()) scheduleRenderRetiredFence()
+            if (renderRetiredPageShots.isNotEmpty() || renderRetiredSlideArtifacts.isNotEmpty()) {
+                scheduleRenderRetiredFence()
+            }
         }
-        relabelPageShot(outgoing, PageShotLeaseKind.PINNED, "render.active")
-        if (revealed !== outgoing) {
-            relabelPageShot(revealed, PageShotLeaseKind.PINNED, "render.active")
-        }
+        listOf(outgoing, revealed)
+            .mapNotNull { (it as? SlidePageFrame.BitmapFrame)?.bitmap }
+            .distinct()
+            .forEach { relabelPageShot(it, PageShotLeaseKind.PINNED, "render.active") }
         val drawable = PageSlideDrawable(
             outgoing,
             revealed,
@@ -4728,13 +5381,13 @@ internal class EpubFlowView(
             height,
             forward,
             density,
-            ::recyclePageShot,
+            ::recycleSlideFrame,
         )
         drawable.setBounds(0, scrollY, width, scrollY + height)
         val renderer = PageSlideOverlayView(
             context = context,
-            frontBitmap = outgoing,
-            revealedBitmap = revealed,
+            frontFrame = outgoing,
+            revealedFrame = revealed,
             viewportW = width,
             viewportH = height,
             forward = forward,
@@ -4791,55 +5444,124 @@ internal class EpubFlowView(
         return front to revealed
     }
 
+    private fun takeActiveFlipFrames(): Pair<SlidePageFrame, SlidePageFrame>? {
+        detachSlideOverlayRenderer()
+        val front = slideDrawable?.takeFrontFrame()
+        val revealed = slideDrawable?.takeRevealedFrame()
+        if (front != null && revealed != null) return front to revealed
+        front?.let(::retireSlideFrame)
+        revealed?.let(::retireSlideFrame)
+        val bitmapFront = slideDrawable?.takeFrontBitmap() ?: curlDrawable?.takeFrontBitmap()
+        val bitmapRevealed = slideDrawable?.takeRevealedBitmap() ?: curlDrawable?.takeRevealedBitmap()
+        if (bitmapFront != null && bitmapRevealed != null) {
+            return SlidePageFrame.BitmapFrame(bitmapFront) to SlidePageFrame.BitmapFrame(bitmapRevealed)
+        }
+        bitmapFront?.let(::recyclePageShot)
+        bitmapRevealed?.let(::recyclePageShot)
+        return null
+    }
+
     private fun retainSettledLocalPageShots(
         origin: PageTurnOrigin,
         targetWindow: EpubFlowPage,
         forward: Boolean,
         committed: Boolean,
     ) {
-        val (front, revealed) = takeActiveFlipBitmaps() ?: return
+        val frames = takeActiveFlipFrames() ?: return
+        retainSettledLocalFrames(origin, targetWindow, forward, committed, frames.first, frames.second)
+    }
+
+    private fun retainSettledLocalFrames(
+        origin: PageTurnOrigin,
+        targetWindow: EpubFlowPage,
+        forward: Boolean,
+        committed: Boolean,
+        front: SlidePageFrame,
+        revealed: SlidePageFrame,
+    ) {
         recycleCachedTextures(preserveRapidFollowUp = true)
         val targetPage = canonicalFloorPageIndexForTopPx(targetWindow.topPx)
         val originKey = pageTextureKey(origin.topPx, origin.window)
         val targetKey = pageTextureKey(targetWindow.topPx, targetWindow)
-        if (committed) {
-            cachedFrontBitmap = revealed
-            cachedFromPage = targetPage
-            cachedFromTopPx = targetWindow.topPx
-            cachedFromTextureKey = targetKey
-            if (forward) {
-                cachedBackwardBitmap = front
-                cachedBackwardPage = origin.pageProjection
-                cachedBackwardTopPx = origin.topPx
-                cachedBackwardTextureKey = originKey
+        val frontBitmap = (front as? SlidePageFrame.BitmapFrame)?.bitmap
+        val revealedBitmap = (revealed as? SlidePageFrame.BitmapFrame)?.bitmap
+        if (frontBitmap != null && revealedBitmap != null) {
+            // Legacy zero-copy Bitmap rekey (SIMULATION / boundary / cold SLIDE).
+            if (committed) {
+                cachedFrontBitmap = revealedBitmap
+                cachedFromPage = targetPage
+                cachedFromTopPx = targetWindow.topPx
+                cachedFromTextureKey = targetKey
+                if (forward) {
+                    cachedBackwardBitmap = frontBitmap
+                    cachedBackwardPage = origin.pageProjection
+                    cachedBackwardTopPx = origin.topPx
+                    cachedBackwardTextureKey = originKey
+                } else {
+                    cachedRevealedBitmap = frontBitmap
+                    cachedTargetPage = origin.pageProjection
+                    cachedTargetTopPx = origin.topPx
+                    cachedTargetTextureKey = originKey
+                }
             } else {
-                cachedRevealedBitmap = front
-                cachedTargetPage = origin.pageProjection
-                cachedTargetTopPx = origin.topPx
-                cachedTargetTextureKey = originKey
+                cachedFrontBitmap = frontBitmap
+                cachedFromPage = origin.pageProjection
+                cachedFromTopPx = origin.topPx
+                cachedFromTextureKey = originKey
+                if (forward) {
+                    cachedRevealedBitmap = revealedBitmap
+                    cachedTargetPage = targetPage
+                    cachedTargetTopPx = targetWindow.topPx
+                    cachedTargetTextureKey = targetKey
+                } else {
+                    cachedBackwardBitmap = revealedBitmap
+                    cachedBackwardPage = targetPage
+                    cachedBackwardTopPx = targetWindow.topPx
+                    cachedBackwardTextureKey = targetKey
+                }
+            }
+            relabelPageShot(cachedFrontBitmap, PageShotLeaseKind.EVICTABLE, "cache.current")
+            relabelPageShot(cachedRevealedBitmap, PageShotLeaseKind.EVICTABLE, "cache.forward")
+            relabelPageShot(cachedBackwardBitmap, PageShotLeaseKind.EVICTABLE, "cache.backward")
+            trimStablePageShotsToBudget()
+            restoreActiveFlipPixelRefreshes(frontBitmap, revealedBitmap)
+            return
+        }
+        // Warm SLIDE artifact rekey: same directional slots with command-artifact owners.
+        val frontArtifact = (front as? SlidePageFrame.ArtifactFrame)?.artifact
+        val revealedArtifact = (revealed as? SlidePageFrame.ArtifactFrame)?.artifact
+        val originArtifactKey = slidePageArtifactKey(origin.topPx, origin.window)
+        val targetArtifactKey = slidePageArtifactKey(targetWindow.topPx, targetWindow)
+        if (frontArtifact != null && revealedArtifact != null && originArtifactKey != null && targetArtifactKey != null) {
+            if (committed) {
+                slideFrontSlot = SlideArtifactSlot(targetPage, targetWindow.topPx, targetArtifactKey, revealedArtifact)
+                if (forward) {
+                    slideBackwardSlot = SlideArtifactSlot(
+                        origin.pageProjection,
+                        origin.topPx,
+                        originArtifactKey,
+                        frontArtifact,
+                    )
+                } else {
+                    slideRevealedSlot = SlideArtifactSlot(
+                        origin.pageProjection,
+                        origin.topPx,
+                        originArtifactKey,
+                        frontArtifact,
+                    )
+                }
+            } else {
+                slideFrontSlot = SlideArtifactSlot(origin.pageProjection, origin.topPx, originArtifactKey, frontArtifact)
+                if (forward) {
+                    slideRevealedSlot = SlideArtifactSlot(targetPage, targetWindow.topPx, targetArtifactKey, revealedArtifact)
+                } else {
+                    slideBackwardSlot = SlideArtifactSlot(targetPage, targetWindow.topPx, targetArtifactKey, revealedArtifact)
+                }
             }
         } else {
-            cachedFrontBitmap = front
-            cachedFromPage = origin.pageProjection
-            cachedFromTopPx = origin.topPx
-            cachedFromTextureKey = originKey
-            if (forward) {
-                cachedRevealedBitmap = revealed
-                cachedTargetPage = targetPage
-                cachedTargetTopPx = targetWindow.topPx
-                cachedTargetTextureKey = targetKey
-            } else {
-                cachedBackwardBitmap = revealed
-                cachedBackwardPage = targetPage
-                cachedBackwardTopPx = targetWindow.topPx
-                cachedBackwardTextureKey = targetKey
-            }
+            listOfNotNull(frontArtifact, revealedArtifact).distinct().forEach(::discardSlideArtifact)
         }
-        relabelPageShot(cachedFrontBitmap, PageShotLeaseKind.EVICTABLE, "cache.current")
-        relabelPageShot(cachedRevealedBitmap, PageShotLeaseKind.EVICTABLE, "cache.forward")
-        relabelPageShot(cachedBackwardBitmap, PageShotLeaseKind.EVICTABLE, "cache.backward")
-        trimStablePageShotsToBudget()
-        restoreActiveFlipPixelRefreshes(front, revealed)
+        clearActiveFlipPixelRefreshes()
     }
 
     private fun restoreActiveFlipPixelRefreshes(front: Bitmap, revealed: Bitmap) {
@@ -4875,8 +5597,8 @@ internal class EpubFlowView(
     }
 
     private fun startFlip(
-        outgoing: Bitmap,
-        revealed: Bitmap,
+        outgoing: SlidePageFrame,
+        revealed: SlidePageFrame,
         forward: Boolean,
         onCommitted: () -> Unit = {},
         onCancelled: () -> Unit = {},
@@ -4889,9 +5611,12 @@ internal class EpubFlowView(
         val bounds = intArrayOf(0, scrollY, width, scrollY + height)
         if (useSimulationDiscreteRenderer()) {
             // CoolReader-PAPER-style local sine strips: flat body, flexible moving edge, no 3D.
+            val outgoingBitmap = (outgoing as? SlidePageFrame.BitmapFrame)?.bitmap
+            val revealedBitmap = (revealed as? SlidePageFrame.BitmapFrame)?.bitmap
+            if (outgoingBitmap == null || revealedBitmap == null) return
             val drawable = PageCurlDrawable(
-                outgoing,
-                checkNotNull(revealed) { "PAPER turns require a revealed page artifact" },
+                outgoingBitmap,
+                revealedBitmap,
                 width,
                 height,
                 forward,
@@ -5097,7 +5822,11 @@ internal class EpubFlowView(
             return false
         }
         onPageTurnStarted?.invoke()
-        startFlip(outgoing, revealed, turn.forward)
+        startFlip(
+            SlidePageFrame.BitmapFrame(outgoing),
+            SlidePageFrame.BitmapFrame(revealed),
+            turn.forward,
+        )
         return true
     }
 
@@ -5158,10 +5887,33 @@ internal class EpubFlowView(
             )
         }
         onPageTurnCapturePreparing?.invoke()
-        preparePinnedLocalWorkingPairBudget()
-        val deferColdShots = latestX != null && latestY != null
         val targetTop = targetWindow.topPx
         val targetPage = canonicalFloorPageIndexForTopPx(targetTop)
+        // A continuity/conversion cover still owns the viewport (conversionSnapshotDrawable):
+        // keep that Bitmap-based turn path intact instead of mixing a bitmap cover with artifacts.
+        if (flipStyle == dev.readflow.core.model.PageFlipStyle.SLIDE && conversionSnapshotDrawable == null) {
+            val artifactPair = takeCachedSlideArtifactsForTurn(
+                fromPage = origin.pageProjection,
+                fromTop = origin.topPx,
+                fromWindow = origin.window,
+                targetPage = targetPage,
+                targetTop = targetTop,
+                targetWindow = targetWindow,
+            )
+            if (artifactPair != null) {
+                return startLocalInteractiveCurl(
+                    origin = origin,
+                    targetWindow = targetWindow,
+                    forward = forward,
+                    axis = axis,
+                    anchor = anchor,
+                    outgoing = SlidePageFrame.ArtifactFrame(artifactPair.first),
+                    revealed = SlidePageFrame.ArtifactFrame(artifactPair.second),
+                )
+            }
+        }
+        preparePinnedLocalWorkingPairBudget()
+        val deferColdShots = latestX != null && latestY != null
         val requiredWarmSlotNeedsPixelRefresh =
             CachedPageShotSlot.FRONT in pendingInPlacePageShotRefreshSlots ||
                 when {
@@ -5271,8 +6023,8 @@ internal class EpubFlowView(
             forward = forward,
             axis = axis,
             anchor = anchor,
-            outgoing = outgoing,
-            revealed = revealed,
+            outgoing = SlidePageFrame.BitmapFrame(outgoing),
+            revealed = SlidePageFrame.BitmapFrame(revealed),
         )
     }
 
@@ -5425,8 +6177,8 @@ internal class EpubFlowView(
             forward = request.forward,
             axis = request.axis,
             anchor = request.anchor,
-            outgoing = outgoing,
-            revealed = target,
+            outgoing = SlidePageFrame.BitmapFrame(outgoing),
+            revealed = SlidePageFrame.BitmapFrame(target),
         )
         updateInteractiveCurl(latestX, latestY)
         if (releasedVelocity != null) endInteractiveCurl(releasedVelocity)
@@ -5438,8 +6190,8 @@ internal class EpubFlowView(
         forward: Boolean,
         axis: InteractiveTurnAxis,
         anchor: Float,
-        outgoing: Bitmap,
-        revealed: Bitmap,
+        outgoing: SlidePageFrame,
+        revealed: SlidePageFrame,
     ): InteractiveTurnStartResult {
         finishInitialRevealForTurn()
         // Park content on the incoming page beneath the overlay; stays silent until the turn commits.
@@ -5448,9 +6200,12 @@ internal class EpubFlowView(
         flipAnimator?.cancel()
         clearFlipOverlay(preserveActivePixelRefreshes = true)
         if (flipStyle == dev.readflow.core.model.PageFlipStyle.SIMULATION) {
+            val outgoingBitmap = (outgoing as? SlidePageFrame.BitmapFrame)?.bitmap
+            val revealedBitmap = (revealed as? SlidePageFrame.BitmapFrame)?.bitmap
+            if (outgoingBitmap == null || revealedBitmap == null) return InteractiveTurnStartResult.REJECTED
             val drawable = PageCurlDrawable(
-                outgoing,
-                revealed,
+                outgoingBitmap,
+                revealedBitmap,
                 width,
                 height,
                 forward,
@@ -5619,7 +6374,11 @@ internal class EpubFlowView(
             overlay.add(drawable)
             curlDrawable = drawable
         } else {
-            installSlideOverlay(outgoing, preview.bitmap, preview.forward)
+            installSlideOverlay(
+                SlidePageFrame.BitmapFrame(outgoing),
+                SlidePageFrame.BitmapFrame(preview.bitmap),
+                preview.forward,
+            )
         }
         interactiveTurnState = InteractiveTurnState.BOUNDARY_SOFTWARE
         curlFromPage = origin.pageProjection

@@ -16,8 +16,13 @@ import kotlin.math.min
 /**
  * Hardware-accelerated slide page-turn (滑动翻页, 静读天下「滑动」手感). A snapshot of the OUTGOING
  * page is blitted at a horizontal offset that tracks [progress]. Every turn also carries the frozen
- * incoming page artifact so a frame never mixes a bitmap generation with the parked live view.
- * This avoids the Canvas mesh work used by the PAPER renderer.
+ * incoming page frame so a frame never mixes a generation with the parked live view. This avoids
+ * the Canvas mesh work used by the PAPER renderer.
+ *
+ * Warm same-chapter SLIDE turns carry [SlidePageFrame.ArtifactFrame] command artifacts recorded by
+ * [SlidePageArtifact]; [PageSlideOverlayView] draws the static 2W x H strip and this Drawable stays
+ * the detached progress/ownership state (it never draws the artifact strip). Cold deferred MOVE
+ * handoffs, boundary, and continuity turns keep the [SlidePageFrame.BitmapFrame] pair.
  *
  * Forward (next): both pages slide LEFT together — outgoing exits left, incoming enters from the right.
  * Backward (prev): mirrored — both slide RIGHT, incoming enters from the left.
@@ -25,19 +30,46 @@ import kotlin.math.min
  * A soft edge shadow is drawn on the leading seam between the two pages for depth.
  */
 internal class PageSlideDrawable(
-    frontBitmap: Bitmap,
-    revealedBitmap: Bitmap,
+    frontFrame: SlidePageFrame,
+    revealedFrame: SlidePageFrame,
     private val viewportW: Int,
     private val viewportH: Int,
     private val forward: Boolean,
     private val density: Float,
-    private val bitmapRecycler: (Bitmap) -> Unit = { bitmap ->
-        if (!bitmap.isRecycled) bitmap.recycle()
+    private val frameRecycler: (SlidePageFrame) -> Unit = { frame ->
+        when (frame) {
+            is SlidePageFrame.BitmapFrame -> if (!frame.bitmap.isRecycled) frame.bitmap.recycle()
+            is SlidePageFrame.ArtifactFrame -> frame.artifact.discard()
+        }
     },
 ) : Drawable() {
 
-    private var frontBitmap: Bitmap? = frontBitmap
-    private var revealedBitmap: Bitmap? = revealedBitmap
+    /** Legacy Bitmap-pair constructor kept for cold/boundary/continuity SLIDE compatibility. */
+    constructor(
+        frontBitmap: Bitmap,
+        revealedBitmap: Bitmap,
+        viewportW: Int,
+        viewportH: Int,
+        forward: Boolean,
+        density: Float,
+        bitmapRecycler: (Bitmap) -> Unit = { bitmap ->
+            if (!bitmap.isRecycled) bitmap.recycle()
+        },
+    ) : this(
+        SlidePageFrame.BitmapFrame(frontBitmap),
+        SlidePageFrame.BitmapFrame(revealedBitmap),
+        viewportW,
+        viewportH,
+        forward,
+        density,
+        { frame -> if (frame is SlidePageFrame.BitmapFrame) bitmapRecycler(frame.bitmap) },
+    )
+
+    private var frontFrame: SlidePageFrame? = frontFrame
+    private var revealedFrame: SlidePageFrame? = revealedFrame
+    /** Bitmap aliases for legacy/cold pairs; null while the pair is artifact-framed. */
+    private var frontBitmap: Bitmap? = (frontFrame as? SlidePageFrame.BitmapFrame)?.bitmap
+    private var revealedBitmap: Bitmap? = (revealedFrame as? SlidePageFrame.BitmapFrame)?.bitmap
 
     /** 0 = outgoing page fully covers the viewport, 1 = outgoing fully slid off (turn complete). */
     var progress: Float = 0f
@@ -150,29 +182,63 @@ internal class PageSlideDrawable(
         shadePaint.shader = null
     }
 
-    /** Transfers the revealed page to the caller without copying it. */
+    /** Transfers the revealed Bitmap to the caller without copying it; null for artifact frames. */
     fun takeRevealedBitmap(): Bitmap? {
-        val bitmap = revealedBitmap
+        val frame = revealedFrame
+        val bitmap = (frame as? SlidePageFrame.BitmapFrame)?.bitmap
+        revealedFrame = null
+        if (frontFrame === frame) frontFrame = null
         revealedBitmap = null
         if (frontBitmap === bitmap) frontBitmap = null
         return bitmap?.takeUnless { it.isRecycled }
     }
 
-    /** Transfers the outgoing page to the caller without copying it. */
+    /** Transfers the outgoing Bitmap to the caller without copying it; null for artifact frames. */
     fun takeFrontBitmap(): Bitmap? {
-        val bitmap = frontBitmap
+        val frame = frontFrame
+        val bitmap = (frame as? SlidePageFrame.BitmapFrame)?.bitmap
+        frontFrame = null
+        if (revealedFrame === frame) revealedFrame = null
         frontBitmap = null
         if (revealedBitmap === bitmap) revealedBitmap = null
         return bitmap?.takeUnless { it.isRecycled }
     }
 
+    /** Transfers the revealed frame (Bitmap or artifact) to the caller without copying it. */
+    fun takeRevealedFrame(): SlidePageFrame? {
+        val frame = revealedFrame
+        revealedFrame = null
+        if (frontFrame === frame) frontFrame = null
+        if (frame is SlidePageFrame.BitmapFrame) {
+            val bitmap = frame.bitmap
+            if (revealedBitmap === bitmap) revealedBitmap = null
+            if (frontBitmap === bitmap) frontBitmap = null
+        }
+        return frame
+    }
+
+    /** Transfers the outgoing frame (Bitmap or artifact) to the caller without copying it. */
+    fun takeFrontFrame(): SlidePageFrame? {
+        val frame = frontFrame
+        frontFrame = null
+        if (revealedFrame === frame) revealedFrame = null
+        if (frame is SlidePageFrame.BitmapFrame) {
+            val bitmap = frame.bitmap
+            if (frontBitmap === bitmap) frontBitmap = null
+            if (revealedBitmap === bitmap) revealedBitmap = null
+        }
+        return frame
+    }
+
     fun recycle() {
-        val front = frontBitmap
-        val revealed = revealedBitmap
+        val front = frontFrame
+        val revealed = revealedFrame
+        frontFrame = null
+        revealedFrame = null
         frontBitmap = null
         revealedBitmap = null
-        if (front != null) bitmapRecycler(front)
-        if (revealed != null && revealed !== front) bitmapRecycler(revealed)
+        if (front != null) frameRecycler(front)
+        if (revealed != null && revealed !== front) frameRecycler(revealed)
     }
 
     override fun setAlpha(alpha: Int) {}
