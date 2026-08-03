@@ -182,23 +182,32 @@ internal class PageSlideDrawable(
         shadePaint.shader = null
     }
 
-    /** Transfers the revealed Bitmap to the caller without copying it; null for artifact frames. */
+    /** The owned Bitmap or artifact behind a frame, for alias-aware ownership comparisons. */
+    private fun SlidePageFrame?.underlyingResource(): Any? = when (this) {
+        is SlidePageFrame.BitmapFrame -> bitmap
+        is SlidePageFrame.ArtifactFrame -> artifact
+        null -> null
+    }
+
+    /** Transfers the revealed Bitmap to the caller without copying it. Null and non-consuming for artifact frames. */
     fun takeRevealedBitmap(): Bitmap? {
         val frame = revealedFrame
-        val bitmap = (frame as? SlidePageFrame.BitmapFrame)?.bitmap
+        if (frame !is SlidePageFrame.BitmapFrame) return null
+        val bitmap = frame.bitmap
         revealedFrame = null
-        if (frontFrame === frame) frontFrame = null
+        if (frontFrame.underlyingResource() === frame.underlyingResource()) frontFrame = null
         revealedBitmap = null
         if (frontBitmap === bitmap) frontBitmap = null
         return bitmap?.takeUnless { it.isRecycled }
     }
 
-    /** Transfers the outgoing Bitmap to the caller without copying it; null for artifact frames. */
+    /** Transfers the outgoing Bitmap to the caller without copying it. Null and non-consuming for artifact frames. */
     fun takeFrontBitmap(): Bitmap? {
         val frame = frontFrame
-        val bitmap = (frame as? SlidePageFrame.BitmapFrame)?.bitmap
+        if (frame !is SlidePageFrame.BitmapFrame) return null
+        val bitmap = frame.bitmap
         frontFrame = null
-        if (revealedFrame === frame) revealedFrame = null
+        if (revealedFrame.underlyingResource() === frame.underlyingResource()) revealedFrame = null
         frontBitmap = null
         if (revealedBitmap === bitmap) revealedBitmap = null
         return bitmap?.takeUnless { it.isRecycled }
@@ -208,7 +217,7 @@ internal class PageSlideDrawable(
     fun takeRevealedFrame(): SlidePageFrame? {
         val frame = revealedFrame
         revealedFrame = null
-        if (frontFrame === frame) frontFrame = null
+        if (frontFrame.underlyingResource() === frame.underlyingResource()) frontFrame = null
         if (frame is SlidePageFrame.BitmapFrame) {
             val bitmap = frame.bitmap
             if (revealedBitmap === bitmap) revealedBitmap = null
@@ -221,7 +230,7 @@ internal class PageSlideDrawable(
     fun takeFrontFrame(): SlidePageFrame? {
         val frame = frontFrame
         frontFrame = null
-        if (revealedFrame === frame) revealedFrame = null
+        if (revealedFrame.underlyingResource() === frame.underlyingResource()) revealedFrame = null
         if (frame is SlidePageFrame.BitmapFrame) {
             val bitmap = frame.bitmap
             if (frontBitmap === bitmap) frontBitmap = null
@@ -238,7 +247,9 @@ internal class PageSlideDrawable(
         frontBitmap = null
         revealedBitmap = null
         if (front != null) frameRecycler(front)
-        if (revealed != null && revealed !== front) frameRecycler(revealed)
+        if (revealed != null && (front == null || front.underlyingResource() !== revealed.underlyingResource())) {
+            frameRecycler(revealed)
+        }
     }
 
     override fun setAlpha(alpha: Int) {}

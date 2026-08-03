@@ -2,6 +2,7 @@ package dev.readflow.render.epub
 
 import android.app.Application
 import android.graphics.Bitmap
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
@@ -55,6 +56,59 @@ class PageDrawableOwnershipTest {
             assertFalse("the transferred alias belongs to the continuity cover", bitmap.isRecycled)
         } finally {
             if (!bitmap.isRecycled) bitmap.recycle()
+        }
+    }
+
+    @Test
+    fun `slide artifact alias transfer clears both drawable owners without recycling transferred ownership`() {
+        val artifact = SlidePageArtifact.record(4, 4) { }
+        val revealedAlias = SlidePageFrame.ArtifactFrame(artifact)
+        val frontAlias = SlidePageFrame.ArtifactFrame(artifact)
+        var recyclerCalls = 0
+        val drawable = PageSlideDrawable(
+            frontAlias,
+            revealedAlias,
+            4,
+            4,
+            forward = true,
+            density = 1f,
+            frameRecycler = { recyclerCalls += 1 },
+        )
+        try {
+            val returned = checkNotNull(drawable.takeRevealedFrame()) as SlidePageFrame.ArtifactFrame
+            assertSame("the transferred frame must be the exact revealed alias", revealedAlias, returned)
+            assertSame("the transferred frame must carry the shared artifact", artifact, returned.artifact)
+            assertNull("the transferred alias must clear the front owner", drawable.takeFrontFrame())
+            drawable.recycle()
+            assertEquals("the transferred artifact must not be recycled again", 0, recyclerCalls)
+            assertNull("bitmap accessor on an artifact frame returns null", drawable.takeRevealedBitmap())
+        } finally {
+            artifact.discard()
+        }
+    }
+
+    @Test
+    fun `slide bitmap accessor leaves artifact owners for normal cleanup`() {
+        val frontArtifact = SlidePageArtifact.record(4, 4) { }
+        val revealedArtifact = SlidePageArtifact.record(4, 4) { }
+        var recyclerCalls = 0
+        val drawable = PageSlideDrawable(
+            SlidePageFrame.ArtifactFrame(frontArtifact),
+            SlidePageFrame.ArtifactFrame(revealedArtifact),
+            4,
+            4,
+            forward = true,
+            density = 1f,
+            frameRecycler = { recyclerCalls += 1 },
+        )
+        try {
+            assertNull("artifact frames expose no revealed bitmap", drawable.takeRevealedBitmap())
+            assertNull("artifact frames expose no front bitmap", drawable.takeFrontBitmap())
+            drawable.recycle()
+            assertEquals("recycle must own and release both artifact frames exactly once", 2, recyclerCalls)
+        } finally {
+            frontArtifact.discard()
+            revealedArtifact.discard()
         }
     }
 

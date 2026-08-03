@@ -478,7 +478,7 @@ class EpubReflowEngineTest {
     }
 
     @Test
-    fun `PIXELS_ONLY callbacks coalesce TextView rebinds without discarding warm page shots`() =
+    fun `PIXELS_ONLY callbacks coalesce TextView rebinds while replacing the dependent artifact and keeping the unrelated target artifact`() =
         runTest(dispatcher) {
             Dispatchers.setMain(dispatcher)
             val epub = tempDir.newFile("flow-image-result-routing.epub")
@@ -521,8 +521,8 @@ class EpubReflowEngineTest {
                 flowView.recycleCachedTexturesForTest()
                 flowView.preCachePageTexturesForTest()
                 shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
-                val warmFront = checkNotNull(flowView.privateField("cachedFrontBitmap") as Bitmap?)
-                val warmRevealed = checkNotNull(flowView.privateField("cachedRevealedBitmap") as Bitmap?)
+                val warmFront = checkNotNull(flowView.slideFrontArtifactForTest())
+                val warmRevealed = checkNotNull(flowView.slideRevealedArtifactForTest())
                 val stableBounds = Rect(0, 0, 800, 1200)
                 val fullPagePixels = EpubAsyncImageResult(
                     layoutStart = 0,
@@ -555,14 +555,30 @@ class EpubReflowEngineTest {
                     "the completed image batch must rebind the TextView display owner once",
                     textRebinds.get() == 1,
                 )
-                assertTrue(
-                    "same-geometry pixel delivery must preserve the warm current-page identity",
-                    flowView.privateField("cachedFrontBitmap") === warmFront && !warmFront.isRecycled,
+                // Same-geometry pixel installs invalidate dependent frozen artifacts (no stale
+                // survival); normal precache rebuilds live replacements.
+                assertFalse(
+                    "the dependent warm artifact must be invalidated by the pixel batch",
+                    warmFront.slideArtifactRecordIsLive(),
                 )
                 assertTrue(
-                    "same-geometry pixel delivery must preserve the warm target-page identity",
-                    flowView.privateField("cachedRevealedBitmap") === warmRevealed && !warmRevealed.isRecycled,
+                    "the unrelated target artifact must survive the full-page pixel batch",
+                    warmRevealed.slideArtifactRecordIsLive(),
                 )
+                flowView.textView.viewTreeObserver.dispatchOnPreDraw()
+                shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+                flowView.drainPendingPageTexturePrecacheForTest()
+                assertTrue(
+                    "the completed image batch must replace the dependent current-page artifact",
+                    flowView.slideFrontArtifactForTest() !== warmFront &&
+                        flowView.slideFrontArtifactForTest()?.slideArtifactRecordIsLive() == true,
+                )
+                assertTrue(
+                    "the unrelated target artifact must remain the same identity and live",
+                    flowView.slideRevealedArtifactForTest() === warmRevealed &&
+                        warmRevealed.slideArtifactRecordIsLive(),
+                )
+                val rebuiltFront = checkNotNull(flowView.slideFrontArtifactForTest())
 
                 textRebinds.set(0)
                 callback(fullPagePixels.copy(destination = "inline.png", isFullPage = false))
@@ -584,13 +600,26 @@ class EpubReflowEngineTest {
                     1,
                     textRebinds.get(),
                 )
-                assertTrue(
-                    "inline pixel delivery must preserve the warm current-page identity",
-                    flowView.privateField("cachedFrontBitmap") === warmFront && !warmFront.isRecycled,
+                assertFalse(
+                    "inline pixel delivery must invalidate the dependent warm current artifact",
+                    rebuiltFront.slideArtifactRecordIsLive(),
                 )
                 assertTrue(
-                    "inline pixel delivery must preserve the warm target-page identity",
-                    flowView.privateField("cachedRevealedBitmap") === warmRevealed && !warmRevealed.isRecycled,
+                    "the unrelated target artifact must survive the inline pixel batch",
+                    warmRevealed.slideArtifactRecordIsLive(),
+                )
+                flowView.textView.viewTreeObserver.dispatchOnPreDraw()
+                shadowOf(Looper.getMainLooper()).idleFor(20L, TimeUnit.MILLISECONDS)
+                flowView.drainPendingPageTexturePrecacheForTest()
+                assertTrue(
+                    "inline pixel delivery must replace the dependent current-page artifact",
+                    flowView.slideFrontArtifactForTest() !== rebuiltFront &&
+                        flowView.slideFrontArtifactForTest()?.slideArtifactRecordIsLive() == true,
+                )
+                assertTrue(
+                    "the unrelated target artifact must remain the same identity and live after inline pixels",
+                    flowView.slideRevealedArtifactForTest() === warmRevealed &&
+                        warmRevealed.slideArtifactRecordIsLive(),
                 )
 
                 textRebinds.set(0)
@@ -6657,6 +6686,33 @@ class EpubReflowEngineTest {
         EpubFlowView::class.java.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this)
+
+    private fun Any.reflectedFieldForTest(name: String): Any? =
+        javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this)
+
+    private fun EpubFlowView.slideFrontArtifactForTest(): Any? =
+        (privateField("slideFrontSlot") as Any?)?.reflectedFieldForTest("artifact")
+
+    private fun EpubFlowView.slideRevealedArtifactForTest(): Any? =
+        (privateField("slideRevealedSlot") as Any?)?.reflectedFieldForTest("artifact")
+
+    private fun Any.slideArtifactRecordIsLive(): Boolean =
+        javaClass.getDeclaredField("record").apply { isAccessible = true }.get(this) != null
+
+    private fun EpubFlowView.drainPendingPageTexturePrecacheForTest(maxFrames: Int = 8) {
+        repeat(maxFrames) {
+            if (
+                !(privateField("pageTexturePrecachePending") as Boolean) &&
+                privateField("pendingPageTexturePrecache") == null &&
+                !(privateField("slideArtifactPrecachePending") as Boolean) &&
+                privateField("pendingSlideArtifactPrecache") == null
+            ) {
+                return
+            }
+            shadowOf(Looper.getMainLooper()).runOneTask()
+        }
+        shadowOf(Looper.getMainLooper()).idle()
+    }
 
     private fun EpubFlowView.setPrivateField(name: String, value: Any?) {
         EpubFlowView::class.java.getDeclaredField(name)

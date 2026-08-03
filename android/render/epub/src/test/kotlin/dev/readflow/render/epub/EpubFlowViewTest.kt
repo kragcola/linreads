@@ -149,8 +149,12 @@ class EpubFlowViewTest {
                 val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
                 val renderer = view.requireActiveSlideRendererView()
                 val livePage = view.getChildAt(0)
-                val front = slide.privateBitmap("frontBitmap")
-                val revealed = slide.privateBitmap("revealedBitmap")
+                val front = checkNotNull(slide.frontArtifactForTest()) {
+                    "warm SLIDE must start from a current-page artifact"
+                }
+                val revealed = checkNotNull(slide.revealedArtifactForTest()) {
+                    "warm SLIDE must start from a target-page artifact"
+                }
                 val initialFrame = intArrayOf(renderer.left, renderer.top, renderer.right, renderer.bottom)
                 val initialTranslationY = renderer.translationY
 
@@ -172,14 +176,14 @@ class EpubFlowViewTest {
                 )
                 assertEquals(0f, livePage.translationX, 0.001f)
                 assertEquals(0f, livePage.translationY, 0.001f)
-                assertSame("progress must retain the outgoing bitmap identity", front, slide.privateBitmap("frontBitmap"))
+                assertSame("progress must retain the outgoing artifact identity", front, slide.frontArtifactForTest())
                 assertSame(
-                    "progress must retain the revealed bitmap identity",
+                    "progress must retain the revealed artifact identity",
                     revealed,
-                    slide.privateBitmap("revealedBitmap"),
+                    slide.revealedArtifactForTest(),
                 )
-                assertFalse(front.isRecycled)
-                assertFalse(revealed.isRecycled)
+                assertTrue("progress must not discard the outgoing artifact", front.slideArtifactRecordIsLive())
+                assertTrue("progress must not discard the revealed artifact", revealed.slideArtifactRecordIsLive())
             } finally {
                 view.dispose()
             }
@@ -187,15 +191,19 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `slide settle and cancel detach renderer after transferring bitmap ownership`() {
+    fun `slide settle and cancel detach renderer after transferring artifact ownership`() {
         for (commit in listOf(true, false)) {
             val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
             try {
                 assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
                 val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
                 val renderer = view.requireActiveSlideRendererView()
-                val front = slide.privateBitmap("frontBitmap")
-                val revealed = slide.privateBitmap("revealedBitmap")
+                val front = checkNotNull(slide.frontArtifactForTest()) {
+                    "warm SLIDE settle must own a current-page artifact"
+                }
+                val revealed = checkNotNull(slide.revealedArtifactForTest()) {
+                    "warm SLIDE settle must own a target-page artifact"
+                }
 
                 view.updateInteractiveCurl(x = view.width * if (commit) 0.10f else 0.98f)
                 view.endInteractiveCurl(velocityX = 0f)
@@ -211,14 +219,14 @@ class EpubFlowViewTest {
                 assertNull("commit=$commit must clear the drawable field", view.privateField("slideDrawable"))
                 assertNull("commit=$commit must release the outgoing reference", slide.reflectedField("frontBitmap"))
                 assertNull("commit=$commit must release the revealed reference", slide.reflectedField("revealedBitmap"))
-                assertFalse("commit=$commit must preserve the outgoing page shot", front.isRecycled)
-                assertFalse("commit=$commit must preserve the revealed page shot", revealed.isRecycled)
+                assertTrue("commit=$commit must keep the outgoing artifact live", front.slideArtifactRecordIsLive())
+                assertTrue("commit=$commit must keep the revealed artifact live", revealed.slideArtifactRecordIsLive())
                 if (commit) {
-                    assertSame(revealed, view.privateField("cachedFrontBitmap"))
-                    assertSame(front, view.privateField("cachedBackwardBitmap"))
+                    assertSame("commit=$commit must rekey the revealed artifact as current", revealed, view.slideFrontArtifactForTest())
+                    assertSame("commit=$commit must rekey the outgoing artifact as backward", front, view.slideBackwardArtifactForTest())
                 } else {
-                    assertSame(front, view.privateField("cachedFrontBitmap"))
-                    assertSame(revealed, view.privateField("cachedRevealedBitmap"))
+                    assertSame("cancel must keep the outgoing artifact as current", front, view.slideFrontArtifactForTest())
+                    assertSame("cancel must keep the revealed artifact as forward target", revealed, view.slideRevealedArtifactForTest())
                 }
             } finally {
                 view.dispose()
@@ -227,63 +235,61 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `low budget slide settle keeps detached display list bitmaps leased through two host frames`() {
-        val oneMotionShotBytes = 360L * 120L * 2L
-        val budget = PageShotBudget(oneMotionShotBytes)
+    fun `warm slide settle keeps rekeyed artifact display lists behind the two host frame barrier`() {
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SLIDE,
-            pageShotBudget = budget,
         )
         view.background = ColorDrawable(0xFFEDE6D6.toInt())
-        view.recycleCachedTexturesForTest()
 
         try {
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            val frontArtifact = checkNotNull(view.slideFrontArtifactForTest())
+            val revealedArtifact = checkNotNull(view.slideRevealedArtifactForTest())
+
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
             val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
             val renderer = view.requireActiveSlideRendererView()
-            val front = slide.privateBitmap("frontBitmap")
-            val revealed = slide.privateBitmap("revealedBitmap")
-            view.drawToBitmapForTest().recycle()
-            val leasedWhileRecorded = budget.leasedBytes
-            val chargedWhileRecorded = budget.chargedBytes
-            assertEquals(oneMotionShotBytes * 2L, leasedWhileRecorded)
+            assertSame("the active strip must record the warmed front artifact", frontArtifact, slide.frontArtifactForTest())
+            assertSame("the active strip must record the warmed revealed artifact", revealedArtifact, slide.revealedArtifactForTest())
 
             view.updateInteractiveCurl(x = view.width * 0.10f)
             view.endInteractiveCurl(velocityX = 0f)
             val animator = view.privateField("flipAnimator") as android.animation.ValueAnimator?
             assertNotNull("the committed turn must enter visual settle", animator)
+            // Hold the rapid-idle window across the settle callback so continueQueuedTurnsOrPrecache
+            // schedules rapid idle instead of starting normal precache that would interleave its
+            // artifact chain with the host-frame fence below.
+            view.setPrivateField("rapidTurnSequenceActive", true)
             animator!!.end()
+            view.setPrivateField("rapidTurnSequenceActive", false)
 
-            val stableCacheBitmaps = listOfNotNull(
-                view.privateField("cachedFrontBitmap") as Bitmap?,
-                view.privateField("cachedRevealedBitmap") as Bitmap?,
-                view.privateField("cachedBackwardBitmap") as Bitmap?,
-            )
             assertNull("settle must detach the renderer before its frame barriers begin", renderer.parent)
-            assertSame("the revealed shot must become the stable current-page cache", revealed, view.privateField("cachedFrontBitmap"))
             assertTrue(
-                "low-budget trim must remove the outgoing shot from stable cache ownership",
-                stableCacheBitmaps.none { it === front },
+                "detach must pin the recorded artifacts behind the render fence",
+                view.renderRetiredSlideArtifactsForTest() == setOf(frontArtifact, revealedArtifact),
             )
-            assertFalse("the detached outgoing display-list bitmap must survive before frame one", front.isRecycled)
-            assertFalse("the stable revealed display-list bitmap must survive before frame one", revealed.isRecycled)
-            assertEquals(leasedWhileRecorded, budget.leasedBytes)
-            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+            assertSame("the revealed artifact must become the stable current-page cache", revealedArtifact, view.slideFrontArtifactForTest())
+            assertSame("the outgoing artifact must become the stable backward-page cache", frontArtifact, view.slideBackwardArtifactForTest())
+            assertTrue("rekeyed artifacts must be live before frame one", frontArtifact.slideArtifactRecordIsLive())
+            assertTrue("rekeyed artifacts must be live before frame one", revealedArtifact.slideArtifactRecordIsLive())
+
+            // Drop the outgoing stable owner and request discard while its display list is still
+            // pinned behind the fence: the artifact must stay live until frame two, while the
+            // rekeyed current artifact survives the barrier untouched.
+            view.discardSlideArtifactForTest(frontArtifact)
+            view.setPrivateField("slideBackwardSlot", null)
+            assertTrue("ownerless artifact must stay live while the fence charges it", frontArtifact.slideArtifactRecordIsLive())
+            assertTrue("the rekeyed current artifact must stay live", revealedArtifact.slideArtifactRecordIsLive())
+
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            assertTrue("the ownerless artifact must remain protected after only one host frame", frontArtifact.slideArtifactRecordIsLive())
 
             shadowOf(Looper.getMainLooper()).runOneTask()
 
-            assertFalse("the outgoing bitmap must remain protected after only one host frame", front.isRecycled)
-            assertFalse("the stable revealed bitmap must remain protected after only one host frame", revealed.isRecycled)
-            assertEquals(leasedWhileRecorded, budget.leasedBytes)
-            assertEquals(chargedWhileRecorded, budget.chargedBytes)
-
-            shadowOf(Looper.getMainLooper()).runOneTask()
-
-            assertTrue("the trimmed outgoing bitmap may recycle only after frame two", front.isRecycled)
-            assertFalse("frame barriers must not recycle a bitmap still owned by the stable cache", revealed.isRecycled)
-            assertSame(revealed, view.privateField("cachedFrontBitmap"))
-            assertEquals(revealed.allocationByteCount.toLong(), budget.leasedBytes)
-            assertEquals(revealed.allocationByteCount.toLong(), budget.chargedBytes)
+            assertFalse("the ownerless artifact may discard only after frame two", frontArtifact.slideArtifactRecordIsLive())
+            assertTrue("frame barriers must not discard an artifact still owned by the stable cache", revealedArtifact.slideArtifactRecordIsLive())
+            assertSame(revealedArtifact, view.slideFrontArtifactForTest())
         } finally {
             view.dispose()
             shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
@@ -335,26 +341,20 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `slide retirement fence resumes budget-deferred current page precache after frame two`() {
-        val oneMotionShotBytes = 360L * 120L * 2L
-        val budget = PageShotBudget(oneMotionShotBytes * 2L)
+    fun `slide retirement fence releases ownerless artifacts and resumes precache after frame two`() {
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SLIDE,
-            pageShotBudget = budget,
         )
         view.background = ColorDrawable(0xFFEDE6D6.toInt())
-        view.recycleCachedTexturesForTest()
 
         try {
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            val frontArtifact = checkNotNull(view.slideFrontArtifactForTest())
+            val revealedArtifact = checkNotNull(view.slideRevealedArtifactForTest())
+
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
-            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
             val renderer = view.requireActiveSlideRendererView()
-            val front = slide.privateBitmap("frontBitmap")
-            val revealed = slide.privateBitmap("revealedBitmap")
-            view.drawToBitmapForTest().recycle()
-            val leasedWhileRecorded = budget.leasedBytes
-            val chargedWhileRecorded = budget.chargedBytes
-            assertEquals(oneMotionShotBytes * 2L, leasedWhileRecorded)
 
             view.updateInteractiveCurl(x = view.width * 0.10f)
             view.endInteractiveCurl(velocityX = 0f)
@@ -369,86 +369,56 @@ class EpubFlowViewTest {
 
             assertNull("settle must detach the renderer before its frame barriers begin", renderer.parent)
             assertNull(
-                "the settle callback must not stage a pending precache while the rapid window is active",
-                view.privateField("pendingPageTexturePrecache"),
+                "the settle callback must not stage an artifact precache while the rapid window is active",
+                view.privateField("pendingSlideArtifactPrecache"),
             )
             assertFalse(
-                "the settle callback must not arm precache while the rapid window is active",
-                view.privateBool("pageTexturePrecachePending"),
+                "the settle callback must not arm artifact precache while the rapid window is active",
+                view.privateBool("slideArtifactPrecachePending"),
             )
             assertSame(
-                "the revealed shot must become the stable current-page cache",
-                revealed,
-                view.privateField("cachedFrontBitmap"),
+                "the revealed artifact must become the stable current-page cache",
+                revealedArtifact,
+                view.slideFrontArtifactForTest(),
             )
             assertSame(
-                "the outgoing shot must become the stable backward-page cache",
-                front,
-                view.privateField("cachedBackwardBitmap"),
+                "the outgoing artifact must become the stable backward-page cache",
+                frontArtifact,
+                view.slideBackwardArtifactForTest(),
             )
-            assertFalse("the stable backward display-list bitmap must survive before frame one", front.isRecycled)
-            assertFalse("the stable current display-list bitmap must survive before frame one", revealed.isRecycled)
-            assertEquals(leasedWhileRecorded, budget.leasedBytes)
-            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+            assertTrue("stable artifacts must be live before frame one", frontArtifact.slideArtifactRecordIsLive())
+            assertTrue("stable artifacts must be live before frame one", revealedArtifact.slideArtifactRecordIsLive())
 
-            // While the retirement fence still holds the outgoing shot, drop its stable backward
-            // owner and request its recycle through the render fence. Front becomes ownerless with
-            // recycleRequested queued, but the fence keeps it leased/charged through frame two.
-            view.detachCachedTextureOwnerForTest(front)
-            view.recyclePageShotForTest(front)
+            // While the retirement fence still holds the outgoing artifact, drop its stable
+            // backward owner and request discard through the render fence. The ownerless artifact
+            // stays live until frame two; the rekeyed current owner survives untouched.
+            view.setPrivateField("slideBackwardSlot", null)
+            view.discardSlideArtifactForTest(frontArtifact)
 
             assertNull(
-                "detaching must remove the outgoing shot from stable cache ownership",
-                view.privateField("cachedBackwardBitmap"),
+                "detaching must remove the outgoing artifact from stable cache ownership",
+                view.slideBackwardArtifactForTest(),
             )
-            assertFalse("detached outgoing bitmap must stay live while the fence charges it", front.isRecycled)
-            assertFalse("detaching the outgoing owner must not disturb the stable current owner", revealed.isRecycled)
-            assertEquals(leasedWhileRecorded, budget.leasedBytes)
-            assertEquals(chargedWhileRecorded, budget.chargedBytes)
-
-            // Ownerless front plus stable revealed fill the two-shot budget exactly: normal precache
-            // must defer rather than stage the adjacent target or replace the current-page owner.
-            view.preCachePageTexturesForTest(idlePostedWork = false)
-
-            assertFalse(
-                "speculative precache must defer while the fence charges consume capacity",
-                view.privateBool("pageTexturePrecachePending"),
-            )
-            assertNull(
-                "a budget-deferred precache must not stage a pending request",
-                view.privateField("pendingPageTexturePrecache"),
-            )
-            assertSame(
-                "deferred precache must not replace the stable current-page owner",
-                revealed,
-                view.privateField("cachedFrontBitmap"),
-            )
-            assertFalse("deferred precache must not recycle the outgoing fenced bitmap", front.isRecycled)
-            assertFalse("deferred precache must not recycle the stable revealed bitmap", revealed.isRecycled)
-            assertEquals(leasedWhileRecorded, budget.leasedBytes)
-            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+            assertTrue("detached outgoing artifact must stay live while the fence charges it", frontArtifact.slideArtifactRecordIsLive())
+            assertTrue("detaching the outgoing owner must not disturb the stable current owner", revealedArtifact.slideArtifactRecordIsLive())
 
             shadowOf(Looper.getMainLooper()).runOneTask()
 
-            assertFalse("the ownerless outgoing bitmap must remain protected after only one host frame", front.isRecycled)
-            assertFalse("the stable current bitmap must remain protected after only one host frame", revealed.isRecycled)
-            assertEquals(leasedWhileRecorded, budget.leasedBytes)
-            assertEquals(chargedWhileRecorded, budget.chargedBytes)
+            assertTrue("the ownerless outgoing artifact must remain protected after only one host frame", frontArtifact.slideArtifactRecordIsLive())
+            assertTrue("the stable current artifact must remain protected after only one host frame", revealedArtifact.slideArtifactRecordIsLive())
 
             shadowOf(Looper.getMainLooper()).runOneTask()
 
-            assertTrue("the ownerless outgoing bitmap may recycle only after frame two", front.isRecycled)
-            assertFalse("frame barriers must not recycle a bitmap still owned by the stable cache", revealed.isRecycled)
-            assertSame(revealed, view.privateField("cachedFrontBitmap"))
-            assertEquals(revealed.allocationByteCount.toLong(), budget.leasedBytes)
-            assertEquals(revealed.allocationByteCount.toLong(), budget.chargedBytes)
+            assertFalse("the ownerless outgoing artifact may discard only after frame two", frontArtifact.slideArtifactRecordIsLive())
+            assertTrue("frame barriers must not discard an artifact still owned by the stable cache", revealedArtifact.slideArtifactRecordIsLive())
+            assertSame(revealedArtifact, view.slideFrontArtifactForTest())
             assertTrue(
-                "frame two must immediately re-arm the deferred precache for the newly admissible " +
-                    "adjacent target without a new event; " +
-                    "pending=${view.privateBool("pageTexturePrecachePending")} " +
-                    "request=${view.privateField("pendingPageTexturePrecache")}",
-                view.privateBool("pageTexturePrecachePending") ||
-                    view.privateField("pendingPageTexturePrecache") != null,
+                "frame two must immediately re-arm the artifact precache for the newly admissible " +
+                    "adjacent pages without a new event; " +
+                    "pending=${view.privateBool("slideArtifactPrecachePending")} " +
+                    "request=${view.privateField("pendingSlideArtifactPrecache")}",
+                view.privateBool("slideArtifactPrecachePending") &&
+                    view.privateField("pendingSlideArtifactPrecache") != null,
             )
         } finally {
             view.dispose()
@@ -749,23 +719,23 @@ class EpubFlowViewTest {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.preCachePageTexturesForTest()
-        val oldFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-        val oldRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+        val oldFront = checkNotNull(view.slideFrontArtifactForTest())
+        val oldRevealed = checkNotNull(view.slideRevealedArtifactForTest())
 
         assertTrue(view.goToAdjacentPage(1))
         shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
 
-        val newFront = view.privateField("cachedFrontBitmap") as Bitmap?
-        val newForward = view.privateField("cachedRevealedBitmap") as Bitmap?
-        val newBackward = view.privateField("cachedBackwardBitmap") as Bitmap?
+        val newFront = view.slideFrontArtifactForTest()
+        val newForward = view.slideRevealedArtifactForTest()
+        val newBackward = view.slideBackwardArtifactForTest()
         assertTrue(
             "commit must rekey the revealed frame as current and retain the old current as a neighbor; " +
-                "oldFront=$oldFront recycled=${oldFront.isRecycled} " +
-                "oldRevealed=$oldRevealed recycled=${oldRevealed.isRecycled} " +
+                "oldFrontLive=${oldFront.slideArtifactRecordIsLive()} " +
+                "oldRevealedLive=${oldRevealed.slideArtifactRecordIsLive()} " +
                 "new=[$newBackward,$newFront,$newForward]",
             newFront === oldRevealed &&
-                !oldRevealed.isRecycled &&
-                !oldFront.isRecycled &&
+                oldRevealed.slideArtifactRecordIsLive() &&
+                oldFront.slideArtifactRecordIsLive() &&
                 (newBackward === oldFront || newForward === oldFront),
         )
     }
@@ -775,29 +745,29 @@ class EpubFlowViewTest {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.preCachePageTexturesForTest()
-        val oldFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-        val oldRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+        val oldFront = checkNotNull(view.slideFrontArtifactForTest())
+        val oldRevealed = checkNotNull(view.slideRevealedArtifactForTest())
 
         assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
         val activeSlide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
-        assertTrue(activeSlide.privateBitmap("frontBitmap") === oldFront)
-        assertTrue(activeSlide.privateBitmap("revealedBitmap") === oldRevealed)
+        assertTrue(activeSlide.frontArtifactForTest() === oldFront)
+        assertTrue(activeSlide.revealedArtifactForTest() === oldRevealed)
         view.updateInteractiveCurl(x = view.width * 0.10f)
         view.endInteractiveCurl(velocityX = 0f)
         shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
 
-        val newFront = view.privateField("cachedFrontBitmap") as Bitmap?
-        val newBackward = view.privateField("cachedBackwardBitmap") as Bitmap?
+        val newFront = view.slideFrontArtifactForTest()
+        val newBackward = view.slideBackwardArtifactForTest()
         assertTrue(
             "interactive commit must transfer the revealed identity into current and the old front " +
-                "into the backward neighbor without recycling or replacing either; " +
-                "oldFront=$oldFront recycled=${oldFront.isRecycled} " +
-                "oldRevealed=$oldRevealed recycled=${oldRevealed.isRecycled} " +
+                "into the backward neighbor without discarding or replacing either; " +
+                "oldFrontLive=${oldFront.slideArtifactRecordIsLive()} " +
+                "oldRevealedLive=${oldRevealed.slideArtifactRecordIsLive()} " +
                 "newBackward=$newBackward newFront=$newFront",
             newFront === oldRevealed &&
                 newBackward === oldFront &&
-                !oldRevealed.isRecycled &&
-                !oldFront.isRecycled,
+                oldRevealed.slideArtifactRecordIsLive() &&
+                oldFront.slideArtifactRecordIsLive(),
         )
     }
 
@@ -1186,35 +1156,108 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `warmed discrete boundary turn transfers outgoing identity without viewport recapture`() {
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
-        view.goToLastPage()
-        val background = RecordingBoundsTopDrawable()
-        view.background = background
-        view.preCachePageTexturesForTest()
-        val warmedOutgoing = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-        val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
-        val leasedBeforeTurn = budget.leasedBytes
-        background.boundsTops.clear()
-        view.offerReadyBoundaryPreviewForTest(forward = true, token = 51L)
-
+    fun `warmed SIMULATION boundary reuses warmed owner while SLIDE boundary captures one fresh outgoing Bitmap`() {
+        EpubPageShotCaptureProbe.reset()
         try {
+            for (style in listOf(PageFlipStyle.SIMULATION, PageFlipStyle.SLIDE)) {
+                val view = pagedFlowView(flipStyle = style)
+                view.goToLastPage()
+                val background = RecordingBoundsTopDrawable()
+                view.background = background
+                view.preCachePageTexturesForTest()
+                val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
+                val leasedBeforeTurn = budget.leasedBytes
+                background.boundsTops.clear()
+                val preview = view.offerReadyBoundaryPreviewForTest(forward = true, token = 51L)
+                try {
+                    val capturesBeforeTurn = EpubPageShotCaptureProbe.total()
+                    assertTrue(view.startDiscreteBoundaryTurn(1))
+                    if (style == PageFlipStyle.SIMULATION) {
+                        val warmedOutgoing = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+                        val paper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?)
+                        assertTrue(
+                            "a warmed SIMULATION boundary tap must transfer the existing current-page owner by identity",
+                            paper.privateBitmap("frontBitmap") === warmedOutgoing,
+                        )
+                        assertTrue(
+                            "the warmed SIMULATION discrete path must not call snapshotViewport or draw the live page again: " +
+                                background.boundsTops,
+                            background.boundsTops.isEmpty(),
+                        )
+                        assertTrue(
+                            "taking the warmed outgoing owner must not add another page-shot lease: " +
+                                "before=$leasedBeforeTurn after=${budget.leasedBytes}",
+                            budget.leasedBytes <= leasedBeforeTurn,
+                        )
+                    } else {
+                        // Warm SLIDE boundary stays Bitmap-based: the outgoing front is freshly
+                        // captured exactly once because the boundary renderer and continuity
+                        // reverseBitmap require Bitmap frames; the offered preview Bitmap identity is
+                        // preserved and no warm Bitmap cache is re-added.
+                        val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+                        assertNotNull(
+                            "SLIDE boundary must capture a fresh outgoing Bitmap",
+                            slide.privateBitmap("frontBitmap"),
+                        )
+                        assertTrue(
+                            "SLIDE boundary renderer must retain the exact offered preview bitmap",
+                            slide.privateBitmap("revealedBitmap") === preview,
+                        )
+                        assertEquals(
+                            "warm SLIDE boundary may capture exactly one fresh outgoing viewport Bitmap",
+                            capturesBeforeTurn + 1,
+                            EpubPageShotCaptureProbe.total(),
+                        )
+                    }
+                } finally {
+                    view.dispose()
+                }
+            }
+        } finally {
+            EpubPageShotCaptureProbe.stop()
+        }
+    }
+
+    @Test
+    fun `dirty SIMULATION front forces fresh outgoing shot for discrete boundary turn`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
+        try {
+            view.goToLastPage()
+            view.preCachePageTexturesForTest()
+            val preview = view.newBoundaryPreviewForTest(forward = true, token = 511L)
+            val previewBitmap = preview.bitmap
+            assertTrue(view.offerBoundaryPreviewForTest(preview))
+            val staleFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            val staleMarker = 0xFF5B00FF.toInt()
+            staleFront.eraseColor(staleMarker)
+            view.replacePendingInPlacePageShotRefreshSlotsForTest("FRONT")
+            assertEquals(
+                "only FRONT should be dirty for this boundary entry",
+                setOf("FRONT"),
+                view.pendingInPlacePageShotRefreshSlotNamesForTest(),
+            )
+
             assertTrue(view.startDiscreteBoundaryTurn(1))
 
-            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val paper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?)
+            val outgoing = paper.privateBitmap("frontBitmap")
+            val revealed = paper.privateBitmap("revealedBitmap")
             assertTrue(
-                "a warmed boundary tap must transfer the existing current-page owner by identity",
-                slide.privateBitmap("frontBitmap") === warmedOutgoing,
+                "dirty FRONT must not transfer the warmed outgoing owner",
+                outgoing !== staleFront,
+            )
+            assertEquals(
+                "fresh outgoing capture must not carry the stale FRONT marker",
+                0,
+                outgoing.countExactPixels(staleMarker),
             )
             assertTrue(
-                "the warmed discrete path must not call snapshotViewport or draw the live page again: " +
-                    background.boundsTops,
-                background.boundsTops.isEmpty(),
+                "boundary renderer must retain the exact offered preview bitmap",
+                revealed === previewBitmap,
             )
-            assertTrue(
-                "taking the warmed outgoing owner must not add another page-shot lease: " +
-                    "before=$leasedBeforeTurn after=${budget.leasedBytes}",
-                budget.leasedBytes <= leasedBeforeTurn,
+            assertFalse(
+                "offered preview must remain live while the boundary renderer owns it",
+                previewBitmap.isRecycled,
             )
         } finally {
             view.dispose()
@@ -1222,65 +1265,8 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `dirty front forces fresh outgoing shot for discrete boundary turn`() {
-        for (style in listOf(PageFlipStyle.SLIDE, PageFlipStyle.SIMULATION)) {
-            val view = pagedFlowView(flipStyle = style)
-            try {
-                view.goToLastPage()
-                view.preCachePageTexturesForTest()
-                val staleFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-                val staleMarker = 0xFF5B00FF.toInt()
-                staleFront.eraseColor(staleMarker)
-                view.replacePendingInPlacePageShotRefreshSlotsForTest("FRONT")
-                assertEquals(
-                    "style=$style only FRONT should be dirty for this boundary entry",
-                    setOf("FRONT"),
-                    view.pendingInPlacePageShotRefreshSlotNamesForTest(),
-                )
-
-                val preview = view.newBoundaryPreviewForTest(forward = true, token = 511L)
-                val previewBitmap = preview.bitmap
-                assertTrue(view.offerBoundaryPreviewForTest(preview))
-
-                assertTrue(view.startDiscreteBoundaryTurn(1))
-
-                val drawable: Any = when (style) {
-                    PageFlipStyle.SLIDE -> checkNotNull(
-                        view.privateField("slideDrawable") as PageSlideDrawable?,
-                    ) { "style=$style discrete boundary turn must install PageSlideDrawable" }
-                    PageFlipStyle.SIMULATION -> checkNotNull(
-                        view.privateField("curlDrawable") as PageCurlDrawable?,
-                    ) { "style=$style discrete boundary turn must install PageCurlDrawable" }
-                    else -> error("unsupported test style $style")
-                }
-                val outgoing = drawable.privateBitmap("frontBitmap")
-                val revealed = drawable.privateBitmap("revealedBitmap")
-                assertTrue(
-                    "style=$style dirty FRONT must not transfer the warmed outgoing owner",
-                    outgoing !== staleFront,
-                )
-                assertEquals(
-                    "style=$style fresh outgoing capture must not carry the stale FRONT marker",
-                    0,
-                    outgoing.countExactPixels(staleMarker),
-                )
-                assertTrue(
-                    "style=$style boundary renderer must retain the exact offered preview bitmap",
-                    revealed === previewBitmap,
-                )
-                assertFalse(
-                    "style=$style offered preview must remain live while the boundary renderer owns it",
-                    previewBitmap.isRecycled,
-                )
-            } finally {
-                view.dispose()
-            }
-        }
-    }
-
-    @Test
     fun `page shot trim clears stable and inactive owners but preserves continuity cover`() {
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         view.goToPage(1)
         view.preCachePageTexturesForTest()
         val continuityCover = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
@@ -1614,41 +1600,41 @@ class EpubFlowViewTest {
     fun `width resize and highlight refresh invalidate warmed local texture owners`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         view.preCachePageTexturesForTest()
-        val originalFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-        val originalTarget = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
-        val originalFrontKey = checkNotNull(view.privateField("cachedFromTextureKey"))
-        val originalTargetKey = checkNotNull(view.privateField("cachedTargetTextureKey"))
+        val originalFront = checkNotNull(view.slideFrontArtifactForTest())
+        val originalTarget = checkNotNull(view.slideRevealedArtifactForTest())
+        val originalFrontKey = checkNotNull(view.slideArtifactSlotKeyForTest("slideFrontSlot"))
+        val originalTargetKey = checkNotNull(view.slideArtifactSlotKeyForTest("slideRevealedSlot"))
 
         view.measure(exactly(420), exactly(120))
         view.layout(0, 0, 420, 120)
         shadowOf(Looper.getMainLooper()).idle()
         view.preCachePageTexturesForTest()
 
-        val resizedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-        val resizedTarget = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
-        val resizedFrontKey = checkNotNull(view.privateField("cachedFromTextureKey"))
-        val resizedTargetKey = checkNotNull(view.privateField("cachedTargetTextureKey"))
-        assertTrue("width-only resize must recycle the old front texture", originalFront.isRecycled)
-        assertTrue("width-only resize must recycle the old target texture", originalTarget.isRecycled)
-        assertTrue("width-only resize must allocate a new front texture owner", resizedFront !== originalFront)
-        assertTrue("width-only resize must allocate a new target texture owner", resizedTarget !== originalTarget)
+        val resizedFront = checkNotNull(view.slideFrontArtifactForTest())
+        val resizedTarget = checkNotNull(view.slideRevealedArtifactForTest())
+        val resizedFrontKey = checkNotNull(view.slideArtifactSlotKeyForTest("slideFrontSlot"))
+        val resizedTargetKey = checkNotNull(view.slideArtifactSlotKeyForTest("slideRevealedSlot"))
+        assertTrue("width-only resize must discard the old front artifact", !originalFront.slideArtifactRecordIsLive())
+        assertTrue("width-only resize must discard the old target artifact", !originalTarget.slideArtifactRecordIsLive())
+        assertTrue("width-only resize must record a new front artifact owner", resizedFront !== originalFront)
+        assertTrue("width-only resize must record a new target artifact owner", resizedTarget !== originalTarget)
         assertTrue("width-only resize must not preserve the old front key", resizedFrontKey != originalFrontKey)
         assertTrue("width-only resize must not preserve the old target key", resizedTargetKey != originalTargetKey)
 
         view.refreshHighlights(emptyList())
 
-        assertTrue("highlight refresh must recycle the current front texture", resizedFront.isRecycled)
-        assertTrue("highlight refresh must recycle the current target texture", resizedTarget.isRecycled)
-        assertNull("highlight refresh must clear the current front key", view.privateField("cachedFromTextureKey"))
-        assertNull("highlight refresh must clear the current target key", view.privateField("cachedTargetTextureKey"))
+        assertTrue("highlight refresh must discard the current front artifact", !resizedFront.slideArtifactRecordIsLive())
+        assertTrue("highlight refresh must discard the current target artifact", !resizedTarget.slideArtifactRecordIsLive())
+        assertNull("highlight refresh must clear the current front key", view.slideArtifactSlotKeyForTest("slideFrontSlot"))
+        assertNull("highlight refresh must clear the current target key", view.slideArtifactSlotKeyForTest("slideRevealedSlot"))
         view.preCachePageTexturesForTest()
         assertTrue(
-            "highlight refresh must rebuild a new front bitmap before the next local turn",
-            checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) !== resizedFront,
+            "highlight refresh must rebuild a new front artifact before the next local turn",
+            checkNotNull(view.slideFrontArtifactForTest()) !== resizedFront,
         )
         assertTrue(
-            "highlight refresh must rebuild a new target bitmap before the next local turn",
-            checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) !== resizedTarget,
+            "highlight refresh must rebuild a new target artifact before the next local turn",
+            checkNotNull(view.slideRevealedArtifactForTest()) !== resizedTarget,
         )
     }
 
@@ -2524,8 +2510,6 @@ class EpubFlowViewTest {
                     PageFlipStyle.SIMULATION -> checkNotNull(view.privateField("curlDrawable"))
                     else -> error("unsupported test style $style")
                 }
-                drawable.privateBitmap("frontBitmap").eraseColor(frontColor)
-                drawable.privateBitmap("revealedBitmap").eraseColor(targetColor)
 
                 view.updateInteractiveCurl(x = view.width / 2f)
                 val progress = when (drawable) {
@@ -2536,20 +2520,35 @@ class EpubFlowViewTest {
                 assertEquals("$style must remain held at half progress", 0.5f, progress, 0.001f)
                 assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
 
-                val heldFrame = view.drawAsScrolledChildToBitmapForTest()
-                try {
-                    assertEquals(
-                        "$style must keep the outgoing page shot visible before release",
-                        frontColor,
-                        heldFrame.getPixel(view.width / 10, view.height / 2),
+                if (style == PageFlipStyle.SIMULATION) {
+                    // Pixel-band verification only applies to the Bitmap paper renderer; the warm
+                    // SLIDE strip replays frozen command artifacts and is not software-drawn here.
+                    drawable.privateBitmap("frontBitmap").eraseColor(frontColor)
+                    drawable.privateBitmap("revealedBitmap").eraseColor(targetColor)
+                    val heldFrame = view.drawAsScrolledChildToBitmapForTest()
+                    try {
+                        assertEquals(
+                            "SIMULATION must keep the outgoing page shot visible before release",
+                            frontColor,
+                            heldFrame.getPixel(view.width / 10, view.height / 2),
+                        )
+                        assertEquals(
+                            "SIMULATION must reveal only the target half before release",
+                            targetColor,
+                            heldFrame.getPixel(view.width * 3 / 4, view.height / 2),
+                        )
+                    } finally {
+                        heldFrame.recycle()
+                    }
+                } else {
+                    assertNotNull(
+                        "SLIDE held strip must own a current-page artifact frame",
+                        (drawable as PageSlideDrawable).frontArtifactForTest(),
                     )
-                    assertEquals(
-                        "$style must reveal only the target half before release",
-                        targetColor,
-                        heldFrame.getPixel(view.width * 3 / 4, view.height / 2),
+                    assertNotNull(
+                        "SLIDE held strip must own a target-page artifact frame",
+                        drawable.revealedArtifactForTest(),
                     )
-                } finally {
-                    heldFrame.recycle()
                 }
             } finally {
                 if (view.privateField("interactiveTurnState").toString() != "NONE") {
@@ -2671,8 +2670,8 @@ class EpubFlowViewTest {
         val slideAfterIntercept = checkNotNull(
             view.privateField("slideDrawable") as PageSlideDrawable?,
         ) { "intercept apply must start interactive slide once" }
-        val frontAfterIntercept = slideAfterIntercept.privateBitmap("frontBitmap")
-        val revealedAfterIntercept = slideAfterIntercept.privateBitmap("revealedBitmap")
+        val frontAfterIntercept = slideAfterIntercept.frontArtifactForTest()
+        val revealedAfterIntercept = slideAfterIntercept.revealedArtifactForTest()
         val progressAfterIntercept = slideAfterIntercept.progress
         val expectedFirst = (downX - firstMoveX) / view.width.toFloat()
         assertEquals(
@@ -2692,12 +2691,12 @@ class EpubFlowViewTest {
             0.0001f,
         )
         assertTrue(
-            "page shots must not reallocate when the intercepted MOVE is redelivered",
-            slideAfterDuplicate.privateBitmap("frontBitmap") === frontAfterIntercept,
+            "artifacts must not be re-recorded when the intercepted MOVE is redelivered",
+            slideAfterDuplicate.frontArtifactForTest() === frontAfterIntercept,
         )
         assertTrue(
-            "revealed page shot must stay the same owner across the suppressed redelivery",
-            slideAfterDuplicate.privateBitmap("revealedBitmap") === revealedAfterIntercept,
+            "revealed artifact must stay the same owner across the suppressed redelivery",
+            slideAfterDuplicate.revealedArtifactForTest() === revealedAfterIntercept,
         )
 
         assertTrue(view.onTouchEvent(secondMove))
@@ -2714,9 +2713,9 @@ class EpubFlowViewTest {
             slideAfterSecond.progress > progressAfterIntercept + 0.01f,
         )
         assertTrue(
-            "subsequent MOVE must not reallocate page shots once the turn is live",
-            slideAfterSecond.privateBitmap("frontBitmap") === frontAfterIntercept &&
-                slideAfterSecond.privateBitmap("revealedBitmap") === revealedAfterIntercept,
+            "subsequent MOVE must not re-record artifacts once the turn is live",
+            slideAfterSecond.frontArtifactForTest() === frontAfterIntercept &&
+                slideAfterSecond.revealedArtifactForTest() === revealedAfterIntercept,
         )
 
         view.onTouchEvent(motionEvent(downTime, downTime + 72L, MotionEvent.ACTION_CANCEL, secondMoveX, y))
@@ -2738,23 +2737,23 @@ class EpubFlowViewTest {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
         view.preCachePageTexturesForTest()
-        val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-        val cachedRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+        val cachedFront = checkNotNull(view.slideFrontArtifactForTest())
+        val cachedRevealed = checkNotNull(view.slideRevealedArtifactForTest())
 
         assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
 
         try {
             val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
             assertTrue(
-                "the crossing MOVE must transfer the warmed current-page shot instead of allocating a replacement",
-                slide.privateBitmap("frontBitmap") === cachedFront,
+                "the crossing MOVE must transfer the warmed current-page artifact instead of allocating a replacement",
+                slide.frontArtifactForTest() === cachedFront,
             )
             assertTrue(
-                "the crossing MOVE must transfer the warmed next-page shot instead of drawing the view again",
-                slide.privateBitmap("revealedBitmap") === cachedRevealed,
+                "the crossing MOVE must transfer the warmed next-page artifact instead of drawing the view again",
+                slide.revealedArtifactForTest() === cachedRevealed,
             )
-            assertNull("the active drawable now owns the front shot", view.privateField("cachedFrontBitmap"))
-            assertNull("the active drawable now owns the revealed shot", view.privateField("cachedRevealedBitmap"))
+            assertNull("the active drawable now owns the front artifact", view.slideFrontArtifactForTest())
+            assertNull("the active drawable now owns the revealed artifact", view.slideRevealedArtifactForTest())
         } finally {
             view.endInteractiveCurl(velocityX = 0f)
             shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
@@ -3068,11 +3067,11 @@ class EpubFlowViewTest {
         val background = RecordingBoundsTopDrawable()
         view.background = background
         view.preCachePageTexturesForTest()
-        val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) {
-            "FREE_REST precache must warm the arbitrary outgoing viewport"
+        val cachedFront = checkNotNull(view.slideFrontArtifactForTest()) {
+            "FREE_REST precache must warm the arbitrary outgoing viewport artifact"
         }
-        val cachedRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) {
-            "FREE_REST precache must warm its dynamic forward target"
+        val cachedRevealed = checkNotNull(view.slideRevealedArtifactForTest()) {
+            "FREE_REST precache must warm its dynamic forward target artifact"
         }
         background.boundsTops.clear()
 
@@ -3080,11 +3079,11 @@ class EpubFlowViewTest {
 
         try {
             val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
-            val frontTransferred = slide.privateBitmap("frontBitmap") === cachedFront
-            val targetTransferred = slide.privateBitmap("revealedBitmap") === cachedRevealed
+            val frontTransferred = slide.frontArtifactForTest() === cachedFront
+            val targetTransferred = slide.revealedArtifactForTest() === cachedRevealed
             val liveDrawBounds = background.boundsTops.toList()
             assertTrue(
-                "the first interactive frame must transfer both warmed FREE_REST shots by identity " +
+                "the first interactive frame must transfer both warmed FREE_REST artifacts by identity " +
                     "without live recapture; frontTransferred=$frontTransferred " +
                     "targetTransferred=$targetTransferred liveDrawBounds=$liveDrawBounds",
                 frontTransferred && targetTransferred && liveDrawBounds.isEmpty(),
@@ -6975,8 +6974,8 @@ class EpubFlowViewTest {
             view.recycleCachedTexturesForTest()
             view.preCachePageTexturesForTest()
 
-            val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-            val cachedTarget = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+            val cachedFront = checkNotNull(view.slideFrontArtifactForTest())
+            val cachedTarget = checkNotNull(view.slideRevealedArtifactForTest())
             val capturesAfterWarm = EpubPageShotCaptureProbe.total()
             val targetWindow = (view.privateField("paged") as List<EpubFlowPage>)[fixture.imagePageIndex]
 
@@ -6991,14 +6990,14 @@ class EpubFlowViewTest {
             assertTrue("rapid turn should start from the warm pair", started)
             val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
             assertSame(
-                "rapid current page must transfer the cached front owner",
+                "rapid current page must transfer the cached front artifact",
                 cachedFront,
-                slide.privateBitmap("frontBitmap"),
+                slide.frontArtifactForTest(),
             )
             assertSame(
-                "rapid target page must transfer the cached revealed owner",
+                "rapid target page must transfer the cached revealed artifact",
                 cachedTarget,
-                slide.privateBitmap("revealedBitmap"),
+                slide.revealedArtifactForTest(),
             )
             assertEquals(
                 "an already valid rapid pair must not allocate another page shot",
@@ -7026,8 +7025,8 @@ class EpubFlowViewTest {
 
             assertFalse("a cold rapid queue must wait for a warm pair", drain)
             assertTrue(
-                "the queue must bootstrap current+target precache instead of taking cold shots",
-                view.privateBool("pageTexturePrecachePending"),
+                "the queue must bootstrap current+target artifact precache instead of taking cold shots",
+                view.privateBool("slideArtifactPrecachePending"),
             )
             assertNull("no animation may start before the pair is committed", view.privateField("slideDrawable"))
 
@@ -7035,8 +7034,8 @@ class EpubFlowViewTest {
 
             assertNotNull("the queued turn may start only after the pair is available", view.privateField("slideDrawable"))
             assertEquals(
-                "the bootstrap must capture exactly one current/target pair",
-                2,
+                "the artifact bootstrap must not allocate any viewport page-shot bitmap",
+                0,
                 EpubPageShotCaptureProbe.total(),
             )
             assertEquals(1, view.currentPageIndex())
@@ -7549,7 +7548,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `precache refreshes recycled cached textures even when top keys match`() {
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
         view.recycleCachedTexturesForTest()
         val pageZeroTop = requireNotNull(view.pageTopPxAt(0))
@@ -7791,7 +7790,9 @@ class EpubFlowViewTest {
         // target must retain that front as pendingLocalPageShotHandoff.frontBitmap (LOCAL_SHOTS_WAITING)
         // and later install the overlay with that exact identity after only one additional target draw.
         val background = RecordingTargetBitmapDrawable()
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        // The partial-front seeding contract lives on the Bitmap precache path; SIMULATION keeps
+        // the split-frame Bitmap staging and deferred MOVE handoff unchanged.
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.goToPage(1)
         view.background = background
@@ -7874,14 +7875,14 @@ class EpubFlowViewTest {
             )
 
             shadowOf(Looper.getMainLooper()).runOneTask()
-            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?) {
-                "seeded handoff must install the local slide overlay after target + front resolution"
+            val paper = checkNotNull(view.privateField("curlDrawable") as PageCurlDrawable?) {
+                "seeded SIMULATION handoff must install the local paper overlay after target + front resolution"
             }
             assertTrue(
-                "local slide overlay must use the exact staged front identity; " +
-                    "paperFront=${slide.privateBitmap("frontBitmap")} staged=$stagedFront " +
+                "local paper overlay must use the exact staged front identity; " +
+                    "paperFront=${paper.privateBitmap("frontBitmap")} staged=$stagedFront " +
                     "recycled=${stagedFront.isRecycled}",
-                slide.privateBitmap("frontBitmap") === stagedFront && !stagedFront.isRecycled,
+                paper.privateBitmap("frontBitmap") === stagedFront && !stagedFront.isRecycled,
             )
             assertEquals(
                 "only one additional full page-shot draw (target) may occur after the staged front; " +
@@ -7891,7 +7892,7 @@ class EpubFlowViewTest {
             )
             assertTrue(
                 "overlay revealed must be the newly captured target identity",
-                slide.privateBitmap("revealedBitmap") === background.targetBitmaps[1],
+                paper.privateBitmap("revealedBitmap") === background.targetBitmaps[1],
             )
         } finally {
             view.onTouchEvent(motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y))
@@ -7903,7 +7904,7 @@ class EpubFlowViewTest {
     @Test
     fun `seeded front ACTION_CANCEL recycles staged front and blocks stale target capture`() {
         val background = RecordingTargetBitmapDrawable()
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.goToPage(1)
         view.background = background
@@ -8003,7 +8004,7 @@ class EpubFlowViewTest {
     @Test
     fun `seeded front invalidation recycles seed and target and ignores stale resume`() {
         val background = RecordingTargetBitmapDrawable()
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.goToPage(1)
         view.background = background
@@ -8101,7 +8102,7 @@ class EpubFlowViewTest {
         val reportedOffsets = mutableListOf<Int>()
         val background = RecordingTargetBitmapDrawable()
         val view = pagedFlowView(
-            flipStyle = PageFlipStyle.SLIDE,
+            flipStyle = PageFlipStyle.SIMULATION,
             onTopOffsetChanged = reportedOffsets::add,
         )
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -8235,7 +8236,7 @@ class EpubFlowViewTest {
         // Stage front + forward (opposite of a backward request) while backward previous is missing.
         // Real backward MOVE must retain front for local handoff and recycle the staged forward neighbor.
         val background = RecordingTargetBitmapDrawable()
-        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SIMULATION)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.goToPage(1)
         view.background = background
@@ -8404,11 +8405,9 @@ class EpubFlowViewTest {
     }
 
     @Test
-    fun `chapter entry precache keeps three full viewport RGB565 motion artifacts`() {
-        val budget = PageShotBudget(48L * 1024L * 1024L)
+    fun `chapter entry precache warms current, previous, and next frozen artifacts`() {
         val view = pagedFlowView(
             flipStyle = PageFlipStyle.SLIDE,
-            pageShotBudget = budget,
         )
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
         view.background = ColorDrawable(0xFFEDE6D6.toInt())
@@ -8418,6 +8417,7 @@ class EpubFlowViewTest {
 
         try {
             view.recycleCachedTexturesForTest()
+            EpubPageShotCaptureProbe.reset()
             view.setChapter(
                 flow,
                 chapterText,
@@ -8430,22 +8430,28 @@ class EpubFlowViewTest {
             view.drainPendingPageTexturePrecacheForTest()
 
             assertEquals("fixture must restore chapter entry to a middle page", 1, view.currentPageIndex())
-            val owners = listOfNotNull(
-                view.privateField("cachedFrontBitmap") as Bitmap?,
-                view.privateField("cachedBackwardBitmap") as Bitmap?,
-                view.privateField("cachedRevealedBitmap") as Bitmap?,
+            val frontSlot = view.slideArtifactSlotForTest("slideFrontSlot")
+            val backwardSlot = view.slideArtifactSlotForTest("slideBackwardSlot")
+            val revealedSlot = view.slideArtifactSlotForTest("slideRevealedSlot")
+            assertNotNull("chapter entry must warm current", frontSlot)
+            assertNotNull("chapter entry must warm previous", backwardSlot)
+            assertNotNull("chapter entry must warm next", revealedSlot)
+            assertEquals(1, checkNotNull(frontSlot).reflectedField("page"))
+            assertEquals(0, checkNotNull(backwardSlot).reflectedField("page"))
+            assertEquals(2, checkNotNull(revealedSlot).reflectedField("page"))
+            assertNotNull("current slot must carry an exact artifact key", checkNotNull(frontSlot).reflectedField("key"))
+            assertNotNull("previous slot must carry an exact artifact key", checkNotNull(backwardSlot).reflectedField("key"))
+            assertNotNull("next slot must carry an exact artifact key", checkNotNull(revealedSlot).reflectedField("key"))
+            assertTrue(checkNotNull(view.slideFrontArtifactForTest()).slideArtifactRecordIsLive())
+            assertTrue(checkNotNull(view.slideBackwardArtifactForTest()).slideArtifactRecordIsLive())
+            assertTrue(checkNotNull(view.slideRevealedArtifactForTest()).slideArtifactRecordIsLive())
+            assertEquals(
+                "warm SLIDE chapter entry must not allocate any viewport page-shot bitmap",
+                0,
+                EpubPageShotCaptureProbe.total(),
             )
-            assertEquals("chapter entry must warm current, previous, and next", 3, owners.size)
-            owners.forEach { bitmap ->
-                assertMotionPageShotSize(view, bitmap)
-                assertEquals(Bitmap.Config.RGB_565, bitmap.config)
-            }
-            val threeMotionRgb565Bytes =
-                view.privateNoArgInt("motionPageShotWidthPx").toLong() *
-                    view.privateNoArgInt("motionPageShotHeightPx").toLong() *
-                    2L * 3L
-            assertEquals(threeMotionRgb565Bytes, budget.leasedBytes)
         } finally {
+            EpubPageShotCaptureProbe.stop()
             view.dispose()
         }
     }
@@ -8993,27 +8999,26 @@ class EpubFlowViewTest {
             view.recycleCachedTexturesForTest()
             view.preCachePageTexturesForTest()
             assertNotNull(
-                "precache must warm front at park=$parkPage",
-                view.privateField("cachedFrontBitmap"),
+                "precache must warm front artifact at park=$parkPage",
+                view.slideFrontArtifactForTest(),
             )
             assertNotNull(
-                "precache must warm revealed at park=$parkPage",
-                view.privateField("cachedRevealedBitmap"),
+                "precache must warm revealed artifact at park=$parkPage",
+                view.slideRevealedArtifactForTest(),
             )
 
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
             view.updateInteractiveCurl(x = view.width * 0.45f)
             assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
 
-            // Snapshot owners after the turn has claimed finger-owned shots. Turn start may
-            // re-home front/revealed into the curl overlay and drop the opposite speculative
-            // slot — that is not PIXELS_ONLY behavior. Measure only what remains under turn.
-            val frontDuringTurn = view.privateField("cachedFrontBitmap") as Bitmap?
-            val revealedDuringTurn = view.privateField("cachedRevealedBitmap") as Bitmap?
-            val backwardDuringTurn = view.privateField("cachedBackwardBitmap") as Bitmap?
-            val genAtTurnStart = view.privateField("pageTexturePrecacheGeneration") as Long
+            // The turn claims the warm artifact pair; PIXELS_ONLY must not mutate the recorded
+            // active artifacts or bump the artifact precache generation.
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            val frontDuringTurn = checkNotNull(slide.frontArtifactForTest())
+            val revealedDuringTurn = checkNotNull(slide.revealedArtifactForTest())
+            val genAtTurnStart = view.privateField("slideArtifactPrecacheGeneration") as Long
             val wakeBefore = view.privateField("asyncImageWakeListener")
-            val pendingPrecacheBefore = view.privateBool("pageTexturePrecachePending")
+            val pendingPrecacheBefore = view.privateBool("slideArtifactPrecachePending")
 
             // Interleaved PIXELS_ONLY completions while the finger still owns the turn.
             view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
@@ -9026,32 +9031,18 @@ class EpubFlowViewTest {
                 "PIXELS_ONLY offsets must queue while the finger owns the turn; queued=$queued",
                 fixture.imageLayoutStart in queued,
             )
-            frontDuringTurn?.let {
-                assertFalse(
-                    "held-finger PIXELS_ONLY must not recycle a warm front still held mid-turn",
-                    it.isRecycled,
-                )
-            }
-            revealedDuringTurn?.let {
-                assertFalse(
-                    "held-finger PIXELS_ONLY must not recycle a warm revealed still held mid-turn",
-                    it.isRecycled,
-                )
-            }
-            backwardDuringTurn?.let {
-                assertFalse(
-                    "held-finger PIXELS_ONLY must not recycle an unrelated warm previous mid-turn",
-                    it.isRecycled,
-                )
-                assertTrue(
-                    "unrelated previous owner must remain the same instance mid-turn",
-                    view.privateField("cachedBackwardBitmap") === it,
-                )
-            }
+            assertTrue(
+                "held-finger PIXELS_ONLY must not discard the recorded active front artifact",
+                frontDuringTurn.slideArtifactRecordIsLive(),
+            )
+            assertTrue(
+                "held-finger PIXELS_ONLY must not discard the recorded active revealed artifact",
+                revealedDuringTurn.slideArtifactRecordIsLive(),
+            )
             assertEquals(
-                "held-finger PIXELS_ONLY must not bump the speculative precache generation",
+                "held-finger PIXELS_ONLY must not bump the artifact precache generation",
                 genAtTurnStart,
-                view.privateField("pageTexturePrecacheGeneration") as Long,
+                view.privateField("slideArtifactPrecacheGeneration") as Long,
             )
             assertTrue(
                 "held-finger PIXELS_ONLY must not install a new async-image precache wake; " +
@@ -9060,13 +9051,13 @@ class EpubFlowViewTest {
                     view.privateField("asyncImageWakeListener") === wakeBefore,
             )
             assertEquals(
-                "speculative precache arming must not change while the finger owns the turn",
+                "artifact precache arming must not change while the finger owns the turn",
                 pendingPrecacheBefore,
-                view.privateBool("pageTexturePrecachePending"),
+                view.privateBool("slideArtifactPrecachePending"),
             )
             assertFalse(
-                "speculative precache must not newly arm while the finger owns the turn",
-                !pendingPrecacheBefore && view.privateBool("pageTexturePrecachePending"),
+                "artifact precache must not newly arm while the finger owns the turn",
+                !pendingPrecacheBefore && view.privateBool("slideArtifactPrecachePending"),
             )
 
             // Settle the turn; deferred pixel refresh applies only after turnInFlight clears.
@@ -9089,14 +9080,17 @@ class EpubFlowViewTest {
                 "queued PIXELS_ONLY offsets must drain after the turn settles",
                 (view.privateField("asyncImagePixelRefreshOffsets") as Set<*>).isEmpty(),
             )
-            // Queued pixels drained; no hang on recycle-based precache rebuild.
+            // Queued pixels drained; normal precache rebuilds the invalidated warm artifacts.
+            view.textView.viewTreeObserver.dispatchOnPreDraw()
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
             assertFalse(
-                "split-frame precache must not remain pending after post-settle drain",
-                view.privateBool("pageTexturePrecachePending"),
+                "artifact precache must not remain pending after post-settle drain",
+                view.privateBool("slideArtifactPrecachePending"),
             )
-            assertTrue(
-                "post-settle in-place refresh queue must empty after drain",
-                (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
+            assertNotNull(
+                "post-settle precache must rebuild a live front artifact",
+                view.slideFrontArtifactForTest()?.takeIf { it.slideArtifactRecordIsLive() },
             )
         } finally {
             if (view.privateField("interactiveTurnState").toString() != "NONE") {
@@ -9197,18 +9191,38 @@ class EpubFlowViewTest {
                 shadowOf(Looper.getMainLooper()).idle()
                 view.recycleCachedTexturesForTest()
                 view.preCachePageTexturesForTest()
-                val staleFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-                val staleRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+                var staleFront: Bitmap? = null
+                var staleRevealed: Bitmap? = null
                 val marker = 0xFF00FF00.toInt()
-                staleFront.eraseColor(marker)
-                staleRevealed.eraseColor(marker)
+                if (style == PageFlipStyle.SLIDE) {
+                    // Warm SLIDE artifacts depend on the synthetic image continuation; a
+                    // PIXELS_ONLY completion invalidates the frozen pair (no in-place repaint), so
+                    // the next MOVE must reject a stale warm transfer and enter cold handoff.
+                    checkNotNull(view.slideFrontArtifactForTest())
+                    checkNotNull(view.slideRevealedArtifactForTest())
+                    view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+                    assertNull(
+                        "style=SLIDE a PIXELS_ONLY completion must invalidate the front artifact",
+                        view.slideFrontArtifactForTest(),
+                    )
+                    assertNull(
+                        "style=SLIDE a PIXELS_ONLY completion must invalidate the revealed artifact",
+                        view.slideRevealedArtifactForTest(),
+                    )
+                } else {
+                    staleFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+                    staleRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+                    staleFront!!.eraseColor(marker)
+                    staleRevealed!!.eraseColor(marker)
 
-                // Both current and forward shots depend on the synthetic image continuation. They
-                // remain stale until the posted in-place redraw runs and are not eligible to turn.
-                view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
-                val pendingNames = view.pendingInPlacePageShotRefreshSlotNamesForTest()
-                assertTrue("style=$style required FRONT must be pending: $pendingNames", "FRONT" in pendingNames)
-                assertTrue("style=$style required REVEALED must be pending: $pendingNames", "REVEALED" in pendingNames)
+                    // Both current and forward shots depend on the synthetic image continuation.
+                    // They remain stale until the posted in-place redraw runs and are not eligible
+                    // to turn.
+                    view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+                    val pendingNames = view.pendingInPlacePageShotRefreshSlotNamesForTest()
+                    assertTrue("style=$style required FRONT must be pending: $pendingNames", "FRONT" in pendingNames)
+                    assertTrue("style=$style required REVEALED must be pending: $pendingNames", "REVEALED" in pendingNames)
+                }
 
                 val downX = view.width * 0.85f
                 val moveX = view.width * 0.45f
@@ -9233,20 +9247,31 @@ class EpubFlowViewTest {
                 val drawable = checkNotNull(
                     view.privateField("slideDrawable") ?: view.privateField("curlDrawable"),
                 ) { "style=$style fresh split capture must install an overlay" }
-                val freshFront = drawable.privateBitmap("frontBitmap")
-                val freshRevealed = drawable.privateBitmap("revealedBitmap")
-                assertTrue("style=$style outgoing shot must be freshly captured", freshFront !== staleFront)
-                assertTrue("style=$style target shot must be freshly captured", freshRevealed !== staleRevealed)
-                assertTrue(
-                    "style=$style fresh outgoing shot must not carry the stale marker",
-                    freshFront.getPixel(0, 0) != marker ||
-                        freshFront.getPixel(freshFront.width / 2, freshFront.height / 2) != marker,
-                )
-                assertTrue(
-                    "style=$style fresh target shot must not carry the stale marker",
-                    freshRevealed.getPixel(0, 0) != marker ||
-                        freshRevealed.getPixel(freshRevealed.width / 2, freshRevealed.height / 2) != marker,
-                )
+                if (style == PageFlipStyle.SLIDE) {
+                    assertNotNull(
+                        "style=SLIDE fresh split capture must install a Bitmap outgoing frame",
+                        drawable.privateBitmap("frontBitmap"),
+                    )
+                    assertNotNull(
+                        "style=SLIDE fresh split capture must install a Bitmap revealed frame",
+                        drawable.privateBitmap("revealedBitmap"),
+                    )
+                } else {
+                    val freshFront = drawable.privateBitmap("frontBitmap")
+                    val freshRevealed = drawable.privateBitmap("revealedBitmap")
+                    assertTrue("style=$style outgoing shot must be freshly captured", freshFront !== checkNotNull(staleFront))
+                    assertTrue("style=$style target shot must be freshly captured", freshRevealed !== checkNotNull(staleRevealed))
+                    assertTrue(
+                        "style=$style fresh outgoing shot must not carry the stale marker",
+                        freshFront.getPixel(0, 0) != marker ||
+                            freshFront.getPixel(freshFront.width / 2, freshFront.height / 2) != marker,
+                    )
+                    assertTrue(
+                        "style=$style fresh target shot must not carry the stale marker",
+                        freshRevealed.getPixel(0, 0) != marker ||
+                            freshRevealed.getPixel(freshRevealed.width / 2, freshRevealed.height / 2) != marker,
+                    )
+                }
 
                 view.onTouchEvent(
                     motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y),
@@ -9267,29 +9292,45 @@ class EpubFlowViewTest {
                 shadowOf(Looper.getMainLooper()).idle()
                 view.recycleCachedTexturesForTest()
                 view.preCachePageTexturesForTest()
-                val front = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-                val revealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
-                val backward = checkNotNull(view.privateField("cachedBackwardBitmap") as Bitmap?)
-                view.replacePendingInPlacePageShotRefreshSlotsForTest("BACKWARD")
+                if (style == PageFlipStyle.SLIDE) {
+                    // Warm SLIDE has no in-place repaint slots: the clean artifact pair transfers
+                    // regardless of any unrelated pending Bitmap refresh work.
+                    val front = checkNotNull(view.slideFrontArtifactForTest())
+                    val revealed = checkNotNull(view.slideRevealedArtifactForTest())
+                    val backward = checkNotNull(view.slideBackwardArtifactForTest())
+                    assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+                    assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+                    val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+                    assertTrue("style=SLIDE clean FRONT artifact must transfer", slide.frontArtifactForTest() === front)
+                    assertTrue("style=SLIDE clean REVEALED artifact must transfer", slide.revealedArtifactForTest() === revealed)
+                    assertTrue("style=SLIDE unrelated BACKWARD artifact must not join the overlay", backward !== front && backward !== revealed)
+                    assertFalse(view.privateBool("activeFlipFrontPixelRefreshPending"))
+                    assertFalse(view.privateBool("activeFlipRevealedPixelRefreshPending"))
+                } else {
+                    val front = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+                    val revealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+                    val backward = checkNotNull(view.privateField("cachedBackwardBitmap") as Bitmap?)
+                    view.replacePendingInPlacePageShotRefreshSlotsForTest("BACKWARD")
 
-                assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
-                assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
-                val drawable = checkNotNull(view.privateField("slideDrawable") ?: view.privateField("curlDrawable"))
-                assertTrue(
-                    "style=$style clean FRONT must transfer even when BACKWARD is dirty",
-                    drawable.privateBitmap("frontBitmap") === front,
-                )
-                assertTrue(
-                    "style=$style clean REVEALED must transfer even when BACKWARD is dirty",
-                    drawable.privateBitmap("revealedBitmap") === revealed,
-                )
-                assertFalse("style=$style unrelated BACKWARD owner must not join the overlay", backward === front)
-                assertFalse("style=$style unrelated BACKWARD owner must not join the overlay", backward === revealed)
-                assertFalse("style=$style clean front needs no deferred repaint", view.privateBool("activeFlipFrontPixelRefreshPending"))
-                assertFalse(
-                    "style=$style clean target needs no deferred repaint",
-                    view.privateBool("activeFlipRevealedPixelRefreshPending"),
-                )
+                    assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+                    assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
+                    val drawable = checkNotNull(view.privateField("slideDrawable") ?: view.privateField("curlDrawable"))
+                    assertTrue(
+                        "style=$style clean FRONT must transfer even when BACKWARD is dirty",
+                        drawable.privateBitmap("frontBitmap") === front,
+                    )
+                    assertTrue(
+                        "style=$style clean REVEALED must transfer even when BACKWARD is dirty",
+                        drawable.privateBitmap("revealedBitmap") === revealed,
+                    )
+                    assertFalse("style=$style unrelated BACKWARD owner must not join the overlay", backward === front)
+                    assertFalse("style=$style unrelated BACKWARD owner must not join the overlay", backward === revealed)
+                    assertFalse("style=$style clean front needs no deferred repaint", view.privateBool("activeFlipFrontPixelRefreshPending"))
+                    assertFalse(
+                        "style=$style clean target needs no deferred repaint",
+                        view.privateBool("activeFlipRevealedPixelRefreshPending"),
+                    )
+                }
             } finally {
                 if (view.privateField("interactiveTurnState").toString() != "NONE") {
                     view.endInteractiveCurl(velocityX = 0f)
@@ -9309,11 +9350,21 @@ class EpubFlowViewTest {
         shadowOf(Looper.getMainLooper()).idle()
         view.recycleCachedTexturesForTest()
         view.preCachePageTexturesForTest()
-        val front = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-        val revealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+        val front = checkNotNull(view.slideFrontArtifactForTest())
+        val revealed = checkNotNull(view.slideRevealedArtifactForTest())
         val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
 
         view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
+        assertNull(
+            "PIXELS_ONLY must invalidate the dependent warm front artifact",
+            view.slideFrontArtifactForTest(),
+        )
+        assertNull(
+            "PIXELS_ONLY must invalidate the dependent warm revealed artifact",
+            view.slideRevealedArtifactForTest(),
+        )
+        assertFalse("the invalidated front artifact must be released", front.slideArtifactRecordIsLive())
+        assertFalse("the invalidated revealed artifact must be released", revealed.slideArtifactRecordIsLive())
         val downX = view.width * 0.85f
         val moveX = view.width * 0.45f
         val y = view.height * 0.10f
@@ -9333,12 +9384,12 @@ class EpubFlowViewTest {
 
         assertFalse(view.privateBool("activeFlipFrontPixelRefreshPending"))
         assertFalse(view.privateBool("activeFlipRevealedPixelRefreshPending"))
-        assertTrue(front.isRecycled)
-        assertTrue(revealed.isRecycled)
+        assertNull("dispose must not revive the invalidated front artifact slot", view.slideFrontArtifactForTest())
+        assertNull("dispose must not revive the invalidated revealed artifact slot", view.slideRevealedArtifactForTest())
         assertEquals(0L, budget.reservedBytes)
         assertEquals(0L, budget.leasedBytes)
         assertEquals(0L, budget.chargedBytes)
-        // Late idle work must not resurrect markers or attempt draws on recycled owners.
+        // Late idle work must not resurrect stale warm artifacts or attempt draws on released owners.
         shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
         assertFalse(view.privateBool("activeFlipFrontPixelRefreshPending"))
         assertFalse(view.privateBool("activeFlipRevealedPixelRefreshPending"))
@@ -9474,6 +9525,7 @@ class EpubFlowViewTest {
 
     @Test
     fun `active turn PIXELS_ONLY completion queues offsets without mid-turn redraw or alloc`() {
+        EpubPageShotCaptureProbe.reset()
         val fixture = headingImageContinuationFixture(leadingBodyLines = 40)
         val view = fixture.view
         view.flipStyle = PageFlipStyle.SLIDE
@@ -9482,20 +9534,18 @@ class EpubFlowViewTest {
             shadowOf(Looper.getMainLooper()).idle()
             view.recycleCachedTexturesForTest()
             view.preCachePageTexturesForTest()
-            val front = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
-            val revealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?)
+            val front = checkNotNull(view.slideFrontArtifactForTest())
+            val revealed = checkNotNull(view.slideRevealedArtifactForTest())
             val budget = checkNotNull(view.privateField("pageShotBudget") as PageShotBudget?)
-            val marker = 0xFF00FF00.toInt()
-            front.eraseColor(marker)
-            revealed.eraseColor(marker)
 
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
             view.updateInteractiveCurl(x = view.width * 0.45f)
             assertEquals("SOFTWARE", view.privateField("interactiveTurnState").toString())
             val leasedAtTurn = budget.leasedBytes
-            val genAtTurn = view.privateField("pageTexturePrecacheGeneration") as Long
+            val genAtTurn = view.privateField("slideArtifactPrecacheGeneration") as Long
+            val capturesAtTurn = EpubPageShotCaptureProbe.total()
 
-            // PIXELS_ONLY while overlay owns the turn: queue only, never redrawPageShotInto.
+            // PIXELS_ONLY while overlay owns the turn: queue only, never mutate the active artifacts.
             view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
             view.onAsyncImagePixelsChanged(fixture.imageLayoutStart)
             shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
@@ -9506,19 +9556,24 @@ class EpubFlowViewTest {
                 "active-turn PIXELS_ONLY must queue the image offset; queued=$queued",
                 fixture.imageLayoutStart in queued,
             )
-            assertEquals(marker, front.getPixel(0, 0))
-            assertEquals(marker, revealed.getPixel(0, 0))
-            assertFalse(front.isRecycled)
-            assertFalse(revealed.isRecycled)
+            assertTrue(
+                "active turn must not discard the recorded active artifacts",
+                front.slideArtifactRecordIsLive() && revealed.slideArtifactRecordIsLive(),
+            )
             assertEquals(
                 "active turn must not allocate or recycle page shots for PIXELS_ONLY",
                 leasedAtTurn,
                 budget.leasedBytes,
             )
             assertEquals(
-                "active turn must not bump speculative precache generation",
+                "active turn must not bump artifact precache generation",
                 genAtTurn,
-                view.privateField("pageTexturePrecacheGeneration") as Long,
+                view.privateField("slideArtifactPrecacheGeneration") as Long,
+            )
+            assertEquals(
+                "active turn must not allocate any viewport page-shot bitmap",
+                capturesAtTurn,
+                EpubPageShotCaptureProbe.total(),
             )
             assertTrue(
                 (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
@@ -9535,14 +9590,26 @@ class EpubFlowViewTest {
             assertTrue(
                 (view.privateField("pendingInPlacePageShotRefreshSlots") as Set<*>).isEmpty(),
             )
-            // Warm identities survive settle rekey; at least the surviving owners must not be recycled.
-            assertFalse(front.isRecycled || revealed.isRecycled)
+            // The deferred pixel batch invalidates the rekeyed artifacts; normal precache rebuilds.
+            view.textView.viewTreeObserver.dispatchOnPreDraw()
+            shadowOf(Looper.getMainLooper()).idle()
+            view.drainPendingPageTexturePrecacheForTest()
+            assertNotNull(
+                "settle must rebuild a live front artifact after the deferred pixel batch",
+                view.slideFrontArtifactForTest()?.takeIf { it.slideArtifactRecordIsLive() },
+            )
+            assertEquals(
+                "settle must not allocate viewport page-shot bitmaps",
+                capturesAtTurn,
+                EpubPageShotCaptureProbe.total(),
+            )
         } finally {
             if (view.privateField("interactiveTurnState").toString() != "NONE") {
                 view.endInteractiveCurl(velocityX = 0f)
                 shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
             }
             view.dispose()
+            EpubPageShotCaptureProbe.stop()
         }
     }
 
@@ -12354,7 +12421,7 @@ class EpubFlowViewTest {
             assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
             view.preCachePageTexturesForTest()
             view.drainPendingPageTexturePrecacheForTest()
-            val warmFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?)
+            val warmFront = checkNotNull(view.slideFrontArtifactForTest())
 
             view.setPrivateField("rapidTurnSequenceActive", true)
             view.setPrivateField("queuedPageTurnDelta", 1)
@@ -12365,11 +12432,11 @@ class EpubFlowViewTest {
                 view.privateBool("asyncImageRefreshPending"),
             )
             assertSame(
-                "geometry refresh must not recycle the warm front between queued turns",
+                "geometry refresh must not discard the warm front artifact between queued turns",
                 warmFront,
-                view.privateField("cachedFrontBitmap"),
+                view.slideFrontArtifactForTest(),
             )
-            assertFalse("the warm owner must stay live for the next rapid frame", warmFront.isRecycled)
+            assertTrue("the warm artifact must stay live for the next rapid frame", warmFront.slideArtifactRecordIsLive())
 
             shadowOf(Looper.getMainLooper()).idleFor(50L, TimeUnit.MILLISECONDS)
 
@@ -12755,25 +12822,31 @@ class EpubFlowViewTest {
             shadowOf(Looper.getMainLooper()).idle()
             view.drainPendingPageTexturePrecacheForTest()
 
-            val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) {
-                "goToPage must arm heading front page-shot without test precache helper"
+            val cachedFront = checkNotNull(view.slideFrontArtifactForTest()) {
+                "goToPage must arm heading front artifact without test precache helper"
             }
-            val cachedRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) {
-                "goToPage must arm image revealed page-shot without test precache helper"
+            val cachedRevealed = checkNotNull(view.slideRevealedArtifactForTest()) {
+                "goToPage must arm image revealed artifact without test precache helper"
             }
-            assertEquals(fixture.headingPageIndex, view.privateInt("cachedFromPage"))
-            assertEquals(fixture.imagePageIndex, view.privateInt("cachedTargetPage"))
+            assertEquals(
+                fixture.headingPageIndex,
+                view.slideArtifactSlotPageTopForTest("slideFrontSlot")?.first,
+            )
+            assertEquals(
+                fixture.imagePageIndex,
+                view.slideArtifactSlotPageTopForTest("slideRevealedSlot")?.first,
+            )
             assertEquals(
                 requireNotNull(view.pageTopPxAt(fixture.headingPageIndex)),
-                view.privateInt("cachedFromTopPx"),
+                view.slideArtifactSlotPageTopForTest("slideFrontSlot")?.second,
             )
             assertEquals(
                 requireNotNull(view.pageTopPxAt(fixture.imagePageIndex)),
-                view.privateInt("cachedTargetTopPx"),
+                view.slideArtifactSlotPageTopForTest("slideRevealedSlot")?.second,
             )
-            assertFalse(cachedFront.isRecycled)
-            assertFalse(cachedRevealed.isRecycled)
-            assertFalse(view.privateBool("pageTexturePrecachePending"))
+            assertTrue(cachedFront.slideArtifactRecordIsLive())
+            assertTrue(cachedRevealed.slideArtifactRecordIsLive())
+            assertFalse(view.privateBool("slideArtifactPrecachePending"))
 
             // Live flip-style change recycles owners; production must re-arm warm pair for the parked page.
             view.flipStyle = PageFlipStyle.SIMULATION
@@ -12813,16 +12886,22 @@ class EpubFlowViewTest {
             shadowOf(Looper.getMainLooper()).idle()
             view.recycleCachedTexturesForTest()
             view.preCachePageTexturesForTest()
-            val cachedFront = checkNotNull(view.privateField("cachedFrontBitmap") as Bitmap?) {
-                "warm mixed path requires a heading-page front shot"
+            val cachedFront = checkNotNull(view.slideFrontArtifactForTest()) {
+                "warm mixed path requires a heading-page front artifact"
             }
-            val cachedRevealed = checkNotNull(view.privateField("cachedRevealedBitmap") as Bitmap?) {
-                "warm mixed path requires an image-page revealed shot"
+            val cachedRevealed = checkNotNull(view.slideRevealedArtifactForTest()) {
+                "warm mixed path requires an image-page revealed artifact"
             }
-            assertEquals(fixture.headingPageIndex, view.privateInt("cachedFromPage"))
-            assertEquals(fixture.imagePageIndex, view.privateInt("cachedTargetPage"))
-            assertFalse(cachedFront.isRecycled)
-            assertFalse(cachedRevealed.isRecycled)
+            assertEquals(
+                fixture.headingPageIndex,
+                view.slideArtifactSlotPageTopForTest("slideFrontSlot")?.first,
+            )
+            assertEquals(
+                fixture.imagePageIndex,
+                view.slideArtifactSlotPageTopForTest("slideRevealedSlot")?.first,
+            )
+            assertTrue(cachedFront.slideArtifactRecordIsLive())
+            assertTrue(cachedRevealed.slideArtifactRecordIsLive())
 
             // Baseline after warm setup: MOVE must not grow these counters.
             val capturesAfterWarm = EpubPageShotCaptureProbe.total()
@@ -12834,12 +12913,12 @@ class EpubFlowViewTest {
             )
             val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
             assertTrue(
-                "warm mixed MOVE must transfer heading front by identity",
-                slide.privateBitmap("frontBitmap") === cachedFront && !cachedFront.isRecycled,
+                "warm mixed MOVE must transfer heading front artifact by identity",
+                slide.frontArtifactForTest() === cachedFront && cachedFront.slideArtifactRecordIsLive(),
             )
             assertTrue(
-                "warm mixed MOVE must transfer image-page target by identity",
-                slide.privateBitmap("revealedBitmap") === cachedRevealed && !cachedRevealed.isRecycled,
+                "warm mixed MOVE must transfer image-page target artifact by identity",
+                slide.revealedArtifactForTest() === cachedRevealed && cachedRevealed.slideArtifactRecordIsLive(),
             )
             assertEquals(
                 "warm path must not recapture full page shots after the pair exists",
@@ -12884,12 +12963,12 @@ class EpubFlowViewTest {
                 1,
                 reportedOffsets.size,
             )
-            assertFalse("committed front identity must not be recycled early", cachedFront.isRecycled)
+            assertTrue("committed front identity must not be discarded early", cachedFront.slideArtifactRecordIsLive())
             // After settle, the revealed image page is typically rekeyed as the new front.
-            val settledFront = view.privateField("cachedFrontBitmap") as Bitmap?
+            val settledFront = view.slideFrontArtifactForTest()
             assertTrue(
-                "settle should retain a live image-page owner (rekeyed target or new front)",
-                settledFront != null && !settledFront.isRecycled,
+                "settle should retain a live image-page artifact (rekeyed target or new front)",
+                settledFront != null && settledFront.slideArtifactRecordIsLive(),
             )
             assertEquals(
                 "settle must not perform main-thread full image decode",
@@ -13872,6 +13951,59 @@ class EpubFlowViewTest {
         javaClass.getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this) as Int
+
+    // ---- Warm SLIDE artifact test helpers ------------------------------------------------------
+
+    /** Identity of the cached current-page SLIDE artifact, or null when no slot is armed. */
+    private fun EpubFlowView.slideFrontArtifactForTest(): Any? =
+        (privateField("slideFrontSlot") as Any?)?.reflectedField("artifact")
+
+    /** Identity of the cached forward-target SLIDE artifact, or null when no slot is armed. */
+    private fun EpubFlowView.slideRevealedArtifactForTest(): Any? =
+        (privateField("slideRevealedSlot") as Any?)?.reflectedField("artifact")
+
+    /** Identity of the cached backward-target SLIDE artifact, or null when no slot is armed. */
+    private fun EpubFlowView.slideBackwardArtifactForTest(): Any? =
+        (privateField("slideBackwardSlot") as Any?)?.reflectedField("artifact")
+
+    /** The raw cached slot (slideFrontSlot / slideRevealedSlot / slideBackwardSlot), or null. */
+    private fun EpubFlowView.slideArtifactSlotForTest(slot: String): Any? = privateField(slot)
+
+    /** (page, topPx) of a named artifact slot, or null when no slot is armed. */
+    private fun EpubFlowView.slideArtifactSlotPageTopForTest(slot: String): Pair<Int, Int>? {
+        val slotValue = privateField(slot) as Any? ?: return null
+        return (slotValue.reflectedField("page") as Int) to (slotValue.reflectedField("topPx") as Int)
+    }
+
+    /** The exact artifact key of a named slot, or null when no slot is armed. */
+    private fun EpubFlowView.slideArtifactSlotKeyForTest(slot: String): Any? =
+        (privateField(slot) as Any?)?.reflectedField("key")
+
+    /** True while the artifact still holds a recorded owner (not yet discarded behind the fence). */
+    private fun Any.slideArtifactRecordIsLive(): Boolean =
+        javaClass.getDeclaredField("record").apply { isAccessible = true }.get(this) != null
+
+    /** Identities still pinned behind the two-host-frame artifact retirement barrier. */
+    private fun EpubFlowView.renderRetiredSlideArtifactsForTest(): Set<*> {
+        val retired = privateField("renderRetiredSlideArtifacts") as? Map<*, *> ?: return emptySet<Any>()
+        return retired.keys.toSet()
+    }
+
+    /** Requests final discard through production fence-aware disposal. */
+    private fun EpubFlowView.discardSlideArtifactForTest(artifact: Any) {
+        val artifactClass = Class.forName("dev.readflow.render.epub.SlidePageArtifact")
+        javaClass.getDeclaredMethod("discardSlideArtifact", artifactClass)
+            .apply { isAccessible = true }
+            .invoke(this, artifact)
+    }
+
+    /** Active outgoing artifact of a warm artifact-framed slide turn. */
+    private fun PageSlideDrawable.frontArtifactForTest(): Any? =
+        (reflectedField("frontFrame") as? SlidePageFrame.ArtifactFrame)?.artifact
+
+    /** Active incoming artifact of a warm artifact-framed slide turn. */
+    private fun PageSlideDrawable.revealedArtifactForTest(): Any? =
+        (reflectedField("revealedFrame") as? SlidePageFrame.ArtifactFrame)?.artifact
 
     private class CountingList<T>(
         private val delegate: List<T>,
