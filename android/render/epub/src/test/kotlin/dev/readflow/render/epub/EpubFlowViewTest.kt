@@ -302,6 +302,12 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    // The direct-overlay raster check runs against the API 28 Picture artifact record, mirroring
+    // the warm artifact overlay test: a RenderNode display list cannot be drawn through a software
+    // Bitmap Canvas (Canvas.drawRenderNode is a hardware-accelerated contract) and LEGACY Robolectric
+    // cannot replay it. The real API 29+ RenderNode path stays covered in the hardware/device lane.
+    @Config(sdk = [28])
     fun `mixed slide frame pair installs the direct two-page overlay and retires both owners`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         try {
@@ -9215,29 +9221,54 @@ class EpubFlowViewTest {
             // the recorded artifact commands, never paint a blank strip over the parked target.
             val hostFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
-                val sampleXs = listOf(view.width / 4, view.width / 2, 3 * view.width / 4)
-                val sampleYs = listOf(view.height / 4, view.height / 2, 3 * view.height / 4)
-                var differingSamples = 0
-                var matchedFrontSamples = 0
-                sampleYs.forEach { y ->
-                    sampleXs.forEach { x ->
+                // A fixed 3x3 sample grid can land entirely outside the only pixels that differ
+                // between consecutive fixture pages (the line-number digits), so discover one real
+                // difference deterministically: scan every pixel and keep the coordinate with the
+                // strongest channel distance between the static front and parked target frames.
+                var differX = -1
+                var differY = -1
+                var differFrontPixel = 0
+                var differTargetPixel = 0
+                var bestDistance = -1
+                for (y in 0 until staticFrontFrame.height) {
+                    for (x in 0 until staticFrontFrame.width) {
                         val frontPixel = staticFrontFrame.getPixel(x, y)
-                        val parkedTargetPixel = staticTargetFrame.getPixel(x, y)
-                        if (frontPixel != parkedTargetPixel) {
-                            differingSamples++
-                            if (hostFrame.getPixel(x, y) == frontPixel) matchedFrontSamples++
+                        val targetPixel = staticTargetFrame.getPixel(x, y)
+                        if (frontPixel == targetPixel) continue
+                        val distance =
+                            kotlin.math.abs(((frontPixel shr 16) and 0xFF) - ((targetPixel shr 16) and 0xFF)) +
+                                kotlin.math.abs(((frontPixel shr 8) and 0xFF) - ((targetPixel shr 8) and 0xFF)) +
+                                kotlin.math.abs((frontPixel and 0xFF) - (targetPixel and 0xFF))
+                        if (distance > bestDistance) {
+                            bestDistance = distance
+                            differX = x
+                            differY = y
+                            differFrontPixel = frontPixel
+                            differTargetPixel = targetPixel
                         }
                     }
                 }
                 assertTrue(
-                    "the front and parked target pages must differ at some sampled rows so a blank " +
-                        "overlay would expose target pixels; differingSamples=$differingSamples",
-                    differingSamples > 0,
+                    "the front and parked target pages must differ at some pixel so a blank overlay " +
+                        "would expose target pixels; discovered=$differX,$differY distance=$bestDistance",
+                    differX >= 0 && differY >= 0,
                 )
+                // The overlay's front band covers [0, W) at progress 0, so the discovered coordinate
+                // is always inside it; a blank overlay would show the parked target value instead.
                 assertTrue(
-                    "the warm overlay's first host draw must replay the front artifact page content; " +
-                        "matched=$matchedFrontSamples differing=$differingSamples",
-                    matchedFrontSamples > differingSamples / 2,
+                    "the discovered coordinate must sit in the front band so the overlay covers it",
+                    differX in 0 until view.width,
+                )
+                assertEquals(
+                    "the warm overlay's first host draw must replay the front artifact page content " +
+                        "at the discovered coordinate ($differX,$differY)",
+                    differFrontPixel,
+                    hostFrame.getPixel(differX, differY),
+                )
+                assertNotEquals(
+                    "the parked target must stay hidden behind the front band at the discovered coordinate",
+                    differTargetPixel,
+                    hostFrame.getPixel(differX, differY),
                 )
             } finally {
                 hostFrame.recycle()
@@ -9250,6 +9281,9 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    // LEGACY Robolectric ignores Paint shaders (drawRect falls back to the paint's solid color), so
+    // the LinearGradient seam shadow would never darken the band; NATIVE graphics rasterizes it.
     fun `slide overlay seam shadow darkens the strip seam for both directions`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         val context = RuntimeEnvironment.getApplication() as Application
@@ -9301,6 +9335,8 @@ class EpubFlowViewTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    // Same LEGACY shader limitation as the seam-shadow test above; NATIVE rasterizes the gradient.
     fun `cold bitmap slide overlay retains the baseline seam shadow`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
@@ -9326,16 +9362,42 @@ class EpubFlowViewTest {
                 renderer.draw(Canvas(frame))
                 val shadowW = renderer.seamShadowWidthPx().coerceAtLeast(1)
                 val bodyX = view.width / 2
-                var bodyLuma = 0f
-                var seamLuma = 0f
-                var sampled = 0
-                for (y in listOf(view.height / 4, view.height / 2, 3 * view.height / 4)) {
-                    val bandX = (view.width + shadowW / 2).coerceAtMost(frame.width - 1)
-                    bodyLuma += android.graphics.Color.luminance(frame.getPixel(bodyX, y))
-                    seamLuma += android.graphics.Color.luminance(frame.getPixel(bandX, y))
-                    sampled += 1
+                // The luma comparison must measure the shadow over real paper, not over dynamic glyph
+                // pixels whose ink can be darker than the shadowed band. Discover one row where both
+                // the front body column and the revealed-band seam column are pure paper in the source
+                // page shots, then compare the same strip row.
+                val paperColor = 0xFFEDE6D6.toInt()
+                // Cold page shots can be lower resolution than the viewport: PageSlideOverlayView
+                // maps them through drawBitmapWindow, so translate viewport x into each source
+                // bitmap's width with the scale convention used elsewhere in this file
+                // (sourceX = sampleX * bitmap.width / view.width), then clamp to the source width.
+                val bodyPageX = (bodyX * front.width / view.width).coerceIn(0, front.width - 1)
+                val seamPageX = ((shadowW / 2) * revealed.width / view.width)
+                    .coerceIn(0, revealed.width - 1)
+                // map each viewport y into both source heights with the same scale convention, so
+                // the discovered paper row stays aligned with the output row even when the cold
+                // page shots are lower resolution than the viewport.
+                var paperRow = -1
+                for (y in 0 until view.height) {
+                    val frontSourceY = (y * front.height / view.height).coerceIn(0, front.height - 1)
+                    val revealedSourceY =
+                        (y * revealed.height / view.height).coerceIn(0, revealed.height - 1)
+                    if (
+                        front.getPixel(bodyPageX, frontSourceY) == paperColor &&
+                        revealed.getPixel(seamPageX, revealedSourceY) == paperColor
+                    ) {
+                        paperRow = y
+                        break
+                    }
                 }
-                assertTrue("cold overlay must paint the baseline seam shadow band", sampled > 0)
+                assertTrue(
+                    "the cold fixture must contain a paper-only row for a clean seam measurement; " +
+                        "paperRow=$paperRow shadowW=$shadowW",
+                    paperRow >= 0,
+                )
+                val bandX = (view.width + shadowW / 2).coerceAtMost(frame.width - 1)
+                val bodyLuma = android.graphics.Color.luminance(frame.getPixel(bodyX, paperRow))
+                val seamLuma = android.graphics.Color.luminance(frame.getPixel(bandX, paperRow))
                 assertTrue(
                     "cold overlay seam band must be darker than the page body; body=$bodyLuma seam=$seamLuma",
                     seamLuma < bodyLuma,
