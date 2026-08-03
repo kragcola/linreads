@@ -1,6 +1,6 @@
 # Active Work
 
-_最后更新：2026-08-02_
+_最后更新：2026-08-03_
 
 Mode: `cloud-verification`
 Objective: 收口 Android EPUB 手感同步到 TXT/Markdown/PDF，并完成 CBZ Stage 1 研究与实现后的云端验收
@@ -70,7 +70,11 @@ Test ledger: [android-epub-free-rest-pagination-2026-07-13.md#test-ledger](andro
 
 - 根因：翻页 motion snapshot 曾固定为视口 `0.25x`，再由 overlay 放大绘制，文本与图片在每次 MOVE 都被低分辨率纹理覆盖；不是 Android blur API。修复将 `MOTION_PAGE_SHOT_SCALE` 恢复为 `1x`，保留双帧上限、RGB565 不透明页和 viewport-sized 1:1 blit。
 - 回归补齐：4 处旧四分之一预算测试改为当前 `360×120×RGB565` 快照预算；新增断言要求 motion/settled snapshot 尺寸一致，并覆盖跨章节目标快照失败时 outgoing continuity cover 不得被清掉，避免失败后硬切到新章节。
-- 当前状态：`git diff --check` 通过；未运行本地 Android Gradle 构建/测试，未提交、未推送、未发布 OTA。下一出口是云端 `phase=2 test`/R8 候选和真机普通翻页、连续快翻、反向翻页、图片章节帧时复测；主代理继续只消费日志、XML、帧时和哈希，不读取截图。
+- 代码基线为 `75edeac7a93069e9910bf9d420b2ded11a172e3c`。GitHub Actions run `30783190007` 在 `10m27s` 内通过完整 Android regression、R8/minification 和 app/helper OTA 构建；`publish_ota=false`，只生成未发布候选 `android-ota-candidate-100360`。app SHA-256 为 `6f306886dc0df896ff20b0f9ceb760f728f7c1bf2f39d4b294c8ed0ed03e57bc`，helper 为 `522a1da8a713db39a49b2ba5dbdd43a940017dd1b8ff718bc2d3318405e7165d`；两包 `unzip -t`、AAPT2 `versionCode=100360` 和 v2 同证书摘要 `eba4adbe463ceb98377ae9b8e67f6aab4694a16be9df6338f05001f529b86ffd` 均通过。
+- Huawei `BKY-W20`（`3FYBB24C06201100`）已用 `adb install -r` 保数据覆盖安装 app/helper `100360`；app/helper `firstInstallTime` 分别保持 `2026-07-31 00:32:21` / `2026-07-30 00:56:53`。设备回读的 `base.apk` SHA-256 与云端 app 候选逐字节一致，书架保持“共 7 本 · 7 本可离线”，目标《86-不存在的战区- 10 - 安里アサト》仍在。
+- 第二轮真机功能矩阵在“幼态延续：断章〈誓言〉”、分页+滑动模式执行：普通正反往返回到章首；CANCEL 回弹保持第 12 章 0%；8 连正翻从 0% 落到 7%，8 连反翻回到 0%；从第 13 章章首反翻到第 12 章末页、再正翻回第 13 章章首。所有关键日志对 FATAL/ANR/OOM/recycled bitmap/`BitmapFactory: doDecode` 均为 0。分段 `input motionevent` 会把命令启动间隔计入单帧，故 CANCEL/UP 的 300-550ms 合成值只作功能证据，不进入手感性能判定。
+- 视觉代理分两轮各检查 4 张 1280px 代表帧：全局四分之一低清模糊已消失，文本、插图和跨章节两页保持相近清晰度；普通与跨章动作都有连续位移，不是硬切；落页无空白、内容消失或图片丢失。快速轮次极窄的离场页条带存在横向压缩/涂抹感，判断为几何压缩而非低分辨率快照；4 帧不能排除未采样的其他快翻瞬间。
+- **性能门失败，禁止发布该候选 OTA**：章首普通往返首轮 `53 frames / P95 150ms / P99 300ms / slow bitmap uploads 2`；预热复测 `78 / P95 89ms / P99 101ms / uploads 0`。8 连正翻录屏轮 `148 / P95 125ms / P99 150ms / jank 18.92% / uploads 2`；排除录屏开销后的稳定复测仍为 `268 / P95 93ms / P99 133ms / jank 10.07% / uploads 5`；8 连反翻为 `263 / P95 93ms / P99 133ms / jank 9.89% / uploads 5`。跨章往返大多数帧正常（`42 / P95 15ms`），但有 `P99 400ms / uploads 1` 长尾。相较 100318 图片章节验收的 `P95 32ms / P99 46ms / uploads 0` 明确退化；`1x` motion 双快照消除强制模糊的同时重新触发全视口纹理上传/合成长尾，当前方案只通过画质和连续性门，没有通过“流畅优先”门。完整文本、录屏和代表帧证据位于 `.evidence/device-100360-epub-round2-20260803/`，主代理未读取或附带图片。
 
 1. **一次证伪一个假设**：先写明根因、单一变量和退出条件；设备证据不足的架构不得进入产品代码。
 2. **按三条流水线批处理**：本地只做范围冻结、定向测试与静态契约；GitHub Actions 独占 full/R8/双 APK 发布验真；CI 全绿后只做一次最终真机链路。禁止每个小改动都穿插本地构建、模拟器、安装和人工验收。
