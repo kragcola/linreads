@@ -8746,16 +8746,28 @@ class EpubFlowViewTest {
             assertNull("the settled reverse turn must detach its overlay", reverseRenderer.parent)
             assertNull("the settled reverse turn must clear the active overlay pointer", view.privateField("slideOverlayView"))
             assertSame(
-                "the settled reverse turn must rekey the outgoing artifact as current",
-                front,
+                "the settled reverse turn must rekey the revealed p0 artifact as current",
+                backward,
                 view.slideFrontArtifactForTest(),
+            )
+            assertSame(
+                "the settled reverse turn must keep the outgoing p1 artifact as the forward target",
+                front,
+                view.slideRevealedArtifactForTest(),
+            )
+            assertNull(
+                "the settled reverse turn must not re-arm a backward slot at the chapter boundary",
+                view.slideBackwardArtifactForTest(),
             )
 
             // Forward warm turn (page 1 -> page 2) installs a fresh direct overlay.
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
             val forwardSlide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
-            assertSame("forward turn must own the rekeyed current artifact", front, forwardSlide.frontArtifactForTest())
-            assertSame("forward turn must own the next-page artifact", revealed, forwardSlide.revealedArtifactForTest())
+            // After the reverse commit the live page is p0, so the forward p0 -> p1 turn uses the
+            // rekeyed p0 artifact as outgoing and the rekeyed p1 artifact as revealed. The original
+            // p2 artifact was discarded with the cache recycle and must not be expected to survive.
+            assertSame("forward turn must own the rekeyed current p0 artifact", backward, forwardSlide.frontArtifactForTest())
+            assertSame("forward turn must own the rekeyed next-page p1 artifact", front, forwardSlide.revealedArtifactForTest())
             val forwardRenderer = view.requireActiveSlideRendererView()
             assertTrue("each warm turn must install its own direct overlay", forwardRenderer !== reverseRenderer)
             view.updateInteractiveCurl(x = view.width * 0.90f)
@@ -9020,8 +9032,11 @@ class EpubFlowViewTest {
                 targetWindow = pages[2],
             )
             assertNull("a stale-keyed pair must not transfer after a viewport change", pair)
-            assertSame("the rejected key must not consume the front slot", frontBefore, view.slideFrontArtifactForTest())
-            assertSame("the rejected key must not consume the revealed slot", revealedBefore, view.slideRevealedArtifactForTest())
+            // The stale rejection eagerly discards the old-keyed owners: the artifact keys include
+            // the viewport dimensions, so the old pair can never be reused and recycleCachedTextures
+            // clears the slots rather than retaining them by identity.
+            assertNull("the stale pair rejection must discard the old front slot", view.slideFrontArtifactForTest())
+            assertNull("the stale pair rejection must discard the old revealed slot", view.slideRevealedArtifactForTest())
 
             // A real turn after the mutation installs a fresh overlay sized to the new viewport;
             // the stale recorded artifacts are never reused as the rendered strip.
@@ -9158,6 +9173,12 @@ class EpubFlowViewTest {
 
     @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    // This first-host-draw raster check runs against the API 28 Picture artifact record. The real
+    // API 29+ RenderNode path is validated in the hardware/device lane: a RenderNode display list
+    // cannot be rasterized through a software Bitmap Canvas (Canvas.drawRenderNode is a
+    // hardware-accelerated contract), so this software test intentionally exercises the production
+    // Picture fallback rather than pretending to rasterize RenderNode through a software Canvas.
+    @Config(sdk = [28])
     fun `warm artifact overlay installed through the real start path paints its page on the first host draw`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
@@ -9283,6 +9304,10 @@ class EpubFlowViewTest {
     fun `cold bitmap slide overlay retains the baseline seam shadow`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        // The cold page shots are captured from the live view, so pin a non-black paper background
+        // first: the luma comparison then measures the seam shadow against paper instead of
+        // transparent/black fixture pixels.
+        view.background = ColorDrawable(0xFFEDE6D6.toInt())
         try {
             // Drop the warm artifact slots so the turn installs a fresh cold BitmapFrame overlay
             // whose onDraw must still draw the baseline seam shadow.
@@ -14008,6 +14033,8 @@ class EpubFlowViewTest {
         view.flipStyle = PageFlipStyle.SLIDE
         view.javaClass.getDeclaredField("onTopOffsetChanged").apply { isAccessible = true }
             .set(view, { offset: Int -> reportedOffsets.add(offset) })
+        var startedCount = 0
+        view.onPageTurnStarted = { startedCount++ }
         try {
             view.goToPage(fixture.headingPageIndex)
             shadowOf(Looper.getMainLooper()).idle()
@@ -14048,6 +14075,11 @@ class EpubFlowViewTest {
                 fullMainBeforeMove,
                 EpubImageDecodeProbe.fullDecodeMainThread(),
             )
+            assertEquals(
+                "deferred intent must not publish the start until its visual renderer is installed",
+                0,
+                startedCount,
+            )
             assertTrue(reportedOffsets.isEmpty())
 
             // Deferred frames: target, then front, then overlay install under the held finger.
@@ -14056,11 +14088,21 @@ class EpubFlowViewTest {
                 "first deferred frame must not install the overlay yet",
                 view.privateField("slideDrawable"),
             )
+            assertEquals(
+                "the deferred start must stay silent while only the target shot is prepared",
+                0,
+                startedCount,
+            )
             shadowOf(Looper.getMainLooper()).runOneTask()
 
             val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?) {
                 "deferred cold handoff must install the local slide after shot frames"
             }
+            assertEquals(
+                "the deferred local handoff must publish exactly one start when its renderer starts",
+                1,
+                startedCount,
+            )
             val front = slide.privateBitmap("frontBitmap")
             val revealed = slide.privateBitmap("revealedBitmap")
             assertFalse(front.isRecycled)

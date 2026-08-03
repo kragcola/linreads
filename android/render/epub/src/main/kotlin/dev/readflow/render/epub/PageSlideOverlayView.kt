@@ -44,14 +44,24 @@ internal class PageSlideOverlayView(
     private val shadePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val bitmapSrc = Rect()
     private val bitmapDst = RectF()
-    private val shadowMatrix = android.graphics.Matrix()
-    private val seamShadowShader = LinearGradient(
+    // The seam shadow is a direction-specific LinearGradient in actual strip coordinates, with the
+    // dark edge pinned to the seam x = W. Precomputed once so no draw allocates a shader or Matrix.
+    private val forwardSeamShadow = LinearGradient(
+        viewportW.toFloat(),
         0f,
-        0f,
-        1f,
+        viewportW + seamShadowWidthPx().toFloat(),
         0f,
         0x40000000,
         0x00000000,
+        Shader.TileMode.CLAMP,
+    )
+    private val backwardSeamShadow = LinearGradient(
+        viewportW - seamShadowWidthPx().toFloat(),
+        0f,
+        viewportW.toFloat(),
+        0f,
+        0x00000000,
+        0x40000000,
         Shader.TileMode.CLAMP,
     )
 
@@ -135,10 +145,7 @@ internal class PageSlideOverlayView(
         val shadowW = min(14f * density, w * 0.06f)
         val edge = w
         val to = if (forward) edge + shadowW else edge - shadowW
-        shadowMatrix.setScale(if (forward) shadowW else -shadowW, 1f)
-        shadowMatrix.postTranslate(edge, 0f)
-        seamShadowShader.setLocalMatrix(shadowMatrix)
-        shadePaint.shader = seamShadowShader
+        shadePaint.shader = if (forward) forwardSeamShadow else backwardSeamShadow
         canvas.drawRect(min(edge, to), 0f, max(edge, to), h, shadePaint)
         shadePaint.shader = null
     }

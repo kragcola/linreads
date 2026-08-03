@@ -6353,6 +6353,7 @@ internal class EpubFlowView(
         curlForward = forward
         curlAxis = axis
         curlAnchor = anchor
+        onPageTurnStarted?.invoke()
         applyFlipProgress(0f, forward)
         return InteractiveTurnStartResult.STARTED
     }
@@ -7449,14 +7450,10 @@ internal class EpubFlowView(
         val result = beginInteractiveCurl(intent.forward, intent.axis, intent.anchor, ev.x, ev.y)
         when (result) {
             InteractiveTurnStartResult.STARTED -> {
-                if (interactiveTurnState != InteractiveTurnState.BOUNDARY_SOFTWARE) {
-                    onPageTurnStarted?.invoke()
-                }
                 updateInteractiveCurl(ev.x, ev.y)
             }
             InteractiveTurnStartResult.WAITING -> {
                 if (localShotsWaiting) {
-                    onPageTurnStarted?.invoke()
                     updatePendingLocalPageShotHandoff(ev.x, ev.y)
                 } else {
                     waitingBoundaryX = ev.x
