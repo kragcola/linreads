@@ -102,6 +102,10 @@ jobs:
         working-directory: android
         run: ./gradlew -Preadflow.phase=2 test
 
+      - name: Compile Android instrumentation test sources
+        working-directory: android
+        run: ./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin
+
       - name: Upload failed test diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

@@ -23,12 +23,18 @@ class F1FrameGateSupportTest {
             90th percentile: 18ms
             95th percentile: 24ms
             99th percentile: 40ms
+            Number Slow UI thread: 2
+            Number Slow issue draw commands: 1
+            Number Slow bitmap uploads: 3
             """.trimIndent(),
         )
         assertEquals(42, metrics.totalFrames)
         assertEquals(5, metrics.jankyFrames)
         assertEquals(18, metrics.p90Ms)
         assertEquals(24, metrics.p95Ms)
+        assertEquals(2, metrics.slowUiThreadFrames)
+        assertEquals(1, metrics.slowIssueDrawCommandsFrames)
+        assertEquals(3, metrics.slowBitmapUploadsFrames)
     }
 
     @Test
@@ -38,6 +44,40 @@ class F1FrameGateSupportTest {
         assertNull(metrics.jankyFrames)
         assertNull(metrics.p90Ms)
         assertNull(metrics.p95Ms)
+        assertNull(metrics.slowUiThreadFrames)
+        assertNull(metrics.slowIssueDrawCommandsFrames)
+        assertNull(metrics.slowBitmapUploadsFrames)
+    }
+
+    @Test
+    fun `gfx parser keeps absent slow lines null while other lines parse`() {
+        val metrics = GfxInfoParser.parse(
+            """
+            Total frames rendered: 12
+            Janky frames: 0 (0.00%)
+            Slow UI thread: 0 frames
+            """.trimIndent(),
+        )
+        assertEquals(12, metrics.totalFrames)
+        assertEquals(0, metrics.slowUiThreadFrames)
+        assertNull(metrics.slowIssueDrawCommandsFrames)
+        assertNull(metrics.slowBitmapUploadsFrames)
+    }
+
+    @Test
+    fun `gfx parser accepts legacy slow lines with frames suffix`() {
+        val metrics = GfxInfoParser.parse(
+            """
+            Total frames rendered: 9
+            Slow UI thread: 4 frames
+            Slow issue draw commands: 2 frames
+            Slow bitmap uploads: 0 frames
+            """.trimIndent(),
+        )
+        assertEquals(9, metrics.totalFrames)
+        assertEquals(4, metrics.slowUiThreadFrames)
+        assertEquals(2, metrics.slowIssueDrawCommandsFrames)
+        assertEquals(0, metrics.slowBitmapUploadsFrames)
     }
 
     // endregion

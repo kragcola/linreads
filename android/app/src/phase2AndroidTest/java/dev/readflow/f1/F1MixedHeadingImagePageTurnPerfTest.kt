@@ -48,6 +48,12 @@ import org.junit.runner.RunWith
 /**
  * Physical-device frame-time gate for F1 mixed heading→image page-turn.
  *
+ * Warm evidence is style-specific: SLIDE uses the frozen RenderNode/Picture artifact slots
+ * (slideFrontSlot/slideRevealedSlot) with exact page/topPx/artifact-key equality and no pending
+ * precache; SIMULATION uses the Bitmap cache only when page/top coordinates AND the current
+ * expected page texture keys agree. Case gates additionally record page-shot-capture deltas and the
+ * parsed gfxinfo slow-counters for attribution.
+ *
  * Static/compile verification only in CI agent path. Hard gfx gate and evidence require a real
  * tablet run under [evidenceDir] (`externalFilesDir/f1`).
  *
@@ -229,6 +235,10 @@ class F1MixedHeadingImagePageTurnPerfTest {
 
         var previousPrecache: Any? = null
         var coldSwapped = false
+        var probeArmed = false
+        var probeResetAttempted = false
+        var warmProbe: WarmProbeSnapshot? = null
+        var captureDelta: Int? = null
         try {
             if (case.cold) {
                 scenario.withActivity {
@@ -237,15 +247,36 @@ class F1MixedHeadingImagePageTurnPerfTest {
                 }
                 coldSwapped = true
             } else {
-                waitForWarmCaches(scenario, flowView, selection)
+                waitForWarmCaches(scenario, flowView, selection, case)
             }
+            warmProbe = scenario.withActivity { warmProbeSnapshot(flowView, selection) }
+            writeTextEvidence(
+                "${case.name}-warm-probe.txt",
+                buildString {
+                    appendLine("style=${case.style.name}")
+                    appendLine("cold=${case.cold}")
+                    appendLine(warmProbe!!.toTextEvidence())
+                },
+            )
 
             takeScreenshot("${case.name}-before.png")
             // Sample memory before gfx reset so the measured frame window starts at DOWN.
             val memoryBefore = Debug.MemoryInfo().also(Debug::getMemoryInfo)
 
+            probeResetAttempted = true
+            probeArmed = capturePageShotProbeReset()
             val slidePoints = scenario.withActivity {
                 screenSlidePoints(flowView)
+            }
+            // Warm acceptance must be re-verified at the dispatch boundary: screenshots, memory
+            // sampling, and the probe reset all run after waitForWarmCaches, so the cache slots can
+            // no longer be assumed warm. Cold cases have no warm-artifact requirement.
+            val warmReadyBeforeDispatch = if (case.cold) {
+                null
+            } else {
+                scenario.withActivity {
+                    warmCachesMatchSelection(flowView, selection, case)
+                }
             }
             // Reset immediately before DOWN; inject off the main / withActivity thread.
             shell("dumpsys gfxinfo ${appContext.packageName} reset")
@@ -253,6 +284,9 @@ class F1MixedHeadingImagePageTurnPerfTest {
 
             // Poll settle without device/instrumentation idle after the gesture.
             waitForTurnSettled(scenario, flowView, selection.imagePage)
+            if (probeArmed) {
+                captureDelta = capturePageShotProbeTotal()
+            }
 
             val gfxInfo = shell("dumpsys gfxinfo ${appContext.packageName}")
             writeTextEvidence("${case.name}-gfxinfo.txt", gfxInfo)
@@ -276,11 +310,34 @@ class F1MixedHeadingImagePageTurnPerfTest {
 
             val metrics = GfxInfoParser.parse(gfxInfo)
             val gate = F1FrameGate.evaluate(metrics, thresholds)
+            val probe = checkNotNull(warmProbe)
+            val warmReadyLabel =
+                if (case.cold) "not_applicable"
+                else if (warmReadyBeforeDispatch == true) "ready"
+                else "not_ready"
+            val warmReadinessReasons =
+                if (case.cold || warmReadyBeforeDispatch == true) {
+                    emptyList()
+                } else {
+                    listOf("warm_artifacts_not_ready_immediately_before_input_dispatch")
+                }
+            val allReasons = gate.reasons + warmReadinessReasons
+            val casePass = gate.pass && warmReadinessReasons.isEmpty()
             writeTextEvidence(
                 "${case.name}-gate.txt",
                 buildString {
-                    appendLine("pass=${gate.pass}")
-                    appendLine("reasons=${gate.reasons.joinToString(";")}")
+                    appendLine("pass=$casePass")
+                    appendLine("reasons=${allReasons.joinToString(";")}")
+                    appendLine("style=${case.style.name}")
+                    appendLine("cold=${case.cold}")
+                    appendLine(probe.toTextEvidence())
+                    appendLine("metrics_pass=${gate.pass}")
+                    appendLine("warm_ready_before_dispatch=${warmReadyBeforeDispatch ?: "n/a"}")
+                    appendLine("warm_readiness=$warmReadyLabel")
+                    appendLine("page_shot_capture_delta=${captureDelta ?: "unavailable"}")
+                    appendLine("slow_ui_thread_frames=${metrics.slowUiThreadFrames}")
+                    appendLine("slow_issue_draw_commands_frames=${metrics.slowIssueDrawCommandsFrames}")
+                    appendLine("slow_bitmap_uploads_frames=${metrics.slowBitmapUploadsFrames}")
                     appendLine("total_frames=${gate.totalFrames}")
                     appendLine("janky_frames=${gate.jankyFrames}")
                     appendLine("janky_ratio=${gate.jankyRatio}")
@@ -295,11 +352,25 @@ class F1MixedHeadingImagePageTurnPerfTest {
             // while production thresholds stay undiluted.
             return CaseGateOutcome(
                 name = case.name,
-                pass = gate.pass,
-                reasons = gate.reasons,
+                pass = casePass,
+                reasons = allReasons,
                 summaryLine = listOf(
                     "case=${case.name}",
-                    "pass=${gate.pass}",
+                    "style=${case.style.name}",
+                    "cold=${case.cold}",
+                    "front_slot_page=${probe.frontSlotPage}",
+                    "revealed_slot_page=${probe.revealedSlotPage}",
+                    "slide_front_slot_ready=${probe.slideFrontSlotReady}",
+                    "slide_revealed_slot_ready=${probe.slideRevealedSlotReady}",
+                    "slide_artifact_precache_pending=${probe.slideArtifactPrecachePending}",
+                    "page_texture_precache_pending=${probe.pageTexturePrecachePending}",
+                    "page_shot_capture_delta=${captureDelta ?: "unavailable"}",
+                    "warm_ready_before_dispatch=${warmReadyBeforeDispatch ?: "n/a"}",
+                    "warm_readiness=$warmReadyLabel",
+                    "slow_ui_thread_frames=${metrics.slowUiThreadFrames}",
+                    "slow_issue_draw_commands_frames=${metrics.slowIssueDrawCommandsFrames}",
+                    "slow_bitmap_uploads_frames=${metrics.slowBitmapUploadsFrames}",
+                    "pass=$casePass",
                     "total_frames=${gate.totalFrames}",
                     "janky_frames=${gate.jankyFrames}",
                     "janky_ratio=${gate.jankyRatio}",
@@ -308,6 +379,11 @@ class F1MixedHeadingImagePageTurnPerfTest {
                 ).joinToString(" | "),
             )
         } finally {
+            // Best-effort stop once reset was attempted, even when reset reported failure: a
+            // partial reflection failure can still leave the production probe armed and counting.
+            if (probeResetAttempted) {
+                capturePageShotProbeStop()
+            }
             if (coldSwapped) {
                 scenario.withActivity {
                     flowView.swapPrivateField("pageTexturePrecacheEnabled", previousPrecache ?: true)
@@ -419,15 +495,67 @@ class F1MixedHeadingImagePageTurnPerfTest {
         scenario: ActivityScenario<MainActivity>,
         flowView: View,
         selection: F1BoundarySelection,
+        case: Case,
     ) {
-        waitForCondition("front/revealed caches match selection pages and tops") {
+        waitForCondition("${case.style.name} warm cache slots match selection page/top/keys") {
             scenario.withActivity {
-                warmCachesMatchSelection(flowView, selection)
+                warmCachesMatchSelection(flowView, selection, case)
             }
         }
     }
 
-    private fun warmCachesMatchSelection(flowView: View, selection: F1BoundarySelection): Boolean {
+    private fun warmCachesMatchSelection(
+        flowView: View,
+        selection: F1BoundarySelection,
+        case: Case,
+    ): Boolean {
+        return if (case.style == PageFlipStyle.SLIDE) {
+            warmSlideArtifactsMatchSelection(flowView, selection)
+        } else {
+            warmBitmapCachesMatchSelection(flowView, selection)
+        }
+    }
+
+    /**
+     * SLIDE warm evidence comes only from the frozen RenderNode/Picture artifact slots. Legacy
+     * Bitmap caches are never accepted as SLIDE-warm evidence.
+     */
+    private fun warmSlideArtifactsMatchSelection(
+        flowView: View,
+        selection: F1BoundarySelection,
+    ): Boolean {
+        val pages = flowView.reflectPrivateAny("paged") as? List<Any> ?: return false
+        if (selection.headingPage !in pages.indices || selection.imagePage !in pages.indices) {
+            return false
+        }
+        val pending = flowView.reflectPrivateAny("slideArtifactPrecachePending") as? Boolean ?: return false
+        if (pending) return false
+
+        val headingTop = pages[selection.headingPage].fieldInt("topPx")
+        val imageTop = pages[selection.imagePage].fieldInt("topPx")
+        val frontSlot = flowView.reflectPrivateAny("slideFrontSlot") as? Any ?: return false
+        val revealedSlot = flowView.reflectPrivateAny("slideRevealedSlot") as? Any ?: return false
+        val frontKey = flowView.reflectSlideArtifactKey(headingTop, pages[selection.headingPage]) ?: return false
+        val revealedKey = flowView.reflectSlideArtifactKey(imageTop, pages[selection.imagePage]) ?: return false
+        val frontMatches =
+            frontSlot.fieldInt("page") == selection.headingPage &&
+                frontSlot.fieldInt("topPx") == headingTop &&
+                frontSlot.fieldAny("key") == frontKey
+        val revealedMatches =
+            revealedSlot.fieldInt("page") == selection.imagePage &&
+                revealedSlot.fieldInt("topPx") == imageTop &&
+                revealedSlot.fieldAny("key") == revealedKey
+        return frontMatches && revealedMatches
+    }
+
+    /**
+     * SIMULATION warm evidence requires the cached page/top coordinates AND the current expected
+     * page texture keys to agree; legacy coordinate-only matches are not warm.
+     */
+    private fun warmBitmapCachesMatchSelection(
+        flowView: View,
+        selection: F1BoundarySelection,
+    ): Boolean {
         val front = flowView.reflectPrivateAny("cachedFrontBitmap") as? Bitmap
         val revealed = flowView.reflectPrivateAny("cachedRevealedBitmap") as? Bitmap
         if (front == null || front.isRecycled || revealed == null || revealed.isRecycled) {
@@ -450,8 +578,58 @@ class F1MixedHeadingImagePageTurnPerfTest {
         if (fromTop != headingTop || targetTop != imageTop) {
             return false
         }
+        val fromTextureKey = flowView.reflectPrivateAny("cachedFromTextureKey") ?: return false
+        val targetTextureKey = flowView.reflectPrivateAny("cachedTargetTextureKey") ?: return false
+        val expectedFromKey = flowView.reflectPageTextureKey(headingTop, pages[selection.headingPage])
+            ?: return false
+        val expectedTargetKey = flowView.reflectPageTextureKey(imageTop, pages[selection.imagePage])
+            ?: return false
+        if (fromTextureKey != expectedFromKey || targetTextureKey != expectedTargetKey) {
+            return false
+        }
         val pending = flowView.reflectPrivateAny("pageTexturePrecachePending") as? Boolean ?: return false
         return !pending
+    }
+
+    /** Text-only probe of both cache paths used for case-gate attribution. */
+    private fun warmProbeSnapshot(
+        flowView: View,
+        selection: F1BoundarySelection,
+    ): WarmProbeSnapshot {
+        val pages = flowView.reflectPrivateAny("paged") as? List<Any>
+        val headingTop = pages?.getOrNull(selection.headingPage)?.fieldInt("topPx")
+        val imageTop = pages?.getOrNull(selection.imagePage)?.fieldInt("topPx")
+        val frontSlot = flowView.reflectPrivateAny("slideFrontSlot") as? Any
+        val revealedSlot = flowView.reflectPrivateAny("slideRevealedSlot") as? Any
+        val expectedFrontArtifactKey = headingTop?.let {
+            flowView.reflectSlideArtifactKey(it, pages?.get(selection.headingPage))
+        }
+        val expectedRevealedArtifactKey = imageTop?.let {
+            flowView.reflectSlideArtifactKey(it, pages?.get(selection.imagePage))
+        }
+        return WarmProbeSnapshot(
+            style = flowView.reflectPrivateAny("flipStyle")?.toString(),
+            frontSlotPage = frontSlot?.fieldInt("page"),
+            frontSlotTopPx = frontSlot?.fieldInt("topPx"),
+            revealedSlotPage = revealedSlot?.fieldInt("page"),
+            revealedSlotTopPx = revealedSlot?.fieldInt("topPx"),
+            slideFrontSlotReady = headingTop != null && frontSlot != null &&
+                frontSlot.fieldInt("page") == selection.headingPage &&
+                frontSlot.fieldInt("topPx") == headingTop &&
+                frontSlot.fieldAny("key") == expectedFrontArtifactKey,
+            slideRevealedSlotReady = imageTop != null && revealedSlot != null &&
+                revealedSlot.fieldInt("page") == selection.imagePage &&
+                revealedSlot.fieldInt("topPx") == imageTop &&
+                revealedSlot.fieldAny("key") == expectedRevealedArtifactKey,
+            slideArtifactPrecachePending =
+                flowView.reflectPrivateAny("slideArtifactPrecachePending") as? Boolean,
+            pageTexturePrecachePending =
+                flowView.reflectPrivateAny("pageTexturePrecachePending") as? Boolean,
+            cachedFrontPage = flowView.reflectPrivateAny("cachedFromPage") as? Int,
+            cachedRevealedPage = flowView.reflectPrivateAny("cachedTargetPage") as? Int,
+            cachedFrontTopPx = flowView.reflectPrivateAny("cachedFromTopPx") as? Int,
+            cachedRevealedTopPx = flowView.reflectPrivateAny("cachedTargetTopPx") as? Int,
+        )
     }
 
     private fun waitForImagesDecoded(
@@ -728,6 +906,69 @@ class F1MixedHeadingImagePageTurnPerfTest {
     private fun View.reflectPrivateAny(name: String): Any? =
         javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this)
 
+    /** Reflects `pageTextureKey(topPx, window)` on the live engine and returns its current key. */
+    private fun View.reflectPageTextureKey(topPx: Int, window: Any?): Any? =
+        reflectKeyMethod("pageTextureKey", topPx, window)
+
+    /** Reflects `slidePageArtifactKey(topPx, window)` on the live engine and returns its current key. */
+    private fun View.reflectSlideArtifactKey(topPx: Int, window: Any?): Any? =
+        reflectKeyMethod("slidePageArtifactKey", topPx, window)
+
+    private fun View.reflectKeyMethod(name: String, topPx: Int, window: Any?): Any? =
+        try {
+            val method = javaClass.declaredMethods.firstOrNull { candidate ->
+                candidate.name == name &&
+                    candidate.parameterCount == 2 &&
+                    candidate.parameterTypes[0] == Int::class.javaPrimitiveType
+            } ?: return null
+            method.isAccessible = true
+            method.invoke(this, topPx, window)
+        } catch (_: Throwable) {
+            null
+        }
+
+    /**
+     * Reset/read/stop hooks for the production page-shot capture probe (internal render-module
+     * object). All operations report explicit success so probe unavailability is never mistaken
+     * for a measured zero-capture result.
+     */
+    private fun capturePageShotProbeReset(): Boolean =
+        invokeCapturePageShotProbeSucceeds("reset")
+
+    private fun capturePageShotProbeTotal(): Int? =
+        (invokeCapturePageShotProbe("total") as? Int)
+
+    private fun capturePageShotProbeStop() {
+        invokeCapturePageShotProbe("stop")
+    }
+
+    /** Ignore the reflective return value; reset succeeds only when invocation completes. */
+    private fun invokeCapturePageShotProbeSucceeds(methodName: String): Boolean =
+        try {
+            val probe = Class.forName(CAPTURE_PROBE_CLASS_NAME).getDeclaredField("INSTANCE")
+                .apply { isAccessible = true }
+                .get(null)
+                ?: error("page-shot capture probe instance unavailable")
+            val method = probe.javaClass.getDeclaredMethod(methodName)
+                .apply { isAccessible = true }
+            method.invoke(probe)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+
+    private fun invokeCapturePageShotProbe(methodName: String): Any? =
+        try {
+            val probe = Class.forName(CAPTURE_PROBE_CLASS_NAME).getDeclaredField("INSTANCE")
+                .apply { isAccessible = true }
+                .get(null)
+            probe?.javaClass?.getDeclaredMethod(methodName)
+                ?.apply { isAccessible = true }
+                ?.invoke(probe)
+        } catch (_: Throwable) {
+            null
+        }
+
     private fun View.swapPrivateField(name: String, value: Any?): Any? {
         val field = javaClass.getDeclaredField(name).apply { isAccessible = true }
         val previous = field.get(this)
@@ -751,6 +992,9 @@ class F1MixedHeadingImagePageTurnPerfTest {
 
     private fun Any.fieldBool(name: String): Boolean =
         javaClass.getDeclaredField(name).apply { isAccessible = true }.getBoolean(this)
+
+    private fun Any.fieldAny(name: String): Any? =
+        javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this)
 
     private fun shell(command: String): String {
         val descriptor = instrumentation.uiAutomation.executeShellCommand(command)
@@ -834,6 +1078,39 @@ class F1MixedHeadingImagePageTurnPerfTest {
         val summaryLine: String,
     )
 
+    /** Attribution snapshot of both cache paths for a case gate (text evidence only). */
+    private data class WarmProbeSnapshot(
+        val style: String?,
+        val frontSlotPage: Int?,
+        val frontSlotTopPx: Int?,
+        val revealedSlotPage: Int?,
+        val revealedSlotTopPx: Int?,
+        val slideFrontSlotReady: Boolean,
+        val slideRevealedSlotReady: Boolean,
+        val slideArtifactPrecachePending: Boolean?,
+        val pageTexturePrecachePending: Boolean?,
+        val cachedFrontPage: Int?,
+        val cachedRevealedPage: Int?,
+        val cachedFrontTopPx: Int?,
+        val cachedRevealedTopPx: Int?,
+    ) {
+        fun toTextEvidence(): String = buildString {
+            appendLine("style=${style ?: "unknown"}")
+            appendLine("slide_front_slot_page=${frontSlotPage}")
+            appendLine("slide_front_slot_top_px=${frontSlotTopPx}")
+            appendLine("slide_revealed_slot_page=${revealedSlotPage}")
+            appendLine("slide_revealed_slot_top_px=${revealedSlotTopPx}")
+            appendLine("slide_front_slot_ready=$slideFrontSlotReady")
+            appendLine("slide_revealed_slot_ready=$slideRevealedSlotReady")
+            appendLine("slide_artifact_precache_pending=${slideArtifactPrecachePending}")
+            appendLine("page_texture_precache_pending=${pageTexturePrecachePending}")
+            appendLine("cached_front_page=${cachedFrontPage}")
+            appendLine("cached_revealed_page=${cachedRevealedPage}")
+            appendLine("cached_front_top_px=${cachedFrontTopPx}")
+            appendLine("cached_revealed_top_px=${cachedRevealedTopPx}")
+        }
+    }
+
     private data class SlidePoints(
         val start: PointF,
         val end: PointF,
@@ -845,6 +1122,7 @@ class F1MixedHeadingImagePageTurnPerfTest {
         private const val ARG_MAX_P95_MS = "f1_max_p95_ms"
         private const val ARG_MAX_JANKY_RATIO = "f1_max_janky_ratio"
         private const val ARG_MIN_TOTAL_FRAMES = "f1_min_total_frames"
+        private const val CAPTURE_PROBE_CLASS_NAME = "dev.readflow.render.epub.EpubPageShotCaptureProbe"
         private const val MIN_CROP_BAND_DP = 24
         private const val FRAME_STEP_MS = 16L
         private val UI_TIMEOUT_MS = 45.seconds.inWholeMilliseconds
