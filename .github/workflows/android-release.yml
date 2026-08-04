@@ -212,6 +212,49 @@ jobs:
               return descriptors
 
 
+          def type_references(data):
+              if len(data) < 0x70 or data[:4] != b"dex\n":
+                  raise ValueError("not a standard DEX file")
+              file_size = u32(data, 0x20, len(data))
+              header_size = u32(data, 0x24, len(data))
+              if header_size < 0x70 or file_size < header_size or file_size > len(data):
+                  raise ValueError("invalid DEX header")
+              if u32(data, 0x28, file_size) != 0x12345678:
+                  raise ValueError("unsupported DEX endian tag")
+
+              strings_size, strings_off = u32(data, 0x38, file_size), u32(data, 0x3c, file_size)
+              types_size, types_off = u32(data, 0x40, file_size), u32(data, 0x44, file_size)
+
+              if strings_off > file_size or strings_size > (file_size - strings_off) // 4:
+                  raise ValueError("DEX string table out of bounds")
+              if types_off > file_size or types_size > (file_size - types_off) // 4:
+                  raise ValueError("DEX type table out of bounds")
+
+              descriptors = set()
+              for index in range(types_size):
+                  descriptor_index = u32(data, types_off + index * 4, file_size)
+                  if descriptor_index >= strings_size:
+                      raise ValueError("invalid type descriptor index")
+                  string_offset = u32(data, strings_off + descriptor_index * 4, file_size)
+                  if string_offset >= file_size:
+                      raise ValueError("invalid string_data_off")
+                  cursor = string_offset
+                  for _ in range(5):
+                      if cursor >= file_size:
+                          raise ValueError("truncated DEX string length")
+                      byte = data[cursor]
+                      cursor += 1
+                      if not byte & 0x80:
+                          break
+                  else:
+                      raise ValueError("invalid DEX string length")
+                  terminator = data.find(b"\0", cursor, file_size)
+                  if terminator < 0:
+                      raise ValueError("unterminated DEX string")
+                  descriptors.add(data[cursor:terminator].decode("utf-8"))
+              return descriptors
+
+
           def require_definition(apk_path, expected):
               with zipfile.ZipFile(apk_path) as archive:
                   dex_names = [
@@ -227,11 +270,46 @@ jobs:
               raise SystemExit(f"{apk_path}: missing class definition {expected}")
 
 
+          def require_kotlin_test_runtime(ota_apk_path, test_apk_path):
+              def descriptors_from(apk_path, extractor):
+                  with zipfile.ZipFile(apk_path) as archive:
+                      dex_names = [
+                          name for name in archive.namelist()
+                          if re.fullmatch(r"classes(?:[0-9]+)?\.dex", name)
+                      ]
+                      if not dex_names:
+                          raise SystemExit(f"{apk_path}: no DEX entries")
+                      descriptors = set()
+                      for dex_name in dex_names:
+                          descriptors.update(extractor(archive.read(dex_name)))
+                      return descriptors
+
+              target_definitions = descriptors_from(ota_apk_path, class_definitions)
+              test_references = descriptors_from(test_apk_path, type_references)
+              required_kotlin = set()
+              for descriptor in test_references:
+                  element = descriptor.lstrip("[")
+                  if element.startswith("Lkotlin/"):
+                      required_kotlin.add(element)
+              missing = sorted(required_kotlin - target_definitions)
+              if missing:
+                  raise SystemExit(
+                      f"{ota_apk_path}: missing Kotlin runtime definitions required by {test_apk_path}: "
+                      + ", ".join(missing)
+                  )
+              print(
+                  f"{ota_apk_path}: defined all {len(required_kotlin)} Kotlin runtime references "
+                  f"required by {test_apk_path}"
+              )
+
+
           require_definition(sys.argv[1], "Lkotlin/jvm/internal/Intrinsics;")
+          require_definition(sys.argv[1], "Lkotlin/jvm/internal/Lambda;")
           require_definition(sys.argv[1], "Landroidx/tracing/Trace;")
           require_definition(sys.argv[1], "Landroidx/tracing/TraceApi18Impl;")
           require_definition(sys.argv[1], "Landroidx/tracing/TraceApi29Impl;")
           require_definition(sys.argv[2], "Landroidx/test/runner/AndroidJUnitRunner;")
+          require_kotlin_test_runtime(sys.argv[1], sys.argv[2])
           PY
 
       - name: Upload Android instrumentation test APK

@@ -48,8 +48,9 @@
 -keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
 -keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
 
-# Keep the AndroidX test runner's Kotlin intrinsic when it targets a minified OTA.
--keep class kotlin.jvm.internal.Intrinsics { *; }
+# AndroidJUnitRunner's monitor library runs in the minified target process and uses Kotlin stdlib
+# classes before any test executes. Keep its complete runtime closure, not only Intrinsics.
+-keep class kotlin.** { *; }
 
 # AndroidJUnitRunner runs in the target app process and resolves this runtime after R8.
 -keep class androidx.tracing.Trace { *; }

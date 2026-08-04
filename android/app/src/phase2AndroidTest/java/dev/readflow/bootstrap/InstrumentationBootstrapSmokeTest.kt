@@ -19,6 +19,9 @@ class InstrumentationBootstrapSmokeTest {
 
         assertEquals("dev.readflow", targetContext.packageName)
         Class.forName("kotlin.jvm.internal.Intrinsics", true, targetClassLoader)
+        Class.forName("kotlin.jvm.internal.Lambda", true, targetClassLoader)
+        Class.forName("kotlin.jvm.functions.Function0", true, targetClassLoader)
+        Class.forName("kotlin.LazyKt", true, targetClassLoader)
         Class.forName("kotlin.KotlinVersion", true, targetClassLoader)
         Class.forName("kotlin.collections.CollectionsKt", true, targetClassLoader)
         Class.forName("androidx.tracing.Trace", true, targetClassLoader)

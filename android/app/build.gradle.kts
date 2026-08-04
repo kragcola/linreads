@@ -163,7 +163,8 @@ dependencies {
     implementation(libs.coil)
     implementation(libs.coil.network.okhttp)
     implementation(libs.work.runtime)
-    // AndroidJUnitRunner resolves Trace through the target app classloader on physical devices.
+    // AndroidJUnitRunner and its monitor library run in the target app process on physical devices.
+    implementation(libs.kotlin.stdlib)
     implementation(libs.androidx.tracing)
     implementation(libs.bundles.koin)
     implementation(libs.bundles.room)
@@ -178,7 +179,4 @@ dependencies {
     androidTestImplementation(libs.androidx.test.rules)
     androidTestImplementation(libs.espresso.core)
     androidTestImplementation(libs.uiautomator)
-    // Instrumentation runs in a separate APK. Keep its Kotlin runtime independent from R8's
-    // production-APK reachability analysis so test code can run against an OTA target.
-    androidTestImplementation(libs.kotlin.stdlib)
 }
