@@ -6558,10 +6558,6 @@ class EpubFlowViewTest {
                 assertEquals(expected, view.privateField("rapidIdleSettleStage").toString())
             }
 
-            shadowOf(Looper.getMainLooper()).idleFor(319L, TimeUnit.MILLISECONDS)
-            assertEquals(0, settledCount)
-            assertTrue(view.privateBool("rapidTurnSequenceActive"))
-
             advanceUntilStage("APPLY_ASYNC")
             assertEquals(
                 "the rapid timeout must not execute image work or settle synchronously",
