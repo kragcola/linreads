@@ -6603,6 +6603,52 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `rapid idle image tail waits for relevant decode before rebind`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.NONE)
+        try {
+            view.pageTexturePrecacheEnabled = false
+            var decodePending = true
+            view.pendingDecodesProvider = { decodePending }
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+
+            view.acceptPromotedPageTurns(delta = 0, rapidSequence = true)
+            view.onAsyncImagePixelsChangedRequiringTextRebind(pages.first().startOffset)
+            assertTrue(view.privateBool("asyncImagePixelTextRebindPending"))
+
+            fun advanceUntilApplyStage() {
+                repeat(16) {
+                    if (view.privateField("rapidIdleSettleStage").toString() == "APPLY_ASYNC") return
+                    shadowOf(Looper.getMainLooper()).runOneTask()
+                }
+                assertEquals("APPLY_ASYNC", view.privateField("rapidIdleSettleStage").toString())
+            }
+            advanceUntilApplyStage()
+
+            shadowOf(Looper.getMainLooper()).idleFor(80L, TimeUnit.MILLISECONDS)
+            assertEquals(
+                "a relevant decode must keep the staged tail in APPLY_ASYNC",
+                "APPLY_ASYNC",
+                view.privateField("rapidIdleSettleStage").toString(),
+            )
+            assertTrue(
+                "a relevant decode must keep the whole-TextView rebind pending",
+                view.privateBool("asyncImagePixelTextRebindPending"),
+            )
+            assertTrue(view.privateBool("rapidTurnSequenceActive"))
+
+            decodePending = false
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+            assertFalse(
+                "the staged apply must consume the rebind after the relevant decode settles",
+                view.privateBool("asyncImagePixelTextRebindPending"),
+            )
+            assertFalse(view.privateBool("rapidTurnSequenceActive"))
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `pointer down cancels pending slide precache but preserves retained warm slots`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         try {

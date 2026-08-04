@@ -4310,6 +4310,22 @@ internal class EpubFlowView(
         }
         when (rapidIdleSettleStage) {
             RapidIdleSettleStage.APPLY_ASYNC -> {
+                if (pendingDecodesProvider?.invoke() == true) {
+                    val now = android.os.SystemClock.uptimeMillis()
+                    if (asyncImageBatchWaitStartedAtMs == 0L) {
+                        asyncImageBatchWaitStartedAtMs = now
+                    }
+                    if (now - asyncImageBatchWaitStartedAtMs < ASYNC_IMAGE_BATCH_MAX_WAIT_MS) {
+                        // Keep the rapid window open while the relevant image batch is still
+                        // decoding. Applying a PIXELS_ONLY rebind here would rebuild the long
+                        // TextView and redraw dependent page shots on the same frame as the
+                        // decode completion, reintroducing the input hitch this staged tail avoids.
+                        rapidIdleSettlePosted = true
+                        postDelayed(rapidIdleSettleRunnable, REFLOW_DEBOUNCE_MS)
+                        return
+                    }
+                }
+                asyncImageBatchWaitStartedAtMs = 0L
                 // The async runnable normally defers while rapid mode is active. Temporarily mark
                 // this one controlled invocation so its existing batching/identity rules can run
                 // without opening the input window or allowing an unrelated callback through.
