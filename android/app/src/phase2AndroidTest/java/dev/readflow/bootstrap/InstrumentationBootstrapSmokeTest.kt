@@ -13,11 +13,15 @@ class InstrumentationBootstrapSmokeTest {
 
     @Test
     fun targetPackageNameIsReadflow() {
-        val targetContext = InstrumentationRegistry.getInstrumentation().targetContext
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val targetContext = instrumentation.targetContext
+        val targetClassLoader = targetContext.classLoader
+        val testClassLoader = instrumentation.context.classLoader
 
         assertEquals("dev.readflow", targetContext.packageName)
-        Class.forName("kotlin.jvm.internal.Intrinsics")
-        Class.forName("kotlin.KotlinVersion")
-        Class.forName("kotlin.collections.CollectionsKt")
+        Class.forName("kotlin.jvm.internal.Intrinsics", true, targetClassLoader)
+        Class.forName("kotlin.KotlinVersion", true, targetClassLoader)
+        Class.forName("kotlin.collections.CollectionsKt", true, targetClassLoader)
+        Class.forName("androidx.tracing.Trace", true, testClassLoader)
     }
 }
