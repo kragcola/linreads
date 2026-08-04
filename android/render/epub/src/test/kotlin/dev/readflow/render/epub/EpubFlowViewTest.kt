@@ -6516,10 +6516,15 @@ class EpubFlowViewTest {
         assertTrue(view.isRapidTurnPerformanceModeActive())
         assertEquals(countBeforeIdle, settledCount)
 
-        shadowOf(Looper.getMainLooper()).idleFor(2L, TimeUnit.MILLISECONDS)
+        shadowOf(Looper.getMainLooper()).runOneTask()
         assertTrue(
             "the timeout must only arm the frame-split settle tail",
             view.isRapidTurnPerformanceModeActive(),
+        )
+        assertEquals(
+            "the idle timeout must arm the first frame rather than run it inline",
+            "APPLY_ASYNC",
+            view.privateField("rapidIdleSettleStage").toString(),
         )
         assertEquals(
             "the settle callback must run after the split frames",
@@ -6553,7 +6558,11 @@ class EpubFlowViewTest {
                 assertEquals(expected, view.privateField("rapidIdleSettleStage").toString())
             }
 
-            shadowOf(Looper.getMainLooper()).idleFor(322L, TimeUnit.MILLISECONDS)
+            shadowOf(Looper.getMainLooper()).idleFor(319L, TimeUnit.MILLISECONDS)
+            assertEquals(0, settledCount)
+            assertTrue(view.privateBool("rapidTurnSequenceActive"))
+
+            advanceUntilStage("APPLY_ASYNC")
             assertEquals(
                 "the rapid timeout must not execute image work or settle synchronously",
                 0,
