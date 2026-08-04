@@ -159,17 +159,20 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
     }
 
     private fun currentResumedEpubSessionOrNull(): CurrentEpubSession? {
+        val lifecycleActivities = ActivityLifecycleMonitorRegistry.getInstance()
+            .getActivitiesInStage(Stage.RESUMED)
+        val activityThreadLookup = activityThreadResumedActivities()
+        activityThreadLookup.unavailableReason?.let { reason ->
+            Log.w(TAG, "ActivityThread current-session fallback unavailable: $reason")
+        }
         val resumedActivities = buildList {
-            addAll(
-                ActivityLifecycleMonitorRegistry.getInstance()
-                    .getActivitiesInStage(Stage.RESUMED),
-            )
-            addAll(activityThreadResumedActivities())
+            addAll(lifecycleActivities)
+            addAll(activityThreadLookup.activities)
         }.distinct()
         for (activity in resumedActivities) {
             if (activity !is MainActivity || activity.isFinishing || activity.isDestroyed) continue
             val flowView = activity.window.decorView.findDescendant { view ->
-                view.isEpubFlowSurface() &&
+                view.javaClass.name == EPUB_FLOW_VIEW_CLASS_NAME &&
                     view.isAttachedToWindow &&
                     view.isShown &&
                     view.isEnabled &&
@@ -178,6 +181,11 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
             } ?: continue
             return CurrentEpubSession(flowView)
         }
+        Log.i(
+            TAG,
+            "No resumed EPUB flow surface: lifecycleActivities=${lifecycleActivities.size} " +
+                "activityThreadActivities=${activityThreadLookup.activities.size}",
+        )
         return null
     }
 
@@ -187,34 +195,33 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
      * already-open real reader session; the runner is invoked with --no-restart so that session is
      * not force-stopped before this lookup.
      */
-    private fun activityThreadResumedActivities(): List<Activity> {
-        val thread = runCatching {
+    private fun activityThreadResumedActivities(): ActivityThreadActivityLookup {
+        val thread = try {
             Class.forName("android.app.ActivityThread").getDeclaredMethod("currentActivityThread")
                 .apply { isAccessible = true }
                 .invoke(null)
-        }.getOrNull() ?: return emptyList()
-        val records = runCatching {
+        } catch (error: ReflectiveOperationException) {
+            return ActivityThreadActivityLookup(unavailableReason = error.message ?: error.javaClass.name)
+        } catch (error: SecurityException) {
+            return ActivityThreadActivityLookup(unavailableReason = error.message ?: error.javaClass.name)
+        } ?: return ActivityThreadActivityLookup(unavailableReason = "currentActivityThread returned null")
+        val records = try {
             thread.javaClass.getDeclaredField("mActivities").apply { isAccessible = true }
                 .get(thread) as? Map<*, *>
-        }.getOrNull() ?: return emptyList()
-        return records.values.mapNotNull { record ->
+        } catch (error: ReflectiveOperationException) {
+            return ActivityThreadActivityLookup(unavailableReason = error.message ?: error.javaClass.name)
+        } catch (error: SecurityException) {
+            return ActivityThreadActivityLookup(unavailableReason = error.message ?: error.javaClass.name)
+        } ?: return ActivityThreadActivityLookup(unavailableReason = "mActivities was not a Map")
+        return ActivityThreadActivityLookup(records.values.mapNotNull { record ->
             val candidate = record ?: return@mapNotNull null
-            val activity = candidate.privateField("activity") as? Activity ?: return@mapNotNull null
-            val paused = candidate.privateField("paused") as? Boolean ?: return@mapNotNull null
-            val stopped = candidate.privateField("stopped") as? Boolean ?: return@mapNotNull null
-            activity.takeIf { !paused && !stopped }
-        }
+            candidate.privateField("activity") as? Activity
+        })
     }
 
     private fun Any.privateField(name: String): Any? = runCatching {
         javaClass.getDeclaredField(name).apply { isAccessible = true }.get(this)
     }.getOrNull()
-
-    private fun View.isEpubFlowSurface(): Boolean =
-        javaClass.name == EPUB_FLOW_VIEW_CLASS_NAME ||
-            (this is android.widget.ScrollView && javaClass.declaredMethods.any { method ->
-                method.name == "currentPageIndex" && method.parameterCount == 0
-            })
 
     private fun View.findDescendant(predicate: (View) -> Boolean): View? {
         if (predicate(this)) return this
@@ -291,6 +298,11 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
 
     private data class CurrentEpubSession(
         val flowView: View,
+    )
+
+    private data class ActivityThreadActivityLookup(
+        val activities: List<Activity> = emptyList(),
+        val unavailableReason: String? = null,
     )
 
     private data class ReaderPosition(
