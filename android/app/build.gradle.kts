@@ -163,6 +163,8 @@ dependencies {
     implementation(libs.coil)
     implementation(libs.coil.network.okhttp)
     implementation(libs.work.runtime)
+    // AndroidJUnitRunner resolves Trace through the target app classloader on physical devices.
+    implementation(libs.androidx.tracing)
     implementation(libs.bundles.koin)
     implementation(libs.bundles.room)
     // Other render engines (epub/pdf/md) + settings: shells only, wired when implemented
@@ -174,7 +176,6 @@ dependencies {
     androidTestImplementation(libs.androidx.test.core)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.rules)
-    androidTestImplementation(libs.androidx.tracing)
     androidTestImplementation(libs.espresso.core)
     androidTestImplementation(libs.uiautomator)
     // Instrumentation runs in a separate APK. Keep its Kotlin runtime independent from R8's

@@ -228,7 +228,10 @@ jobs:
 
 
           require_definition(sys.argv[1], "Lkotlin/jvm/internal/Intrinsics;")
-          require_definition(sys.argv[2], "Landroidx/tracing/Trace;")
+          require_definition(sys.argv[1], "Landroidx/tracing/Trace;")
+          require_definition(sys.argv[1], "Landroidx/tracing/TraceApi18Impl;")
+          require_definition(sys.argv[1], "Landroidx/tracing/TraceApi29Impl;")
+          require_definition(sys.argv[2], "Landroidx/test/runner/AndroidJUnitRunner;")
           PY
 
       - name: Upload Android instrumentation test APK

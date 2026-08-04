@@ -51,6 +51,11 @@
 # Keep the AndroidX test runner's Kotlin intrinsic when it targets a minified OTA.
 -keep class kotlin.jvm.internal.Intrinsics { *; }
 
+# AndroidJUnitRunner runs in the target app process and resolves this runtime after R8.
+-keep class androidx.tracing.Trace { *; }
+-keep class androidx.tracing.TraceApi18Impl { *; }
+-keep class androidx.tracing.TraceApi29Impl { *; }
+
 # Keep Markwon
 -keep class io.noties.markwon.** { *; }
 # markwon-image bundles Svg/GifMediaDecoder, which reference the OPTIONAL androidsvg
