@@ -6517,8 +6517,84 @@ class EpubFlowViewTest {
         assertEquals(countBeforeIdle, settledCount)
 
         shadowOf(Looper.getMainLooper()).idleFor(2L, TimeUnit.MILLISECONDS)
+        assertTrue(
+            "the timeout must only arm the frame-split settle tail",
+            view.isRapidTurnPerformanceModeActive(),
+        )
+        assertEquals(
+            "the settle callback must run after the split frames",
+            countBeforeIdle,
+            settledCount,
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
         assertFalse(view.isRapidTurnPerformanceModeActive())
         assertEquals(countBeforeIdle + 1, settledCount)
+    }
+
+    @Test
+    fun `rapid idle image tail separates rebind from settle callback`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.NONE)
+        try {
+            view.pageTexturePrecacheEnabled = false
+            var settledCount = 0
+            view.onPageSettled = { settledCount++ }
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+
+            view.acceptPromotedPageTurns(delta = 0, rapidSequence = true)
+            view.onAsyncImagePixelsChangedRequiringTextRebind(pages.first().startOffset)
+            assertTrue(view.privateBool("asyncImagePixelTextRebindPending"))
+
+            fun advanceUntilStage(expected: String) {
+                repeat(16) {
+                    if (view.privateField("rapidIdleSettleStage").toString() == expected) return
+                    shadowOf(Looper.getMainLooper()).runOneTask()
+                }
+                assertEquals(expected, view.privateField("rapidIdleSettleStage").toString())
+            }
+
+            shadowOf(Looper.getMainLooper()).idleFor(322L, TimeUnit.MILLISECONDS)
+            assertEquals(
+                "the rapid timeout must not execute image work or settle synchronously",
+                0,
+                settledCount,
+            )
+            assertEquals(
+                "the timeout must arm the first frame-split stage",
+                "APPLY_ASYNC",
+                view.privateField("rapidIdleSettleStage").toString(),
+            )
+            assertTrue(view.privateBool("rapidTurnSequenceActive"))
+
+            advanceUntilStage("PRECACHE")
+            assertEquals(
+                "the apply frame must hand off to precache without settling in the same callback",
+                "PRECACHE",
+                view.privateField("rapidIdleSettleStage").toString(),
+            )
+            assertEquals(0, settledCount)
+            assertFalse(view.privateBool("asyncImagePixelTextRebindPending"))
+
+            advanceUntilStage("SETTLE")
+            assertEquals(
+                "precache must hand off to settle on its own frame",
+                "SETTLE",
+                view.privateField("rapidIdleSettleStage").toString(),
+            )
+            assertEquals(0, settledCount)
+            assertTrue(view.privateBool("rapidTurnSequenceActive"))
+
+            advanceUntilStage("NONE")
+            assertEquals(1, settledCount)
+            assertFalse(view.privateBool("rapidTurnSequenceActive"))
+            assertEquals(
+                "the staged tail must be fully retired after its settle frame",
+                "NONE",
+                view.privateField("rapidIdleSettleStage").toString(),
+            )
+        } finally {
+            view.dispose()
+        }
     }
 
     @Test

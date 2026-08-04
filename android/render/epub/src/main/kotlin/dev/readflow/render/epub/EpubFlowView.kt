@@ -321,7 +321,7 @@ internal class EpubFlowView(
                 pendingInPlacePageShotRefreshSlots.clear()
                 applyAsyncImageResultRefresh()
             } else {
-                if (rapidTurnSequenceActive) {
+                if (rapidTurnSequenceActive && !rapidIdleApplyingAsync) {
                     // Keep the whole-TextView rebind (and its dependent in-place redraw) deferred
                     // while a rapid queued sequence is unresolved; the settle pass applies it once.
                     postDelayed(this, REFLOW_DEBOUNCE_MS)
@@ -555,6 +555,15 @@ internal class EpubFlowView(
     private var rapidTurnSequenceActive = false
     private var rapidQueuedTurnDrainPosted = false
     private var rapidTurnPairBootstrapRetries = 0
+    /**
+     * Quiet rapid-turn cleanup is deliberately split across frame callbacks. Keeping the rapid
+     * sequence active until SETTLE also makes a DOWN arriving between those callbacks join the
+     * same coalescing window instead of racing the deferred image/cache work.
+     */
+    private enum class RapidIdleSettleStage { NONE, APPLY_ASYNC, PRECACHE, SETTLE }
+    private var rapidIdleSettleStage = RapidIdleSettleStage.NONE
+    private var rapidIdleSettlePosted = false
+    private var rapidIdleApplyingAsync = false
     private val rapidTurnIdleRunnable = object : Runnable {
         override fun run() {
             if (queuedPageTurnDelta != 0) {
@@ -576,22 +585,16 @@ internal class EpubFlowView(
                     postDelayed(this, RAPID_TURN_IDLE_TIMEOUT_MS)
                 }
             } else if (!turnInFlight) {
-                rapidTurnSequenceActive = false
-                if (asyncImageRefreshPending) {
-                    removeCallbacks(asyncImageRefreshRunnable)
-                    asyncImageRefreshRunnable.run()
-                    return
-                }
-                // Rapid turns settled: apply the deferred rebind/pixel batch first, then let the
-                // staged in-place slots drain as one final full-resolution refresh.
-                applyDeferredAsyncImagePixelRefreshIfAny()
-                preCachePageTextures()
-                onPageSettled?.invoke()
+                // Do not co-locate image rebind, page-shot/artifact precache, and the settle
+                // callback in this timeout callback. The staged runner spreads those operations
+                // over independent animation frames while retaining rapid-mode input ownership.
+                scheduleRapidIdleSettle()
             } else if (!disposed) {
                 postDelayed(this, RAPID_TURN_IDLE_TIMEOUT_MS)
             }
         }
     }
+    private val rapidIdleSettleRunnable = Runnable { runRapidIdleSettle() }
     /** Finger-owned and boundary software turn states. */
     private enum class InteractiveTurnState {
         NONE,
@@ -998,9 +1001,14 @@ internal class EpubFlowView(
         preCachePageTextures(allowRapidBootstrap = false)
     }
 
-    private fun preCachePageTextures(allowRapidBootstrap: Boolean) {
+    private fun preCachePageTextures(
+        allowRapidBootstrap: Boolean,
+        allowRapidIdleSettle: Boolean = false,
+    ) {
         if (disposed) return
-        if (rapidTurnSequenceActive && !allowRapidBootstrap) return
+        // The quiet tail is the only path allowed to start idle precache while rapid mode still
+        // owns input; keeping the flag set protects the gap before the SETTLE callback.
+        if (rapidTurnSequenceActive && !allowRapidBootstrap && !allowRapidIdleSettle) return
         clearRapidFollowUpPageShot()
         if (!pageTexturePrecacheEnabled) return
         if (pageShotSpeculationPaused || pageShotBudget.isSpeculativeAdmissionPaused) return
@@ -2681,7 +2689,9 @@ internal class EpubFlowView(
     }
 
     private fun deferAsyncImageGeometryRefreshForRapidTurn(): Boolean =
-        rapidTurnSequenceActive || rapidIdlePageTurnGesture || queuedPageTurnDelta != 0
+        (rapidTurnSequenceActive && !rapidIdleApplyingAsync) ||
+            rapidIdlePageTurnGesture ||
+            queuedPageTurnDelta != 0
 
     fun onAsyncImagePixelsChanged(layoutOffset: Int) {
         onAsyncImagePixelsChanged(layoutOffset, rebindText = false)
@@ -2696,7 +2706,12 @@ internal class EpubFlowView(
             post { onAsyncImagePixelsChanged(layoutOffset, rebindText) }
             return
         }
-        if (turnInFlight || rebindText || asyncImagePixelTextRebindPending) {
+        if (
+            turnInFlight ||
+            rapidIdleSettleStage != RapidIdleSettleStage.NONE ||
+            rebindText ||
+            asyncImagePixelTextRebindPending
+        ) {
             asyncImagePixelRefreshOffsets += layoutOffset
             asyncImagePixelTextRebindPending = asyncImagePixelTextRebindPending || rebindText
             removeCallbacks(asyncImageRefreshRunnable)
@@ -3551,6 +3566,7 @@ internal class EpubFlowView(
         removeCallbacks(revealSafetyRunnable)
         removeCallbacks(reflowRunnable)
         removeCallbacks(asyncImageRefreshRunnable)
+        cancelRapidIdleSettle()
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
         asyncImagePixelTextRebindPending = false
@@ -4189,6 +4205,7 @@ internal class EpubFlowView(
 
     private fun clearQueuedPageTurns() {
         removeCallbacks(rapidTurnIdleRunnable)
+        cancelRapidIdleSettle()
         clearRapidFollowUpPageShot()
         queuedPageTurnDelta = 0
         rapidTurnSequenceActive = false
@@ -4218,6 +4235,7 @@ internal class EpubFlowView(
 
     private fun armRapidTurnSequence() {
         removeCallbacks(rapidTurnIdleRunnable)
+        cancelRapidIdleSettle()
         rapidTurnSequenceActive = true
         postDelayed(rapidTurnIdleRunnable, RAPID_TURN_IDLE_TIMEOUT_MS)
     }
@@ -4226,6 +4244,86 @@ internal class EpubFlowView(
         if (!rapidTurnSequenceActive) return
         removeCallbacks(rapidTurnIdleRunnable)
         postDelayed(rapidTurnIdleRunnable, RAPID_TURN_IDLE_TIMEOUT_MS)
+    }
+
+    private fun cancelRapidIdleSettle() {
+        removeCallbacks(rapidIdleSettleRunnable)
+        rapidIdleSettlePosted = false
+        rapidIdleSettleStage = RapidIdleSettleStage.NONE
+        rapidIdleApplyingAsync = false
+    }
+
+    private fun scheduleRapidIdleSettle() {
+        if (disposed || !rapidTurnSequenceActive || rapidIdleSettlePosted) return
+        if (rapidIdleSettleStage == RapidIdleSettleStage.NONE) {
+            rapidIdleSettleStage = RapidIdleSettleStage.APPLY_ASYNC
+        }
+        rapidIdleSettlePosted = true
+        postOnAnimation(rapidIdleSettleRunnable)
+    }
+
+    /**
+     * Runs the quiet rapid-turn tail one responsibility per frame. Any new input or queued intent
+     * abandons the stale tail and lets the normal rapid window re-arm it for the new sequence.
+     */
+    private fun runRapidIdleSettle() {
+        rapidIdleSettlePosted = false
+        if (disposed) {
+            rapidIdleSettleStage = RapidIdleSettleStage.NONE
+            return
+        }
+        if (queuedPageTurnDelta != 0 || turnInFlight || rapidIdlePageTurnGesture) {
+            rapidIdleSettleStage = RapidIdleSettleStage.NONE
+            scheduleRapidTurnIdle()
+            return
+        }
+        when (rapidIdleSettleStage) {
+            RapidIdleSettleStage.APPLY_ASYNC -> {
+                // The async runnable normally defers while rapid mode is active. Temporarily mark
+                // this one controlled invocation so its existing batching/identity rules can run
+                // without opening the input window or allowing an unrelated callback through.
+                rapidIdleApplyingAsync = true
+                try {
+                    if (asyncImageRefreshPending) {
+                        removeCallbacks(asyncImageRefreshRunnable)
+                        asyncImageRefreshRunnable.run()
+                    } else {
+                        applyDeferredAsyncImagePixelRefreshIfAny()
+                    }
+                } finally {
+                    rapidIdleApplyingAsync = false
+                }
+                // A decode gate may still be holding the batch. Leave rapid ownership intact and
+                // retry through the ordinary idle deadline instead of starting a partial precache.
+                if (rapidPageArtifactRefreshPending()) {
+                    rapidIdleSettleStage = RapidIdleSettleStage.NONE
+                    scheduleRapidTurnIdle()
+                    return
+                }
+                rapidIdleSettleStage = RapidIdleSettleStage.PRECACHE
+                scheduleRapidIdleSettle()
+            }
+            RapidIdleSettleStage.PRECACHE -> {
+                preCachePageTextures(allowRapidBootstrap = false, allowRapidIdleSettle = true)
+                rapidIdleSettleStage = RapidIdleSettleStage.SETTLE
+                scheduleRapidIdleSettle()
+            }
+            RapidIdleSettleStage.SETTLE -> {
+                if (rapidPageArtifactRefreshPending()) {
+                    rapidIdleSettleStage = RapidIdleSettleStage.NONE
+                    scheduleRapidTurnIdle()
+                    return
+                }
+                rapidIdleSettleStage = RapidIdleSettleStage.NONE
+                removeCallbacks(rapidTurnIdleRunnable)
+                rapidTurnSequenceActive = false
+                // Release staged in-place owners before publishing idle so the next frame can do
+                // one bounded slot redraw without making the current callback recursive.
+                resumeDeferredInPlacePageShotRefresh()
+                onPageSettled?.invoke()
+            }
+            RapidIdleSettleStage.NONE -> Unit
+        }
     }
 
     private fun scheduleRapidQueuedTurnDrain() {
