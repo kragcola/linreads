@@ -310,29 +310,32 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
                     geometryTextRebindCount = delegate.intProperty("geometryTextRebindCount"),
                 )
             }
-        }
-    }
 
-    private fun Any.booleanProperty(propertyName: String): Boolean =
-        property(propertyName) as? Boolean
-            ?: throw AssertionError("probe snapshot must expose Boolean $propertyName.")
+            private fun Any.booleanProperty(propertyName: String): Boolean =
+                property(propertyName) as? Boolean
+                    ?: throw AssertionError("probe snapshot must expose Boolean $propertyName.")
 
-    private fun Any.intProperty(propertyName: String): Int =
-        (property(propertyName) as? Number)?.toInt()
-            ?: throw AssertionError("probe snapshot must expose numeric $propertyName.")
+            private fun Any.intProperty(propertyName: String): Int =
+                (property(propertyName) as? Number)?.toInt()
+                    ?: throw AssertionError("probe snapshot must expose numeric $propertyName.")
 
-    private fun Any.property(propertyName: String): Any? {
-        val getterName = "get" + propertyName.replaceFirstChar(Char::uppercaseChar)
-        val getter = javaClass.declaredMethods.singleOrNull { method ->
-            method.name == getterName && method.parameterCount == 0
-        } ?: javaClass.methods.singleOrNull { method ->
-            method.name == getterName && method.parameterCount == 0
-        } ?: throw AssertionError("probe snapshot must expose $getterName().")
-        getter.isAccessible = true
-        return try {
-            getter.invoke(this)
-        } catch (error: InvocationTargetException) {
-            throw AssertionError("probe snapshot getter $getterName() must not throw.", error.targetException)
+            private fun Any.property(propertyName: String): Any? {
+                val getterName = "get" + propertyName.replaceFirstChar(Char::uppercaseChar)
+                val getter = javaClass.declaredMethods.singleOrNull { method ->
+                    method.name == getterName && method.parameterCount == 0
+                } ?: javaClass.methods.singleOrNull { method ->
+                    method.name == getterName && method.parameterCount == 0
+                } ?: throw AssertionError("probe snapshot must expose $getterName().")
+                getter.isAccessible = true
+                return try {
+                    getter.invoke(this)
+                } catch (error: InvocationTargetException) {
+                    throw AssertionError(
+                        "probe snapshot getter $getterName() must not throw.",
+                        error.targetException,
+                    )
+                }
+            }
         }
     }
 
