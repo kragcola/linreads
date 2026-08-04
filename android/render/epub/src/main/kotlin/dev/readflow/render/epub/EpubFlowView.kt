@@ -1129,6 +1129,7 @@ internal class EpubFlowView(
         )
         pendingPageTexturePrecache = request
         pageTexturePrecachePending = true
+        EpubRapidIdleWorkProbe.notePrecacheArmed()
         continuePendingPageTexturePrecache(request)
     }
 
@@ -1427,6 +1428,10 @@ internal class EpubFlowView(
      */
     private fun recordSlidePageArtifact(topPx: Int, window: EpubFlowPage?): SlidePageArtifact? {
         if (width == 0 || height == 0) return null
+        val recordStartedAtNs = EpubRapidIdleWorkProbe.beginTimingNs()
+        if (recordStartedAtNs != null) {
+            EpubRapidIdleWorkProbe.noteSlideArtifactRecordStart(recordStartedAtNs)
+        }
         return try {
             SlidePageArtifact.record(width, height) { canvas ->
                 withContainerAtRest {
@@ -1435,6 +1440,8 @@ internal class EpubFlowView(
             }
         } catch (_: Throwable) {
             null
+        } finally {
+            EpubRapidIdleWorkProbe.endSlideArtifactRecordTiming(recordStartedAtNs)
         }
     }
 
@@ -1515,6 +1522,7 @@ internal class EpubFlowView(
         )
         pendingSlideArtifactPrecache = request
         slideArtifactPrecachePending = true
+        EpubRapidIdleWorkProbe.notePrecacheArmed()
         continuePendingSlideArtifactPrecache(request)
     }
 
@@ -2641,7 +2649,12 @@ internal class EpubFlowView(
                 return@post
             }
             if (chapterGeneration != expectedChapterGeneration) return@post
-            textView.text = textView.text
+            val rebindStartedAtNs = EpubRapidIdleWorkProbe.beginTimingNs()
+            try {
+                textView.text = textView.text
+            } finally {
+                EpubRapidIdleWorkProbe.endGeometryTextRebindTiming(rebindStartedAtNs)
+            }
             textView.requestLayout()
             textView.post {
                 if (!disposed && chapterGeneration == expectedChapterGeneration) action()
@@ -2748,7 +2761,12 @@ internal class EpubFlowView(
             // A full-page AsyncDrawable needs a TextView display-list rebuild even when its reserved
             // bounds are unchanged. Keep pagination and warm page-shot identities intact; dependent
             // shots are repainted in place below after this same-geometry rebind settles.
-            textView.text = textView.text
+            val rebindStartedAtNs = EpubRapidIdleWorkProbe.beginTimingNs()
+            try {
+                textView.text = textView.text
+            } finally {
+                EpubRapidIdleWorkProbe.endPixelTextRebindTiming(rebindStartedAtNs)
+            }
         }
         // Far-page PIXELS_ONLY must not touch the live viewport's warm shots or restart nearby
         // precache. Boundary-preview pages (preceding text that synthetically crops a next-page
@@ -3120,7 +3138,12 @@ internal class EpubFlowView(
         recycleCachedTextures()
         // Rebind the same Spannable so TextView rebuilds the layout after a Markwon AsyncDrawable
         // replaces a transparent placeholder with same-sized bitmap bounds.
-        textView.text = textView.text
+        val rebindStartedAtNs = EpubRapidIdleWorkProbe.beginTimingNs()
+        try {
+            textView.text = textView.text
+        } finally {
+            EpubRapidIdleWorkProbe.endGeometryTextRebindTiming(rebindStartedAtNs)
+        }
         textView.invalidate()
         container.invalidate()
         invalidate()
@@ -7019,6 +7042,18 @@ internal class EpubFlowView(
      */
     @SuppressLint("ClickableViewAccessibility")
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (EpubRapidIdleWorkProbe.isEnabled()) {
+            val eventTimeNs = ev.eventTime * 1_000_000L
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> EpubRapidIdleWorkProbe.notePointerDown(
+                    queuedSlide = pendingSlideArtifactPrecache != null,
+                    eventTimeNs = eventTimeNs,
+                )
+                MotionEvent.ACTION_MOVE -> EpubRapidIdleWorkProbe.notePointerMove(eventTimeNs)
+                MotionEvent.ACTION_UP -> EpubRapidIdleWorkProbe.notePointerUp(eventTimeNs)
+                MotionEvent.ACTION_CANCEL -> EpubRapidIdleWorkProbe.notePointerCancel(eventTimeNs)
+            }
+        }
         if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
             discardPendingSpeculativePrecacheForPointerDown()
         }
