@@ -1000,6 +1000,13 @@ internal class EpubFlowView(
             asyncImagePixelRefreshOffsets.isNotEmpty() ||
             asyncImagePixelTextRebindPending
 
+    /** Keep rapid ownership until split-frame page shots/artifacts have committed or been cleared. */
+    private fun rapidPagePrecacheWorkPending(): Boolean =
+        pageTexturePrecachePending ||
+            pendingPageTexturePrecache != null ||
+            slideArtifactPrecachePending ||
+            pendingSlideArtifactPrecache != null
+
     private fun preCachePageTextures() {
         preCachePageTextures(allowRapidBootstrap = false)
     }
@@ -4356,7 +4363,7 @@ internal class EpubFlowView(
                 scheduleRapidIdleSettle()
             }
             RapidIdleSettleStage.SETTLE -> {
-                if (rapidPageArtifactRefreshPending()) {
+                if (rapidPageArtifactRefreshPending() || rapidPagePrecacheWorkPending()) {
                     rapidIdleSettleStage = RapidIdleSettleStage.NONE
                     scheduleRapidTurnIdle()
                     return

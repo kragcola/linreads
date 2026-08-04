@@ -6649,6 +6649,67 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `rapid idle settle waits for any pending precache state`() {
+        listOf(
+            Triple(PageFlipStyle.SIMULATION, "pageTexturePrecachePending", "pendingPageTexturePrecache"),
+            Triple(PageFlipStyle.SLIDE, "slideArtifactPrecachePending", "pendingSlideArtifactPrecache"),
+        ).forEach { (flipStyle, pendingFlagField, pendingRequestField) ->
+            val view = pagedFlowView(flipStyle = flipStyle)
+            var request: Any? = null
+            var precacheCompleted = false
+            try {
+                var settledCount = 0
+                view.onPageSettled = { settledCount++ }
+                view.recycleCachedTexturesForTest()
+                view.preCachePageTexturesForTest(idlePostedWork = false)
+                assertTrue("$pendingFlagField must be armed by real precache", view.privateBool(pendingFlagField))
+                request = checkNotNull(view.privateField(pendingRequestField))
+
+                fun assertSettleWaitsForPendingState(state: String) {
+                    view.setRapidIdleSettleStageForTest("SETTLE")
+                    view.runRapidIdleSettleForTest()
+                    assertEquals(
+                        "$pendingFlagField/$pendingRequestField $state must keep settle behind precache",
+                        0,
+                        settledCount,
+                    )
+                    assertTrue(
+                        "$pendingFlagField/$pendingRequestField $state must keep rapid ownership",
+                        view.privateBool("rapidTurnSequenceActive"),
+                    )
+                }
+
+                view.setPrivateField("rapidTurnSequenceActive", true)
+                view.setPrivateField(pendingRequestField, null)
+                assertSettleWaitsForPendingState("flag-only")
+
+                view.setPrivateField(pendingRequestField, request)
+                view.setPrivateField(pendingFlagField, false)
+                assertSettleWaitsForPendingState("request-only")
+
+                view.setPrivateField(pendingFlagField, true)
+                view.drainPendingPageTexturePrecacheForTest()
+                precacheCompleted = true
+                view.setRapidIdleSettleStageForTest("SETTLE")
+                view.runRapidIdleSettleForTest()
+                assertEquals(
+                    "$pendingFlagField/$pendingRequestField must settle after the real precache commits",
+                    1,
+                    settledCount,
+                )
+                assertFalse(view.privateBool("rapidTurnSequenceActive"))
+            } finally {
+                if (!precacheCompleted && request != null) {
+                    view.setPrivateField(pendingRequestField, request)
+                    view.setPrivateField(pendingFlagField, true)
+                }
+                view.removeCallbacks(view.privateField("rapidTurnIdleRunnable") as Runnable)
+                view.dispose()
+            }
+        }
+    }
+
+    @Test
     fun `pointer down cancels pending slide precache but preserves retained warm slots`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         try {
@@ -14892,6 +14953,18 @@ class EpubFlowViewTest {
     private fun EpubFlowView.runReflowRunnable(idlePostedWork: Boolean = true) {
         (privateField("reflowRunnable") as Runnable).run()
         if (idlePostedWork) shadowOf(Looper.getMainLooper()).idle()
+    }
+
+    private fun EpubFlowView.setRapidIdleSettleStageForTest(stageName: String) {
+        val field = javaClass.getDeclaredField("rapidIdleSettleStage").apply { isAccessible = true }
+        val stage = checkNotNull(field.type.enumConstants).single { (it as Enum<*>).name == stageName }
+        field.set(this, stage)
+    }
+
+    private fun EpubFlowView.runRapidIdleSettleForTest() {
+        javaClass.getDeclaredMethod("runRapidIdleSettle")
+            .apply { isAccessible = true }
+            .invoke(this)
     }
 
     private fun EpubFlowView.preCachePageTexturesForTest(idlePostedWork: Boolean = true) {
