@@ -777,6 +777,9 @@ internal class EpubFlowView(
         var frontArtifact: SlidePageArtifact? = null,
         var previousArtifact: SlidePageArtifact? = null,
         var targetArtifact: SlidePageArtifact? = null,
+        val frontArtifactRetained: Boolean = false,
+        val previousArtifactRetained: Boolean = false,
+        val targetArtifactRetained: Boolean = false,
     )
     private var pendingSlideArtifactPrecache: PendingSlideArtifactPrecache? = null
     private var captureSlideArtifactFrontRunnable: Runnable? = null
@@ -1506,6 +1509,9 @@ internal class EpubFlowView(
             frontArtifact = retainedFront,
             previousArtifact = retainedPrevious,
             targetArtifact = retainedTarget,
+            frontArtifactRetained = retainedFront != null,
+            previousArtifactRetained = retainedPrevious != null,
+            targetArtifactRetained = retainedTarget != null,
         )
         pendingSlideArtifactPrecache = request
         slideArtifactPrecachePending = true
@@ -1717,9 +1723,11 @@ internal class EpubFlowView(
             pendingSlideArtifactPrecache = null
             clearPendingSlideArtifactPrecacheCallbacks()
         }
-        listOfNotNull(request.frontArtifact, request.targetArtifact, request.previousArtifact)
-            .distinct()
-            .forEach(::discardSlideArtifact)
+        listOfNotNull(
+            request.frontArtifact?.takeUnless { request.frontArtifactRetained },
+            request.targetArtifact?.takeUnless { request.targetArtifactRetained },
+            request.previousArtifact?.takeUnless { request.previousArtifactRetained },
+        ).distinct().forEach(::discardSlideArtifact)
         request.frontArtifact = null
         request.targetArtifact = null
         request.previousArtifact = null
@@ -7011,6 +7019,9 @@ internal class EpubFlowView(
      */
     @SuppressLint("ClickableViewAccessibility")
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            discardPendingSpeculativePrecacheForPointerDown()
+        }
         if (coverConsumedGesture) {
             pendingCleanTapX = null
             trackVelocity(ev)
@@ -7170,6 +7181,10 @@ internal class EpubFlowView(
             }
         }
         return handled
+    }
+
+    private fun discardPendingSpeculativePrecacheForPointerDown() {
+        pendingSlideArtifactPrecache?.let(::discardPendingSlideArtifactPrecache)
     }
 
     override fun onWindowVisibilityChanged(visibility: Int) {

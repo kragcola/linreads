@@ -6603,6 +6603,76 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `pointer down cancels pending slide precache but preserves retained warm slots`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+            view.recycleCachedTexturesForTest()
+            view.preCachePageTexturesForTest()
+            view.drainPendingPageTexturePrecacheForTest()
+            val initialFront = checkNotNull(view.slideFrontArtifactForTest())
+            val initialRevealed = checkNotNull(view.slideRevealedArtifactForTest())
+
+            assertTrue(view.goToAdjacentPage(1))
+            checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?).end()
+
+            val pageBeforeDown = view.currentPageIndex()
+            val topBeforeDown = view.scrollY
+            val pages = view.privateField("paged") as List<EpubFlowPage>
+            val warmFront = checkNotNull(view.slideFrontArtifactForTest())
+            val warmBackward = checkNotNull(view.slideBackwardArtifactForTest())
+            val pending = checkNotNull(view.privateField("pendingSlideArtifactPrecache"))
+            assertTrue("settled forward turn must have a backward warm slot", pageBeforeDown > 0)
+            assertSame(initialRevealed, warmFront)
+            assertSame(initialFront, warmBackward)
+            assertSame("pending front must alias the live current slot", warmFront, pending.reflectedField("frontArtifact"))
+            assertSame("pending previous must alias the live backward slot", warmBackward, pending.reflectedField("previousArtifact"))
+            assertEquals(true, pending.reflectedField("frontArtifactRetained"))
+            assertEquals(true, pending.reflectedField("previousArtifactRetained"))
+            assertNull(pending.reflectedField("targetArtifact"))
+            assertTrue(view.privateBool("slideArtifactPrecachePending"))
+
+            val downTime = SystemClock.uptimeMillis()
+            view.dispatchTouchEvent(
+                motionEvent(
+                    downTime,
+                    downTime,
+                    MotionEvent.ACTION_DOWN,
+                    view.width * 0.85f,
+                    view.height * 0.50f,
+                ),
+            )
+
+            assertNull(view.privateField("pendingSlideArtifactPrecache"))
+            assertFalse(view.privateBool("slideArtifactPrecachePending"))
+            assertNull(view.privateField("captureSlideArtifactTargetRunnable"))
+            assertSame("cancellation must preserve the live current slot", warmFront, view.slideFrontArtifactForTest())
+            assertSame("cancellation must preserve the live backward slot", warmBackward, view.slideBackwardArtifactForTest())
+            assertTrue(warmFront.slideArtifactRecordIsLive())
+            assertTrue(warmBackward.slideArtifactRecordIsLive())
+            assertEquals(pageBeforeDown, view.currentPageIndex())
+            assertEquals(topBeforeDown, view.scrollY)
+
+            val usablePair = checkNotNull(
+                view.takeCachedSlideArtifactsForTurnForTest(
+                    fromPage = pageBeforeDown,
+                    fromTop = topBeforeDown,
+                    fromWindow = pages[pageBeforeDown],
+                    targetPage = pageBeforeDown - 1,
+                    targetTop = pages[pageBeforeDown - 1].topPx,
+                    targetWindow = pages[pageBeforeDown - 1],
+                ),
+            )
+            assertSame(warmFront, usablePair.first)
+            assertSame(warmBackward, usablePair.second)
+            view.discardSlideArtifactForTest(usablePair.first)
+            view.discardSlideArtifactForTest(usablePair.second)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
     fun `page turn started callback covers visual follow-ups and interactive intent`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         var startedCount = 0
@@ -14881,9 +14951,9 @@ class EpubFlowViewTest {
         val targetArtifact = recordSlidePageArtifactForTest(targetWindow.topPx, targetWindow)
 
         val requestClass = Class.forName("dev.readflow.render.epub.EpubFlowView\$PendingSlideArtifactPrecache")
-        // Pick the 14-parameter primary constructor explicitly; default parameters may add a
+        // Pick the 17-parameter primary constructor explicitly; default parameters may add a
         // synthetic default-argument constructor that .single() would fail on.
-        val constructor = requestClass.declaredConstructors.single { it.parameterTypes.size == 14 }
+        val constructor = requestClass.declaredConstructors.single { it.parameterTypes.size == 17 }
         val request = constructor.apply { isAccessible = true }.newInstance(
             generation,
             fromWindow.topPx,
@@ -14899,6 +14969,9 @@ class EpubFlowViewTest {
             frontArtifact,
             null,
             targetArtifact,
+            false,
+            false,
+            false,
         )
         javaClass.getDeclaredField("pendingSlideArtifactPrecache").apply {
             isAccessible = true
