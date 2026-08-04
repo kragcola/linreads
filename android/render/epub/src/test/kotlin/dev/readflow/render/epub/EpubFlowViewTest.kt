@@ -6677,6 +6677,11 @@ class EpubFlowViewTest {
                         "$pendingFlagField/$pendingRequestField $state must keep rapid ownership",
                         view.privateBool("rapidTurnSequenceActive"),
                     )
+                    assertEquals(
+                        "$pendingFlagField/$pendingRequestField $state must recheck settle next frame",
+                        "SETTLE",
+                        view.privateField("rapidIdleSettleStage").toString(),
+                    )
                 }
 
                 view.setPrivateField("rapidTurnSequenceActive", true)
@@ -6704,6 +6709,7 @@ class EpubFlowViewTest {
                     view.setPrivateField(pendingFlagField, true)
                 }
                 view.removeCallbacks(view.privateField("rapidTurnIdleRunnable") as Runnable)
+                view.removeCallbacks(view.privateField("rapidIdleSettleRunnable") as Runnable)
                 view.dispose()
             }
         }

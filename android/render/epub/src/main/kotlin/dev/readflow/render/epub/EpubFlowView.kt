@@ -4363,9 +4363,17 @@ internal class EpubFlowView(
                 scheduleRapidIdleSettle()
             }
             RapidIdleSettleStage.SETTLE -> {
-                if (rapidPageArtifactRefreshPending() || rapidPagePrecacheWorkPending()) {
+                if (rapidPageArtifactRefreshPending()) {
                     rapidIdleSettleStage = RapidIdleSettleStage.NONE
                     scheduleRapidTurnIdle()
+                    return
+                }
+                if (rapidPagePrecacheWorkPending()) {
+                    // A split-frame precache has a bounded, already-posted continuation. Recheck
+                    // on its next frame instead of adding a new full rapid-idle timeout after the
+                    // capture commits; this keeps DISPLAY promotion off the capture frame without
+                    // making the final parked page feel delayed.
+                    scheduleRapidIdleSettle()
                     return
                 }
                 rapidIdleSettleStage = RapidIdleSettleStage.NONE
