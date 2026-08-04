@@ -5812,6 +5812,12 @@ class EpubFlowViewTest {
             )
 
             view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            view.measure(exactly(view.width), exactly(view.height))
+            view.layout(0, 0, view.width, view.height)
+            // First process the posted layout/settle pass so the 800ms gate is armed from a
+            // measured target rather than from Robolectric's nested-post scheduling order.
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("the unstable target must arm the safety reveal", view.privateBool("awaitingReveal"))
             shadowOf(Looper.getMainLooper()).idleFor(801L, TimeUnit.MILLISECONDS)
 
             val waitingCover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
