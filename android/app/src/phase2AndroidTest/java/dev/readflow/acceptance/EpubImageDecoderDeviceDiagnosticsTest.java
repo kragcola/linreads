@@ -11,7 +11,6 @@ import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
-import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
@@ -30,11 +29,10 @@ public final class EpubImageDecoderDeviceDiagnosticsTest {
     private static final String TAG = "EpubImageDecodeDiag";
     private static final long MAX_ENCODED_BYTES = 20L * 1024L * 1024L;
     private static final List<String> HREFS = Arrays.asList(
-            "Images/006.jpg",
-            "Images/007.jpg",
-            "Images/008.jpg",
-            "Images/009.webp",
-            "Images/016.png"
+            "OEBPS/Images/006.jpg",
+            "OEBPS/Images/007.jpg",
+            "OEBPS/Images/008.jpg",
+            "OEBPS/Images/009.webp"
     );
 
     @Test
@@ -63,6 +61,7 @@ public final class EpubImageDecoderDeviceDiagnosticsTest {
                 try (InputStream input = zip.getInputStream(entry)) {
                     bytes = readAll(input);
                 }
+                int sample = logBounds(href, bytes);
                 Bitmap productionBitmap = (Bitmap) production.invoke(
                         null,
                         epub,
@@ -72,38 +71,68 @@ public final class EpubImageDecoderDeviceDiagnosticsTest {
                         MAX_ENCODED_BYTES
                 );
                 logBitmap(href + " production", productionBitmap);
-                logBitmap(href + " byte-default", decodeBytes(bytes, 1, null));
-                logBitmap(href + " byte-argb", decodeBytes(bytes, 1, Bitmap.Config.ARGB_8888));
-                logBitmap(href + " byte-rgb565", decodeBytes(bytes, 1, Bitmap.Config.RGB_565));
-                logStream(href + " zip-default", zip, entry, false);
-                logStream(href + " zip-buffered", zip, entry, true);
-                logBounds(href, bytes);
+                logBitmap(href + " bytes-default sample=" + sample,
+                        decodeBytes(bytes, sample, null, false));
+                logBitmap(href + " bytes-argb8888 sample=" + sample,
+                        decodeBytes(bytes, sample, Bitmap.Config.ARGB_8888, false));
+                logBitmap(href + " bytes-argb8888-mutable sample=" + sample,
+                        decodeBytes(bytes, sample, Bitmap.Config.ARGB_8888, true));
+                logStream(href + " zip-default sample=" + sample,
+                        zip, entry, sample, null, false);
+                logStream(href + " zip-argb8888 sample=" + sample,
+                        zip, entry, sample, Bitmap.Config.ARGB_8888, false);
+                logStream(href + " zip-argb8888-mutable sample=" + sample,
+                        zip, entry, sample, Bitmap.Config.ARGB_8888, true);
             }
         }
     }
 
-    private static Bitmap decodeBytes(byte[] bytes, int sample, Bitmap.Config config) {
+    private static Bitmap decodeBytes(
+            byte[] bytes,
+            int sample,
+            Bitmap.Config config,
+            boolean mutable
+    ) {
         BitmapFactory.Options options = new BitmapFactory.Options();
         options.inSampleSize = sample;
         if (config != null) options.inPreferredConfig = config;
+        options.inMutable = mutable;
         return BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
     }
 
-    private static void logStream(String label, ZipFile zip, ZipEntry entry, boolean buffered)
-            throws Exception {
+    private static void logStream(
+            String label,
+            ZipFile zip,
+            ZipEntry entry,
+            int sample,
+            Bitmap.Config config,
+            boolean mutable
+    ) throws Exception {
         BitmapFactory.Options options = new BitmapFactory.Options();
-        options.inSampleSize = 1;
-        try (InputStream raw = zip.getInputStream(entry);
-             InputStream input = buffered ? new BufferedInputStream(raw) : raw) {
+        options.inSampleSize = sample;
+        if (config != null) options.inPreferredConfig = config;
+        options.inMutable = mutable;
+        try (InputStream input = zip.getInputStream(entry)) {
             logBitmap(label, BitmapFactory.decodeStream(input, null, options));
         }
     }
 
-    private static void logBounds(String href, byte[] bytes) {
+    private static int logBounds(String href, byte[] bytes) {
         BitmapFactory.Options options = new BitmapFactory.Options();
         options.inJustDecodeBounds = true;
         BitmapFactory.decodeByteArray(bytes, 0, bytes.length, options);
         Log.i(TAG, href + " bounds=" + options.outWidth + "x" + options.outHeight);
+        return sampleSize(options.outWidth, options.outHeight);
+    }
+
+    private static int sampleSize(int width, int height) {
+        int sample = 1;
+        while (width / sample > 1600
+                || height / sample > 1600
+                || (long) (width / sample) * (height / sample) > 4_000_000L) {
+            sample *= 2;
+        }
+        return sample;
     }
 
     private static void logBitmap(String label, Bitmap bitmap) {
