@@ -102,14 +102,14 @@ jobs:
         working-directory: android
         run: ./gradlew -Preadflow.phase=2 test
 
-      - name: Compile Android instrumentation test sources
+      - name: Assemble Android instrumentation test APK
         working-directory: android
-        run: ./gradlew -Preadflow.phase=2 :app:compileDebugAndroidTestKotlin
+        run: ./gradlew -Preadflow.phase=2 :app:assembleDebugAndroidTest
 
       - name: Build Android instrumentation APKs for manual candidates
         if: ${{ github.event_name == 'workflow_dispatch' }}
         working-directory: android
-        run: ./gradlew -Preadflow.phase=2 :app:assembleDebug :app:assembleDebugAndroidTest
+        run: ./gradlew -Preadflow.phase=2 :app:assembleDebug
 
       - name: Upload Android instrumentation candidate
         if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -136,6 +136,42 @@ jobs:
       - name: Build OTA APKs
         working-directory: android
         run: ./gradlew -Preadflow.phase=2 :updater-helper:assembleOta :app:assembleOta
+
+      - name: Verify OTA instrumentation runtime closure
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ota_apk="app/build/outputs/apk/ota/app-ota.apk"
+          test -s "$ota_apk"
+
+          mapfile -t dex_entries < <(unzip -Z1 "$ota_apk" | grep -E '^classes([0-9]+)?\.dex$' || true)
+          if ((${#dex_entries[@]} == 0)); then
+            echo "No dex entries found in $ota_apk" >&2
+            exit 1
+          fi
+
+          found=false
+          for dex_entry in "${dex_entries[@]}"; do
+            if unzip -p "$ota_apk" "$dex_entry" | strings | grep -F 'Lkotlin/jvm/internal/Intrinsics;' >/dev/null; then
+              found=true
+              break
+            fi
+          done
+
+          if [[ "$found" != true ]]; then
+            echo "Missing kotlin.jvm.internal.Intrinsics from $ota_apk" >&2
+            exit 1
+          fi
+
+      - name: Upload Android instrumentation test APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-instrumentation-test-apk-${{ github.run_number }}-${{ github.run_attempt }}
+          path: android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Upload unpublished OTA candidates
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.publish_ota }}

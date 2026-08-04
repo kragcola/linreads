@@ -114,8 +114,22 @@ internal class EpubFlowView(
         }
     }
 
+    /** Retires a cover whose exact-pixels gate is invalid once paged windows no longer exist. */
+    private fun cancelDirectImageFirstCoverForPagedToScroll() {
+        if (directImageFirstCoverTarget == null) return
+        removeCallbacks(revealSafetyRunnable)
+        container.animate().cancel()
+        awaitingReveal = false
+        awaitingStableChapter = false
+        container.alpha = 1f
+        clearConversionSnapshot()
+    }
+
     private fun applyMode(value: Mode, reposition: Boolean) {
         if (modeValue != value) {
+            if (modeValue == Mode.PAGED && value == Mode.SCROLL) {
+                cancelDirectImageFirstCoverForPagedToScroll()
+            }
             cancelFreeFlingForLifecycle()
             abortLocalPageShotTurnForExternalMutation()
             onBoundaryPreviewConfigurationChanged?.invoke()
@@ -549,6 +563,8 @@ internal class EpubFlowView(
         { cover, destination -> cover.flattenOver(destination) }
     private var boundaryContinuityCover = false
     private var pendingBoundaryPageTurn: BoundaryPageTurn? = null
+    /** Target identity for a direct image-first chapter cover; never participates in boundary turns. */
+    private var directImageFirstCoverTarget: EpubChapterFlow? = null
     private var chapterGeneration = 0L
     private val flipDurationMs = 280L
     private var queuedPageTurnDelta = 0
@@ -3211,7 +3227,13 @@ internal class EpubFlowView(
         reportPositionAfterStableReveal: Boolean = false,
     ) {
         if (disposed) return
-        val preserveQueuedTurns = pendingBoundaryPageTurn != null || boundaryContinuityCover
+        val preserveDirectImageFirstCover =
+            directImageFirstCoverTarget === flow && this.flow !== flow
+        if (directImageFirstCoverTarget != null && !preserveDirectImageFirstCover) {
+            clearConversionSnapshot()
+        }
+        val preserveQueuedTurns = pendingBoundaryPageTurn != null ||
+            (boundaryContinuityCover && directImageFirstCoverTarget == null)
         cancelFreeFlingForLifecycle()
         abortLocalPageShotTurnForExternalMutation(preserveQueuedTurns = preserveQueuedTurns)
         pageLayoutMetadata = null
@@ -3321,12 +3343,20 @@ internal class EpubFlowView(
         }
     }
 
-    private fun isLayoutSettled(): Boolean =
-        textView.layout != null &&
+    private fun isLayoutSettled(): Boolean {
+        val directImageFirstCoverActive =
+            directImageFirstCoverTarget != null && directImageFirstCoverTarget === flow
+        val imagesStable = if (directImageFirstCoverActive) {
+            paged.getOrNull(currentPage)?.let(::targetImagePixelsAreStable) == true
+        } else {
+            pendingDecodesProvider?.invoke() != true
+        }
+        return textView.layout != null &&
             height > 0 &&
             !textView.isLayoutRequested &&
             textView.layout!!.height == paginatedLayoutHeight &&
-            pendingDecodesProvider?.invoke() != true
+            imagesStable
+    }
 
     private fun revealContent(stable: Boolean) {
         if (!awaitingReveal && !stable) return
@@ -4590,6 +4620,32 @@ internal class EpubFlowView(
 
     fun prepareBoundaryPageTurn(delta: Int): Boolean =
         prepareBoundaryPageTurnResult(delta) == BoundaryPageTurnPreparation.PREPARED
+
+    /**
+     * Freezes the outgoing viewport for a resolved direct cross-spine target whose first compressed
+     * segment is an image. This intentionally does not create a boundary turn or pending turn state.
+     */
+    internal fun prepareDirectImageFirstChapterCover(targetFlow: EpubChapterFlow): Boolean {
+        if (
+            disposed ||
+            mode != Mode.PAGED ||
+            isRapidTurnPerformanceModeActive() ||
+            targetFlow.segments.firstOrNull()?.isImage != true
+        ) return false
+        val conversionCapture = conversionSnapshotCopy()
+        if (conversionCapture === ConversionSnapshotCapture.Failed) return false
+        val outgoing = (conversionCapture as? ConversionSnapshotCapture.Captured)?.bitmap
+            ?: snapshotViewport(
+                PageShotLeaseKind.PINNED,
+                "continuity.direct.image-first",
+                fullResolution = true,
+            )
+            ?: return false
+        showConversionSnapshot(outgoing)
+        boundaryContinuityCover = true
+        directImageFirstCoverTarget = targetFlow
+        return true
+    }
 
     fun prepareBoundaryPageTurnResult(delta: Int): BoundaryPageTurnPreparation {
         if (
@@ -6057,6 +6113,7 @@ internal class EpubFlowView(
         }
         conversionSnapshotDrawable = null
         boundaryContinuityCover = false
+        directImageFirstCoverTarget = null
     }
 
     private fun consumePendingBoundaryPageTurn(): Boolean {

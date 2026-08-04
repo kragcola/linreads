@@ -176,4 +176,7 @@ dependencies {
     androidTestImplementation(libs.androidx.test.rules)
     androidTestImplementation(libs.espresso.core)
     androidTestImplementation(libs.uiautomator)
+    // Instrumentation runs in a separate APK. Keep its Kotlin runtime independent from R8's
+    // production-APK reachability analysis so test code can run against an OTA target.
+    androidTestImplementation(libs.kotlin.stdlib)
 }

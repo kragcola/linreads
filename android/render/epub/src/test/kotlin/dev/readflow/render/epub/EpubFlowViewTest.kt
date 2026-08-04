@@ -5760,6 +5760,275 @@ class EpubFlowViewTest {
     }
 
     @Test
+    fun `direct image-first chapter cover waits for exact first-page pixels before fading`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)
+        view.goToPage(1)
+        val visibleOutgoing = requireNotNull(view.snapshotViewportForTest())
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(
+                EpubDisplayBlock.Image(
+                    href = "chapter-opening.png",
+                    altText = "chapter opening image",
+                    paragraphIndex = 0,
+                    isInlineContent = false,
+                ),
+                EpubDisplayBlock.Text(
+                    text = (1..40).joinToString("\n") { "Incoming chapter line $it." },
+                    headingLevel = null,
+                    paragraphIndex = 1,
+                ),
+            ),
+        )
+        val incomingImageStart = checkNotNull(incomingFlow.segments.firstOrNull { it.isImage }).layoutStart
+        var exactPixelsStable = false
+        val queriedImageStarts = mutableListOf<List<Int>>()
+        // Broad work remains pending; the direct cover must use only the current-page image gate.
+        view.pendingDecodesProvider = { true }
+        view.imagePixelsStableProvider = { starts ->
+            queriedImageStarts += starts.toList()
+            exactPixelsStable
+        }
+
+        try {
+            assertTrue(
+                "a direct image-first target must freeze the currently visible outgoing viewport",
+                view.prepareDirectImageFirstChapterCover(incomingFlow),
+            )
+            val cover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+            assertAllPixelsEqual(
+                "the direct cover must own the exact outgoing viewport before the prior image loader releases",
+                visibleOutgoing,
+                cover.privateBitmap("bitmap"),
+            )
+            assertNull(
+                "direct navigation must not reuse boundary turn state",
+                view.privateField("pendingBoundaryPageTurn"),
+            )
+            assertTrue(
+                "the direct cover must use the existing continuity-input shield",
+                view.privateBool("boundaryContinuityCover"),
+            )
+
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+            shadowOf(Looper.getMainLooper()).idleFor(801L, TimeUnit.MILLISECONDS)
+
+            val waitingCover = checkNotNull(view.privateField("conversionSnapshotDrawable"))
+            assertEquals(
+                "the safety reveal may expose live content beneath the frozen outgoing owner",
+                1f,
+                view.getChildAt(0).alpha,
+            )
+            assertEquals(
+                "an unstable first image must keep the direct cover fully opaque after the safety timeout",
+                255,
+                waitingCover.privateInt("alphaValue"),
+            )
+            assertTrue(
+                "the direct gate must query the current first-page image occurrence, queried=$queriedImageStarts",
+                queriedImageStarts.any { incomingImageStart in it },
+            )
+            assertNull(
+                "the direct image-first gate must never create a pending boundary turn",
+                view.privateField("pendingBoundaryPageTurn"),
+            )
+
+            exactPixelsStable = true
+            view.onAsyncImageDecodeFinished()
+            view.textView.viewTreeObserver.dispatchOnPreDraw()
+            shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
+
+            assertNull(
+                "the current reveal fade must retire the direct cover only after exact first-page pixels stabilize",
+                view.privateField("conversionSnapshotDrawable"),
+            )
+        } finally {
+            if (!visibleOutgoing.isRecycled) view.recyclePageShotForTest(visibleOutgoing)
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `direct image-first chapter cover discards source rapid turns before target install`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(
+                EpubDisplayBlock.Image(
+                    href = "chapter-opening.png",
+                    altText = "chapter opening image",
+                    paragraphIndex = 0,
+                    isInlineContent = false,
+                ),
+                EpubDisplayBlock.Text(
+                    text = "Target chapter text.",
+                    headingLevel = null,
+                    paragraphIndex = 1,
+                ),
+            ),
+        )
+
+        try {
+            assertTrue(view.prepareDirectImageFirstChapterCover(incomingFlow))
+            view.setPrivateField("queuedPageTurnDelta", 2)
+            view.setPrivateField("rapidTurnSequenceActive", true)
+
+            view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+
+            assertEquals(
+                "source-page taps must not turn the newly selected chapter",
+                0,
+                view.privateInt("queuedPageTurnDelta"),
+            )
+            assertFalse(view.privateBool("rapidTurnSequenceActive"))
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `direct image-first chapter cover refuses a moving viewport`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(
+                EpubDisplayBlock.Image(
+                    href = "chapter-opening.png",
+                    altText = "chapter opening image",
+                    paragraphIndex = 0,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+
+        try {
+            assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+            assertTrue(view.goToAdjacentPage(1))
+            assertTrue(view.isRapidTurnPerformanceModeActive())
+
+            assertFalse(
+                "a direct cover must never snapshot the TextView while its visible page is an overlay",
+                view.prepareDirectImageFirstChapterCover(incomingFlow),
+            )
+            assertNull(view.privateField("conversionSnapshotDrawable"))
+        } finally {
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.end()
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `direct image-first cover refuses to snapshot during page-turn motion`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(
+                EpubDisplayBlock.Image(
+                    href = "chapter-opening.png",
+                    altText = "chapter opening image",
+                    paragraphIndex = 0,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+
+        try {
+            view.setPrivateField("queuedPageTurnDelta", 1)
+
+            assertTrue("fixture must model unresolved source page-turn motion", view.isPageTurnMotionActive())
+            assertFalse(view.prepareDirectImageFirstChapterCover(incomingFlow))
+            assertNull(
+                "the defensive guard must not install a snapshot of a page parked beneath the active turn",
+                view.privateField("conversionSnapshotDrawable"),
+            )
+            assertNull(view.privateField("directImageFirstCoverTarget"))
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `direct image-first cover is ignored in scroll mode`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        val incomingFlow = epubBuildChapterFlow(
+            spineIndex = 1,
+            blocks = listOf(
+                EpubDisplayBlock.Image(
+                    href = "chapter-opening.png",
+                    altText = "chapter opening image",
+                    paragraphIndex = 0,
+                    isInlineContent = false,
+                ),
+            ),
+        )
+
+        try {
+            view.mode = EpubFlowView.Mode.SCROLL
+
+            assertFalse(view.prepareDirectImageFirstChapterCover(incomingFlow))
+            assertNull(view.privateField("conversionSnapshotDrawable"))
+            assertNull(view.privateField("directImageFirstCoverTarget"))
+            assertFalse(view.privateBool("awaitingReveal"))
+            assertFalse(view.privateBool("awaitingStableChapter"))
+            assertEquals(1f, view.getChildAt(0).alpha)
+        } finally {
+            view.dispose()
+        }
+    }
+
+    @Test
+    fun `paged to scroll retires a waiting direct image-first cover through both mode paths`() {
+        fun assertWaitingCoverIsRetired(switchToScroll: (EpubFlowView) -> Unit) {
+            val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+            val incomingFlow = epubBuildChapterFlow(
+                spineIndex = 1,
+                blocks = listOf(
+                    EpubDisplayBlock.Image(
+                        href = "chapter-opening.png",
+                        altText = "chapter opening image",
+                        paragraphIndex = 0,
+                        isInlineContent = false,
+                    ),
+                    EpubDisplayBlock.Text(
+                        text = "Incoming target text.",
+                        headingLevel = null,
+                        paragraphIndex = 1,
+                    ),
+                ),
+            )
+            view.pendingDecodesProvider = { true }
+            view.imagePixelsStableProvider = { false }
+
+            try {
+                assertTrue(view.prepareDirectImageFirstChapterCover(incomingFlow))
+                view.setChapter(incomingFlow, incomingFlow.text, pageHeightPx = view.height)
+                assertNotNull(view.privateField("conversionSnapshotDrawable"))
+                assertTrue(view.privateBool("awaitingStableChapter"))
+
+                switchToScroll(view)
+
+                assertEquals(EpubFlowView.Mode.SCROLL, view.mode)
+                assertEquals(1f, view.getChildAt(0).alpha)
+                assertFalse(view.privateBool("awaitingReveal"))
+                assertFalse(view.privateBool("awaitingStableChapter"))
+                assertNull(view.privateField("conversionSnapshotDrawable"))
+                assertNull(view.privateField("directImageFirstCoverTarget"))
+                assertFalse(view.privateBool("boundaryContinuityCover"))
+            } finally {
+                view.dispose()
+            }
+        }
+
+        assertWaitingCoverIsRetired { view ->
+            view.setModeAnchored(EpubFlowView.Mode.SCROLL, layoutOffset = 0)
+        }
+        assertWaitingCoverIsRetired { view ->
+            view.mode = EpubFlowView.Mode.SCROLL
+        }
+    }
+
+    @Test
     fun `accepted pending boundary animation pairs one start with one settle`() {
         val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 3)

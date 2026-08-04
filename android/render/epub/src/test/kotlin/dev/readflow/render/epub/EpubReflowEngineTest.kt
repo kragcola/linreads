@@ -1855,6 +1855,51 @@ class EpubReflowEngineTest {
         }
 
     @Test
+    fun `cross spine navigation waits for source page-turn motion before installing its target`() = runTest(dispatcher) {
+        Dispatchers.setMain(dispatcher)
+        val epub = tempDir.newFile("cross-spine-navigation-waits-for-source-motion.epub")
+        writeBoundaryImageEpub(epub)
+        val engine = EpubReflowEngine(
+            context = RuntimeEnvironment.getApplication() as Application,
+            flowEngineEnabled = true,
+        )
+        engine.setMode(ReadingMode.PAGED)
+        engine.openBook(Uri.fromFile(epub))
+        val host = engine.createView() as FrameLayout
+        val sourceView = host.getChildAt(0) as EpubFlowView
+        awaitCondition("fixture must expose the cross-spine TOC target") {
+            runCurrent()
+            engine.tableOfContents.value.size == 2
+        }
+
+        try {
+            sourceView.setPrivateField("queuedPageTurnDelta", 1)
+
+            engine.goTo(engine.tableOfContents.value[1].locator)
+
+            assertTrue(
+                "the direct target must remain deferred while the source has unresolved page-turn motion",
+                sourceView.textView.text.contains("Preview source chapter."),
+            )
+            assertEquals(
+                "the deferred request must not publish its target locator before installation",
+                0,
+                (engine.currentLocator.value.strategy as LocatorStrategy.Section).spineIndex,
+            )
+
+            sourceView.setPrivateField("queuedPageTurnDelta", 0)
+            shadowOf(Looper.getMainLooper()).idleFor(20L, TimeUnit.MILLISECONDS)
+            awaitCondition("the same navigation request must install after source motion settles") {
+                runCurrent()
+                (engine.currentLocator.value.strategy as? LocatorStrategy.Section)?.spineIndex == 1 &&
+                    sourceView.textView.text.contains("Image target begins.")
+            }
+        } finally {
+            engine.close()
+        }
+    }
+
+    @Test
     fun `cross spine toc jump prepares image bounds before main thread installation`() = runTest(dispatcher) {
         Dispatchers.setMain(dispatcher)
         val epub = tempDir.newFile("toc-jump-background-flow-preparation.epub")

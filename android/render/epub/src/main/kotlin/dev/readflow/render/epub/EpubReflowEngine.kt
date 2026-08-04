@@ -1142,12 +1142,16 @@ class EpubReflowEngine private constructor(
         landOnLast: Boolean = false,
         reportPositionAfterStableReveal: Boolean = false,
         preparedFlow: EpubChapterFlow? = null,
+        directCrossSpineNavigation: Boolean = false,
     ) {
         val view = flowView ?: return
         val flow = preparedFlow?.takeIf { it.spineIndex == spineIndex } ?: run {
             val blocks = blocksForSpine(spineIndex)
             if (blocks.isEmpty()) return
             epubBuildChapterFlow(spineIndex, blocks)
+        }
+        if (directCrossSpineNavigation) {
+            view.prepareDirectImageFirstChapterCover(flow)
         }
         liveFlowImageLoader?.releaseAll(view)
         liveFlowImageLoader = installFlowChapter(
@@ -2646,6 +2650,8 @@ class EpubReflowEngine private constructor(
                         index = resolved.globalParagraphIndex,
                         paragraphOffset = resolved.anchor.paragraphOffset,
                         targetSpine = requestedSection.spineIndex,
+                        requestId = navigationRequestId,
+                        generation = navigationBookGeneration,
                     )
                     true
                 }
@@ -2680,7 +2686,13 @@ class EpubReflowEngine private constructor(
                     generation = navigationBookGeneration,
                 )
             } else {
-                navigateFlowOnMain(idx, paraOffset, targetSpine)
+                navigateFlowOnMain(
+                    index = idx,
+                    paragraphOffset = paraOffset,
+                    targetSpine = targetSpine,
+                    requestId = navigationRequestId,
+                    generation = navigationBookGeneration,
+                )
             }
         }
     }
@@ -2793,6 +2805,8 @@ class EpubReflowEngine private constructor(
             paragraphOffset = paragraphOffset,
             targetSpine = targetSpine,
             preparedFlow = prepared?.flow,
+            requestId = requestId,
+            generation = generation,
         )
     }
 
@@ -2813,9 +2827,37 @@ class EpubReflowEngine private constructor(
         paragraphOffset: Int,
         targetSpine: Int,
         preparedFlow: EpubChapterFlow? = null,
+        requestId: Long,
+        generation: Long,
     ) {
-        invalidateBoundaryPreviewState(clearViewSlots = true)
+        if (!isCurrentFlowNavigationRequest(requestId, generation)) return
         val view = flowView
+        if (
+            view != null &&
+            targetSpine != flowSpineIndex &&
+            view.isRapidTurnPerformanceModeActive()
+        ) {
+            // A local turn parks the live TextView on its incoming page while an overlay owns the
+            // visible viewport. Retrying on the next frame keeps a TOC jump from freezing that
+            // parked, non-visible page; the request/generation guard drops stale retries.
+            view.postOnAnimation {
+                if (
+                    flowView === view &&
+                    isCurrentFlowNavigationRequest(requestId, generation)
+                ) {
+                    navigateFlowOnMain(
+                        index = index,
+                        paragraphOffset = paragraphOffset,
+                        targetSpine = targetSpine,
+                        preparedFlow = preparedFlow,
+                        requestId = requestId,
+                        generation = generation,
+                    )
+                }
+            }
+            return
+        }
+        invalidateBoundaryPreviewState(clearViewSlots = true)
         if (view == null) {
             _currentLocator.value = runtimeLocatorForOffset(index, paragraphOffset)
             updateChapterInfo(index)
@@ -2827,6 +2869,7 @@ class EpubReflowEngine private constructor(
                 restoreToParagraph = index,
                 restoreToParagraphOffset = paragraphOffset,
                 preparedFlow = preparedFlow,
+                directCrossSpineNavigation = true,
             )
         } else {
             val offset = flowCurrentFlow?.offsetForParagraph(index, paragraphOffset) ?: 0

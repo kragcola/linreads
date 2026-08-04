@@ -48,6 +48,9 @@
 -keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
 -keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
 
+# Keep the AndroidX test runner's Kotlin intrinsic when it targets a minified OTA.
+-keep class kotlin.jvm.internal.Intrinsics { *; }
+
 # Keep Markwon
 -keep class io.noties.markwon.** { *; }
 # markwon-image bundles Svg/GifMediaDecoder, which reference the OPTIONAL androidsvg
