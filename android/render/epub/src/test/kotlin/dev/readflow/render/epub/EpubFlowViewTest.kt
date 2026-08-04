@@ -6665,7 +6665,10 @@ class EpubFlowViewTest {
                 assertTrue("$pendingFlagField must be armed by real precache", view.privateBool(pendingFlagField))
                 request = checkNotNull(view.privateField(pendingRequestField))
 
-                fun assertSettleWaitsForPendingState(state: String) {
+                fun assertSettleWaitsForPendingState(
+                    state: String,
+                    cancelSyntheticRecheck: Boolean,
+                ) {
                     view.setRapidIdleSettleStageForTest("SETTLE")
                     view.runRapidIdleSettleForTest()
                     assertEquals(
@@ -6682,23 +6685,41 @@ class EpubFlowViewTest {
                         "SETTLE",
                         view.privateField("rapidIdleSettleStage").toString(),
                     )
+                    assertTrue(
+                        "$pendingFlagField/$pendingRequestField $state must post one next-frame recheck",
+                        view.privateBool("rapidIdleSettlePosted"),
+                    )
+                    if (cancelSyntheticRecheck) view.cancelRapidIdleSettleForTest()
+                }
+
+                fun advanceUntilOneFinalSettle() {
+                    repeat(16) {
+                        if (settledCount == 1 && !view.privateBool("rapidTurnSequenceActive")) return
+                        shadowOf(Looper.getMainLooper()).runOneTask()
+                    }
+                    assertEquals(
+                        "$pendingFlagField/$pendingRequestField must publish exactly one final settle",
+                        1,
+                        settledCount,
+                    )
+                    assertFalse(view.privateBool("rapidTurnSequenceActive"))
                 }
 
                 view.setPrivateField("rapidTurnSequenceActive", true)
                 view.setPrivateField(pendingRequestField, null)
-                assertSettleWaitsForPendingState("flag-only")
+                assertSettleWaitsForPendingState("flag-only", cancelSyntheticRecheck = true)
 
                 view.setPrivateField(pendingRequestField, request)
                 view.setPrivateField(pendingFlagField, false)
-                assertSettleWaitsForPendingState("request-only")
+                assertSettleWaitsForPendingState("request-only", cancelSyntheticRecheck = false)
 
                 view.setPrivateField(pendingFlagField, true)
                 view.drainPendingPageTexturePrecacheForTest()
                 precacheCompleted = true
-                view.setRapidIdleSettleStageForTest("SETTLE")
-                view.runRapidIdleSettleForTest()
+                advanceUntilOneFinalSettle()
+                shadowOf(Looper.getMainLooper()).idle()
                 assertEquals(
-                    "$pendingFlagField/$pendingRequestField must settle after the real precache commits",
+                    "$pendingFlagField/$pendingRequestField must not publish a duplicate final settle",
                     1,
                     settledCount,
                 )
@@ -14971,6 +14992,11 @@ class EpubFlowViewTest {
         javaClass.getDeclaredMethod("runRapidIdleSettle")
             .apply { isAccessible = true }
             .invoke(this)
+    }
+
+    private fun EpubFlowView.cancelRapidIdleSettleForTest() {
+        removeCallbacks(privateField("rapidIdleSettleRunnable") as Runnable)
+        setPrivateField("rapidIdleSettlePosted", false)
     }
 
     private fun EpubFlowView.preCachePageTexturesForTest(idlePostedWork: Boolean = true) {
