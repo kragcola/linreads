@@ -592,6 +592,35 @@ internal class EpubFlowView(
     private var rapidQueuedTurnDrainPosted = false
     private var rapidTurnPairBootstrapRetries = 0
     /**
+     * A page-shot teardown must reveal the parked page immediately, but re-recording the complete
+     * chapter TextView can take tens of milliseconds on image-heavy EPUBs. Coalesce that refresh
+     * behind the quiet-turn gate so it cannot share the first settled or next rapid-turn frame.
+     */
+    private var deferredLiveTextRerecordPending = false
+    private val deferredLiveTextRerecordRunnable = object : Runnable {
+        override fun run() {
+            if (disposed) {
+                deferredLiveTextRerecordPending = false
+                return
+            }
+            if (
+                turnInFlight ||
+                    queuedPageTurnDelta != 0 ||
+                    rapidTurnSequenceActive ||
+                    rapidIdlePageTurnGesture ||
+                    pageShotOverlayActive
+            ) {
+                postDelayed(this, RAPID_TURN_IDLE_TIMEOUT_MS)
+                return
+            }
+            deferredLiveTextRerecordPending = false
+            EpubRapidIdleWorkProbe.noteLiveContentRerecordArmed()
+            textView.invalidate()
+            container.invalidate()
+            postInvalidateOnAnimation()
+        }
+    }
+    /**
      * Quiet rapid-turn cleanup is deliberately split across frame callbacks. Keeping the rapid
      * sequence active until SETTLE also makes a DOWN arriving between those callbacks join the
      * same coalescing window instead of racing the deferred image/cache work.
@@ -3658,6 +3687,8 @@ internal class EpubFlowView(
         removeCallbacks(reflowRunnable)
         removeCallbacks(asyncImageRefreshRunnable)
         cancelRapidIdleSettle()
+        removeCallbacks(deferredLiveTextRerecordRunnable)
+        deferredLiveTextRerecordPending = false
         asyncImageRefreshPending = false
         asyncImagePixelRefreshOffsets.clear()
         asyncImagePixelTextRebindPending = false
@@ -4346,6 +4377,13 @@ internal class EpubFlowView(
         rapidIdleSettlePosted = false
         rapidIdleSettleStage = RapidIdleSettleStage.NONE
         rapidIdleApplyingAsync = false
+    }
+
+    private fun scheduleDeferredLiveTextRerecord() {
+        if (disposed) return
+        if (deferredLiveTextRerecordPending) return
+        deferredLiveTextRerecordPending = true
+        postOnAnimation(deferredLiveTextRerecordRunnable)
     }
 
     private fun scheduleRapidIdleSettle() {
@@ -6050,8 +6088,8 @@ internal class EpubFlowView(
     private fun clearFlipOverlay(preserveActivePixelRefreshes: Boolean = false) {
         cancelPendingLocalPageShotHandoff(consumeGesture = true)
         // Every page-shot owner suppresses the live TextView while it is active. The opaque SLIDE
-        // View renderer covers the same viewport as the Drawable owner, so teardown must explicitly
-        // rerecord the parked chapter RenderNode before the next settled frame.
+        // View renderer covers the same viewport as the Drawable owner, so teardown must restore
+        // the parked chapter RenderNode without making its full re-record part of the settle frame.
         val rerecordLiveText = container.skipContentDraw || liveContentDrawSuppressedByPageShot
         detachSlideOverlayRenderer()
         slideDrawable?.let {
@@ -6079,11 +6117,11 @@ internal class EpubFlowView(
         container.translationY = 0f
         // The overlay draw path suppresses the live child. If HWUI records the container while that
         // suppression is active, removing the overlay alone can keep replaying an empty RenderNode.
-        // Dirty both levels so the first settled frame records the parked page and image spans again.
+        // Dirty the parent immediately so the first settled frame reveals the parked page. The
+        // complete TextView RenderNode is refreshed later, once no turn can consume that frame.
         container.skipContentDraw = false
         if (rerecordLiveText) {
-            EpubRapidIdleWorkProbe.noteLiveContentRerecordArmed()
-            textView.invalidate()
+            scheduleDeferredLiveTextRerecord()
         }
         container.invalidate()
         postInvalidateOnAnimation()

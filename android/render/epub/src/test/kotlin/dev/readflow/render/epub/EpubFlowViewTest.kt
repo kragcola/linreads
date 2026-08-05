@@ -2374,7 +2374,6 @@ class EpubFlowViewTest {
             textShadow.clearWasInvalidated()
 
             view.clearFlipOverlayForTest()
-            shadowOf(Looper.getMainLooper()).idle()
 
             assertNull(view.privateField("slideDrawable"))
             assertNull("teardown must clear the active slide overlay pointer", view.privateField("slideOverlayView"))
@@ -2387,7 +2386,12 @@ class EpubFlowViewTest {
                 contentShadow.wasInvalidated(),
             )
             assertTrue(
-                "removing an opaque SLIDE View must dirty the suppressed TextView RenderNode",
+                "removing an opaque SLIDE View must defer the expensive TextView RenderNode re-record",
+                !textShadow.wasInvalidated(),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            assertTrue(
+                "deferred SLIDE teardown must eventually dirty the TextView RenderNode",
                 textShadow.wasInvalidated(),
             )
             val settledFrame = view.drawAsScrolledChildToBitmapForTest()
@@ -2475,14 +2479,18 @@ class EpubFlowViewTest {
             containerShadow.clearWasInvalidated()
             textShadow.clearWasInvalidated()
             view.clearFlipOverlayForTest()
-            shadowOf(Looper.getMainLooper()).idle()
             assertNull(view.privateField("curlDrawable"))
             assertTrue(
                 "overlay teardown must invalidate the container so the live page replaces the page shot",
                 containerShadow.wasInvalidated(),
             )
             assertTrue(
-                "overlay teardown must invalidate the text child so HWUI re-records live content",
+                "overlay teardown must defer the expensive text child re-record",
+                !textShadow.wasInvalidated(),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            assertTrue(
+                "deferred overlay teardown must eventually invalidate the text child",
                 textShadow.wasInvalidated(),
             )
 
