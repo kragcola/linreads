@@ -2505,22 +2505,18 @@ class EpubFlowViewTest {
                 "PAPER teardown must retain a terminal cover until the parked child is rerecorded"
             }
             val settledCurl = checkNotNull(settledCover.reflectedField("curlDrawable")) as PageCurlDrawable
-            val firstSettledFrame = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
-            try {
-                // Robolectric's manual View.draw() path does not composite ViewOverlay children;
-                // draw the production terminal Drawable directly to verify its actual page content.
-                val coverCanvas = Canvas(firstSettledFrame)
-                coverCanvas.translate(0f, -view.scrollY.toFloat())
-                settledCurl.draw(coverCanvas)
-                val terminalCoverHits = firstSettledFrame.countExactPixels(0xFF1E3A8A.toInt())
-                assertTrue(
-                    "the terminal PAPER cover must retain the revealed page while the child re-record is deferred; " +
-                        "hits=$terminalCoverHits",
-                    terminalCoverHits > 0,
-                )
-            } finally {
-                firstSettledFrame.recycle()
-            }
+            assertEquals(
+                "teardown must park PAPER at the revealed page rather than replaying the outgoing page",
+                1f,
+                settledCurl.progress,
+                0.001f,
+            )
+            assertSame(
+                "the terminal PAPER cover must retain the exact revealed page owner",
+                revealed,
+                settledCurl.reflectedField("revealedBitmap"),
+            )
+            assertFalse("the terminal revealed page must remain live", revealed.isRecycled)
             shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
             assertTrue(
                 "deferred overlay teardown must eventually invalidate the text child",
