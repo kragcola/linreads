@@ -11,6 +11,9 @@ import android.os.Looper
 import android.os.Process
 import android.util.Log
 import java.lang.reflect.InvocationTargetException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Debug-only, shell-gated controls for collecting in-process rapid-idle timing from an open reader.
@@ -77,21 +80,17 @@ class EpubRapidIdleDiagnosticsProvider : ContentProvider() {
     }
 
     private fun snapshot(): Bundle {
-        val (sessionId, snapshot) = synchronized(lock) {
-            activeSessionId to RapidIdleProbeHandle.snapshot()
-        }
+        val sessionId = synchronized(lock) { activeSessionId }
+        val snapshot = onMainSync { RapidIdleProbeHandle.snapshot() }
         Log.i(TAG, "snapshot session=$sessionId pid=${Process.myPid()} raw=$snapshot")
         return result(status = "snapshot", sessionId = sessionId, snapshot = snapshot)
     }
 
     private fun stop(): Bundle {
-        val sessionId: Long
-        val snapshot: String
-        synchronized(lock) {
-            sessionId = activeSessionId
-            activeSessionId = 0L
-            snapshot = RapidIdleProbeHandle.snapshotThenStop()
+        val sessionId = synchronized(lock) {
+            activeSessionId.also { activeSessionId = 0L }
         }
+        val snapshot = onMainSync { RapidIdleProbeHandle.snapshotThenStop() }
         Log.i(TAG, "stopped session=$sessionId pid=${Process.myPid()} raw=$snapshot")
         return result(status = "stopped", sessionId = sessionId, snapshot = snapshot)
     }
@@ -106,6 +105,20 @@ class EpubRapidIdleDiagnosticsProvider : ContentProvider() {
             TAG,
             "completed session=$sessionId windowMs=$windowMs pid=${Process.myPid()} raw=$snapshot",
         )
+    }
+
+    private fun <T> onMainSync(block: () -> T): T {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<Result<T>?>(null)
+        check(mainHandler.post {
+            result.set(runCatching(block))
+            latch.countDown()
+        }) { "Rapid-idle diagnostics main-thread barrier was rejected." }
+        check(latch.await(MAIN_THREAD_BARRIER_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            "Rapid-idle diagnostics main-thread barrier timed out."
+        }
+        return checkNotNull(result.get()).getOrThrow()
     }
 
     private fun requireShellCaller() {
@@ -167,5 +180,6 @@ class EpubRapidIdleDiagnosticsProvider : ContentProvider() {
 
     private companion object {
         const val TAG = "EpubRapidIdleDiagnostic"
+        const val MAIN_THREAD_BARRIER_TIMEOUT_MS = 1_000L
     }
 }

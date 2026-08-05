@@ -18,6 +18,7 @@ internal object EpubRapidIdleWorkProbe {
     private const val MAX_RECENT_ARTIFACT_RECORDS = 16
     private const val MAX_FRAME_METRIC_WINDOWS = 32
     private const val SETTLED_FRAME_SAMPLE_LIMIT = 2
+    private const val FRAME_METRIC_TIMESTAMP_GUARD_NS = 25_000_000L
 
     data class Snapshot(
         val enabled: Boolean,
@@ -371,7 +372,9 @@ internal object EpubRapidIdleWorkProbe {
             val window = FrameMetricWindow(
                 generation = ++nextFrameMetricGeneration,
                 phase = FrameMetricPhase.OVERLAY,
-                startedAtNs = atNs,
+                // The first frame's intended-vsync can precede the UI callback that installs the
+                // renderer by one refresh interval; retain a bounded pre-marker guard for it.
+                startedAtNs = (atNs - FRAME_METRIC_TIMESTAMP_GUARD_NS).coerceAtLeast(0L),
             )
             appendFrameMetricWindowLocked(window)
             overlayFrameMetricWindow = window
@@ -412,7 +415,7 @@ internal object EpubRapidIdleWorkProbe {
             val window = FrameMetricWindow(
                 generation = generation,
                 phase = FrameMetricPhase.SETTLED,
-                startedAtNs = atNs,
+                startedAtNs = (atNs - FRAME_METRIC_TIMESTAMP_GUARD_NS).coerceAtLeast(0L),
             )
             appendFrameMetricWindowLocked(window)
             settledFrameMetricWindow = window
@@ -476,7 +479,9 @@ internal object EpubRapidIdleWorkProbe {
             view.post { observeView(view) }
             return
         }
-        val window = findWindow(view.context) ?: return
+        // EpubReflowEngine intentionally builds reader views from androidContext(); once attached,
+        // the decor/root context is the reliable Activity window owner.
+        val window = findWindow(view.rootView.context) ?: return
         val registration = synchronized(lock) {
             if (!enabled) return@synchronized null
             if (
