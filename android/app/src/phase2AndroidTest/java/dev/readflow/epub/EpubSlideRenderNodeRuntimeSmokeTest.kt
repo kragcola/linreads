@@ -6,7 +6,6 @@ import android.graphics.RenderNode
 import android.os.Build
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.LargeTest
-import kotlin.jvm.functions.Function1
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -29,7 +28,7 @@ class EpubSlideRenderNodeRuntimeSmokeTest {
         val recordMethod = companion.javaClass.declaredMethods.single { method ->
             method.name.startsWith("record") && method.parameterTypes.size == 3
         }.apply { isAccessible = true }
-        val draw = Function1<Canvas, Unit> { canvas ->
+        val draw: (Canvas) -> Unit = { canvas ->
             canvas.drawColor(Color.WHITE)
             Unit
         }
