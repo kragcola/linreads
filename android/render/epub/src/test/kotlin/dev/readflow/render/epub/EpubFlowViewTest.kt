@@ -2501,11 +2501,18 @@ class EpubFlowViewTest {
                 "overlay teardown must defer the expensive text child re-record",
                 !textShadow.wasInvalidated(),
             )
-            val firstSettledFrame = view.drawAsScrolledChildToBitmapForTest()
+            val settledCover = checkNotNull(view.privateField("settledPageCover")) {
+                "PAPER teardown must retain a terminal cover until the parked child is rerecorded"
+            }
+            val settledCurl = checkNotNull(settledCover.reflectedField("curlDrawable")) as PageCurlDrawable
+            val firstSettledFrame = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
             try {
+                // Robolectric's manual View.draw() path does not composite ViewOverlay children;
+                // draw the production terminal Drawable directly to verify its actual page content.
+                settledCurl.draw(Canvas(firstSettledFrame))
                 val terminalCoverHits = firstSettledFrame.countExactPixels(0xFF1E3A8A.toInt())
                 assertTrue(
-                    "the first settled PAPER frame must retain the revealed page while the child re-record is deferred; " +
+                    "the terminal PAPER cover must retain the revealed page while the child re-record is deferred; " +
                         "hits=$terminalCoverHits",
                     terminalCoverHits > 0,
                 )
