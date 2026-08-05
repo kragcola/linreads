@@ -422,7 +422,7 @@ internal object EpubRapidIdleWorkProbe {
 
     fun beginLiveContentDispatch(): Long? {
         if (!enabled) return null
-        synchronized(lock) {
+        return synchronized(lock) {
             if (!enabled || !liveContentDispatchArmed) return@synchronized null
             // One sample per release is enough to identify the expensive traversal and avoids
             // turning a diagnostic session into a full dispatch profiler.
@@ -636,12 +636,12 @@ internal object EpubRapidIdleWorkProbe {
     private fun removeFrameMetricsListener(
         registration: Pair<Window, Window.OnFrameMetricsAvailableListener>,
     ) {
-        val remove = {
+        val remove = Runnable {
             runCatching {
                 registration.first.removeOnFrameMetricsAvailableListener(registration.second)
             }
         }
-        if (Looper.myLooper() == Looper.getMainLooper()) remove() else mainHandler.post(remove)
+        if (Looper.myLooper() == Looper.getMainLooper()) remove.run() else mainHandler.post(remove)
     }
 
     private fun findWindow(context: Context): Window? {
