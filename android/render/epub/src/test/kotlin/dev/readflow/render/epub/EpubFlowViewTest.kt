@@ -2287,6 +2287,56 @@ class EpubFlowViewTest {
 
     @Test
     @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `slide cancel settle keeps live content available under the overlay`() {
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
+        assertTrue("pageCount=${view.pageCount()}", view.pageCount() > 2)
+        val container = view.privateField("container") as View
+        fun liveContentSuppressed(): Boolean = container.reflectedField("skipContentDraw") as Boolean
+        view.isVerticalScrollBarEnabled = false
+        var outgoingFrame: Bitmap? = null
+
+        try {
+            view.goToPage(1)
+            outgoingFrame = view.drawToBitmapForTest()
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val renderer = view.requireActiveSlideRendererView()
+            view.updateInteractiveCurl(x = view.width * 0.95f)
+            assertTrue("the active drag must suppress the parked live page", liveContentSuppressed())
+
+            view.endInteractiveCurl(velocityX = 0f)
+            assertEquals("SOFTWARE_SETTLING", view.privateField("interactiveTurnState").toString())
+            assertFalse("cancel settle must expose the parked live page as an underlay", liveContentSuppressed())
+
+            val animator = checkNotNull(view.privateField("flipAnimator") as android.animation.ValueAnimator?)
+            assertTrue("cancel settle must remain animated", animator.isRunning)
+            // Model the Huawei frame where the ViewOverlay loses its RenderNode for one traversal.
+            renderer.visibility = View.INVISIBLE
+            animator.currentPlayTime = animator.duration / 2L
+            assertFalse(
+                "settle update frames must not re-enable live-content suppression",
+                liveContentSuppressed(),
+            )
+            val fallbackFrame = view.drawToBitmapForTest()
+            try {
+                assertTrue(
+                    "a missing settle overlay frame must reveal the restored outgoing page, not paper/white",
+                    bitmapsHaveSamePixels(checkNotNull(outgoingFrame), fallbackFrame),
+                )
+            } finally {
+                fallbackFrame.recycle()
+            }
+        } finally {
+            (view.privateField("flipAnimator") as? android.animation.ValueAnimator)?.let { animator ->
+                if (animator.isRunning) animator.end()
+            }
+            outgoingFrame?.recycle()
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idleFor(100L, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun `slide teardown rerecords the parked image page after suppressing live draw`() {
         val fixture = visibleHeadingImageContinuationFixture(minHeadingPageIndex = 1)
         val view = fixture.view

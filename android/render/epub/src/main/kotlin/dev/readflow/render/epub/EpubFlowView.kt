@@ -5747,7 +5747,11 @@ internal class EpubFlowView(
         // Hold live-content suppression for the full page-shot transaction. Toggling it only
         // around dispatchDraw can make HWUI record an empty container between parent draws and
         // leave parked image spans invisible after overlay teardown.
-        if (!container.skipContentDraw && pageShotOverlayActive) {
+        if (
+            !container.skipContentDraw &&
+            pageShotOverlayActive &&
+            interactiveTurnState != InteractiveTurnState.SOFTWARE_SETTLING
+        ) {
             container.skipContentDraw = true
             container.invalidate()
         }
@@ -6850,6 +6854,17 @@ internal class EpubFlowView(
             positionSlideOverlay(curlForward)
             val top = scrollY
             curlDrawable?.setBounds(0, top, width, top + height)
+        }
+        // Keep the parked live page available underneath the overlay during settle. Huawei can
+        // briefly expose an empty ViewOverlay RenderNode when a cancellation repositions the strip;
+        // retaining the live layer turns that gap into a stable page instead of paper/white.
+        if (
+            interactiveTurnState == InteractiveTurnState.SOFTWARE_SETTLING &&
+            container.skipContentDraw
+        ) {
+            container.skipContentDraw = false
+            container.invalidate()
+            textView.invalidate()
         }
         val forward = curlForward
         val distance = kotlin.math.abs(end - start)
