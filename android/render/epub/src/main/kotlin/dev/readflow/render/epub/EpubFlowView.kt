@@ -572,6 +572,12 @@ internal class EpubFlowView(
     private var activeFlipFrontPixelRefreshPending = false
     private var activeFlipRevealedPixelRefreshPending = false
     private var localSoftwareSettleCommit: Boolean? = null
+    /** Only a local SLIDE rollback needs the restored outgoing page as an overlay underlay. */
+    private val localSlideCancelSettleActive: Boolean
+        get() =
+            interactiveTurnState == InteractiveTurnState.SOFTWARE_SETTLING &&
+                localSoftwareSettleCommit == false &&
+                slideDrawable != null
     private var conversionSnapshotDrawable: ViewportSnapshotDrawable? = null
     private var conversionSnapshotFlattener: (ViewportSnapshotDrawable, Bitmap) -> Boolean =
         { cover, destination -> cover.flattenOver(destination) }
@@ -5744,13 +5750,12 @@ internal class EpubFlowView(
      * shot flat inside [PageCurlDrawable], while only the outgoing shot warps over it.
      */
     private fun applyFlipProgress(progress: Float, forward: Boolean) {
-        // Hold live-content suppression for the full page-shot transaction. Toggling it only
-        // around dispatchDraw can make HWUI record an empty container between parent draws and
-        // leave parked image spans invisible after overlay teardown.
+        // Keep the live page suppressed during finger tracking. A local SLIDE rollback is the one
+        // exception: its restored outgoing page is a fallback if Huawei drops the overlay briefly.
         if (
             !container.skipContentDraw &&
             pageShotOverlayActive &&
-            interactiveTurnState != InteractiveTurnState.SOFTWARE_SETTLING
+            !localSlideCancelSettleActive
         ) {
             container.skipContentDraw = true
             container.invalidate()
@@ -6858,10 +6863,7 @@ internal class EpubFlowView(
         // Keep the parked live page available underneath the overlay during settle. Huawei can
         // briefly expose an empty ViewOverlay RenderNode when a cancellation repositions the strip;
         // retaining the live layer turns that gap into a stable page instead of paper/white.
-        if (
-            interactiveTurnState == InteractiveTurnState.SOFTWARE_SETTLING &&
-            container.skipContentDraw
-        ) {
+        if (localSlideCancelSettleActive && container.skipContentDraw) {
             container.skipContentDraw = false
             container.invalidate()
             textView.invalidate()

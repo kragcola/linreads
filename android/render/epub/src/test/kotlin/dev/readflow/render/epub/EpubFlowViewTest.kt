@@ -2297,13 +2297,21 @@ class EpubFlowViewTest {
 
         try {
             view.goToPage(1)
-            outgoingFrame = view.drawToBitmapForTest()
-            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            outgoingFrame = view.drawAsScrolledChildToBitmapForTest()
+            val downX = view.width * 0.85f
+            val moveX = view.width * 0.15f
+            val y = view.height * 0.50f
+            val downTime = SystemClock.uptimeMillis()
+            view.dispatchTouchEvent(motionEvent(downTime, downTime, MotionEvent.ACTION_DOWN, downX, y))
+            view.dispatchTouchEvent(motionEvent(downTime, downTime + 24L, MotionEvent.ACTION_MOVE, moveX, y))
             val renderer = view.requireActiveSlideRendererView()
-            view.updateInteractiveCurl(x = view.width * 0.95f)
+            val slide = checkNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
+            assertTrue("fixture must cross the normal release commit threshold", slide.progress > 0.5f)
             assertTrue("the active drag must suppress the parked live page", liveContentSuppressed())
 
-            view.endInteractiveCurl(velocityX = 0f)
+            view.onTouchEvent(
+                motionEvent(downTime, downTime + 48L, MotionEvent.ACTION_CANCEL, moveX, y),
+            )
             assertEquals("SOFTWARE_SETTLING", view.privateField("interactiveTurnState").toString())
             assertFalse("cancel settle must expose the parked live page as an underlay", liveContentSuppressed())
 
@@ -2316,7 +2324,7 @@ class EpubFlowViewTest {
                 "settle update frames must not re-enable live-content suppression",
                 liveContentSuppressed(),
             )
-            val fallbackFrame = view.drawToBitmapForTest()
+            val fallbackFrame = view.drawAsScrolledChildToBitmapForTest()
             try {
                 assertTrue(
                     "a missing settle overlay frame must reveal the restored outgoing page, not paper/white",
