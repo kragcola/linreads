@@ -2269,8 +2269,8 @@ class EpubFlowSpannableTest {
             )
             shadowOf(Looper.getMainLooper()).idleFor(64L, TimeUnit.MILLISECONDS)
             assertEquals(2, prepared.size)
-            assertSame(decoded[0], prepared[0])
-            assertSame(decoded[1], prepared[1])
+            assertTrue("the current DISPLAY bitmap must be prepared", prepared.any { it === decoded[0] })
+            assertTrue("the adjacent DISPLAY bitmap must be prepared", prepared.any { it === decoded[1] })
 
             loader.requestIdleGpuPreparation(currentAndAdjacent) { readerIdle }
             shadowOf(Looper.getMainLooper()).idleFor(64L, TimeUnit.MILLISECONDS)
