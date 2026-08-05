@@ -5885,6 +5885,11 @@ internal class EpubFlowView(
             frames.forEach(::retireSettledFrame)
             if (frames.isNotEmpty()) scheduleRenderRetiredFence()
         }
+        // PAPER's terminal Drawable is the only owner of the first settled frame. Restore live
+        // child drawing only after that owner has been detached, otherwise the parked TextView can
+        // paint over the revealed page in the same software or hardware traversal.
+        container.skipContentDraw = false
+        container.invalidate()
     }
 
     /** Retires a terminal frame behind the same host/render-thread fence as active SLIDE frames. */
@@ -6284,6 +6289,12 @@ internal class EpubFlowView(
         // Dirty the parent immediately so the first settled frame reveals the parked page. The
         // complete TextView RenderNode is refreshed later, once no turn can consume that frame.
         container.skipContentDraw = false
+        if (terminalCurlCover) {
+            // Keep the live TextView out of the first PAPER terminal frame. The Bitmap Drawable is
+            // the stable settled owner; releaseSettledPageCover() re-enables the child after the
+            // deferred pre-draw has recorded the parked chapter.
+            container.skipContentDraw = true
+        }
         if (rerecordLiveText) {
             scheduleDeferredLiveTextRerecord()
         }
