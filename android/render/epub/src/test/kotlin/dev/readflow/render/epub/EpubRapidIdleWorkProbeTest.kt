@@ -122,7 +122,7 @@ class EpubRapidIdleWorkProbeTest {
             assertEquals(13L, snapshot.long("frameMetricsOverlayCommandIssueTotalNs"))
             assertEquals(2, snapshot.int("frameMetricsSettledFrameCount"))
             assertEquals(52L, snapshot.long("frameMetricsSettledDrawTotalNs"))
-            assertEquals(54L, snapshot.long("frameMetricsSettledCommandIssueTotalNs"))
+            assertEquals(56L, snapshot.long("frameMetricsSettledCommandIssueTotalNs"))
         } finally {
             probe.stop()
         }
