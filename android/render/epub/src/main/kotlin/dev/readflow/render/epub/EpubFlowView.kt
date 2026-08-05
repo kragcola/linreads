@@ -369,6 +369,8 @@ internal class EpubFlowView(
     var pageTexturePrecacheEnabled: Boolean = true
     private var pageShotSpeculationPaused: Boolean = false
     var onChapterStable: (() -> Unit)? = null
+    /** Called after a conversion cover is fully retired and no longer owns the viewport. */
+    var onConversionCoverRetired: (() -> Unit)? = null
     private var lastReportedTopOffset: Int? = null
     private val revealSafetyRunnable = Runnable {
         if (!awaitingReveal) return@Runnable
@@ -528,6 +530,18 @@ internal class EpubFlowView(
     /** Includes the rapid coalescing idle window used to defer display-quality promotion. */
     internal fun isRapidTurnPerformanceModeActive(): Boolean =
         isPageTurnMotionActive() || rapidTurnSequenceActive
+
+    /** Strict gate for optional GPU uploads that must never join a visible continuity transition. */
+    internal fun isIdleGpuPreparationSafe(): Boolean =
+        !disposed &&
+            !isRapidTurnPerformanceModeActive() &&
+            !fullViewportOverlayActive &&
+            !awaitingReveal &&
+            !awaitingStableChapter &&
+            !boundaryContinuityCover &&
+            pendingBoundaryPageTurn == null &&
+            directImageFirstCoverTarget == null &&
+            conversionFadeAnimator?.isRunning != true
 
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
@@ -3657,6 +3671,7 @@ internal class EpubFlowView(
         pendingDecodesProvider = null
         imagePixelsStableProvider = null
         onChapterStable = null
+        onConversionCoverRetired = null
         onBoundaryPreviewNeeded = null
         onBoundaryPreviewConfigurationChanged = null
         canCommitBoundaryTurn = null
@@ -3686,8 +3701,10 @@ internal class EpubFlowView(
     private fun startConversionSnapshotFade(fadingCover: ViewportSnapshotDrawable) {
         val startAlpha = fadingCover.alphaValue
         if (startAlpha <= 0) {
-            if (conversionSnapshotDrawable === fadingCover) clearConversionSnapshot()
+            val ownsCover = conversionSnapshotDrawable === fadingCover
+            if (ownsCover) clearConversionSnapshot()
             if (!consumePendingInitialPageTurn()) continueQueuedTurnsOrPrecache()
+            if (ownsCover) onConversionCoverRetired?.invoke()
             return
         }
         conversionFadeAnimator = android.animation.ValueAnimator.ofInt(startAlpha, 0).apply {
@@ -3707,6 +3724,7 @@ internal class EpubFlowView(
                     if (!cancelled && conversionSnapshotDrawable === fadingCover) {
                         clearConversionSnapshot()
                         if (!consumePendingInitialPageTurn()) continueQueuedTurnsOrPrecache()
+                        onConversionCoverRetired?.invoke()
                     }
                 }
             })

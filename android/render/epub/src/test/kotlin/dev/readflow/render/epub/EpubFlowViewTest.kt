@@ -5784,12 +5784,14 @@ class EpubFlowViewTest {
         val incomingImageStart = checkNotNull(incomingFlow.segments.firstOrNull { it.isImage }).layoutStart
         var exactPixelsStable = false
         val queriedImageStarts = mutableListOf<List<Int>>()
+        var coverRetiredCallbacks = 0
         // Broad work remains pending; the direct cover must use only the current-page image gate.
         view.pendingDecodesProvider = { true }
         view.imagePixelsStableProvider = { starts ->
             queriedImageStarts += starts.toList()
             exactPixelsStable
         }
+        view.onConversionCoverRetired = { coverRetiredCallbacks++ }
 
         try {
             assertTrue(
@@ -5839,16 +5841,31 @@ class EpubFlowViewTest {
                 "the direct image-first gate must never create a pending boundary turn",
                 view.privateField("pendingBoundaryPageTurn"),
             )
+            assertFalse(
+                "the direct image-first continuity cover must block optional GPU preparation",
+                view.isIdleGpuPreparationSafe(),
+            )
 
             exactPixelsStable = true
             view.onAsyncImageDecodeFinished()
             view.textView.viewTreeObserver.dispatchOnPreDraw()
+            assertEquals(
+                "cover retirement must wait until the conversion fade has finished",
+                0,
+                coverRetiredCallbacks,
+            )
+            assertFalse(
+                "GPU preparation must remain gated while the direct cover is fading",
+                view.isIdleGpuPreparationSafe(),
+            )
             shadowOf(Looper.getMainLooper()).idleFor(200L, TimeUnit.MILLISECONDS)
 
             assertNull(
                 "the current reveal fade must retire the direct cover only after exact first-page pixels stabilize",
                 view.privateField("conversionSnapshotDrawable"),
             )
+            assertEquals("cover retirement must reopen the idle preparation window", 1, coverRetiredCallbacks)
+            assertTrue(view.isIdleGpuPreparationSafe())
         } finally {
             if (!visibleOutgoing.isRecycled) view.recyclePageShotForTest(visibleOutgoing)
             view.dispose()

@@ -8,6 +8,7 @@ import android.graphics.drawable.Drawable
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.Choreographer
 import android.view.View
 import io.noties.markwon.image.AsyncDrawable
 import io.noties.markwon.image.AsyncDrawableLoader
@@ -259,6 +260,15 @@ private class EpubImagePixelDrawable(
         invalidateSelf()
     }
 
+    /** The active source is safe to prepare after the DISPLAY crossfade retires its old pixels. */
+    fun stablePixelsForGpuPreparation(): Bitmap? =
+        pixels.takeIf {
+            fallbackPixels != null &&
+                previousPixels == null &&
+                it !== EpubImagePixelDrawableHolder.bitmap &&
+                !it.isRecycled
+        }
+
     /** Drops decoded pixels while retaining the final layout geometry for a later window re-entry. */
     fun retirePixels(): List<Bitmap> {
         val retired = ArrayList<Bitmap>(3)
@@ -310,6 +320,7 @@ internal class EpubFlowImageLoader(
     },
     private val onImageResultChanged: ((EpubAsyncImageResult) -> Unit)? = null,
     private val onDecodeFinished: (() -> Unit)? = null,
+    private val bitmapPreparer: (Bitmap) -> Unit = Bitmap::prepareToDraw,
 ) : AsyncDrawableLoader() {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -320,6 +331,7 @@ internal class EpubFlowImageLoader(
     private val decodeFailureCountByDrawable = WeakHashMap<AsyncDrawable, Int>()
     private val terminalFailureGenerationByDrawable = WeakHashMap<AsyncDrawable, Long>()
     private val promotionCompletionByDrawable = WeakHashMap<AsyncDrawable, Runnable>()
+    private val gpuPreparedBitmaps = WeakHashMap<Bitmap, Unit>()
     private val retiredPixelBitmaps = ArrayList<RetiredPixelBitmap>()
     private var retiredPixelBytes = 0L
     private var retiredPixelBarrierGeneration = 0L
@@ -338,8 +350,124 @@ internal class EpubFlowImageLoader(
     private val retiredPixelFlushRunnable = Runnable { flushRetiredPixels() }
     private var decodeWindowRanges: List<IntRange>? = null
     private var decodeWindowRestrictsAdmission = false
+    private data class IdleGpuPreparationRequest(
+        val layoutRangesProvider: () -> Collection<IntRange>,
+        val mayPrepare: () -> Boolean,
+    )
+
+    private val idleGpuPreparationRunnable = Runnable { runIdleGpuPreparation() }
+    private val idleGpuPreparationFrameCallback = Choreographer.FrameCallback {
+        runIdleGpuPreparation()
+    }
+    private var idleGpuPreparationRequest: IdleGpuPreparationRequest? = null
+    private var idleGpuPreparationPosted = false
     private var lifecycleGeneration = 0L
     private var released = false
+
+    /**
+     * Queues hardware preparation only after the caller rechecks that the reader is idle. This
+     * deliberately stays on the main Looper so an arriving page turn cannot race the gate.
+     */
+    internal fun requestIdleGpuPreparation(
+        layoutRangesProvider: () -> Collection<IntRange>,
+        mayPrepare: () -> Boolean,
+    ) {
+        val request = IdleGpuPreparationRequest(layoutRangesProvider, mayPrepare)
+        val shouldPost = synchronized(lifecycleLock) {
+            if (released) {
+                false
+            } else {
+                idleGpuPreparationRequest = request
+                if (idleGpuPreparationPosted) {
+                    false
+                } else {
+                    idleGpuPreparationPosted = true
+                    true
+                }
+            }
+        }
+        if (!shouldPost) return
+        if (!handler.post(idleGpuPreparationRunnable)) {
+            clearIdleGpuPreparation(request)
+        }
+    }
+
+    /** Prepares at most one candidate per frame so an image-heavy page cannot monopolize input. */
+    private fun runIdleGpuPreparation() {
+        val request = synchronized(lifecycleLock) {
+            if (released) {
+                idleGpuPreparationRequest = null
+                idleGpuPreparationPosted = false
+                null
+            } else {
+                idleGpuPreparationRequest
+            }
+        }
+        if (request == null || !runCatching(request.mayPrepare).getOrDefault(false)) {
+            clearIdleGpuPreparation(request)
+            return
+        }
+        val ranges = runCatching { request.layoutRangesProvider().toList() }.getOrDefault(emptyList())
+        if (ranges.isEmpty()) {
+            clearIdleGpuPreparation(request)
+            return
+        }
+        val candidate = synchronized(lifecycleLock) {
+            if (released) {
+                null
+            } else {
+                layoutStartByDrawable.entries.asSequence().mapNotNull { (drawable, layoutStart) ->
+                    if (
+                        !drawable.isAttached ||
+                        ranges.none { layoutStart in it } ||
+                        installedQualityByDrawable[drawable] != EpubImageRenderQuality.DISPLAY ||
+                        inFlight[drawable] != null ||
+                        promotionCompletionByDrawable[drawable] != null
+                    ) {
+                        return@mapNotNull null
+                    }
+                    val bitmap = (drawable.result as? EpubImagePixelDrawable)
+                        ?.stablePixelsForGpuPreparation()
+                        ?: return@mapNotNull null
+                    if (gpuPreparedBitmaps.containsKey(bitmap)) null else bitmap
+                }.firstOrNull()
+            }
+        }
+        if (
+            candidate == null ||
+            candidate.isRecycled ||
+            !runCatching(request.mayPrepare).getOrDefault(false)
+        ) {
+            clearIdleGpuPreparation(request)
+            return
+        }
+        if (runCatching { bitmapPreparer(candidate) }.isFailure) {
+            clearIdleGpuPreparation(request)
+            return
+        }
+        val scheduleNextFrame = synchronized(lifecycleLock) {
+            if (released || idleGpuPreparationRequest !== request) {
+                false
+            } else {
+                gpuPreparedBitmaps[candidate] = Unit
+                true
+            }
+        }
+        if (scheduleNextFrame && runCatching(request.mayPrepare).getOrDefault(false)) {
+            Choreographer.getInstance().postFrameCallback(idleGpuPreparationFrameCallback)
+        } else {
+            clearIdleGpuPreparation(request)
+        }
+    }
+
+    private fun clearIdleGpuPreparation(request: IdleGpuPreparationRequest?) {
+        synchronized(lifecycleLock) {
+            if (request == null || idleGpuPreparationRequest === request) {
+                idleGpuPreparationRequest = null
+                idleGpuPreparationPosted = false
+            }
+        }
+    }
 
     /** Returns true while at least one async image decode is still in flight. */
     fun hasPendingDecodes(): Boolean = synchronized(lifecycleLock) { inFlight.isNotEmpty() }
@@ -1076,6 +1204,9 @@ internal class EpubFlowImageLoader(
                 installedQualityByDrawable.clear()
                 decodeFailureCountByDrawable.clear()
                 terminalFailureGenerationByDrawable.clear()
+                gpuPreparedBitmaps.clear()
+                idleGpuPreparationRequest = null
+                idleGpuPreparationPosted = false
                 decodeWindowRanges = null
                 decodeWindowRestrictsAdmission = false
             }
@@ -1096,6 +1227,7 @@ internal class EpubFlowImageLoader(
         }
         cancellation.pending.forEach { it.future?.cancel(true) }
         cancellation.completions.forEach(handler::removeCallbacks)
+        if (permanently) handler.removeCallbacks(idleGpuPreparationRunnable)
         retirePixelLayers(cancellation.retiredLayers)
         if (permanently) {
             handler.removeCallbacks(retiredPixelMaintenanceRunnable)

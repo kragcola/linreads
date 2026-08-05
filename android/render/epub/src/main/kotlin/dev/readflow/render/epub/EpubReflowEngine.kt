@@ -1028,6 +1028,9 @@ class EpubReflowEngine private constructor(
                 liveFlowImageLoader?.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
                 liveFlowImageLoader?.promoteToDisplayQuality(view.displayQualityLayoutRanges())
                 if (!view.isRapidTurnPerformanceModeActive()) {
+                    if (view.isIdleGpuPreparationSafe()) {
+                        requestIdleGpuPreparation(view)
+                    }
                     liveFlowImageLoader?.scheduleRetiredPixelFlushAfterRenderBarrier(view)
                 }
             }
@@ -1042,12 +1045,37 @@ class EpubReflowEngine private constructor(
                 liveFlowImageLoader?.updateDecodeWindow(view.decodeAdmissionLayoutRanges())
                 liveFlowImageLoader?.promoteToDisplayQuality(view.displayQualityLayoutRanges())
                 if (!view.isRapidTurnPerformanceModeActive()) {
+                    if (view.isIdleGpuPreparationSafe()) {
+                        requestIdleGpuPreparation(view)
+                    }
                     liveFlowImageLoader?.scheduleRetiredPixelFlushAfterRenderBarrier(view)
                     prewarmBoundaryPreviews()
                 }
             }
             tryDrainPendingFontPrewarmRebuild()
         }
+        view.onConversionCoverRetired = {
+            if (
+                flowView === view &&
+                flowSpineIndex >= 0 &&
+                view.isIdleGpuPreparationSafe()
+            ) {
+                requestIdleGpuPreparation(view)
+            }
+        }
+    }
+
+    private fun requestIdleGpuPreparation(view: EpubFlowView) {
+        val loader = liveFlowImageLoader ?: return
+        loader.requestIdleGpuPreparation(
+            layoutRangesProvider = view::displayQualityLayoutRanges,
+            mayPrepare = {
+                flowView === view &&
+                    view.isAttachedToWindow &&
+                    view.isHardwareAccelerated &&
+                    view.isIdleGpuPreparationSafe()
+            },
+        )
     }
 
     private fun markFlowViewPrepared(view: EpubFlowView) {
@@ -1410,6 +1438,12 @@ class EpubReflowEngine private constructor(
                             view.onAsyncImagePixelsChangedRequiringTextRebind(result.layoutStart)
                         }
                         else -> view.onAsyncImagePixelsChanged(result.layoutStart)
+                    }
+                    if (
+                        result.quality == EpubImageRenderQuality.DISPLAY &&
+                        view.isIdleGpuPreparationSafe()
+                    ) {
+                        requestIdleGpuPreparation(view)
                     }
                 }
             },

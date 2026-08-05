@@ -2216,6 +2216,136 @@ class EpubFlowSpannableTest {
     }
 
     @Test
+    fun `idle gpu preparation rechecks reader state and keeps work in current adjacent display ranges`() {
+        val epub = createImageEpub("idle-gpu-preparation-window")
+        val executor = QueuedExecutorService()
+        val decoded = mutableListOf<android.graphics.Bitmap>()
+        val prepared = mutableListOf<android.graphics.Bitmap>()
+        var readerIdle = true
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = executor,
+            columnWidthPx = 800,
+            pageHeightProvider = { 1200 },
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+            imageQualityProvider = { EpubImageRenderQuality.DISPLAY },
+            imageDecoder = { _, _, _ ->
+                android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888)
+                    .also(decoded::add)
+            },
+            bitmapPreparer = prepared::add,
+        )
+        val current = asyncDrawable(loader)
+        val adjacent = asyncDrawable(loader)
+        val distant = asyncDrawable(loader)
+        val currentAndAdjacent = { listOf(0 until 100, 100 until 200) }
+
+        try {
+            loader.registerOccurrence(current, layoutStart = 40)
+            loader.registerOccurrence(adjacent, layoutStart = 140)
+            loader.registerOccurrence(distant, layoutStart = 240)
+            listOf(current, adjacent, distant).forEach { it.setCallback2(attachedDrawableCallback) }
+            repeat(3) { executor.runNext() }
+            shadowOf(Looper.getMainLooper()).idle()
+
+            loader.requestIdleGpuPreparation(currentAndAdjacent) { readerIdle }
+            readerIdle = false
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(
+                "a turn that begins before the queued idle callback must suppress GPU preparation",
+                emptyList<android.graphics.Bitmap>(),
+                prepared,
+            )
+
+            readerIdle = true
+            loader.requestIdleGpuPreparation(currentAndAdjacent) { readerIdle }
+            shadowOf(Looper.getMainLooper()).runOneTask()
+            assertEquals(
+                "the first idle callback must prepare one bitmap before yielding a frame",
+                1,
+                prepared.size,
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(64L, TimeUnit.MILLISECONDS)
+            assertEquals(2, prepared.size)
+            assertSame(decoded[0], prepared[0])
+            assertSame(decoded[1], prepared[1])
+
+            loader.requestIdleGpuPreparation(currentAndAdjacent) { readerIdle }
+            shadowOf(Looper.getMainLooper()).idleFor(64L, TimeUnit.MILLISECONDS)
+            assertEquals("an unchanged bitmap is prepared once", 2, prepared.size)
+
+            loader.requestIdleGpuPreparation({ listOf(200 until 300) }) { readerIdle }
+            shadowOf(Looper.getMainLooper()).idleFor(64L, TimeUnit.MILLISECONDS)
+            assertEquals(3, prepared.size)
+            assertSame(decoded[2], prepared[2])
+        } finally {
+            loader.releaseAll()
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
+    fun `idle gpu preparation waits for display promotion to retire the old bitmap`() {
+        val epub = createImageEpub("idle-gpu-preparation-promotion")
+        val executor = QueuedExecutorService()
+        val decoded = mutableListOf<android.graphics.Bitmap>()
+        val prepared = mutableListOf<android.graphics.Bitmap>()
+        val displayRange = { listOf(0 until 100) }
+        val loader = EpubFlowImageLoader(
+            epubFileProvider = { epub },
+            executor = executor,
+            columnWidthPx = 800,
+            pageHeightProvider = { 1200 },
+            inlineMaxHeightPx = 720,
+            fullPageHrefs = emptySet(),
+            imageBoundsProvider = { EpubImageBounds(width = 4, height = 4) },
+            imageQualityProvider = { EpubImageRenderQuality.RAPID },
+            imageDecoder = { _, _, _ ->
+                android.graphics.Bitmap.createBitmap(4, 4, android.graphics.Bitmap.Config.ARGB_8888)
+                    .also(decoded::add)
+            },
+            bitmapPreparer = prepared::add,
+        )
+        val drawable = asyncDrawable(loader)
+
+        try {
+            loader.registerOccurrence(drawable, layoutStart = 40)
+            drawable.setCallback2(attachedDrawableCallback)
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            loader.requestIdleGpuPreparation(displayRange) { true }
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("RAPID pixels are not a display-quality preparation target", prepared.isEmpty())
+
+            assertEquals(1, loader.promoteToDisplayQuality(displayRange()))
+            executor.runNext()
+            shadowOf(Looper.getMainLooper()).idle()
+            loader.requestIdleGpuPreparation(displayRange) { true }
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue("the 120ms crossfade must not prepare either old or new bitmap", prepared.isEmpty())
+
+            shadowOf(Looper.getMainLooper()).idleFor(120L, TimeUnit.MILLISECONDS)
+            loader.requestIdleGpuPreparation(displayRange) { true }
+            shadowOf(Looper.getMainLooper()).idleFor(64L, TimeUnit.MILLISECONDS)
+            assertEquals(1, prepared.size)
+            assertSame(
+                "only the post-fade DISPLAY bitmap may be prepared",
+                decoded[1],
+                prepared.single(),
+            )
+            assertFalse("the retired RAPID bitmap must not be prepared", prepared.contains(decoded[0]))
+        } finally {
+            loader.releaseAll()
+            executor.shutdownNow()
+            epub.delete()
+        }
+    }
+
+    @Test
     fun `failed image decode notifies the host that pending work finished`() {
         val epub = java.io.File.createTempFile("readflow-image-missing", ".epub")
         ZipOutputStream(epub.outputStream()).use { }
