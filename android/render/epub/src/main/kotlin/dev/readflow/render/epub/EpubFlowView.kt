@@ -546,6 +546,7 @@ internal class EpubFlowView(
     private var flipAnimator: ValueAnimator? = null
     private var slideDrawable: PageSlideDrawable? = null
     private var slideOverlayView: PageSlideOverlayView? = null
+    private var slideOverlayForward = true
     /**
      * Bitmaps recorded by a detached SLIDE renderer whose HWUI display list may still be in flight.
      * Each entry stays PINNED and fully budget-charged until the two-frame fence completes; recycle
@@ -591,6 +592,27 @@ internal class EpubFlowView(
     private var rapidTurnSequenceActive = false
     private var rapidQueuedTurnDrainPosted = false
     private var rapidTurnPairBootstrapRetries = 0
+    private data class SettledPageCover(
+        val slideView: PageSlideOverlayView? = null,
+        val curlDrawable: PageCurlDrawable? = null,
+    )
+    private var settledPageCover: SettledPageCover? = null
+    private var deferredLiveTextRerecordSerial = 0L
+    private var deferredLiveTextRerecordChapterGeneration = 0L
+    private var deferredLiveTextRerecordLayoutGeneration = 0L
+    private var deferredLiveTextRerecordScrollY = 0
+    private var deferredLiveTextRerecordMode = Mode.PAGED
+    private var settledPageCoverReleaseSerial = -1L
+    private val settledPageCoverFallbackRunnable = Runnable {
+        val expectedSerial = settledPageCoverReleaseSerial
+        if (
+            !disposed &&
+                expectedSerial >= 0L &&
+                expectedSerial == deferredLiveTextRerecordSerial
+        ) {
+            releaseSettledPageCover()
+        }
+    }
     /**
      * A page-shot teardown must reveal the parked page immediately, but re-recording the complete
      * chapter TextView can take tens of milliseconds on image-heavy EPUBs. Coalesce that refresh
@@ -603,12 +625,28 @@ internal class EpubFlowView(
                 deferredLiveTextRerecordPending = false
                 return
             }
+            val requestSerial = deferredLiveTextRerecordSerial
+            val staleGeneration =
+                chapterGeneration != deferredLiveTextRerecordChapterGeneration ||
+                    pageLayoutGeneration != deferredLiveTextRerecordLayoutGeneration ||
+                    scrollY != deferredLiveTextRerecordScrollY ||
+                    mode != deferredLiveTextRerecordMode
+            if (staleGeneration) {
+                deferredLiveTextRerecordPending = false
+                releaseSettledPageCover()
+                return
+            }
             if (
                 turnInFlight ||
                     queuedPageTurnDelta != 0 ||
                     rapidTurnSequenceActive ||
                     rapidIdlePageTurnGesture ||
-                    pageShotOverlayActive
+                    pageShotOverlayActive ||
+                    awaitingReveal ||
+                    awaitingStableChapter ||
+                    boundaryContinuityCover ||
+                    conversionSnapshotDrawable != null ||
+                    directImageFirstCoverTarget != null
             ) {
                 postDelayed(this, RAPID_TURN_IDLE_TIMEOUT_MS)
                 return
@@ -618,6 +656,30 @@ internal class EpubFlowView(
             textView.invalidate()
             container.invalidate()
             postInvalidateOnAnimation()
+            val observer = viewTreeObserver
+            if (observer.isAlive) {
+                val listener = object : android.view.ViewTreeObserver.OnPreDrawListener {
+                    override fun onPreDraw(): Boolean {
+                        observer.removeOnPreDrawListener(this)
+                        postOnAnimation {
+                            if (!disposed && deferredLiveTextRerecordSerial == requestSerial) {
+                                releaseSettledPageCover()
+                            }
+                        }
+                        return true
+                    }
+                }
+                observer.addOnPreDrawListener(listener)
+            } else {
+                postOnAnimation {
+                    if (!disposed && deferredLiveTextRerecordSerial == requestSerial) {
+                        releaseSettledPageCover()
+                    }
+                }
+            }
+            settledPageCoverReleaseSerial = requestSerial
+            removeCallbacks(settledPageCoverFallbackRunnable)
+            postDelayed(settledPageCoverFallbackRunnable, SETTLED_PAGE_COVER_FALLBACK_MS)
         }
     }
     /**
@@ -3677,6 +3739,7 @@ internal class EpubFlowView(
 
     fun dispose() {
         if (disposed) return
+        releaseSettledPageCover()
         disposed = true
         deferredBoundaryFinishCommit = false
         boundaryPreviewGeneration++
@@ -4381,8 +4444,22 @@ internal class EpubFlowView(
 
     private fun scheduleDeferredLiveTextRerecord() {
         if (disposed) return
-        if (deferredLiveTextRerecordPending) return
+        if (deferredLiveTextRerecordPending) {
+            // A later teardown supersedes the parked target, but the already-posted quiet callback
+            // can still serve it. Refresh its generation snapshot instead of losing the request.
+            deferredLiveTextRerecordSerial += 1L
+            deferredLiveTextRerecordChapterGeneration = chapterGeneration
+            deferredLiveTextRerecordLayoutGeneration = pageLayoutGeneration
+            deferredLiveTextRerecordScrollY = scrollY
+            deferredLiveTextRerecordMode = mode
+            return
+        }
         deferredLiveTextRerecordPending = true
+        deferredLiveTextRerecordSerial += 1L
+        deferredLiveTextRerecordChapterGeneration = chapterGeneration
+        deferredLiveTextRerecordLayoutGeneration = pageLayoutGeneration
+        deferredLiveTextRerecordScrollY = scrollY
+        deferredLiveTextRerecordMode = mode
         postOnAnimation(deferredLiveTextRerecordRunnable)
     }
 
@@ -5721,6 +5798,7 @@ internal class EpubFlowView(
      * draw. No hidden alpha-0 record pass or future traversal is ever a prerequisite for admission.
      */
     private fun installSlideOverlay(outgoing: SlidePageFrame, revealed: SlidePageFrame, forward: Boolean): Boolean {
+        releaseSettledPageCover()
         // Reactivate frames still behind an earlier render fence: the new renderer records them
         // again, so cancel their pending recycle/discard state and invalidate stale frame callbacks.
         var reactivated = false
@@ -5773,7 +5851,47 @@ internal class EpubFlowView(
         renderer.invalidate()
         slideDrawable = drawable
         slideOverlayView = renderer
+        slideOverlayForward = forward
         return true
+    }
+
+    /** Releases the terminal cover only after the live child has had a real pre-draw. */
+    private fun releaseSettledPageCover() {
+        deferredLiveTextRerecordSerial += 1L
+        settledPageCoverReleaseSerial = -1L
+        removeCallbacks(settledPageCoverFallbackRunnable)
+        val cover = settledPageCover ?: return
+        settledPageCover = null
+        cover.slideView?.let { renderer ->
+            val frames = renderer.takeRecordedFrames()
+            overlay.remove(renderer)
+            frames.forEach(::retireSettledFrame)
+            if (frames.isNotEmpty()) scheduleRenderRetiredFence()
+        }
+        cover.curlDrawable?.let { drawable ->
+            overlay.remove(drawable)
+            val frames = listOfNotNull(
+                drawable.takeFrontBitmap()?.let { SlidePageFrame.BitmapFrame(it) },
+                drawable.takeRevealedBitmap()?.let { SlidePageFrame.BitmapFrame(it) },
+            )
+            frames.forEach(::retireSettledFrame)
+            if (frames.isNotEmpty()) scheduleRenderRetiredFence()
+        }
+    }
+
+    /** Retires a terminal frame behind the same host/render-thread fence as active SLIDE frames. */
+    private fun retireSettledFrame(frame: SlidePageFrame) {
+        when (frame) {
+            is SlidePageFrame.BitmapFrame -> {
+                renderRetiredPageShots.getOrPut(frame.bitmap) { RenderRetiredPageShot() }
+                relabelPageShot(frame.bitmap, PageShotLeaseKind.PINNED, "render.settled-cover")
+                recyclePageShot(frame.bitmap)
+            }
+            is SlidePageFrame.ArtifactFrame -> {
+                retireSlideArtifact(frame.artifact)
+                discardSlideArtifact(frame.artifact)
+            }
+        }
     }
 
     /** Relays the slide renderer at its base-left/top after scroll restore, without changing progress. */
@@ -6087,19 +6205,45 @@ internal class EpubFlowView(
 
     private fun clearFlipOverlay(preserveActivePixelRefreshes: Boolean = false) {
         cancelPendingLocalPageShotHandoff(consumeGesture = true)
+        // A new renderer or an external teardown invalidates any pre-draw callback that still
+        // references the previous terminal cover before touching the active pair.
+        releaseSettledPageCover()
         // Every page-shot owner suppresses the live TextView while it is active. The opaque SLIDE
         // View renderer covers the same viewport as the Drawable owner, so teardown must restore
         // the parked chapter RenderNode without making its full re-record part of the settle frame.
         val rerecordLiveText = container.skipContentDraw || liveContentDrawSuppressedByPageShot
-        detachSlideOverlayRenderer()
+        val terminalSlideCover =
+            if (!disposed && !preserveActivePixelRefreshes && rerecordLiveText && slideOverlayView != null) {
+            val renderer = slideOverlayView!!
+            renderer.translationX = if (slideOverlayForward) -width.toFloat() else width.toFloat()
+            settledPageCover = SettledPageCover(slideView = renderer)
+            slideOverlayView = null
+            true
+        } else {
+            detachSlideOverlayRenderer()
+            false
+        }
         slideDrawable?.let {
-            overlay.remove(it)
-            it.recycle()
+            if (!terminalSlideCover) {
+                overlay.remove(it)
+                it.recycle()
+            }
         }
         slideDrawable = null
-        curlDrawable?.let {
-            overlay.remove(it)
-            it.recycle()
+        val terminalCurlCover =
+            !disposed &&
+                !preserveActivePixelRefreshes &&
+                rerecordLiveText &&
+                !terminalSlideCover &&
+                curlDrawable != null
+        curlDrawable?.let { drawable ->
+            if (terminalCurlCover) {
+                drawable.progress = 1f
+                settledPageCover = SettledPageCover(curlDrawable = drawable)
+            } else {
+                overlay.remove(drawable)
+                drawable.recycle()
+            }
         }
         curlDrawable = null
         if (!preserveActivePixelRefreshes) clearActiveFlipPixelRefreshes()
@@ -7889,6 +8033,8 @@ internal class EpubFlowView(
         const val MAX_RAPID_PAIR_BOOTSTRAP_RETRIES = 3
         const val RAPID_DECODE_WINDOW_MAX_PAGES = 4
         const val RAPID_TURN_IDLE_TIMEOUT_MS = 320L
+        /** Bounded fallback when an unattached/quiet host never delivers a pre-draw callback. */
+        const val SETTLED_PAGE_COVER_FALLBACK_MS = 64L
         const val RAPID_FOLLOW_UP_PREFETCH_DELAY_MS = 32L
         /** Detached-host fallback for render-retired SLIDE page shots that never saw a host frame. */
         const val RENDER_RETIRED_FALLBACK_DELAY_MS = 320L

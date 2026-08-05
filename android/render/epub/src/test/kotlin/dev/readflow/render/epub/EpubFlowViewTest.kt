@@ -2389,6 +2389,15 @@ class EpubFlowViewTest {
                 "removing an opaque SLIDE View must defer the expensive TextView RenderNode re-record",
                 !textShadow.wasInvalidated(),
             )
+            val firstSettledFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                assertTrue(
+                    "the first settled SLIDE frame must retain page content while the child re-record is deferred",
+                    firstSettledFrame.countDistinctPixels() > 1,
+                )
+            } finally {
+                firstSettledFrame.recycle()
+            }
             shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
             assertTrue(
                 "deferred SLIDE teardown must eventually dirty the TextView RenderNode",
@@ -2488,6 +2497,17 @@ class EpubFlowViewTest {
                 "overlay teardown must defer the expensive text child re-record",
                 !textShadow.wasInvalidated(),
             )
+            val firstSettledFrame = view.drawAsScrolledChildToBitmapForTest()
+            try {
+                val terminalCoverHits = firstSettledFrame.countExactPixels(0xFF1E3A8A.toInt())
+                assertTrue(
+                    "the first settled PAPER frame must retain the revealed page while the child re-record is deferred; " +
+                        "hits=$terminalCoverHits",
+                    terminalCoverHits > 0,
+                )
+            } finally {
+                firstSettledFrame.recycle()
+            }
             shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
             assertTrue(
                 "deferred overlay teardown must eventually invalidate the text child",
@@ -2506,6 +2526,32 @@ class EpubFlowViewTest {
             }
         } finally {
             if (view.privateField("curlDrawable") != null) view.clearFlipOverlayForTest()
+            view.dispose()
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
+
+    @Test
+    fun `deferred live text rerecord is discarded when its chapter generation becomes stale`() {
+        val fixture = visibleHeadingImageContinuationFixture(minHeadingPageIndex = 1)
+        val view = fixture.view
+        view.flipStyle = PageFlipStyle.SLIDE
+        try {
+            view.goToPage(fixture.headingPageIndex)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
+            val textShadow = shadowOf(view.textView)
+            textShadow.clearWasInvalidated()
+            view.clearFlipOverlayForTest()
+            val generation = view.privateField("chapterGeneration") as Long
+            view.setPrivateField("chapterGeneration", generation + 1L)
+            shadowOf(Looper.getMainLooper()).idleFor(400L, TimeUnit.MILLISECONDS)
+            assertFalse(
+                "a stale teardown callback must not re-record a later chapter",
+                textShadow.wasInvalidated(),
+            )
+            assertNull("stale callback must release its terminal cover", view.privateField("settledPageCover"))
+        } finally {
             view.dispose()
             shadowOf(Looper.getMainLooper()).idle()
         }
