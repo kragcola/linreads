@@ -37,6 +37,47 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
 
     @Test
+    fun resumedEpubFlowView_externalProbeWindow_logsRapidIdleSnapshotWithoutInput() {
+        val rawWindowMs = InstrumentationRegistry.getArguments().getString(ARG_EXTERNAL_PROBE_WINDOW_MS)
+        assumeTrue(EXTERNAL_PROBE_WINDOW_REQUIRED, rawWindowMs != null)
+        val windowMs = checkNotNull(rawWindowMs).toLongOrNull()
+            ?: throw AssertionError("$ARG_EXTERNAL_PROBE_WINDOW_MS must be an integer millisecond value.")
+        require(windowMs in EXTERNAL_PROBE_MIN_WINDOW_MS..EXTERNAL_PROBE_MAX_WINDOW_MS) {
+            "$ARG_EXTERNAL_PROBE_WINDOW_MS must be between " +
+                "$EXTERNAL_PROBE_MIN_WINDOW_MS and $EXTERNAL_PROBE_MAX_WINDOW_MS ms; was $windowMs."
+        }
+
+        val expectedSurface = awaitResumedEpubSession(EXTERNAL_PROBE_SESSION_TIMEOUT_MS).flowView
+        var rapidIdleProbe: ProbeHandle? = null
+        try {
+            rapidIdleProbe = ProbeHandle.load(RAPID_IDLE_PROBE_CLASS_NAME)
+            val rapidProbe = checkNotNull(rapidIdleProbe)
+            val initialSnapshot = instrumentation.runOnMainSyncWithResult {
+                val session = checkNotNull(currentResumedEpubSessionOrNull()) {
+                    "The resumed EPUB EpubFlowView disappeared before the external probe could start."
+                }
+                check(session.flowView === expectedSurface) {
+                    "The resumed EPUB EpubFlowView was rebound before the external probe could start."
+                }
+                rapidProbe.reset()
+                RapidIdleSnapshot.from(rapidProbe.snapshot())
+            }
+            assertTrue("rapid-idle probe must be enabled before the external observation window", initialSnapshot.enabled)
+            Log.i(TAG, "probeReady windowMs=$windowMs raw=${initialSnapshot.raw}")
+
+            SystemClock.sleep(windowMs)
+
+            val snapshot = RapidIdleSnapshot.from(rapidProbe.snapshot())
+            Log.i(
+                TAG,
+                "probeWindowComplete windowMs=$windowMs summary=${snapshot.summary()} raw=${snapshot.raw}",
+            )
+        } finally {
+            rapidIdleProbe?.stopQuietly()
+        }
+    }
+
+    @Test
     fun resumedEpubFlowView_subthresholdCancel_preservesPositionAndRecordsRapidIdleStream() {
         instrumentation.waitForIdleSync()
         val initialSession = instrumentation.runOnMainSyncWithResult {
@@ -187,6 +228,17 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
                 "activityThreadActivities=${activityThreadLookup.activities.size}",
         )
         return null
+    }
+
+    private fun awaitResumedEpubSession(timeoutMs: Long): CurrentEpubSession {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            instrumentation.runOnMainSyncWithResult { currentResumedEpubSessionOrNull() }?.let { return it }
+            SystemClock.sleep(EXTERNAL_PROBE_POLL_INTERVAL_MS)
+        }
+        return checkNotNull(instrumentation.runOnMainSyncWithResult { currentResumedEpubSessionOrNull() }) {
+            "Timed out after ${timeoutMs}ms waiting for a resumed visible EpubFlowView."
+        }
     }
 
     /**
@@ -340,12 +392,17 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
         val slideArtifactRecordCount: Int,
         val pixelTextRebindCount: Int,
         val geometryTextRebindCount: Int,
+        val bitmapPrepareToDrawCount: Int,
+        val bitmapPrepareToDrawTotalNs: Long,
+        val bitmapPrepareToDrawMaxNs: Long,
     ) {
         fun summary(): String =
             "enabled=$enabled precacheArms=$precacheArmCount down=$pointerDownCount " +
                 "move=$pointerMoveCount up=$pointerUpCount cancel=$pointerCancelCount " +
                 "artifactRecords=$slideArtifactRecordCount pixelRebinds=$pixelTextRebindCount " +
-                "geometryRebinds=$geometryTextRebindCount"
+                "geometryRebinds=$geometryTextRebindCount " +
+                "bitmapPrepareToDraw=count=$bitmapPrepareToDrawCount " +
+                "totalNs=$bitmapPrepareToDrawTotalNs maxNs=$bitmapPrepareToDrawMaxNs"
 
         companion object {
             fun from(snapshot: Any?): RapidIdleSnapshot {
@@ -361,6 +418,9 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
                     slideArtifactRecordCount = delegate.intProperty("slideArtifactRecordCount"),
                     pixelTextRebindCount = delegate.intProperty("pixelTextRebindCount"),
                     geometryTextRebindCount = delegate.intProperty("geometryTextRebindCount"),
+                    bitmapPrepareToDrawCount = delegate.intProperty("bitmapPrepareToDrawCount"),
+                    bitmapPrepareToDrawTotalNs = delegate.longProperty("bitmapPrepareToDrawTotalNs"),
+                    bitmapPrepareToDrawMaxNs = delegate.longProperty("bitmapPrepareToDrawMaxNs"),
                 )
             }
 
@@ -370,6 +430,10 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
 
             private fun Any.intProperty(propertyName: String): Int =
                 (property(propertyName) as? Number)?.toInt()
+                    ?: throw AssertionError("probe snapshot must expose numeric $propertyName.")
+
+            private fun Any.longProperty(propertyName: String): Long =
+                (property(propertyName) as? Number)?.toLong()
                     ?: throw AssertionError("probe snapshot must expose numeric $propertyName.")
 
             private fun Any.property(propertyName: String): Any? {
@@ -445,6 +509,13 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
         private const val EPUB_FLOW_VIEW_CLASS_NAME = "dev.readflow.render.epub.EpubFlowView"
         private const val RAPID_IDLE_PROBE_CLASS_NAME = "dev.readflow.render.epub.EpubRapidIdleWorkProbe"
         private const val PAGE_SHOT_PROBE_CLASS_NAME = "dev.readflow.render.epub.EpubPageShotCaptureProbe"
+        private const val ARG_EXTERNAL_PROBE_WINDOW_MS = "externalProbeWindowMs"
+        private const val EXTERNAL_PROBE_MIN_WINDOW_MS = 1_000L
+        private const val EXTERNAL_PROBE_MAX_WINDOW_MS = 30_000L
+        private const val EXTERNAL_PROBE_SESSION_TIMEOUT_MS = 10_000L
+        private const val EXTERNAL_PROBE_POLL_INTERVAL_MS = 250L
+        private const val EXTERNAL_PROBE_WINDOW_REQUIRED =
+            "Skipping external rapid-idle probe: pass -e externalProbeWindowMs=<1000..30000>."
         private const val NO_RESUMED_EPUB_SESSION =
             "Skipping: no resumed MainActivity with an attached visible EpubFlowView; " +
                 "resume a real EPUB reader session before running this acceptance test."

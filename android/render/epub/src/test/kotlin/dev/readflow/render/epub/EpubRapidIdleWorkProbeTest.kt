@@ -58,6 +58,12 @@ class EpubRapidIdleWorkProbeTest {
             assertEquals(1, rebindSnapshot.int("geometryTextRebindCount"))
             assertEquals(45L, rebindSnapshot.long("geometryTextRebindTotalNs"))
             assertEquals(45L, rebindSnapshot.long("geometryTextRebindMaxNs"))
+
+            probe.noteBitmapPrepareToDraw(startNs = 4_000L, endNs = 4_027L)
+            val bitmapPrepareSnapshot = probe.snapshot()
+            assertEquals(1, bitmapPrepareSnapshot.int("bitmapPrepareToDrawCount"))
+            assertEquals(27L, bitmapPrepareSnapshot.long("bitmapPrepareToDrawTotalNs"))
+            assertEquals(27L, bitmapPrepareSnapshot.long("bitmapPrepareToDrawMaxNs"))
         } finally {
             probe.stop()
         }
@@ -81,6 +87,9 @@ class EpubRapidIdleWorkProbeTest {
         assertEquals(0, snapshot.int("geometryTextRebindCount"))
         assertEquals(0L, snapshot.long("geometryTextRebindTotalNs"))
         assertEquals(0L, snapshot.long("geometryTextRebindMaxNs"))
+        assertEquals(0, snapshot.int("bitmapPrepareToDrawCount"))
+        assertEquals(0L, snapshot.long("bitmapPrepareToDrawTotalNs"))
+        assertEquals(0L, snapshot.long("bitmapPrepareToDrawMaxNs"))
     }
 
     private fun loadProbe(): ProbeHandle {
@@ -139,6 +148,10 @@ class EpubRapidIdleWorkProbeTest {
 
         fun noteGeometryTextRebind(startNs: Long, endNs: Long) {
             invoke("noteGeometryTextRebind", startNs, endNs)
+        }
+
+        fun noteBitmapPrepareToDraw(startNs: Long, endNs: Long) {
+            invoke("noteBitmapPrepareToDraw", startNs, endNs)
         }
 
         private fun invoke(methodName: String, vararg arguments: Any): Any? {

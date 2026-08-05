@@ -441,7 +441,15 @@ internal class EpubFlowImageLoader(
             clearIdleGpuPreparation(request)
             return
         }
-        if (runCatching { bitmapPreparer(candidate) }.isFailure) {
+        val preparation = runCatching {
+            val startedAtNs = EpubRapidIdleWorkProbe.beginTimingNs()
+            try {
+                bitmapPreparer(candidate)
+            } finally {
+                EpubRapidIdleWorkProbe.endBitmapPrepareToDrawTiming(startedAtNs)
+            }
+        }
+        if (preparation.isFailure) {
             clearIdleGpuPreparation(request)
             return
         }

@@ -38,6 +38,9 @@ internal object EpubRapidIdleWorkProbe {
         val geometryTextRebindCount: Int,
         val geometryTextRebindTotalNs: Long,
         val geometryTextRebindMaxNs: Long,
+        val bitmapPrepareToDrawCount: Int,
+        val bitmapPrepareToDrawTotalNs: Long,
+        val bitmapPrepareToDrawMaxNs: Long,
     )
 
     private enum class PointerBoundary { MOVE, UP, CANCEL }
@@ -79,6 +82,9 @@ internal object EpubRapidIdleWorkProbe {
     private var geometryTextRebindCount = 0
     private var geometryTextRebindTotalNs = 0L
     private var geometryTextRebindMaxNs = 0L
+    private var bitmapPrepareToDrawCount = 0
+    private var bitmapPrepareToDrawTotalNs = 0L
+    private var bitmapPrepareToDrawMaxNs = 0L
 
     fun reset() {
         synchronized(lock) {
@@ -124,6 +130,9 @@ internal object EpubRapidIdleWorkProbe {
             geometryTextRebindCount = geometryTextRebindCount,
             geometryTextRebindTotalNs = geometryTextRebindTotalNs,
             geometryTextRebindMaxNs = geometryTextRebindMaxNs,
+            bitmapPrepareToDrawCount = bitmapPrepareToDrawCount,
+            bitmapPrepareToDrawTotalNs = bitmapPrepareToDrawTotalNs,
+            bitmapPrepareToDrawMaxNs = bitmapPrepareToDrawMaxNs,
         )
     }
 
@@ -205,6 +214,17 @@ internal object EpubRapidIdleWorkProbe {
         noteTimedRebind(startNs, endNs, geometry = true)
     }
 
+    fun noteBitmapPrepareToDraw(startNs: Long, endNs: Long) {
+        if (!enabled) return
+        val durationNs = (endNs - startNs).coerceAtLeast(0L)
+        synchronized(lock) {
+            if (!enabled) return@synchronized
+            bitmapPrepareToDrawCount += 1
+            bitmapPrepareToDrawTotalNs += durationNs
+            bitmapPrepareToDrawMaxNs = maxOf(bitmapPrepareToDrawMaxNs, durationNs)
+        }
+    }
+
     fun beginTimingNs(): Long? {
         if (!enabled) return null
         return uptimeNs()
@@ -223,6 +243,11 @@ internal object EpubRapidIdleWorkProbe {
     fun endGeometryTextRebindTiming(startNs: Long?) {
         if (startNs == null || !enabled) return
         noteGeometryTextRebind(startNs, uptimeNs())
+    }
+
+    fun endBitmapPrepareToDrawTiming(startNs: Long?) {
+        if (startNs == null || !enabled) return
+        noteBitmapPrepareToDraw(startNs, uptimeNs())
     }
 
     private fun notePointerBoundary(boundary: PointerBoundary, eventTimeNs: Long) {
@@ -314,6 +339,9 @@ internal object EpubRapidIdleWorkProbe {
         geometryTextRebindCount = 0
         geometryTextRebindTotalNs = 0L
         geometryTextRebindMaxNs = 0L
+        bitmapPrepareToDrawCount = 0
+        bitmapPrepareToDrawTotalNs = 0L
+        bitmapPrepareToDrawMaxNs = 0L
     }
 
     private fun uptimeNs(): Long = SystemClock.uptimeMillis() * NANOSECONDS_PER_MILLISECOND

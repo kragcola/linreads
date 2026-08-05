@@ -2243,6 +2243,7 @@ class EpubFlowSpannableTest {
         val currentAndAdjacent = { listOf(0 until 100, 100 until 200) }
 
         try {
+            EpubRapidIdleWorkProbe.reset()
             loader.registerOccurrence(current, layoutStart = 40)
             loader.registerOccurrence(adjacent, layoutStart = 140)
             loader.registerOccurrence(distant, layoutStart = 240)
@@ -2271,6 +2272,25 @@ class EpubFlowSpannableTest {
             assertEquals(2, prepared.size)
             assertTrue("the current DISPLAY bitmap must be prepared", prepared.any { it === decoded[0] })
             assertTrue("the adjacent DISPLAY bitmap must be prepared", prepared.any { it === decoded[1] })
+            val adjacentPreparationSnapshot = EpubRapidIdleWorkProbe.snapshot()
+            assertEquals(
+                "each injected bitmap preparation must be reflected in rapid-idle telemetry",
+                prepared.size,
+                adjacentPreparationSnapshot.bitmapPrepareToDrawCount,
+            )
+            assertTrue(
+                "bitmap preparation timing must not be negative",
+                adjacentPreparationSnapshot.bitmapPrepareToDrawTotalNs >= 0L,
+            )
+            assertTrue(
+                "bitmap preparation max timing must not be negative",
+                adjacentPreparationSnapshot.bitmapPrepareToDrawMaxNs >= 0L,
+            )
+            assertTrue(
+                "bitmap preparation max timing must not exceed the aggregate",
+                adjacentPreparationSnapshot.bitmapPrepareToDrawMaxNs <=
+                    adjacentPreparationSnapshot.bitmapPrepareToDrawTotalNs,
+            )
 
             loader.requestIdleGpuPreparation(currentAndAdjacent) { readerIdle }
             shadowOf(Looper.getMainLooper()).idleFor(64L, TimeUnit.MILLISECONDS)
@@ -2280,7 +2300,13 @@ class EpubFlowSpannableTest {
             shadowOf(Looper.getMainLooper()).idleFor(64L, TimeUnit.MILLISECONDS)
             assertEquals(3, prepared.size)
             assertSame(decoded[2], prepared[2])
+            assertEquals(
+                "a later display-range preparation must increment telemetry once",
+                prepared.size,
+                EpubRapidIdleWorkProbe.snapshot().bitmapPrepareToDrawCount,
+            )
         } finally {
+            EpubRapidIdleWorkProbe.stop()
             loader.releaseAll()
             executor.shutdownNow()
             epub.delete()
