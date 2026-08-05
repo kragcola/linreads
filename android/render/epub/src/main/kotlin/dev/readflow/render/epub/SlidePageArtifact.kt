@@ -97,6 +97,7 @@ private class Api29SlidePageRenderNodeRecord private constructor(
     companion object {
         fun record(width: Int, height: Int, draw: (Canvas) -> Unit): SlidePageArtifact {
             val node = android.graphics.RenderNode("slide-page-artifact")
+            node.setPosition(0, 0, width, height)
             val canvas = node.beginRecording(width, height)
             draw(canvas)
             node.endRecording()

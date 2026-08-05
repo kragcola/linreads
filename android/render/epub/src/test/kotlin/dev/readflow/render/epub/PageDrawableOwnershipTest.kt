@@ -2,6 +2,7 @@ package dev.readflow.render.epub
 
 import android.app.Application
 import android.graphics.Bitmap
+import android.graphics.RenderNode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -16,6 +17,35 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class PageDrawableOwnershipTest {
+
+    @Test
+    fun `slide RenderNode artifact has explicit recorded viewport bounds`() {
+        val width = 37
+        val height = 53
+        val artifact = SlidePageArtifact.record(width, height) { }
+        try {
+            val record = checkNotNull(artifact.javaClass.getDeclaredField("record").apply {
+                isAccessible = true
+            }.get(artifact))
+            assertTrue(
+                "API 29+ artifact recording must not silently fall back to Picture",
+                record.javaClass.name.endsWith("Api29SlidePageRenderNodeRecord"),
+            )
+            val node = record.javaClass.getDeclaredField("renderNode").apply {
+                isAccessible = true
+            }.get(record) as RenderNode
+
+            assertEquals(0, node.left)
+            assertEquals(0, node.top)
+            assertEquals(width, node.right)
+            assertEquals(height, node.bottom)
+            assertEquals(width, node.width)
+            assertEquals(height, node.height)
+            assertTrue("the node must retain its completed display list", node.hasDisplayList())
+        } finally {
+            artifact.discard()
+        }
+    }
 
     @Test
     fun `curl transfers revealed bitmap without recycling it during cleanup`() {
