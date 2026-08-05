@@ -2516,6 +2516,9 @@ internal class EpubFlowView(
      * overlay (a [Drawable] on the view overlay) draws after dispatchDraw, so it is unaffected.
      */
     override fun dispatchDraw(canvas: Canvas) {
+        // The listener is debug-only and remains inert unless the shell-gated rapid-idle probe is
+        // active. Register before the overlay child draws so the first frame is included.
+        EpubRapidIdleWorkProbe.observeView(this)
         val clipBottom = pageClipBottomInViewport()
         val topClip = pageClipTopInViewport()
         if (clipBottom == null && topClip <= scrollY) {
@@ -5725,6 +5728,7 @@ internal class EpubFlowView(
         )
         val stripLeft = if (forward) 0 else -width
         renderer.layout(stripLeft, scrollY, stripLeft + 2 * width, scrollY + height)
+        EpubRapidIdleWorkProbe.noteSlideOverlayInstalled()
         overlay.add(renderer)
         // Request an actual draw pass for the freshly installed overlay so the first visible frame
         // (especially the cold/boundary/continuity Bitmap pair) is never blank.
@@ -6077,7 +6081,10 @@ internal class EpubFlowView(
         // suppression is active, removing the overlay alone can keep replaying an empty RenderNode.
         // Dirty both levels so the first settled frame records the parked page and image spans again.
         container.skipContentDraw = false
-        if (rerecordLiveText) textView.invalidate()
+        if (rerecordLiveText) {
+            EpubRapidIdleWorkProbe.noteLiveContentRerecordArmed()
+            textView.invalidate()
+        }
         container.invalidate()
         postInvalidateOnAnimation()
     }
@@ -7928,7 +7935,12 @@ internal class EpubFlowView(
 
         override fun dispatchDraw(canvas: Canvas) {
             if (skipContentDraw) return
-            super.dispatchDraw(canvas)
+            val timingStartNs = EpubRapidIdleWorkProbe.beginLiveContentDispatch()
+            try {
+                super.dispatchDraw(canvas)
+            } finally {
+                EpubRapidIdleWorkProbe.endLiveContentDispatch(timingStartNs)
+            }
         }
 
         var minimumScrollableHeightPx: Int = 0

@@ -342,6 +342,30 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
         val bitmapPrepareToDrawCount: Int,
         val bitmapPrepareToDrawTotalNs: Long,
         val bitmapPrepareToDrawMaxNs: Long,
+        val overlayFirstDrawCount: Int,
+        val overlayFirstDrawTotalNs: Long,
+        val overlayFirstDrawMaxNs: Long,
+        val liveContentDispatchDrawCount: Int,
+        val liveContentDispatchDrawTotalNs: Long,
+        val liveContentDispatchDrawMaxNs: Long,
+        val frameMetricsOverlayFrameCount: Int,
+        val frameMetricsOverlayDrawTotalNs: Long,
+        val frameMetricsOverlayDrawMaxNs: Long,
+        val frameMetricsOverlaySyncTotalNs: Long,
+        val frameMetricsOverlaySyncMaxNs: Long,
+        val frameMetricsOverlayCommandIssueTotalNs: Long,
+        val frameMetricsOverlayCommandIssueMaxNs: Long,
+        val frameMetricsOverlaySwapBuffersTotalNs: Long,
+        val frameMetricsOverlaySwapBuffersMaxNs: Long,
+        val frameMetricsSettledFrameCount: Int,
+        val frameMetricsSettledDrawTotalNs: Long,
+        val frameMetricsSettledDrawMaxNs: Long,
+        val frameMetricsSettledSyncTotalNs: Long,
+        val frameMetricsSettledSyncMaxNs: Long,
+        val frameMetricsSettledCommandIssueTotalNs: Long,
+        val frameMetricsSettledCommandIssueMaxNs: Long,
+        val frameMetricsSettledSwapBuffersTotalNs: Long,
+        val frameMetricsSettledSwapBuffersMaxNs: Long,
     ) {
         fun summary(): String =
             "enabled=$enabled precacheArms=$precacheArmCount down=$pointerDownCount " +
@@ -349,7 +373,21 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
                 "artifactRecords=$slideArtifactRecordCount pixelRebinds=$pixelTextRebindCount " +
                 "geometryRebinds=$geometryTextRebindCount " +
                 "bitmapPrepareToDraw=count=$bitmapPrepareToDrawCount " +
-                "totalNs=$bitmapPrepareToDrawTotalNs maxNs=$bitmapPrepareToDrawMaxNs"
+                "totalNs=$bitmapPrepareToDrawTotalNs maxNs=$bitmapPrepareToDrawMaxNs " +
+                "overlayFirstDraw=count=$overlayFirstDrawCount " +
+                "totalNs=$overlayFirstDrawTotalNs maxNs=$overlayFirstDrawMaxNs " +
+                "liveDispatch=count=$liveContentDispatchDrawCount " +
+                "totalNs=$liveContentDispatchDrawTotalNs maxNs=$liveContentDispatchDrawMaxNs " +
+                "frameMetricsOverlay=count=$frameMetricsOverlayFrameCount " +
+                "drawNs=$frameMetricsOverlayDrawTotalNs/$frameMetricsOverlayDrawMaxNs " +
+                "syncNs=$frameMetricsOverlaySyncTotalNs/$frameMetricsOverlaySyncMaxNs " +
+                "commandNs=$frameMetricsOverlayCommandIssueTotalNs/$frameMetricsOverlayCommandIssueMaxNs " +
+                "swapNs=$frameMetricsOverlaySwapBuffersTotalNs/$frameMetricsOverlaySwapBuffersMaxNs " +
+                "frameMetricsSettled=count=$frameMetricsSettledFrameCount " +
+                "drawNs=$frameMetricsSettledDrawTotalNs/$frameMetricsSettledDrawMaxNs " +
+                "syncNs=$frameMetricsSettledSyncTotalNs/$frameMetricsSettledSyncMaxNs " +
+                "commandNs=$frameMetricsSettledCommandIssueTotalNs/$frameMetricsSettledCommandIssueMaxNs " +
+                "swapNs=$frameMetricsSettledSwapBuffersTotalNs/$frameMetricsSettledSwapBuffersMaxNs"
 
         companion object {
             fun from(snapshot: Any?): RapidIdleSnapshot {
@@ -368,6 +406,30 @@ class EpubRapidIdleCurrentSessionInstrumentationTest {
                     bitmapPrepareToDrawCount = delegate.intProperty("bitmapPrepareToDrawCount"),
                     bitmapPrepareToDrawTotalNs = delegate.longProperty("bitmapPrepareToDrawTotalNs"),
                     bitmapPrepareToDrawMaxNs = delegate.longProperty("bitmapPrepareToDrawMaxNs"),
+                    overlayFirstDrawCount = delegate.intProperty("overlayFirstDrawCount"),
+                    overlayFirstDrawTotalNs = delegate.longProperty("overlayFirstDrawTotalNs"),
+                    overlayFirstDrawMaxNs = delegate.longProperty("overlayFirstDrawMaxNs"),
+                    liveContentDispatchDrawCount = delegate.intProperty("liveContentDispatchDrawCount"),
+                    liveContentDispatchDrawTotalNs = delegate.longProperty("liveContentDispatchDrawTotalNs"),
+                    liveContentDispatchDrawMaxNs = delegate.longProperty("liveContentDispatchDrawMaxNs"),
+                    frameMetricsOverlayFrameCount = delegate.intProperty("frameMetricsOverlayFrameCount"),
+                    frameMetricsOverlayDrawTotalNs = delegate.longProperty("frameMetricsOverlayDrawTotalNs"),
+                    frameMetricsOverlayDrawMaxNs = delegate.longProperty("frameMetricsOverlayDrawMaxNs"),
+                    frameMetricsOverlaySyncTotalNs = delegate.longProperty("frameMetricsOverlaySyncTotalNs"),
+                    frameMetricsOverlaySyncMaxNs = delegate.longProperty("frameMetricsOverlaySyncMaxNs"),
+                    frameMetricsOverlayCommandIssueTotalNs = delegate.longProperty("frameMetricsOverlayCommandIssueTotalNs"),
+                    frameMetricsOverlayCommandIssueMaxNs = delegate.longProperty("frameMetricsOverlayCommandIssueMaxNs"),
+                    frameMetricsOverlaySwapBuffersTotalNs = delegate.longProperty("frameMetricsOverlaySwapBuffersTotalNs"),
+                    frameMetricsOverlaySwapBuffersMaxNs = delegate.longProperty("frameMetricsOverlaySwapBuffersMaxNs"),
+                    frameMetricsSettledFrameCount = delegate.intProperty("frameMetricsSettledFrameCount"),
+                    frameMetricsSettledDrawTotalNs = delegate.longProperty("frameMetricsSettledDrawTotalNs"),
+                    frameMetricsSettledDrawMaxNs = delegate.longProperty("frameMetricsSettledDrawMaxNs"),
+                    frameMetricsSettledSyncTotalNs = delegate.longProperty("frameMetricsSettledSyncTotalNs"),
+                    frameMetricsSettledSyncMaxNs = delegate.longProperty("frameMetricsSettledSyncMaxNs"),
+                    frameMetricsSettledCommandIssueTotalNs = delegate.longProperty("frameMetricsSettledCommandIssueTotalNs"),
+                    frameMetricsSettledCommandIssueMaxNs = delegate.longProperty("frameMetricsSettledCommandIssueMaxNs"),
+                    frameMetricsSettledSwapBuffersTotalNs = delegate.longProperty("frameMetricsSettledSwapBuffersTotalNs"),
+                    frameMetricsSettledSwapBuffersMaxNs = delegate.longProperty("frameMetricsSettledSwapBuffersMaxNs"),
                 )
             }
 

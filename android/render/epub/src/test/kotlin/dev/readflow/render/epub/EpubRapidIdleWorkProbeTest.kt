@@ -71,6 +71,63 @@ class EpubRapidIdleWorkProbeTest {
         assertCleared(snapshot = probe.snapshot(), enabled = false)
     }
 
+    @Test
+    fun `probe separates overlay frames from the bounded settled rerecord window`() {
+        val probe = loadProbe()
+
+        try {
+            probe.reset()
+            probe.noteSlideOverlayInstalled(atNs = 1_000L)
+            probe.noteOverlayDraw(startNs = 1_010L, endNs = 1_030L)
+            probe.noteFrameMetrics(
+                sampleAtNs = 1_040L,
+                drawDurationNs = 11L,
+                syncDurationNs = 12L,
+                commandIssueDurationNs = 13L,
+                swapBuffersDurationNs = 14L,
+            )
+
+            probe.noteLiveContentRerecordArmed(atNs = 2_000L)
+            probe.noteLiveContentDispatch(startNs = 2_010L, endNs = 2_070L)
+            probe.noteFrameMetrics(
+                sampleAtNs = 2_080L,
+                drawDurationNs = 21L,
+                syncDurationNs = 22L,
+                commandIssueDurationNs = 23L,
+                swapBuffersDurationNs = 24L,
+            )
+            probe.noteFrameMetrics(
+                sampleAtNs = 2_100L,
+                drawDurationNs = 31L,
+                syncDurationNs = 32L,
+                commandIssueDurationNs = 33L,
+                swapBuffersDurationNs = 34L,
+            )
+            // The settled attribution is deliberately capped to two frame samples.
+            probe.noteFrameMetrics(
+                sampleAtNs = 2_120L,
+                drawDurationNs = 41L,
+                syncDurationNs = 42L,
+                commandIssueDurationNs = 43L,
+                swapBuffersDurationNs = 44L,
+            )
+
+            val snapshot = probe.snapshot()
+            assertEquals(1, snapshot.int("overlayFirstDrawCount"))
+            assertEquals(20L, snapshot.long("overlayFirstDrawTotalNs"))
+            assertEquals(1, snapshot.int("liveContentDispatchDrawCount"))
+            assertEquals(60L, snapshot.long("liveContentDispatchDrawTotalNs"))
+            assertEquals(1, snapshot.int("frameMetricsOverlayFrameCount"))
+            assertEquals(11L, snapshot.long("frameMetricsOverlayDrawTotalNs"))
+            assertEquals(13L, snapshot.long("frameMetricsOverlayCommandIssueTotalNs"))
+            assertEquals(2, snapshot.int("frameMetricsSettledFrameCount"))
+            assertEquals(52L, snapshot.long("frameMetricsSettledDrawTotalNs"))
+            assertEquals(54L, snapshot.long("frameMetricsSettledCommandIssueTotalNs"))
+        } finally {
+            probe.stop()
+        }
+    }
+
     private fun assertCleared(snapshot: ProbeSnapshot, enabled: Boolean) {
         assertEquals(enabled, snapshot.boolean("enabled"))
         assertEquals(0, snapshot.int("precacheArmCount"))
@@ -90,6 +147,30 @@ class EpubRapidIdleWorkProbeTest {
         assertEquals(0, snapshot.int("bitmapPrepareToDrawCount"))
         assertEquals(0L, snapshot.long("bitmapPrepareToDrawTotalNs"))
         assertEquals(0L, snapshot.long("bitmapPrepareToDrawMaxNs"))
+        assertEquals(0, snapshot.int("overlayFirstDrawCount"))
+        assertEquals(0L, snapshot.long("overlayFirstDrawTotalNs"))
+        assertEquals(0L, snapshot.long("overlayFirstDrawMaxNs"))
+        assertEquals(0, snapshot.int("liveContentDispatchDrawCount"))
+        assertEquals(0L, snapshot.long("liveContentDispatchDrawTotalNs"))
+        assertEquals(0L, snapshot.long("liveContentDispatchDrawMaxNs"))
+        assertEquals(0, snapshot.int("frameMetricsOverlayFrameCount"))
+        assertEquals(0L, snapshot.long("frameMetricsOverlayDrawTotalNs"))
+        assertEquals(0L, snapshot.long("frameMetricsOverlayDrawMaxNs"))
+        assertEquals(0L, snapshot.long("frameMetricsOverlaySyncTotalNs"))
+        assertEquals(0L, snapshot.long("frameMetricsOverlaySyncMaxNs"))
+        assertEquals(0L, snapshot.long("frameMetricsOverlayCommandIssueTotalNs"))
+        assertEquals(0L, snapshot.long("frameMetricsOverlayCommandIssueMaxNs"))
+        assertEquals(0L, snapshot.long("frameMetricsOverlaySwapBuffersTotalNs"))
+        assertEquals(0L, snapshot.long("frameMetricsOverlaySwapBuffersMaxNs"))
+        assertEquals(0, snapshot.int("frameMetricsSettledFrameCount"))
+        assertEquals(0L, snapshot.long("frameMetricsSettledDrawTotalNs"))
+        assertEquals(0L, snapshot.long("frameMetricsSettledDrawMaxNs"))
+        assertEquals(0L, snapshot.long("frameMetricsSettledSyncTotalNs"))
+        assertEquals(0L, snapshot.long("frameMetricsSettledSyncMaxNs"))
+        assertEquals(0L, snapshot.long("frameMetricsSettledCommandIssueTotalNs"))
+        assertEquals(0L, snapshot.long("frameMetricsSettledCommandIssueMaxNs"))
+        assertEquals(0L, snapshot.long("frameMetricsSettledSwapBuffersTotalNs"))
+        assertEquals(0L, snapshot.long("frameMetricsSettledSwapBuffersMaxNs"))
     }
 
     private fun loadProbe(): ProbeHandle {
@@ -152,6 +233,39 @@ class EpubRapidIdleWorkProbeTest {
 
         fun noteBitmapPrepareToDraw(startNs: Long, endNs: Long) {
             invoke("noteBitmapPrepareToDraw", startNs, endNs)
+        }
+
+        fun noteSlideOverlayInstalled(atNs: Long) {
+            invoke("noteSlideOverlayInstalled", atNs)
+        }
+
+        fun noteOverlayDraw(startNs: Long, endNs: Long) {
+            invoke("noteOverlayDraw", startNs, endNs)
+        }
+
+        fun noteLiveContentRerecordArmed(atNs: Long) {
+            invoke("noteLiveContentRerecordArmed", atNs)
+        }
+
+        fun noteLiveContentDispatch(startNs: Long, endNs: Long) {
+            invoke("noteLiveContentDispatch", startNs, endNs)
+        }
+
+        fun noteFrameMetrics(
+            sampleAtNs: Long,
+            drawDurationNs: Long,
+            syncDurationNs: Long,
+            commandIssueDurationNs: Long,
+            swapBuffersDurationNs: Long,
+        ) {
+            invoke(
+                "noteFrameMetrics",
+                sampleAtNs,
+                drawDurationNs,
+                syncDurationNs,
+                commandIssueDurationNs,
+                swapBuffersDurationNs,
+            )
         }
 
         private fun invoke(methodName: String, vararg arguments: Any): Any? {

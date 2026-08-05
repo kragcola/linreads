@@ -1,6 +1,13 @@
 package dev.readflow.render.epub
 
-import android.os.SystemClock
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.os.Handler
+import android.os.Looper
+import android.view.FrameMetrics
+import android.view.View
+import android.view.Window
 import java.util.ArrayDeque
 
 /**
@@ -8,8 +15,9 @@ import java.util.ArrayDeque
  * It is reset explicitly by instrumentation and never writes outside this process.
  */
 internal object EpubRapidIdleWorkProbe {
-    private const val NANOSECONDS_PER_MILLISECOND = 1_000_000L
     private const val MAX_RECENT_ARTIFACT_RECORDS = 16
+    private const val MAX_FRAME_METRIC_WINDOWS = 32
+    private const val SETTLED_FRAME_SAMPLE_LIMIT = 2
 
     data class Snapshot(
         val enabled: Boolean,
@@ -41,6 +49,30 @@ internal object EpubRapidIdleWorkProbe {
         val bitmapPrepareToDrawCount: Int,
         val bitmapPrepareToDrawTotalNs: Long,
         val bitmapPrepareToDrawMaxNs: Long,
+        val overlayFirstDrawCount: Int,
+        val overlayFirstDrawTotalNs: Long,
+        val overlayFirstDrawMaxNs: Long,
+        val liveContentDispatchDrawCount: Int,
+        val liveContentDispatchDrawTotalNs: Long,
+        val liveContentDispatchDrawMaxNs: Long,
+        val frameMetricsOverlayFrameCount: Int,
+        val frameMetricsOverlayDrawTotalNs: Long,
+        val frameMetricsOverlayDrawMaxNs: Long,
+        val frameMetricsOverlaySyncTotalNs: Long,
+        val frameMetricsOverlaySyncMaxNs: Long,
+        val frameMetricsOverlayCommandIssueTotalNs: Long,
+        val frameMetricsOverlayCommandIssueMaxNs: Long,
+        val frameMetricsOverlaySwapBuffersTotalNs: Long,
+        val frameMetricsOverlaySwapBuffersMaxNs: Long,
+        val frameMetricsSettledFrameCount: Int,
+        val frameMetricsSettledDrawTotalNs: Long,
+        val frameMetricsSettledDrawMaxNs: Long,
+        val frameMetricsSettledSyncTotalNs: Long,
+        val frameMetricsSettledSyncMaxNs: Long,
+        val frameMetricsSettledCommandIssueTotalNs: Long,
+        val frameMetricsSettledCommandIssueMaxNs: Long,
+        val frameMetricsSettledSwapBuffersTotalNs: Long,
+        val frameMetricsSettledSwapBuffersMaxNs: Long,
     )
 
     private enum class PointerBoundary { MOVE, UP, CANCEL }
@@ -50,9 +82,73 @@ internal object EpubRapidIdleWorkProbe {
         val endedAtNs: Long,
     )
 
+    private enum class FrameMetricPhase { OVERLAY, SETTLED }
+
+    private data class FrameMetricWindow(
+        val generation: Long,
+        val phase: FrameMetricPhase,
+        val startedAtNs: Long,
+        var endedAtNs: Long = Long.MAX_VALUE,
+        var sampleCount: Int = 0,
+    )
+
+    private class FrameMetricTotals {
+        var frameCount = 0
+        var drawTotalNs = 0L
+        var drawMaxNs = 0L
+        var syncTotalNs = 0L
+        var syncMaxNs = 0L
+        var commandIssueTotalNs = 0L
+        var commandIssueMaxNs = 0L
+        var swapBuffersTotalNs = 0L
+        var swapBuffersMaxNs = 0L
+
+        fun add(
+            drawDurationNs: Long,
+            syncDurationNs: Long,
+            commandIssueDurationNs: Long,
+            swapBuffersDurationNs: Long,
+        ) {
+            frameCount += 1
+            drawTotalNs += drawDurationNs
+            drawMaxNs = maxOf(drawMaxNs, drawDurationNs)
+            syncTotalNs += syncDurationNs
+            syncMaxNs = maxOf(syncMaxNs, syncDurationNs)
+            commandIssueTotalNs += commandIssueDurationNs
+            commandIssueMaxNs = maxOf(commandIssueMaxNs, commandIssueDurationNs)
+            swapBuffersTotalNs += swapBuffersDurationNs
+            swapBuffersMaxNs = maxOf(swapBuffersMaxNs, swapBuffersDurationNs)
+        }
+
+        fun clear() {
+            frameCount = 0
+            drawTotalNs = 0L
+            drawMaxNs = 0L
+            syncTotalNs = 0L
+            syncMaxNs = 0L
+            commandIssueTotalNs = 0L
+            commandIssueMaxNs = 0L
+            swapBuffersTotalNs = 0L
+            swapBuffersMaxNs = 0L
+        }
+    }
+
     private val lock = Any()
     @Volatile private var enabled = false
     private val recentArtifactRecordIntervals = ArrayDeque<ArtifactRecordInterval>()
+    private val frameMetricWindows = ArrayDeque<FrameMetricWindow>()
+    private val overlayFrameMetrics = FrameMetricTotals()
+    private val settledFrameMetrics = FrameMetricTotals()
+    private val mainHandler by lazy(LazyThreadSafetyMode.NONE) { Handler(Looper.getMainLooper()) }
+    private var registeredFrameMetricsWindow: Window? = null
+    private var registeredFrameMetricsListener: Window.OnFrameMetricsAvailableListener? = null
+    private var registeredFrameMetricsSession = 0L
+    private var frameMetricsSession = 0L
+    private var nextFrameMetricGeneration = 0L
+    private var overlayFrameMetricWindow: FrameMetricWindow? = null
+    private var settledFrameMetricWindow: FrameMetricWindow? = null
+    private var overlayFirstDrawSeen = false
+    private var liveContentDispatchArmed = false
 
     private var precacheArmCount = 0
     private var pointerDownCount = 0
@@ -85,19 +181,31 @@ internal object EpubRapidIdleWorkProbe {
     private var bitmapPrepareToDrawCount = 0
     private var bitmapPrepareToDrawTotalNs = 0L
     private var bitmapPrepareToDrawMaxNs = 0L
+    private var overlayFirstDrawCount = 0
+    private var overlayFirstDrawTotalNs = 0L
+    private var overlayFirstDrawMaxNs = 0L
+    private var liveContentDispatchDrawCount = 0
+    private var liveContentDispatchDrawTotalNs = 0L
+    private var liveContentDispatchDrawMaxNs = 0L
 
     fun reset() {
-        synchronized(lock) {
+        val registration = synchronized(lock) {
+            frameMetricsSession += 1L
             clearLocked()
             enabled = true
+            takeFrameMetricsRegistrationLocked()
         }
+        registration?.let(::removeFrameMetricsListener)
     }
 
     fun stop() {
-        synchronized(lock) {
+        val registration = synchronized(lock) {
             enabled = false
+            frameMetricsSession += 1L
             clearLocked()
+            takeFrameMetricsRegistrationLocked()
         }
+        registration?.let(::removeFrameMetricsListener)
     }
 
     fun isEnabled(): Boolean = enabled
@@ -133,6 +241,30 @@ internal object EpubRapidIdleWorkProbe {
             bitmapPrepareToDrawCount = bitmapPrepareToDrawCount,
             bitmapPrepareToDrawTotalNs = bitmapPrepareToDrawTotalNs,
             bitmapPrepareToDrawMaxNs = bitmapPrepareToDrawMaxNs,
+            overlayFirstDrawCount = overlayFirstDrawCount,
+            overlayFirstDrawTotalNs = overlayFirstDrawTotalNs,
+            overlayFirstDrawMaxNs = overlayFirstDrawMaxNs,
+            liveContentDispatchDrawCount = liveContentDispatchDrawCount,
+            liveContentDispatchDrawTotalNs = liveContentDispatchDrawTotalNs,
+            liveContentDispatchDrawMaxNs = liveContentDispatchDrawMaxNs,
+            frameMetricsOverlayFrameCount = overlayFrameMetrics.frameCount,
+            frameMetricsOverlayDrawTotalNs = overlayFrameMetrics.drawTotalNs,
+            frameMetricsOverlayDrawMaxNs = overlayFrameMetrics.drawMaxNs,
+            frameMetricsOverlaySyncTotalNs = overlayFrameMetrics.syncTotalNs,
+            frameMetricsOverlaySyncMaxNs = overlayFrameMetrics.syncMaxNs,
+            frameMetricsOverlayCommandIssueTotalNs = overlayFrameMetrics.commandIssueTotalNs,
+            frameMetricsOverlayCommandIssueMaxNs = overlayFrameMetrics.commandIssueMaxNs,
+            frameMetricsOverlaySwapBuffersTotalNs = overlayFrameMetrics.swapBuffersTotalNs,
+            frameMetricsOverlaySwapBuffersMaxNs = overlayFrameMetrics.swapBuffersMaxNs,
+            frameMetricsSettledFrameCount = settledFrameMetrics.frameCount,
+            frameMetricsSettledDrawTotalNs = settledFrameMetrics.drawTotalNs,
+            frameMetricsSettledDrawMaxNs = settledFrameMetrics.drawMaxNs,
+            frameMetricsSettledSyncTotalNs = settledFrameMetrics.syncTotalNs,
+            frameMetricsSettledSyncMaxNs = settledFrameMetrics.syncMaxNs,
+            frameMetricsSettledCommandIssueTotalNs = settledFrameMetrics.commandIssueTotalNs,
+            frameMetricsSettledCommandIssueMaxNs = settledFrameMetrics.commandIssueMaxNs,
+            frameMetricsSettledSwapBuffersTotalNs = settledFrameMetrics.swapBuffersTotalNs,
+            frameMetricsSettledSwapBuffersMaxNs = settledFrameMetrics.swapBuffersMaxNs,
         )
     }
 
@@ -225,6 +357,160 @@ internal object EpubRapidIdleWorkProbe {
         }
     }
 
+    /** Called immediately before a static SLIDE renderer is admitted to the overlay. */
+    fun noteSlideOverlayInstalled() {
+        noteSlideOverlayInstalled(uptimeNs())
+    }
+
+    /** Timestamped form used by the JVM contract test and by deterministic diagnostics. */
+    fun noteSlideOverlayInstalled(atNs: Long) {
+        if (!enabled) return
+        synchronized(lock) {
+            if (!enabled) return@synchronized
+            closeOpenFrameMetricWindowsLocked(atNs)
+            val window = FrameMetricWindow(
+                generation = ++nextFrameMetricGeneration,
+                phase = FrameMetricPhase.OVERLAY,
+                startedAtNs = atNs,
+            )
+            appendFrameMetricWindowLocked(window)
+            overlayFrameMetricWindow = window
+            settledFrameMetricWindow = null
+            overlayFirstDrawSeen = false
+        }
+    }
+
+    /** Records only the first View draw for the current overlay generation. */
+    fun noteOverlayDraw(startNs: Long, endNs: Long) {
+        if (!enabled) return
+        val durationNs = (endNs - startNs).coerceAtLeast(0L)
+        synchronized(lock) {
+            if (!enabled || overlayFirstDrawSeen) return@synchronized
+            overlayFirstDrawSeen = true
+            overlayFirstDrawCount += 1
+            overlayFirstDrawTotalNs += durationNs
+            overlayFirstDrawMaxNs = maxOf(overlayFirstDrawMaxNs, durationNs)
+        }
+    }
+
+    fun endOverlayDrawTiming(startNs: Long?) {
+        if (startNs == null || !enabled) return
+        noteOverlayDraw(startNs, uptimeNs())
+    }
+
+    /** Arms one live container dispatch sample after page-shot suppression is released. */
+    fun noteLiveContentRerecordArmed() {
+        noteLiveContentRerecordArmed(uptimeNs())
+    }
+
+    fun noteLiveContentRerecordArmed(atNs: Long) {
+        if (!enabled) return
+        synchronized(lock) {
+            if (!enabled) return@synchronized
+            closeOpenFrameMetricWindowsLocked(atNs)
+            val generation = overlayFrameMetricWindow?.generation ?: ++nextFrameMetricGeneration
+            val window = FrameMetricWindow(
+                generation = generation,
+                phase = FrameMetricPhase.SETTLED,
+                startedAtNs = atNs,
+            )
+            appendFrameMetricWindowLocked(window)
+            settledFrameMetricWindow = window
+            liveContentDispatchArmed = true
+        }
+    }
+
+    fun beginLiveContentDispatch(): Long? {
+        if (!enabled) return null
+        synchronized(lock) {
+            if (!enabled || !liveContentDispatchArmed) return@synchronized null
+            // One sample per release is enough to identify the expensive traversal and avoids
+            // turning a diagnostic session into a full dispatch profiler.
+            liveContentDispatchArmed = false
+            return@synchronized uptimeNs()
+        }
+    }
+
+    fun endLiveContentDispatch(startNs: Long?) {
+        if (startNs == null || !enabled) return
+        noteLiveContentDispatch(startNs, uptimeNs())
+    }
+
+    fun noteLiveContentDispatch(startNs: Long, endNs: Long) {
+        if (!enabled) return
+        val durationNs = (endNs - startNs).coerceAtLeast(0L)
+        synchronized(lock) {
+            if (!enabled) return@synchronized
+            liveContentDispatchDrawCount += 1
+            liveContentDispatchDrawTotalNs += durationNs
+            liveContentDispatchDrawMaxNs = maxOf(liveContentDispatchDrawMaxNs, durationNs)
+        }
+    }
+
+    /**
+     * Attributes one Window.FrameMetrics sample to the timestamped overlay or settled window.
+     * This overload is intentionally pure with respect to Android Window registration so the
+     * attribution rules remain testable on the JVM.
+     */
+    fun noteFrameMetrics(
+        sampleAtNs: Long,
+        drawDurationNs: Long,
+        syncDurationNs: Long,
+        commandIssueDurationNs: Long,
+        swapBuffersDurationNs: Long,
+    ) {
+        noteFrameMetrics(
+            registrationSession = synchronized(lock) { frameMetricsSession },
+            sampleAtNs = sampleAtNs,
+            drawDurationNs = drawDurationNs,
+            syncDurationNs = syncDurationNs,
+            commandIssueDurationNs = commandIssueDurationNs,
+            swapBuffersDurationNs = swapBuffersDurationNs,
+        )
+    }
+
+    /** Installs the debug-only Window.FrameMetrics listener for the currently visible reader. */
+    fun observeView(view: View) {
+        if (!enabled) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            view.post { observeView(view) }
+            return
+        }
+        val window = findWindow(view.context) ?: return
+        val registration = synchronized(lock) {
+            if (!enabled) return@synchronized null
+            if (
+                registeredFrameMetricsWindow === window &&
+                    registeredFrameMetricsSession == frameMetricsSession
+            ) {
+                return@synchronized null
+            }
+            val old = takeFrameMetricsRegistrationLocked()
+            val session = frameMetricsSession
+            val listener = Window.OnFrameMetricsAvailableListener { _, metrics, _ ->
+                noteAndroidFrameMetrics(session, metrics)
+            }
+            registeredFrameMetricsWindow = window
+            registeredFrameMetricsListener = listener
+            registeredFrameMetricsSession = session
+            old to listener
+        } ?: return
+
+        val (old, listener) = registration
+        old?.let(::removeFrameMetricsListener)
+        runCatching {
+            window.addOnFrameMetricsAvailableListener(listener, mainHandler)
+        }.onFailure {
+            synchronized(lock) {
+                if (registeredFrameMetricsListener === listener) {
+                    registeredFrameMetricsWindow = null
+                    registeredFrameMetricsListener = null
+                    registeredFrameMetricsSession = 0L
+                }
+            }
+        }
+    }
+
     fun beginTimingNs(): Long? {
         if (!enabled) return null
         return uptimeNs()
@@ -248,6 +534,126 @@ internal object EpubRapidIdleWorkProbe {
     fun endBitmapPrepareToDrawTiming(startNs: Long?) {
         if (startNs == null || !enabled) return
         noteBitmapPrepareToDraw(startNs, uptimeNs())
+    }
+
+    private fun noteAndroidFrameMetrics(registrationSession: Long, metrics: FrameMetrics) {
+        val callbackAtNs = System.nanoTime()
+        val sampleAtNs = runCatching {
+            metrics.getMetric(FrameMetrics.INTENDED_VSYNC_TIMESTAMP)
+        }.getOrDefault(0L).takeIf { it > 0L } ?: callbackAtNs
+        noteFrameMetrics(
+            registrationSession = registrationSession,
+            sampleAtNs = sampleAtNs,
+            fallbackSampleAtNs = callbackAtNs,
+            drawDurationNs = metricOrZero(metrics, FrameMetrics.DRAW_DURATION),
+            syncDurationNs = metricOrZero(metrics, FrameMetrics.SYNC_DURATION),
+            commandIssueDurationNs = metricOrZero(metrics, FrameMetrics.COMMAND_ISSUE_DURATION),
+            swapBuffersDurationNs = metricOrZero(metrics, FrameMetrics.SWAP_BUFFERS_DURATION),
+        )
+    }
+
+    private fun metricOrZero(metrics: FrameMetrics, metric: Int): Long =
+        runCatching { metrics.getMetric(metric) }.getOrDefault(0L).coerceAtLeast(0L)
+
+    private fun noteFrameMetrics(
+        registrationSession: Long,
+        sampleAtNs: Long,
+        fallbackSampleAtNs: Long? = null,
+        drawDurationNs: Long,
+        syncDurationNs: Long,
+        commandIssueDurationNs: Long,
+        swapBuffersDurationNs: Long,
+    ) {
+        synchronized(lock) {
+            if (!enabled || registrationSession != frameMetricsSession) return@synchronized
+            fun matches(candidate: FrameMetricWindow, timestampNs: Long): Boolean =
+                timestampNs >= candidate.startedAtNs &&
+                    timestampNs <= candidate.endedAtNs &&
+                    (candidate.phase != FrameMetricPhase.SETTLED ||
+                        candidate.sampleCount < SETTLED_FRAME_SAMPLE_LIMIT)
+
+            val window = frameMetricWindows.toList().asReversed().firstOrNull { candidate ->
+                matches(candidate, sampleAtNs)
+            } ?: fallbackSampleAtNs?.let { fallback ->
+                frameMetricWindows.toList().asReversed().firstOrNull { candidate ->
+                    matches(candidate, fallback)
+                }
+            }
+                ?: return@synchronized
+            val safeDraw = drawDurationNs.coerceAtLeast(0L)
+            val safeSync = syncDurationNs.coerceAtLeast(0L)
+            val safeCommandIssue = commandIssueDurationNs.coerceAtLeast(0L)
+            val safeSwapBuffers = swapBuffersDurationNs.coerceAtLeast(0L)
+            when (window.phase) {
+                FrameMetricPhase.OVERLAY -> overlayFrameMetrics.add(
+                    safeDraw,
+                    safeSync,
+                    safeCommandIssue,
+                    safeSwapBuffers,
+                )
+                FrameMetricPhase.SETTLED -> settledFrameMetrics.add(
+                    safeDraw,
+                    safeSync,
+                    safeCommandIssue,
+                    safeSwapBuffers,
+                )
+            }
+            window.sampleCount += 1
+            if (
+                window.phase == FrameMetricPhase.SETTLED &&
+                    window.sampleCount >= SETTLED_FRAME_SAMPLE_LIMIT
+            ) {
+                window.endedAtNs = minOf(window.endedAtNs, sampleAtNs)
+            }
+        }
+    }
+
+    private fun appendFrameMetricWindowLocked(window: FrameMetricWindow) {
+        if (frameMetricWindows.size == MAX_FRAME_METRIC_WINDOWS) {
+            frameMetricWindows.removeFirst()
+        }
+        frameMetricWindows.addLast(window)
+    }
+
+    private fun closeOpenFrameMetricWindowsLocked(atNs: Long) {
+        overlayFrameMetricWindow?.let { window ->
+            if (window.endedAtNs == Long.MAX_VALUE) window.endedAtNs = atNs
+        }
+        settledFrameMetricWindow?.let { window ->
+            if (window.endedAtNs == Long.MAX_VALUE) window.endedAtNs = atNs
+        }
+    }
+
+    private fun takeFrameMetricsRegistrationLocked(): Pair<Window, Window.OnFrameMetricsAvailableListener>? {
+        val window = registeredFrameMetricsWindow
+        val listener = registeredFrameMetricsListener
+        registeredFrameMetricsWindow = null
+        registeredFrameMetricsListener = null
+        registeredFrameMetricsSession = 0L
+        return if (window != null && listener != null) window to listener else null
+    }
+
+    private fun removeFrameMetricsListener(
+        registration: Pair<Window, Window.OnFrameMetricsAvailableListener>,
+    ) {
+        val remove = {
+            runCatching {
+                registration.first.removeOnFrameMetricsAvailableListener(registration.second)
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) remove() else mainHandler.post(remove)
+    }
+
+    private fun findWindow(context: Context): Window? {
+        var current: Context? = context
+        repeat(8) {
+            when (val candidate = current) {
+                is Activity -> return candidate.window
+                is ContextWrapper -> current = candidate.baseContext
+                else -> return null
+            }
+        }
+        return null
     }
 
     private fun notePointerBoundary(boundary: PointerBoundary, eventTimeNs: Long) {
@@ -342,7 +748,24 @@ internal object EpubRapidIdleWorkProbe {
         bitmapPrepareToDrawCount = 0
         bitmapPrepareToDrawTotalNs = 0L
         bitmapPrepareToDrawMaxNs = 0L
+
+        frameMetricWindows.clear()
+        overlayFrameMetrics.clear()
+        settledFrameMetrics.clear()
+        nextFrameMetricGeneration = 0L
+        overlayFrameMetricWindow = null
+        settledFrameMetricWindow = null
+        overlayFirstDrawSeen = false
+        liveContentDispatchArmed = false
+        overlayFirstDrawCount = 0
+        overlayFirstDrawTotalNs = 0L
+        overlayFirstDrawMaxNs = 0L
+        liveContentDispatchDrawCount = 0
+        liveContentDispatchDrawTotalNs = 0L
+        liveContentDispatchDrawMaxNs = 0L
     }
 
-    private fun uptimeNs(): Long = SystemClock.uptimeMillis() * NANOSECONDS_PER_MILLISECOND
+    // FrameMetrics timestamps use the monotonic nano-time base; keep probe markers on the same
+    // clock instead of fabricating nanoseconds from millisecond uptime samples.
+    private fun uptimeNs(): Long = System.nanoTime()
 }

@@ -74,16 +74,21 @@ internal class PageSlideOverlayView(
     }
 
     override fun onDraw(canvas: Canvas) {
-        val w = viewportW.toFloat()
-        val h = viewportH.toFloat()
-        if (forward) {
-            drawFrame(canvas, frontFrame, 0f, w, h)
-            drawFrame(canvas, revealedFrame, w, w, h)
-        } else {
-            drawFrame(canvas, revealedFrame, 0f, w, h)
-            drawFrame(canvas, frontFrame, w, w, h)
+        val timingStartNs = EpubRapidIdleWorkProbe.beginTimingNs()
+        try {
+            val w = viewportW.toFloat()
+            val h = viewportH.toFloat()
+            if (forward) {
+                drawFrame(canvas, frontFrame, 0f, w, h)
+                drawFrame(canvas, revealedFrame, w, w, h)
+            } else {
+                drawFrame(canvas, revealedFrame, 0f, w, h)
+                drawFrame(canvas, frontFrame, w, w, h)
+            }
+            drawSeamShadow(canvas, w, h)
+        } finally {
+            EpubRapidIdleWorkProbe.endOverlayDrawTiming(timingStartNs)
         }
-        drawSeamShadow(canvas, w, h)
     }
 
     /** Draws one strip-local page frame at [left]; artifacts replay at their recorded viewport size. */
