@@ -2297,6 +2297,11 @@ class EpubFlowViewTest {
 
         try {
             view.goToPage(1)
+            // The real input path defers a cold pair across two host frames. This test needs an
+            // active overlay before ACTION_CANCEL so it can isolate the rollback underlay contract.
+            view.preCachePageTexturesForTest()
+            assertNotNull("fixture requires a warmed current-page slide artifact", view.slideFrontArtifactForTest())
+            assertNotNull("fixture requires a warmed target-page slide artifact", view.slideRevealedArtifactForTest())
             outgoingFrame = view.drawAsScrolledChildToBitmapForTest()
             val downX = view.width * 0.85f
             val moveX = view.width * 0.15f
