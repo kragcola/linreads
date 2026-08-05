@@ -4402,6 +4402,7 @@ internal class EpubFlowView(
         rapidTurnPairBootstrapRetries = 0
         busyPageTurnGesture = false
         rapidIdlePageTurnGesture = false
+        armDeferredLiveTextRerecordWhenQuiet()
     }
 
     fun takeQueuedPageTurnsForPromotion(): Pair<Int, Boolean> {
@@ -4460,6 +4461,12 @@ internal class EpubFlowView(
         deferredLiveTextRerecordLayoutGeneration = pageLayoutGeneration
         deferredLiveTextRerecordScrollY = scrollY
         deferredLiveTextRerecordMode = mode
+        if (!rapidTurnSequenceActive) postOnAnimation(deferredLiveTextRerecordRunnable)
+    }
+
+    private fun armDeferredLiveTextRerecordWhenQuiet() {
+        if (disposed || !deferredLiveTextRerecordPending || rapidTurnSequenceActive) return
+        removeCallbacks(deferredLiveTextRerecordRunnable)
         postOnAnimation(deferredLiveTextRerecordRunnable)
     }
 
@@ -4551,6 +4558,7 @@ internal class EpubFlowView(
                 rapidIdleSettleStage = RapidIdleSettleStage.NONE
                 removeCallbacks(rapidTurnIdleRunnable)
                 rapidTurnSequenceActive = false
+                armDeferredLiveTextRerecordWhenQuiet()
                 // Release staged in-place owners before publishing idle so the next frame can do
                 // one bounded slot redraw without making the current callback recursive.
                 resumeDeferredInPlacePageShotRefresh()
@@ -6212,8 +6220,19 @@ internal class EpubFlowView(
         // View renderer covers the same viewport as the Drawable owner, so teardown must restore
         // the parked chapter RenderNode without making its full re-record part of the settle frame.
         val rerecordLiveText = container.skipContentDraw || liveContentDrawSuppressedByPageShot
+        val boundaryTurnActive =
+            interactiveTurnState == InteractiveTurnState.BOUNDARY_SOFTWARE ||
+                interactiveTurnState == InteractiveTurnState.BOUNDARY_DISCRETE_ACTIVE ||
+                activeBoundaryPreview != null ||
+                pendingBoundaryPageTurn != null ||
+                boundaryContinuityCover
         val terminalSlideCover =
-            if (!disposed && !preserveActivePixelRefreshes && rerecordLiveText && slideOverlayView != null) {
+            if (!disposed &&
+                !preserveActivePixelRefreshes &&
+                !boundaryTurnActive &&
+                rerecordLiveText &&
+                slideOverlayView != null
+            ) {
             val renderer = slideOverlayView!!
             renderer.translationX = if (slideOverlayForward) -width.toFloat() else width.toFloat()
             settledPageCover = SettledPageCover(slideView = renderer)
@@ -6233,6 +6252,7 @@ internal class EpubFlowView(
         val terminalCurlCover =
             !disposed &&
                 !preserveActivePixelRefreshes &&
+                !boundaryTurnActive &&
                 rerecordLiveText &&
                 !terminalSlideCover &&
                 curlDrawable != null
@@ -6268,6 +6288,7 @@ internal class EpubFlowView(
             scheduleDeferredLiveTextRerecord()
         }
         container.invalidate()
+        invalidate()
         postInvalidateOnAnimation()
     }
 

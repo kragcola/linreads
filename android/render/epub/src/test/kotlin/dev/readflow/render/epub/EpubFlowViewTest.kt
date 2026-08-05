@@ -2363,6 +2363,10 @@ class EpubFlowViewTest {
                 "fixture must start from a non-zero page so overlay bounds exercise content coordinates",
                 view.scrollY > 0,
             )
+            // Keep the software Canvas lane on the cold Bitmap overlay. Warm API 29+ artifacts
+            // are RenderNode-backed and are validated by the hardware/device lane instead of
+            // asking a software Canvas to execute Canvas.drawRenderNode.
+            view.recycleCachedTexturesForTest()
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
             assertNotNull(view.privateField("slideDrawable") as PageSlideDrawable?)
             assertNotNull(view.privateField("slideOverlayView") as PageSlideOverlayView?)
@@ -2533,11 +2537,9 @@ class EpubFlowViewTest {
 
     @Test
     fun `deferred live text rerecord is discarded when its chapter generation becomes stale`() {
-        val fixture = visibleHeadingImageContinuationFixture(minHeadingPageIndex = 1)
-        val view = fixture.view
-        view.flipStyle = PageFlipStyle.SLIDE
+        val view = pagedFlowView(flipStyle = PageFlipStyle.SLIDE)
         try {
-            view.goToPage(fixture.headingPageIndex)
+            view.goToPage(1)
             shadowOf(Looper.getMainLooper()).idle()
             assertTrue(view.beginInteractiveCurl(forward = true, anchorX = view.width.toFloat()))
             val textShadow = shadowOf(view.textView)
