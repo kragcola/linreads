@@ -2509,7 +2509,9 @@ class EpubFlowViewTest {
             try {
                 // Robolectric's manual View.draw() path does not composite ViewOverlay children;
                 // draw the production terminal Drawable directly to verify its actual page content.
-                settledCurl.draw(Canvas(firstSettledFrame))
+                val coverCanvas = Canvas(firstSettledFrame)
+                coverCanvas.translate(0f, -view.scrollY.toFloat())
+                settledCurl.draw(coverCanvas)
                 val terminalCoverHits = firstSettledFrame.countExactPixels(0xFF1E3A8A.toInt())
                 assertTrue(
                     "the terminal PAPER cover must retain the revealed page while the child re-record is deferred; " +
